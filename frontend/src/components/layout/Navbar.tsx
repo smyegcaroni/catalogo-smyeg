@@ -318,6 +318,15 @@ function MobileNav() {
             >
               Visor
             </a>
+            <a
+              href="https://caroni.org.ve"
+              target="_blank"
+              rel="noopener noreferrer"
+              className={mobileNavLinkClass({ isActive: false })}
+              onClick={() => setOpen(false)}
+            >
+              Sobre el Proyecto
+            </a>
             {canAccessAdmin && (
               <NavLink to="/admin" className={mobileNavLinkClass}>
                 {t('nav.admin')}
@@ -452,6 +461,14 @@ export function Navbar() {
               className={navLinkClass({ isActive: false })}
             >
               Visor
+            </a>
+            <a
+              href="https://caroni.org.ve"
+              target="_blank"
+              rel="noopener noreferrer"
+              className={navLinkClass({ isActive: false })}
+            >
+              Sobre el Proyecto
             </a>
             {/* Operators get a first-class entry — previously buried in the
                 user dropdown only. */}
