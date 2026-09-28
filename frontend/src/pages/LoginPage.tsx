@@ -201,7 +201,7 @@ export function LoginPage() {
           {/* Mobile needs its own branding and level-one heading because the
               desktop brand panel and its heading are hidden below 880px. */}
           <div className="mb-6 flex flex-col items-center gap-2 text-center min-[880px]:hidden">
-            <GeoLensLogo size="md" />
+            <GeoLensLogo size="md" className="rounded-xl bg-[#116AAB] px-4 py-3" />
             <h1 className="text-pretty text-lg font-semibold leading-snug tracking-[-0.01em] text-foreground">
               {t('loginHero')}
             </h1>
