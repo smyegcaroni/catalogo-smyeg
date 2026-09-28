@@ -148,7 +148,7 @@ export function LoginPage() {
             >
               <GeoLensLogo size="lg" />
             </button>
-            <p className="eyebrow mt-2.5 text-white/75">
+            <p className="eyebrow mt-2.5 text-white">
               {t('geospatialDataCatalog')}
             </p>
           </div>
