@@ -47,8 +47,10 @@
   --card-foreground: oklch(0.145 0.005 250);
   --popover: oklch(0.99 0.002 85);
   --popover-foreground: oklch(0.145 0.005 250);
-  --primary: oklch(0.66 0.16 195);
-  --primary-foreground: oklch(0.985 0 0);
+  /* Requested catalog orange (#F58320). A dark foreground is required because
+     white reaches only 2.58:1 on this fill; this pairing exceeds WCAG AA. */
+  --primary: oklch(0.723769 0.170695 54.402);
+  --primary-foreground: oklch(0.18 0.008 250);
   --secondary: oklch(0.97 0.003 85);
   --secondary-foreground: oklch(0.205 0.005 250);
   --muted: oklch(0.97 0.003 85);
@@ -209,7 +211,7 @@
   --card-foreground: oklch(0.985 0 0);
   --popover: oklch(0.22 0.010 250);
   --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.72 0.17 250);
+  --primary: oklch(0.723769 0.170695 54.402);
   --primary-foreground: oklch(0.18 0.008 250);
   --secondary: oklch(0.269 0.008 250);
   --secondary-foreground: oklch(0.985 0 0);

@@ -75,8 +75,8 @@ describe('MAP_COLORS design-token parity', () => {
     })).toBe('#ff0000');
   });
 
-  it('uses branding v0.2.0\'s frozen sRGB primary for MapLibre paints', () => {
-    expect(readOklchToken(root, '--primary')).toEqual(readOklchToken(root, '--viz-1'));
+  it('uses the catalog orange for UI actions while retaining the map-safe primary', () => {
+    expect(oklchToSrgbHex(readOklchToken(root, '--primary'))).toBe('#f58320');
     expect(MAP_COLORS.default.fill).toBe(brandedPrimary);
     expect(MAP_COLORS.categorical[0]).toBe(brandedPrimary);
   });

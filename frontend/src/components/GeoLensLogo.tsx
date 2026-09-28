@@ -9,7 +9,7 @@ interface GeoLensLogoProps {
 }
 
 const sizes = {
-  sm: { fao: 'h-5', caroni: 'h-5', gap: 'gap-2' },
+  sm: { fao: 'h-5 md:h-7', caroni: 'h-5 md:h-7', gap: 'gap-2 md:gap-3' },
   md: { fao: 'h-7', caroni: 'h-7', gap: 'gap-3' },
   lg: { fao: 'h-10', caroni: 'h-10', gap: 'gap-4' },
 };
