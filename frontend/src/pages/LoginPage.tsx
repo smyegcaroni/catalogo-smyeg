@@ -19,6 +19,7 @@ import { useEdition } from '@/hooks/use-edition';
 import { isSafeHttpUrl } from '@/lib/safe-http-url';
 import { writeSessionStorage } from '@/lib/storage';
 import catalogBackground from '@/assets/fondo-catalogo.jpg';
+import catalogVideo from '@/assets/video-login.mp4';
 
 function getOAuthErrorMessage(error: string, t: (key: string, opts?: Record<string, string>) => string): string {
   if (error.includes('invalid_grant')) {
@@ -120,7 +121,20 @@ export function LoginPage() {
         className="relative hidden overflow-hidden border-e border-border bg-cover bg-center px-14 py-12 min-[880px]:flex min-[880px]:flex-col min-[880px]:justify-between"
         style={{ backgroundImage: `url(${catalogBackground})` }}
       >
-        {/* The dark scrim preserves text contrast over the photographic background. */}
+        <video
+          className="pointer-events-none absolute inset-0 size-full object-cover object-center motion-reduce:hidden"
+          autoPlay
+          loop
+          muted
+          playsInline
+          preload="metadata"
+          poster={catalogBackground}
+          aria-hidden="true"
+        >
+          <source src={catalogVideo} type="video/mp4" />
+        </video>
+
+        {/* The dark scrim preserves text contrast over the moving background. */}
         <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-black/75 via-black/50 to-black/20" />
 
         <div className="relative z-10 flex h-full flex-col">
