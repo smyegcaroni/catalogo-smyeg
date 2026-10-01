@@ -63,6 +63,7 @@ function isProse(value: string): boolean {
  */
 const IDENTICAL_ACROSS_LOCALES = new Set([
   // Product and standards names
+  'common:appName', // Catálogo Geoespacial Cuenca Río Caroní (institutional name)
   'common:enums.sourceFormat.arcgisFeatureServer', // ArcGIS FeatureServer
   'common:enums.sourceFormat.ogcapiFeatures', // OGC API Features
   'common:enums.sourceFormat.fgdb', // File Geodatabase (Esri product name)

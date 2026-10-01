@@ -8,13 +8,13 @@ describe('useDocumentTitle', () => {
     document.title = originalTitle;
   });
 
-  it('sets document.title to "Title - GeoLens" for non-empty title', () => {
+  it('sets document.title with the catalog name for a non-empty title', () => {
     renderHook(() => useDocumentTitle('Search'));
-    expect(document.title).toBe('Search - GeoLens');
+    expect(document.title).toBe('Search - Catálogo Geoespacial Cuenca Río Caroní');
   });
 
-  it('sets document.title to "GeoLens" for empty title', () => {
+  it('sets document.title to the catalog name for an empty title', () => {
     renderHook(() => useDocumentTitle(''));
-    expect(document.title).toBe('GeoLens');
+    expect(document.title).toBe('Catálogo Geoespacial Cuenca Río Caroní');
   });
 });
