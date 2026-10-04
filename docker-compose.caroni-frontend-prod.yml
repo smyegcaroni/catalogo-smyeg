@@ -1,0 +1,37 @@
+name: caroni-geolens-frontend
+
+services:
+  frontend:
+    image: geolens-caroni-frontend:20261004-privacy-v1
+    container_name: geolens-caroni-frontend-prod
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    ports:
+      - "127.0.0.1:8081:8080"
+    environment:
+      API_BASE_URL: /api
+      TILE_BASE_URL: /api
+      API_UPSTREAM: http://api:8000
+      PUBLIC_APP_URL: https://catalogo.caroni.org.ve
+      CLIENT_MAX_BODY_SIZE: 500m
+      TRUSTED_PROXY_CIDRS: 172.18.0.10/32
+    volumes:
+      - frontend_cache:/var/cache/nginx
+    networks:
+      geolens:
+        aliases:
+          - caroni-frontend-prod
+
+networks:
+  geolens:
+    external: true
+    name: geolens_default
+
+volumes:
+  frontend_cache:

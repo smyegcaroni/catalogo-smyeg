@@ -109,6 +109,7 @@ docs/
 *.png
 !.github/assets/*.png
 !frontend/public/*.png
+!frontend/public/privacidad-assets/*.png
 !frontend/src/assets/**/*.png
 
 # Logs / temp

@@ -1,190 +1,153 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Política de Privacidad - Catálogo de Datos Geoespaciales</title>
-    <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            line-height: 1.7;
-            color: #2c3e50;
-            margin: 0;
-            padding: 20px;
-            background-color: #f4f6f9;
-        }
-        .container {
-            max-width: 1000px;
-            margin: 0 auto;
-            background: #ffffff;
-            padding: 40px 50px;
-            border-radius: 8px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.05);
-            border-top: 5px solid #1a7f3d;
-        }
-        h1 {
-            font-size: 2.2rem;
-            color: #1a3b5c;
-            border-bottom: 2px solid #eaeef2;
-            padding-bottom: 15px;
-            margin-top: 0;
-            letter-spacing: -0.5px;
-        }
-        .subtitle {
-            font-size: 1.1rem;
-            color: #5a6c7d;
-            margin-top: -5px;
-            margin-bottom: 30px;
-            font-weight: 400;
-            border-left: 4px solid #8cb3d9;
-            padding-left: 15px;
-        }
-        h2 {
-            font-size: 1.5rem;
-            color: #1a3b5c;
-            margin-top: 35px;
-            border-bottom: 1px solid #eaeef2;
-            padding-bottom: 8px;
-        }
-        h3 {
-            font-size: 1.2rem;
-            color: #1f4b6e;
-            margin-top: 25px;
-        }
-        p {
-            margin-bottom: 1rem;
-        }
-        ul {
-            margin-bottom: 1.2rem;
-            padding-left: 1.8rem;
-        }
-        li {
-            margin-bottom: 0.5rem;
-        }
-        .highlight-box {
-            background: #f0f4fb;
-            padding: 18px 25px;
-            border-radius: 6px;
-            border-left: 4px solid #2b7a4b;
-            margin: 25px 0;
-        }
-        .footer-meta {
-            margin-top: 45px;
-            padding-top: 25px;
-            border-top: 1px solid #e0e6ed;
-            font-size: 0.9rem;
-            color: #6a7b8c;
-            display: flex;
-            justify-content: space-between;
-            flex-wrap: wrap;
-        }
-        .contact-info {
-            background: #f8fafc;
-            padding: 15px 20px;
-            border-radius: 6px;
-            margin: 20px 0;
-        }
-        @media (max-width: 768px) {
-            .container { padding: 25px 20px; }
-            h1 { font-size: 1.8rem; }
-        }
-    </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Datos personales, uso, conservación y protección en el Catálogo de Datos Geoespaciales de la Cuenca del Río Caroní.">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <title>Política de privacidad · Catálogo Geoespacial Cuenca Río Caroní</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <style>
+    @font-face{font-family:"IBM Plex Sans";font-style:normal;font-weight:100 700;font-display:swap;src:url("/privacidad-assets/ibm-plex-sans-latin-variable.woff2") format("woff2")}
+    :root{color-scheme:light;--background:#fafaf8;--surface:#fff;--text:#202226;--muted:#5c626a;--border:#e0e2e4;--brand:#116aab;--link:#0d5b94;--primary:#5792c9;--hover:#f58320;--soft:#f0f6fb;font-family:"IBM Plex Sans",ui-sans-serif,system-ui,sans-serif}
+    *{box-sizing:border-box}html{scroll-padding-top:88px}body{margin:0;color:var(--text);background:var(--background);font-size:16px;line-height:1.65}
+    a{color:var(--link);text-underline-offset:3px;overflow-wrap:anywhere}a:hover{text-decoration-thickness:2px}a:focus-visible,summary:focus-visible{outline:3px solid var(--brand);outline-offset:4px;border-radius:3px}
+    .skip-link{position:fixed;top:-100px;left:16px;z-index:5;padding:10px 16px;background:var(--surface)}.skip-link:focus{top:8px}
+    .topbar{position:sticky;top:0;z-index:2;background:var(--brand);border-bottom:1px solid #0d5b94}.topbar-inner{max-width:1280px;margin:auto;min-height:56px;padding:10px 28px;display:flex;align-items:center;justify-content:space-between;gap:24px}
+    .brand{display:inline-flex;align-items:center;gap:16px;flex-shrink:0}.brand img{display:block;width:auto;height:30px}.topnav{display:flex;align-items:center;gap:24px;font-size:14px}.topnav a{color:#fff;text-decoration:none;padding:4px 0}.topnav a[aria-current="page"]{border-bottom:2px solid white}.topbar a:focus-visible{outline-color:white}
+    .page{max-width:1180px;margin:auto;padding:32px 28px 64px}.breadcrumb{margin-bottom:22px;display:flex;flex-wrap:wrap;align-items:center;gap:10px;color:var(--muted);font-size:13px}.breadcrumb a{color:var(--muted)}
+    .intro{padding-bottom:28px;border-bottom:1px solid var(--border);margin-bottom:32px}.eyebrow{margin:0 0 10px;color:var(--link);font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
+    h1{margin:0 0 10px;font-size:clamp(30px,4vw,42px);line-height:1.15;letter-spacing:-.025em;font-weight:600}.subtitle{max-width:720px;margin:0;color:var(--muted);font-size:18px;line-height:1.5}.metadata{margin-top:20px;display:flex;flex-wrap:wrap;gap:10px 24px;color:var(--muted);font-size:13px}
+    .layout{display:grid;grid-template-columns:240px minmax(0,1fr);gap:40px;align-items:start}.contents{position:sticky;top:86px}.contents h2{margin:0 0 14px;font-size:13px;line-height:1.4;font-weight:600;color:var(--muted)}
+    .contents ol{list-style:none;margin:0;padding:0;border-left:1px solid var(--border)}.contents li{margin:0}.contents a{display:block;padding:7px 0 7px 16px;font-size:13px;line-height:1.45;color:var(--muted);text-decoration:none}.contents a:hover{color:var(--link);background:var(--soft)}.contents .contact-link{margin:24px 0 0 16px;padding:0;color:var(--link);text-decoration:underline}
+    .mobile-contents{display:none}.policy{min-width:0}.summary{margin-bottom:28px;padding:20px 24px;background:var(--soft);border:1px solid #d6e5f2;border-left:3px solid var(--primary);border-radius:6px}.summary p{margin:0;font-size:15px}
+    .policy section{margin-bottom:32px}.policy h2{margin:0 0 14px;padding-top:4px;font-size:22px;font-weight:600;line-height:1.3;letter-spacing:-.01em}.policy h3{font-size:17px;font-weight:600;line-height:1.4;margin:22px 0 8px}.policy p{margin:0 0 14px}.policy ul{margin:10px 0 16px;padding-left:22px}.policy li{margin-bottom:8px}strong{font-weight:600}
+    .retention{margin:18px 0;border:1px solid var(--border);background:var(--surface);border-radius:8px;overflow:hidden}.retention div{display:grid;grid-template-columns:180px minmax(0,1fr);gap:16px;padding:16px 20px}.retention div+div{border-top:1px solid var(--border)}.retention dt{font-weight:600}.retention dd{margin:0}
+    .contact{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:24px}.contact p:last-child{margin-bottom:0}.contact-address{font-size:19px}
+    .document-end{display:flex;flex-wrap:wrap;gap:16px;align-items:center;justify-content:space-between;padding-top:20px;margin-top:32px;border-top:1px solid var(--border)}.back-link{display:inline-flex;align-items:center;gap:8px;padding:9px 16px;background:var(--primary);border-radius:6px;color:#171f28;font-size:14px;font-weight:500;text-decoration:none}.back-link:hover{background:var(--hover);text-decoration:none}.document-end>a:last-child{font-size:13px}
+    footer{border-top:1px solid var(--border);padding:20px 28px;text-align:center;color:var(--muted);font-size:12px}footer p{margin:0 0 6px}footer a{color:var(--muted)}
+    @media(max-width:850px){.layout{display:block}.contents{display:none}.mobile-contents{display:block;padding:14px 18px;margin-bottom:24px;background:var(--surface);border:1px solid var(--border);border-radius:8px}.mobile-contents summary{font-weight:500;cursor:pointer}.mobile-contents ol{padding-left:20px;margin:12px 0 0}.mobile-contents li{margin:7px 0;font-size:14px}}
+    @media(max-width:560px){.topbar-inner{padding:12px 18px;min-height:62px;gap:14px;flex-wrap:wrap}.brand{gap:12px}.brand img{height:26px;max-width:150px}.topnav{gap:18px;font-size:13px}.topnav .current{display:none}.page{padding:24px 18px 40px}.intro{margin-bottom:24px;padding-bottom:24px}.subtitle{font-size:16px}.metadata{display:block}.metadata span{display:block;margin-top:5px}.summary{padding:16px 18px}.policy h2{font-size:21px}.retention div{display:block;padding:16px 18px}.retention dd{margin-top:5px}.contact{padding:20px}}
+    @media print{:root{--background:white;--text:black;--muted:#444}body{font-size:11pt}.topbar,.breadcrumb,.contents,.mobile-contents,.document-end,.skip-link,footer{display:none}.page{max-width:none;padding:0}.layout{display:block}.intro{margin-bottom:20px}h1{font-size:25pt}h2,h3{break-after:avoid}p,li{orphans:3;widows:3}.retention div,.contact{break-inside:avoid}a{color:black}}
+    @media(max-width:560px){html{scroll-padding-top:120px}}
+  </style>
 </head>
-<body>
-    <div class="container">
-        <h1>Política de Privacidad y Protección de Datos</h1>
-        <div class="subtitle">
-            Catálogo de Datos Geoespaciales · Proyecto Cuenca del Río Caroní<br>
-            <span style="font-size:0.9rem; color:#3d637f;">Ministerio del Poder Popular para el Ecosocialismo (MINAE) · Organización de las Naciones Unidas para la Alimentación y la Agricultura (FAO)</span>
-        </div>
-
-        <p><strong>Última actualización:</strong> 20 de agosto de 2026</p>
-
-        <p>En el marco del Proyecto "Conservación y uso sustentable de la diversidad biológica en la cuenca del río Caroní, estado Bolívar", el MINAE Venezuela y la Organización de las Naciones Unidas para la Alimentación y la Agricultura (FAO) se comprometen a proteger la privacidad y los datos personales de todas las personas que interactúan con el Catálogo de Datos Geoespaciales. Esta política se basa en la <strong>Política de Protección de Datos de la FAO</strong> y sus principios rectores: Finalidad legítima, Integridad, Responsabilidad, Seguridad y Transparencia (FIRST) [citation:1][citation:5][citation:7].</p>
-
-        <div class="highlight-box">
-            <strong>⚖️ Alcance:</strong> Esta política se aplica a todos los datos personales recopilados, almacenados y procesados en el Catálogo de Datos Geoespaciales del proyecto, incluyendo información de beneficiarios, socios, personal de campo, usuarios del sistema y visitantes de las plataformas en línea asociadas [citation:2][citation:3].
-        </div>
-
-        <h2>1. Datos que Recopilamos</h2>
-        <p>La información que recopilamos depende de la interacción del usuario con el Catálogo y el proyecto. Solo se solicita la información pertinente y necesaria para los fines indicados [citation:2].</p>
-
-        <h3>1.1. Datos Personales Proporcionados Directamente</h3>
-        <ul>
-            <li><strong>Información de contacto:</strong> Nombre completo, afiliación (organización, institución), dirección de correo electrónico, número de teléfono y país.</li>
-            <li><strong>Credenciales de cuenta:</strong> Nombre de usuario y contraseña para acceder a áreas restringidas del Catálogo.</li>
-            <li><strong>Datos profesionales:</strong> Cargo, área de especialización, publicaciones o currículum, cuando sea relevante para la colaboración en el proyecto [citation:2].</li>
-            <li><strong>Información de beneficiarios:</strong> En el caso de beneficiarios del proyecto (asistencia técnica, transferencias), se podrá recopilar información demográfica básica (tamaño del hogar, ocupación) para determinar la elegibilidad y brindar apoyo [citation:2].</li>
-        </ul>
-
-        <h3>1.2. Datos Recopilados Automáticamente</h3>
-        <ul>
-            <li><strong>Datos de navegación:</strong> Dirección IP, tipo de navegador, sistema operativo, páginas visitadas, fechas y horas de acceso. Esta información se analiza de forma agregada para mejorar el rendimiento y la experiencia del usuario, y no se utiliza para identificar personalmente a los visitantes [citation:2].</li>
-            <li><strong>Cookies:</strong> Se utilizan cookies para mejorar la funcionalidad del sitio. El usuario puede desactivarlas en la configuración de su navegador, aunque algunas funciones podrían no estar disponibles [citation:2].</li>
-        </ul>
-
-        <h3>1.3. Datos Sensibles</h3>
-        <p>La FAO evita recopilar datos sensibles (origen racial o étnico, opiniones políticas, creencias religiosas, datos de salud) a menos que sea estrictamente necesario y se cuente con el <strong>consentimiento explícito</strong> del proveedor de datos o se requiera para proteger sus intereses vitales [citation:4][citation:7].</p>
-
-        <h2>2. Uso de la Información</h2>
-        <p>Los datos recopilados en el Catálogo se utilizan exclusivamente para los fines legítimos del proyecto, que incluyen:</p>
-        <ul>
-            <li><strong>Gestión del Catálogo:</strong> Almacenar, organizar y proporcionar acceso a los datos geoespaciales y metadatos del proyecto.</li>
-            <li><strong>Comunicación y seguimiento:</strong> Contactar a los usuarios para responder consultas, enviar notificaciones sobre actualizaciones del Catálogo o gestionar su participación en actividades del proyecto.</li>
-            <li><strong>Análisis y mejora:</strong> Evaluar el uso del Catálogo para mejorar su funcionalidad y la calidad de los datos.</li>
-            <li><strong>Informes y cumplimiento:</strong> Generar informes agregados para los donantes (incluyendo la FAO) y para el cumplimiento de requisitos legales o administrativos [citation:1][citation:4].</li>
-        </ul>
-        <p>En ningún caso se compartirán los datos con anunciantes o para fines comerciales ajenos al mandato de la FAO [citation:1].</p>
-
-        <h2>3. Compartición de Datos</h2>
-        <p>La FAO y el MINAE pueden compartir datos en las siguientes circunstancias:</p>
-        <ul>
-            <li><strong>Con proveedores de servicios autorizados:</strong> Terceros que procesan datos en nombre de la FAO (por ejemplo, para alojamiento web o distribución de correos), quienes están sujetos a estrictas obligaciones contractuales de confidencialidad y seguridad [citation:1][citation:9].</li>
-            <li><strong>Por obligación legal o administrativa:</strong> Cuando sea necesario para cumplir con auditorías, requisitos de donantes o procedimientos legales, siempre en línea con las políticas de la FAO y el marco de las Naciones Unidas [citation:1][citation:9].</li>
-            <li><strong>Con el consentimiento del proveedor de datos:</strong> En cualquier otro caso, se obtendrá el consentimiento explícito del individuo antes de compartir sus datos personales con terceros.</li>
-        </ul>
-
-        <h2>4. Seguridad de los Datos</h2>
-        <p>Implementamos medidas técnicas, físicas y organizativas rigurosas para proteger los datos contra el acceso no autorizado, la divulgación, la alteración o la destrucción [citation:1][citation:5]:</p>
-        <ul>
-            <li><strong>Infraestructura segura:</strong> Uso de firewalls, cifrado en tránsito y en reposo, y monitoreo de seguridad regular.</li>
-            <li><strong>Control de acceso:</strong> Solo el personal autorizado que necesita los datos para un propósito específico puede acceder a ellos.</li>
-            <li><strong>Capacitación:</strong> Todo el personal y los socios reciben formación sobre protección de datos y confidencialidad [citation:1][citation:8].</li>
-            <li><strong>Evaluación de riesgos:</strong> Se realizan evaluaciones de impacto para identificar y mitigar riesgos en el procesamiento de datos de alto riesgo [citation:5][citation:7].</li>
-        </ul>
-
-        <h2>5. Retención y Eliminación de Datos</h2>
-        <p>Conservamos los datos personales solo durante el tiempo necesario para cumplir con los fines para los que fueron recopilados, de acuerdo con las políticas internas de la FAO y los requisitos legales o de donantes [citation:1].</p>
-        <ul>
-            <li><strong>Datos de usuarios y suscripciones:</strong> Se mantienen mientras la cuenta esté activa o el usuario esté suscrito. Tras la desactivación o solicitud de eliminación, los datos se eliminan o anonimizan en un plazo razonable.</li>
-            <li><strong>Datos de proyectos:</strong> Se retienen según los plazos establecidos para el proyecto y los requisitos de archivo. Una vez que ya no son necesarios, se eliminan o anonimizan de forma segura [citation:1].</li>
-            <li><strong>Excepciones:</strong> En algunos casos, los datos pueden conservarse por más tiempo para cumplir con obligaciones legales, de auditoría, de archivo de interés público o para la defensa de derechos legales [citation:1].</li>
-        </ul>
-
-        <h2>6. Sus Derechos como Proveedor de Datos</h2>
-        <p>De acuerdo con la Política de Protección de Datos de la FAO, usted tiene derecho a [citation:1][citation:4][citation:9]:</p>
-        <ul>
-            <li><strong>Acceder</strong> a los datos personales que la FAO tiene sobre usted.</li>
-            <li><strong>Rectificar</strong> o corregir datos inexactos o incompletos.</li>
-            <li><strong>Solicitar la eliminación</strong> de sus datos personales, sujeto a limitaciones razonables (por ejemplo, si los datos son necesarios para un proyecto en curso o un requisito legal).</li>
-            <li><strong>Oponerse</strong> al uso de sus datos para ciertos fines.</li>
-            <li><strong>Presentar una queja</strong> ante la Unidad de Protección de Datos de la FAO si no está satisfecho con la respuesta a su solicitud.</li>
-        </ul>
-        <p>Para ejercer estos derechos, puede ponerse en contacto con la Unidad de Protección de Datos de la FAO a través del correo electrónico: <strong>FAO-Data-Privacy@fao.org</strong> [citation:9].</p>
-
-        <div class="contact-info">
-            <strong>📩 Contacto para consultas sobre datos:</strong><br>
-            Unidad de Protección de Datos de la FAO · <a href="mailto:FAO-Data-Privacy@fao.org">FAO-Data-Privacy@fao.org</a><br>
-            También puede dirigirse al equipo del proyecto en el MINAE Venezuela para consultas específicas sobre el Catálogo de Datos Geoespaciales de la cuenca del río Caroní.
-        </div>
-
-        <h2>7. Actualizaciones de esta Política</h2>
-        <p>Esta política de privacidad puede ser revisada y actualizada periódicamente para reflejar cambios en las prácticas de procesamiento de datos o en los requisitos normativos. Se recomienda a los usuarios revisar esta página de manera regular. La fecha de la última actualización se indica al inicio del documento [citation:7].</p>
-
-        <div class="footer-meta">
-            <span>© 2026 MINAE Venezuela / FAO. Todos los derechos reservados.</span>
-            <span>Política basada en la <a href="https://www.fao.org/contact-us/data-protection-and-privacy/es/" target="_blank">Política de Protección de Datos de la FAO</a>.</span>
-        </div>
+<body id="inicio">
+  <a class="skip-link" href="#contenido">Ir al contenido principal</a>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/" aria-label="Volver al Catálogo Geoespacial Cuenca Río Caroní">
+        <img src="/privacidad-assets/fao-logo-white-es.svg" alt="Organización de las Naciones Unidas para la Alimentación y la Agricultura" width="180" height="30">
+        <img src="/privacidad-assets/logo-cuenca-caroni-white.png" alt="Cuenca del Río Caroní" width="96" height="30">
+      </a>
+      <nav class="topnav" aria-label="Navegación principal"><a href="/">Catálogo</a><a href="/privacidad.html" class="current" aria-current="page">Privacidad</a><a href="/login">Iniciar sesión</a></nav>
     </div>
+  </header>
+  <main id="contenido" class="page" tabindex="-1">
+    <nav class="breadcrumb" aria-label="Ruta de navegación"><a href="/">Catálogo</a><span aria-hidden="true">/</span><span aria-current="page">Política de privacidad</span></nav>
+    <div class="intro">
+      <p class="eyebrow">Catálogo de datos geoespaciales · Cuenca del Río Caroní</p>
+      <h1>Política de privacidad</h1>
+      <p class="subtitle">Cómo se recopilan, utilizan, conservan y protegen los datos personales de quienes consultan y utilizan el catálogo.</p>
+      <div class="metadata"><span>Entrada en vigor: 4 de octubre de 2026</span><span>Última actualización: 4 de octubre de 2026</span><span>Sitio: catalogo.caroni.org.ve</span></div>
+    </div>
+    <div class="layout">
+      <aside class="contents">
+        <nav aria-label="Contenido de la política"><h2>En esta página</h2><ol>
+          <li><a href="#alcance">1. Alcance y contexto</a></li><li><a href="#datos">2. Datos que se recopilan</a></li><li><a href="#finalidades">3. Uso de la información</a></li><li><a href="#navegador">4. Almacenamiento en el navegador</a></li><li><a href="#terceros">5. Acceso y servicios de terceros</a></li><li><a href="#alojamiento">6. Alojamiento y seguridad</a></li><li><a href="#conservacion">7. Conservación y eliminación</a></li><li><a href="#geoespaciales">8. Datos geoespaciales sensibles</a></li><li><a href="#derechos">9. Solicitudes sobre sus datos</a></li><li><a href="#cambios">10. Cambios de esta política</a></li><li><a href="#contacto">11. Contacto</a></li>
+        </ol><a class="contact-link" href="mailto:diego.padron@fao.org">Consultar sobre privacidad</a></nav>
+      </aside>
+      <article class="policy" aria-label="Texto de la política de privacidad">
+        <details class="mobile-contents"><summary>Contenido de la política</summary><nav aria-label="Contenido de la política en dispositivos móviles"><ol>
+          <li><a href="#alcance">Alcance y contexto</a></li><li><a href="#datos">Datos que se recopilan</a></li><li><a href="#finalidades">Uso de la información</a></li><li><a href="#navegador">Almacenamiento en el navegador</a></li><li><a href="#terceros">Acceso y servicios de terceros</a></li><li><a href="#alojamiento">Alojamiento y seguridad</a></li><li><a href="#conservacion">Conservación y eliminación</a></li><li><a href="#geoespaciales">Datos geoespaciales sensibles</a></li><li><a href="#derechos">Solicitudes sobre sus datos</a></li><li><a href="#cambios">Cambios de esta política</a></li><li><a href="#contacto">Contacto</a></li>
+        </ol></nav></details>
+        <div class="summary"><p><strong>La consulta del catálogo público no requiere una cuenta.</strong> El registro permite acceder a las funciones habilitadas para cada usuario. Los datos personales se utilizan para gestionar ese acceso, operar el servicio y atender solicitudes sobre la plataforma.</p></div>
+        <section id="alcance">
+          <h2>1. Alcance y contexto</h2>
+          <p>Esta política se aplica al sitio <a href="https://catalogo.caroni.org.ve/">catalogo.caroni.org.ve</a>, denominado Catálogo de Datos Geoespaciales de la Cuenca del Río Caroní. Describe el tratamiento de datos personales asociado a la navegación, las cuentas de usuario y las funciones del catálogo.</p>
+          <p>El catálogo apoya la recopilación, gestión y difusión de información geoespacial del proyecto «Conservación y uso sustentable de la diversidad biológica en la cuenca del río Caroní», GCP/VEN/023/GFF, en el estado Bolívar, Venezuela. El proyecto es liderado por el Ministerio del Poder Popular para el Ecosocialismo (MINEC), con asistencia técnica de la Organización de las Naciones Unidas para la Alimentación y la Agricultura (FAO) y financiamiento del Fondo para el Medio Ambiente Mundial (GEF).</p>
+          <p>Esta política no sustituye los avisos específicos de otras actividades del proyecto ni las condiciones de privacidad de sitios o servicios externos. La identificación de las instituciones participantes en el proyecto no implica que todas reciban los datos personales de los usuarios.</p>
+        </section>
+        <section id="datos">
+          <h2>2. Datos que se recopilan</h2>
+          <h3>Datos de cuenta y comunicaciones</h3>
+          <p>Al registrarse, se solicita un nombre de usuario, una dirección de correo electrónico y una contraseña. El correo se utiliza para verificar la cuenta. La contraseña se almacena mediante una función de resumen criptográfico, no como texto legible. También se gestionan el identificador de la cuenta, sus permisos y los datos técnicos necesarios para la autenticación.</p>
+          <p>Si usted contacta al equipo del catálogo, se tratarán su dirección de correo y el contenido de su consulta para responderla. Si aporta un nombre u otros datos de perfil, se utilizarán para las funciones correspondientes.</p>
+          <h3>Datos técnicos de acceso</h3>
+          <p>La infraestructura genera registros que pueden incluir dirección IP, fecha y hora, ruta solicitada, tipo de navegador, respuesta del servidor y errores técnicos. Estos datos permiten operar el servicio, investigar incidentes y proteger el acceso.</p>
+          <h3>Contenido aportado al catálogo</h3>
+          <p>Los usuarios con permisos pueden incorporar archivos, metadatos y otra información geoespacial. Esos contenidos pueden incluir datos personales si permiten identificar a una persona, por sí solos o al combinarse con otra información. Su publicación debe respetar las autorizaciones, restricciones de acceso y condiciones de uso que correspondan.</p>
+          <p>El catálogo no solicita información demográfica de hogares, historiales de salud ni currículos para crear una cuenta. Actualmente no ofrece inicio de sesión mediante proveedores externos como Google o Microsoft.</p>
+        </section>
+        <section id="finalidades">
+          <h2>3. Uso de la información</h2>
+          <ul>
+            <li><strong>Gestionar cuentas y permisos:</strong> verificar el correo, autenticar a los usuarios y controlar el acceso a funciones y contenidos.</li>
+            <li><strong>Operar y proteger el catálogo:</strong> mantener su funcionamiento, resolver problemas y detectar accesos o usos no autorizados.</li>
+            <li><strong>Atender comunicaciones:</strong> responder consultas y enviar avisos necesarios sobre la cuenta o el servicio.</li>
+            <li><strong>Gestionar contenidos:</strong> identificar a los usuarios autorizados que incorporan o administran información en la plataforma.</li>
+          </ul>
+          <p>Los datos personales no se destinan a publicidad comercial ni a su venta o alquiler. Para informes del proyecto se utilizará información agregada o anonimizada cuando sea suficiente para la finalidad del informe. Un uso adicional que requiera datos identificables deberá informarse a las personas afectadas y contar con la habilitación correspondiente.</p>
+          <p>La mera navegación por el sitio no se considera una autorización general para utilizar datos personales con fines distintos de los descritos.</p>
+        </section>
+        <section id="navegador">
+          <h2>4. Almacenamiento en el navegador</h2>
+          <p>La aplicación utiliza almacenamiento local y de sesión para conservar información de autenticación, preferencias de idioma y apariencia, y decisiones sobre avisos de la interfaz. El sistema de autenticación también puede utilizar cookies técnicas de sesión y de seguridad.</p>
+          <p>La aplicación instalable conserva archivos de la interfaz, como imágenes, fuentes y estilos, en la caché del navegador para facilitar su apertura. Las búsquedas, los datos y los servicios geoespaciales requieren conexión a Internet. Esta caché de la interfaz no equivale a una copia completa de los conjuntos de datos.</p>
+          <p>Usted puede borrar las cookies, el almacenamiento y la caché desde las opciones del navegador. Al hacerlo, puede perder preferencias o necesitar iniciar sesión nuevamente. Borrar esos archivos locales no elimina su cuenta ni los datos almacenados en el servidor.</p>
+        </section>
+        <section id="terceros">
+          <h2>5. Acceso y servicios de terceros</h2>
+          <p>El acceso a datos personales se limita al personal autorizado y a los proveedores técnicos que lo necesiten para alojar, mantener o proteger el servicio, con las obligaciones de protección de datos que correspondan. La participación de MINEC, FAO o GEF en el proyecto no autoriza por sí sola la entrega de datos de cuenta a esas instituciones.</p>
+          <p>Los metadatos y conjuntos de datos publicados como públicos pueden ser consultados y descargados por terceros según los permisos y las licencias de cada recurso. Los responsables de su publicación deben evitar exponer datos personales o información sensible sin la autorización correspondiente.</p>
+          <p>Al cargar mapas base, capas o servicios geoespaciales externos, su navegador puede conectarse a sus proveedores. Estos pueden recibir su dirección IP y datos técnicos de la solicitud. El tratamiento que realicen se rige por sus propias políticas. Los enlaces externos también conducen a servicios con condiciones de privacidad independientes.</p>
+          <p>Las solicitudes de acceso a datos formuladas por autoridades se evaluarán de acuerdo con el marco jurídico e institucional aplicable al responsable del tratamiento, limitando cualquier comunicación a lo que corresponda.</p>
+        </section>
+        <section id="alojamiento">
+          <h2>6. Alojamiento y seguridad</h2>
+          <p>El servidor que aloja el catálogo y su base de datos se encuentra en <strong>Estados Unidos</strong>, en la infraestructura de Hetzner. Las copias de seguridad locales verificadas también se almacenan en ese servidor. El uso del catálogo implica el tratamiento y almacenamiento de datos en esa infraestructura, fuera de Venezuela.</p>
+          <p>El sitio utiliza HTTPS para proteger la transmisión de información. La aplicación dispone de autenticación, permisos de acceso y almacenamiento de contraseñas mediante resúmenes criptográficos. Se realizan copias de seguridad para facilitar la recuperación del servicio.</p>
+          <p>Estas medidas reducen los riesgos, pero no permiten garantizar una seguridad absoluta. Si usted sospecha un acceso no autorizado o identifica una exposición de datos personales, puede comunicarlo al contacto indicado en esta política, sin incluir contraseñas ni credenciales de acceso.</p>
+        </section>
+        <section id="conservacion">
+          <h2>7. Conservación y eliminación</h2>
+          <p>Los datos personales se conservarán durante el tiempo necesario para los fines descritos. Se establecen los siguientes criterios:</p>
+          <dl class="retention">
+            <div><dt>Registros de acceso</dt><dd>Un máximo de <strong>12 meses</strong> desde su generación, salvo que deban conservarse de forma justificada para investigar un incidente o atender una obligación aplicable.</dd></div>
+            <div><dt>Datos de cuenta</dt><dd>Mientras la cuenta permanezca activa. Ante una solicitud válida de eliminación, se eliminarán o anonimizarán en un máximo de <strong>30 días naturales</strong> desde la verificación de la identidad y la aceptación de la solicitud.</dd></div>
+            <div><dt>Copias de seguridad</dt><dd>Los datos ya eliminados del sistema activo pueden permanecer temporalmente en copias anteriores hasta su rotación. Si se restaura una copia, se deberán volver a aplicar las solicitudes de eliminación aceptadas.</dd></div>
+          </dl>
+          <p>Si existe una razón para conservar determinados datos después de la solicitud, se informará de su alcance y justificación. El acceso a esos datos quedará limitado a la finalidad que motive su conservación.</p>
+          <p>La eliminación de una cuenta no supone la eliminación automática de los conjuntos de datos aportados al catálogo. Su conservación, retirada o anonimización se evaluará según su contenido, las autorizaciones de publicación y las necesidades de gestión documental.</p>
+        </section>
+        <section id="geoespaciales">
+          <h2>8. Datos geoespaciales sensibles</h2>
+          <p>Los datos geoespaciales pueden revelar información sobre personas, viviendas, comunidades o territorios aun cuando no incluyan nombres. También pueden exponer localizaciones cuya difusión afecte a comunidades indígenas, ecosistemas o especies amenazadas.</p>
+          <p>Antes de publicar ese tipo de información, se deberá evaluar el riesgo de identificación o afectación y aplicar, según corresponda, restricciones de acceso, eliminación de atributos identificables o reducción de la precisión espacial. La disponibilidad técnica de un archivo no constituye autorización para hacerlo público.</p>
+          <p>La publicación de información vinculada a comunidades indígenas debe respetar sus derechos, las autorizaciones sobre los datos y los procesos de consentimiento libre, previo e informado que correspondan. La creación de una cuenta no sustituye esos procesos.</p>
+        </section>
+        <section id="derechos">
+          <h2>9. Solicitudes sobre sus datos</h2>
+          <p>Usted puede solicitar información sobre los datos personales asociados a su cuenta, su corrección y, cuando corresponda, su eliminación o la limitación de su uso. También puede plantear una objeción o retirar una autorización que haya otorgado para un uso específico. La retirada no afecta al tratamiento realizado válidamente con anterioridad.</p>
+          <p>Las solicitudes se atenderán conforme al marco aplicable al responsable del tratamiento. Para proteger la cuenta, puede ser necesario verificar su identidad mediante información proporcionada por un canal seguro. No se le solicitará que envíe su contraseña por correo.</p>
+          <p>La solicitud debe enviarse a <a href="mailto:diego.padron@fao.org">diego.padron@fao.org</a>, indicando la cuenta o la interacción a la que se refiere y la acción solicitada. Si no es posible atenderla íntegramente, se comunicarán las razones y las alternativas disponibles.</p>
+          <p>Cuando el tratamiento sea realizado por la FAO, se aplicarán sus normas y procedimientos internos de protección de datos. Puede consultar el <a href="https://www.fao.org/contact-us/data-protection-and-privacy/es/" target="_blank" rel="noopener noreferrer">Aviso de protección de datos y privacidad de la FAO</a> para conocer ese marco institucional.</p>
+        </section>
+        <section id="cambios">
+          <h2>10. Cambios de esta política</h2>
+          <p>Esta política se revisará cuando cambien las funciones del catálogo, sus condiciones de alojamiento o las prácticas de tratamiento de datos. La fecha de entrada en vigor y la última actualización se indican al inicio de esta página.</p>
+          <p>Los cambios relevantes se comunicarán mediante un aviso visible en el sitio o por los canales de contacto disponibles. Si una nueva finalidad requiere autorización, se solicitará antes de utilizar los datos para ella.</p>
+        </section>
+        <section id="contacto" class="contact">
+          <h2>11. Contacto</h2>
+          <p>Las consultas sobre privacidad, las solicitudes relacionadas con cuentas y los reportes de exposición de datos se reciben a través del contacto técnico del catálogo:</p>
+          <p class="contact-address"><a href="mailto:diego.padron@fao.org">diego.padron@fao.org</a></p>
+          <p>Contacto técnico del Catálogo de Datos Geoespaciales de la Cuenca del Río Caroní.</p>
+        </section>
+        <div class="document-end"><a class="back-link" href="/">← Volver al catálogo</a><a href="#inicio">Volver al inicio de la página ↑</a></div>
+      </article>
+    </div>
+  </main>
+  <footer><p>Catálogo de Datos Geoespaciales de la Cuenca del Río Caroní</p><p>Desarrollado con <a href="https://getgeolens.com/" target="_blank" rel="noopener noreferrer">GeoLens</a> · <a href="https://www.fao.org/contact-us/data-protection-and-privacy/es/" target="_blank" rel="noopener noreferrer">Protección de datos y privacidad de la FAO</a></p></footer>
 </body>
 </html>
