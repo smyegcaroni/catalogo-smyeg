@@ -123,7 +123,7 @@ describe('MapViewerGate', () => {
     renderRoute();
 
     expect(await screen.findByTestId('builder-page')).toBeInTheDocument();
-    expect(document.title).toBe('Cached Map Title - GeoLens');
+    expect(document.title).toBe('Cached Map Title - Catálogo Geoespacial Cuenca Río Caroní');
   });
 
   it('loads the public viewer when server denies builder access for a stale editor cache', async () => {

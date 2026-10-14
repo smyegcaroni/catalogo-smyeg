@@ -22,5 +22,5 @@ it("shows the gate's fallback title while the viewer chunk is still loading", as
     { route: '/maps/map-1' },
   );
 
-  await waitFor(() => expect(document.title).toBe('Map - GeoLens'));
+  await waitFor(() => expect(document.title).toBe('Map - Catálogo Geoespacial Cuenca Río Caroní'));
 });
