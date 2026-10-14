@@ -2,7 +2,7 @@ name: caroni-geolens-frontend
 
 services:
   frontend:
-    image: geolens-caroni-frontend:20261008-header1
+    image: geolens-caroni-frontend:1.24.0-20261014-pwaicon1
     container_name: geolens-caroni-frontend-prod
     restart: unless-stopped
     read_only: true

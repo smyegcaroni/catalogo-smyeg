@@ -1,0 +1,22 @@
+services:
+  api:
+    image: geolens-caroni-api:1.24.0-20261014
+  worker:
+    image: geolens-caroni-api:1.24.0-20261014
+  migrate:
+    image: geolens-caroni-api:1.24.0-20261014
+  frontend:
+    image: geolens-caroni-dev:1.24.0-20261014
+  valkey:
+    profiles: !reset []
+    ports: !reset []
+    volumes: !reset []
+    image: "valkey/valkey:8.1.10-alpine"
+    restart: "unless-stopped"
+    user: "valkey"
+    security_opt: !override ["no-new-privileges:true"]
+    cap_drop: !override ["ALL"]
+    mem_limit: "268435456"
+    command: !override ["valkey-server", "--save", "", "--appendonly", "no", "--maxmemory", "192mb", "--maxmemory-policy", "volatile-ttl"]
+    healthcheck: {"test": ["CMD", "valkey-cli", "ping"], "timeout": "5s", "interval": "10s", "retries": 3, "start_period": "5s"}
+    logging: {"driver": "json-file", "options": {"max-file": "3", "max-size": "50m"}}
