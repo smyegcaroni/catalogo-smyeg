@@ -47,11 +47,10 @@
   --card-foreground: oklch(0.145 0.005 250);
   --popover: oklch(0.99 0.002 85);
   --popover-foreground: oklch(0.145 0.005 250);
-  /* Catalog blue (#5792c9). A dark foreground is required because white
-     reaches only 3.30:1 on this fill; this pairing exceeds WCAG AA. */
-  --primary: oklch(0.642899 0.103556 248.119);
-  --primary-hover: oklch(0.723769 0.170695 54.402); /* #F58320 */
-  --primary-foreground: oklch(0.18 0.008 250);
+  /* Caroni actions: white on teal, dark text on green hover. */
+  --primary: oklch(0.442150 0.060074 211.143);
+  --primary-hover: oklch(0.654476 0.129281 166.573); /* #1BA97F */
+  --primary-foreground: #ffffff;
   --secondary: oklch(0.97 0.003 85);
   --secondary-foreground: oklch(0.205 0.005 250);
   --muted: oklch(0.97 0.003 85);
@@ -212,9 +211,9 @@
   --card-foreground: oklch(0.985 0 0);
   --popover: oklch(0.22 0.010 250);
   --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.642899 0.103556 248.119);
-  --primary-hover: oklch(0.723769 0.170695 54.402);
-  --primary-foreground: oklch(0.18 0.008 250);
+  --primary: oklch(0.442150 0.060074 211.143);
+  --primary-hover: oklch(0.654476 0.129281 166.573);
+  --primary-foreground: #ffffff;
   --secondary: oklch(0.269 0.008 250);
   --secondary-foreground: oklch(0.985 0 0);
   --muted: oklch(0.269 0.008 250);
@@ -788,4 +787,8 @@ div:has(> [data-group-drop-target="true"]) > [id^="folder-group-children"] {
       env(safe-area-inset-bottom)
     );
   }
+}
+
+@media (hover: hover) {
+  .hover\:bg-primary-hover:hover { color: #171f28; }
 }

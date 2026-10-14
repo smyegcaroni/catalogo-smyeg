@@ -164,6 +164,7 @@ export default defineConfig({
     },
   },
   build: {
+    manifest: true,
     // MapLibre is isolated in map-vendor by manualChunks. Keep Vite's generic
     // warning above the current GIS engine chunk so build output only warns when
     // that explicit budget grows materially.

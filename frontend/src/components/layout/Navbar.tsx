@@ -294,7 +294,7 @@ function MobileNav() {
         </SheetTrigger>
         <SheetContent side="left" className="w-64">
           <SheetHeader>
-            <SheetTitle className="rounded-md bg-[#116AAB] p-3 pe-8">
+            <SheetTitle className="rounded-md bg-[#245C66] p-3 pe-8">
               <GeoLensLogo size="sm" />
             </SheetTitle>
             <SheetDescription className="sr-only">{t('nav.navigationMenu')}</SheetDescription>
@@ -433,14 +433,14 @@ export function Navbar() {
     // AppLayout reserves this header's height (h-14 + safe-area) as top padding.
     <header
       className="fixed inset-x-0 top-0 z-40 border-b text-white pt-[env(safe-area-inset-top)]"
-      style={{ backgroundColor: '#116AAB', borderColor: '#0d5b94' }}
+      style={{ backgroundColor: '#245C66', borderColor: '#245C66' }}
     >
       {/* Full-bleed control bar — page content keeps its own max-width;
           the frame spans the viewport like the rest of the chrome. */}
       <div className="flex h-14 w-full items-center justify-between gap-4 px-4 sm:px-6">
         <div className="flex min-w-0 items-center gap-4">
           <MobileNav />
-          <Link to="/" aria-label={t('appName')} className="rounded-md transition-opacity duration-150 hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-[#116AAB]">
+          <Link to="/" aria-label={t('appName')} className="rounded-md transition-opacity duration-150 hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-[#245C66]">
             <GeoLensLogo size="sm" />
           </Link>
           <Separator orientation="vertical" className="hidden h-6 bg-white/25 md:block" />

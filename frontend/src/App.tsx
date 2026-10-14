@@ -11,6 +11,7 @@ import { LoadingState } from '@/components/layout/LoadingState';
 import { LazyLoadErrorBoundary, RouteErrorBoundary } from '@/components/error';
 import { SessionExpiredDialog } from '@/components/auth/SessionExpiredDialog';
 import { AnalysisJobWatcher } from '@/components/analysis/AnalysisJobWatcher';
+import { PwaInstallPrompt } from '@/components/layout/PwaInstallPrompt';
 
 // Lazy page imports — each produces a separate Vite chunk
 const LoginPage = lazy(() => import('./pages/LoginPage').then(m => ({ default: m.LoginPage })));
@@ -70,6 +71,7 @@ function RootLayout() {
           server-side and the dataset is in the catalog, but the guarantee is
           "a running job survives a reload", not "a notification does". */}
       <AnalysisJobWatcher />
+      <PwaInstallPrompt />
       <Suspense fallback={<LoadingState />}>
         <Outlet />
       </Suspense>

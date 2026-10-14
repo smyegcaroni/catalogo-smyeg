@@ -7,8 +7,8 @@
   "author": "Carto Concepts, LLC",
   "scripts": {
     "dev": "vite",
-    "build:app": "vite build",
-    "build": "tsc -b && vite build",
+    "build:app": "vite build && node scripts/finalize-pwa-build.mjs",
+    "build": "tsc -b && npm run build:app",
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest run --passWithNoTests",

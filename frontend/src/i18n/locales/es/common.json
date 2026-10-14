@@ -1,5 +1,18 @@
 {
   "appName": "Catálogo Geoespacial Cuenca Río Caroní",
+  "pwaInstall": {
+    "title": "Instala Catálogo Datos Geoespaciales",
+    "description": "Añade la aplicación a tu dispositivo móvil o de escritorio para abrir el catálogo directamente.",
+    "offlineLimit": "La interfaz conserva archivos esenciales para abrirse sin conexión. Las búsquedas, los datos, los mapas y los servicios geoespaciales requieren Internet.",
+    "instructions": {
+      "ios": "En Safari, toca Compartir y elige «Añadir a la pantalla de inicio».",
+      "safari": "En Safari, abre el menú Archivo y elige «Añadir al Dock».",
+      "browser": "En el menú de tu navegador, elige «Instalar aplicación» o «Añadir a la pantalla de inicio»."
+    },
+    "install": "Instalar aplicación",
+    "understood": "Entendido",
+    "later": "Ahora no"
+  },
   "clearSearch": "Borrar búsqueda",
   "loading": "Cargando...",
   "error": "Error",
