@@ -1064,8 +1064,8 @@ class TestAPreviewFailureCarriesNoCredential:
         Without a positive control an absence assertion is satisfied by a
         preview that never reached the failure block at all. This drives the
         same path with the scrub disabled and requires the credential to come
-        through, so the three tests above cannot be green for the wrong
-        reason.
+        through to the log, so the three tests above cannot be green for the
+        wrong reason. The exception never carries GDAL's text at all.
         """
         monkeypatch.setattr(
             preview_mod, "scrub_secret_value", lambda text, secret: text
@@ -1079,7 +1079,7 @@ class TestAPreviewFailureCarriesNoCredential:
             monkeypatch, credential, f"ERROR 1: sent '{blob}'"
         )
 
-        assert blob in str(error)
+        assert str(error) == "ogrinfo failed (exit 1)"
         assert blob in str(captured)
 
     async def test_unreadable_stdout_names_none_of_it(self, monkeypatch) -> None:
@@ -9050,7 +9050,7 @@ class TestAdapterProbeReadsAreBounded:
     turn.
 
     Fixed by routing each read through `bounded_probe_read`
-    (`platform/probe_bounds.py`), which streams via `client.stream` and
+    (`platform/probe_bounds.py`), which streams via `client.send` and
     `read_bounded_body` -- the same `MAX_DOCUMENT_BYTES` on the wire,
     identity-only so a compressed body is refused before a byte of it is
     inflated -- and `require_decodable` for the same `MAX_DOCUMENT_TOKENS`/
@@ -9067,17 +9067,10 @@ class TestAdapterProbeReadsAreBounded:
     sweep below enumerates the ones that stay unbounded and why each is a
     different, lower-severity case than the four named entry points:
 
-    - `stac.py`'s `list_stac_collections`/`search_stac_items`: STAC's own
-      adapter carries no credential at all on this codepath (`_make_client`
-      builds an anonymous client; `has_url_credentials` is what this module
-      polices instead), so the "a caller already holds a credential for it"
-      half of the finding does not apply the same way.
-
-    Closing those is real follow-up work, not a settled non-issue -- an
-    unbounded read is still an unbounded read regardless of what credential
-    is or is not attached -- but it is a different, wider-scoped change than
-    this finding's four named entry points, so it is named here rather than
-    silently left for a future sweep to rediscover.
+    `stac.py`'s `list_stac_collections`/`search_stac_items` were on that list
+    and are off it: both read through `bounded_probe_read`/
+    `bounded_probe_exchange` under `DEFAULT_CHECK_TIMEOUT`, so they no longer
+    show up as a raw `client.<verb>(` call.
 
     fix(#1770 round 44 P1): `arcgis.py`'s `_fetch_count`/
     `fetch_arcgis_feature_count`/`fetch_arcgis_pagination_info`/
@@ -9122,10 +9115,11 @@ class TestAdapterProbeReadsAreBounded:
       independently bounded by its own `client.stream()` implementation
       from #1758 (byte cap and deadline both native to that module, not
       borrowed from `probe_bounds.py`).
-    - `catalog/sources/cog_info.py`'s `fetch_cog_info` (3 sites): all three
-      talk to GeoLens's OWN internal, trusted Titiler service
-      (`build_titiler_cog_url`), carrying no external credential at all --
-      see that function's own Gate 1/Gate 2 docstring.
+    - `catalog/sources/cog_info.py`'s `fetch_cog_info` (3 sites) and
+      `fetch_cog_nodata` (1 site): both talk to GeoLens's OWN internal,
+      trusted Titiler service (`build_titiler_cog_url`), carrying no
+      external credential at all -- see each function's own Gate 1/Gate 2
+      docstring.
     - `catalog/sources/origin_probe.py`'s `probe_remote_uri`/
       `fetch_json_document`: neither attaches a credential header; both
       already run under their own doubled hard deadline and (for the JSON
@@ -9143,6 +9137,11 @@ class TestAdapterProbeReadsAreBounded:
       header (`headers={"Accept-Encoding": "identity"}` only); already
       bounded by its own outer `asyncio.timeout`, identity-only streaming,
       and its own `codeql[py/full-ssrf]` marker (fix(#1708)).
+    - `catalog/sources/adapters/stac_asset_size.py`'s `_probe_size`: a
+      one-byte `Range` request whose body is never read (the response is
+      closed after its headers), under its own deadline and a concurrency
+      cap. The catalog credential is attached only for an asset on the
+      catalog's own origin, and the client is `make_safe_client()`.
     - `platform/probe_bounds.py`'s `bounded_probe_read` and
       `platform/service_endpoints.py`'s `fetch_document`: the two bounded
       implementations themselves.
@@ -9225,20 +9224,15 @@ class TestAdapterProbeReadsAreBounded:
             # not a member (its token travels in the URL, never a header;
             # `ARCGIS_SERVICE_FORMAT` in this file). No bound of any kind ran
             # for these four before this round.
-            (
-                "app.modules.catalog.sources.adapters.stac",
-                "list_stac_collections",
-                "get",
-            ),
-            ("app.modules.catalog.sources.adapters.stac", "search_stac_items", "post"),
             # The two already-bounded implementations themselves.
             ("app.platform.service_endpoints", "fetch_document", "stream"),
-            ("app.platform.probe_bounds", "bounded_probe_read", "stream"),
+            ("app.platform.probe_bounds", "bounded_probe_exchange", "send"),
             # fix(#1770 round 43 P1): the tree-wide widening. See class
             # docstring for why each of these is out of scope.
             ("app.modules.auth.oauth.service", "_resolve_github_identity", "get"),
             ("app.modules.catalog.sources.arcgis_signin", "_fetch_json", "stream"),
             ("app.modules.catalog.sources.cog_info", "fetch_cog_info", "get"),
+            ("app.modules.catalog.sources.cog_info", "fetch_cog_nodata", "get"),
             ("app.modules.catalog.sources.origin_probe", "probe_remote_uri", "stream"),
             (
                 "app.modules.catalog.sources.origin_probe",
@@ -9257,6 +9251,11 @@ class TestAdapterProbeReadsAreBounded:
                 "stream",
             ),
             ("app.processing.ingest.url_fetch", "fetch_url_to_path", "stream"),
+            (
+                "app.modules.catalog.sources.adapters.stac_asset_size",
+                "_probe_size",
+                "stream",
+            ),
         }
         assert found == expected, found - expected or expected - found
 
@@ -9932,26 +9931,22 @@ class TestASecretDoesNotSurviveInTheChain:
 
 
 class TestAHeaderAuthJobUsesTheTasksOwnQueue:
-    """fix(#1812): a credentialed job defers on the task's own queue with its
-    header line under `token`; the worker still lists `ingest-auth-v2`.
-    """
+    """A credentialed job defers on the task's own queue; the worker still lists `ingest-auth-v2`."""
 
     async def test_a_header_auth_import_defers_on_the_default_queue(
         self,
         client,
         admin_auth_header: dict,
         test_db_session,
-        monkeypatch,
     ) -> None:
-        """The import door hands `ingest_service` its own queue and the composed line."""
-        from app.core.config import settings
+        """The import door hands `ingest_service` its own queue and stages the composed line."""
         from app.platform.jobs.models import IngestJob
         from app.platform.refresh import credentials as creds
         from tests.factories import get_user_id
 
-        # The stock install: no credential store, so the line itself crosses.
-        creds.set_credential_backend(None)
-        monkeypatch.setattr(settings, "redis_url", None, raising=False)
+        from tests.test_service_refresh_1220 import _FakeCredentialBackend
+
+        creds.set_credential_backend(_FakeCredentialBackend())
 
         admin_id = await get_user_id(test_db_session, "admin")
         job = IngestJob(
@@ -9978,15 +9973,17 @@ class TestAHeaderAuthJobUsesTheTasksOwnQueue:
                     json={"title": "Roads", "token": secret},
                     headers=admin_auth_header,
                 )
+            assert resp.status_code == 202, resp.text
+            # The task's own queue, as declared on it: nothing reconfigures it.
+            task.configure.assert_not_called()
+            kwargs = task.defer_async.call_args.kwargs
+            assert "token" not in kwargs
+            assert (
+                await creds.claim_service_credential(kwargs["credential_ref"])
+                == f"Authorization: Bearer {secret}"
+            )
         finally:
             creds.set_credential_backend(None)
-
-        assert resp.status_code == 202, resp.text
-        # The task's own queue, as declared on it: nothing reconfigures it.
-        task.configure.assert_not_called()
-        kwargs = task.defer_async.call_args.kwargs
-        assert kwargs["token"] == f"Authorization: Bearer {secret}"
-        assert kwargs["credential_ref"] is None
 
     def test_the_worker_default_keeps_the_legacy_queue_as_a_consumer(self) -> None:
         """The class default still lists `ingest-auth-v2`, with nothing producing on it."""

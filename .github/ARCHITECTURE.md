@@ -92,8 +92,12 @@ upload → processing/ingest/router.py (validates, stages file, checks quota)
          creates catalog Records, generates embeddings + a quicklook
 ```
 
-The HTTP request returns immediately; the heavy work happens in the **worker**. (Note:
-the per-user quota is checked at request time, not atomically in the worker — see issue #302.)
+The HTTP request returns immediately; the heavy work happens in the **worker**. The
+upload request does an early quota check so an over-quota upload fails fast. The
+authoritative check runs in the worker: `reserve_dataset_slot` and `reserve_storage_bytes`
+in `modules/quota/service.py` take a per-user advisory lock inside the transaction that
+creates the record, then recount usage. Concurrent uploads by one user serialize on that
+lock, so they can't all pass the early check and overshoot the cap.
 
 ---
 
@@ -113,8 +117,15 @@ branches to core code.
 ## Frontend (React + Vite)
 
 `frontend/src/` — React 19, Vite, TanStack Query (server state), Zustand (`stores/`,
-client state; auth token under `geolens-auth`), `@vis.gl/react-maplibre` v8 + `maplibre-gl`
+client state), `@vis.gl/react-maplibre` v8 + `maplibre-gl`
 v5, Tailwind, and shadcn/ui primitives in `components/ui/`.
+
+- **Auth session:** the access token lives in memory only. The `geolens-auth` entry in
+  localStorage holds just the session id and the user. On reload, `lib/session-sync.ts`
+  gets a new token from the httpOnly refresh cookie. Tabs tell each other about sign-in and
+  sign-out over a `BroadcastChannel` (`lib/auth-channel.ts`), and those messages carry only
+  the session id. A session on an API that the cookie can't reach keeps its refresh token
+  in memory too, so a reload ends it.
 
 - **API access:** `api/client.ts` `apiFetch()` wraps fetch + auth; one file per domain in `api/`.
 - **Routes:** `pages/` (admin sub-pages in `pages/admin/`).

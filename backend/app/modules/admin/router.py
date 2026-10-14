@@ -6,16 +6,17 @@ import io
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 import anyio
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
 
+from app.modules.admin.job_review import REVIEW_REQUIRED, review_states
 from app.modules.admin.schemas import (
     AdminJobListResponse,
     AdminJobResponse,
@@ -25,6 +26,7 @@ from app.modules.admin.schemas import (
     AIStatusUpdate,
     ApproveRequest,
     BackfillResponse,
+    BackfillTenantRun,
     CatalogStatsResponse,
     EmbeddingStatsResponse,
     JobSortField,
@@ -33,7 +35,6 @@ from app.modules.admin.schemas import (
     UserListResponse,
     UserNameItem,
     UserSortField,
-    RoleName,
     UserUpdate,
 )
 from app.modules.admin.service import (
@@ -43,16 +44,27 @@ from app.modules.admin.service import (
 )
 from app.modules.quota.service import get_user_quota_usage_bulk
 from app.modules.audit.service import AuditEvent, audit_emit, audit_emit_durable
-from app.modules.auth.dependencies import require_mode_permission, require_permission
+from app.modules.auth.dependencies import (
+    get_current_active_user,
+    require_mode_permission,
+    require_permission,
+)
 from app.platform.ratelimit import limiter  # HARDEN-01: shared rate-limiter instance
 from app.modules.auth.models import User
-from app.modules.auth.schemas import UserResponse
+from app.modules.auth.schemas import RoleName, UserResponse
 from app.processing.export.service import safe_content_disposition
 from app.core.config import settings as app_settings
-from app.core.db.tenant_session import defer_async_with_tenant, tenant_job_context
+from app.core.permissions import MANAGE_TENANTS
+from app.core.db.tenant_session import (
+    current_tenant_var,
+    defer_async_with_tenant,
+    tenant_job_context,
+)
 from app.core.csv_safety import escape_csv_formula
 from app.core.dependencies import get_client_ip, get_db
+from app.core.url_redaction import redact_url_credentials
 from app.modules.admin.router_operations import router as operations_router
+from app.platform.binary_response import binary_response
 from app.platform.extensions import get_catalog_port
 from app.platform.jobs.defer_guard import (
     DeferFailed,
@@ -60,10 +72,18 @@ from app.platform.jobs.defer_guard import (
     make_ingest_job_failed_rollback,
 )
 from app.platform.jobs.models import (
+    IngestJob,
     ACTIVE_BACKFILL_INDEX_NAME,
     EMBEDDING_BACKFILL_METADATA_KEY,
+    FAN_OUT_INTERRUPTED_METADATA_KEY,
+    URL_DOWNLOAD_IN_FLIGHT_METADATA_KEY,
+    URL_IMPORT_METADATA_KEY,
+    public_job_metadata,
 )
-from app.platform.jobs.router import get_retry_capability
+from app.platform.jobs.router import (
+    _can_access_another_users_job,
+    get_retry_capability,
+)
 from app.standards.ogc.errors import (
     CONFLICT_RESPONSE,
     ERROR_RESPONSES_AUTH,
@@ -102,7 +122,7 @@ def _user_response(user: User) -> UserResponse:
 def _refuse_backfill_in_flight(
     *,
     active_job_id: str | None,
-    user_id: str,
+    user_id: str | None,
     force: bool,
     detected_by: str,
 ) -> NoReturn:
@@ -273,6 +293,7 @@ async def list_users(
 @router.get(
     "/users/export.csv",
     response_class=StreamingResponse,
+    responses={200: binary_response("The CSV file", "text/csv")},
     summary="Export registered users as CSV",
     tags=["Admin"],
 )
@@ -807,7 +828,14 @@ async def get_catalog_stats(
     dependencies=[Depends(require_permission("manage_users"))],
 )
 async def list_admin_jobs(
-    status: str | None = Query(None),
+    status: str | None = Query(
+        None,
+        description=(
+            "Job status to match. 'failed' leaves out replacements held for "
+            "review, which 'awaiting_review' lists while their run still needs "
+            "a decision."
+        ),
+    ),
     user_id: uuid.UUID | None = Query(None),
     search: str | None = Query(None),
     skip: int = Query(0, ge=0),
@@ -840,6 +868,8 @@ async def list_admin_jobs(
     retry_capabilities = await asyncio.gather(
         *(get_retry_capability(job) for job, _username in rows)
     )
+    held = [job.id for job, _ in rows if job.error_code == REVIEW_REQUIRED]
+    states = await review_states(db, held)
     jobs = [
         AdminJobResponse(
             id=job.id,
@@ -847,9 +877,13 @@ async def list_admin_jobs(
             source_filename=job.source_filename,
             dataset_id=job.dataset_id,
             error_message=job.error_message,
+            error_code=job.error_code,
+            review_state=states.get(job.id),
             can_retry=can_retry,
             retry_reason=retry_reason,
-            user_metadata=job.user_metadata,
+            source_url=_listed_source_url(job),
+            restart_source=None if can_retry else _restart_source(job),
+            user_metadata=public_job_metadata(job.user_metadata),
             created_by=job.created_by,
             username=username,
             started_at=job.started_at,
@@ -863,11 +897,42 @@ async def list_admin_jobs(
     return AdminJobListResponse(jobs=jobs, total=total)
 
 
+# Jobs that write to an existing dataset or are not imports at all; starting one
+# again from the import page would create a second dataset.
+_NOT_NEW_DATASET_MARKERS = (
+    "reupload",
+    "refresh",
+    "manifest_key",
+    "analysis",
+    EMBEDDING_BACKFILL_METADATA_KEY,
+    FAN_OUT_INTERRUPTED_METADATA_KEY,
+)
+
+
+def _restart_source(job: IngestJob) -> Literal["url", "service"] | None:
+    metadata = job.user_metadata or {}
+    if job.status != "failed" or any(metadata.get(m) for m in _NOT_NEW_DATASET_MARKERS):
+        return None
+    if job.source_url and not job.file_path:
+        return "service"
+    if metadata.get(URL_IMPORT_METADATA_KEY) or metadata.get(
+        URL_DOWNLOAD_IN_FLIGHT_METADATA_KEY
+    ):
+        return "url"
+    return None
+
+
+def _listed_source_url(job: IngestJob) -> str | None:
+    url = job.source_url or (job.user_metadata or {}).get(URL_IMPORT_METADATA_KEY)
+    return redact_url_credentials(url) if isinstance(url, str) and url else None
+
+
 def _ai_status(
     enabled: bool,
     provider: str,
     semantic_search_enabled: bool = False,
     has_embeddings: bool = False,
+    model: str | None = None,
 ) -> AIStatusResponse:
     """Build AIStatusResponse from the SELECTED provider + DB toggle.
 
@@ -879,17 +944,13 @@ def _ai_status(
         "anthropic": app_settings.anthropic_api_key,
         "openai_compatible": app_settings.openai_api_key,
     }
-    models = {
-        "anthropic": app_settings.llm_model,
-        "openai_compatible": app_settings.openai_model,
-    }
     display_names = {"anthropic": "anthropic", "openai_compatible": "openai"}
 
     selected_key = keys.get(provider)
     configured = bool(selected_key)
     return AIStatusResponse(
         provider=display_names.get(provider) if configured else None,
-        model=models.get(provider) if configured else None,
+        model=model if configured else None,
         enabled=enabled,
         configured=configured,
         semantic_search_enabled=semantic_search_enabled,
@@ -931,6 +992,7 @@ async def get_ai_status(
     """Return single-deployment AI status; no provider-routing policy controls (admin only)."""
     from app.core.persistent_config import (
         AI_ENABLED,
+        LLM_MODEL,
         LLM_PROVIDER,
         SEMANTIC_SEARCH_ENABLED,
     )
@@ -942,7 +1004,11 @@ async def get_ai_status(
     semantic = await SEMANTIC_SEARCH_ENABLED.get(db)
     has_embeds = await has_embeddings(db)
     result = _ai_status(
-        enabled, provider, semantic_search_enabled=semantic, has_embeddings=has_embeds
+        enabled,
+        provider,
+        semantic_search_enabled=semantic,
+        has_embeddings=has_embeds,
+        model=await LLM_MODEL.for_provider(db, provider),
     )
     if probe:
         from app.processing.ai.probe import run_ai_probe
@@ -975,6 +1041,7 @@ async def update_ai_status(
     from app.processing.embeddings.helpers import has_embeddings
     from app.core.persistent_config import (
         AI_ENABLED,
+        LLM_MODEL,
         LLM_PROVIDER,
         SEMANTIC_SEARCH_ENABLED,
     )
@@ -993,6 +1060,7 @@ async def update_ai_status(
         provider,
         semantic_search_enabled=semantic,
         has_embeddings=has_embeds,
+        model=await LLM_MODEL.for_provider(db, provider),
     )
 
 
@@ -1047,6 +1115,26 @@ async def _settle_undispatched_backfill(
         )
 
 
+async def _require_backfill_permission(
+    request: Request,
+    all_tenants: bool = False,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """Require manage_users, or manage_tenants for a hosted all-tenant backfill.
+
+    A hosted fleet operator can change the shared embedding settings with
+    manage_tenants alone, so regenerating every tenant must not also demand
+    the per-tenant manage_users.
+    """
+    from app.core.tenancy import is_multi_tenant
+
+    capability = MANAGE_TENANTS if all_tenants and is_multi_tenant() else "manage_users"
+    return await require_permission(capability)(
+        request=request, current_user=current_user, db=db
+    )
+
+
 # ROUTE-01 (Phase 1092): dual-shape decorator — see /users above.
 @router.post(
     "/backfill-embeddings",
@@ -1063,16 +1151,86 @@ async def trigger_backfill(
     request: Request,
     db: AsyncSession = Depends(get_db),
     force: bool = False,
-    current_user: User = Depends(require_permission("manage_users")),
+    all_tenants: bool = False,
+    current_user: User = Depends(_require_backfill_permission),
 ) -> BackfillResponse:
     """Queue semantic-search embedding generation for records (admin only).
 
-    Pass ?force=true to delete all existing embeddings and regenerate from
-    scratch (required after changing the embedding model or dimensions).
+    Pass ?force=true to regenerate every record and replace its stored vectors.
+    Without it, the run embeds only records that lack a current-model embedding.
+
+    The run covers the calling tenant's records. In a multi-tenant deployment
+    the embedding model and width are shared by every tenant, so a change
+    leaves each tenant to regenerate. Pass ?all_tenants=true to also queue a
+    run for every other registered tenant; there it needs
+    manage_tenants instead of manage_users, and ``other_tenants`` reports
+    each run. When the calling tenant already has a run in flight, the status
+    is ``already_running``, ``job_id`` is that run (null when the caller may
+    not read it) and the other tenants are still queued. This request did not queue that run and it may predate the
+    change, so run the backfill again once it ends. A single-tenant
+    deployment ignores the flag.
 
     The run happens on the job queue because a full regeneration can exceed
     request timeouts. This endpoint returns the job id; poll
     ``GET /jobs/{job_id}`` for the outcome.
+    """
+    from app.core.tenancy import is_multi_tenant
+
+    every_tenant = all_tenants and is_multi_tenant()
+    ip_address = get_client_ip(request)
+    # One operation id across every tenant's run ties the system runs queued
+    # elsewhere to this request's audited actor.
+    operation_id = str(uuid.uuid4())
+    try:
+        job = await _queue_backfill_run(
+            db,
+            force=force,
+            requested_by=current_user.id,
+            ip_address=ip_address,
+            operation_id=operation_id,
+        )
+    except HTTPException as exc:
+        if not every_tenant or exc.status_code != status.HTTP_409_CONFLICT:
+            raise
+        from app.modules.admin.backfill_jobs import find_active_embedding_backfill
+
+        # The run may have ended since it refused this one; the fleet still
+        # goes ahead and this tenant is left for a rerun either way.
+        active = await find_active_embedding_backfill(db)
+        readable = active is not None and (
+            active.created_by == current_user.id
+            or await _can_access_another_users_job(
+                request, db, current_user, active, log_denial=False
+            )
+        )
+        job_id = active.id if active is not None and readable else None
+        job_status = "already_running"
+    else:
+        job_id, job_status = job.id, "pending"
+    other_tenants = (
+        await _queue_backfill_for_other_tenants(force=force, operation_id=operation_id)
+        if every_tenant
+        else []
+    )
+    return BackfillResponse(
+        job_id=job_id, status=job_status, other_tenants=other_tenants
+    )
+
+
+async def _queue_backfill_run(
+    db: AsyncSession,
+    *,
+    force: bool,
+    requested_by: uuid.UUID | None,
+    ip_address: str | None,
+    operation_id: str,
+) -> IngestJob:
+    """Queue one backfill run for the tenant ``db`` is scoped to.
+
+    ``requested_by`` is None for a run queued on another tenant's behalf: the
+    database refuses a job or audit row whose user belongs to a different
+    tenant. Raises 409 when that tenant already has a run in flight and 503
+    when the queue refuses the job.
     """
     from app.modules.admin.backfill_jobs import (
         UNRESOLVED_OUTCOME,
@@ -1080,9 +1238,7 @@ async def trigger_backfill(
         run_embedding_backfill,
     )
 
-    operation_id = str(uuid.uuid4())
-    current_user_id = current_user.id
-    ip_address = get_client_ip(request)
+    requester = str(requested_by) if requested_by is not None else None
 
     # fix(#1542): retrying after a 504 could start a second regenerate (a
     # second DELETE on the force path); #1519's pre-flight guards don't see
@@ -1093,13 +1249,13 @@ async def trigger_backfill(
     if active is not None:
         _refuse_backfill_in_flight(
             active_job_id=str(active.id),
-            user_id=str(current_user_id),
+            user_id=requester,
             force=force,
             detected_by="preflight_query",
         )
 
     audit_context = {
-        "user_id": str(current_user_id),
+        "user_id": requester,
         "ip_address": ip_address,
         "operation_id": operation_id,
         "force": force,
@@ -1111,7 +1267,7 @@ async def trigger_backfill(
     pending_job_id: uuid.UUID | None = None
     try:
         job = await get_catalog_port().create_ingest_job(
-            db, "embedding-backfill", "", current_user_id
+            db, "embedding-backfill", "", requested_by
         )
         pending_job_id = job.id
         job.user_metadata = {
@@ -1126,7 +1282,7 @@ async def trigger_backfill(
         await audit_emit(
             db,
             AuditEvent(
-                user_id=current_user_id,
+                user_id=requested_by,
                 action="embedding.backfill",
                 resource_type="record_embedding",
                 details={
@@ -1155,7 +1311,7 @@ async def trigger_backfill(
         winner = await find_active_embedding_backfill(db)
         _refuse_backfill_in_flight(
             active_job_id=str(winner.id) if winner is not None else None,
-            user_id=str(current_user_id),
+            user_id=requester,
             force=force,
             detected_by="unique_index",
         )
@@ -1175,7 +1331,7 @@ async def trigger_backfill(
             job_id=str(job.id),
             attempt_id=str(job.attempt_id),
             force=force,
-            user_id=str(current_user_id),
+            user_id=requester,
             ip_address=ip_address,
             operation_id=operation_id,
         )
@@ -1185,58 +1341,48 @@ async def trigger_backfill(
         await defer_with_orphan_guard(
             _defer,
             rollback=make_ingest_job_failed_rollback(
-                job, message_prefix="Failed to queue embedding backfill"
+                job,
+                message_prefix="Failed to queue embedding backfill",
+                ip_address=ip_address,
             ),
             db=db,
             job=job,
         )
     except DeferFailed as dispatch_exc:
-        # fix(#1550): the orphan guard already failed+committed the job before
-        # raising 503, so nothing else closes the audit trail — this must write
-        # the terminal state too. Condition on rolled_back: if the rollback
-        # didn't land, the row is still `pending` (blocking later backfills) and
-        # audit_emit_durable's own session could still succeed later, so
-        # recording "failed" here would misrepresent it.
-        if dispatch_exc.rolled_back:
-            details: dict[str, Any] = {
-                "force": force,
-                "operation_id": operation_id,
-                "job_id": job_id,
-                "outcome": "failed",
-                "error_code": "dispatch_failed",
-            }
-        else:
-            details = {
-                "force": force,
-                "operation_id": operation_id,
-                "job_id": job_id,
-                "outcome": UNRESOLVED_OUTCOME,
-                "error_code": "dispatch_rollback_failed",
-                "intended_outcome": "failed",
-            }
+        # A landed rollback closed the trail with the row, and a missed one
+        # leaves both to the worker. Only an unlanded rollback leaves the row
+        # pending, so the trail says the outcome is unresolved.
+        if not dispatch_exc.rolled_back:
             logger.error(
                 "embedding_backfill_dispatch_rollback_failed",
-                user_id=str(current_user_id),
+                user_id=requester,
                 operation_id=operation_id,
                 job_id=job_id,
             )
-        try:
-            await audit_emit_durable(
-                AuditEvent(
-                    user_id=current_user_id,
-                    action="embedding.backfill",
-                    resource_type="record_embedding",
-                    details=details,
-                    ip_address=ip_address,
-                ),
-            )
-        except Exception:  # broad: the audit write must not mask the 503
-            logger.exception(
-                "embedding_backfill_dispatch_audit_failed",
-                user_id=str(current_user_id),
-                operation_id=operation_id,
-                job_id=job_id,
-            )
+            try:
+                await audit_emit_durable(
+                    AuditEvent(
+                        user_id=requested_by,
+                        action="embedding.backfill",
+                        resource_type="record_embedding",
+                        details={
+                            "force": force,
+                            "operation_id": operation_id,
+                            "job_id": job_id,
+                            "outcome": UNRESOLVED_OUTCOME,
+                            "error_code": "dispatch_rollback_failed",
+                            "intended_outcome": "failed",
+                        },
+                        ip_address=ip_address,
+                    ),
+                )
+            except Exception:  # broad: the audit write must not mask the 503
+                logger.exception(
+                    "embedding_backfill_dispatch_audit_failed",
+                    user_id=requester,
+                    operation_id=operation_id,
+                    job_id=job_id,
+                )
         raise
     except asyncio.CancelledError:
         # fix(#1550): the orphan guard catches `Exception`, so cancellation here
@@ -1246,4 +1392,70 @@ async def trigger_backfill(
             db, job.id, {**audit_context, "job_id": job_id}
         )
         raise
-    return BackfillResponse(job_id=job.id, status="pending")
+    return job
+
+
+async def _queue_backfill_for_other_tenants(
+    *, force: bool, operation_id: str
+) -> list[BackfillTenantRun]:
+    """Queue a backfill in every registered tenant except the caller's.
+
+    Tenants come from the registry rather than the request, and each run is
+    queued in its own session under that tenant's context, as a system run with
+    no user or client address, which belong to the caller's tenant. A tenant with nothing to embed still gets a run, which finishes at
+    once; checking for records first would scan the shared table per tenant. A
+    refusal or failure in one tenant is reported and the loop moves on.
+    """
+    from app.core.db import async_session
+
+    caller = current_tenant_var.get()
+    async with async_session() as registry_session:
+        tenant_ids = [
+            str(tenant_id)
+            for tenant_id in (
+                await registry_session.execute(
+                    text("SELECT id FROM catalog.tenants ORDER BY id")
+                )
+            ).scalars()
+        ]
+
+    runs: list[BackfillTenantRun] = []
+    for tenant_id in tenant_ids:
+        if caller is not None and tenant_id == str(uuid.UUID(caller)):
+            continue
+        try:
+            with tenant_job_context(tenant_id):
+                async with async_session() as tenant_db:
+                    job = await _queue_backfill_run(
+                        tenant_db,
+                        force=force,
+                        requested_by=None,
+                        ip_address=None,
+                        operation_id=operation_id,
+                    )
+        except HTTPException as exc:
+            refused = exc.status_code == status.HTTP_409_CONFLICT
+            runs.append(
+                BackfillTenantRun(
+                    tenant_id=uuid.UUID(tenant_id),
+                    job_id=None,
+                    status="already_running" if refused else "not_queued",
+                )
+            )
+            continue
+        except Exception:  # broad: one tenant's failure must not stop the rest
+            logger.exception(
+                "embedding_backfill_tenant_queue_failed", tenant_id=tenant_id
+            )
+            runs.append(
+                BackfillTenantRun(
+                    tenant_id=uuid.UUID(tenant_id), job_id=None, status="not_queued"
+                )
+            )
+            continue
+        runs.append(
+            BackfillTenantRun(
+                tenant_id=uuid.UUID(tenant_id), job_id=job.id, status="pending"
+            )
+        )
+    return runs

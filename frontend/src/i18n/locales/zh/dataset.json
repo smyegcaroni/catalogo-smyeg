@@ -4,6 +4,8 @@
   "rowCount_one": "{{count}} 行",
   "rowCount_other": "{{count}} 行",
   "page": {
+    "showMapPreview": "显示地图预览",
+    "hideMapPreview": "隐藏地图预览",
     "loading": "正在加载数据集...",
     "errorTitle": "未找到数据集",
     "errorMessage": "无法加载请求的数据集。",
@@ -63,13 +65,17 @@
     "notOwner": "只有数据集所有者或管理员才能编辑此记录。"
   },
   "connect": {
+    "openInstructions": "打开连接说明",
+    "instructionsTools": "QGIS、Python 和 curl",
     "copyCogUrl": "复制 COG URL",
     "copyXyzTileUrl": "复制 XYZ 瓦片 URL",
     "copyS3Uri": "复制 S3 URI",
     "copyCsvExportUrl": "复制 CSV 导出 URL",
     "copyOgcFeaturesUrl": "复制 OGC 要素 URL",
     "copyVectorTilesUrl": "复制矢量瓦片 URL",
-    "copied": "已复制：{{preview}}"
+    "copied": "已复制：{{preview}}",
+    "copyTilesetUrl": "复制瓦片集 URL",
+    "instructionsTileset": "CesiumJS"
   },
   "addToMap": {
     "button": "添加到地图",
@@ -229,7 +235,8 @@
     "actions": {
       "metadataEdit": "元数据已更新",
       "datasetDelete": "数据集已删除",
-      "datasetCreate": "数据集已创建"
+      "datasetCreate": "数据集已创建",
+      "datasetTransferOwner": "所有者已变更"
     }
   },
   "versionHistory": {
@@ -239,8 +246,29 @@
     "version": "版本 {{number}}",
     "current": "当前",
     "unknownFile": "未知文件",
+    "detailsUnrecorded": "未记录此版本的详细信息。",
     "features": "{{count}} 个要素",
-    "srid": "SRID {{value}}"
+    "srid": "SRID {{value}}",
+    "restore": "恢复",
+    "restoreBusyHint": "已有刷新、替换或恢复正在进行。请查看刷新历史。",
+    "restoreSelectionHint": "请先取消选择地图上选中的要素，再进行恢复。"
+  },
+  "restoreDialog": {
+    "title": "恢复版本 {{number}}？",
+    "description": "版本 {{number}} 将重新成为当前数据。被替换的数据会保留，因此在下次替换之前可以撤销此次恢复。",
+    "consequenceEdits": "自版本 {{number}} 以来对要素所做的编辑将被丢弃。",
+    "consequenceMosaics": "使用此数据集的镶嵌数据集在重建之前仍会读取当前成员。",
+    "confirmPrompt": "请输入数据集名称以确认：",
+    "restoring": "正在恢复...",
+    "restore": "恢复版本",
+    "failed": "恢复版本失败",
+    "queued": "版本 {{number}} 的恢复已排队，可在刷新历史中查看。",
+    "refusal": {
+      "dataset_busy": "此数据集正在进行其他刷新、替换或恢复。请等待其完成后再试。",
+      "previous_version_changed": "对话框打开期间，保留的上一版本已发生变化。请关闭对话框并重新查看历史。",
+      "no_previous_version": "此数据集已没有可恢复的上一版本。",
+      "restore_not_applicable": "此数据集没有要素表，因此无可恢复内容。"
+    }
   },
   "deleteDialog": {
     "title": "删除数据集",
@@ -266,6 +294,7 @@
       "committing": "正在提交重新上传...",
       "tracking": "数据集正在后台更新。",
       "complete": "数据集已成功更新。",
+      "held": "此替换已暂缓，等待审核。",
       "error": "重新上传过程中出现问题。"
     },
     "sourceSelector": {
@@ -283,6 +312,7 @@
       "connecting": "正在连接服务...",
       "layerStep": "选择一个图层",
       "emptyState": "未找到此服务的图层。",
+      "unsupportedLayerType": "{{type}} 不包含要素，无法用于重新上传。",
       "previewLayer": "预览图层",
       "previewing": "正在准备重新上传预览...",
       "layerLabel": "图层：",
@@ -314,6 +344,7 @@
     "uploadingMessage": "正在上传并分析文件...",
     "file": "文件：",
     "schemaChangeAdvisory": "字段结构与先前版本不同：新增 {{added}} 列，移除 {{removed}} 列。",
+    "reviewReasonsLabel": "需要审核的更改",
     "warningSchemaChanges": "警告：此次重新上传包含字段结构变更，可能影响现有查询。",
     "confirmReupload": "确认重新上传",
     "committingMessage": "正在提交重新上传...",
@@ -333,6 +364,10 @@
   },
   "quality": {
     "title": "质量评分",
+    "assessedAt": "质量评估时间：{{date}}（{{age}}）",
+    "assessmentVsSource": "此日期仅表示质量评估时间。请在“来源”中查看数据更新时间和来源时效。",
+    "scoreExplanation": "总分由可用的质量维度组成。百分比表示各维度的权重。",
+    "metadataExplanation": "质量元数据完整度统计已填写的可选记录字段（共 10 项）。“元数据”中的验证进度另行计算。",
     "metadataCompleteness": "元数据完整性",
     "geometryValidity": "几何有效性",
     "attributeCompleteness": "属性完整性",
@@ -342,28 +377,30 @@
       "absolute": "上次检查：{{date}}",
       "relative": "上次检查：{{relative}}",
       "cadence": "预期的刷新频率为{{cadence}}。",
-      "cadenceDaily": "预期每日刷新。",
-      "cadenceWeekly": "预期每周刷新。",
-      "cadenceMonthly": "预期每月刷新。",
-      "cadenceQuarterly": "预期每季度刷新。",
-      "cadenceAnnually": "预期每年刷新。",
-      "cadenceUnknown": "刷新频率未知；请确认刷新计划。",
+      "cadenceDaily": "评估时效按所填的每日更新频率判断。",
+      "cadenceWeekly": "评估时效按所填的每周更新频率判断。",
+      "cadenceMonthly": "评估时效按所填的每月更新频率判断。",
+      "cadenceQuarterly": "评估时效按所填的每季度更新频率判断。",
+      "cadenceAnnually": "评估时效按所填的每年更新频率判断。",
+      "cadenceUnknown": "未设置定期更新频率；评估时效采用 45 天参考值。",
       "state": {
-        "fresh": "时效正常",
-        "stale": "需要更新",
-        "missing": "缺少时效信息"
+        "fresh": "近期已评估",
+        "stale": "需要重新评估",
+        "missing": "无评估日期"
       },
       "remediation": {
-        "fresh": "无需立即刷新。",
-        "stale": "请重新计算质量指标，并验证最近的数据源更新是否已导入。",
-        "missing": "请运行质量校验以生成时效时间戳。"
+        "fresh": "无需更新评估。",
+        "stale": "请重新计算质量评估，以检查当前数据集。",
+        "missing": "请运行质量验证以生成评估日期。"
       },
       "notAvailable": "不可用",
-      "unknownAge": "时效未知"
+      "unknownAge": "时效未知",
+      "readOnlyGuidance": "请联系数据集所有者或上方列出的联系人，更新质量评估。"
     }
   },
   "serviceUrls": {
-    "authHelpSimple": "这些端点接受 X-Api-Key 或 Authorization: Bearer 请求头。",
+    "authHelpSimple": "下载、OGC Features 和矢量瓦片端点接受 X-Api-Key 或 Authorization: Bearer 请求头。",
+    "vectorTilesKeyHint": "非公开数据集的矢量瓦片需要 API 密钥。在 QGIS 中，用去掉 api_key 参数的瓦片 URL 添加矢量瓦片连接，然后在“身份验证”下选择 API Header 方法，请求头填写 X-Api-Key。无法发送请求头的客户端可以保留 ?api_key=。请使用只读密钥。",
     "manageApiKeys": "管理 API 密钥"
   },
   "schema": {
@@ -403,6 +440,10 @@
     "ariaLabel": "数据集地图",
     "featureSaved": "要素已保存",
     "featureSaveFailed": "保存要素失败",
+    "featureSavedThenChanged": "该要素已保存，之后有其他人修改了它，因此你的最新修改未被应用。再次保存将用你的修改替换对方的修改，或选择放弃以保留对方的版本。",
+    "featureSavedThenRemoved": "之前保存的要素已被移除。再次保存将重新创建该要素。",
+    "featureSavedThenReplaced": "你之前保存后，该数据集的数据已被替换，因此你的修改未被应用。再次保存将重新创建该要素。",
+    "featureDatasetReplaced": "你开始编辑后，该数据集的数据已被替换，因此你的修改未保存。",
     "featureUpdated": "要素已更新",
     "featureUpdateFailed": "更新要素失败",
     "featureDeleted": "要素已删除",
@@ -412,9 +453,13 @@
     "attributesUpdated": "属性已更新",
     "attributesUpdateFailed": "更新属性失败",
     "unsavedDiscarded": "未保存的更改已放弃",
+    "sketchStillSaving": "上一个要素仍在保存。请在保存完成后重试。",
     "discardChangesTitle": "放弃未保存的地图编辑？",
     "discardChangesDescription": "您的几何更改尚未保存。您可以继续编辑，也可以放弃更改。",
+    "discardChangesAccessLostDescription": "您已无法编辑此数据集，放弃后将从地图上移除这些未保存的几何更改。",
     "discardChangesAction": "放弃更改",
+    "editAccessLostNotice": "您已无法编辑此数据集，因此无法保存这些地图更改。",
+    "editLostOnReloadNotice": "地图已重新加载，此要素未保存的更改已丢失。",
     "deleteFeatureTitle": "删除要素",
     "deleteFeatureDescription": "确定删除此要素吗？此操作无法撤销。",
     "multiPartNotEditable": "此要素包含多个部分，无法在地图上编辑。",
@@ -445,7 +490,8 @@
       "publisher": "发布者",
       "distributor": "分发者",
       "custodian": "保管者"
-    }
+    },
+    "remove": "移除联系人 {{name}}"
   },
   "keywords": {
     "title": "关键词",
@@ -464,7 +510,8 @@
     "inheritedConfirmTitle": "共享继承的关键词？",
     "inheritedConfirmBody": "这些关键词复制自更广泛受众无法打开的源数据集。可以继续共享，也可以取消并先将其移除。",
     "inheritedConfirmContinue": "更改可见性",
-    "inheritedGeneric": "此数据集带有从其源数据集继承的关键词。共享前请查看完整的关键词列表。"
+    "inheritedGeneric": "此数据集带有从其源数据集继承的关键词。共享前请查看完整的关键词列表。",
+    "remove": "移除关键词 {{keyword}}"
   },
   "validation": {
     "title": "校验状态",
@@ -478,6 +525,7 @@
     "helperWarnings": "发现 {{warningCount}} 个警告。请在发布前查看可能的原因。",
     "likelyCompact": "可能原因：",
     "troubleshootAction": "疑难解答",
+    "readOnlyGuidance": "请联系数据集所有者或上方列出的联系人，处理这些验证问题。",
     "health": {
       "title": "数据集健康度",
       "required": "必填项 {{count}}",
@@ -524,6 +572,24 @@
       "invalid": "{{field}}无效",
       "conflicting": "{{field}}存在冲突",
       "needsReview": "{{field}}需要审查"
+    },
+    "fields": {
+      "title": "标题",
+      "summary": "摘要",
+      "license": "许可证",
+      "spatialExtent": "空间范围",
+      "lineageSummary": "数据来源摘要",
+      "srid": "坐标参考系统",
+      "contacts": "联系人",
+      "keywords": "关键词",
+      "geometry": "几何",
+      "attributeDescriptions": "属性说明",
+      "sourceUrl": "来源网址",
+      "sourceOrganization": "来源机构",
+      "qualityStatement": "质量说明",
+      "updateFrequency": "更新频率",
+      "temporalExtent": "时间范围",
+      "attribution": "署名"
     }
   },
   "attributeMetadata": {
@@ -540,12 +606,15 @@
     "editingDisabled": "此部署已禁用属性编辑。"
   },
   "distributions": {
-    "title": "访问点",
+    "title": "下载与连接",
     "download": "下载",
     "api": "API 端点",
     "tiles": "瓦片服务",
     "other": "其他访问方式",
-    "noDistributions": "无可用分发。",
+    "noDistributions": "此处未列出其他下载项或服务。",
+    "connectWithClient": "使用 QGIS、Python 或 curl 连接",
+    "otherFormats": "下载其他格式",
+    "accessPermissions": "谁可以访问此数据集",
     "auto": "自动",
     "primary": "主要",
     "copyUrl": "复制 URL",
@@ -582,7 +651,9 @@
     "noRecords": "无相关记录",
     "showingCount": "正在显示 {{shown}} / {{total}} 条记录",
     "error": "加载关系失败",
-    "loadError": "加载相关记录失败"
+    "loadError": "加载相关记录失败",
+    "broken": "已损坏",
+    "brokenMessage": "连接列在其数据集中已不存在。请删除或重新创建此关系。"
   },
   "iso": {
     "lineage": "数据血缘",
@@ -674,6 +745,9 @@
     "nodata": "无数据值",
     "ogcApiFeatures": "OGC API Features",
     "percentComplete": "已完成 {{percent}}%",
+    "validationProgress": "通过的验证检查：{{percent}}%",
+    "validationProgressHelp": "估算方式：以 12 项基础检查减去报告的错误和警告。质量元数据分数另行统计可选字段。",
+    "askMaintainer": "请联系数据集所有者或下方列出的联系人，填写{{field}}",
     "rasterProperties": "栅格属性",
     "recommendedCount_one": "{{count}} 个建议项",
     "recommendedCount_other": "{{count}} 个建议项",
@@ -731,7 +805,7 @@
       "table": "已注册的表",
       "serviceType": "服务类型",
       "layer": "图层标识符",
-      "endpoint": "安全的数据源地址",
+      "endpoint": "数据源 URL（已移除凭据）",
       "collection": "STAC 集合",
       "asset": "STAC 资产",
       "item": "STAC 条目"
@@ -755,6 +829,7 @@
         "unknown": "未比较"
       }
     },
+    "healthUnknownHint": "刷新数据源时检查。",
     "healthDetail": {
       "not_found": "未找到源资源。",
       "item_withdrawn": "该 STAC 条目已被撤回。",
@@ -785,6 +860,10 @@
       "dialogDescription": "从最初导入的位置重新拉取此数据集的数据。在新数据就绪之前，数据集会继续提供当前数据。",
       "reviewDialogTitle": "审核并重试刷新",
       "reviewDialogDescription": "再次获取源数据，仅在其与已审核的运行一致时发布。",
+      "uploadReviewDialogTitle": "发布已审核的替换",
+      "uploadReviewDialogDescription": "从此运行保留的上传文件发布它暂缓发布的文件。仅当其更改仍与此运行列出的更改一致时才会发布。",
+      "uploadConfirm": "发布替换",
+      "uploadToastAccepted": "替换已开始（运行 {{runId}}）。",
       "tokenLabel": "访问令牌（可选）",
       "tokenPlaceholder": "仅受保护的数据源需要",
       "tokenHint": "仅用于此次刷新；不会随数据集存储。",
@@ -844,6 +923,7 @@
         "empty": "尚无刷新运行记录。",
         "featureDelta": "{{before}} → {{after}} 个要素",
         "triggeredBy": "由 {{username}} 启动",
+        "scheduledFor": "计划于 {{time}} 执行",
         "mechanismLabel": "方式：{{mechanism}}",
         "mechanismTooltip": "此运行的执行方式，而非数据集的来源",
         "status": {
@@ -852,7 +932,8 @@
           "succeeded": "已成功",
           "failed": "已失败",
           "cancelled": "已取消",
-          "blocked": "需要审核"
+          "blocked": "需要审核",
+          "accepted": "已接受"
         },
         "sourceCountUnavailable": "数据源计数不可用。",
         "identityUnavailable": "未比较记录标识。",
@@ -863,12 +944,145 @@
         "permalink": "链接",
         "reason": {
           "source_count_unavailable": "GeoLens 无法将获取的行数与数据源进行比较，因此发布前需要审核。",
-          "empty_result": "此次刷新会用空结果替换非空数据集。",
-          "destructive_schema_change": "此次刷新会删除列或更改列类型。"
+          "empty_result": "新数据会用空数据集替换非空数据集。",
+          "destructive_schema_change": "新数据会删除列或更改列类型。",
+          "geometry_type_changed": "新数据会更改几何类型。",
+          "srid_changed": "新数据会更改坐标系。",
+          "coordinate_dimension_reduced": "新数据会丢弃高程等坐标维度。",
+          "arcgis_id_coverage_unavailable": "GeoLens 无法验证 ArcGIS 对象 ID 的覆盖情况。",
+          "arcgis_source_membership_changed": "此次刷新运行期间，ArcGIS 数据源发生了变化。",
+          "live_data_changed": "此替换运行期间有要素被编辑。发布它将丢弃这些编辑。"
         },
         "reviewAndRetry": "审核并重试",
+        "acceptedReasonsLabel": "已接受的审核原因：",
         "loadMore": "加载更早的运行"
       }
+    },
+    "sync": {
+      "title": "定时同步",
+      "description": "按 UTC 计划保持此 ArcGIS 数据源为最新状态。",
+      "loading": "正在加载定时同步",
+      "unavailable": "Enterprise 定时功能启用后可使用定时同步。",
+      "unsupportedSource": "此数据源无法定时同步。支持带整数图层标识符的 ArcGIS FeatureServer 图层。",
+      "reader": "你可以查看此数据集的数据源。所有者或管理员可以配置定时同步。",
+      "notConfigured": "尚未配置计划。请先创建草稿、运行验证，然后明确启用。",
+      "setup": "设置计划",
+      "setupTitle": "设置定时同步",
+      "editTitle": "编辑定时同步",
+      "dialogDescription": "数据源绑定保持不变。时间使用 UTC。",
+      "replacementWarningTitle": "定时刷新会替换本地数据",
+      "replacementWarning": "每次定时刷新都会替换数据集的本地副本。本地更改可能会被覆盖。",
+      "createDraft": "创建草稿",
+      "save": "保存计划",
+      "edit": "编辑",
+      "runNow": "运行验证",
+      "pause": "暂停",
+      "enable": "启用计划",
+      "detach": "解除关联",
+      "detachTitle": "解除定时同步关联？",
+      "detachDescription": "将取消未来未认领的定时工作。已经认领的运行会继续并保留在历史记录中。",
+      "enableTitle": "启用定时同步？",
+      "enableDescription": "每次定时刷新都会替换数据集的本地副本。本地更改可能会被覆盖。仅在确认符合预期时启用。",
+      "runAccepted": "验证运行已加入队列。",
+      "paused": "定时同步已暂停。",
+      "enabled": "定时同步已启用。",
+      "detached": "定时同步已解除关联。",
+      "cadenceLabel": "计划",
+      "nextDue": "下次时间",
+      "credential": "凭据",
+      "publicSource": "公开数据源",
+      "lastRun": "上次同步运行",
+      "noRuns": "尚无定时运行",
+      "verificationRun": "验证运行",
+      "occurrenceState": {
+        "planned": "已排队",
+        "admitted": "已准入",
+        "delivered": "已交付",
+        "claimed": "运行中",
+        "completed": "已完成",
+        "failed": "失败",
+        "cancelled": "已取消",
+        "expired": "已过期"
+      },
+      "status": {
+        "draft": "草稿",
+        "enabled": "已启用",
+        "paused": "已暂停"
+      },
+      "cadence": {
+        "hourly": "每小时",
+        "daily": "每天",
+        "weekly": "每周",
+        "hourlyAt": "每小时 {{time}}",
+        "dailyAt": "每天 {{time}}",
+        "weeklyAt": "{{weekday}} {{time}}"
+      },
+      "weekday": {
+        "0": "星期一",
+        "1": "星期二",
+        "2": "星期三",
+        "3": "星期四",
+        "4": "星期五",
+        "5": "星期六",
+        "6": "星期日"
+      },
+      "form": {
+        "cadence": "频率",
+        "weekday": "星期",
+        "hour": "小时",
+        "minute": "分钟",
+        "utc": "所有计划时间均使用 UTC。",
+        "credential": "凭据",
+        "publicSource": "无凭据（公开数据源）",
+        "newCredential": "保存新凭据",
+        "credentialName": "凭据名称",
+        "token": "ArcGIS 令牌",
+        "tokenHint": "令牌只会发送一次，绝不会在此浏览器中显示或存储。",
+        "replaceToken": "替换已存令牌",
+        "cancelReplace": "保留当前令牌",
+        "credentialRequired": "请输入凭据名称和令牌。",
+        "tokenRequired": "请输入令牌。",
+        "invalidTime": "请输入有效的 UTC 时间。"
+      },
+      "eligibility": {
+        "qualifying_run_required": "请在启用此计划前成功运行验证。",
+        "verification_policy_changed": "验证策略已更改。请在启用此计划前重新运行验证。",
+        "source_or_credential_changed": "数据源或凭据已更改。请在启用此计划前重新运行验证。"
+      },
+      "pauseReason": {
+        "qualification_required": "需要合格的验证运行。",
+        "review_required": "请在启用此计划前检查最新刷新。",
+        "transient_failures": "计划在多次临时失败后已暂停。",
+        "credential_invalid": "已存凭据不再有效。",
+        "authorization_changed": "数据源授权已更改。",
+        "source_changed": "数据源绑定已更改，需要验证。",
+        "source_or_credential_changed": "数据源或凭据已更改，需要验证。",
+        "database_restored": "计划在数据库恢复后已暂停。",
+        "restored": "计划已恢复为暂停状态。",
+        "manual": "计划已手动暂停。"
+      },
+      "errors": {
+        "loadFailed": "无法加载定时同步。",
+        "credentialsUnavailable": "无法加载已保存的凭据。您仍可以为公开数据源安排定时同步，或保存新凭据。",
+        "saveFailed": "无法保存定时同步。",
+        "revisionConflict": "服务器上的此计划已更改。请查看最新详情后重试。",
+        "notEligible": "此数据源不符合验证运行条件。",
+        "runFailed": "无法启动验证运行。",
+        "qualificationRequired": "请在启用此计划前成功运行验证。",
+        "statusFailed": "无法更改计划状态。",
+        "detachFailed": "无法解除定时同步关联。",
+        "occurrenceError": {
+          "admissionMetadataError": "由于数据源元数据已更改，计划无法准入。请检查数据源后重试。",
+          "admissionInvalid": "计划无法准入。请检查数据源和计划设置后重试。",
+          "admissionFailed": "计划无法准入。请重试或检查数据源设置。",
+          "sourceChanged": "数据源已更改。请在启用计划前检查数据源并重新运行验证。",
+          "localEditsChanged": "本地编辑已更改数据集。请在下次运行前检查并解决本地更改。",
+          "credentialExpired": "已保存的凭据已过期。请更新凭据并重新运行验证。",
+          "failed": "此定时运行未完成。请检查计划后重试。",
+          "expired": "此定时运行在开始前已过期。将在下一个计划时间重试。"
+        }
+      },
+      "verificationHelp": "验证会检查是否已获取每个数据源 ID，以及 ID 集合是否保持不变。数据源属性仍可能在刷新期间发生变化。"
     },
     "vrt": {
       "title": "VRT 成员",
@@ -1025,5 +1239,41 @@
     "description": "您有未保存的更改。确定要离开吗？您的更改将会丢失。",
     "stay": "留下",
     "leave": "离开"
+  },
+  "pointcloud": {
+    "title": "COPC 点云",
+    "pointCount": "点数",
+    "crs": "水平坐标参考系",
+    "size": "文件大小",
+    "pointFormat": "点格式",
+    "bounds": "地理范围",
+    "elevationRange": "高程范围",
+    "verticalCrs": "垂直坐标参考系",
+    "accessTitle": "在点云客户端中打开",
+    "urlLabel": "COPC 文件地址",
+    "copyUrl": "复制 COPC URL",
+    "privateHint": "此点云需要只读 API 密钥。客户端支持请求头时，请使用 X-Api-Key。示例中只有占位符，不会包含您的密钥。",
+    "clientLabel": "点云客户端",
+    "potreeHint": "Potree 无法为 COPC 发送 X-Api-Key 请求头。请将 URL 中的占位符替换为只读密钥，并将生成的 URL 作为机密信息保管。",
+    "copySnippet": "复制客户端示例",
+    "qgisSteps": "QGIS {{version}} → 图层 > 添加图层 > 添加点云图层\n来源类型：协议：HTTP(S)、云端等\nURL：{{url}}",
+    "qgisAuthentication": "身份验证：API Header → X-Api-Key: YOUR_API_KEY",
+    "qgisPrivateVersionHint": "点云图层使用 API Header 身份验证需要 QGIS 4.0 或更新版本。",
+    "instructions": "QGIS、Potree 和 copc.js"
+  },
+  "tileset": {
+    "title": "3D Tiles 瓦片集",
+    "version": "版本",
+    "geometricError": "几何误差",
+    "boundingVolume": "包围体",
+    "size": "解压后大小",
+    "extent": "范围",
+    "noExtent": "此瓦片集未记录范围。",
+    "contentTypes": "内容类型",
+    "extensionsRequired": "必需的扩展",
+    "accessTitle": "在 3D Tiles 客户端中加载",
+    "urlLabel": "瓦片集 URL",
+    "headerHint": "内部、受限和私有瓦片集都需要在 X-Api-Key 请求头中提供 API 密钥。请使用只读密钥，因为 CesiumJS 加载瓦片集时发出的每个请求都会带上它。",
+    "copySnippet": "复制 CesiumJS 代码片段"
   }
 }

@@ -55,6 +55,19 @@ describe('admin api request contracts', () => {
     expect(calledUrl()).toBe('/admin/users/');
   });
 
+  it('listUserNames retrieves names beyond the first 500', async () => {
+    const firstPage = Array.from({ length: 500 }, (_, index) => ({ id: `id-${index}`, username: `user-${index}` }));
+    const laterUser = { id: 'id-500', username: 'user-500' };
+    mockApiFetch.mockResolvedValueOnce(firstPage).mockResolvedValueOnce([laterUser]);
+
+    const names = await admin.listUserNames();
+
+    expect(mockApiFetch).toHaveBeenNthCalledWith(1, '/admin/users/names/?skip=0&limit=500');
+    expect(mockApiFetch).toHaveBeenNthCalledWith(2, '/admin/users/names/?skip=500&limit=500');
+    expect(names).toHaveLength(501);
+    expect(names.at(-1)).toEqual(laterUser);
+  });
+
   it('listAuditLogs forwards actor and resource filters', async () => {
     await admin.listAuditLogs({
       user_id: 'u1',
@@ -156,13 +169,16 @@ describe('admin api request contracts', () => {
     mockApiFetch.mockClear();
     await admin.triggerBackfill(true);
     expect(calledUrl()).toBe('/admin/backfill-embeddings/?force=true');
+    expect(calledInit()).not.toHaveProperty('timeoutMs');
   });
 
-  it('updateSemanticSearch PUTs the settings envelope to /settings/', async () => {
-    await admin.updateSemanticSearch(true);
-    expect(calledUrl()).toBe('/settings/');
-    expect(calledInit()?.method).toBe('PUT');
-    expect(JSON.parse(calledInit()?.body as string)).toEqual({ settings: { semantic_search_enabled: true } });
+  it('triggerBackfill asks for every tenant only when told to', async () => {
+    await admin.triggerBackfill(false, true);
+    expect(calledUrl()).toBe('/admin/backfill-embeddings/?all_tenants=true');
+    expect(calledInit()).toMatchObject({ timeoutMs: 630_000 });
+    mockApiFetch.mockClear();
+    await admin.triggerBackfill(true, true);
+    expect(calledUrl()).toBe('/admin/backfill-embeddings/?force=true&all_tenants=true');
   });
 
   it('exportUsersCsv uses the refresh-aware raw fetch against the absolute export URL (UX-01)', async () => {

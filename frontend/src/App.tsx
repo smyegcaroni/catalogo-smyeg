@@ -1,5 +1,5 @@
 import { lazy, Suspense } from 'react';
-import { Route, Navigate, Outlet } from 'react-router';
+import { Route, Navigate, Outlet, useLocation } from 'react-router';
 import { ProtectedRoute } from '@/components/auth/ProtectedRoute';
 import { AdminCapabilityRoute, AdminIndexRoute, AdminRoute, AdminSettingsRoute } from '@/components/auth/AdminRoute';
 import { LandingFirstGuard } from '@/components/auth/LandingFirstGuard';
@@ -10,6 +10,7 @@ import { AdminLayout } from '@/components/admin/AdminLayout';
 import { LoadingState } from '@/components/layout/LoadingState';
 import { LazyLoadErrorBoundary, RouteErrorBoundary } from '@/components/error';
 import { SessionExpiredDialog } from '@/components/auth/SessionExpiredDialog';
+import { SessionRestoreNotice } from '@/components/auth/SessionRestoreNotice';
 import { AnalysisJobWatcher } from '@/components/analysis/AnalysisJobWatcher';
 import { PwaInstallPrompt } from '@/components/layout/PwaInstallPrompt';
 
@@ -57,6 +58,7 @@ function RootLayout() {
       {/* fix(#628): global session-expiry host — needs router context for the
           sign-in-returns-to-route action, so it lives here rather than main.tsx. */}
       <SessionExpiredDialog />
+      <SessionRestoreNotice />
       {/* feat(#682): analysis-job notifier — global so a materialize job that
           outlives the builder (panel closed, navigated away, tab reloaded)
           still reports when it lands. Needs router context for its
@@ -92,6 +94,12 @@ function BannerShell() {
   );
 }
 
+// Search lives on the home page; keep the query so old /search?q= links still work.
+function SearchRedirect() {
+  const { search, hash } = useLocation();
+  return <Navigate to={{ pathname: '/', search, hash }} replace />;
+}
+
 export const appRoutes = (
   <Route element={<RootLayout />}>
     <Route element={<BannerShell />}>
@@ -106,7 +114,7 @@ export const appRoutes = (
       {/* FRONT-01: LandingFirstGuard redirects anonymous visitors to /login
           when the landing_first flag is ON; otherwise renders SearchPage. */}
       <Route index element={<LandingFirstGuard />} errorElement={<RouteErrorBoundary />} />
-      <Route path="search" element={<Navigate to="/" replace />} />
+      <Route path="search" element={<SearchRedirect />} />
       <Route path="datasets/:id" element={<DatasetPage />} errorElement={<RouteErrorBoundary />} />
       <Route path="collections" element={<CollectionsPage />} errorElement={<RouteErrorBoundary />} />
       <Route path="collections/:id" element={<CollectionDetailPage />} errorElement={<RouteErrorBoundary />} />

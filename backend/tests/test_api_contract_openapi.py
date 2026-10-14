@@ -205,6 +205,16 @@ def test_upload_quota_and_upstream_failures_are_route_scoped() -> None:
         assert "502" not in spec["paths"][path][method]["responses"]
 
 
+def test_embedding_changing_settings_routes_document_409_and_503() -> None:
+    spec = _openapi()
+
+    for path in ("/settings/", "/settings/reset/", "/config-ops/import/"):
+        method = "put" if path == "/settings/" else "post"
+        responses = spec["paths"][path][method]["responses"]
+        assert "409" in responses
+        assert "503" in responses
+
+
 def test_frontend_settings_dependencies_are_in_openapi() -> None:
     spec = _openapi()
 
@@ -514,6 +524,7 @@ def test_cookie_session_operations_declare_their_negotiation_headers() -> None:
         "/auth/login": {"wants_cookie_auth"},
         "/auth/refresh/": {"wants_cookie_auth", "enforce_csrf"},
         "/auth/logout/": {"enforce_csrf"},
+        "/auth/oauth/exchange/": {"wants_cookie_auth"},
     }
 
     for path, helpers in expected_helpers.items():

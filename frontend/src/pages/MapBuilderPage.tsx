@@ -119,7 +119,7 @@ import { usePluginStore } from '@/stores/map-plugin-store';
 import type { ViewportContext } from '@/components/builder/chat-suggestions';
 import type { EphemeralAnalysisHandoff } from '@/components/builder/hooks/use-ephemeral-layers';
 import { readStorage, removeStorage, storageKeys } from '@/lib/storage';
-import { analysisAddToMap, useAnalysisJobStore } from '@/stores/analysis-job-store';
+import { registerAnalysisAddToMap, useAnalysisJobStore } from '@/stores/analysis-job-store';
 import { takeChatResult } from '@/lib/chat-result-handoff';
 
 export function MapBuilderPage() {
@@ -960,17 +960,19 @@ export function MapBuilderPage() {
     },
     [setAnalysisJob, id],
   );
-  // No dep array: keeps the registered callback fresh on every render; the
-  // cleanup is what matters, so the watcher falls back to "View dataset" once
-  // this builder is gone.
+  // Only a loaded map whose layers have hydrated can take the add, so the
+  // loading and error screens below leave an open toast on "View dataset".
+  const addAnalysisOutput =
+    !error && mapData && layers.layersMapId === id
+      ? (layers.chatLayerActions?.onAddDataset ?? null)
+      : null;
+  // No dep array: keeps the registered callback fresh on every render. The
+  // clear runs only on unmount, so an open completion toast hears about this
+  // builder arriving, leaving or switching maps, never about a re-render.
   useEffect(() => {
-    analysisAddToMap.current = layers.chatLayerActions?.onAddDataset ?? null;
-    analysisAddToMap.mapId = id ?? null;
-    return () => {
-      analysisAddToMap.current = null;
-      analysisAddToMap.mapId = null;
-    };
+    registerAnalysisAddToMap(addAnalysisOutput, id ?? null);
   });
+  useEffect(() => () => registerAnalysisAddToMap(null, null), []);
 
   // feat(#675): "Save as dataset" on the ephemeral preview — open the Analysis
   // panel prefilled with the operation behind the chat preview.
@@ -2081,10 +2083,12 @@ export function MapBuilderPage() {
         {isEditorHidden && isEditorOpen && (
           <Sheet
             open={true}
+            modal={false}
             onOpenChange={(open) => { if (!open) handleCloseEditor(); }}
           >
             <SheetContent
               side="right"
+              overlay={false}
               showCloseButton={false}
               /* RESP-03 (Phase 1051 Plan 10): suppress shadcn Sheet's
                  built-in auto-close X. The wrapped LayerEditorPanel already
@@ -2287,12 +2291,18 @@ export function MapBuilderPage() {
           }
         }}
         addDataInitialQuery={dialogs.addDataInitialQuery}
+        // The click that dismisses the dialog picks its own target, so the
+        // deferred editor-open would otherwise race (and toggle shut) a click
+        // on the layer just added.
+        onAddDataPointerDownOutside={() => {
+          pendingEditorLayerIdRef.current = null;
+        }}
         onAddDataset={(datasetId: string) => {
           layers.handleAddDataset(datasetId, (newLayerId) => {
-            // ux(#776): keep the dialog open for multi-add — the row flips to
-            // "Added ✓" and Escape/backdrop/X still close it. The editor
-            // opens on close (see onShowAddDataChange above) instead of
-            // landing behind the dialog.
+            // Keep the dialog open for multi-add: the row flips to "Added"
+            // and Escape, an outside click or the close button still close
+            // it. The editor opens on close (see onShowAddDataChange above)
+            // instead of landing behind the dialog.
             pendingEditorLayerIdRef.current = newLayerId;
           });
         }}

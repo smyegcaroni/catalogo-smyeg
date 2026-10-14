@@ -4,7 +4,23 @@ from __future__ import annotations
 
 import hashlib
 
-from fastapi import Request, Response, status
+from fastapi import HTTPException, Request, Response, status
+
+from app.platform.cache.scope import bound_shared_cache_lifetime
+
+
+def tile_busy_error(detail: str = "Tile service busy, please retry") -> HTTPException:
+    """Return a non-cacheable rejection whose cooldown is visible cross-origin."""
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail=detail,
+        headers={
+            "Retry-After": "2",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "Retry-After",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 def _tile_headers(cache_scope: str, cache_ttl: int) -> dict[str, str]:
@@ -32,17 +48,27 @@ def _serving_tile_headers(
 ) -> dict[str, str]:
     """Apply hosted cache policy only to responses already safe for sharing.
 
-    Signed, embed-token, and unpublished preview tiles resolve to ``private``.
-    A serving extension must never turn those into publicly cacheable CDN
-    responses. Public tiles may use the provider's CDN-specific TTL.
+    Signed, embed-token, caller-authorized and unpublished preview tiles
+    resolve to ``private``. A serving extension must never turn those into
+    publicly cacheable CDN responses. Public tiles may use the provider's
+    CDN-specific TTL, within the shared-cache lifetime cap. A ``no-store``
+    scope is sent as a bare ``no-store`` and takes no TTL.
     """
     headers = (
         _empty_tile_headers(cache_scope, cache_ttl)
         if empty
         else _tile_headers(cache_scope, cache_ttl)
     )
-    if cache_scope == "public" and cache_control_override is not None:
-        headers["Cache-Control"] = cache_control_override
+    if cache_scope == "no-store":
+        headers["Cache-Control"] = "no-store"
+    elif cache_scope == "public":
+        headers["Cache-Control"] = bound_shared_cache_lifetime(
+            cache_control_override or headers["Cache-Control"]
+        )
+    if cache_scope != "public":
+        # A client cache must not replay one credential's tile to another
+        # credential, or to none, on the same URL.
+        headers["Vary"] = "Authorization, X-Api-Key, X-Embed-Token"
     return headers
 
 

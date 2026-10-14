@@ -48,6 +48,18 @@ describe('LoginForm', () => {
     expect(screen.getByLabelText('Password', { exact: true })).toBeInTheDocument();
   });
 
+  it('shows the support hint while sign-up is closed', () => {
+    render(<LoginForm />);
+
+    expect(screen.getByText(/contact a geolens administrator/i)).toBeInTheDocument();
+  });
+
+  it('hides the support hint while sign-up is open', () => {
+    render(<LoginForm signupOpen />);
+
+    expect(screen.queryByText(/contact a geolens administrator/i)).not.toBeInTheDocument();
+  });
+
   it('renders sign in button', () => {
     render(<LoginForm />);
 
@@ -170,5 +182,22 @@ describe('LoginForm', () => {
     } finally {
       restore();
     }
+  });
+
+  it('does not navigate when sign-in finishes after the form is gone', async () => {
+    let finish!: () => void;
+    mockLogin.mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const user = userEvent.setup();
+    const view = render(<LoginForm />);
+
+    await user.type(screen.getByLabelText(/username/i), 'someone');
+    await user.type(screen.getByLabelText('Password', { exact: true }), 'secret');
+    await user.click(screen.getByRole('button', { name: /sign in/i }));
+    await waitFor(() => expect(mockLogin).toHaveBeenCalled());
+    view.unmount();
+    finish();
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mockNavigate).not.toHaveBeenCalled();
   });
 });

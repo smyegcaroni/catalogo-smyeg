@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient, keepPreviousData, type QueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/query-keys';
+import { ApiError } from '@/api/client';
 import {
   createDataset,
   getDataset,
@@ -16,6 +17,7 @@ import {
   getDatasetVersions,
   refreshDataset,
   getDatasetRefreshRuns,
+  restorePreviousVersion,
   listAttributes,
   updateAttribute,
   validateDataset,
@@ -28,6 +30,7 @@ import type {
   AttributeMetadataUpdate,
   ReuploadServicePreviewRequest,
   DatasetRefreshRunResponse,
+  DatasetRefreshRequest,
   ServiceAuthRequest,
 } from '@/types/api';
 
@@ -42,13 +45,27 @@ export function useCreateDataset() {
   });
 }
 
-export function useDataset(id: string, options?: { refetchInterval?: number | false | ((query: unknown) => number | false) }) {
+export function useDataset(
+  id: string,
+  options?: {
+    refetchInterval?: number | false | ((query: unknown) => number | false);
+    staleTime?: number;
+    refetchOnWindowFocus?: boolean;
+  },
+) {
   return useQuery({
     queryKey: queryKeys.datasets.detail(id),
     queryFn: () => getDataset(id),
     enabled: !!id,
     refetchInterval: options?.refetchInterval,
-    staleTime: 60_000,
+    staleTime: options?.staleTime ?? 60_000,
+    // An undefined key would still override the app's default when merged.
+    ...(options?.refetchOnWindowFocus !== undefined && {
+      refetchOnWindowFocus: options.refetchOnWindowFocus,
+    }),
+    // A missing dataset stays missing; retrying only delays the not-found page.
+    retry: (failureCount, error) =>
+      !(error instanceof ApiError && error.status === 404) && failureCount < 1,
   });
 }
 
@@ -60,6 +77,12 @@ export function useDatasetRows(id: string, limit: number, cursor: number, filter
     placeholderData: keepPreviousData,
     staleTime: 60_000,
   });
+}
+
+/** Publication and visibility changes retire the signatures minted for the dataset. */
+function invalidateTileTokens(qc: QueryClient, datasetId: string) {
+  qc.invalidateQueries({ queryKey: queryKeys.tileTokens.token(datasetId) });
+  qc.invalidateQueries({ queryKey: ['tile-tokens-batch'] });
 }
 
 export function useUpdateDataset() {
@@ -75,6 +98,7 @@ export function useUpdateDataset() {
       // otherwise refetch after a metadata edit. Force invalidation so the
       // quality-score badge reflects the freshly-computed value.
       qc.invalidateQueries({ queryKey: queryKeys.datasets.validation(variables.datasetId) });
+      if (variables.data.visibility !== undefined) invalidateTileTokens(qc, variables.datasetId);
     },
   });
 }
@@ -89,6 +113,7 @@ export function useSetTargetStatus() {
       qc.invalidateQueries({ queryKey: queryKeys.datasets.all });
       qc.invalidateQueries({ queryKey: queryKeys.search.all });
       qc.invalidateQueries({ queryKey: queryKeys.datasets.validation(variables.datasetId) });
+      invalidateTileTokens(qc, variables.datasetId);
     },
   });
 }
@@ -180,6 +205,7 @@ export function useReuploadCommit() {
       // fix(#1768): the origin the dialog captured when it staged the
       // replacement, so the commit door can refuse a mid-flow rebinding.
       expectedOriginKind,
+      reviewFingerprint,
     }: {
       datasetId: string;
       jobId: string;
@@ -187,13 +213,24 @@ export function useReuploadCommit() {
       token?: string;
       layerName?: string;
       expectedOriginKind?: DatasetOrigin | null;
-    }) => reuploadCommit(datasetId, jobId, sridOverride, token, layerName, expectedOriginKind),
+      reviewFingerprint?: string | null;
+    }) => reuploadCommit(
+      datasetId,
+      jobId,
+      sridOverride,
+      token,
+      layerName,
+      expectedOriginKind,
+      reviewFingerprint,
+    ),
     // REMED-01 (ingest-audit P2-06): invalidate the dataset-detail warnings
     // banner cache so it refetches the new ingest job's warnings. The
     // useDatasetJobStatus query uses `staleTime: Infinity` and would
     // otherwise hold the prior job's value until a hard refresh.
     onSuccess: (_data, variables) => {
       qc.invalidateQueries({ queryKey: queryKeys.ingest.jobStatusByDataset(variables.datasetId) });
+      // The commit admitted a run; an open Sources tab shows it.
+      qc.invalidateQueries({ queryKey: queryKeys.datasets.refreshRunsPrefix(variables.datasetId) });
     },
   });
 }
@@ -216,18 +253,35 @@ export function useRefreshDataset() {
       token,
       auth,
       acceptBlockedRunId,
+      verificationPolicy,
     }: {
       datasetId: string;
       token?: string;
       auth?: ServiceAuthRequest;
       acceptBlockedRunId?: string;
-    }) => refreshDataset(datasetId, token, auth, acceptBlockedRunId),
+      verificationPolicy?: DatasetRefreshRequest['verification_policy'];
+    }) => refreshDataset(datasetId, token, auth, acceptBlockedRunId, verificationPolicy),
     // The dispatched run belongs in history immediately (status "pending"),
     // and dataset-detail health/freshness change once the worker finishes —
     // both queries are cheap enough to just invalidate rather than patch.
     onSuccess: (_data, variables) => {
       qc.invalidateQueries({ queryKey: queryKeys.datasets.refreshRunsPrefix(variables.datasetId) });
       qc.invalidateQueries({ queryKey: queryKeys.datasets.detail(variables.datasetId) });
+    },
+  });
+}
+
+export function useRestorePreviousVersion() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ datasetId, versionNumber }: { datasetId: string; versionNumber: number }) =>
+      restorePreviousVersion(datasetId, versionNumber),
+    // The restore is queued like a refresh: its run appears in history at once,
+    // and the detail's previous version and the version list change when it settles.
+    onSettled: (_data, _error, variables) => {
+      qc.invalidateQueries({ queryKey: queryKeys.datasets.refreshRunsPrefix(variables.datasetId) });
+      qc.invalidateQueries({ queryKey: queryKeys.datasets.detail(variables.datasetId) });
+      qc.invalidateQueries({ queryKey: queryKeys.datasets.versionsPrefix(variables.datasetId) });
     },
   });
 }
@@ -249,7 +303,7 @@ export function useCancelRefreshJob() {
 
 export function useDatasetRefreshRuns(
   datasetId: string,
-  params: { skip?: number; limit?: number } = {},
+  params: { skip?: number; limit?: number; pollWhenScheduled?: boolean } = {},
 ) {
   const skip = params.skip ?? 0;
   const limit = params.limit ?? 10;
@@ -306,7 +360,8 @@ export function useDatasetRefreshRuns(
     // dataset_id filter rather than trusting index 0 belongs to `datasetId`.
     refetchInterval: (query) => {
       const latest = query.state.data?.runs.find((run) => run.dataset_id === datasetId);
-      return latest?.status === 'pending' || latest?.status === 'running' ? 5_000 : false;
+      if (latest?.status === 'pending' || latest?.status === 'running') return 5_000;
+      return params.pollWhenScheduled ? 10_000 : false;
     },
   });
 }
@@ -402,6 +457,8 @@ export function useDatasetRefreshWatch(datasetId: string): DatasetRefreshWatch {
     //   - relationships.recordsPrefix: the actual joined related-record
     //     ROWS a RelatedRecordsPanel section renders, fetched by feature —
     //     genuinely stale after a data replace.
+    //   - relationships.listPrefix: every list carries its relationships'
+    //     `broken` flag, which a replace of either endpoint changes.
     //
     // Considered and excluded, and why:
     //   - refreshRunsPrefix: this IS the query driving this effect; already
@@ -413,8 +470,6 @@ export function useDatasetRefreshWatch(datasetId: string): DatasetRefreshWatch {
     //     data. datasets.all exists only to alias these two under the
     //     shared 'datasets' root (see useUpdateDataset), so it adds nothing
     //     once both are excluded.
-    //   - relationships.list: the relationship DEFINITION (source/target
-    //     column) is user-configured, not recomputed by a refresh.
     //   - search.facets / search.summary: different root than search.all
     //     (['facets', params] / ['catalog-summary'], not ['search', ...]) —
     //     confirmed no existing "this dataset's data changed" mutation in
@@ -435,6 +490,7 @@ export function useDatasetRefreshWatch(datasetId: string): DatasetRefreshWatch {
     queryClient.invalidateQueries({ queryKey: queryKeys.search.all });
     queryClient.invalidateQueries({ queryKey: queryKeys.ingest.jobStatusByDataset(datasetId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.relationships.recordsPrefix(datasetId) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.relationships.listPrefix });
   }, [latestRunId, latestRunStatus, dispatchedRunId, datasetId, queryClient]);
 
   const trackDispatchedRun = useCallback((runId: string) => {

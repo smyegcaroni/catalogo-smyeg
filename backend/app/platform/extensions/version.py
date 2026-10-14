@@ -108,7 +108,39 @@ logger = logging.getLogger(__name__)
 # ``verified_refresh_service_task`` method. Refresh dispatch must resolve a
 # task name that pre-change workers do not register, while ordinary service
 # reuploads continue using ``reupload_service_task``.
-EXTENSION_API_VERSION: int = 10
+# 10 -> 11 (feat(scheduled-refresh)): a single-slot
+# "scheduled_refresh_lifecycle" registry key was added. It owns optional
+# scheduler/dispatcher tasks while the worker's queue connector is live.
+# ProcessingPort.build_gdal_source also gained required object_ids support for
+# a verified ArcGIS ID chunk; an older overlay would reject that keyword.
+# ProcessingPort.fetch_arcgis_id_plan also crosses the catalog-owned adapter
+# through the sanctioned port, avoiding a processing-to-catalog import.
+# 11 -> 12 (fix(refresh)): ProcessingPort.build_gdal_source gained the optional
+# ``force_arcgis_geojson`` keyword so every chunk in one verified ArcGIS ID
+# plan uses the same GDAL driver when any object ID exceeds ESRIJSON's range.
+#
+# 12 -> 13 (fix(quota)): CatalogPort gained the required ``cog_may_be_read``
+# method. The replacement quota check asks it whether a VRT may still read a
+# member's COG before crediting the bytes the publish would keep charged. An
+# overlay replacing the ``catalog_port`` slot without it would fail every
+# reupload request.
+#
+# 13 -> 14: ProcessingPort.get_catalog_vocabulary and get_keywords_for_records
+# take the caller's ``user`` and ``user_roles`` as required keywords and return
+# only keywords of records that caller may read, because AI keyword
+# suggestions send both to the model. An overlay on the old signatures fails
+# every keyword suggestion request.
+#
+# 14 -> 15: CatalogPort gained the required ``stored_column_name`` and
+# ``get_geometry_types`` methods. The file re-upload preview diffs its columns
+# under their stored names and reads the live geometry types to judge review
+# reasons, so an overlay replacing the ``catalog_port`` slot without them
+# fails every file re-upload preview.
+#
+# 15 -> 16: CatalogPort gained the required ``restore_previous_version_task``
+# method, which the previous-version restore route defers. An overlay
+# replacing the ``catalog_port`` slot without it fails every restore request.
+EXTENSION_API_VERSION: int = 16
 
 
 def check_extension_api_version(name: str, declared_version: int | None) -> None:

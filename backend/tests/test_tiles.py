@@ -368,7 +368,7 @@ class TestTileEndpoint:
         # fix(#2007): the publication version follows the dataset id.
         mock_cache.get.assert_awaited_once_with(
             f"{table_name}:ds{dataset.id.hex}:p{dataset.publication_version}"
-            ":cluster:v3:r64:z12",
+            f":v{dataset.tile_cache_version}:cluster:v3:r64:z12",
             0,
             0,
             0,
@@ -607,8 +607,8 @@ class TestTileQueryStructure:
         result = _build_attr_columns(columns)
         assert "geom" not in result
         assert "geom_4326" not in result
-        assert "t.name" in result
-        assert "t.value" in result
+        assert 't."name"' in result
+        assert 't."value"' in result
 
     def test_tile_query_uses_correct_params(self):
         """Tile query uses ST_AsMVTGeom with 4096 extent, 256 buffer."""

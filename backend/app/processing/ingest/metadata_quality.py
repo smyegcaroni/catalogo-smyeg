@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.record_types import is_table_or_raster_backed
 from app.processing.ingest.metadata_sql import (
     _qtable,
     _sql_quote_ident,
@@ -49,10 +50,9 @@ async def _score_metadata_completeness(
     return round(filled / len(optional_fields) * 100, 1)
 
 
-def _score_crs(dataset: "Dataset") -> float:
+def _score_crs(srid: int | None, geometry_type: str | None) -> float:
     """100 if SRID is defined or dataset has no geometry, else 0."""
-    has_geometry = dataset.geometry_type is not None
-    return 100.0 if (dataset.srid is not None or not has_geometry) else 0.0
+    return 100.0 if (srid is not None or geometry_type is None) else 0.0
 
 
 async def _score_geometry_validity(
@@ -129,22 +129,61 @@ async def compute_quality_score(
     *,
     schema: str = "data",
 ) -> dict:
-    """Compute a weighted quality score for a dataset.
+    """:func:`score_quality` for ``dataset`` as it is stored."""
+    return await score_quality(
+        session,
+        table_name,
+        column_info,
+        record=dataset.record,
+        record_type=getattr(dataset.record, "record_type", None),
+        geometry_type=dataset.geometry_type,
+        srid=dataset.srid,
+        max_validity_rows=max_validity_rows,
+        schema=schema,
+    )
+
+
+async def score_quality(
+    session: AsyncSession,
+    table_name: str,
+    column_info: list[dict],
+    *,
+    record: "Record",
+    record_type: str | None,
+    geometry_type: str | None,
+    srid: int | None,
+    max_validity_rows: int = 10000,
+    schema: str = "data",
+) -> dict:
+    """Compute a weighted quality score for a table and the record describing it.
 
     Dimensions:
-    - Metadata completeness (30%): non-empty optional fields on dataset
+    - Metadata completeness (30%): non-empty optional fields on the record
     - Geometry validity (30%): percentage of valid geometries
     - Attribute completeness (25%): average non-null percentage across columns
     - CRS defined (15%): 100 if srid is set, else 0
 
-    Returns a dict with overall score and per-dimension scores.
+    ``record_type``, ``geometry_type`` and ``srid`` are arguments so a
+    measurement can be scored before it is written. Returns a dict with the
+    overall score and the per-dimension scores. A dataset that neither a
+    feature table nor a raster asset backs (a tileset, a point cloud) is scored
+    on its metadata alone: its ``table_name`` names no table.
     """
     _validate_table_name(table_name)
-    record = dataset.record
-    has_geometry = dataset.geometry_type is not None
+    has_geometry = geometry_type is not None
 
     metadata_score = await _score_metadata_completeness(session, record)
-    crs_score = _score_crs(dataset)
+    # A record not yet flushed has no record_type and is scored as vector data.
+    if record_type is not None and not is_table_or_raster_backed(record_type):
+        return {
+            "overall": round(metadata_score),
+            "metadata_completeness": metadata_score,
+            "geometry_validity": None,
+            "attribute_completeness": None,
+            "crs_defined": None,
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    crs_score = _score_crs(srid, geometry_type)
     geometry_score = await _score_geometry_validity(
         session,
         table_name,
@@ -161,8 +200,7 @@ async def compute_quality_score(
 
     # Table records have no geometry_validity/crs_defined; re-normalize
     # weights to metadata (30) + attribute (25) = 55 total.
-    is_table = getattr(record, "record_type", None) == "table"
-    if is_table:
+    if record_type == "table":
         overall = round(metadata_score * (30 / 55) + attribute_score * (25 / 55))
         return {
             "overall": overall,

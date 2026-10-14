@@ -259,8 +259,14 @@ async def test_vector_worker_geometry_override_uses_helper_contract(
             )
 
     call_kwargs = geometry_override.await_args.kwargs
-    assert set(call_kwargs) == {"table_name", "user_metadata", "effective_srid"}
+    assert set(call_kwargs) == {
+        "table_name",
+        "user_metadata",
+        "effective_srid",
+        "renamed_columns",
+    }
     assert call_kwargs["user_metadata"] == job.user_metadata
+    assert call_kwargs["renamed_columns"] == []
     assert call_kwargs["effective_srid"] == 4326
 
 
@@ -368,6 +374,11 @@ async def test_service_worker_advances_ogr2ogr_progress_while_remote_import_is_r
 
     monkeypatch.setattr(tasks_vector, "_service_import_heartbeat_tick", _tracking_tick)
 
+    async def _fake_page_info(*args, **kwargs):
+        return 1, 1000, False, "OBJECTID"
+
+    monkeypatch.setattr(tasks_vector, "_fetch_arcgis_import_page_info", _fake_page_info)
+
     worker_task = asyncio.create_task(
         tasks_vector.ingest_service.func(
             job_id=str(job_id),
@@ -379,12 +390,15 @@ async def test_service_worker_advances_ogr2ogr_progress_while_remote_import_is_r
     )
 
     try:
-        await asyncio.wait_for(remote_import_started.wait(), timeout=5)
+        # A generous hang guard, not a timing assumption under test: reaching
+        # the stub only needs the worker task to get scheduled, which a
+        # loaded runner can delay well past a couple of seconds.
+        await asyncio.wait_for(remote_import_started.wait(), timeout=30)
 
         # A generous hang guard, not the source of the assertions below --
         # the heartbeat's own mocked interval is 0.01s, so a healthy tick
         # lands almost immediately.
-        await asyncio.wait_for(tick_committed.wait(), timeout=5)
+        await asyncio.wait_for(tick_committed.wait(), timeout=30)
         assert not worker_task.done()
 
         result = await test_db_session.execute(
@@ -538,7 +552,10 @@ async def test_service_worker_chunks_large_arcgis_imports(test_db_session, monke
         _fake_rename_reserved_columns,
     )
     monkeypatch.setattr(tasks_vector, "_finalize_ingest", _fake_finalize_ingest)
-    monkeypatch.setattr(tasks_vector, "_emit_billing_event", _fake_emit_billing_event)
+    monkeypatch.setattr(
+        "app.processing.ingest.publish_followups._emit_billing_event",
+        _fake_emit_billing_event,
+    )
 
     await tasks_vector.ingest_service.func(
         job_id=str(job_id),
@@ -650,7 +667,7 @@ async def test_service_worker_skips_arcgis_chunking_without_pagination_support(
         return table_name, None
 
     async def _fake_page_info(*args, **kwargs):
-        return None, 1000, False, "FID"
+        return 800, 1000, False, "FID"
 
     async def _fake_run_ogr2ogr_service(
         gdal_source: str,
@@ -720,7 +737,10 @@ async def test_service_worker_skips_arcgis_chunking_without_pagination_support(
         _fake_rename_reserved_columns,
     )
     monkeypatch.setattr(tasks_vector, "_finalize_ingest", _fake_finalize_ingest)
-    monkeypatch.setattr(tasks_vector, "_emit_billing_event", _fake_emit_billing_event)
+    monkeypatch.setattr(
+        "app.processing.ingest.publish_followups._emit_billing_event",
+        _fake_emit_billing_event,
+    )
 
     await tasks_vector.ingest_service.func(
         job_id=str(job_id),
@@ -740,6 +760,140 @@ async def test_service_worker_skips_arcgis_chunking_without_pagination_support(
             "service_type": "arcgis_featureserver",
         }
     ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("page_info", "expected", "refusal"),
+    [
+        ((251, 2000, True, "FID"), [["FID ASC"]], None),
+        ((251, 2000, True, None), [None], None),
+        ((5000, 2000, False, None), [], "can't page through the rest"),
+        ((5000, 2000, False, "FID"), [], "can't page through the rest"),
+        ((None, 2000, False, "FID"), [], "couldn't read this ArcGIS layer's feature"),
+        ((None, None, False, "OBJECTID"), [], "couldn't read this ArcGIS layer"),
+    ],
+)
+async def test_service_worker_single_fetch_orders_by_the_layers_own_oid_field(
+    test_db_session, monkeypatch, page_info, expected, refusal
+):
+    """The single fetch orders by the layer's field and records it, or refuses."""
+    from app.modules.catalog.sources.preview import build_gdal_source
+    from app.processing.ingest import tasks_vector
+
+    admin_id = await _get_admin_id(test_db_session)
+    table_name = f"tbl_arcgis_fid_{_uuid.uuid4().hex[:8]}"
+    source_url = "https://example.test/arcgis/rest/services/Countries/FeatureServer"
+
+    job = IngestJob(
+        source_filename="Countries",
+        source_url=source_url,
+        source_layer="0",
+        created_by=admin_id,
+        status="pending",
+        user_metadata={
+            "title": "Countries",
+            "visibility": "private",
+            "service_type": "ArcGIS FeatureServer",
+            "layer_id": "0",
+            "geometry_type": "Polygon",
+            "object_id_field": "OBJECTID",
+        },
+    )
+    test_db_session.add(job)
+    await test_db_session.flush()
+    await test_db_session.commit()
+
+    order_fields: list[list[str] | None] = []
+
+    class _FakeProcessingPort:
+        def build_gdal_source(self, *args, **kwargs):
+            return build_gdal_source(*args, **kwargs)
+
+    async def _validate_url_noop(_url: str) -> None:
+        return None
+
+    async def _fake_generate_table_name(*args, **kwargs):
+        return table_name, None
+
+    page_info_kwargs: list[dict] = []
+
+    async def _fake_page_info(*args, **kwargs):
+        page_info_kwargs.append(kwargs)
+        return page_info
+
+    async def _fake_run_ogr2ogr_service(
+        gdal_source: str, layer_name: str, target_table: str, *args, **kwargs
+    ) -> None:
+        query = parse_qs(urlsplit(gdal_source.removeprefix("ESRIJSON:")).query)
+        order_fields.append(query.get("orderByFields"))
+        await test_db_session.execute(
+            text(f'DROP TABLE IF EXISTS data."{target_table}"')
+        )
+        await test_db_session.execute(
+            text(f'CREATE TABLE data."{target_table}" (gid serial PRIMARY KEY)')
+        )
+        await test_db_session.commit()
+
+    async def _fake_rename_reserved_columns(*args, **kwargs):
+        return []
+
+    async def _fake_finalize_ingest(context):
+        context.job.status = "complete"
+        context.job.current_step = "complete"
+        context.job.progress = 1.0
+        await context.session.commit()
+
+    async def _fake_emit_billing_event(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "app.platform.security.validate_url_for_ssrf", _validate_url_noop
+    )
+    monkeypatch.setattr(
+        "app.platform.extensions.get_processing_port",
+        lambda: _FakeProcessingPort(),
+    )
+    monkeypatch.setattr("app.processing.ingest.ogr.build_pg_conn_str", lambda: "PG:")
+    monkeypatch.setattr(
+        "app.processing.ingest.service.generate_table_name",
+        _fake_generate_table_name,
+    )
+    monkeypatch.setattr(tasks_vector, "_fetch_arcgis_import_page_info", _fake_page_info)
+    monkeypatch.setattr(
+        "app.processing.ingest.ogr.run_ogr2ogr_service", _fake_run_ogr2ogr_service
+    )
+    monkeypatch.setattr(
+        "app.processing.ingest.metadata.rename_reserved_columns",
+        _fake_rename_reserved_columns,
+    )
+    monkeypatch.setattr(tasks_vector, "_finalize_ingest", _fake_finalize_ingest)
+    monkeypatch.setattr(
+        "app.processing.ingest.publish_followups._emit_billing_event",
+        _fake_emit_billing_event,
+    )
+
+    run = tasks_vector.ingest_service.func(
+        job_id=str(job.id),
+        attempt_id=str(job.attempt_id),
+        source_url=source_url,
+        source_layer="0",
+        user_id=str(admin_id),
+    )
+    if refusal is None:
+        await run
+        await test_db_session.refresh(job)
+        assert job.user_metadata["object_id_field"] == page_info[3]
+    else:
+        from app.processing.ingest.ogr import IngestionError
+
+        with pytest.raises(IngestionError, match=refusal):
+            await run
+        await test_db_session.refresh(job)
+        assert job.status == "failed"
+
+    assert order_fields == expected
+    assert page_info_kwargs == [{"fallback_order_field": "OBJECTID"}]
 
 
 @pytest.mark.anyio
@@ -860,7 +1014,10 @@ async def test_service_worker_skips_arcgis_chunking_without_order_field(
         _fake_rename_reserved_columns,
     )
     monkeypatch.setattr(tasks_vector, "_finalize_ingest", _fake_finalize_ingest)
-    monkeypatch.setattr(tasks_vector, "_emit_billing_event", _fake_emit_billing_event)
+    monkeypatch.setattr(
+        "app.processing.ingest.publish_followups._emit_billing_event",
+        _fake_emit_billing_event,
+    )
 
     await tasks_vector.ingest_service.func(
         job_id=str(job_id),

@@ -3,7 +3,8 @@ import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { Globe, Check } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { formatDateTimeSmart } from '@/lib/format';
+import { formatDateTimeSmart, formatNumber } from '@/lib/format';
+import { getGeometryTypeLabel } from '@/i18n/labels';
 import { ApiError } from '@/api/client';
 import { probeService, commitImport, arcgisSignin } from '@/api/ingest';
 import {
@@ -35,7 +36,12 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { TypeTag } from './TypeTag';
-import { defaultPortalFor, looksLikeArcGisServiceUrl, originOf } from './utils';
+import {
+  defaultPortalFor,
+  looksLikeArcGisPortalUrl,
+  looksLikeArcGisServiceUrl,
+  originOf,
+} from './utils';
 
 type ServiceStep =
   | 'idle'
@@ -71,10 +77,10 @@ type ServiceCredentialMethod = 'none' | 'bearer' | 'basic' | 'header';
 // already decided to retire.
 const EXPIRY_MARGIN_MS = 30_000;
 
-export function ServiceUrlForm() {
+export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
   const { t } = useTranslation('import');
   const [step, setStep] = useState<ServiceStep>('idle');
-  const [url, setUrl] = useState('');
+  const [url, setUrl] = useState(initialUrl);
   const [token, setToken] = useState('');
   const [probeResult, setProbeResult] = useState<ProbeResponse | null>(null);
   const [previewData, setPreviewData] = useState<ServicePreviewResponse | null>(null);
@@ -101,6 +107,7 @@ export function ServiceUrlForm() {
   const [basicPassword, setBasicPassword] = useState('');
   const [headerName, setHeaderName] = useState('');
   const [headerValue, setHeaderValue] = useState('');
+  const [credentialsReset, setCredentialsReset] = useState(false);
 
   // codex review #1757 P1: a stale in-flight sign-in response must never
   // resurrect a token or run after the auth context it belongs to is gone.
@@ -110,6 +117,7 @@ export function ServiceUrlForm() {
   const signinGenerationRef = useRef(0);
   const authOrigin = originOf(url);
   const isArcGisShaped = looksLikeArcGisServiceUrl(url);
+  const isArcGisPortalShaped = looksLikeArcGisPortalUrl(url);
   // fix(#1712): guards every `setState` reached after an `await` in the
   // preview/commit session helpers below, mirroring UrlImportForm's
   // identical ref (`url-import-session.ts`'s consumer) — the module-scoped
@@ -233,6 +241,14 @@ export function ServiceUrlForm() {
     lastAuthOriginRef.current = authOrigin;
     lastAuthShapeRef.current = isArcGisShaped;
     if (!originChanged && !shapeChanged) return;
+    const hadCredentials =
+      arcgisAuthMethod !== 'none' ||
+      serviceCredentialMethod !== 'none' ||
+      [token, username, password, basicUsername, basicPassword, headerName, headerValue].some(
+        (value) => value !== '',
+      );
+    // Retyping a URL passes through empty origins; a later no-op reset must not hide the notice.
+    if (hadCredentials) setCredentialsReset(true);
     invalidateMintedCredential();
     setArcgisAuthMethod('none');
     setPortalUrl('');
@@ -254,7 +270,22 @@ export function ServiceUrlForm() {
     // only on a genuine origin or shape change; including it here is for
     // correctness (react-hooks/exhaustive-deps), not because it can
     // change what this effect does.
-  }, [authOrigin, isArcGisShaped, invalidateMintedCredential]);
+    // The ref guards above make this a no-op unless the origin or shape changed, so
+    // depending on the credential fields does not re-run the reset as they change.
+  }, [
+    authOrigin,
+    isArcGisShaped,
+    invalidateMintedCredential,
+    arcgisAuthMethod,
+    serviceCredentialMethod,
+    token,
+    username,
+    password,
+    basicUsername,
+    basicPassword,
+    headerName,
+    headerValue,
+  ]);
 
   // codex review #1757 round 2: the expiry timer must not outlive the
   // component (a backgrounded/unmounted tab has no business scheduling
@@ -270,6 +301,7 @@ export function ServiceUrlForm() {
 
   const reset = () => {
     if (commitInFlight) return;
+    setCredentialsReset(false);
     invalidateMintedCredential();
     clearServiceImport();
     setStep('idle');
@@ -295,6 +327,7 @@ export function ServiceUrlForm() {
   // half-honouring them, same rule as handleAuthMethodChange below (plan
   // 3.4 / the backend's own oneOf-shaped `auth` object).
   const handleServiceCredentialMethodChange = (next: ServiceCredentialMethod) => {
+    setCredentialsReset(false);
     setServiceCredentialMethod(next);
     setToken('');
     setBasicUsername('');
@@ -331,6 +364,7 @@ export function ServiceUrlForm() {
   // plan 3.4). A stale password or a stale pasted token left over from the
   // method the user just backed out of must never ride along silently.
   const handleAuthMethodChange = (next: ArcgisAuthMethod) => {
+    setCredentialsReset(false);
     invalidateMintedCredential();
     setArcgisAuthMethod(next);
     setUsername('');
@@ -426,7 +460,7 @@ export function ServiceUrlForm() {
     }
 
     const trimmed = url.trim();
-    if (!trimmed) return;
+    if (!trimmed || isArcGisPortalShaped) return;
 
     setStep('probing');
     setError(null);
@@ -689,6 +723,24 @@ export function ServiceUrlForm() {
     );
   }
 
+  // The first line already shows the title, so the machine name only repeats when it differs.
+  // A layer that cannot be imported gets no geometry or count; the reason line below covers it.
+  const layerDetails = (layer: LayerInfo) =>
+    [
+      layer.title && layer.title !== layer.name ? layer.name : null,
+      layer.importable !== false && layer.geometry_type
+        ? getGeometryTypeLabel(t, layer.geometry_type)
+        : null,
+      layer.importable !== false && layer.feature_count != null
+        ? t('review.featureCount', {
+            count: layer.feature_count,
+            value: formatNumber(layer.feature_count),
+          })
+        : null,
+    ]
+      .filter(Boolean)
+      .join(' · ');
+
   // ── Layer selection with probe result ──
   if (step === 'layer-select' && probeResult) {
     return (
@@ -707,7 +759,7 @@ export function ServiceUrlForm() {
               type="text"
               readOnly
               value={probeResult.url}
-              className="flex-1 bg-transparent px-3.5 py-2.5 font-mono text-sm text-foreground outline-none"
+              className="min-w-20 flex-1 bg-transparent px-3.5 py-2.5 font-mono text-sm text-foreground outline-none"
             />
             <button
               onClick={reset}
@@ -724,12 +776,12 @@ export function ServiceUrlForm() {
             <span className="rounded-md bg-type-vrt-bg px-2.5 py-0.5 font-mono text-mini font-semibold uppercase tracking-wider text-type-vrt">
               {probeResult.service_type}
             </span>
-            <div className="flex-1">
-              <h3 className="text-sm font-medium tracking-tight">
+            <div className="min-w-0 flex-1">
+              <h3 className="truncate text-sm font-medium tracking-tight" title={probeResult.url}>
                 {probeResult.url}
               </h3>
               <p className="font-mono text-mini text-muted-foreground tracking-wide">
-                {t('serviceUrl.layersAvailable', { count: probeResult.layers.length, defaultValue: `${probeResult.layers.length} layers available` })}
+                {t('serviceUrl.layersAvailable', { count: probeResult.layers.length })}
               </p>
             </div>
           </div>
@@ -744,6 +796,7 @@ export function ServiceUrlForm() {
               // D-10 (Phase 1057 CLASS-07): consume backend-classified layer.kind directly.
               // Previously re-derived from geometry_type string contents, which failed
               // when geometry_type is null (the post-D-05 default for OGC API / WFS layers).
+              const unsupported = layer.importable === false;
               return (
                 <button
                   // fix(#1746): keyed by layer_id, not layer.name — two
@@ -754,9 +807,10 @@ export function ServiceUrlForm() {
                   // backend already dedupes on.
                   key={layer.layer_id ?? layer.name}
                   onClick={() => handleLayerSelect(layer)}
+                  disabled={unsupported}
                   className={cn(
                     'flex items-center gap-2.5 rounded-lg border border-border p-2.5 text-start transition-colors',
-                    'hover:bg-surface-2',
+                    unsupported ? 'cursor-not-allowed opacity-60' : 'hover:bg-surface-2',
                   )}
                 >
                   <TypeTag kind={layer.kind} size="sm" />
@@ -765,9 +819,15 @@ export function ServiceUrlForm() {
                       {layer.title || layer.name}
                     </p>
                     <p className="truncate font-mono text-2xs text-muted-foreground tracking-wide mt-0.5">
-                      {layer.name}
-                      {layer.geometry_type && ` · ${layer.geometry_type}`}
+                      {layerDetails(layer)}
                     </p>
+                    {unsupported && (
+                      <p className="mt-0.5 text-2xs text-muted-foreground">
+                        {t('serviceUrl.unsupportedLayerType', {
+                          type: layer.source_layer_type ?? layer.layer_type,
+                        })}
+                      </p>
+                    )}
                   </div>
                 </button>
               );
@@ -786,7 +846,7 @@ export function ServiceUrlForm() {
   if ((step === 'review' || step === 'committing') && previewData) {
     return (
       <div className="space-y-4">
-        <ImportPreview preview={previewData} />
+        <ImportPreview preview={previewData} source="service" />
         {error && <p className="text-sm text-destructive">{error}</p>}
         <ImportMetadataForm
           defaultName={previewData.source_filename ?? previewData.layer_name}
@@ -828,7 +888,7 @@ export function ServiceUrlForm() {
             />
             <button
               type="submit"
-              disabled={!url.trim()}
+              disabled={!url.trim() || isArcGisPortalShaped}
               className="bg-primary px-4 text-xs font-semibold text-primary-foreground hover:bg-primary-hover disabled:opacity-40"
             >
               {t('serviceUrl.probe', { defaultValue: 'Probe →' })}
@@ -844,7 +904,25 @@ export function ServiceUrlForm() {
           </div>
         </div>
 
-        {isArcGisShaped ? (
+        {credentialsReset && (
+          <p
+            role="status"
+            data-testid="credentials-reset-notice"
+            className="text-sm text-muted-foreground"
+          >
+            {t('serviceUrl.credentialsReset')}
+          </p>
+        )}
+
+        {isArcGisPortalShaped ? (
+          <p
+            role="status"
+            data-testid="arcgis-portal-url-hint"
+            className="text-sm text-muted-foreground"
+          >
+            {t('serviceUrl.arcgisPortalUrlHint')}
+          </p>
+        ) : isArcGisShaped ? (
           <div className="space-y-3" data-testid="arcgis-auth-block">
             <div className="space-y-2">
               <Label htmlFor="arcgis-auth-method" className="text-xs text-muted-foreground">

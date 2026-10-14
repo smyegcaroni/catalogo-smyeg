@@ -64,29 +64,26 @@ class TestRegisterBeforeWrite:
 
 
 class TestUnpublishedStorageKeys:
-    def test_both_raster_tails_record_their_keys_before_phase_2(self) -> None:
+    def test_the_first_ingest_tail_records_its_keys_before_phase_2(self) -> None:
         """The write has to precede the phase-2 session, not sit inside it.
 
         Phase 2's first statements dirty the ingest_jobs row, so a second
         session writing that row while phase 2 held it would block until phase
         2 ended, and phase 2 would be waiting on the write.
         """
-        for module in (
-            "processing/ingest/tasks_raster.py",
-            "processing/ingest/tasks_raster_replace.py",
-        ):
-            lines = _source(module).splitlines()
-            record = next(
-                (
-                    i
-                    for i, line in enumerate(lines)
-                    if "await record_unpublished_storage_keys(" in line
-                ),
-                None,
-            )
-            assert record is not None, f"{module} never records its keys"
-            phase2 = next(i for i, line in enumerate(lines) if 'phase="phase2"' in line)
-            assert record < phase2, f"{module} records its keys inside phase 2"
+        module = "processing/ingest/tasks_raster.py"
+        lines = _source(module).splitlines()
+        record = next(
+            (
+                i
+                for i, line in enumerate(lines)
+                if "await record_unpublished_storage_keys(" in line
+            ),
+            None,
+        )
+        assert record is not None, f"{module} never records its keys"
+        phase2 = next(i for i, line in enumerate(lines) if 'phase="phase2"' in line)
+        assert record < phase2, f"{module} records its keys inside phase 2"
 
     @pytest.mark.parametrize(
         "metadata,expected",
@@ -150,31 +147,14 @@ class TestUnpublishedStorageKeys:
             "originals/d/abc",
         }
 
-    @pytest.mark.asyncio
-    async def test_fail_stale_jobs_carries_them_out_of_a_running_row(self) -> None:
-        """The keys reach the outcome, and only after the settling commit.
-
-        fix(#1778 codex r10): the running-row transition no longer collects
-        keys directly -- that collection moved into the unconditional
-        artifact-carrying SELECT that runs after the retention block, so a
-        row this pass just failed is seen through that query instead. Against
-        real Postgres the SELECT runs inside the same uncommitted
-        transaction as the UPDATE above it and sees the new status, so the
-        two-query split changes nothing about same-pass reaping; the double
-        has to route the fixture through the query that actually answers it
-        now, which is why this passes the row as ``purged_rows`` rather than
-        ``running_rows``.
-        """
+    async def test_fail_stale_jobs_carries_them_out_of_a_running_row(
+        self, test_db_session
+    ) -> None:
+        """A running row the pass settles hands its keys to the reap, which runs after the commit."""
         from app.platform.jobs.sweep import fail_stale_jobs
 
-        job_uuid = uuid.uuid4()
         keys = ["rasters/d/abc/source.cog.tif", "rasters/d/abc/quicklook_256.png"]
-        mock_db = _mock_db_for_fail_stale(
-            running_rows=[(job_uuid, None, None)],
-            purged_rows=[
-                (job_uuid, None, {"unpublished_storage_keys": keys}),
-            ],
-        )
+        await _stale_running_row_naming(test_db_session, keys)
         storage = MagicMock()
         storage.delete = AsyncMock()
         with (
@@ -184,34 +164,70 @@ class TestUnpublishedStorageKeys:
                 AsyncMock(return_value=set()),
             ),
         ):
-            outcome = await fail_stale_jobs(mock_db, detailed=True)
+            outcome = await fail_stale_jobs(test_db_session, detailed=True)
 
-        assert outcome._unpublished_storage_keys == tuple(sorted(keys))
-        assert {call.args[0] for call in storage.delete.await_args_list} == set(keys)
+        assert set(keys) <= set(outcome._unpublished_storage_keys)
+        assert set(keys) <= {call.args[0] for call in storage.delete.await_args_list}
 
-    @pytest.mark.asyncio
-    async def test_a_rolled_back_settle_deletes_nothing(self) -> None:
+    async def test_a_rolled_back_settle_deletes_nothing(
+        self, test_db_session, monkeypatch
+    ) -> None:
+        """A pass whose commit fails deletes none of the keys its rows name."""
+        from sqlalchemy import delete
+
+        from app.platform.jobs.models import IngestJob
         from app.platform.jobs.sweep import fail_stale_jobs
 
-        mock_db = _mock_db_for_fail_stale(
-            running_rows=[
-                (
-                    uuid.uuid4(),
-                    {"unpublished_storage_keys": ["rasters/d/abc/source.cog.tif"]},
-                    None,
-                ),
-            ]
+        job_id = await _stale_running_row_naming(
+            test_db_session, ["rasters/d/abc/source.cog.tif"]
         )
-        mock_db.commit.side_effect = RuntimeError("commit failed")
         storage = MagicMock()
         storage.delete = AsyncMock()
-        with (
-            patch("app.platform.storage.get_storage", return_value=storage),
-            pytest.raises(RuntimeError, match="commit failed"),
-        ):
-            await fail_stale_jobs(mock_db, detailed=True)
 
-        storage.delete.assert_not_awaited()
+        async def _commit_fails() -> None:
+            raise RuntimeError("commit failed")
+
+        try:
+            monkeypatch.setattr(test_db_session, "commit", _commit_fails)
+            with (
+                patch("app.platform.storage.get_storage", return_value=storage),
+                pytest.raises(RuntimeError, match="commit failed"),
+            ):
+                await fail_stale_jobs(test_db_session, detailed=True)
+
+            storage.delete.assert_not_awaited()
+        finally:
+            monkeypatch.undo()
+            await test_db_session.rollback()
+            # _stale_running_row_naming committed this row before the forced
+            # failure, so rollback() can't undo it; a later stale-job sweep
+            # in this process would otherwise reap its key.
+            await test_db_session.execute(
+                delete(IngestJob).where(IngestJob.id == job_id)
+            )
+            await test_db_session.commit()
+
+
+async def _stale_running_row_naming(session, keys: list[str]) -> uuid.UUID:
+    """A running job past its lease whose row names unpublished storage keys."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.platform.jobs.models import IngestJob
+    from app.platform.jobs.sweep import JOB_TIMEOUT_SECONDS
+    from app.processing.ingest.tasks_raster_common import (
+        UNPUBLISHED_STORAGE_KEYS_FIELD,
+    )
+
+    job = IngestJob(
+        status="running",
+        source_filename="raster.tif",
+        started_at=datetime.now(timezone.utc)
+        - timedelta(seconds=JOB_TIMEOUT_SECONDS + 60),
+        user_metadata={UNPUBLISHED_STORAGE_KEYS_FIELD: keys},
+    )
+    session.add(job)
+    await session.commit()
+    return job.id
 
 
 class TestRecorderChecksItsOwnFence:
@@ -464,8 +480,10 @@ class TestIdenticalReplacementKeepsTheLiveAsset:
                 "already_published="
             ), rel
         assert found == {
+            "processing/ingest/tasks_pointcloud.py",
             "processing/ingest/tasks_raster.py",
             "processing/ingest/tasks_raster_replace.py",
+            "processing/ingest/tasks_tileset.py",
             "processing/ingest/tasks_vrt.py",
         }, found
 
@@ -700,11 +718,11 @@ class TestAttemptScopedReplaceKeys:
 # own rather than riding the existing entry, which is the rule
 # `test_rule2_structural`'s allowlists follow for the same reason.
 PUT_SITES_WITH_ANOTHER_OWNER: dict[tuple[str, str], tuple[int, str]] = {
-    ("processing/ingest/tasks_vrt.py", "regenerate_vrt"): (
+    ("processing/ingest/tasks_raster_replace.py", "install"): (
         3,
-        "generation-scoped keys, rebuilt from the durable VrtGeneration row by "
-        "_stale_generation_storage_keys in the job sweep (feat(#1267)) - the "
-        "mechanism this finding's recorder was modelled on",
+        "the raster strategy's fetch records these three attempt-scoped keys "
+        "on the job row, and the settlement seam runs fetch to completion "
+        "before it calls install, so the stale-job reaper can name them",
     ),
     ("processing/ingest/tasks_staging.py", "_archive_original_file"): (
         1,
@@ -715,7 +733,7 @@ PUT_SITES_WITH_ANOTHER_OWNER: dict[tuple[str, str], tuple[int, str]] = {
         "dataset_assets row names - archive_lossy_original's own pre-write "
         "probe is what decides that one",
     ),
-    ("processing/ingest/tasks_common.py", "_generate_quicklook"): (
+    ("processing/ingest/tasks_common.py", "_draw_quicklook"): (
         1,
         "vectors/{dataset_id}/quicklook_256.png, written after the vector "
         "dataset row is committed, so delete_dataset's vectors/ prefix reap "
@@ -733,6 +751,17 @@ PUT_SITES_WITH_ANOTHER_OWNER: dict[tuple[str, str], tuple[int, str]] = {
     ("processing/export/artifact_cache.py", "_write"): (
         1,
         "the export artifact cache, reaped by its own TTL sweep",
+    ),
+    ("processing/ingest/tasks_tileset.py", "unpack_tileset"): (
+        1,
+        "tiles3d/{dataset_id}/{attempt_id}/: ingest_tileset records that prefix "
+        "on the job row before calling it, and the job sweep reaps it",
+    ),
+    ("processing/ingest/tasks_pointcloud.py", "store_pointcloud"): (
+        1,
+        "pointclouds/{dataset_id}/{attempt_id}/data.copc.laz: ingest_pointcloud "
+        "records that key on the job row before calling it, and the job sweep "
+        "reaps it",
     ),
 }
 
@@ -1220,25 +1249,31 @@ class TestReapScalesAndStaysRetryable:
         done_id, partial_id = done.id, partial.id
         await test_db_session.commit()
 
-        await _clear_settled_artifact_records(
-            storage_keys={"rasters/a/x.tif", "rasters/a/y.png"}
-        )
+        try:
+            await _clear_settled_artifact_records(
+                storage_keys={"rasters/a/x.tif", "rasters/a/y.png"}
+            )
 
-        test_db_session.expire_all()
-        rows = {
-            row.id: row.user_metadata
-            for row in (
-                await test_db_session.execute(
-                    select(IngestJob).where(IngestJob.id.in_([done_id, partial_id]))
-                )
-            ).scalars()
-        }
-        assert rows[done_id] == {"keep_me": True}, (
-            "a fully settled row loses the record and keeps everything else"
-        )
-        assert "unpublished_storage_keys" in rows[partial_id], (
-            "a row with an unsettled key keeps its whole record for the retry"
-        )
+            test_db_session.expire_all()
+            rows = {
+                row.id: row.user_metadata
+                for row in (
+                    await test_db_session.execute(
+                        select(IngestJob).where(IngestJob.id.in_([done_id, partial_id]))
+                    )
+                ).scalars()
+            }
+            assert rows[done_id] == {"keep_me": True}, (
+                "a fully settled row loses the record and keeps everything else"
+            )
+            assert "unpublished_storage_keys" in rows[partial_id], (
+                "a row with an unsettled key keeps its whole record for the retry"
+            )
+        finally:
+            # partial's row is left naming rasters/b/z.tif on purpose (that's
+            # what's under test); a later fail_stale_jobs pass in this process
+            # would otherwise pick it up as a real unreaped artifact.
+            await _clear_settled_artifact_records(storage_keys={"rasters/b/z.tif"})
 
 
 class TestTheRecordAccumulatesAcrossAttempts:
@@ -1288,7 +1323,10 @@ class TestTheRecordAccumulatesAcrossAttempts:
         self, test_db_session
     ) -> None:
         from app.platform.jobs.models import IngestJob
-        from app.platform.jobs.sweep import unpublished_storage_keys_from_metadata
+        from app.platform.jobs.sweep import (
+            _clear_settled_artifact_records,
+            unpublished_storage_keys_from_metadata,
+        )
 
         attempt_one, attempt_two = uuid.uuid4(), uuid.uuid4()
         job = IngestJob(status="failed", file_path="", attempt_id=attempt_one)
@@ -1298,20 +1336,26 @@ class TestTheRecordAccumulatesAcrossAttempts:
         await test_db_session.commit()
 
         first = ["rasters/a/attempts/one/h/source.cog.tif"]
-        await self._record(job_id, attempt_one, first)
-
-        # The retry keeps user_metadata and takes a new attempt token.
-        row = await self._reload(test_db_session, job_id)
-        row.attempt_id = attempt_two
-        await test_db_session.commit()
-
         second = ["rasters/a/attempts/two/h/source.cog.tif"]
-        await self._record(job_id, attempt_two, second)
+        try:
+            await self._record(job_id, attempt_one, first)
 
-        row = await self._reload(test_db_session, job_id)
-        assert unpublished_storage_keys_from_metadata(row.user_metadata) == tuple(
-            first + second
-        ), "attempt 1's objects lost their last durable pointer"
+            # The retry keeps user_metadata and takes a new attempt token.
+            row = await self._reload(test_db_session, job_id)
+            row.attempt_id = attempt_two
+            await test_db_session.commit()
+
+            await self._record(job_id, attempt_two, second)
+
+            row = await self._reload(test_db_session, job_id)
+            assert unpublished_storage_keys_from_metadata(row.user_metadata) == tuple(
+                first + second
+            ), "attempt 1's objects lost their last durable pointer"
+        finally:
+            # The row is left naming both keys on purpose (that's what's under
+            # test), which any later fail_stale_jobs pass in this process would
+            # otherwise pick up as a real unreaped artifact.
+            await _clear_settled_artifact_records(storage_keys={*first, *second})
 
     @pytest.mark.anyio
     async def test_clearing_removes_only_the_settled_keys(

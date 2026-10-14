@@ -13,6 +13,7 @@ const { mockUseAuditLogs } = vi.hoisted(() => ({ mockUseAuditLogs: vi.fn() }));
 
 vi.mock('@/hooks/use-admin', () => ({
   useAuditLogs: (...args: unknown[]) => mockUseAuditLogs(...args),
+  useUserNames: () => ({ data: [] }),
 }));
 
 beforeAll(() => {
@@ -63,6 +64,13 @@ function renderViewer(route = '/admin/audit', total = 1) {
 
 beforeEach(() => {
   mockUseAuditLogs.mockReset();
+});
+
+describe('AuditLogViewer heading', () => {
+  it('leaves the page title to the page header', () => {
+    renderViewer();
+    expect(screen.queryByRole('heading', { name: 'Audit Logs' })).not.toBeInTheDocument();
+  });
 });
 
 describe('AuditLogViewer sorting', () => {

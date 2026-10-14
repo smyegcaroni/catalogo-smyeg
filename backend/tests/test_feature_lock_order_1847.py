@@ -598,67 +598,6 @@ class TestEmittedSqlPinsTheOrder:
         assert catalog_locks.REQUEST_LOCK_TIMEOUT in session.statements[0]
 
 
-class TestWorkerSitesLeadWithTheDatasetRow:
-    """The two background writers of the pair keep the order this one matched."""
-
-    def _lines(self, rel: str) -> list[str]:
-        from pathlib import Path
-
-        app_dir = Path(__file__).resolve().parents[1] / "app"
-        return (app_dir / rel).read_text().splitlines()
-
-    def test_postgis_refresh_locks_the_dataset_before_applying_the_measurement(self):
-        lines = self._lines("processing/ingest/tasks_postgis_refresh.py")
-        lock = next(
-            i
-            for i, line in enumerate(lines)
-            if "select(Dataset.tile_cache_version)" in line
-        )
-        apply_call = next(
-            i for i, line in enumerate(lines) if line.strip() == "_apply_measurement("
-        )
-        assert lock < apply_call, (
-            "phase 3 must take the datasets row before _apply_measurement "
-            "writes dataset.record. Reversing this re-opens #1847 from the "
-            "worker side."
-        )
-
-    def test_stac_refresh_locks_the_dataset_before_writing_the_record(self):
-        lines = self._lines("processing/ingest/tasks_stac_refresh.py")
-        lock = next(
-            i
-            for i, line in enumerate(lines)
-            if "select(" in line and "Dataset." in line
-        )
-        write = next(
-            i
-            for i, line in enumerate(lines)
-            if "dataset.record.spatial_extent" in line and "=" in line
-        )
-        assert lock < write
-
-    def test_stac_refresh_locks_the_raster_row_before_the_dataset(self):
-        """Phase 3 writes raster_assets after its binding guard, so the child
-        row is taken first, the order the is_dem PATCH and the replace hold."""
-        lines = self._lines("processing/ingest/tasks_stac_refresh.py")
-        raster_lock = next(
-            i
-            for i, line in enumerate(lines)
-            if "select(RasterAsset.dataset_id)" in line
-        )
-        dataset_lock = next(
-            i
-            for i, line in enumerate(lines)
-            if "with_for_update" in line
-            and any("Dataset.origin_uri" in prev for prev in lines[max(0, i - 8) : i])
-        )
-        assert raster_lock < dataset_lock, (
-            "refresh_stac must take raster_assets before the datasets row; "
-            "holding datasets first and then repointing the asset is an ABBA "
-            "against the is_dem PATCH."
-        )
-
-
 class TestFeatureWriteErrorClassification:
     """A lock conflict is a retryable 409, not a 503 telling clients to back off."""
 
@@ -1483,10 +1422,9 @@ class TestOneShapeForEveryContendedRow:
 class TestTheRasterChildIsHeldBeforeTheReap:
     """The delete must not reap raster objects it may not get to commit.
 
-    The replace worker holds the RasterAsset row across its upload and only
-    then takes the pair. A delete that took the pair, reaped the raster prefix,
-    and met that row for the first time at the cascade would wait on the worker
-    with the bytes already gone.
+    Raster writers take the RasterAsset row ahead of the pair. A delete that
+    took the pair, reaped the raster prefix, and met that row for the first
+    time at the cascade would wait on the writer with the bytes already gone.
     """
 
     async def test_a_held_raster_row_stops_the_delete_before_it_reaps(
@@ -1510,7 +1448,7 @@ class TestTheRasterChildIsHeldBeforeTheReap:
 
         title = locked_raster_dataset.record.title
         async with db_module.async_session() as holder:
-            # Exactly what the replace worker holds across its upload.
+            # The row a raster writer takes ahead of the pair.
             await holder.execute(
                 select(RasterAsset.dataset_id)
                 .where(RasterAsset.dataset_id == locked_raster_dataset.id)
@@ -1635,8 +1573,22 @@ class TestEveryJobWriterLeadsWithTheJobRow:
     raster row takes the job row first, the order the dataset delete holds.
     """
 
-    _JOB_WRITES = ("require_ingest_job_update(", "update_ingest_job_for_attempt(")
-    _ROW_LOCKS = ("lock_catalog_rows", "lock_catalog_rows_for_write")
+    _JOB_WRITES = (
+        "require_ingest_job_update(",
+        "update_ingest_job_for_attempt(",
+        "_complete(",
+        "_fail(",
+        "ledger.claim(",
+        "ledger.stage(",
+        "ledger.complete(",
+        "ledger.fail(",
+    )
+    _JOB_LOCKS = ("hold_publishing_job",)
+    _ROW_LOCKS = (
+        "lock_catalog_rows",
+        "lock_catalog_rows_for_write",
+        "_take_catalog_rows",
+    )
 
     @classmethod
     def _first_locks(cls, body: list[ast.stmt]) -> tuple[int | None, int | None]:
@@ -1655,6 +1607,8 @@ class TestEveryJobWriterLeadsWithTheJobRow:
                     job = node.lineno if job is None else job
                 else:
                     other = node.lineno if other is None else other
+            elif func.rsplit(".", 1)[-1] in cls._JOB_LOCKS:
+                job = node.lineno if job is None else job
             elif func.rsplit(".", 1)[-1] in cls._ROW_LOCKS:
                 other = node.lineno if other is None else other
         return job, other
@@ -1681,10 +1635,9 @@ class TestEveryJobWriterLeadsWithTheJobRow:
                     job, other = self._first_locks(node.body)
                     if other is None:
                         continue
+                    ok = job is not None and job < other
                     if name == "_job_phase_session":
-                        ok = any(k.arg == "require_status" for k in call.keywords)
-                    else:
-                        ok = job is not None and job < other
+                        ok = ok or any(k.arg == "require_status" for k in call.keywords)
                     if not ok:
                         offenders.append(f"{path.relative_to(root)}:{node.lineno}")
         assert offenders == [], offenders
@@ -1694,7 +1647,7 @@ class TestEveryJobWriterLeadsWithTheJobRow:
 
         root = Path(app.__file__).parent / "processing" / "ingest"
         seen = 0
-        for name in ("tasks_vrt.py", "tasks_stac_refresh.py"):
+        for name in ("tasks_vrt.py", "publication.py"):
             for node in ast.walk(ast.parse((root / name).read_text())):
                 if isinstance(node, ast.AsyncWith):
                     job, other = self._first_locks(node.body)
@@ -1745,7 +1698,7 @@ class TestALaterLockWaitAnswersTheSameWay:
                 db_module.async_session() as holder,
                 db_module.async_session() as probe,
             ):
-                # The worker's first lock, held across its upload.
+                # A raster writer's first lock, taken ahead of the pair.
                 await holder.execute(
                     select(RasterAsset.dataset_id)
                     .where(RasterAsset.dataset_id == locked_dataset.id)
@@ -2318,17 +2271,15 @@ class TestTheOtherSitesHoldTheOrderToo:
 
 
 class TestWorkerDoorsAcquireBeforeTheirWrites:
-    """The three worker sites, checked on emitted order rather than by racing.
+    """The worker sites that acquire themselves, checked on emitted order.
 
     Each needs a staged upload and a live ingest job to reach its swap, and the
-    property under test is an ordering.
-    `test_reupload_swap_lock_retry.py::TestSwapLocksBeforeItWrites` drives the
-    reupload door end to end against a real session.
+    property under test is an ordering. `test_replacement_preamble.py` races
+    the replacement tasks end to end, and `test_settle_replacement.py` checks
+    the order the settlement seam takes for its strategies.
     """
 
     SITES = [
-        ("processing/ingest/tasks_common.py", "_apply_reupload_swap"),
-        ("processing/ingest/tasks_raster_replace.py", "reupload_raster"),
         ("processing/ingest/tasks_vrt.py", "regenerate_vrt"),
     ]
 
@@ -2347,67 +2298,15 @@ class TestWorkerDoorsAcquireBeforeTheirWrites:
             for n in ast.walk(tree)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
         )
-        key = f"{module}.{name}"
-        if key in _INMEMORY_UNTIL_ACQUIRED:
-            pytest.skip(f"exempt: {_INMEMORY_UNTIL_ACQUIRED[key]}")
         ok, why = acquisition_dominates_writes(
             fn, bindings, module, _acquiring_functions()
         )
         assert ok, f"{rel}::{name}: {why}"
 
-    def test_the_deferred_flush_exemption_still_holds(self):
-        """The `no_autoflush` the exemption rests on must actually be there.
-
-        Without it the in-memory assignments reach the database at whatever
-        statement the archive path runs next, ahead of the acquisition.
-        """
-        import ast
-        from pathlib import Path
-
-        app_dir = Path(__file__).resolve().parents[1] / "app"
-        src = (app_dir / "processing/ingest/tasks_raster_replace.py").read_text()
-        tree = ast.parse(src)
-        fn = next(
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.AsyncFunctionDef) and n.name == "reupload_raster"
-        )
-        swap = next(
-            n.lineno
-            for n in ast.walk(fn)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == "_write_swapped_fields"
-        )
-        acquire = next(
-            n.lineno
-            for n in ast.walk(fn)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == "lock_catalog_rows"
-        )
-        guarded = [
-            n.lineno
-            for n in ast.walk(fn)
-            if isinstance(n, ast.With)
-            and any(
-                isinstance(item.context_expr, ast.Attribute)
-                and item.context_expr.attr == "no_autoflush"
-                for item in n.items
-            )
-        ]
-        assert swap < acquire, "the swap helper must precede the acquisition here"
-        assert any(swap < line < acquire for line in guarded), (
-            "reupload_raster is exempt from the ordering check because its "
-            "in-memory assignments are held under `no_autoflush` until the "
-            "acquisition. That block is gone, so the exemption is now false: "
-            f"swap at {swap}, acquisition at {acquire}, no_autoflush at {guarded}"
-        )
-
     def test_the_worker_takes_the_raster_row_before_the_pair(self):
-        """The reason both raster exemptions rest on, checked not asserted.
+        """The reason the VRT exemption rests on, checked not asserted.
 
-        Each takes `raster_assets` itself rather than through the helper. If
+        It takes `raster_assets` itself rather than through the helper. If
         that acquisition ever moves below the pair, the exemption is false and
         the site is the ABBA the rule exists to stop.
         """
@@ -2415,10 +2314,7 @@ class TestWorkerDoorsAcquireBeforeTheirWrites:
         from pathlib import Path
 
         app_dir = Path(__file__).resolve().parents[1] / "app"
-        for rel, name in (
-            ("processing/ingest/tasks_raster_replace.py", "reupload_raster"),
-            ("processing/ingest/tasks_vrt.py", "regenerate_vrt"),
-        ):
+        for rel, name in (("processing/ingest/tasks_vrt.py", "regenerate_vrt"),):
             tree = ast.parse((app_dir / rel).read_text())
             fn = next(
                 n
@@ -2449,38 +2345,51 @@ class TestWorkerDoorsAcquireBeforeTheirWrites:
                 "now false."
             )
 
-    def test_the_raster_replace_door_is_the_only_unclamped_acquisition(self):
-        """`lock_timeout=None` appears there alone, and nowhere on a request path.
+    def test_every_unclamped_acquisition_runs_under_the_worker_budget(self):
+        """`lock_timeout=None` appears only inside `worker_lock_budget`.
 
         `SET LOCAL` applies for the rest of the transaction, so a worker
         carrying the request budget would fail a multi-minute ingest on
-        contention it is supposed to wait out.
+        contention it is supposed to wait out, and one carrying no budget
+        waits on a stuck holder forever.
         """
         import ast
         from pathlib import Path
 
+        def _unclamped(node) -> bool:
+            fname = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            return fname == "lock_catalog_rows" and any(
+                kw.arg == "lock_timeout"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is None
+                for kw in node.keywords
+            )
+
         app_dir = Path(__file__).resolve().parents[1] / "app"
-        none_sites = []
+        unclamped, budgeted = [], []
         for path in sorted(app_dir.rglob("*.py")):
+            rel = str(path.relative_to(app_dir.parent))
             tree = ast.parse(path.read_text())
             for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                fname = getattr(node.func, "id", None) or getattr(
-                    node.func, "attr", None
-                )
-                if fname != "lock_catalog_rows":
-                    continue
-                for kw in node.keywords:
-                    if kw.arg == "lock_timeout" and isinstance(kw.value, ast.Constant):
-                        if kw.value.value is None:
-                            none_sites.append(str(path.relative_to(app_dir.parent)))
-        assert sorted(set(none_sites)) == [
-            "app/processing/ingest/tasks_raster_replace.py",
-        ], (
-            "the raster-replace door is the one acquisition with no lock_timeout "
-            "of its own, because its phase budget (#1937) covers it. Every other "
-            f"site names a budget. Found: {none_sites}"
+                if isinstance(node, ast.Call) and _unclamped(node):
+                    unclamped.append((rel, node.lineno))
+                if isinstance(node, ast.AsyncWith) and any(
+                    isinstance(item.context_expr, ast.Call)
+                    and getattr(item.context_expr.func, "id", None)
+                    == "worker_lock_budget"
+                    for item in node.items
+                ):
+                    budgeted += [
+                        (rel, inner.lineno)
+                        for stmt in node.body
+                        for inner in ast.walk(stmt)
+                        if isinstance(inner, ast.Call) and _unclamped(inner)
+                    ]
+        assert unclamped, "the scan found no unclamped acquisition at all"
+        assert sorted(unclamped) == sorted(budgeted), (
+            "these acquisitions take no lock_timeout of their own and run "
+            "outside worker_lock_budget: "
+            f"{sorted(set(unclamped) - set(budgeted))}"
         )
 
 
@@ -2501,6 +2410,9 @@ _PAIR_WRITER_EXEMPTIONS = {
     "app.processing.ingest.tasks_vrt.create_vrt_dataset": "creates the pair",
     "app.processing.ingest.tasks_common._finalize_ingest": "creates the pair, then stamps it",
     "app.processing.ingest.tasks_raster.ingest_raster": "creates the pair, then stamps it",
+    "app.processing.ingest.tasks_tileset.create_tileset_dataset": "creates the pair",
+    "app.processing.ingest.tasks_tileset.ingest_tileset": "creates the pair, then stamps it",
+    "app.processing.ingest.tasks_pointcloud.ingest_pointcloud": "creates the pair, then stamps it",
     "app.processing.ingest.tasks_vector.ingest_file": "wrapper around _finalize_ingest",
     "app.processing.ingest.tasks_vector.ingest_service": "wrapper around _finalize_ingest",
     "app.modules.catalog.sources.stac_router.stac_import": "one pair per item, each in its own savepoint",
@@ -2509,25 +2421,15 @@ _PAIR_WRITER_EXEMPTIONS = {
     "app.processing.analysis.provenance.apply_analysis_provenance": "record of a pair being created",
     # --- writes one half; the caller owns the ordering ---------------------
     "app.processing.ingest.tasks_common.apply_manifest_record_metadata": "record only",
-    "app.processing.ingest.tasks_raster_swap._write_swapped_fields": "sync, no session; reupload_raster acquires before calling it",
-    # --- takes the datasets row FOR UPDATE itself -------------------------
-    # The lock and the superseded-content check are one step here, so these do
-    # not go through the helper.
-    "app.processing.ingest.tasks_postgis_refresh._apply_measurement": "caller refresh_postgis holds datasets FOR UPDATE",
-    "app.processing.ingest.tasks_postgis_refresh.refresh_postgis": "takes datasets FOR UPDATE for its superseded guard",
-    "app.processing.ingest.tasks_stac_refresh.refresh_stac": "takes datasets FOR UPDATE for its superseded guard",
-}
-
-
-# Assigns catalog fields in memory before acquiring, held under `no_autoflush`
-# until after it. The reason is enforced by
-# test_the_deferred_flush_exemption_still_holds.
-_INMEMORY_UNTIL_ACQUIRED = {
-    "app.processing.ingest.tasks_raster_replace.reupload_raster": (
-        "`_write_swapped_fields` only assigns; the acquisition sits below "
-        "`archive_lossy_original`, which uploads the whole original raster, "
-        "and `no_autoflush` holds the assignments until after it."
-    ),
+    "app.processing.ingest.tasks_raster_swap._write_swapped_fields": "sync, no session; the raster strategy's write calls it holding the rows",
+    # --- writes both rows under its callers' acquisition -------------------
+    "app.processing.ingest.catalog_projection.project": "the settlement seam takes the job row and the pair before a strategy projects",
+    "app.processing.ingest.tasks_common._write_reupload_catalog": "the settlement seam takes the job row and the pair before a strategy writes",
+    "app.processing.ingest.tasks_reupload.write": "the file and service strategies' write step, which the settlement seam calls holding the job row and the pair",
+    "app.processing.ingest.tasks_raster_replace.write": "the raster strategy's write step, which the settlement seam calls holding the job row, the raster row and the pair",
+    "app.processing.ingest.tasks_postgis_refresh.write": "the PostGIS strategy's write step, which the settlement seam calls holding the job row and the pair",
+    "app.processing.ingest.tasks_restore.write": "the restore strategy's write step, which the settlement seam calls holding the job row and the pair",
+    "app.processing.ingest.tasks_stac_refresh.write": "the STAC strategy's write step, which the settlement seam calls holding the job row, the raster row and the pair",
 }
 
 
@@ -2535,17 +2437,9 @@ _INMEMORY_UNTIL_ACQUIRED = {
 # through the helper's `with_raster_asset`. The reason is enforced by
 # test_the_worker_takes_the_raster_row_before_the_pair.
 _ORDERS_RASTER_ITSELF = {
-    "app.processing.ingest.tasks_raster_replace.reupload_raster": (
-        "takes RasterAsset FOR UPDATE itself, ahead of the pair, which is the "
-        "order every other site is matching"
-    ),
     "app.processing.ingest.tasks_vrt.regenerate_vrt": (
         "claims the row with an UPDATE and re-reads it FOR UPDATE through its "
         "asset join, both ahead of the pair"
-    ),
-    "app.processing.ingest.tasks_stac_refresh.refresh_stac": (
-        "takes RasterAsset FOR UPDATE ahead of the datasets FOR UPDATE that is "
-        "its binding guard; the repoint writes that row after the guard"
     ),
 }
 
@@ -2558,6 +2452,16 @@ _CONDITIONAL_ACQUISITION = {
         "test_every_write_handler_acquires_on_every_path checks per arm."
     ),
 }
+
+
+# Callees whose writes join no caller transaction; only the edge into a caller is cut.
+_OWN_TRANSACTION_CALLEES = {
+    "app.processing.ingest.publish_followups.run_publish_followups": "runs after its caller's commit, in sessions it opens",
+}
+
+# What a callee taking its caller's transaction would be handed.
+_CALLER_SESSION_NAMES = {"session", "db", "conn", "connection"}
+_CALLER_SESSION_TYPES = ("AsyncSession", "Session", "AsyncConnection", "Connection")
 
 
 ACQUIRERS = frozenset(
@@ -2783,7 +2687,10 @@ def _app_function_facts():
     for rel, module, bindings, fn in _walk_app_functions():
         key = f"{module}.{fn.name}"
         writes.setdefault(key, set()).update(_direct_writes(fn))
-        calls.setdefault(key, set()).update(_called_targets(fn, bindings, module))
+        callees = (
+            _called_targets(fn, bindings, module) - _OWN_TRANSACTION_CALLEES.keys()
+        )
+        calls.setdefault(key, set()).update(callees)
         sites.setdefault(key, f"{rel}:{fn.lineno}")
     return writes, calls, sites
 
@@ -2927,7 +2834,10 @@ def _write_predicate(bindings, module, is_acq, reaches_write):
             return False
         if not isinstance(node.func, ast.Name):
             return False  # unresolvable attribute call; do not guess
-        reached = reaches_write.get(_resolve(node.func.id, bindings, module)) or set()
+        callee = _resolve(node.func.id, bindings, module)
+        if callee in _OWN_TRANSACTION_CALLEES:
+            return False
+        reached = reaches_write.get(callee) or set()
         return bool(reached & {"record", "dataset"})
 
     return is_write
@@ -2997,6 +2907,37 @@ class TestEveryPairWriterTakesTheHouseOrder:
     acquires nothing inverts against every writer holding the dataset row.
     """
 
+    def test_every_own_transaction_callee_opens_its_own_session(self):
+        """Each listed callee exists, takes no session from its caller and opens one itself."""
+        import ast
+
+        found = {}
+        for _rel, module, _bindings, fn in _walk_app_functions():
+            key = f"{module}.{fn.name}"
+            if key in _OWN_TRANSACTION_CALLEES:
+                found[key] = fn
+        assert found.keys() == _OWN_TRANSACTION_CALLEES.keys()
+        for key, fn in found.items():
+            params = fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs
+            for param in params:
+                annotation = ast.unparse(param.annotation) if param.annotation else ""
+                assert param.arg.lower() not in _CALLER_SESSION_NAMES, (
+                    f"{key} takes {param.arg!r} from its caller"
+                )
+                assert not any(t in annotation for t in _CALLER_SESSION_TYPES), (
+                    f"{key} takes a {annotation} from its caller"
+                )
+            opens = [
+                node
+                for node in ast.walk(fn)
+                if isinstance(node, ast.Call)
+                and (
+                    getattr(node.func, "attr", None) == "async_session"
+                    or getattr(node.func, "id", None) == "async_session"
+                )
+            ]
+            assert opens, f"{key} opens no session of its own"
+
     def test_every_pair_writer_acquires_or_is_exempt(self):
         writers = _pair_writer_report()
         acquirers = _acquiring_functions()
@@ -3030,11 +2971,7 @@ class TestEveryPairWriterTakesTheHouseOrder:
         failures = []
         for rel, module, bindings, fn in _walk_app_functions():
             key = f"{module}.{fn.name}"
-            if (
-                key in _PAIR_WRITER_EXEMPTIONS
-                or key in _CONDITIONAL_ACQUISITION
-                or key in _INMEMORY_UNTIL_ACQUIRED
-            ):
+            if key in _PAIR_WRITER_EXEMPTIONS or key in _CONDITIONAL_ACQUISITION:
                 continue
             # Every acquirer OR pair writer, whether its writes are its own
             # or a callee's: either selection alone has a blind spot.
@@ -3056,8 +2993,8 @@ class TestEveryPairWriterTakesTheHouseOrder:
     def test_a_raster_writer_orders_the_child_first(self):
         """The gate owns this class now, not a human reading diffs.
 
-        The replace worker holds `raster_assets` across its upload and asks
-        for the pair afterwards, so taking the pair first is an ABBA.
+        Raster writers take `raster_assets` ahead of the pair, so one that
+        takes the pair first is an ABBA against them.
         """
         acquirers = _acquiring_functions()
         raster_writers = _raster_writer_report()
@@ -3097,7 +3034,7 @@ class TestEveryPairWriterTakesTheHouseOrder:
         writers = _pair_writer_report()
         for expected in (
             "app.modules.catalog.datasets.domain.service_metadata.update_user_metadata",
-            "app.processing.ingest.tasks_common._apply_reupload_swap",
+            "app.processing.ingest.tasks_common._write_reupload_catalog",
             "app.modules.catalog.features.service.refresh_dataset_metadata",
             "app.modules.catalog.datasets.domain.service_lifecycle.delete_dataset",
         ):
@@ -3567,16 +3504,25 @@ class TestNoCatalogModuleWritesAnAbsoluteTileVersion:
             "which increments the row at write time."
         )
 
-    def test_the_scan_sees_the_known_request_sites(self):
+    def _by_file(self, name: str) -> dict[str, int]:
         by_file: dict[str, int] = {}
-        for site in self._sites(self.ATOMIC):
+        for site in self._sites(name):
             rel = site.rsplit(":", 1)[0]
             by_file[rel] = by_file.get(rel, 0) + 1
-        assert by_file == {
-            "features/router.py": 4,
-            "layers/router.py": 4,
+        return by_file
+
+    def test_the_scan_sees_the_known_request_sites(self):
+        assert self._by_file(self.ATOMIC) == {
+            "features/router.py": 1,
             "datasets/api/router.py": 1,
-        }, by_file
+        }
+        # Every feature and column write also rolls the data revision a
+        # replacement compares; the remaining feature-router site rolls tiles
+        # for a table replaced outside GeoLens and writes nothing.
+        assert self._by_file("record_live_data_write") == {
+            "features/router.py": 5,
+            "layers/router.py": 4,
+        }
 
     def test_the_scan_catches_the_absolute_spelling(self):
         tree = ast.parse(

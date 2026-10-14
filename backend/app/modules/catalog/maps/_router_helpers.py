@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.geo import extent_to_bbox
 from app.core.identity import Identity
+from app.modules.auth.permissions import get_effective_permissions
 from app.modules.catalog.authorization import get_user_roles
 from app.modules.catalog.maps.models import Map, MapLayer
 from app.modules.catalog.maps.schemas import (
@@ -19,7 +20,11 @@ from app.modules.catalog.maps.schemas import (
     MapLayerResponse,
     MapResponse,
 )
-from app.modules.catalog.maps.service import LayerRow
+from app.modules.catalog.maps.service import LayerRow, validate_public_visibility
+from app.modules.catalog.maps.sharing import can_read_every_map_dataset
+from app.modules.catalog.maps.style_json import project_terrain_config
+from app.platform.cache.scope import public_cache_control
+from app.platform.extensions import get_permission_extension
 
 logger = structlog.stdlib.get_logger(__name__)
 
@@ -250,6 +255,43 @@ async def _check_map_read_access(
             )
 
 
+async def _reject_non_public_datasets(db: AsyncSession, map_obj: Map) -> None:
+    """Raise 400 when a public map's layers include a non-public dataset.
+
+    Publishing runs the same check, but a map that is already public only
+    meets it again when its layers change.
+    """
+    if map_obj.visibility != "public":
+        return
+    non_public = await validate_public_visibility(db, map_obj.id)
+    if non_public:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": "A public map can't contain non-public datasets",
+                "datasets": ", ".join(non_public),
+            },
+        )
+
+
+async def _stored_image_cache_control(
+    db: AsyncSession, map_obj: Map, user: Identity | None, *, max_age: int
+) -> str | None:
+    """Cache-Control for a map's stored thumbnail or OG image; None withholds it.
+
+    A stored image can't leave out a layer the way live map responses do, so
+    it goes only to a caller who can read every dataset the map draws. It is
+    publicly cacheable only when an anonymous caller could read them all too.
+    """
+    if not await can_read_every_map_dataset(db, map_obj, user):
+        return None
+    if map_obj.visibility == "public" and (
+        user is None or await can_read_every_map_dataset(db, map_obj, None)
+    ):
+        return public_cache_control(max_age)
+    return "private, no-cache"
+
+
 async def _can_edit_map(
     map_obj: Map,
     user: Identity | None,
@@ -258,10 +300,15 @@ async def _can_edit_map(
     if user is None:
         return False
     user_roles = await get_user_roles(db, user)
-    is_admin = "admin" in user_roles
-    is_editor = "editor" in user_roles
-    is_owner = map_obj.created_by == user.id
-    return is_admin or (is_editor and is_owner)
+    matrix = await get_effective_permissions(db)
+    granted = await get_permission_extension().check_permission(
+        db,
+        user,
+        "edit_metadata",
+        user_roles=user_roles,
+        permission_matrix=matrix,
+    )
+    return granted and ("admin" in user_roles or map_obj.created_by == user.id)
 
 
 def _build_map_response(
@@ -269,7 +316,18 @@ def _build_map_response(
     layers: list[MapLayerResponse],
     forked_from_name: str | None = None,
     created_by_username: str | None = None,
+    *,
+    terrain_dataset_ids: set[str] | None = None,
 ) -> MapResponse:
+    """Build the map response.
+
+    ``terrain_dataset_ids`` is for reads filtered by what the caller may see:
+    the stored terrain binding then survives only when its DEM is one of those
+    ids, so a hidden DEM's id is not echoed.
+    """
+    terrain_config = map_obj.terrain_config
+    if terrain_dataset_ids is not None:
+        terrain_config = project_terrain_config(terrain_config, terrain_dataset_ids)
     thumbnail_url = f"/maps/{map_obj.id}/thumbnail/" if map_obj.thumbnail_uri else None
     og_image_url = f"/maps/{map_obj.id}/og-image/" if map_obj.og_image_uri else None
     return MapResponse(
@@ -285,7 +343,7 @@ def _build_map_response(
         basemap_style=map_obj.basemap_style,
         show_basemap_labels=map_obj.show_basemap_labels,
         basemap_config=map_obj.basemap_config,
-        terrain_config=map_obj.terrain_config,
+        terrain_config=terrain_config,
         visibility=map_obj.visibility,
         thumbnail_url=thumbnail_url,
         og_image_url=og_image_url,

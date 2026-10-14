@@ -9,6 +9,8 @@ from ...types import Response
 from ... import errors
 
 from ...models.problem_detail import ProblemDetail
+from ...types import File
+from io import BytesIO
 from uuid import UUID
 
 
@@ -28,10 +30,24 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | ProblemDetail | None:
+) -> Any | File | ProblemDetail | None:
     if response.status_code == 200:
-        response_200 = cast(Any, None)
+        response_200 = File(payload=BytesIO(response.content))
+
         return response_200
+
+    if response.status_code == 206:
+        response_206 = File(payload=BytesIO(response.content))
+
+        return response_206
+
+    if response.status_code == 302:
+        response_302 = cast(Any, None)
+        return response_302
+
+    if response.status_code == 304:
+        response_304 = cast(Any, None)
+        return response_304
 
     if response.status_code == 400:
         response_400 = ProblemDetail.from_dict(response.json())
@@ -86,7 +102,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | ProblemDetail]:
+) -> Response[Any | File | ProblemDetail]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -98,14 +114,18 @@ def _build_response(
 def sync_detailed(
     dataset_id: UUID,
     *,
-    client: AuthenticatedClient,
-) -> Response[Any | ProblemDetail]:
+    client: AuthenticatedClient | Client,
+) -> Response[Any | File | ProblemDetail]:
     """Download Cog
 
      Download the Cloud-Optimized GeoTIFF for a raster dataset.
 
-    Local storage: streams the COG file with Content-Type image/tiff.
-    S3 storage: returns a 302 redirect to a presigned GET URL (1-hour expiry).
+    On S3 storage with presigned downloads enabled, answers 302 to a
+    short-lived presigned URL (at most 5 minutes, and never past the expiry of
+    a ``?token=`` download token); otherwise streams the object with
+    Content-Type image/tiff. Even then, a GET carrying If-Match, or a resume
+    whose If-Range no longer matches, is streamed. A COG imported by reference
+    redirects to its origin.
     Accepts standard auth or ?token= JWT query parameter for browser downloads.
 
     ``user`` may be None when a no-sub anonymous
@@ -122,7 +142,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | ProblemDetail]
+        Response[Any | File | ProblemDetail]
     """
 
     kwargs = _get_kwargs(
@@ -139,14 +159,18 @@ def sync_detailed(
 def sync(
     dataset_id: UUID,
     *,
-    client: AuthenticatedClient,
-) -> Any | ProblemDetail | None:
+    client: AuthenticatedClient | Client,
+) -> Any | File | ProblemDetail | None:
     """Download Cog
 
      Download the Cloud-Optimized GeoTIFF for a raster dataset.
 
-    Local storage: streams the COG file with Content-Type image/tiff.
-    S3 storage: returns a 302 redirect to a presigned GET URL (1-hour expiry).
+    On S3 storage with presigned downloads enabled, answers 302 to a
+    short-lived presigned URL (at most 5 minutes, and never past the expiry of
+    a ``?token=`` download token); otherwise streams the object with
+    Content-Type image/tiff. Even then, a GET carrying If-Match, or a resume
+    whose If-Range no longer matches, is streamed. A COG imported by reference
+    redirects to its origin.
     Accepts standard auth or ?token= JWT query parameter for browser downloads.
 
     ``user`` may be None when a no-sub anonymous
@@ -163,7 +187,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | ProblemDetail
+        Any | File | ProblemDetail
     """
 
     return sync_detailed(
@@ -175,14 +199,18 @@ def sync(
 async def asyncio_detailed(
     dataset_id: UUID,
     *,
-    client: AuthenticatedClient,
-) -> Response[Any | ProblemDetail]:
+    client: AuthenticatedClient | Client,
+) -> Response[Any | File | ProblemDetail]:
     """Download Cog
 
      Download the Cloud-Optimized GeoTIFF for a raster dataset.
 
-    Local storage: streams the COG file with Content-Type image/tiff.
-    S3 storage: returns a 302 redirect to a presigned GET URL (1-hour expiry).
+    On S3 storage with presigned downloads enabled, answers 302 to a
+    short-lived presigned URL (at most 5 minutes, and never past the expiry of
+    a ``?token=`` download token); otherwise streams the object with
+    Content-Type image/tiff. Even then, a GET carrying If-Match, or a resume
+    whose If-Range no longer matches, is streamed. A COG imported by reference
+    redirects to its origin.
     Accepts standard auth or ?token= JWT query parameter for browser downloads.
 
     ``user`` may be None when a no-sub anonymous
@@ -199,7 +227,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | ProblemDetail]
+        Response[Any | File | ProblemDetail]
     """
 
     kwargs = _get_kwargs(
@@ -214,14 +242,18 @@ async def asyncio_detailed(
 async def asyncio(
     dataset_id: UUID,
     *,
-    client: AuthenticatedClient,
-) -> Any | ProblemDetail | None:
+    client: AuthenticatedClient | Client,
+) -> Any | File | ProblemDetail | None:
     """Download Cog
 
      Download the Cloud-Optimized GeoTIFF for a raster dataset.
 
-    Local storage: streams the COG file with Content-Type image/tiff.
-    S3 storage: returns a 302 redirect to a presigned GET URL (1-hour expiry).
+    On S3 storage with presigned downloads enabled, answers 302 to a
+    short-lived presigned URL (at most 5 minutes, and never past the expiry of
+    a ``?token=`` download token); otherwise streams the object with
+    Content-Type image/tiff. Even then, a GET carrying If-Match, or a resume
+    whose If-Range no longer matches, is streamed. A COG imported by reference
+    redirects to its origin.
     Accepts standard auth or ?token= JWT query parameter for browser downloads.
 
     ``user`` may be None when a no-sub anonymous
@@ -238,7 +270,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | ProblemDetail
+        Any | File | ProblemDetail
     """
 
     return (

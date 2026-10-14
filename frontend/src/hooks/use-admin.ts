@@ -25,7 +25,6 @@ import {
   getInfrastructure,
   getEmbeddingStats,
   triggerBackfill,
-  updateSemanticSearch,
 } from '@/api/admin';
 import type { ApiKeyScope } from '@/types/api';
 import { toast } from 'sonner';
@@ -59,11 +58,12 @@ export function useUserList(params: {
   });
 }
 
-export function useUserNames() {
+export function useUserNames(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: queryKeys.admin.userNames,
     queryFn: listUserNames,
     staleTime: 60_000,
+    enabled: options?.enabled,
   });
 }
 
@@ -108,7 +108,10 @@ export function useAdminJobs(params: {
     refetchInterval: (q) => {
       const jobs = q.state.data?.jobs ?? [];
       const hasActive = jobs.some((j) => j.status === 'pending' || j.status === 'running');
-      return hasActive ? 3_000 : false;
+      if (hasActive) return 3_000;
+      // Accepting a held replacement changes no job status, so a page showing
+      // one is rechecked slowly.
+      return jobs.some((j) => j.review_state === 'awaiting') ? 15_000 : false;
     },
     refetchIntervalInBackground: false,
   });
@@ -203,7 +206,7 @@ export function useCreateUser() {
 export function useUpdateUser() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ userId, data }: { userId: string; data: { email?: string; is_active?: boolean; status?: 'active' | 'suspended' | 'deactivated'; role?: string } }) =>
+    mutationFn: ({ userId, data }: { userId: string; data: { email?: string | null; is_active?: boolean; status?: 'active' | 'suspended' | 'deactivated'; role?: string } }) =>
       updateUser(userId, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: queryKeys.admin.allUsers });
@@ -436,11 +439,18 @@ export function useEmbeddingStats(options?: { enabled?: boolean }) {
   });
 }
 
-// Backfill embeddings
+// Backfill embeddings. allTenants also queues a run for every other tenant in a
+// multi-tenant deployment; a single-tenant one ignores it.
+export interface BackfillOptions {
+  force?: boolean;
+  allTenants?: boolean;
+}
+
 export function useBackfillEmbeddings() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (force?: boolean) => triggerBackfill(force),
+    mutationFn: ({ force = false, allTenants = false }: BackfillOptions = {}) =>
+      triggerBackfill(force, allTenants),
     // Refetch so the response exposes the run in flight and starts progress polling.
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: queryKeys.admin.embeddingStats });
@@ -510,22 +520,6 @@ export function useBackfillJobStatus(jobId: string | null) {
   }, [jobId, status, query.data?.rows_failed, qc]);
 
   return query;
-}
-
-// Semantic search toggle
-export function useUpdateSemanticSearch() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (enabled: boolean) => updateSemanticSearch(enabled),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: queryKeys.admin.aiStatus });
-      qc.invalidateQueries({ queryKey: queryKeys.settings.all });
-    },
-    onError: (err) => {
-      logger.error('[useUpdateSemanticSearch]', err);
-      toast.error(i18n.t('admin:errors.semanticSearchFailed'));
-    },
-  });
 }
 
 // Infrastructure

@@ -2,15 +2,27 @@
 
 [English](README.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [简体中文](README.zh.md)
 
-**您团队的自托管空间数据枢纽：在一个地方完成搜索、制图与共享。**
+**将分散的 GIS 文件转为可搜索的目录和可共享的地图，全部部署在您自己的基础设施上。**
 
-GeoLens 是一个面向 GIS 和数据团队的开源空间数据枢纽：在您自己掌控的基础设施上查找和使用数据，全程无遥测。GeoLens 本身不会主动连接任何外部服务，唯一的例外是默认底图瓦片——在管理员配置其他底图之前，它们从 tiles.openfreemap.org 加载。（您主动启用的其他功能可能产生出站请求：连接您所选的 OpenAI 兼容端点或 Anthropic 密钥的 AI 助手、OAuth/OIDC 登录、SMTP、远程/S3 数据源以及异地备份。）上传文件、在浏览器中创建数据集、免复制地注册 GeoLens 自身 PostGIS 数据库中已有的表、从 WFS、ArcGIS FeatureServer 或 OGC API Features 导入一次性副本，或实时引用远程 STAC 资产。GeoLens 记录每个数据集的来源，开箱即用地用 pg_trgm 索引目录元数据以支持模糊搜索（配置嵌入提供方并启用语义搜索后，pgvector 还会带来语义排序），并通过 OGC/STAC API 让 QGIS、ArcGIS 和 MapLibre 客户端原生连接。直接在浏览器中组合、样式化并共享多图层地图。基于 FastAPI 和 React 构建。一条命令完成部署。
+GeoLens 将文件、数据库表、服务快照和远程资产汇集到由您掌控的空间目录中。搜索元数据、预览数据，并始终查看每个数据集的来源。在浏览器中创建地图，发布链接或嵌入内容，同时继续使用 QGIS、开放标准和团队现有工具。
 
 <p align="center">
   <a href="https://demo.getgeolens.com"><img src="https://img.shields.io/badge/%E2%96%B6%20Try%20the%20live%20demo-demo.getgeolens.com-2563eb?style=for-the-badge" alt="试用在线演示" /></a>
   <br />
   <sub>无需安装。无需账号即可浏览示例目录和地图，或使用 Google、GitHub 或 Microsoft 登录体验地图构建器。演示数据可能随时被清除。</sub>
 </p>
+
+<p align="center">
+  <a href="https://demo.getgeolens.com/maps"><img src=".github/assets/geolens-manhattan-3d-hero.jpg" alt="GeoLens 地图构建器：曼哈顿建筑轮廓挤出成 3D 天际线并按建造年代着色，地图旁是地铁图层和可拖拽排序的图层栈" width="900" /></a>
+  <br />
+  <em>地图构建器：曼哈顿每栋建筑按真实屋顶高度挤出并按建造年代着色，地铁在下方穿行——由开放数据通过 <code>scripts/seed-showcase.py</code> 生成</em>
+</p>
+
+## 您可以做什么
+
+- **查找数据集：** 在一个目录中搜索已上传文件、数据库表和已导入的服务快照。
+- **构建和共享地图：** 在浏览器中组合多图层地图，然后发布链接或嵌入到团队工作的地方。
+- **继续使用现有工具：** 通过 OGC/STAC API 和直接瓦片 URL 连接 QGIS、ArcGIS、MapLibre 和脚本。
 
 [![CI](https://github.com/geolens-io/geolens/actions/workflows/ci.yml/badge.svg)](https://github.com/geolens-io/geolens/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -23,11 +35,11 @@ curl -fsSL https://getgeolens.com/install.sh | sh
 # Open http://localhost:8080, then log in with the credentials you chose
 ```
 
-<p align="center">
-  <img src=".github/assets/geolens-manhattan-3d-hero.jpg" alt="GeoLens 地图构建器：曼哈顿建筑轮廓挤出成 3D 天际线并按建造年代着色，地图旁是地铁图层和可拖拽排序的图层栈" width="900" />
-  <br />
-  <em>地图构建器：曼哈顿每栋建筑按真实屋顶高度挤出并按建造年代着色，地铁在下方穿行——由开放数据通过 <code>scripts/seed-showcase.py</code> 生成</em>
-</p>
+## 隐私、出站连接与数据源
+
+GeoLens 不使用遥测，也不会主动连接外部服务；唯一例外是默认底图瓦片，在管理员配置其他提供商之前从 tiles.openfreemap.org 加载。您主动启用的功能可能产生出站请求：连接您选择的 OpenAI 兼容端点或 Anthropic 密钥的 AI 助手、OAuth/OIDC 登录、SMTP、远程或 S3 数据源以及异地备份。
+
+您可以上传文件、在浏览器中创建数据集，或免复制注册 GeoLens 自身 PostGIS 数据库中已有的表。从 WFS、ArcGIS FeatureServer 或 OGC API Features 导入会创建一次性副本；远程 STAC 资产仍为实时引用。GeoLens 记录每个数据集的来源，使用 pg_trgm 索引元数据以支持模糊搜索；配置嵌入提供方并启用该功能后，还可通过 pgvector 增加语义排序。
 
 > [!NOTE]
 > **API 稳定性。** 标准化接口（OGC API Features/Records、STAC
@@ -201,7 +213,7 @@ PostGIS 和 pgvector 共享同一个数据库，因此启用语义搜索后，�
 
 **前置条件：** Docker Engine 24+ 和 Docker Compose v2。自带的服务栈内置
 PostgreSQL 18。如果您将 GeoLens 指向外部管理的数据库，它必须是
-**PostgreSQL 13+**（为了 `gen_random_uuid()`）并带 **pgvector 0.5+**
+**PostgreSQL 15+**（为了 `NULLS NOT DISTINCT` 唯一索引）并带 **pgvector 0.5+**
 （为了 HNSW 语义搜索索引），另需 PostGIS、pg_trgm 和 unaccent。API 和
 worker 运行在容器中（内置 Python 3.14，无需宿主机 Python）。可选的 CLI
 运行在宿主机上，需要 Python 3.11+；Python SDK 和种子脚本需要
@@ -363,7 +375,7 @@ flowchart TB
 | 栅格瓦片 | Titiler（COG 瓦片服务） |
 | 对象存储 | MinIO（S3 兼容，本地开发）或任意 S3 提供方 |
 | 缓存 | Valkey（瓦片与查询缓存） |
-| 数据库 | PostgreSQL 18 + PostGIS 3.6 + pgvector + pg_trgm（最低要求：PostgreSQL 13、pgvector 0.5） |
+| 数据库 | PostgreSQL 18 + PostGIS 3.6 + pgvector + pg_trgm（最低要求：PostgreSQL 15、pgvector 0.5） |
 | 反向代理 | Nginx（生产）/ Vite 开发代理（开发） |
 
 ## 配置

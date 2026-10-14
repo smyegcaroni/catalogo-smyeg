@@ -17,7 +17,7 @@
  * the IdP registration exactly.
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
@@ -74,6 +74,7 @@ import {
 import { queryKeys } from '@/lib/query-keys';
 import { useInvalidateAuthProviders } from '@/hooks/use-auth-providers';
 import { triggerDownload } from '@/lib/download';
+import { ApiError } from '@/api/client';
 import { Textarea } from '@/components/ui/textarea';
 
 function slugify(name: string): string {
@@ -173,7 +174,11 @@ export function SamlProvidersSection() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingProvider, setEditingProvider] = useState<SamlProviderConfig | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<SamlProviderConfig | null>(null);
+  const [adminRoleConfirmOpen, setAdminRoleConfirmOpen] = useState(false);
   const [form, setForm] = useState<SamlFormData>(EMPTY_FORM);
+  const [certError, setCertError] = useState<string | null>(null);
+  const [mappingError, setMappingError] = useState<string | null>(null);
+  const mappingRef = useRef<HTMLTextAreaElement>(null);
 
   /**
    * Build a sensible default sp_entity_id for the current slug, using the
@@ -207,12 +212,16 @@ export function SamlProvidersSection() {
 
   function openAddDialog() {
     setEditingProvider(null);
+    setCertError(null);
+    setMappingError(null);
     setForm({ ...EMPTY_FORM });
     setDialogOpen(true);
   }
 
   function openEditDialog(provider: SamlProviderConfig) {
     setEditingProvider(provider);
+    setCertError(null);
+    setMappingError(null);
     setForm({
       display_name: provider.display_name,
       slug: provider.slug,
@@ -240,15 +249,38 @@ export function SamlProvidersSection() {
     }
   }
 
-  function handleSubmit() {
+  function handleSaveError(err: unknown) {
+    const detail = err instanceof ApiError && err.status === 422 ? err.body : null;
+    if (
+      Array.isArray(detail) &&
+      detail.some((d) => Array.isArray(d?.loc) && d.loc.includes('idp_certificate'))
+    ) {
+      setCertError(t('saml.certInvalid'));
+    }
+  }
+
+  function handleSubmit(adminRoleConfirmed = false) {
     let groupMapping: Record<string, string> | null = null;
     if (form.group_role_mapping.trim()) {
       try {
         groupMapping = JSON.parse(form.group_role_mapping);
       } catch {
-        toast.error(t('saml.invalidJson'));
+        setMappingError(t('saml.invalidJson'));
+        mappingRef.current?.focus();
         return;
       }
+    }
+
+    if (!editingProvider && !form.idp_certificate) {
+      toast.error(t('saml.certRequired'));
+      return;
+    }
+
+    const grantsAdmin = form.default_role === 'admin'
+      || Object.values(groupMapping ?? {}).includes('admin');
+    if (grantsAdmin && !adminRoleConfirmed) {
+      setAdminRoleConfirmOpen(true);
+      return;
     }
 
     if (editingProvider) {
@@ -271,13 +303,9 @@ export function SamlProvidersSection() {
       }
       updateMutation.mutate(
         { id: editingProvider.id, data },
-        { onSuccess: () => setDialogOpen(false) },
+        { onSuccess: () => setDialogOpen(false), onError: handleSaveError },
       );
     } else {
-      if (!form.idp_certificate) {
-        toast.error(t('saml.certRequired'));
-        return;
-      }
       const data: SamlProviderCreateData = {
         slug: form.slug,
         display_name: form.display_name,
@@ -291,7 +319,10 @@ export function SamlProvidersSection() {
         group_role_mapping: groupMapping,
         enabled: form.enabled,
       };
-      createMutation.mutate(data, { onSuccess: () => setDialogOpen(false) });
+      createMutation.mutate(data, {
+        onSuccess: () => setDialogOpen(false),
+        onError: handleSaveError,
+      });
     }
   }
 
@@ -300,11 +331,7 @@ export function SamlProvidersSection() {
   return (
     <>
       <div className="space-y-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="text-base font-medium">{t('saml.title')}</h3>
-            <p className="text-sm text-muted-foreground">{t('saml.description')}</p>
-          </div>
+        <div className="flex items-center justify-end">
           <Button size="sm" onClick={openAddDialog}>
             <Plus className="me-1 h-4 w-4" />
             {t('saml.addProvider')}
@@ -458,8 +485,13 @@ export function SamlProvidersSection() {
                 id="saml-idp-certificate"
                 className="min-h-[140px] text-xs font-mono"
                 value={form.idp_certificate}
-                onChange={(e) =>
-                  setForm((prev) => ({ ...prev, idp_certificate: e.target.value }))
+                onChange={(e) => {
+                  setCertError(null);
+                  setForm((prev) => ({ ...prev, idp_certificate: e.target.value }));
+                }}
+                aria-invalid={certError ? true : undefined}
+                aria-describedby={
+                  certError ? 'saml-idp-certificate-hint saml-idp-certificate-error' : 'saml-idp-certificate-hint'
                 }
                 placeholder={
                   editingProvider
@@ -467,7 +499,14 @@ export function SamlProvidersSection() {
                     : '-----BEGIN CERTIFICATE-----\nMIIC...\n-----END CERTIFICATE-----'
                 }
               />
-              <p className="text-xs text-muted-foreground">{t('saml.idpCertificateHint')}</p>
+              <p id="saml-idp-certificate-hint" className="text-xs text-muted-foreground">
+                {t('saml.idpCertificateHint')}
+              </p>
+              {certError && (
+                <p id="saml-idp-certificate-error" role="alert" className="text-xs text-destructive">
+                  {certError}
+                </p>
+              )}
             </div>
 
             <div className="space-y-2">
@@ -486,14 +525,14 @@ export function SamlProvidersSection() {
             </div>
 
             <div className="space-y-2">
-              <Label>{t('saml.defaultRole')}</Label>
+              <Label htmlFor="saml-default-role">{t('saml.defaultRole')}</Label>
               <Select
                 value={form.default_role}
                 onValueChange={(v) =>
                   setForm((prev) => ({ ...prev, default_role: v }))
                 }
               >
-                <SelectTrigger className="w-full">
+                <SelectTrigger id="saml-default-role" className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -521,16 +560,29 @@ export function SamlProvidersSection() {
               <Label htmlFor="saml-group-role-mapping">{t('saml.groupRoleMapping')}</Label>
               <Textarea
                 id="saml-group-role-mapping"
+                ref={mappingRef}
                 className="min-h-[80px]"
                 value={form.group_role_mapping}
-                onChange={(e) =>
-                  setForm((prev) => ({ ...prev, group_role_mapping: e.target.value }))
+                onChange={(e) => {
+                  setMappingError(null);
+                  setForm((prev) => ({ ...prev, group_role_mapping: e.target.value }));
+                }}
+                aria-invalid={mappingError ? true : undefined}
+                aria-describedby={
+                  mappingError
+                    ? 'saml-group-role-mapping-hint saml-group-role-mapping-error'
+                    : 'saml-group-role-mapping-hint'
                 }
                 placeholder='{"IdP Group": "viewer", "Admins": "admin"}'
               />
-              <p className="text-xs text-muted-foreground">
+              <p id="saml-group-role-mapping-hint" className="text-xs text-muted-foreground">
                 {t('saml.groupRoleMappingHint')}
               </p>
+              {mappingError && (
+                <p id="saml-group-role-mapping-error" role="alert" className="text-xs text-destructive">
+                  {mappingError}
+                </p>
+              )}
             </div>
 
             <div className="flex items-center gap-3">
@@ -550,7 +602,7 @@ export function SamlProvidersSection() {
               {t('common:cancel')}
             </Button>
             <Button
-              onClick={handleSubmit}
+              onClick={() => handleSubmit()}
               disabled={
                 isMutating ||
                 !form.slug ||
@@ -565,6 +617,25 @@ export function SamlProvidersSection() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog open={adminRoleConfirmOpen} onOpenChange={setAdminRoleConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('settings.auth.adminRoleConfirmTitle')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {form.default_role === 'admin'
+                ? t('settings.auth.adminRoleConfirmDescription')
+                : t('settings.auth.adminGroupConfirmDescription')}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('common:cancel')}</AlertDialogCancel>
+            <AlertDialogAction variant="destructive" onClick={() => handleSubmit(true)}>
+              {t('settings.auth.adminRoleConfirm')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Delete Confirmation */}
       <AlertDialog

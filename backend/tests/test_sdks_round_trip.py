@@ -39,6 +39,7 @@ import shutil
 import socket
 import subprocess
 import sys as _sys
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 
@@ -74,6 +75,10 @@ if str(_SDK_PY_PATH) not in _sys.path:
 
 from geolens.auth import GeolensClient  # noqa: E402
 from geolens.client import AuthenticatedClient, Client  # noqa: E402
+from geolens.models.reupload_commit_request import ReuploadCommitRequest  # noqa: E402
+from geolens.models.service_auth_request import ServiceAuthRequest  # noqa: E402
+from geolens.models.stac_item_summary import StacItemSummary  # noqa: E402
+from geolens.types import UNSET  # noqa: E402
 
 # Phase 278 TEST-09: lift the 3 TypeScript-round-trip skip preconditions to
 # module-level constants so the conditional skips become @pytest.mark.skipif
@@ -173,6 +178,663 @@ class TestPythonAuthWrapperUnit:
         assert c.client is c._client
 
 
+# ------------------- Model field compatibility (older server) -------------------
+
+
+class TestPythonModelOptionalFieldCompatibility:
+    """A Python SDK version can run a version ahead of the GeoLens server it
+    talks to — unlike the web app, which always ships bundled with its own
+    API. A field the SDK knows about but an older server never sent must
+    come back ``UNSET``, not raise ``KeyError``; that only holds if the
+    generated model's own field stays optional (a ``default=None`` on the
+    backend schema, not just nullable) once it exists."""
+
+    def test_stac_item_summary_from_dict_tolerates_a_missing_optional_field(
+        self,
+    ) -> None:
+        # Shaped like an older server's /services/stac/search response:
+        # every required field present, data_asset_import_refusal simply
+        # doesn't exist yet.
+        raw = {"id": "item-1", "title": "Item 1", "asset_count": 1}
+        item = StacItemSummary.from_dict(raw)
+        assert item.data_asset_import_refusal is UNSET
+
+
+class TestPythonModelPositionalSlots:
+    """A field added to a request model never takes a slot a caller already fills."""
+
+    def test_a_positional_auth_on_a_reupload_commit_stays_auth(self) -> None:
+        auth = ServiceAuthRequest(method="bearer", token="t")
+        request = ReuploadCommitRequest(None, None, None, None, auth)
+        assert request.auth is auth
+        assert request.to_dict()["auth"]["method"] == "bearer"
+        assert "review_fingerprint" not in request.to_dict()
+
+
+# ------------------- Binary downloads -------------------
+
+
+class TestPointCloudDownload:
+    """The convenience calls return a point cloud file's bytes, whole or ranged."""
+
+    @pytest.mark.parametrize("status", [200, 206])
+    def test_sync_and_asyncio_return_the_file(self, status: int) -> None:
+        from geolens.api.datasets import (
+            get_pointcloud_file_datasets_dataset_id_copc_attempt_id_name_copc_laz_get as download,
+        )
+        from geolens.types import File
+
+        body = b"LASF" + bytes(range(64))
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status,
+                content=body,
+                headers={"Content-Type": "application/vnd.laszip+copc"},
+            )
+
+        client = AuthenticatedClient(
+            base_url="http://sdk.test",
+            token=uuid4().hex,
+            httpx_args={"transport": httpx.MockTransport(respond)},
+        )
+        ids = {"dataset_id": uuid4(), "attempt_id": uuid4(), "name": "data"}
+
+        synced = download.sync(**ids, client=client)
+        awaited = asyncio.run(download.asyncio(**ids, client=client))
+
+        for result in (synced, awaited):
+            assert isinstance(result, File)
+            assert result.payload.read() == body
+
+
+class TestFeaturesGeojsonDownload:
+    """The convenience calls return the parsed FeatureCollection, not None."""
+
+    def test_sync_and_asyncio_return_the_collection(self) -> None:
+        from geolens.api.features import (
+            get_features_geojson_z_endpoint_datasets_dataset_id_features_geojson_get as fetch,
+        )
+
+        body = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "id": 1,
+                    "geometry": {"type": "Point", "coordinates": [1.0, 2.0, 3.0]},
+                    "properties": {"name": "a"},
+                },
+                {"type": "Feature", "id": 2, "geometry": None, "properties": {}},
+            ],
+            "truncated": False,
+            "total_count": 2,
+        }
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json=body, headers={"Content-Type": "application/geo+json"}
+            )
+
+        client = AuthenticatedClient(
+            base_url="http://sdk.test",
+            token=uuid4().hex,
+            httpx_args={"transport": httpx.MockTransport(respond)},
+        )
+        dataset_id = uuid4()
+
+        synced = fetch.sync(dataset_id, client=client)
+        awaited = asyncio.run(fetch.asyncio(dataset_id, client=client))
+
+        for result in (synced, awaited):
+            assert result is not None
+            payload = result.to_dict()
+            assert payload["features"][0]["geometry"]["coordinates"] == [1.0, 2.0, 3.0]
+            assert payload["truncated"] is False
+            assert payload["features"][1]["geometry"] is None
+            assert payload["total_count"] == 2
+
+
+class TestCogDownload:
+    """sync() and asyncio() return the COG download's bytes for 200 and 206."""
+
+    @pytest.mark.parametrize("status", [200, 206])
+    def test_sync_and_asyncio_return_the_file(self, status: int) -> None:
+        from geolens.api.datasets_export import (
+            download_cog_datasets_dataset_id_download_cog_get as download,
+        )
+        from geolens.types import File
+
+        body = b"II*\x00" + bytes(range(64))  # a TIFF byte-order marker + filler
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status, content=body, headers={"Content-Type": "image/tiff"}
+            )
+
+        client = AuthenticatedClient(
+            base_url="http://sdk.test",
+            token=uuid4().hex,
+            httpx_args={"transport": httpx.MockTransport(respond)},
+        )
+        dataset_id = uuid4()
+
+        synced = download.sync(dataset_id=dataset_id, client=client)
+        awaited = asyncio.run(download.asyncio(dataset_id=dataset_id, client=client))
+
+        for result in (synced, awaited):
+            assert isinstance(result, File)
+            assert result.payload.read() == body
+
+
+class TestExportDownload:
+    """sync() and asyncio() return the export's bytes.
+
+    One format stands in for the whole set here (schemas.ExportFormat) —
+    every format is declared with the identical binary schema
+    (_EXPORT_BODY), so the generated parse code is the same for all of them.
+    """
+
+    @pytest.mark.parametrize("status", [200, 206])
+    def test_sync_and_asyncio_return_the_file(self, status: int) -> None:
+        from geolens.api.datasets import (
+            export_dataset_endpoint_datasets_dataset_id_export_get as download,
+        )
+        from geolens.types import File
+
+        body = b"GPKG-bytes-not-real-sqlite" + bytes(range(32))
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status,
+                content=body,
+                headers={"Content-Type": "application/geopackage+sqlite3"},
+            )
+
+        client = AuthenticatedClient(
+            base_url="http://sdk.test",
+            token=uuid4().hex,
+            httpx_args={"transport": httpx.MockTransport(respond)},
+        )
+        dataset_id = uuid4()
+
+        synced = download.sync(dataset_id=dataset_id, client=client)
+        awaited = asyncio.run(download.asyncio(dataset_id=dataset_id, client=client))
+
+        for result in (synced, awaited):
+            assert isinstance(result, File)
+            assert result.payload.read() == body
+
+
+class TestTiles3dFileDownload:
+    """sync() and asyncio() return a 3D Tiles file's bytes.
+
+    Parametrized across a JSON file (tileset.json) and a binary one (a GLB
+    tile) — both must come back as bytes, not a parsed dict, which is the
+    failure mode _TILES3D_BODY's exclusion of "application/json" guards
+    against (see the router's comment).
+    """
+
+    @pytest.mark.parametrize("content_type", ["application/json", "model/gltf-binary"])
+    def test_sync_and_asyncio_return_the_file(self, content_type: str) -> None:
+        from geolens.api.datasets import (
+            get_tileset_file_datasets_dataset_id_tiles3d_path_get as download,
+        )
+        from geolens.types import File
+
+        body = (
+            b'{"asset": {"version": "1.1"}}'
+            if "json" in content_type
+            else b"glTF" + bytes(range(32))
+        )
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, content=body, headers={"Content-Type": content_type}
+            )
+
+        client = AuthenticatedClient(
+            base_url="http://sdk.test",
+            token=uuid4().hex,
+            httpx_args={"transport": httpx.MockTransport(respond)},
+        )
+        ids = {"dataset_id": uuid4(), "path": "0/tileset.json"}
+
+        synced = download.sync(**ids, client=client)
+        awaited = asyncio.run(download.asyncio(**ids, client=client))
+
+        for result in (synced, awaited):
+            assert isinstance(result, File)
+            assert result.payload.read() == body
+
+
+class TestCogAndExportNotModified:
+    """A 304 from the COG download or export is a declared status, so
+    raise_on_unexpected_status=True doesn't raise on a cache hit.
+    """
+
+    def test_cog_304_does_not_raise(self) -> None:
+        from geolens.api.datasets_export import (
+            download_cog_datasets_dataset_id_download_cog_get as download,
+        )
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(304, headers={"ETag": '"abc123"'})
+
+        client = AuthenticatedClient(
+            base_url="http://sdk.test",
+            token=uuid4().hex,
+            httpx_args={"transport": httpx.MockTransport(respond)},
+            raise_on_unexpected_status=True,
+        )
+
+        result = download.sync_detailed(dataset_id=uuid4(), client=client)
+
+        assert result.status_code == 304
+
+    def test_export_304_does_not_raise(self) -> None:
+        from geolens.api.datasets import (
+            export_dataset_endpoint_datasets_dataset_id_export_get as download,
+        )
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(304, headers={"ETag": '"abc123"'})
+
+        client = AuthenticatedClient(
+            base_url="http://sdk.test",
+            token=uuid4().hex,
+            httpx_args={"transport": httpx.MockTransport(respond)},
+            raise_on_unexpected_status=True,
+        )
+
+        result = download.sync_detailed(dataset_id=uuid4(), client=client)
+
+        assert result.status_code == 304
+
+
+class _Storage:
+    """Stands in for every host reached over a real network transport."""
+
+    def __init__(self, body: bytes) -> None:
+        self.seen: list[httpx.Request] = []
+        self.respond = lambda request: httpx.Response(200, content=body)
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        self.seen.append(request)
+        return self.respond(request)
+
+
+class TestCogDownloadRedirect:
+    """geolens.cog_download returns the COG on every storage backend.
+
+    The GeoLens client answers through its own MockTransport; the storage
+    host is whatever a fresh httpx client reaches, captured by patching the
+    real network transports.
+    """
+
+    _BODY = b"II*\x00" + bytes(range(64))
+    _STORAGE_URL = "https://storage.test/bucket/cog.tif?X-Amz-Signature=abc123"
+    _AUTH = {
+        "bearer": {},
+        "api_key": {"prefix": "", "auth_header_name": "X-API-Key"},
+    }
+
+    @pytest.fixture
+    def storage(self, monkeypatch: pytest.MonkeyPatch) -> _Storage:
+        storage = _Storage(self._BODY)
+
+        async def handle_async(_transport, request: httpx.Request) -> httpx.Response:
+            return storage.handle(request)
+
+        monkeypatch.setattr(
+            httpx.HTTPTransport,
+            "handle_request",
+            lambda _transport, request: storage.handle(request),
+        )
+        monkeypatch.setattr(
+            httpx.AsyncHTTPTransport, "handle_async_request", handle_async
+        )
+        return storage
+
+    def _client(
+        self,
+        respond,
+        *,
+        auth: str = "api_key",
+        secrets: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        **kwargs,
+    ) -> tuple[AuthenticatedClient, list[httpx.Request]]:
+        secrets = secrets or {
+            name: uuid4().hex for name in ("token", "header", "cookie")
+        }
+        sent: list[httpx.Request] = []
+
+        def record(request: httpx.Request) -> httpx.Response:
+            sent.append(request)
+            return respond(request)
+
+        client = AuthenticatedClient(
+            base_url="http://sdk.test/api",
+            token=secrets["token"],
+            headers={"X-Custom-Header": secrets["header"], **(headers or {})},
+            cookies={"geolens_session": secrets["cookie"]},
+            httpx_args={"transport": httpx.MockTransport(record)},
+            **self._AUTH[auth],
+            **kwargs,
+        )
+        return client, sent
+
+    def _redirect_to(self, location: str):
+        return lambda request: httpx.Response(302, headers={"Location": location})
+
+    def _download(self, mode: str, client: AuthenticatedClient):
+        from geolens import cog_download
+
+        if mode == "sync":
+            return cog_download.sync(uuid4(), client=client)
+        return asyncio.run(cog_download.asyncio(uuid4(), client=client))
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    @pytest.mark.parametrize("auth", ["bearer", "api_key"])
+    def test_302_target_gets_the_bytes_and_no_geolens_credentials(
+        self, storage: _Storage, auth: str, mode: str
+    ) -> None:
+        from geolens.types import File
+
+        secrets = {name: uuid4().hex for name in ("token", "header", "cookie")}
+        client, sent = self._client(
+            self._redirect_to(self._STORAGE_URL), auth=auth, secrets=secrets
+        )
+
+        result = self._download(mode, client)
+
+        assert isinstance(result, File)
+        assert result.payload.read() == self._BODY
+        # The GeoLens request carried every credential, so their absence
+        # below is the helper's doing.
+        (geolens_request,) = sent
+        joined = " ".join(geolens_request.headers.values())
+        assert all(secret in joined for secret in secrets.values())
+        (fetched,) = storage.seen
+        assert fetched.url == self._STORAGE_URL
+        for name in ("Authorization", "X-API-Key", "Cookie", "X-Custom-Header"):
+            assert name not in fetched.headers
+        joined = " ".join(fetched.headers.values())
+        assert not any(secret in joined for secret in secrets.values())
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    def test_client_that_follows_redirects_still_sends_no_credentials(
+        self, storage: _Storage, mode: str
+    ) -> None:
+        client, sent = self._client(
+            self._redirect_to(self._STORAGE_URL), follow_redirects=True
+        )
+
+        assert self._download(mode, client).payload.read() == self._BODY
+        assert len(sent) == 1
+        (fetched,) = storage.seen
+        assert "X-API-Key" not in fetched.headers
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    def test_same_host_storage_redirect_is_followed_without_credentials(
+        self, storage: _Storage, mode: str
+    ) -> None:
+        storage.respond = lambda request: (
+            httpx.Response(307, headers={"Location": "/bucket/moved.tif"})
+            if request.url.path == "/bucket/cog.tif"
+            else httpx.Response(200, content=self._BODY)
+        )
+        client, _ = self._client(self._redirect_to(self._STORAGE_URL))
+
+        assert self._download(mode, client).payload.read() == self._BODY
+        assert [str(request.url) for request in storage.seen] == [
+            self._STORAGE_URL,
+            "https://storage.test/bucket/moved.tif",
+        ]
+        assert all("X-API-Key" not in request.headers for request in storage.seen)
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    def test_storage_redirect_to_another_host_raises(
+        self, storage: _Storage, mode: str
+    ) -> None:
+        from geolens.errors import UnexpectedStatus
+
+        storage.respond = lambda request: (
+            httpx.Response(302, headers={"Location": "http://internal.test/meta"})
+            if request.url.host == "storage.test"
+            else httpx.Response(200, content=b"not the COG")
+        )
+        client, _ = self._client(self._redirect_to(self._STORAGE_URL))
+
+        with pytest.raises(UnexpectedStatus) as raised:
+            self._download(mode, client)
+        assert raised.value.status_code == 302
+        assert "internal.test" in str(raised.value)
+        assert [request.url.host for request in storage.seen] == ["storage.test"]
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    def test_storage_redirect_from_http_to_https_is_followed(
+        self, storage: _Storage, mode: str
+    ) -> None:
+        storage.respond = lambda request: (
+            httpx.Response(301, headers={"Location": "https://storage.test/cog.tif"})
+            if request.url.scheme == "http"
+            else httpx.Response(200, content=self._BODY)
+        )
+        client, _ = self._client(self._redirect_to("http://storage.test/cog.tif"))
+
+        assert self._download(mode, client).payload.read() == self._BODY
+        assert [request.url.scheme for request in storage.seen] == ["http", "https"]
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    def test_storage_redirect_from_https_to_http_raises(
+        self, storage: _Storage, mode: str
+    ) -> None:
+        from geolens.errors import UnexpectedStatus
+
+        storage.respond = lambda request: (
+            httpx.Response(302, headers={"Location": "http://storage.test/cog.tif"})
+            if request.url.scheme == "https"
+            else httpx.Response(200, content=self._BODY)
+        )
+        client, _ = self._client(self._redirect_to(self._STORAGE_URL))
+
+        with pytest.raises(UnexpectedStatus):
+            self._download(mode, client)
+        assert [request.url.scheme for request in storage.seen] == ["https"]
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    def test_storage_redirects_past_the_limit_raise(
+        self, storage: _Storage, mode: str
+    ) -> None:
+        from geolens import cog_download
+        from geolens.errors import UnexpectedStatus
+
+        # Stops redirecting on its own after 20 hops, so a missing limit fails
+        # the test instead of hanging it.
+        storage.respond = lambda request: (
+            httpx.Response(302, headers={"Location": f"/hop/{len(storage.seen)}"})
+            if len(storage.seen) <= 20
+            else httpx.Response(200, content=self._BODY)
+        )
+        client, _ = self._client(self._redirect_to(self._STORAGE_URL))
+
+        with pytest.raises(UnexpectedStatus):
+            self._download(mode, client)
+        assert len(storage.seen) == cog_download._MAX_STORAGE_REDIRECTS + 1
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    def test_relative_location_resolves_against_the_request_url(
+        self, storage: _Storage, mode: str
+    ) -> None:
+        client, _ = self._client(self._redirect_to("/files/cog.tif"))
+
+        assert self._download(mode, client).payload.read() == self._BODY
+        (fetched,) = storage.seen
+        assert fetched.url == "http://sdk.test/files/cog.tif"
+        assert "X-API-Key" not in fetched.headers
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    @pytest.mark.parametrize(
+        "location",
+        ["ftp://storage.test/cog.tif", "file:///etc/passwd", "https:/cog.tif"],
+    )
+    def test_non_http_location_raises(
+        self, storage: _Storage, location: str, mode: str
+    ) -> None:
+        client, _ = self._client(self._redirect_to(location))
+
+        with pytest.raises(ValueError, match="unsupported URL"):
+            self._download(mode, client)
+        assert storage.seen == []
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    @pytest.mark.parametrize("if_match", ['"v1"', '"v0"'])
+    def test_range_and_preconditions_reach_the_target(
+        self, storage: _Storage, if_match: str, mode: str
+    ) -> None:
+        from geolens.errors import UnexpectedStatus
+        from geolens.types import File
+
+        def answer(request: httpx.Request) -> httpx.Response:
+            if request.headers.get("if-match") != '"v1"':
+                return httpx.Response(412)
+            return httpx.Response(206, content=self._BODY[2:6])
+
+        storage.respond = answer
+        secrets = {name: uuid4().hex for name in ("token", "header", "cookie")}
+        client, _ = self._client(
+            self._redirect_to(self._STORAGE_URL),
+            secrets=secrets,
+            headers={"Range": "bytes=2-5", "If-Match": if_match},
+        )
+
+        if if_match == '"v1"':
+            result = self._download(mode, client)
+            assert isinstance(result, File)
+            assert result.payload.read() == self._BODY[2:6]
+        else:
+            with pytest.raises(UnexpectedStatus) as raised:
+                self._download(mode, client)
+            assert raised.value.status_code == 412
+        (fetched,) = storage.seen
+        assert fetched.headers["Range"] == "bytes=2-5"
+        assert fetched.headers["If-Match"] == if_match
+        for name in ("Authorization", "X-API-Key", "Cookie", "X-Custom-Header"):
+            assert name not in fetched.headers
+        joined = " ".join(fetched.headers.values())
+        assert not any(secret in joined for secret in secrets.values())
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            ("If-None-Match", '"remote-etag"'),
+            ("If-Modified-Since", "Wed, 01 Jan 2025 00:00:00 GMT"),
+        ],
+    )
+    def test_not_modified_target_returns_none(
+        self, storage: _Storage, condition: tuple[str, str], mode: str
+    ) -> None:
+        name, value = condition
+        storage.respond = lambda request: httpx.Response(304)
+        client, _ = self._client(
+            self._redirect_to(self._STORAGE_URL), headers={name: value}
+        )
+
+        assert self._download(mode, client) is None
+        assert storage.seen[0].headers[name] == value
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    @pytest.mark.parametrize(
+        "status", [304, 302], ids=["unconditional-304", "302-without-location"]
+    )
+    def test_target_3xx_that_is_not_an_answer_raises(
+        self, storage: _Storage, status: int, mode: str
+    ) -> None:
+        from geolens.errors import UnexpectedStatus
+
+        storage.respond = lambda request: httpx.Response(status)
+        client, _ = self._client(self._redirect_to(self._STORAGE_URL))
+
+        with pytest.raises(UnexpectedStatus) as raised:
+            self._download(mode, client)
+        assert raised.value.status_code == status
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    def test_failed_storage_fetch_raises(self, storage: _Storage, mode: str) -> None:
+        from geolens.errors import UnexpectedStatus
+
+        storage.respond = lambda request: httpx.Response(403, content=b"expired")
+        client, _ = self._client(self._redirect_to(self._STORAGE_URL))
+
+        with pytest.raises(UnexpectedStatus) as raised:
+            self._download(mode, client)
+        assert raised.value.status_code == 403
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    @pytest.mark.parametrize("status", [200, 206])
+    def test_local_storage_returns_the_body(
+        self, storage: _Storage, status: int, mode: str
+    ) -> None:
+        from geolens.types import File
+
+        client, _ = self._client(
+            lambda request: httpx.Response(status, content=self._BODY)
+        )
+
+        result = self._download(mode, client)
+
+        assert isinstance(result, File)
+        assert result.payload.read() == self._BODY
+        assert storage.seen == []
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    @pytest.mark.parametrize("route", ["local", "redirected"])
+    def test_large_cog_is_spooled_to_disk(
+        self, storage: _Storage, route: str, mode: str
+    ) -> None:
+        import tempfile
+
+        from geolens import cog_download
+
+        body = os.urandom(cog_download.SPOOL_MAX_SIZE + 1024 * 1024)
+        if route == "local":
+            client, _ = self._client(lambda request: httpx.Response(200, content=body))
+        else:
+            storage.respond = lambda request: httpx.Response(200, content=body)
+            client, _ = self._client(self._redirect_to(self._STORAGE_URL))
+
+        payload = self._download(mode, client).payload
+
+        assert isinstance(payload, tempfile.SpooledTemporaryFile)
+        # Rolled over: the bytes are in a file on disk, not held in memory.
+        assert payload._rolled
+        assert payload.read() == body
+        payload.close()
+
+    @pytest.mark.parametrize("mode", ["sync", "asyncio"])
+    def test_generated_call_does_not_raise_on_302(self, mode: str) -> None:
+        from geolens.api.datasets_export import (
+            download_cog_datasets_dataset_id_download_cog_get as download,
+        )
+
+        client, _ = self._client(
+            self._redirect_to(self._STORAGE_URL), raise_on_unexpected_status=True
+        )
+
+        if mode == "sync":
+            result = download.sync_detailed(dataset_id=uuid4(), client=client)
+        else:
+            result = asyncio.run(
+                download.asyncio_detailed(dataset_id=uuid4(), client=client)
+            )
+
+        assert result.status_code == 302
+        assert result.headers["location"] == self._STORAGE_URL
+
+
 # ------------------- Optional request bodies (regeneration guard) -------------------
 
 
@@ -264,6 +926,105 @@ class TestOptionalRequestBodyIsOmitted:
         assert request.read() == b""
 
 
+# ------------------- Anonymous-capable client typing (regeneration guard) -------------------
+
+
+class TestAnonymousCapableEndpointAcceptsPlainClient:
+    """An operation whose security allows anonymous access (one alternative is
+    ``{}``) must still accept GeolensClient's plain ``Client``, not only
+    ``AuthenticatedClient`` — openapi-python-client types it from
+    ``bool(security)`` alone, ignoring the ``{}`` alternative.
+    """
+
+    def _anonymous_capable_operations(self) -> set[tuple[str, str]]:
+        spec = json.loads(
+            (_REPO_ROOT / "backend" / "openapi.json").read_text(encoding="utf-8")
+        )
+        http_methods = {
+            "get",
+            "post",
+            "put",
+            "patch",
+            "delete",
+            "head",
+            "options",
+            "trace",
+        }
+        operations: set[tuple[str, str]] = set()
+        for path, methods in spec.get("paths", {}).items():
+            for method, operation in methods.items():
+                if method not in http_methods:
+                    continue
+                security = operation.get("security")
+                if security and any(alternative == {} for alternative in security):
+                    operations.add((path, method))
+        return operations
+
+    def _endpoint_key(self, source: str) -> tuple[str, str] | None:
+        """Recover the (path, method) an endpoint module was generated for."""
+        method_match = re.search(r'"method":\s*"([a-z]+)"', source)
+        url_match = re.search(r'"url":\s*"([^"]*)"', source)
+        if not method_match or not url_match:
+            return None
+        return url_match.group(1), method_match.group(1)
+
+    def test_the_sdk_still_has_anonymous_capable_endpoints_to_guard(self) -> None:
+        """Guard the guard: an empty sweep would pass the test below vacuously."""
+        assert self._anonymous_capable_operations(), (
+            "No anonymous-capable operations found in backend/openapi.json. Either "
+            "the API stopped allowing anonymous access anywhere, or this scan "
+            "stopped matching — verify before deleting."
+        )
+
+    def test_every_anonymous_capable_endpoint_accepts_a_plain_client(self) -> None:
+        anonymous = self._anonymous_capable_operations()
+        api_root = _SDK_PY_PATH / "geolens" / "api"
+        narrow_client = "    client: AuthenticatedClient,\n"
+
+        unmatched = set(anonymous)
+        unwidened: list[str] = []
+        for path in sorted(api_root.rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            key = self._endpoint_key(source)
+            if key is None or key not in anonymous:
+                continue
+            unmatched.discard(key)
+            if narrow_client in source:
+                unwidened.append(str(path.relative_to(_SDK_PY_PATH)))
+
+        assert not unmatched, (
+            "No generated module found for anonymous-capable operation(s); the "
+            "generator may have dropped or renamed them:\n  "
+            + "\n  ".join(
+                f"{method.upper()} {path}" for path, method in sorted(unmatched)
+            )
+        )
+        assert not unwidened, (
+            "These anonymous-capable endpoints still type `client` as "
+            "AuthenticatedClient only, so GeolensClient's plain Client (anonymous "
+            "mode) fails a type check calling them. Run `make sdks` (which applies "
+            "scripts/fix_sdk_anonymous_client.py) and commit the result:\n  "
+            + "\n  ".join(unwidened)
+        )
+
+    def test_a_plain_client_completes_an_anonymous_capable_call(self) -> None:
+        """A plain ``Client`` actually completes the call, against a mocked transport."""
+        from geolens.api.search import search_datasets_endpoint_search_datasets_get
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"numberMatched": 0, "numberReturned": 0, "features": []},
+            )
+
+        client = Client(
+            base_url="http://sdk.test",
+            httpx_args={"transport": httpx.MockTransport(respond)},
+        )
+        resp = search_datasets_endpoint_search_datasets_get.sync_detailed(client=client)
+        assert resp.status_code == 200, resp.content
+
+
 # --------------------------- Round-trip tests (Python) ---------------------------
 
 
@@ -335,56 +1096,190 @@ class TestPythonRoundTrip:
         assert resp.status_code == 404, resp.content
 
     @pytest.mark.anyio
-    async def test_ingest_upload(self, client, admin_auth_header) -> None:
-        """ROADMAP SC#1: POST /ingest/upload round-trip.
+    async def test_ingest_upload(
+        self, client, admin_auth_header, test_db_session
+    ) -> None:
+        """POST /ingest/upload with a real file creates the staged ingest job."""
+        from sqlalchemy import select, text
 
-        The generated ``BodyUploadFileIngestUploadPost.to_multipart()`` packs
-        the file field as ``str(self.file).encode()`` with ``text/plain`` MIME
-        — that's a known generator quirk for OpenAPI ``binary`` form fields.
-        Backend's ``upload_file`` handler validates filename + extension; we
-        accept any non-5xx status as proof the SDK's request shape reaches the
-        handler. ROADMAP SC#1 says "round-trip succeeds" — we read that as
-        "request reaches the route, gets a structured response".
-        """
         from app.api.main import app
+        from app.platform.jobs.models import IngestJob
         from geolens.api.datasets import upload_file_ingest_upload_post
         from geolens.models.body_upload_file_ingest_upload_post import (
             BodyUploadFileIngestUploadPost,
         )
+        from geolens.types import File
 
         token = admin_auth_header["Authorization"].removeprefix("Bearer ")
         sdk = GeolensClient(base_url="http://test", bearer_token=token)
         _wire_asgi_transport(sdk, app)
 
-        # Tiny GeoJSON payload as the file body. The generator's to_multipart()
-        # will encode this as text/plain — backend will parse the multipart and
-        # then likely 422 on extension check (filename is None per generator),
-        # but the request shape itself is round-tripped.
+        payload = json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "geometry": {"type": "Point", "coordinates": [0, 0]},
+                        "properties": {"name": "origin"},
+                    }
+                ],
+            }
+        ).encode()
         body = BodyUploadFileIngestUploadPost(
-            file=json.dumps(
-                {
-                    "type": "FeatureCollection",
-                    "features": [
-                        {
-                            "type": "Feature",
-                            "geometry": {
-                                "type": "Point",
-                                "coordinates": [0, 0],
-                            },
-                            "properties": {"name": "origin"},
-                        }
-                    ],
-                }
+            file=File(
+                payload=BytesIO(payload),
+                file_name="origin.geojson",
+                mime_type="application/geo+json",
             )
         )
         resp = await upload_file_ingest_upload_post.asyncio_detailed(
             client=sdk.client,
             body=body,
         )
-        assert resp.status_code < 500, (
-            f"5xx from /ingest/upload — SDK request shape reached the server "
-            f"as malformed: {resp.status_code} {resp.content!r}"
+        assert resp.status_code == 201, resp.content
+        job_id = resp.parsed.job_id
+        try:
+            job = (
+                await test_db_session.execute(
+                    select(IngestJob).where(IngestJob.id == job_id)
+                )
+            ).scalar_one()
+            assert job.source_filename == "origin.geojson"
+        finally:
+            await test_db_session.rollback()
+            await test_db_session.execute(
+                text("DELETE FROM catalog.ingest_jobs WHERE id = :id"), {"id": job_id}
+            )
+            await test_db_session.commit()
+
+    @pytest.mark.anyio
+    async def test_reupload_body_reaches_the_handler(
+        self, client, admin_auth_header
+    ) -> None:
+        """A real file part passes request validation, so an unknown dataset is a 404."""
+        from app.api.main import app
+        from geolens.api.datasets_reupload import (
+            reupload_dataset_datasets_dataset_id_reupload_post,
         )
+        from geolens.models.body_reupload_dataset_datasets_dataset_id_reupload_post import (
+            BodyReuploadDatasetDatasetsDatasetIdReuploadPost,
+        )
+        from geolens.types import File
+
+        token = admin_auth_header["Authorization"].removeprefix("Bearer ")
+        sdk = GeolensClient(base_url="http://test", bearer_token=token)
+        _wire_asgi_transport(sdk, app)
+
+        resp = (
+            await reupload_dataset_datasets_dataset_id_reupload_post.asyncio_detailed(
+                dataset_id=uuid4(),
+                client=sdk.client,
+                body=BodyReuploadDatasetDatasetsDatasetIdReuploadPost(
+                    file=File(payload=BytesIO(b"{}"), file_name="new.geojson")
+                ),
+            )
+        )
+        assert resp.status_code == 404, resp.content
+
+    @pytest.mark.anyio
+    async def test_icon_upload_and_png_endpoints_return_bytes(
+        self, client, admin_auth_header, test_db_session
+    ) -> None:
+        """An uploaded icon is served back as bytes, and so is the sprite sheet."""
+        from sqlalchemy import text
+
+        from app.api.main import app
+        from geolens.api.maps import (
+            get_geolens_sprite_png_endpoint_maps_sprites_geolens_png_get as sprite_png,
+        )
+        from geolens.api.maps import (
+            get_map_icon_asset_endpoint_maps_icons_icon_id_asset_get as icon_asset,
+        )
+        from geolens.api.maps import upload_map_icon_endpoint_maps_icons_post
+        from geolens.models.body_upload_map_icon_endpoint_maps_icons_post import (
+            BodyUploadMapIconEndpointMapsIconsPost,
+        )
+        from geolens.types import File
+
+        token = admin_auth_header["Authorization"].removeprefix("Bearer ")
+        sdk = GeolensClient(base_url="http://test", bearer_token=token)
+        _wire_asgi_transport(sdk, app)
+
+        svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"></svg>'
+        created = await upload_map_icon_endpoint_maps_icons_post.asyncio_detailed(
+            client=sdk.client,
+            body=BodyUploadMapIconEndpointMapsIconsPost(
+                file=File(
+                    payload=BytesIO(svg),
+                    file_name="dot.svg",
+                    mime_type="image/svg+xml",
+                )
+            ),
+        )
+        assert created.status_code == 201, created.content
+        icon_id = created.parsed.id
+        try:
+            served = await icon_asset.asyncio_detailed(
+                icon_id=icon_id, client=sdk.client
+            )
+            assert served.status_code == 200
+            assert served.content.startswith(b"<svg")
+            assert served.parsed.payload.read() == served.content
+
+            sheet = await sprite_png.asyncio_detailed(client=sdk.client)
+            assert sheet.status_code == 200
+            assert sheet.content.startswith(b"\x89PNG\r\n\x1a\n")
+            assert sheet.parsed.payload.read() == sheet.content
+        finally:
+            await test_db_session.rollback()
+            await test_db_session.execute(
+                text("DELETE FROM catalog.map_icon_assets WHERE id = :id"),
+                {"id": icon_id},
+            )
+            await test_db_session.commit()
+
+    @pytest.mark.anyio
+    async def test_a_tileset_upload_body_carries_its_kind(
+        self, client, admin_auth_header, test_db_session
+    ) -> None:
+        """The generated multipart body sends a named file and kind, and the door takes them."""
+        from sqlalchemy import select, text
+
+        from app.platform.jobs.models import IngestJob
+        from geolens.models.body_upload_file_ingest_upload_post import (
+            BodyUploadFileIngestUploadPost,
+        )
+        from geolens.types import File
+        from tests.tiles3d_archives import tileset_json, zip_bytes
+
+        archive = zip_bytes([("tileset.json", tileset_json()), ("0/0.glb", b"glb")])
+        parts = BodyUploadFileIngestUploadPost(
+            file=File(
+                payload=BytesIO(archive),
+                file_name="campus.zip",
+                mime_type="application/zip",
+            ),
+            kind="tiles3d",
+        ).to_multipart()
+        resp = await client.post(
+            "/ingest/upload", files=parts, headers=admin_auth_header
+        )
+        assert resp.status_code == 201, resp.text
+        job_id = resp.json()["job_id"]
+        try:
+            job = (
+                await test_db_session.execute(
+                    select(IngestJob).where(IngestJob.id == job_id)
+                )
+            ).scalar_one()
+            assert job.user_metadata["file_type"] == "tiles3d"
+        finally:
+            await test_db_session.rollback()
+            await test_db_session.execute(
+                text("DELETE FROM catalog.ingest_jobs WHERE id = :id"), {"id": job_id}
+            )
+            await test_db_session.commit()
 
     @pytest.mark.anyio
     async def test_api_key_auth_mode(self, client, admin_auth_header) -> None:
@@ -430,7 +1325,9 @@ class TestPythonRoundTrip:
     not _UVICORN_AVAILABLE,
     reason="uvicorn not installed (TS half needs a real HTTP server)",
 )
-async def test_typescript_round_trip(client, admin_auth_header) -> None:
+async def test_typescript_round_trip(
+    client, admin_auth_header, test_db_session
+) -> None:
     """Spawn a Node subprocess that exercises the TypeScript SDK against a
     uvicorn instance bound to a free port on 127.0.0.1.
 
@@ -444,6 +1341,7 @@ async def test_typescript_round_trip(client, admin_auth_header) -> None:
     node = shutil.which("node")
 
     import uvicorn
+    from sqlalchemy import text
 
     from app.api.main import app
 
@@ -501,6 +1399,25 @@ async def test_typescript_round_trip(client, admin_auth_header) -> None:
             f"STDOUT:\n{result.stdout}\n"
             f"STDERR:\n{result.stderr}"
         )
+        match = re.search(r"^UPLOAD_JOB_ID=(\S+)$", result.stdout, re.MULTILINE)
+        assert match, f"TS upload printed no job id:\n{result.stdout}"
+        job_id = match.group(1)
+        try:
+            row = (
+                await test_db_session.execute(
+                    text(
+                        "SELECT source_filename FROM catalog.ingest_jobs WHERE id = :id"
+                    ),
+                    {"id": job_id},
+                )
+            ).one()
+            assert row.source_filename == "tiny.geojson"
+        finally:
+            await test_db_session.rollback()
+            await test_db_session.execute(
+                text("DELETE FROM catalog.ingest_jobs WHERE id = :id"), {"id": job_id}
+            )
+            await test_db_session.commit()
     finally:
         server.should_exit = True
         try:

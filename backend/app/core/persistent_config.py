@@ -10,13 +10,14 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from collections.abc import Sequence
+import inspect
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Generic, TypeVar, cast
 
 import structlog
 from fastapi import HTTPException
 from pydantic import TypeAdapter, ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.platform.cache import get_cache
@@ -39,6 +40,8 @@ T = TypeVar("T")
 
 _CACHE_TTL = 30  # seconds
 _CACHE_PREFIX = "config:"
+# Marks an omitted ``old_value``; ``None`` is a real setting value.
+_UNSET: Any = object()
 
 _registry: list[PersistentConfig] = []
 
@@ -59,7 +62,6 @@ def _get_cache_safe() -> CacheProvider | None:
 
 # Sync cache for slowapi (cannot use async CacheProvider)
 _sync_rate_limit_cache: dict[str, tuple[Any, float]] = {}
-_DEFAULT_LOGIN_RATE_LIMIT = 5
 _DEFAULT_GLOBAL_RATE_LIMIT = 60
 _DEFAULT_SEMANTIC_SEARCH_RATE_LIMIT = 30
 _DEFAULT_BASEMAP_PROXY_RATE_LIMIT = 120
@@ -105,8 +107,10 @@ class PersistentConfig(Generic[T]):
         tab: str = "",
         label: str = "",
         env_default_factory: Any | None = None,
+        cache: bool = True,
     ) -> None:
         self.key = key
+        self._cache = cache
         self._type = type_
         self._adapter: TypeAdapter[T] = TypeAdapter(type_)
         self._env_default_static = env_default
@@ -125,8 +129,20 @@ class PersistentConfig(Generic[T]):
         # intentionally cast rather than assert non-None here.
         return cast(T, self._env_default_static)
 
+    async def resolved_default(
+        self, db: AsyncSession, settings: Mapping[str, object] | None = None
+    ) -> T:
+        """The value this key takes when it has no override.
+
+        ``settings`` is a prospective snapshot for keys whose default depends
+        on other settings; this one doesn't.
+        """
+        return self.env_default
+
     async def get(self, db: AsyncSession) -> T:
         """Resolve effective value: env_only -> cache -> DB -> env_default."""
+        if not self._cache:
+            return await self.get_uncached(db)
         if _is_env_only():
             return self.env_default
 
@@ -190,15 +206,22 @@ class PersistentConfig(Generic[T]):
         user_id: uuid.UUID | None = None,
         ip_address: str | None = None,
         commit: bool = True,
+        old_value: Any = _UNSET,
     ) -> None:
-        """Upsert value into app_settings, audit, and invalidate cache."""
+        """Upsert value into app_settings, audit, and invalidate cache.
+
+        A batch passes ``old_value`` as read before its first write, so a key
+        whose value depends on another key in the batch audits what was in
+        effect before the batch.
+        """
         if _is_env_only():
             raise HTTPException(
                 status_code=403,
                 detail="Configuration locked to environment variables",
             )
 
-        old_value = await self.get(db)
+        if old_value is _UNSET:
+            old_value = await self.get(db)
 
         result = await db.execute(select(AppSetting).where(AppSetting.key == self.key))
         existing = result.scalar_one_or_none()
@@ -272,8 +295,13 @@ class PersistentConfig(Generic[T]):
         user_id: uuid.UUID | None = None,
         ip_address: str | None = None,
         commit: bool = True,
+        old_value: Any = _UNSET,
+        settings: Mapping[str, object] | None = None,
     ) -> None:
         """Delete DB override, reverting to env_default. Audit and invalidate cache.
+
+        ``settings`` is the batch's prospective snapshot, so the audited new
+        value is the default that takes effect once the whole batch commits.
 
         fix(#430): pass ``commit=False`` to defer the DB commit to a caller's
         terminal commit (config-import overwrite mode), so a mid-import failure
@@ -285,7 +313,8 @@ class PersistentConfig(Generic[T]):
                 detail="Configuration locked to environment variables",
             )
 
-        old_value = await self.get(db)
+        if old_value is _UNSET:
+            old_value = await self.get(db)
 
         result = await db.execute(select(AppSetting).where(AppSetting.key == self.key))
         existing = result.scalar_one_or_none()
@@ -302,7 +331,7 @@ class PersistentConfig(Generic[T]):
                         details={
                             "setting_key": self.key,
                             "old_value": old_value,
-                            "new_value": self.env_default,
+                            "new_value": await self.resolved_default(db, settings),
                         },
                         ip_address=ip_address,
                     ),
@@ -393,9 +422,19 @@ REGISTRATION_ENABLED = PersistentConfig[bool](
 EMAIL_VERIFICATION_REQUIRED = PersistentConfig[bool](
     key="email_verification_required",
     type_=bool,
-    env_default=True,
+    env_default_factory=lambda: settings.email_verification_required,
     tab="auth",
     label="Require Email Verification",
+)
+
+# Granted when a password sign-up activates by verifying its email. Admin
+# approval names its own role, and SSO accounts use the provider's default_role.
+REGISTRATION_DEFAULT_ROLE = PersistentConfig[str](
+    key="registration_default_role",
+    type_=str,
+    env_default="viewer",
+    tab="auth",
+    label="Default Role for Self-Registration",
 )
 
 
@@ -557,7 +596,7 @@ REFRESH_TOKEN_EXPIRE_DAYS = PersistentConfig[int](
 LOGIN_RATE_LIMIT = PersistentConfig[int](
     key="login_rate_limit",
     type_=int,
-    env_default=_DEFAULT_LOGIN_RATE_LIMIT,
+    env_default_factory=lambda: settings.login_rate_limit,
     tab="auth",
     label="Login Rate Limit (per min)",
 )
@@ -568,7 +607,7 @@ LOGIN_RATE_LIMIT = PersistentConfig[int](
 ALLOWED_EMAIL_DOMAINS = PersistentConfig[list[str]](
     key="allowed_email_domains",
     type_=list[str],
-    env_default=[],
+    env_default_factory=lambda: settings.allowed_email_domains_list,
     tab="auth",
     label="Allowed Email Domains",
 )
@@ -580,7 +619,7 @@ ALLOWED_EMAIL_DOMAINS = PersistentConfig[list[str]](
 PASSWORD_LOGIN_ENABLED = PersistentConfig[bool](
     key="password_login_enabled",
     type_=bool,
-    env_default=True,
+    env_default_factory=lambda: settings.password_login_enabled,
     tab="auth",
     label="Password Login Enabled",
 )
@@ -593,6 +632,8 @@ AI_ENABLED = PersistentConfig[bool](
     label="AI Features Enabled",
 )
 
+# Uncached like the model settings, so a provider/model pair is read from the
+# same committed rows.
 LLM_PROVIDER = PersistentConfig[str](
     key="llm_provider",
     type_=str,
@@ -601,17 +642,185 @@ LLM_PROVIDER = PersistentConfig[str](
     ),
     tab="ai",
     label="LLM Provider",
+    cache=False,
 )
 
-LLM_MODEL = PersistentConfig[str](
-    key="llm_model",
-    type_=str,
-    env_default_factory=lambda: (
-        settings.llm_model if settings.anthropic_api_key else settings.openai_model
-    ),
-    tab="ai",
-    label="LLM Model",
+
+def llm_model_default(provider: str, *, light: bool = False) -> str:
+    """The model ``provider`` uses when no admin override is set."""
+    if provider == "anthropic":
+        return "claude-haiku-4-5-20251001" if light else settings.llm_model
+    if light:
+        # Reuse OPENAI_MODEL rather than a hardcoded name, which 404s on Azure
+        # OpenAI, gateways and Ollama, where it must match a real deployment.
+        return settings.openai_model_light or settings.openai_model
+    return settings.openai_model
+
+
+_MODEL_RESET_LOCK_SQL = text(
+    "LOCK TABLE catalog.app_settings IN SHARE ROW EXCLUSIVE MODE"
 )
+
+
+def _accepts_settings(resolver: Callable[..., object]) -> bool:
+    """Whether an extension's resolver takes the prospective ``settings``."""
+    params = inspect.signature(resolver).parameters.values()
+    return any(p.name == "settings" or p.kind is p.VAR_KEYWORD for p in params)
+
+
+async def prospective_settings(
+    db: AsyncSession, changes: Mapping[str, object]
+) -> dict[str, Any]:
+    """Committed setting values with a batch's ``changes`` applied.
+
+    A batch that clears a model override also holds off other settings writes
+    until its transaction ends, so the default it resolves is the one committed.
+    """
+    if any(is_unset_model(key, value) for key, value in changes.items()):
+        # A row lock can't stop the insert of a provider key that has no row.
+        await db.execute(_MODEL_RESET_LOCK_SQL)
+    return {**await _load_registry_values(db), **changes}
+
+
+def provider_model_kwargs(
+    cfg: PersistentConfig[Any], snapshot: Mapping[str, object]
+) -> dict[str, Any]:
+    """The ``settings=`` argument for a set/reset of ``cfg`` in a batch."""
+    return {"settings": snapshot} if isinstance(cfg, _ProviderModelConfig) else {}
+
+
+class _ProviderModelConfig(PersistentConfig[str]):
+    """A model setting whose default follows the selected LLM provider.
+
+    The stored default is empty, and a blank or whitespace value, including one
+    an older version stored, means no override; either resolves to the selected
+    provider's default on each read. Reads skip the shared cache: older releases
+    read ``config:<key>`` as the model itself and only ever evict that key, so
+    no cached copy stays coherent across a rolling deploy. Writes still evict
+    that key for them.
+    """
+
+    def __init__(self, key: str, *, light: bool, label: str) -> None:
+        super().__init__(
+            key, type_=str, env_default="", tab="ai", label=label, cache=False
+        )
+        self.light = light
+
+    async def default_for(
+        self,
+        db: AsyncSession,
+        provider: str,
+        runtime_config: dict[str, object] | None = None,
+        settings: Mapping[str, object] | None = None,
+    ) -> str:
+        """The model ``provider`` uses when no admin override is set.
+
+        A caller that already resolved the provider's runtime config passes it,
+        so the model and endpoint come from one snapshot. ``settings`` resolves
+        the provider against values not yet committed.
+
+        An extension provider, or an overlay under a built-in name, supplies its
+        own ``default_model`` through ``resolve_runtime_config``; without one
+        it takes the community default.
+        """
+        from app.core.ai_credentials import OpenAICredentialDestinationError
+        from app.platform.extensions import get_ai_provider
+        from app.platform.extensions.defaults import (
+            DefaultAnthropicProvider,
+            DefaultOpenAICompatibleProvider,
+        )
+
+        try:
+            ext = get_ai_provider(provider)
+        except ValueError:
+            return llm_model_default(provider, light=self.light)
+        built_in_resolvers = (
+            DefaultAnthropicProvider.resolve_runtime_config,
+            DefaultOpenAICompatibleProvider.resolve_runtime_config,
+        )
+        if type(ext).resolve_runtime_config not in built_in_resolvers:
+            # A stale endpoint must not stop the settings page or an import
+            # that would repair it; the call-time check still rejects it.
+            config = runtime_config
+            if config is None:
+                try:
+                    config = (
+                        await ext.resolve_runtime_config(db, settings=settings)
+                        if settings is not None
+                        and _accepts_settings(ext.resolve_runtime_config)
+                        else await ext.resolve_runtime_config(db)
+                    )
+                except OpenAICredentialDestinationError:
+                    config = {}
+            model = config.get("default_model")
+            if isinstance(model, str) and model.strip():
+                return model
+        return llm_model_default(provider, light=self.light)
+
+    async def resolved_default(
+        self, db: AsyncSession, settings: Mapping[str, object] | None = None
+    ) -> str:
+        provider = (
+            settings[LLM_PROVIDER.key]
+            if settings is not None and LLM_PROVIDER.key in settings
+            else await LLM_PROVIDER.get(db)
+        )
+        return await self.default_for(db, provider, settings=settings)
+
+    async def override(self, db: AsyncSession) -> str:
+        """The admin's model, or ``""`` when none is set."""
+        value = await super().get_uncached(db)
+        return value if value.strip() else ""
+
+    async def get_uncached(self, db: AsyncSession) -> str:
+        # get() lands here too, since this setting is uncached.
+        return await self.override(db) or await self.resolved_default(db)
+
+    async def for_provider(
+        self,
+        db: AsyncSession,
+        provider: str,
+        runtime_config: dict[str, object] | None = None,
+    ) -> str:
+        """The override, or ``provider``'s default, for a caller that has
+        already chosen the provider, so a concurrent switch can't pair it with
+        another provider's model."""
+        return await self.override(db) or await self.default_for(
+            db, provider, runtime_config
+        )
+
+    async def set(
+        self,
+        db: AsyncSession,
+        value: str,
+        *,
+        user_id: uuid.UUID | None = None,
+        ip_address: str | None = None,
+        commit: bool = True,
+        old_value: Any = _UNSET,
+        settings: Mapping[str, object] | None = None,
+    ) -> None:
+        if not value.strip():
+            await self.reset(
+                db,
+                user_id=user_id,
+                ip_address=ip_address,
+                commit=commit,
+                old_value=old_value,
+                settings=settings,
+            )
+            return
+        await super().set(
+            db,
+            value,
+            user_id=user_id,
+            ip_address=ip_address,
+            commit=commit,
+            old_value=old_value,
+        )
+
+
+LLM_MODEL = _ProviderModelConfig("llm_model", light=False, label="LLM Model")
 
 OPENAI_BASE_URL = PersistentConfig[str](
     key="openai_base_url",
@@ -661,20 +870,19 @@ AI_SEND_SAMPLE_VALUES = PersistentConfig[bool](
     label="Send Sample Values to LLM",
 )
 
-LLM_MODEL_LIGHT = PersistentConfig[str](
-    key="llm_model_light",
-    type_=str,
-    # Fall back to openai_model rather than a hardcoded model name — a
-    # hardcoded name 404s on Azure OpenAI/gateways/Ollama, where it must
-    # match a real deployment. Set OPENAI_MODEL_LIGHT for a cheaper model.
-    env_default_factory=lambda: (
-        "claude-haiku-4-5-20251001"
-        if settings.anthropic_api_key
-        else (settings.openai_model_light or settings.openai_model)
-    ),
-    tab="ai",
-    label="Light LLM Model (SQL/Metadata)",
+LLM_MODEL_LIGHT = _ProviderModelConfig(
+    "llm_model_light", light=True, label="Light LLM Model (SQL/Metadata)"
 )
+
+
+def is_unset_model(key: str, value: object) -> bool:
+    """Whether a stored model value is blank, which means the provider's default."""
+    return (
+        key in (LLM_MODEL.key, LLM_MODEL_LIGHT.key)
+        and isinstance(value, str)
+        and not value.strip()
+    )
+
 
 MAX_AI_TOKENS_PER_USER_PER_DAY = PersistentConfig[int](
     key="max_ai_tokens_per_user_per_day",
@@ -757,6 +965,25 @@ MAX_DATASETS_PER_USER = PersistentConfig[int](
 )
 
 
+async def _load_registry_values(db: AsyncSession) -> dict[str, Any]:
+    """Every registered key's override or env_default, model defaults unresolved."""
+    settings_dict: dict[str, Any] = {cfg.key: cfg.env_default for cfg in _registry}
+
+    if not _is_env_only():
+        result = await db.execute(select(AppSetting))
+        all_settings = {row.key: row.value for row in result.scalars().all()}
+        for cfg in _registry:
+            raw = all_settings.get(cfg.key)
+            if raw is not None:
+                # AppSetting.value is JSONB — unwrap the stored scalar wrapper
+                unwrapped = (
+                    raw if not isinstance(raw, dict) or "v" not in raw else raw["v"]
+                )
+                value, _ok = _validate_or_fallback(cfg, unwrapped)
+                settings_dict[cfg.key] = value
+    return settings_dict
+
+
 async def get_all_registry_values(db: AsyncSession) -> dict[str, Any]:
     """Batch-load all registry settings in a single DB query.
 
@@ -770,26 +997,14 @@ async def get_all_registry_values(db: AsyncSession) -> dict[str, Any]:
         an admin/settings dump endpoint that needs an atomic snapshot
         without N round-trips.
     """
-    settings_dict: dict[str, Any] = {}
+    settings_dict = await _load_registry_values(db)
 
-    if _is_env_only():
-        for cfg in _registry:
-            settings_dict[cfg.key] = cfg.env_default
-        return settings_dict
-
-    result = await db.execute(select(AppSetting))
-    all_settings = {row.key: row.value for row in result.scalars().all()}
-
-    for cfg in _registry:
-        raw = all_settings.get(cfg.key)
-        if raw is not None:
-            # AppSetting.value is JSONB — unwrap the stored scalar wrapper
-            unwrapped = raw if not isinstance(raw, dict) or "v" not in raw else raw["v"]
-            value, _ok = _validate_or_fallback(cfg, unwrapped)
-            settings_dict[cfg.key] = value
-        else:
-            settings_dict[cfg.key] = cfg.env_default
-
+    # A model without an override resolves against this snapshot's provider.
+    for model in (LLM_MODEL, LLM_MODEL_LIGHT):
+        if not settings_dict[model.key].strip():
+            settings_dict[model.key] = await model.default_for(
+                db, settings_dict[LLM_PROVIDER.key]
+            )
     return settings_dict
 
 
@@ -901,7 +1116,7 @@ def get_cached_login_rate_limit() -> int:
     cached = _sync_rate_limit_cache.get("login_rate_limit")
     if cached and (time.monotonic() - cached[1]) < _CACHE_TTL:
         return cached[0]
-    return _DEFAULT_LOGIN_RATE_LIMIT
+    return LOGIN_RATE_LIMIT.env_default
 
 
 def get_cached_global_rate_limit() -> int:

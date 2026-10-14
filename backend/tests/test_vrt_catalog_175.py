@@ -297,6 +297,12 @@ class TestDatasetToResponseVrt:
 # ---------------------------------------------------------------------------
 
 
+def _quicklook_request():
+    from starlette.requests import Request
+
+    return Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+
+
 class TestQuicklookVrt:
     """Quicklook guard accepts vrt_dataset (200); rejects vector_dataset (400)."""
 
@@ -339,6 +345,7 @@ class TestQuicklookVrt:
                     # Should not raise HTTPException 400 — guard passes for vrt_dataset
                     response = await get_quicklook(
                         dataset_id=dataset_id,
+                        request=_quicklook_request(),
                         size=256,
                         user=mock_user,
                         db=mock_db,
@@ -370,6 +377,7 @@ class TestQuicklookVrt:
                 with pytest.raises(HTTPException) as exc_info:
                     await get_quicklook(
                         dataset_id=dataset_id,
+                        request=_quicklook_request(),
                         size=256,
                         user=mock_user,
                         db=mock_db,
@@ -395,6 +403,7 @@ class TestQuicklookVrt:
             with pytest.raises(HTTPException) as exc_info:
                 await get_quicklook(
                     dataset_id=dataset_id,
+                    request=_quicklook_request(),
                     size=256,
                     user=mock_user,
                     db=mock_db,
@@ -682,43 +691,42 @@ class TestVrtSourcesEndpoint:
 
 
 class TestTileTokenVrt:
-    """CAT-04: raster tile auth accepts vrt_dataset record_type (regression guard).
+    """Raster tile auth accepts the vrt_dataset record_type.
 
-    The record_type guard lives in ``_resolve_raster_meta`` (the cached metadata
-    resolver) which is called by ``_resolve_raster_access``.  Tests inspect the
-    metadata resolver's source since that is where the guard lives.
+    The record_type guard lives in ``_read_raster_meta``, the metadata reader
+    behind ``_resolve_raster_meta`` and so behind ``_resolve_raster_access``.
+    Tests inspect the reader's source since that is where the guard lives.
     """
 
     def test_resolve_raster_access_accepts_vrt_dataset_record_type(self):
-        """_resolve_raster_meta accepts both raster_dataset and vrt_dataset.
+        """_read_raster_meta accepts both raster_dataset and vrt_dataset.
 
-        fix(#836): the guard now checks membership in the canonical
-        RASTER_FAMILY_RECORD_TYPES constant instead of an inline tuple literal,
-        so the CAT-04 assertion targets the constant plus its contents.
+        The guard checks membership in the canonical RASTER_FAMILY_RECORD_TYPES
+        constant rather than an inline tuple literal, so the assertion targets
+        the constant plus its contents.
         """
         import inspect
 
         import app.processing.tiles.router as tiles_module
         from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
 
-        # PERF-002: guard moved to _resolve_raster_meta (cached metadata resolver).
-        source = inspect.getsource(tiles_module._resolve_raster_meta)
+        # The guard lives in the reader every metadata cache path goes through.
+        source = inspect.getsource(tiles_module._read_raster_meta)
 
         assert "RASTER_FAMILY_RECORD_TYPES" in source, (
-            "_resolve_raster_meta must guard record_type via the canonical "
-            "raster family — CAT-04 regression: guard was updated in Phase 171"
+            "_read_raster_meta must guard record_type via the canonical raster family"
         )
         assert "vrt_dataset" in RASTER_FAMILY_RECORD_TYPES
 
     def test_resolve_raster_access_uses_tuple_guard_for_both_types(self):
-        """_resolve_raster_meta guards via the family covering both record types."""
+        """_read_raster_meta guards via the family covering both record types."""
         import inspect
 
         import app.processing.tiles.router as tiles_module
         from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
 
-        # PERF-002: guard moved to _resolve_raster_meta (cached metadata resolver).
-        source = inspect.getsource(tiles_module._resolve_raster_meta)
+        # The guard lives in the reader every metadata cache path goes through.
+        source = inspect.getsource(tiles_module._read_raster_meta)
 
         # Must reject non-raster types; the family constant carries both.
         assert "RASTER_FAMILY_RECORD_TYPES" in source
@@ -731,8 +739,8 @@ class TestTileTokenVrt:
 
         import app.processing.tiles.router as tiles_module
 
-        # PERF-002: guard moved to _resolve_raster_meta (cached metadata resolver).
-        source = inspect.getsource(tiles_module._resolve_raster_meta)
+        # The guard lives in the reader every metadata cache path goes through.
+        source = inspect.getsource(tiles_module._read_raster_meta)
 
         # Find the guard line that checks record_type
         lines = [
@@ -807,21 +815,18 @@ class TestSearchEnrichmentVrt:
                 return self._rows
 
         class FakeSession:
-            def __init__(self):
-                self.execute_count = 0
-
             async def execute(self, _stmt):
-                # PERF-02: blocks 1 and 4 use inner sessions (mocked below).
-                # The caller's `db` only sees the VRT source_count merge query
-                # in block 3, so the FIRST execute on the FakeSession is the
-                # VRT lookup.
-                self.execute_count += 1
-                if self.execute_count == 1:
-                    row = MagicMock()
-                    row.dataset_id = vrt.id
-                    row.source_count = 2
-                    return FakeExecuteResult(rows=[row])
                 return FakeExecuteResult()
+
+        counted: list[uuid.UUID] = []
+
+        async def fake_visible_vrt_source_counts(_db, vrt_ids, _user, _roles):
+            counted.extend(vrt_ids)
+            return {vrt_id: 2 for vrt_id in vrt_ids}
+
+        monkeypatch.setattr(
+            search_module, "visible_vrt_source_counts", fake_visible_vrt_source_counts
+        )
 
         # PERF-02: stub out the inner-session factory used by blocks 1 + 4.
         # Each inner block opens `async with async_session() as inner_db:`,
@@ -846,12 +851,13 @@ class TestSearchEnrichmentVrt:
         monkeypatch.setattr(_db_module, "async_session", _fake_async_session)
 
         _, raster_meta, _ = await search_module._bulk_fetch_dataset_metadata(
-            FakeSession(), [vector, raster, vrt]
+            FakeSession(), [vector, raster, vrt], None, set()
         )
 
         assert set(seen_ids) == {raster.id, vrt.id}
         assert vector.id not in seen_ids
         assert raster_meta[str(vrt.id)]["vrt_type"] == "mosaic"
+        assert counted == [vrt.id]
         assert raster_meta[str(vrt.id)]["source_count"] == 2
 
     def test_dataset_to_ogc_record_exposes_vrt_raster_meta_from_facade(self):

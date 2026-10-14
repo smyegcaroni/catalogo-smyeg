@@ -1,6 +1,6 @@
 import { useTranslation } from 'react-i18next';
-import { formatGsd, formatNumber, formatRelativeDate } from '@/lib/format';
-import { getGeometryTypeLabel } from '@/i18n/labels';
+import { formatBytes, formatGsd, formatNumber, formatRelativeDate } from '@/lib/format';
+import { getBoundingVolumeLabel, getGeometryTypeLabel, withCoordSuffix } from '@/i18n/labels';
 import { computeRasterGsd } from '@/lib/geo-utils';
 import type { DatasetResponse } from '@/types/api';
 import { cn } from '@/lib/utils';
@@ -85,6 +85,18 @@ export function DatasetStatsBar({ dataset, className }: DatasetStatsBarProps) {
         value: String(dataset.raster.source_count),
       });
     }
+  } else if (dataset.tileset) {
+    const { tileset } = dataset;
+    cells.push({ label: t('tileset.size'), value: formatBytes(tileset.size_bytes) });
+    if (tileset.version) {
+      cells.push({ label: t('tileset.version'), value: tileset.version });
+    }
+    if (tileset.bounding_volume) {
+      cells.push({
+        label: t('tileset.boundingVolume'),
+        value: getBoundingVolumeLabel(t, tileset.bounding_volume),
+      });
+    }
   } else {
     // Vector/Table stats
     if (dataset.feature_count != null) {
@@ -98,7 +110,7 @@ export function DatasetStatsBar({ dataset, className }: DatasetStatsBarProps) {
     if (dataset.geometry_type) {
       cells.push({
         label: t('metadata.geometry', { defaultValue: 'Geometry' }),
-        value: getGeometryTypeLabel(t, dataset.geometry_type),
+        value: getGeometryTypeLabel(t, withCoordSuffix(dataset.geometry_type, dataset.is_3d, dataset.n_dims)),
         mono: true,
       });
     }

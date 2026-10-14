@@ -11,6 +11,7 @@ from app.core.public_urls import (
     is_api_base_path,
     is_usable_public_origin,
 )
+from app.modules.auth.schemas import validate_role_name
 
 
 class BasemapEntry(BaseModel):
@@ -174,6 +175,10 @@ class SettingItem(BaseModel):
         description="Where the value came from: 'default' (built-in default), 'overridden' (admin set via UI), or 'env_only' (configured via environment variable, read-only)."
     )
     label: str = Field(description="Human-readable label for display in the admin UI.")
+    default_value: Any = Field(
+        default=None,
+        description="Runtime default the setting resets to. Reported only for embedding_dims, so the UI can tell whether a reset changes the live width.",
+    )
 
 
 class FeatureFlagsResponse(BaseModel):
@@ -601,7 +606,7 @@ def validate_allowed_email_domains(v: Any) -> list[str]:
 
     Imports domain helpers inline to avoid a circular-import risk at module load.
     """
-    from app.modules.auth.domain_validation import (
+    from app.platform.domain_validation import (
         is_domain_pattern_valid,
         normalize_domains,
     )
@@ -674,4 +679,5 @@ SETTING_VALIDATORS: dict[str, Any] = {
     "max_datasets_per_user": validate_max_datasets_per_user,
     "max_ai_tokens_per_user_per_day": validate_max_ai_tokens_per_user_per_day,
     "allowed_email_domains": validate_allowed_email_domains,
+    "registration_default_role": validate_role_name,
 }

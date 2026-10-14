@@ -1,5 +1,6 @@
 """Shared helpers for dataset routers."""
 
+import contextlib
 import uuid
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
@@ -7,26 +8,32 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.identity import Identity
+from app.core.pointcloud import pointcloud_path
 from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
 from app.core.tile_scope import tile_template_query
+from app.core.tiles3d import tileset_path
 from app.modules.auth.models import User
 from app.modules.catalog.datasets.domain.source_freshness import (
     compute_source_freshness,
 )
 from app.modules.catalog.datasets.domain.schemas import (
     DatasetResponse,
+    PointCloudMetadata,
     RasterBandInfo,
     RasterConnect,
     RasterMetadata,
+    TilesetMetadata,
 )
 from app.modules.catalog.sources.provenance import (
     UNKNOWN_ACTOR_LABEL,
     derive_last_edited,
     resolve_actor,
 )
-from app.core.geo import extent_to_bbox, wkt_is_geographic
+from app.core.geo import extent_to_bbox, raster_crs_facts
 from app.platform.dataset_origin import classify_origin, project_unknown
+from app.platform.storage.titiler_url import resolve_current_storage_key
 
 
 async def _load_actor_identities(
@@ -65,10 +72,18 @@ def _build_raster_metadata(
                 )
             )
 
-    # s3_uri exposed only to admins when storage backend is S3
+    # Admins see where a managed COG sits on an S3 install; the row's tag
+    # separates managed from remote bytes and doesn't name the store.
     s3_uri = None
-    if raster_asset.storage_backend == "s3" and is_admin:
-        s3_uri = raster_asset.asset_uri
+    if (
+        is_admin
+        and settings.storage_provider == "s3"
+        and raster_asset.storage_backend != "remote"
+    ):
+        # A hand-edited key the resolver refuses has no location to show.
+        with contextlib.suppress(ValueError):
+            key = resolve_current_storage_key(raster_asset.asset_uri)
+            s3_uri = f"s3://{settings.s3_bucket}/{key}"
 
     # fix(#821): ?api_key= is deprecated, but desktop GIS XYZ tile clients
     # can't send headers -- this placeholder is the sanctioned remaining use.
@@ -104,7 +119,7 @@ def _build_raster_metadata(
 
     return RasterMetadata(
         epsg=raster_asset.epsg,
-        crs_is_geographic=wkt_is_geographic(raster_asset.crs_wkt),
+        crs_is_geographic=raster_crs_facts(raster_asset)["crs_is_geographic"],
         res_x=raster_asset.res_x,
         res_y=raster_asset.res_y,
         band_count=raster_asset.band_count,
@@ -130,6 +145,8 @@ def dataset_to_response(
     collections=None,
     actors_by_id: Mapping[uuid.UUID, Identity] | None = None,
     raster_asset=None,
+    tileset_asset=None,
+    pointcloud_asset=None,
     is_admin: bool = False,
     source_count: int | None = None,
     base_url: str | None = None,
@@ -173,6 +190,35 @@ def dataset_to_response(
             source_count=source_count,
             base_url=base_url,
         )
+
+    tileset = (
+        TilesetMetadata(
+            url=f"/api{tileset_path(dataset.id)}",
+            size_bytes=tileset_asset.size_bytes,
+            version=dataset.tileset_version,
+            geometric_error=dataset.tileset_geometric_error,
+            bounding_volume=dataset.tileset_bounding_volume,
+            content_types=dataset.tileset_content_types,
+            extensions_required=dataset.tileset_extensions_required,
+        )
+        if record_type == "tiles3d_dataset" and tileset_asset is not None
+        else None
+    )
+    pointcloud = (
+        PointCloudMetadata(
+            url=(
+                f"/api{pointcloud_path(dataset.id, dataset.pointcloud_attempt_id)}"
+                if dataset.pointcloud_attempt_id is not None
+                else None
+            ),
+            size_bytes=pointcloud_asset.size_bytes,
+            point_count=dataset.pointcloud_point_count,
+            point_format=dataset.pointcloud_point_format,
+            vertical_crs=dataset.pointcloud_vertical_crs,
+        )
+        if record_type == "pointcloud_dataset" and pointcloud_asset is not None
+        else None
+    )
 
     # feat(#1218/#1224): resolved once -- serves as `origin` below and gates
     # source freshness, so the badge and freshness chip can't disagree.
@@ -260,6 +306,8 @@ def dataset_to_response(
         updated_by=record.updated_by,
         record_type=record_type,
         raster=raster_metadata,
+        tileset=tileset,
+        pointcloud=pointcloud,
         stac_assets=stac_assets,
         language=getattr(record, "language", None),
     )
@@ -285,3 +333,31 @@ async def dataset_geom_is_generic(db, table_name: str) -> bool:
     )
     col_type = result.scalar_one_or_none()
     return col_type is not None and col_type.strip().upper() == "GEOMETRY"
+
+
+class WorkflowTransitionDenied(ValueError):
+    """A refused publication stage change, with the stages as fields.
+
+    ``detail`` is the 422 body: ``message`` stays human-readable for clients
+    that only show text, and the stage names travel as fields so no reader
+    has to split them back out of the sentence.
+    """
+
+    def __init__(self, current: str, requested: str, allowed: Iterable[str]) -> None:
+        self.current = current
+        self.requested = requested
+        self.allowed = sorted(allowed)
+        super().__init__(
+            f"Cannot transition from '{current}' to '{requested}'. "
+            f"Allowed: {self.allowed}"
+        )
+
+    @property
+    def detail(self) -> dict[str, object]:
+        return {
+            "code": "workflow_transition_denied",
+            "message": str(self),
+            "current_stage": self.current,
+            "requested_stage": self.requested,
+            "allowed_stages": self.allowed,
+        }

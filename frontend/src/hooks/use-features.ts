@@ -43,11 +43,15 @@ export function useCreateFeature() {
       datasetId,
       geometry,
       properties,
+      idempotencyKey,
+      attempt,
     }: {
       datasetId: string;
       geometry: Geometry;
       properties?: Record<string, unknown>;
-    }) => createFeature(datasetId, geometry, properties),
+      idempotencyKey?: string;
+      attempt?: number;
+    }) => createFeature(datasetId, geometry, properties, idempotencyKey, attempt),
     onSuccess: (_data, variables) => {
       invalidateFeatureCaches(qc, variables.datasetId);
     },
@@ -65,12 +69,14 @@ export function useUpdateFeature() {
       gid,
       geometry,
       properties,
+      tableId,
     }: {
       datasetId: string;
       gid: number;
       geometry?: Geometry;
       properties?: Record<string, unknown>;
-    }) => updateFeature(datasetId, gid, geometry, properties),
+      tableId?: string | null;
+    }) => updateFeature(datasetId, gid, geometry, properties, tableId),
     onSuccess: (_data, variables) => {
       invalidateFeatureCaches(qc, variables.datasetId);
     },
@@ -86,10 +92,12 @@ export function useDeleteFeature() {
     mutationFn: ({
       datasetId,
       gid,
+      tableId,
     }: {
       datasetId: string;
       gid: number;
-    }) => deleteFeature(datasetId, gid),
+      tableId?: string | null;
+    }) => deleteFeature(datasetId, gid, tableId),
     onSuccess: (_data, variables) => {
       invalidateFeatureCaches(qc, variables.datasetId);
     },
@@ -114,6 +122,7 @@ export function useAddColumn() {
       qc.invalidateQueries({ queryKey: queryKeys.datasets.rowsPrefix(variables.datasetId) });
       qc.invalidateQueries({ queryKey: queryKeys.datasets.attributes(variables.datasetId) });
       invalidateColumnCaches(qc, variables.datasetId);
+      qc.invalidateQueries({ queryKey: queryKeys.relationships.listPrefix });
     },
   });
 }
@@ -133,6 +142,7 @@ export function useDropColumn() {
       qc.invalidateQueries({ queryKey: queryKeys.datasets.rowsPrefix(variables.datasetId) });
       qc.invalidateQueries({ queryKey: queryKeys.datasets.attributes(variables.datasetId) });
       invalidateColumnCaches(qc, variables.datasetId);
+      qc.invalidateQueries({ queryKey: queryKeys.relationships.listPrefix });
     },
   });
 }

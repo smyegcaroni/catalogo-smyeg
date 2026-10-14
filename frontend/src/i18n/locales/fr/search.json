@@ -1,4 +1,15 @@
 {
+  "mapsMatchingQuery": "Cartes correspondant à « {{query}} »",
+  "loadingMaps": "Chargement des cartes correspondantes...",
+  "mapsError": "Impossible de charger les cartes correspondantes.",
+  "retryMaps": "Relancer la recherche de cartes",
+  "mapsScopeHint": "Les cartes correspondent uniquement au texte recherché ; les filtres du catalogue ne s'appliquent pas.",
+  "catalogResults_one": "{{count}} résultat du catalogue",
+  "catalogResults_other": "{{count}} résultats du catalogue",
+  "catalogResults_many": "{{count}} résultats du catalogue",
+  "mapMatchCount_one": "{{count}} carte correspondante",
+  "mapMatchCount_other": "{{count}} cartes correspondantes",
+  "mapMatchCount_many": "{{count}} cartes correspondantes",
   "title": "Trouver des données géospatiales",
   "subtitle": "Recherchez, prévisualisez et exportez des données géospatiales du catalogue",
   "placeholder": "Rechercher dans le catalogue...",
@@ -8,17 +19,27 @@
   "resultCount_other": "{{count}} résultats",
   "mapsSectionTitle": "Cartes",
   "empty": {
+    "catalogResultsTitle": "Aucun résultat dans le catalogue",
+    "catalogResultsDescription": "Essayez de modifier la recherche ou les filtres.",
     "title": "Aucun jeu de données trouvé",
     "description": "Essayez d'ajuster votre recherche ou vos filtres",
     "cta": "Importez votre premier jeu de données",
     "catalogTitle": "Votre catalogue est vide",
     "catalogDescription": "Importez un jeu de données pour commencer à constituer votre catalogue géospatial.",
+    "catalogTitleViewer": "Aucun jeu de données à afficher",
+    "catalogDescriptionViewer": "Aucun jeu de données ne vous est visible pour le moment. Ils apparaîtront ici dès que quelqu'un en ajoutera ou en partagera un avec vous.",
+    "catalogDescriptionAnonymous": "Il n'y a pas encore de jeu de données public. Connectez-vous pour voir ceux qui sont partagés avec vous.",
+    "signIn": "Se connecter",
     "clear": "Effacer la recherche et les filtres"
   },
   "error": {
     "message": "Échec du chargement des résultats : {{message}}"
   },
   "filters": {
+    "datasetFilters": "Filtres des jeux de données",
+    "activeRefinements": "Filtres actifs",
+    "advancedFilters": "Filtres avancés",
+    "dataCoverageDate": "Dates couvertes par les données",
     "geometry": "Géométrie",
     "anyGeometry": "Toute géométrie",
     "point": "Point",
@@ -98,6 +119,8 @@
     "vrt": "Raster virtuel",
     "collection": "Collection",
     "table": "Table",
+    "tiles3d": "3D Tiles",
+    "pointcloud": "Nuage de points",
     "sourceCount_one": "{{count}} source",
     "sourceCount_other": "{{count}} sources",
     "autoDesc": {
@@ -109,7 +132,8 @@
       "vrt_other": "Raster virtuel {{vrtType}} avec {{count}} sources",
       "table_one": "Table avec {{count}} ligne",
       "table_other": "Table avec {{count}} lignes",
-      "fallback": "Jeu de données géospatial"
+      "fallback": "Jeu de données géospatial",
+      "tiles3d": "Tileset 3D Tiles"
     },
     "moretags": "+{{count}} de plus",
     "updatedFallback": "Mis à jour il y a {{time}}",
@@ -144,7 +168,7 @@
   "bbox": {
     "mapAriaLabel": "Carte du cadre de sélection",
     "noExtent": "Pas d'étendue",
-    "instruction": "Cliquez et faites glisser pour dessiner un cadre de sélection",
+    "instruction": "Cliquez pour commencer la boîte, puis cliquez à nouveau pour la terminer",
     "loading": "Chargement de la carte..."
   },
   "typeahead": {
@@ -193,7 +217,7 @@
     "close": "Fermer",
     "rectangle": "Rectangle",
     "polygon": "Polygone",
-    "rectangleInstruction": "Cliquez et faites glisser pour dessiner une boîte englobante",
+    "rectangleInstruction": "Cliquez pour commencer la boîte, puis cliquez à nouveau pour la terminer",
     "polygonInstruction": "Cliquez pour ajouter des points, double-cliquez pour terminer",
     "predicate": "Mode :",
     "intersects": "Intersecte",

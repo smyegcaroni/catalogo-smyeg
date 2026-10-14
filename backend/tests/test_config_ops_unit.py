@@ -3,8 +3,10 @@
 import hashlib
 import json
 import uuid
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -460,7 +462,9 @@ async def test_overwrite_saml_uses_certificate_not_oauth_client_secret(
         provider_type="saml",
         idp_entity_id="https://idp.example.com/entity",
         idp_sso_url="https://idp.example.com/sso",
-        idp_certificate="test-certificate",
+        idp_certificate=(
+            Path(__file__).parent / "fixtures" / "saml" / "idp_cert.pem"
+        ).read_text(),
         sp_entity_id="https://geolens.example.com/saml/metadata",
     )
     db = AsyncMock()
@@ -487,6 +491,7 @@ async def test_overwrite_saml_uses_certificate_not_oauth_client_secret(
 async def test_import_result_and_audit_report_exact_account_link_deletions():
     """The exact cascade count reaches both the response and aggregate audit."""
     from app.platform.config_ops.service import ConfigImportPlan, import_config
+    from app.processing.embeddings.service import CommittedEmbeddingPair
 
     plan = ConfigImportPlan(
         validated_settings={},
@@ -527,6 +532,27 @@ async def test_import_result_and_audit_report_exact_account_link_deletions():
             AsyncMock(),
         ),
         patch("app.modules.audit.service.audit_emit", AsyncMock()) as audit_emit,
+        # The overwrite resets embedding_dims, so it reconciles the column; the
+        # live column already matches.
+        patch(
+            "app.processing.embeddings.service.embedding_change_lock",
+            lambda _needed, **_kwargs: nullcontext(),
+        ),
+        patch(
+            "app.processing.embeddings.service.read_committed_embedding_pair",
+            AsyncMock(
+                return_value=CommittedEmbeddingPair(
+                    dims=1536,
+                    model="text-embedding-3-small",
+                    dims_overridden=False,
+                    model_overridden=False,
+                )
+            ),
+        ),
+        patch(
+            "app.processing.embeddings.service.rebuild_embedding_column",
+            AsyncMock(return_value=False),
+        ),
     ):
         result = await import_config(
             db,
@@ -559,3 +585,107 @@ async def test_list_providers_can_load_deferred_saml_export_fields():
     assert "idp_entity_id" in statement
     assert "idp_sso_url" in statement
     assert "sp_entity_id" in statement
+
+
+async def _preview(mode, settings, live_width):
+    """Dry-run an import against a mocked database whose column has ``live_width``."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.platform.config_ops.service import dry_run_import
+
+    mock_db = AsyncMock(spec=AsyncSession)
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = None
+    mock_result.scalars.return_value.all.return_value = []
+    mock_result.all.return_value = []
+    mock_db.execute = AsyncMock(return_value=mock_result)
+
+    with patch(
+        "app.processing.embeddings.service.live_embedding_column_width",
+        AsyncMock(return_value=live_width),
+    ):
+        preview = await dry_run_import(mock_db, {"settings": settings}, mode)
+    return {c["key"]: c for c in preview.settings["changes"]}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["merge", "overwrite"])
+async def test_dry_run_warns_that_a_width_change_deletes_embeddings(mode):
+    """A width that differs from the live column warns, with the model change noted."""
+    changes = await _preview(
+        mode, {"embedding_dims": "768", "embedding_model": "other-model"}, 1536
+    )
+
+    assert "deleted" in changes["embedding_dims"]["reason"]
+    assert "regenerat" in changes["embedding_dims"]["reason"]
+    assert "regenerat" in changes["embedding_model"]["reason"]
+    assert changes["embedding_dims"]["reason_code"] == "embedding_width_changed"
+    assert changes["embedding_model"]["reason_code"] == "embedding_model_changed"
+
+
+@pytest.mark.anyio
+async def test_dry_run_warns_when_the_saved_width_differs_from_the_live_column():
+    """Importing the saved width still resizes a column left at another one."""
+    from app.core.persistent_config import EMBEDDING_DIMS
+
+    # Equal to the setting in effect, so the diff itself has nothing to say.
+    saved = str(EMBEDDING_DIMS.env_default)
+    changes = await _preview("merge", {"embedding_dims": saved}, 512)
+
+    assert "deleted" in changes["embedding_dims"]["reason"]
+
+
+@pytest.mark.anyio
+async def test_dry_run_warns_when_an_overwrite_resets_the_width_to_the_default():
+    """An overwrite that omits the width resets it, which resizes a different column."""
+    changes = await _preview("overwrite", {"ai_enabled": True}, 512)
+
+    assert changes["embedding_dims"]["reason_code"] == "embedding_width_changed"
+
+
+@pytest.mark.anyio
+async def test_dry_run_is_quiet_when_the_width_matches_the_live_column():
+    """A width the column already has deletes nothing."""
+    from app.core.persistent_config import EMBEDDING_DIMS
+
+    default = int(EMBEDDING_DIMS.env_default)
+    changes = await _preview("merge", {"embedding_dims": str(default)}, default)
+
+    assert "deleted" not in (changes["embedding_dims"]["reason"] or "")
+
+
+@pytest.mark.anyio
+async def test_a_preview_goes_stale_when_the_live_column_width_changes():
+    """A warning-free token is refused once a rebuild moves the column; an unmoved one applies."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.core.persistent_config import EMBEDDING_DIMS
+    from app.platform.config_ops.exceptions import ConfigPreviewError
+    from app.platform.config_ops.service import (
+        _issue_preview_token,
+        _verify_preview_token,
+        preflight_import,
+    )
+
+    mock_db = AsyncMock(spec=AsyncSession)
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = None
+    mock_result.scalars.return_value.all.return_value = []
+    mock_result.all.return_value = []
+    mock_db.execute = AsyncMock(return_value=mock_result)
+    default = int(EMBEDDING_DIMS.env_default)
+    payload = {"settings": {"embedding_dims": str(default)}}
+
+    async def _plan(live_width):
+        with patch(
+            "app.processing.embeddings.service.live_embedding_column_width",
+            AsyncMock(return_value=live_width),
+        ):
+            return await preflight_import(mock_db, payload, "overwrite")
+
+    previewed = await _plan(default)
+    token = _issue_preview_token(previewed, "overwrite")
+
+    _verify_preview_token(token, await _plan(default), "overwrite")
+    with pytest.raises(ConfigPreviewError):
+        _verify_preview_token(token, await _plan(512), "overwrite")

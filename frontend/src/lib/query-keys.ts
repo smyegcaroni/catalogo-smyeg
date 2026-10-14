@@ -48,6 +48,9 @@ export const queryKeys = {
     refreshRuns: (id: string, skip: number, limit: number) =>
       ['dataset-refresh-runs', id, skip, limit] as const,
     refreshRunsPrefix: (id: string) => ['dataset-refresh-runs', id] as const,
+    sync: (id: string) => ['dataset-sync', id] as const,
+    syncCredentialsPrefix: ['sync-credentials'] as const,
+    syncCredentials: (datasetId: string) => ['sync-credentials', datasetId] as const,
     attributes: (id: string | undefined) => ['attributes', id] as const,
     validation: (id: string | undefined) => ['validation', id] as const,
     related: (id: string) => ['datasets', id, 'related'] as const,
@@ -289,6 +292,8 @@ export const queryKeys = {
   // -------------------------------------------------------------------------
   relationships: {
     list: (datasetId: string) => ['dataset-relationships', datasetId] as const,
+    // A list's broken flags also depend on each target dataset's schema.
+    listPrefix: ['dataset-relationships'] as const,
     records: (datasetId: string, featureGid: number, relationshipId: string) =>
       ['related-records', datasetId, featureGid, relationshipId] as const,
     // records() is parameterized by featureGid and
@@ -317,6 +322,7 @@ export const queryKeys = {
   // Dataset search (builder panel)
   // -------------------------------------------------------------------------
   datasetSearch: {
+    all: ['dataset-search'] as const,
     results: (query: string, recordType: string) =>
       ['dataset-search', query, recordType] as const,
   },

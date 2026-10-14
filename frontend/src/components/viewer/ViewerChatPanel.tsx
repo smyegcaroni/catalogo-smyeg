@@ -11,6 +11,8 @@ import { EphemeralBadge } from '@/components/builder/EphemeralBadge';
 import { cn } from '@/lib/utils';
 import { chatOverlayCompleteness, overlayFeatureCount } from '@/lib/chat-result-completeness';
 import type { ChatAction, ChatHistoryMessage, MapLayerResponse } from '@/types/api';
+import { randomId } from '@/lib/random-id';
+import { formatQueryCell } from '@/lib/query-cell';
 
 const prefersReducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false;
 
@@ -52,10 +54,6 @@ export function QueryResultTable({ result }: { result: QueryResult }) {
   }
   const visibleColumns = columns.slice(0, 5);
   const hasMore = columns.length > 5;
-  const cellAt = (row: unknown, index: number): string => {
-    const raw = Array.isArray(row) ? row[index] : undefined;
-    return raw == null ? '' : String(raw);
-  };
   return (
     <div className="mt-2 overflow-hidden rounded-md border">
       <div className="max-h-48 overflow-y-auto" role="region" aria-label={t('viewer.ai.queryResult.tableLabel')}>
@@ -74,9 +72,10 @@ export function QueryResultTable({ result }: { result: QueryResult }) {
             {rows.map((row, idx) => (
               <tr key={idx} className="border-b border-border last:border-0">
                 {visibleColumns.map((col, colIdx) => {
-                  const display = cellAt(row, colIdx);
+                  const raw = Array.isArray(row) ? row[colIdx] : undefined;
+                  const display = formatQueryCell(raw);
                   return (
-                    <td key={col} className="max-w-[8rem] truncate px-2 py-1 text-foreground" title={display}>
+                    <td key={col} className="max-w-[8rem] truncate px-2 py-1 text-foreground" title={raw == null ? '' : String(raw)}>
                       {display}
                     </td>
                   );
@@ -212,7 +211,7 @@ export function ViewerChatPanel({ mapId, layers, mapInstanceRef }: ViewerChatPan
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .slice(-20)
       .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
-    setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: 'user', content: userMsg }]);
+    setMessages((prev) => [...prev, { id: randomId(), role: 'user', content: userMsg }]);
     setIsLoading(true);
     const controller = new AbortController();
     abortRef.current = controller;
@@ -239,7 +238,7 @@ export function ViewerChatPanel({ mapId, layers, mapInstanceRef }: ViewerChatPan
           }
         } else if (event === 'done') {
           const finalText = (typeof data.explanation === 'string' ? data.explanation : '') || streamed;
-          setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: 'assistant', content: finalText, queryResult }]);
+          setMessages((prev) => [...prev, { id: randomId(), role: 'assistant', content: finalText, queryResult }]);
         } else if (event === 'error') {
           // A pre-flight HTTP status (403/503) rides the SSE error event; surface it
           // as ApiError so it classifies honestly rather than as a generic failure.
@@ -253,12 +252,12 @@ export function ViewerChatPanel({ mapId, layers, mapInstanceRef }: ViewerChatPan
       if (controller.signal.aborted) {
         setMessages((prev) => [
           ...prev,
-          { id: crypto.randomUUID(), role: 'assistant', content: streamed || t('viewer.ai.cancelled') },
+          { id: randomId(), role: 'assistant', content: streamed || t('viewer.ai.cancelled') },
         ]);
       } else {
         setMessages((prev) => [
           ...prev,
-          { id: crypto.randomUUID(), role: 'error', content: t('viewer.ai.error'), retryMessage: userMsg },
+          { id: randomId(), role: 'error', content: t('viewer.ai.error'), retryMessage: userMsg },
         ]);
       }
     } finally {

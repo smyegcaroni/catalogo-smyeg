@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@/test/test-utils';
+import { act, render, screen, waitFor, within } from '@/test/test-utils';
 import userEvent from '@testing-library/user-event';
 import { denySessionStorage } from '@/test/deny-storage';
 import { sendChatMessage, streamChatMessage } from '@/api/maps';
@@ -983,6 +983,35 @@ describe('ChatPanel', () => {
     expect(screen.queryByRole('button', { name: /undo/i })).not.toBeInTheDocument();
   });
 
+  it('cancel during the non-streaming fallback applies nothing and shows no answer', async () => {
+    // eslint-disable-next-line require-yield
+    mockStreamChat.mockImplementation(async function* () {
+      throw new Error('stream failed');
+    });
+    let settle!: (r: { explanation: string; actions: unknown[] }) => void;
+    mockSendChat.mockImplementation(
+      () => new Promise((r) => { settle = r as typeof settle; }),
+    );
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'style it red');
+    await waitFor(() => expect(mockSendChat).toHaveBeenCalled());
+    const signal = mockSendChat.mock.calls[0][5] as AbortSignal;
+
+    await user.click(screen.getByRole('button', { name: /cancel/i }));
+    expect(signal.aborted).toBe(true);
+    await act(async () => {
+      settle({
+        explanation: 'Made it red',
+        actions: [{ type: 'set_style', layer_id: 'layer-1', paint: { 'fill-color': 'red' } }],
+      });
+    });
+
+    expect(props.onPaintChange).not.toHaveBeenCalled();
+    expect(screen.queryByText('Made it red')).not.toBeInTheDocument();
+  });
+
   it('fix(#392): set_style preserves builder _outline-* keys on a polygon (backend allowlist accepts them)', async () => {
     mockStreamChat.mockImplementation(async function* () {
       yield {
@@ -1639,6 +1668,25 @@ describe('ChatPanel — inline data-analysis card (Phase 1135 AI-08)', () => {
     expect(await screen.findByText(/Hamilton/)).toBeInTheDocument();
     // Scroll region with aria-label should exist
     expect(await screen.findByRole('region', { name: /query result table/i })).toBeInTheDocument();
+  });
+
+  it('drops floating-point noise from aggregate cells', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'show_query_result', columns: ['borough', 'total_acres'], rows: [['Brooklyn', 491.9000000000001]] },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Acreage by borough' } };
+    });
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'acreage by borough');
+    expect(await screen.findByRole('cell', { name: '491.9' })).toBeInTheDocument();
+    expect(screen.queryByText(/491\.90000/)).not.toBeInTheDocument();
   });
 
   it('renders the LAST query result when a retry supersedes an empty one (#534)', async () => {

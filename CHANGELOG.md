@@ -7,6 +7,1352 @@ and releases use semantic versioning.
 
 ## [Unreleased]
 
+## [1.24.0] - 2026-10-11
+
+### Added
+
+- Admins can transfer a dataset or a map to another user. `PATCH /datasets/{id}`
+  accepts `owner_id`, and the new `PATCH /maps/{id}` takes `owner_id` as its
+  only field. The new owner must be an active user whose role can create that
+  kind of object (`upload` for datasets, `edit_metadata` for maps), so viewers
+  can't receive either; an unknown, inactive or under-permissioned user, or
+  `null`, answers 422 and nothing changes. The current owner and other editors
+  get 403. Each transfer writes one `dataset.transfer_owner` or
+  `map.transfer_owner` audit row with the previous and new owner, and the
+  dataset change history shows "Owner changed". Transferring to the current
+  owner is a no-op. A dataset transfer answers 409 `dataset_busy` while a
+  refresh, re-upload or VRT regeneration is pending or running, and rolls the
+  publication version, so signed tile URLs minted before it stop validating.
+  A map transfer answers 422, listing the dataset ids, when the new owner
+  can't read every dataset the map uses. Ownership is `created_by`, so the
+  write gates, private visibility, provenance and quota usage move with it;
+  grants, collections, existing embed and share tokens, API keys and job
+  history stay as they are. There is no admin UI for transfers yet, and a
+  transfer doesn't check the new owner's storage quota. (#2895)
+- ArcGIS imports use each field's alias as the attribute title and its
+  description as the attribute description, so `POP_2020` shows as
+  "Population (2020 census)" when the service says so. An alias that only
+  repeats the field name is ignored. Imports that skip the preview step,
+  such as bulk and CLI imports, keep humanized titles. (#2899)
+- Map popups label each row with the attribute's title from the dataset's
+  attribute metadata, falling back to the humanized property key. (#2901)
+- The ArcGIS service probe reports each layer's ArcGIS type
+  (`source_layer_type`), its `parent_layer_id` and whether it is
+  `importable`. The preview answers Group, Raster, Annotation, Topology and
+  Utility Network layers with 422 `unsupported_layer_type` instead of making
+  an empty dataset, and the service import form and the Re-Upload dialog show
+  those layers disabled with the reason. (#2890)
+- `EMAIL_VERIFICATION_REQUIRED`, `PASSWORD_LOGIN_ENABLED`, `LOGIN_RATE_LIMIT`
+  (1 to 1000) and `ALLOWED_EMAIL_DOMAINS` (comma-separated) set those auth
+  settings from the environment, with the previous defaults, and both compose
+  files pass them to the api service. An invalid value stops boot with a line
+  naming the variable. With `ENV_ONLY_CONFIG=true` the Auth tab shows them as
+  env-managed. (#2892)
+- `geolens arcgis inventory` writes schema version 2. Each item gains its
+  descriptive metadata (snippet, description, tags, access and license text,
+  extent, thumbnail path, spatial reference), its folder, its owner's name and
+  email, and the groups it is shared with; `--no-groups` skips the group
+  reads. With `-o`, each web map's and app's configuration is saved under
+  `webmaps/` and `apps/` with mode 0600, after every credential-like key and
+  string is masked. StoryMap, Hub, Notebook and Web Scene items are now read.
+  A hosted view records its source service, a hosted layer the file it was
+  published from and a survey form its results service, and every dependency
+  says whether it is `external` to the organization. `--read-all-item-data`
+  scans the remaining items for item references. A script that reads only an
+  item's `id`, `type`, `title` and `class` keeps working, but a reader that
+  validates against the v1 schema rejects a v2 report and needs updating.
+  (#2888, #2904)
+- `geolens arcgis plan <arcgis-inventory.json>` turns an inventory into an
+  editable migration plan, `arcgis-migration-plan.json`. It reads only the
+  inventory and contacts nothing. Each item gets a default action
+  (`import_layers`, `import_file`, `import_map` or `export_only`), a target
+  visibility, collection, groups, title and tags, and the items it depends
+  on. The plan lists every owner, group and basemap for you to map to
+  GeoLens users, collections and basemaps. Running it twice writes the same
+  file, and it stops rather than overwrite a plan you edited unless you pass
+  `--force`. The CLI README documents the inventory, the saved configuration
+  files and the plan format. (#2910)
+- The OpenAPI descriptions of a map layer's `style_config` and
+  `label_config` list the keys the server accepts, and a test pins that
+  vocabulary for desktop GIS plugins that publish maps. (#2905)
+
+### Changed
+
+- A re-upload or refresh keeps the title and description of an attribute
+  nobody has edited. Before, it reset both to their defaults. (#2899)
+- The review step of a service import is headed "Service preview". Its layer
+  rows show the geometry and feature count, and repeat the layer name only
+  when it differs from the title. Changing the service address to another
+  origin now says that it reset the chosen authentication. On a dataset's
+  Source tab the service URL row reads "Source URL (credentials removed)",
+  and a PostGIS or STAC dataset whose health was never checked says the next
+  refresh checks it. (#2886, #2887, #2894, #2903)
+
+### Fixed
+
+- Token refresh is limited to 30 a minute per session instead of 30 a minute
+  per client address, with 300 a minute per address as a ceiling. Many people
+  behind one office proxy no longer run out of budget together and land on a
+  page that looks signed in without access. A refresh with a missing or
+  invalid token still counts against the address. When a page load can't
+  restore the session for a transient reason, a toast says so and offers
+  "Try again". (#2891)
+- With `ENV_ONLY_CONFIG=true` the Auth tab lets admins add, edit and delete
+  SSO providers, which the API already allowed. While its settings cache is
+  cold, the login rate limit uses `LOGIN_RATE_LIMIT` instead of a fixed 5 a
+  minute. Nothing warms that cache in env-only mode, so an environment value
+  was never enforced there. (#2892)
+- The sign-in page shows "Need access? Contact a GeoLens administrator." only
+  while sign-up is closed. (#2869)
+- The maintenance commands in `RUNBOOK.md` and the scripts' usage text call
+  `/app/.venv/bin/python` instead of `uv run`, which fails in the read-only
+  production api container. (#2889)
+- A float32 or float64 raster left on the default stretch now stretches over
+  its data range, read from band statistics. It used to be rescaled from 0 to
+  1, so an elevation raster such as ETOPO drew in black and white. Integer
+  rasters render as before. A failed statistics lookup is retried
+  after a minute instead of being kept, and a tile drawn without statistics,
+  including a percentile or stddev stretch that fell back, is no longer stored
+  by shared caches. Tiles cached before the upgrade keep their old look until
+  they expire. (#2916)
+- A DEM's preview on its dataset page draws as hillshade, as it does in the
+  map builder, instead of showing its terrain-RGB tiles as a coloured image.
+  (#2917)
+- `/search?q=` links keep their query when they redirect to the home page.
+  On a phone, the service import form keeps the service URL and its Clear
+  button inside their cards. (#2918)
+- Distinct values for a date, time or timestamp column come back as text in
+  the form vector tiles use, instead of failing with a 500 error. (#2924)
+
+## [1.23.1] - 2026-10-10
+
+### Added
+
+- `docker-compose.prod.yml` bundles an opt-in cache. Start it with
+  `--profile cache` (or `COMPOSE_PROFILES=cache`) and set
+  `REDIS_URL=redis://valkey:6379/0` so token-protected service imports, shared
+  rate limits and tile content versions work on a single host. The valkey
+  service now restarts with the host, takes a `VALKEY_MEM_LIMIT` (default
+  256m) with a lower `VALKEY_MAXMEMORY` that evicts the soonest-expiring keys
+  first, keeps nothing on disk and no longer publishes port 6379 on the host. The `cloud-dev`
+  profile still starts it. An install that ran the old prod `valkey` service
+  keeps its `<project>_valkey_data` volume, which may hold a snapshot with
+  service credentials: remove the old container with
+  `docker compose --profile cache rm -sf valkey`, then the volume with
+  `docker volume rm <project>_valkey_data`. If you already upgraded, start the
+  cache again afterwards with `docker compose --profile cache up -d valkey`.
+
+### Fixed
+
+- Sample values for a `timestamptz` column now use the same UTC text that
+  vector tiles write (`2024-03-01T17:00:00+00:00`), so a category picked from
+  the samples matches the features. Existing datasets keep their stored samples
+  until their metadata is next refreshed.
+- Single sign-on links an identity to an existing account by email only when
+  that account is active and its own address is verified. A sign-in that
+  resolves to an account that is pending, suspended or deactivated is refused
+  with `error=account_inactive` before any session or sign-in code is issued,
+  and it is recorded as `oauth.login.failure`. SAML reports the same refusal
+  as `saml_failed`. An address an admin enters counts as verified, so the
+  documented flow where an admin creates the account and the person's first
+  sign-in links to it keeps working. Migration `0081` marks existing local
+  accounts with an email and no self-registration record as verified. An
+  account that signed up itself and was approved without verifying its
+  address no longer links by email: the owner can verify the address, or an
+  admin can set it. The sign-in page shows a specific message for each new
+  error code. The sign-in code's lifetime is documented as two minutes, which
+  is what it always was. (#2859, #2862)
+- A password sign-up that activates through the email link now gets a role
+  instead of none. The new auth setting `registration_default_role` (`viewer`
+  by default, or `editor` or `admin`) sets it. `/auth/register` answers 403
+  while password login is off, answers 422 for a sign-up without an email while
+  an email-domain allowlist is set, and reads the registration switches
+  without the cache. `/auth/config` reports `allow_signup=false` while
+  password login is off. Creating or renaming a provider onto a slug another
+  provider uses answers 409 instead of 500, and a provider's `default_role` and
+  group role mapping values must be `viewer`, `editor` or `admin`. A user in
+  several mapped groups gets the most privileged mapped role instead of the
+  one the identity provider listed first. Providers already stored keep
+  working until edited. (#2860)
+- Admin > Settings > Auth describes what each setting does: new SSO accounts
+  and email-verified password sign-ups are active right away, and approval
+  applies to the rest. It adds a "Default role for new sign-ups" control and
+  warns when sign-up is on with a public provider and no domain allowlist.
+  Saving a sign-up default role or provider default role of admin, enabling
+  sign-ups or widening the domain allowlist while a path grants admin, or
+  saving a group mapped to admin asks for confirmation, as does resetting the
+  domain list, email verification or password login. The register page shows
+  its closed state while password login is off, and the provider dialog keeps
+  the slug when editing and shows the server's error text. (#2861)
+
+## [1.23.0] - 2026-10-09
+
+### Added
+
+- Builder analysis runs on what each layer shows. The panel sends the layer's
+  filter with the preview and materialize requests, and the API applies it to
+  the source layer and to the mask or join layer, so a buffer on a layer
+  filtered down to 6 points makes 6 buffers. The request fields `filter`,
+  `mask_filter` and `join_filter` take CQL2-JSON, are checked against the
+  layer's live columns, and an invalid one answers 422. A filter the server
+  can't apply the way the map does shows the panel's "analysis can't apply"
+  message instead. The output's lineage records the source filter. (#2822,
+  #2838)
+- The History section of a dataset's Metadata tab has a Restore button on the
+  version whose data GeoLens kept. It asks you to type the dataset name, then
+  queues the restore described in 1.22.0. (#2812)
+- `POST /services/stac/asset-sizes` looks up the size of the selected STAC
+  assets whose catalog omits `file:size`, and the import review step shows
+  them instead of "Size unavailable". The probe uses the same checked HTTP
+  client as the other service imports. (#2698)
+- A manifest apply that would queue a replacement already held for review
+  reports `action: "blocked"` with the held job id, dataset id, `run_id` and
+  `review_reasons`, and queues nothing. `geolens apply` counts blocked
+  entries in its summary and prints a RUN ID column. (#2823)
+- A service re-upload from the Re-Upload dialog gets the same review as a
+  file replacement: the column diff, an empty result and the geometry
+  contract. The service preview returns `review_reasons` and
+  `review_fingerprint`, and a commit without the matching fingerprint ends
+  `blocked` with `review_required`. (#2820)
+- A replacement or refresh whose dataset received feature edits while it ran
+  is held for review with the new reason `live_data_changed` instead of
+  discarding the edits. A service re-upload from the dialog has no review
+  step, so it fails with `live_data_changed` and leaves the live data alone.
+  (#2745)
+- Admin Jobs lists a held replacement as awaiting review rather than failed.
+  The job list returns `review_state`, `status=awaiting_review` filters the
+  waiting jobs, and the failed-jobs badge no longer counts them. (#2749)
+- `POST /admin/backfill-embeddings/` takes `all_tenants`. When a deployment
+  hosts several tenants and the settings page regenerates embeddings after a
+  width or model change, it queues a run for every registered tenant, not
+  only the caller's. The flag needs `manage_tenants` in that case. (#2816)
+- Job status gains `quicklook_pending`, and OGC record properties gain
+  `quicklook_version`. The Re-Upload dialog keeps polling until a redrawn
+  quicklook lands, and search results refetch the image when its version
+  changes. (#2680, #2757)
+- Workflow transition refusals return a structured 422 `detail` with `code`,
+  `message`, `current_stage`, `requested_stage` and `allowed_stages`, and the
+  dataset page names the refused step and what is still open. (#2827, #2748)
+- A relationship that points at a join column that no longer exists is
+  marked `broken` in the relationship list, the dataset page shows a
+  "Broken" badge with a hint to delete or recreate it, and the related-records
+  read answers 409 `relationship_column_missing` instead of 503. If the
+  column was dropped directly in the database, the first read confirms it
+  against the live table and updates the stored column list. (#2817, #2837)
+- The `geolens` CLI `scan` lists a GeoJSON or GeoPackage that shares a name
+  with a shapefile, and treats `x.tif.aux.xml` as a sidecar of `x.tif`.
+  (#2719)
+
+### Changed
+
+- Importing, re-uploading or refreshing a token-protected service now requires
+  `REDIS_URL` to point at a Valkey or Redis instance that the API and the
+  worker share. Without one, the import and re-upload doors answer 503
+  `credential_store_unavailable` the way the refresh door already did, instead
+  of sending the token to the worker in the job's queue arguments. The API
+  logs `credential_store_not_configured` at startup when `REDIS_URL` is unset.
+  Imports, re-uploads and refreshes that carry no token are unaffected.
+  (#2818)
+- Titiler now reads remote (STAC by-reference) rasters through an internal
+  API route that checks every connection and redirect and serves only
+  GeoTIFF or COG bytes, instead of fetching the remote URL itself. Titiler
+  must be able to reach the API at `REMOTE_RASTER_RELAY_BASE_URL`, which
+  defaults to `http://api:8000` and needs no change under either Compose
+  file; set it for other deployments. Remote VRT assets and assets that are
+  not GeoTIFF or COG are refused at STAC import, a remote raster can no
+  longer be a VRT member, and a mosaic that names a remote member answers
+  409 until it is rebuilt from managed rasters. (#2771)
+- The browser keeps the access token in memory instead of `localStorage`. A
+  reload gets it back from the refresh cookie before the first render, and
+  tabs follow each other's sign-ins and sign-outs through a message that
+  carries only a session id. A session that uses body tokens, which is the
+  case when the API is on another origin or path, ends when the page
+  reloads. Stored tokens from earlier releases are removed on first load.
+  (#2819)
+- Single sign-on on a same-origin deployment redirects with a one-time code,
+  and the callback page exchanges it for the session cookie through the new
+  `POST /auth/oauth/exchange/`, inside the same cross-tab lock as password
+  sign-in and refresh. Deployments with the API on another origin keep
+  fragment token delivery. (#2839)
+- A sign-in, request or upload now finishes only inside the session it
+  started in. If that session ended or was replaced, the work is dropped
+  instead of refreshing, signing out or resending under the newer session. A
+  sign-in whose profile request fails stays signed in. Uploads follow the
+  same refresh rules as other requests. (#2739)
+- Public vector tiles, cluster tiles and derived map images now send
+  `s-maxage=60` or less, so a CDN or proxy that honors origin headers drops
+  them within a minute of a dataset leaving public. Browsers keep their
+  `max-age`. An edge rule that ignores origin `Cache-Control` keeps tiles for
+  its own TTL. Private, signed and token-authorized responses are
+  unchanged. (#2681)
+- The SQL sandbox behind AI chat and `POST /api/query/` caps the bytes a
+  result can return, counted in PostgreSQL before rows leave it, and weights
+  array and other nested columns by their decoded size. Rows past the cap
+  are dropped and the result is marked `truncated`; a first row over the cap
+  is refused with `result_too_large`. Chat also caps the rows it passes to
+  the model. (#2769, #2826)
+- A refused workflow transition returns an object as its 422 `detail`
+  instead of a sentence. `message` keeps the old wording. (#2827)
+- Manifest source URIs accept only `s3://`, the one scheme apply can read,
+  and `VrtCreateRequest.source_dataset_ids` requires 2 to 500 ids. The CLI
+  help and bundled schema say the same. `GET /datasets/{id}/features.geojson`
+  declares a FeatureCollection body, so the Python SDK returns it parsed.
+  (#2814)
+- The Python SDK sends real files for upload, re-upload and icon calls, which
+  answered 422 before, and returns bytes for quicklook, thumbnail, social
+  image, CSV and audit export, tile, icon and sprite routes. (#2735)
+- A signed-in user without the export capability gets the same download of
+  a public dataset that an anonymous visitor gets, on vector export, raster
+  COG download and the STAC `data` asset. Non-public datasets still need the
+  capability. (#2829)
+- The shared map page no longer shows the app footer. "GeoLens" appears in
+  the map's attribution control under the same edition rule the footer badge
+  used, and "Map data" is a tab centered on the bottom edge. (#2653)
+- MCP tool calls run in a worker thread, so a slow upstream request no longer
+  stalls ping or cancellation. The advertised `limit`, `offset` and
+  `row_limit` bounds are enforced, arguments outside the schema are
+  rejected, and the search total counts datasets only. (#2715)
+- `geolens publish --wait` and `analysis materialize --wait` report the job's
+  terminal status in `--json` output, and `whoami --json` reports `roles`.
+  (#2719)
+- `scripts/restore.sh` fails on every nonzero `pg_restore` exit and leaves
+  `api` and `worker` stopped, instead of treating an interrupted restore as
+  warnings only. (#2708)
+- `make migrate` runs the one-shot `migrate` service in the dev stack, and
+  the dev worker mounts the checkout's migrations, so neither needs an image
+  rebuild after a migration. The dev frontend container reinstalls its
+  dependencies when `package-lock.json` changes. (#2774, #2706)
+- The Valkey image is 8.1.10, up from 8.1.7. (#2738)
+- Backend and frontend dependencies are refreshed, including werkzeug 3.1.9,
+  mako 1.4.2, source-map-js 1.2.2, cryptography 50.0.2 and vitest 5.0.3.
+  (#2676, #2677, #2691, #2693, #2695)
+
+- Vector tiles now carry `timestamp with time zone` values as UTC text, for
+  example `2024-03-01T17:00:00+00:00`, whatever the database's time zone.
+  Map labels and popups show these values in UTC. The layer filter editor
+  writes a value typed for such a column in the same form, reading a value
+  with no offset as UTC, and builder analysis can now apply a filter that
+  compares one. A saved filter or style that compares the old text form no
+  longer matches; editing a filter's value in the editor converts it.
+  Datasets with these columns get a new tile version on upgrade, so caches
+  stop serving the old text. (#2849)
+
+### Fixed
+
+- Two tabs that finish signing in at nearly the same time no longer sign
+  each other out. Each sign-in gets a number while it holds the cookie lock,
+  the cross-tab notice carries it, and a tab ignores a notice that is not
+  newer than a sign-in it already knows. A password login also cancels any
+  refresh queued behind it. A notice from an older build still counts as
+  newer. (#2847)
+- Restoring a previous version now records the live version's row first and
+  reinstates the version's source CRS, origin and dimensionality. The Source
+  panel names the restored file, a drawn layer keeps the type its edits
+  expect, and an empty unconstrained table keeps its dimensions. (#2688)
+- The version history no longer presents current facts as the original
+  upload's. A dataset replaced before its first version row was recorded
+  shows those facts as unknown with a note. (#2758)
+- Attempt staging tables left by killed ingests are dropped once the attempt
+  is settled, and settling a lost worker frees the dataset for the next
+  replacement in the same commit. (#2758)
+- A replacement of a dataset with a generic geometry column no longer rescans
+  geometry types while holding the live table locked. The scan before the
+  lock records a witness, and the second scan runs only when GeoLens wrote
+  to the table since. Owed publish follow-ups are held through a rollback. (#2686)
+- Vector and cluster tiles work for tables with a mixed-case attribute
+  column, such as registered tables and service imports that keep upstream
+  casing. Tiles at z10 and above answered 503 before. The property keeps its
+  stored name. (#2844)
+- Date and datetime filters compare against explicit UTC midnights, so OGC
+  Records, STAC, `date_from`/`date_to` and CQL2 date literals no longer move
+  with the database session time zone. (#2744)
+- AI-generated map specs are clamped to the ranges the map save API enforces,
+  so a generated map can be saved. Creating a relationship checks that both
+  join columns exist and answers 422 otherwise. `PATCH /admin/users/{id}`
+  clears an email on an explicit null or blank value. (#2744)
+- A CSV import stores numeric columns as numbers, matching the preview, for
+  single imports and Import All with Defaults. The re-upload preview diffs
+  the same types. (#2678)
+- The 0077 downgrade drops each dataset's kept previous-version table unless
+  a dataset in the same tenant uses the name, instead of keeping it because
+  a same-named table exists in another tenant. (#2679)
+- A Shapefile that declares a code page imports in that encoding, and a ZIP
+  with the Shapefile set inside one folder opens. (#2752)
+- A zip holding a CSV, GeoJSON or GeoPackage is recorded under that format
+  instead of `shapefile`. (#2696)
+- Z and M dimensions survive GeoParquet export and CSV WKT imports, and a
+  CSV exported by GeoLens can be imported again. (#2737)
+- A source that mixes geometry kinds is cataloged as `GEOMETRY` instead of
+  the type of its first row. (#2749)
+- Concurrent first vector imports into a database that `ogr2ogr` had never
+  written to no longer fail on GDAL's metadata schema. (#2762)
+- ArcGIS imports and refreshes refuse a server that can't page when the
+  feature count is unknown, instead of publishing a truncated table. They
+  record the order field they used, and a failed query reports the
+  service's own error code and message. (#2684)
+- A blank LLM model resolves against the settings an import would apply, and
+  the audit of a cleared model override resolves against a locked snapshot
+  of the provider settings. (#2697, #2815)
+- A redrawn quicklook shows without a hard reload. Each redraw writes an
+  image under its own key, and a sweep removes images no dataset points at.
+  (#2680, #2757)
+- After Back to Results in the STAC import, the form restores its date, area
+  and cloud cover filters and the Load more button. (#2698)
+- A failed URL import whose staged file is gone offers Start again with the
+  File URL filled in, using a stored URL reduced to scheme, host and path.
+  (#2700)
+- Catalog geometry search and STAC `intersects` probe the spatial index once
+  per piece of a search area that crosses the antimeridian, instead of
+  scanning the whole latitude band. Results are unchanged. (#2699)
+- Admin SAML: the provider list returns the stored entity IDs and SSO URL so
+  Edit opens with values, a signing certificate that isn't X.509 is rejected
+  with a field error, and malformed group-role mapping JSON shows an inline
+  error. SAML sign-in buttons go to the SAML login route and appear only
+  where SAML sign-in is available. (#2725, #2770, #2809, #2817)
+- The viewer resets its basemap and drawings when the route switches to
+  another map or share link, and layer visibility is tied to the map it was
+  set on. (#2807, #2720)
+- Cancelling the AI chat also stops its non-streaming retry. The search-area
+  picker survives a basemap change, and a plain click on the dataset map
+  finds related records. (#2720)
+- Direct-POST uploads settle once on abort, inactivity timeout or network
+  error, and can be cancelled. (#2808)
+- Search, facet, map-list and GeoJSON reads cancel when superseded, GeoJSON
+  reads always carry a 30 second deadline, and downloads share one save
+  helper. (#2824)
+- The catalog keeps a filter entry between 768 and 1023 px, admin pages no
+  longer widen behind the sidebar, and the Published Maps filters and the
+  attribute table pagination wrap at 320 px. The table-name copy button and
+  footer links have 44 px targets on touch devices. (#2709, #2813)
+- Closing a dialog without a trigger returns focus to the element that opened
+  it. (#2760)
+- The tablet layer style sheet no longer dims or blocks the map being styled.
+  (#2811)
+- Wording and layout: held replacements read as "held for review" in the
+  Re-Upload dialog, Jobs and Sources, accepted runs introduce their reasons
+  as accepted, the analysis empty state asks for a vector layer, empty
+  catalog and map lists depend on the viewer, ArcGIS organization or portal
+  URLs get a hint to paste a layer REST URL, admin pages show one title,
+  the builder map name uses the room it has, and the opacity sliders explain
+  how they combine. Validation messages name fields in plain language. (#2675,
+  #2810, #2748, #2825, #2809)
+
+### Upgrade notes
+
+- Migrations 0078, 0079 and 0080 run on upgrade. 0078 adds nullable
+  `original_srid`, `is_3d` and `n_dims` to dataset versions. 0079 adds
+  `datasets.data_revision` and the refresh run's `data_revision_baseline`.
+  0080 adds 1 to the tile version of every dataset with a
+  `timestamp with time zone` column, so tile caches stop serving the old text.
+  None needs a backfill, and runs admitted before 0079 are not compared for
+  live-data changes.
+- Set `REMOTE_RASTER_RELAY_BASE_URL` if Titiler reaches the API at an address
+  other than `http://api:8000`, and make sure Titiler can connect to it. The
+  default needs no change under either Compose file. Deployments that send
+  Titiler's traffic through a forward proxy should add the API host to
+  `NO_PROXY`. Templates for other deployments are in
+  [geolens-deployments](https://github.com/geolens-io/geolens-deployments).
+  (#2771)
+- Set `REDIS_URL` to a shared Valkey or Redis instance before importing,
+  re-uploading or refreshing a token-protected service. (#2818)
+- Browser sessions on a deployment whose API is on another origin or path end
+  when the page reloads. Same-origin deployments recover from the refresh
+  cookie. (#2819)
+- A CDN rule that overrides origin cache headers is not bounded by
+  `s-maxage`. Public tiles stay cached for that rule's TTL. (#2681)
+- Clients that read a refused workflow transition's 422 `detail` as a string
+  must read `detail.message`. (#2827)
+- Source-build installs keep their dev frontend volume in sync with the
+  lockfile on start, so the first start after an upgrade can take a minute
+  longer. See UPGRADING.md. (#2706)
+
+### Known limitations
+
+- A cached vector tile keeps a column that was dropped outside GeoLens until
+  its cache entry expires. The relationship repair removes only the missing
+  join column from the stored list. (#2837)
+- Style categories picked from a timestamp-with-time-zone column's stored
+  sample values still use the old text form, so they don't match the UTC tile
+  text. (#2848)
+
+## [1.22.0] - 2026-10-05
+
+### Added
+
+- A file replacement that needs review is held until a person has seen it,
+  the same as a service refresh. When the new file would empty the dataset,
+  drop or retype columns, or change the geometry type, SRID or coordinate
+  dimension, the run ends `blocked` with `review_required`, the live data
+  stays as it was, and the upload is kept. The re-upload dialog lists the
+  reasons under the schema diff and releases the replacement when you
+  confirm. A blocked run shows "Review and retry" on the Sources tab, which
+  publishes the reviewed replacement without asking for a credential. The
+  preview now names columns as the database will store them, so a source
+  column called `geom` no longer shows as a removed and added pair. API
+  clients that commit without a `review_fingerprint` from the preview are
+  held when there is anything to review, and a manifest apply that removes a
+  column ends `blocked`. (#2607)
+- `geolens replace` prints the columns removed, retyped and added, the old
+  and new row counts and each review reason before it asks. `replace`,
+  `refresh` and `apply` accept `--wait` to follow a blocked run to its end,
+  print why it is blocked with the `geolens refresh <dataset>
+  --accept-blocked-run <run-id>` command that accepts it, and exit 6.
+  `--yes` skips the prompt but acknowledges nothing, so a replacement that
+  needs review still ends blocked. `geolens apply --wait` is new and adds a
+  STATUS column; its `--json` results gain `final_status` and `run_id`.
+  (#2629)
+- GeoLens keeps the data a refresh or file replacement replaced. One
+  previous version is kept per vector dataset, next to the live table.
+  `POST /datasets/{id}/previous-version/restore` publishes it again as a new
+  version through the normal replacement path, and the data it replaces
+  becomes the new previous version, so a restore can be undone until the
+  next replacement. `DELETE /datasets/{id}/previous-version` frees it. The
+  dataset detail response gains `previous_version`, and a version records
+  `restored_from_version`. A restore holds scheduled sync for that dataset
+  until the hold is released; manual refresh still works. A replacement or
+  restore is refused with the objects named when a view, foreign key or
+  similar object depends on the live table, because it would keep serving
+  the old rows. Rasters, mosaics, tilesets, point clouds, partitioned
+  tables and registered PostGIS refreshes keep no previous version, so keep
+  backups for those. The restore screen follows in a later release. (#2630)
+- `geolens arcgis inventory` reads an ArcGIS Online organization or Portal
+  for ArcGIS and reports which items import, which partly import, which have
+  no GeoLens equivalent and which Esri is retiring. It runs on your machine,
+  talks only to the portal URL you give it, needs no GeoLens instance and
+  changes nothing. (#2614)
+- Vector tiles of a non-public dataset load in desktop GIS clients such as
+  QGIS with an API key (`X-Api-Key` or `?api_key=`) or a bearer token,
+  when that user can see the dataset. A request with no credential still
+  gets 403, a key without access gets 404, and a key or token that does not
+  resolve gets 401 instead of being read as anonymous. (#2619)
+- Settings changes to the embedding width or model ask for confirmation
+  first, naming how many stored embeddings the change deletes, and a
+  configuration import preview shows the same reasons. The confirmation can
+  queue regeneration of the embeddings, on by default. A merge import that
+  would delete embeddings needs a preview token. (#2575, #2598)
+- The STAC import filters items by date range, area and, where the catalog
+  supports it, maximum cloud cover, and a Load more control pages through
+  the results. (#2581)
+- A failed URL or service import that cannot be retried shows a Start again
+  link that opens the import page on the matching tab, with a service URL
+  prefilled and credentials never filled in. (#2582)
+- `scripts/backfill-map-thumbnails.mjs --refresh <map-id>...` recaptures the
+  thumbnails of the named maps even when one exists. (#2580)
+
+### Changed
+
+- Publish follow-ups are no longer lost when a worker dies at the wrong
+  moment. The completion or failure notice, cache purges, quicklook, search
+  embedding and usage event are recorded in the same transaction that ends
+  the job and removed only once each has landed. A step that fails is
+  retried by the stale-job sweep or worker recovery with a growing delay.
+  (#2600)
+- The extension API version is now 16, up from 14. Version 15 adds the
+  required `CatalogPort.get_geometry_types` and
+  `CatalogPort.stored_column_name` methods, and version 16 adds the required
+  `CatalogPort.restore_previous_version_task`. An extension that replaces
+  the `catalog_port` slot must implement all three before it re-pins.
+  (#2607, #2630)
+- Every file replacement now queues the `reupload_verified_file` task. A
+  worker still running the previous release fails such a job as an unknown
+  task without publishing it. `reupload_file` stays registered and runs the
+  same verified path for jobs queued before the upgrade. (#2607)
+- A service refresh is held for review when it changes the geometry family,
+  SRID or coordinate dimension, not only attribute columns. A gain of
+  dimensions never holds. (#2595)
+- Dataset deletion and table discovery know about previous-version tables:
+  deleting a dataset drops its kept table, and `<table>_previous_<id>` names
+  are hidden from discovery and refused at registration. (#2630)
+- The seed script retries transient download failures, prints the rerun
+  command for a builder that still fails, and turns Semantic Search on after
+  backfilling embeddings when nothing else has set it. (#2584)
+- A blank LLM model resolves to the extension provider's own default model
+  when the provider publishes one. (#2579)
+- The 409 and 503 answers of `PUT /settings/`, `POST /settings/reset/` and
+  `POST /config-ops/import/` are documented in OpenAPI. (#2571)
+- The search page's Type filter shows the total that choosing All returns,
+  collections included, through the new `numberMatchedAllTypes` field of
+  `/search/datasets/`. (#2573)
+
+### Fixed
+
+- The idempotency key prune on `POST /datasets/{id}/features/` deleted every
+  expired key instead of at most 100 per create when the planner chose a
+  nested loop and re-ran its batch subquery for each candidate row, which
+  stale table statistics trigger. The batch is now selected once, so a
+  create trims one batch. (#2601, #2625)
+- A feature added while a replacement is staging, or a column added to the
+  dataset, is now seen by the review. The live table is held for the check
+  and the swap, so such a change blocks the run instead of being dropped.
+  A geometry type added to the live table in that window is compared too,
+  and holds a point-only replacement for `geometry_type_changed`. (#2607,
+  #2628)
+- Accepting a blocked upload run no longer races the retention purge, which
+  could delete the kept upload and leave the accepted replacement with no
+  source. The acceptance now answers 422 `upload_unavailable` if the purge
+  won. (#2631)
+- Confirming the replacement preview now releases a replacement whose source
+  columns collide after renaming, such as `geom` and `src_geom`, because the
+  preview and the worker name stored columns the same way. (#2632)
+- A publish notice that reached some channels and failed on others is
+  retried on the failed channels only, with the same `notification_id`, so
+  nobody is emailed twice. (#2608)
+- GeoParquet exports keep the column types the table declares instead of
+  widening integers to floats or decimals to the widest scale. (#2572)
+- A search point or line exactly on longitude 180 or -180 matches the same
+  items however its longitude is written. (#2576)
+- An admin settings field no longer stays marked unsaved after the server
+  accepts a normalized value. (#2578)
+- `geolens arcgis inventory` reports a web map with no `baseMap` as an
+  invalid item instead of a complete map. (#2623)
+- `/maps` says "No matching maps" when a filter matches nothing. (#2617)
+- After a restore, the dataset's Source panel names the restored file and its
+  fingerprint instead of the replaced one, when the kept version came from an
+  upload. (#2639, #2641)
+- Import All with Defaults turns a CSV with latitude and longitude or WKT
+  columns into a point layer, as a single import does, instead of a table
+  without geometry. A `.3tz` or `.laz` dropped in the Geospatial files mode
+  now gets a message naming the mode that imports it. (#2645, #2648)
+- ArcGIS layers whose object ID field is not named `OBJECTID`, such as the
+  `FID` on many ArcGIS Online layers, import and refresh. GeoLens orders by
+  the field the layer reports, and sends no ordering to a layer that can't
+  sort. An import or refresh from a server that can't page now fails with a
+  message when the layer has more features than one request returns,
+  instead of publishing a partial table. (#2643, #2647)
+- Accessibility fixes from the WCAG 2.1 AA review of the public pages:
+  status messages and landmarks, page titles on the shared map and embed,
+  Escape and focus handling in the legend, a list structure and labeled
+  pagination for search results, a visible focus ring on result cards, a
+  sticky dataset tab bar with a correct scroll offset, reflow of the shared
+  map at 320 px, wrapping legend labels, translated map controls, and
+  screen reader announcements for map results after a catalog failure and
+  for repeated empty user filters. (#2609, #2618, #2620, #2624)
+
+### Upgrade notes
+
+- Migration 0077 runs on upgrade. It adds nullable columns for the previous
+  version and the scheduled refresh hold, `restored_from_version` on dataset
+  versions, and widens the refresh run origin check to allow `restore`. It
+  needs no backfill and can be rerun after an interruption.
+- Rolling back past 1.22 can leave storage objects behind. The previous
+  release's retention purge does not recognize the new follow-up record, so
+  it can delete a job past retention (30 days by default) that still owes
+  cleanup, and a superseded storage object such as a replaced COG or archive
+  is then never deleted. No live dataset data is affected. After a rollback,
+  run a storage orphan sweep to find and remove those objects. GeoLens does
+  not ship one for this, so use your storage provider's tooling or an
+  inventory diff against the catalog. (#2599)
+- Rolling back across migration 0077 drops the kept previous-version tables,
+  and the downgrade fails while a restore run exists.
+- Custom clients that commit a file replacement without a `review_fingerprint`
+  now end with a blocked run whenever the replacement needs review. Send the
+  fingerprint from the preview response after a person has seen it.
+
+### Known limitations
+
+- A CDN that honors origin cache headers can keep serving a public vector
+  tile for up to `max-age` after its dataset turns private. (#2611)
+- A refresh of a dataset with a generic geometry column blocks tile and
+  feature readers while it rescans geometry types under the publication
+  lock. (#2627)
+- Restoring the previous version of a layer created in GeoLens leaves it
+  typed for edits, so a layer that took lines and polygons before the
+  replacement now refuses them. (#2633)
+- Restoring an empty, unconstrained previous version shows `is_3d` and
+  `n_dims` as null even when the kept data was 3D. (#2634)
+- The 0077 downgrade's ownership check is not scoped to the tenant, so a
+  same-named table in another tenant can make it keep a retained table, which
+  then shows up as registerable. Nothing is dropped that should not be.
+  (#2636)
+- Restoring the original import after its first replacement still names the
+  replacing file in the Source panel, because the original import has no
+  version record to restore it from. The restored data is correct. (#2649)
+- After a restore, the dataset's source coordinate system still describes
+  the replaced upload. (#2646)
+- An ArcGIS server that can't page and doesn't return a feature count can
+  still publish a partial table on a first import. (#2652)
+
+## [1.21.1] - 2026-10-02
+
+### Added
+
+- 3D Tiles and COPC dataset pages show a map preview with the dataset's
+  extent outlined whenever the dataset has an extent, so a reader can see
+  where the data is. (#2465)
+- Presigned S3 URLs can be signed against a separate public host. The new
+  optional `S3_PUBLIC_ENDPOINT` setting names the address browsers and
+  external clients reach, so presigned uploads, STAC asset links and COG
+  download redirects work when `S3_ENDPOINT` is a container hostname or
+  private address. Unset, nothing changes. (#2489)
+- `backend/scripts/backfill_tileset_extents.py` fills in the extent of 3D
+  Tiles datasets published before box and sphere bounding volumes were read.
+  It supports `--dry-run`. (#2474)
+- A periodic reconcile deletes `originals/` archives that no dataset or
+  import job can still use, such as an archive write that landed after its
+  dataset was deleted. It only removes prefixes older than a day and does
+  nothing while the catalog holds no datasets. (#2510)
+- Registering an existing PostGIS table that has no `gid` column now adds
+  one, so the table's tiles, OGC items, rows table and feature editing work.
+  A `gid` that is not an integer, can be NULL or is not unique is refused
+  with a clear message, as are a table that other tables inherit from and a
+  partitioned table without one, and the register form explains each case
+  in all five languages. (#2535)
+
+### Changed
+
+- The extension API version is now 14, up from 12. Version 13 adds a required
+  `CatalogPort.cog_may_be_read` method, which the replacement quota check
+  asks whether a VRT may still read a mosaic member's COG. An extension
+  that replaces the `catalog_port` slot without it fails every reupload
+  request. (#2491) Version 14 makes `ProcessingPort.get_catalog_vocabulary`
+  and `ProcessingPort.get_keywords_for_records` require the caller's `user`
+  and `user_roles`, so an extension that implements either method must
+  accept the new arguments. An extension upgrading from 12 needs both
+  changes before it re-pins to 14. (#2522)
+- GeoParquet exports are written in bounded batches instead of being built in
+  memory. `json` and `jsonb` columns are now written as JSON text rather than
+  inferred from decoded values, so numbers keep their digits and JSON `null`
+  is the text `null`. Files have more row groups (at most 100,000 rows each),
+  columns that fall back to text write arrays as JSON, and the timeout
+  message now ends "the row source or the write is too slow". Exports that
+  used to fail on an empty JSON object or an integer past the 64-bit range
+  now succeed. (#2529)
+- Embedding width changes are serialized. `PUT /settings`, a settings reset
+  and a configuration import that change `embedding_model` or
+  `embedding_dims` now run one at a time, and a second one answers 409
+  "Another embedding configuration change is in progress" until the first
+  finishes, even when it only repeats the current model. When rebuilding
+  the vector column fails, a reset or import restores the previous width
+  and model and answers 503, and the message says which other settings in
+  the request were kept. In env-only mode these changes still answer 403.
+  (#2527)
+- The single-feature `GET`, the create, `PUT` and `PATCH` responses, and the
+  `feature_changed` 409 carry an opaque `table_id`. The feature list and
+  `features.geojson` responses do not. `PUT`, `PATCH` and `DELETE` on
+  `/datasets/{id}/features/{gid}` accept it as an optional query parameter,
+  and a write whose table was replaced since the editor read it is refused
+  with 409 `dataset_replaced`. A retried create whose feature is gone is
+  refused with 409 `feature_gone`, alongside the existing `feature_changed`.
+  Writes without `table_id` behave as before. (#2528)
+- `POST /datasets/{id}/features/` accepts optional `Idempotency-Key` and
+  `Idempotency-Attempt` headers, so a retried create returns the stored
+  feature instead of inserting a second one. A migration adds the table
+  that records the keys. (#2519)
+- The admin dataset list is no longer cached, so a list read right after an
+  import completes includes the new dataset. (#2461)
+- PostgreSQL 15 is now stated as the minimum version in the README and the
+  migration docs. The baseline migration and migration 0050 refuse an older
+  server up front instead of failing partway through. (#2512)
+- The `cloud-dev` Compose profile pulls its MinIO server and client images
+  from the maintained `pgsty` fork, pinned by tag and digest, because the
+  previous `quay.io` images no longer allow anonymous pulls. `.env.example`
+  now documents `S3_ADDRESSING_STYLE=path` for local MinIO. (#2490)
+- The published 401 description on optional-auth routes now matches what each
+  route accepts. Routes that take no embed token or signed tile template
+  describe plain fail-closed behavior. (#2466)
+- A public vector dataset's quicklook is revalidated by ETag with
+  `Cache-Control: public, no-cache` instead of being cached for an hour, so
+  a replaced image shows up right away. Raster quicklooks keep their hour of
+  freshness. (#2534)
+- Dependency updates: Vite 8.3.1, terra-draw 1.35, lucide-react 1.48,
+  react-i18next 17.0.15, TanStack Query, procrastinate 3.10, PyJWT 2.15,
+  Starlette, psycopg, sqlglot, boto3, azure-storage-blob, ruff, and the Node
+  Alpine image, plus routine type and lint packages and the CodeQL and
+  setup-uv actions. (#2436 to #2457)
+
+### Fixed
+
+- Resetting `embedding_dims` or importing a configuration that sets it now
+  resizes the vector column, as `PUT /settings` already did. Before, the
+  call answered 200 and left the column at the old width, and the
+  embedding backfill then refused to run because the widths disagreed.
+  Re-sending the current width repairs a column left at another one.
+  (#2527)
+- A retried feature create on the dataset map that the server refuses because
+  the first attempt landed and the feature has since changed or gone no
+  longer leaves the sketch stuck. The draft stays, tiles reload, a message
+  explains what happened, and the next Save either updates the feature or
+  creates it again. A Save from an editor opened before a reupload, or
+  before a registered table was dropped and recreated, can no longer
+  overwrite an unrelated row that reused the feature id. (#2519, #2528)
+- The dataset map stays safe while feature writes are in flight. The session
+  waits for every pending create, update and delete, Escape and the toolbar
+  are ignored during a save, and a refused automatic save keeps the sketch
+  as unsaved work instead of silently dropping it. When edit rights are
+  lost mid-edit, unsaved work stays behind a notice with a Discard button
+  instead of an invisible toolbar, and the confirmation no longer offers to
+  continue editing. (#2481, #2486, #2500)
+- Inline fields a viewer cannot edit show "Not set" when empty instead of an
+  edit prompt such as "Add a description...". (#2500)
+- The Ask AI launcher no longer covers the Save button of the pending-edits
+  bar, and the dataset header actions wrap on phone widths. (#2511, #2498)
+- Terrain no longer throws a `shaderPreludeCode` error on a cold load, because
+  it is cleared before a fetched basemap style replaces the placeholder
+  style. (#2462)
+- Uploading a GeoPackage, COPC `.laz`, `.3tz`, FlatGeobuf or Parquet file
+  that the browser gives no MIME type no longer fails with
+  `SignatureDoesNotMatch` on S3 storage. The upload signs and sends one
+  content type. (#2497)
+- Ingesting a Cloud Optimized GeoTIFF without internal overviews no longer
+  leaves a `tmp*.tif.ovr` file in the upload staging volume. (#2499)
+- 3D Tiles datasets whose root bounding volume is a georeferenced `box` or
+  `sphere` now get a spatial extent, so search no longer shows "No Extent".
+  A volume that covers the globe gets the full extent, and a JSON integer
+  too large for a float is refused as a bounding volume error instead of
+  crashing. (#2472, #2477)
+- OGC records for published rasters on S3 storage link their thumbnail and
+  overview again, through the access-checked quicklook route. (#2476)
+- `GET /datasets/` no longer answers 500 when a raster dataset stored a
+  numeric band `nodata` value. (#2471)
+- Switching the LLM provider to OpenAI-compatible with both provider keys set
+  no longer breaks every AI feature. Model defaults follow the selected
+  provider, an admin override still wins, and the AI status endpoint reports
+  the model requests actually use. (#2507)
+- With "Send Sample Values to LLM" turned off, sample values no longer reach
+  the provider through metadata drafts, SQL schema context or map chat.
+  Keyword suggestions no longer draw on private records the caller cannot
+  read. (#2522)
+- AI metadata prompts describe a dataset's extent as signed longitude and
+  latitude ranges, so models no longer read the edges as hemispheres. Chat
+  result tables show at most 12 significant digits instead of floating-point
+  noise such as `491.9000000000001`, and the cell title keeps the exact
+  value. (#2506, #2505)
+- Metadata edits and re-embeds stay in order. The re-embed job is queued after
+  the edit commits, and a stale vector no longer overwrites a record that
+  changed while it was being embedded. (#2517)
+- Reapplying a manifest now applies its title, summary, visibility and
+  status, so a manifest asking for a draft no longer leaves a record public.
+  Two commits of one upload no longer both dispatch, an accepted
+  `srid_override` applies to native GDAL formats, and objects written by a
+  failed VRT regeneration are cleaned up. (#2515)
+- A replacement of a mosaic member near the storage cap is no longer admitted
+  and then refused at publish, because the check no longer credits a COG that
+  a VRT may still read. (#2491)
+- A VRT regeneration whose commit acknowledgement was lost now always runs its
+  catalog cache purge and embedding refresh, so the regenerated VRT no
+  longer serves stale catalog results. (#2485)
+- An archive that lands after its dataset was deleted is deleted by the
+  stale-job sweep instead of staying in storage. (#2483)
+- The Azure `originals/` reconcile resumes a listing from its continuation
+  token, so orphans deeper than the first 100 pages are reached. (#2526)
+- Five map and search fixes. A malformed SVG sprite path no
+  longer hangs rendering, a failed vector search falls back to full text
+  instead of failing the request, pagination links keep `sort_desc` and
+  `spatial_predicate`, appending a layer respects the 200-layer limit, and
+  map detail and `style.json` no longer return a terrain binding whose DEM
+  the caller cannot see. (#2523)
+- Embed origin allowlist changes take effect on the next request instead of
+  after the cache expires. (#2516)
+- Streamed request bodies over the size cap are rejected with 413 before any
+  write happens. Password hashing no longer stalls other requests while it
+  runs, and a user with two roles both granted on a restricted dataset no
+  longer gets a 500. (#2514)
+- A redirect's body is no longer read in full when a document fetch, URL
+  import or reupload follows it. (#2520)
+- STAC browsing and search read provider responses with a time and size
+  limit, an ArcGIS sign-in settles within its time budget, a cancelled
+  service preview stops its `ogrinfo` process, and a STAC request holds one
+  database connection instead of three or four. Redirect bodies are also
+  dropped on connect probes. (#2513)
+- Maintenance scripts: `seed_tiles.py` writes cache entries under the key the
+  tile route reads and no longer prints the Redis password, and the
+  quicklook scripts exit with status 2 on deployments with per-tenant
+  schemas, where they cannot work. Migration 0032's downgrade locks its
+  tables before counting keys. (#2518, #2512)
+- Vector dataset quicklooks are redrawn after a file re-upload, a conversion
+  to a live service or a service refresh, instead of showing the old data.
+  A redraw uses one database connection, a replacement is no longer held
+  up by a slow image upload, and a redraw removes the image it uploaded if
+  the dataset was deleted in the meantime. (#2534)
+- Refreshing a registered PostGIS table restores its `gid`, and a refresh
+  whose recreated `gid` cannot key features fails with
+  `source_gid_unusable` instead of reporting a healthy table. The register
+  form labels discovered tables with the data schema instead of `public`,
+  and shows no row estimate for a table PostgreSQL has never analyzed
+  instead of "-1". An analyzed empty table still shows 0. (#2535)
+- FlatGeobuf exports keep features with null or empty geometry, retry
+  without the spatial index when the driver refuses it, and log export
+  failures. (#2533)
+- Date-only values show that calendar day west of UTC, data vintage is edited
+  as an ISO date and can be cleared, and short attribute tables no longer
+  clip rows below the header. (#2531)
+- Search area: the rectangle prompt describes the click-to-start,
+  click-to-finish gesture in all five languages, a box with no area is
+  ignored, the sheet stays exposed to assistive technology, and an area
+  that crosses the antimeridian is shown and sent with longitudes inside
+  180, including from the phone-width picker. Reopening the sheet draws the
+  applied area, "Use current map extent" draws its rectangle, and an
+  applied polygon reopens as itself and keeps its shape on Apply instead
+  of turning into its bounding rectangle. (#2531)
+- A polygon search area that crosses the antimeridian now matches records on
+  both sides of it. Catalog search, its facets and STAC Item Search fold a
+  geometry written with longitudes past 180 back into range before
+  matching, where records past the seam never matched before. A search
+  area spanning more than 8 world copies, or with a coordinate too large
+  for a float, is refused with a 400. (#2537, #2556)
+- The Semantic Search switch in AI settings now saves with the rest of the
+  AI settings, counts as an unsaved change and is restored by Discard
+  Changes, instead of saving the moment it is flipped. It is disabled when
+  settings come from environment variables. Edits made while a save runs
+  are kept, and the settings page keeps the form when a background refresh
+  fails instead of dropping it. (#2553)
+- The map builder's Add Data dialog no longer blocks the page behind it, so
+  one click on the map or layer list works while it is open, and focus
+  returns to where it was when the dialog closes. (#2554)
+- The Render as buttons in the builder expose their selected state to
+  assistive technology, and the notifications region label is translated in
+  every language. (#2531)
+- Importing: completed datasets are linked on the multi-file and STAC import
+  completion screens, and virtual raster jobs get a label instead of their
+  type token. (#2531)
+- Dataset pages: the Source panel labels STAC, GeoTIFF and service types in
+  all five languages, the tile token is refetched after a publish,
+  unpublish or visibility change, a non-public dataset no longer offers an
+  unsigned vector tiles URL. (#2531)
+- The import preview shows a single-layer upload's own name as Layer Name
+  instead of the staged file's job-id prefix, and keeps real layer names
+  that merely end with the file name. A dataset that is not found stops
+  retrying its dependent queries, the dataset map attribution stays clear
+  of the basemap thumbnail on narrow maps, and 19 Spanish strings regain
+  their accents. (#2532)
+- Collection Add buttons are named after their dataset, the Create dataset
+  link is hidden from users without `edit_metadata`, folder groups are kept
+  out of analysis layer pickers, and the analysis panel notes that a
+  layer's filter is ignored. (#2531)
+
+### Security
+
+- The MCP server requires PyJWT 2.15.0 or later, and the frontend lockfile
+  moves `brace-expansion` and `undici` to patched releases, clearing
+  published advisories. (#2493, #2484)
+
+## [1.21.0] - 2026-09-28
+
+### Added
+
+- `/api/health/ready` is a readiness probe that checks only the database, so
+  an orchestrator no longer takes every API replica out of service during a
+  cache or object-store outage. `/api/health` remains the full dependency
+  report. (#2150)
+- ArcGIS refreshes can opt into exact object-ID coverage verification. Missing,
+  duplicate, unexpected, or changing source IDs block publication; successful
+  coverage verifies layer membership without claiming an atomic source
+  snapshot. (#2104)
+- Dataset Source panels support scheduled sync setup, UTC scheduling,
+  write-only credential controls, and explicit verification before enabling a
+  schedule. (#2104)
+- 3D Tiles tilesets can now be imported and served. Uploading a `.zip` or
+  `.3tz` archive, or importing one from a URL, validates its layout, every
+  tile's content and every URI it points to before publishing it as a
+  dataset: absolute or path-escaping URIs inside tile content are refused,
+  and only stored or standard-deflate zip entries are read. A published
+  tileset gets its own dataset page showing its version, geometric error,
+  bounding volume, extent, recorded tile content types and required
+  extensions, is served at a dedicated route with per-read authorization and
+  revalidated caching, and is advertised in the dataset detail response, OGC
+  records and the DCAT feeds. New settings `MAX_TILESET_UNPACKED_MB` and
+  `MAX_TILESET_ENTRIES` bound how large an uploaded tileset can be. (#2187,
+  #2194, #2212, #2223, #2232, #2250, #2254, #2256, #2259, #2260, #2267,
+  #2375)
+- COPC (`.laz`) point cloud files can now be imported and served. Uploading a
+  file validates its header, its hierarchy and every point, decoded in a
+  resource-bounded child process, before publishing it as a point cloud
+  dataset. A published file is served whole or by byte range with per-read
+  authorization, audit logging and per-client rate limits, and its dataset
+  page shows point count, file size, point format, geographic bounds,
+  horizontal and vertical CRS, and elevation range, with connection examples
+  for QGIS, Potree and copc.js. (#2281, #2285, #2287, #2355, #2362, #2371,
+  #2372)
+- The Python SDK can download a COG through `geolens.cog_download` even when
+  the server redirects to object storage, fetching the redirect target
+  without forwarding GeoLens credentials to the storage host. (#2397)
+
+### Changed
+
+- The extension API version is now 12. Catalog extensions must supply a
+  `scheduled_refresh_lifecycle` slot to run scheduled dispatch, and
+  `ProcessingPort.build_gdal_source` gains required ArcGIS object-ID chunk
+  support, including a keyword that forces the ESRIJSON driver when an
+  object ID exceeds its range. (#2104)
+- Catalog search separates map-title matches from dataset results, each with
+  its own loading, retry and empty state, and groups specialized filters
+  under an Advanced filters section while keeping active refinements
+  visible. Dataset detail pages keep the full map on the Overview tab, add a
+  collapsible compact preview on task tabs, and link Connect to the existing
+  QGIS, Python and curl instructions. (#2106)
+- Upload, presigned-upload, URL-import and re-upload refusals now carry a
+  stable code alongside their message, so the import UI can show a properly
+  translated explanation instead of a generic error for content the server
+  rejected. (#2284)
+- Jobs and their linked refresh runs, VRT regenerations and fan-out children
+  left stale by a worker restart are now resolved during startup recovery
+  instead of waiting for the next periodic sweep. (#2172)
+- A stuck analysis job now fails after 5 minutes without a heartbeat instead
+  of waiting for the general 60-minute timeout, and checking a job's status
+  also settles its linked refresh run, VRT generation and fan-out state in
+  the same pass. (#2182)
+- Refreshing a registered PostGIS table now records whether its geometry is
+  3D and its elevation range on every refresh instead of leaving those
+  fields blank. Quality scoring for a re-upload or refresh now runs before
+  the table swap instead of holding the live table locked while scoring, and
+  a run that ends up blocked or rejected no longer runs a quality scan at
+  all. (#2192)
+- The admin job status field's published description now documents the
+  `fanned_out` status, used when a multi-layer upload is split into
+  independent per-layer jobs. (#2282)
+- Dependency updates: React map tooling, jsdom, alembic, boto3,
+  azure-storage-blob, urllib3, pyjwt, Node Alpine images, CodeQL actions, and
+  routine backend and frontend packages. (#2102, #2121, #2125, #2129, #2130,
+  #2131, #2132, #2136, #2138, #2139, #2140, #2141)
+- A page of STAC items now resolves the caller's COG export permission once
+  instead of once per raster item. Which items link a COG is unchanged.
+  (#2293)
+
+### Fixed
+
+- `/api/health` reports the database as degraded when the catalog schema is
+  missing. Its probe looked the table up but ignored the NULL PostgreSQL
+  returns for a relation that is not there. (#2150)
+- The web UI works on deployments served over plain HTTP. Imports, the map
+  builder and AI chat generated ids with `crypto.randomUUID`, which browsers
+  expose only on HTTPS or localhost, so dropping a file on the import page
+  did nothing there. (#2149)
+- Rasters uploaded before v1.3.0 now list their COG and quicklooks as STAC
+  and OGC Records assets, as newer rasters do, and their COG counts toward
+  the owner's storage quota. An upgrade migration adds the missing asset
+  rows. Owners of older rasters will see their storage usage rise, and
+  anyone it puts over the cap cannot upload until they free space. (#2279)
+- Ingest publication is now resilient to a lost database acknowledgement.
+  When a publish, VRT regeneration, or raster, 3D Tiles or point cloud
+  commit's outcome cannot be confirmed right away, GeoLens now asks
+  PostgreSQL for the transaction's real result instead of assuming failure,
+  keeps every version of the data until the outcome is known, and finishes
+  deferred steps (owner notifications, cache invalidation, embeddings, usage
+  events) exactly once, even after a delay. This closes several related
+  gaps: a re-upload's original file could be deleted before its archive copy
+  finished; a replaced raster's superseded COG, or a superseded VRT, could
+  be deleted while another VRT still needed it; staged uploads and archive
+  attempts could be kept forever, or occasionally deleted before they were
+  needed; and a re-upload could block the dataset's tile, feature and
+  catalog requests for as long as the original file's archive took. A
+  periodic sweep now also removes local staged uploads that no import job
+  can still use. (#2181, #2189, #2191, #2199, #2249, #2255, #2264, #2339,
+  #2354, #2359, #2386, #2392, #2393, #2401, #2404)
+- A dataset replacement or refresh that fails, or one whose failure record is
+  delayed by a lock or an interrupted transaction, now reliably sends its
+  owner a failure notification, closing several gaps where a failed raster
+  replacement, file or service replacement, PostGIS or STAC refresh, or
+  rejected verification could complete or fail with nothing sent. A refresh
+  whose dataset is deleted while it runs, or whose underlying STAC asset
+  moved, now settles cleanly instead of being left stuck as running. (#2228,
+  #2244, #2252, #2271, #2275)
+- Map legends, layer icons, the style preview and exported PNGs now
+  consistently match what the map itself draws. Legend classes are derived
+  directly from each layer's paint instead of stored config, so a legend
+  shows a layer's real breaks, its heatmap ramp and weighting column, an
+  "Other" row for uncovered categorical values, and the outline a layer
+  actually draws. Style, paint, zoom-range and opacity edits in the builder
+  now apply immediately instead of waiting for the next render pass;
+  switching a layer's render mode, or pasting a style that changes a
+  layer's family (for example circle to heatmap), redraws it correctly; and
+  a layer with a saved zoom range or a custom height column is no longer
+  dropped by an edit. A clustered layer whose data is too large or fails to
+  load is now labeled correctly instead of still reading as a cluster, and
+  shared or embedded maps respect a dataset's extent for both vector and
+  raster sources. The shared-map response now includes each layer's
+  `dataset_extent_bbox`, as the builder's map response already did.
+  (#2159, #2169, #2173, #2178, #2179, #2184, #2185, #2188, #2198, #2202,
+  #2214, #2216, #2218, #2220, #2227, #2236, #2243, #2248)
+- Refresh and replacement runs handle contention and edge cases more
+  reliably: a failed credential check on the first page of a scheduled
+  ArcGIS refresh now reports as an expired credential so an automation can
+  pause, instead of a generic ingestion error (#2133); applying a manifest
+  re-upload now creates its refresh run before the update is queued, so it
+  appears in run history and is refused with a busy error instead of
+  silently queuing a second update alongside it (#2160); refreshing or
+  re-uploading a 3D point layer through a service connection no longer
+  drops its elevation column or resets its recorded 3D metadata (#2161); a
+  refresh run is now marked failed only when its job actually failed to
+  start, not whenever an unrelated dispatch rollback runs afterward (#2165);
+  accepting a blocked refresh no longer gets stuck if the accepting refresh
+  is later cancelled or fails (#2168); when a STAC refresh is blocked
+  because its source address is disallowed by GeoLens's outbound-address
+  policy, the stored failure message now says so instead of showing a
+  generic "try again" message (#2257); a refresh that ends blocked or
+  rejected while another operation holds a lock on the same dataset now
+  waits up to 60 seconds for that lock instead of failing after 2 seconds
+  and losing the review outcome (#2183); and dataset and refresh conflicts
+  from concurrent operations now all report one consistent conflict code,
+  with affected jobs waiting briefly for a conflicting lock instead of
+  failing immediately (#2206).
+- STAC and OGC Records metadata for rasters is more accurate: ground sample
+  distance is published in metres, as the specification requires, instead of
+  the raster's native CRS units (#2330); `raster:bands` is built from a
+  raster's actual stored band and statistics information and placed on the
+  correct asset (#2335, #2351); band statistics for rasters with 10 or more
+  bands are stored in the correct order (#2337); a raster's nodata value is
+  now recorded correctly on import and refresh, with a scheduled refresh
+  backfilling it for rasters imported before this fix (#2356); a raster's
+  CRS facts are now derived once at ingest, so requests no longer parse
+  stored CRS text (#2328); a remote COG's coordinate reference system must
+  now be identified by an EPSG code or CRS84 before import or refresh
+  (#2302); an asset with no known media type no longer breaks search, OGC
+  record or STAC item responses (#2327); the DCAT feeds advertise a COG
+  download for a public raster only when it actually has one (#2301); and
+  STAC and OGC Records items for rasters stored locally, not in S3, now
+  advertise COG and quicklook download links, which were previously listed
+  only for S3-backed rasters (#2261).
+- Tile and file serving is more reliable under load: a re-upload or refresh
+  of a vector dataset without Valkey configured now serves the new tiles
+  within 60 seconds instead of up to 5 minutes (#2305); editing a feature
+  now reloads tiles using the edit's committed tile cache version, so every
+  API worker in a multi-worker install picks up the change within its
+  normal freshness window (#2321); raster tile requests now share the same
+  bounded, cached metadata re-read vector tiles already use (#2322); tile
+  rendering capacity is now bounded per API process, with the map client
+  retrying a throttled request instead of leaving it blank (#2366); and the
+  COG download route now answers a clean 404 or 503, instead of a truncated
+  response, when the underlying file changes size or vanishes, closes its
+  storage connection promptly on a client disconnect, and honors
+  `If-None-Match` on non-GET/HEAD requests (#2315).
+- Import handles edge cases more clearly: a file whose source has geometry
+  but whose imported table ends up without one now fails with a message
+  telling the user to check the file and re-upload, instead of an internal
+  error (#2229); uploading a disallowed extension through the presigned
+  (S3) upload door now returns a proper error instead of an unhandled
+  server error, matching the direct upload door (#2241); the import form
+  shows the server's actual refusal reason, such as an unsafe archive or a
+  disallowed extension, instead of a generic "submitted values are invalid"
+  message (#2268); STAC search results now flag items the import would
+  refuse, such as an `s3://` address, a credentialed URL, or an address
+  that is too long, and disable those items in the import form with the
+  reason shown, instead of letting them fail after submission (#2309);
+  re-upload schema previews now compare column types against what the
+  import will actually store, instead of GDAL's raw type report, so an
+  unchanged GeoJSON boolean or CSV column no longer falsely shows as a
+  schema change (#2318); importing a CSV with X/Y coordinate columns into a
+  self-hosted database on PostgreSQL 13 through 15 no longer fails, since
+  the coordinate check no longer depends on a PostgreSQL 16-only function
+  (#2396); and leaving the Upload tab while a commit is still pending no
+  longer loses the result, letting a refused commit be retried with the
+  same edited fields (#2400).
+- The map builder's Share dialog now checks with the server before offering
+  "Make public" on a map holding a non-public dataset; when the map cannot
+  be made public yet, it names the blocking datasets and offers only
+  Cancel, instead of offering an option the server would refuse. (#2308)
+- Record-type and geometry handling is more consistent: raster datasets now
+  return 404, instead of mismatched errors, from the vector tile, dataset
+  rows, and column add/rename/retype/drop routes (#2170); registering or
+  refreshing a table whose geometry column has no declared SRID is refused
+  up front with a clear message, and bulk registration errors no longer
+  leak raw database text (#2219); a measured (M-typed) geometry column is
+  now cataloged by its base geometry type instead of failing to register
+  (#2221); writing a geometry to a measured (M) layer's features fails
+  immediately with a clear message instead of a generic database error
+  partway through (#2226); and the dataset Overview page's Table Name row is
+  no longer shown for raster, VRT and 3D Tiles datasets, whose table name is
+  a synthetic identifier rather than a queryable table (#2235).
+- Remaining English-only messages are now translated in all five locales:
+  the upload dropzone's rejection reason and four smaller display issues
+  (#2306); admin job status labels, including Cancelled and Fanned out, with
+  matching Status filter options (#2307); fixed job failure reasons shown
+  across the admin job list, import panel, analysis panel and re-upload
+  dialog (#2312); and refresh run failure reasons on the source panel's
+  refresh history (#2324).
+- Each dataset's preview map is now rebuilt when navigating from one dataset
+  to another, so returning to a previously viewed dataset no longer shows
+  the wrong dataset's map or a blank preview (#2186). An unset line cap or
+  join now consistently resolves to round instead of sometimes keeping
+  stale rendering state (#2222). A finished analysis job's completion toast
+  keeps a consistent label, placement and action based on where it is
+  currently being viewed (#2346). Opening a map that does not exist, or
+  that the signed-in user can no longer access, now shows a "Map not found"
+  page instead of a retry prompt that could never succeed (#2349).
+- The admin job list no longer includes internal bookkeeping fields, such as
+  unpublished storage keys, staging paths and multipart upload ids, in a
+  job's metadata (#2274). Dataset quicklook thumbnails for private,
+  internal, restricted or draft datasets are no longer marked publicly
+  cacheable, which could let a shared cache or CDN serve a private
+  thumbnail to an unauthorized caller; self-hosted deployments with a
+  caching proxy or CDN in front of the API should purge cached quicklook
+  responses after upgrading (#2289).
+- A worker restart no longer fails a queued URL import that was already
+  marked running but still waiting in the queue past the stale-job timeout
+  (#2157). Reading an uploaded raster's metadata could, in rare cases, hang
+  indefinitely and freeze the whole server process if the file's coordinate
+  reference system caused the underlying geospatial library to wait on an
+  external file read; raster reads now run in a separate process that is
+  killed if it does not finish in time (#2295). The child process used to
+  decode untrusted point clouds and compare raster CRS text now keeps its
+  timeout regardless of request size and caps how much it can write back
+  (#2379).
+- The Python SDK's anonymous-capable operations, such as dataset search and
+  point cloud reads, now accept a client with no credentials instead of
+  only a typed authenticated client a type checker would reject (#2378).
+  Downloading a COG, an export file, or a 3D Tiles file through the SDK's
+  simple call now returns the file's bytes instead of silently discarding
+  them (#2382).
+- The OAuth2 password flow's advertised token URL now correctly points at
+  the proxied `/api/auth/login` path, instead of one that resolved to the
+  frontend's own route when followed through the bundled reverse proxy.
+  (#2341)
+- Downloading a COG on an S3-backed install now follows the server's
+  configured storage provider rather than a stale per-row tag, so a managed
+  raster can be served as a redirect to object storage. This is opt-in
+  through the new `S3_PRESIGNED_DOWNLOADS` setting, off by default; with it
+  off, downloads stream through the API as they did before. (#2411)
+- A batch of catalog, import, dataset, builder and admin UX fixes: a
+  dataset's compact warning summary expands to full details instead of
+  always showing everything; the import review keeps a single file's
+  reviewed settings, and a failed job's retry controls stay visible, during
+  a mixed batch; publishing a map now discloses that Public makes it
+  visible to everyone and lists it in Maps; storage quota controls accept
+  exact GiB and byte values; and creating, editing or deleting a map from
+  the dataset page, an AI result or the import flow now consistently checks
+  the caller's effective permissions and ownership. (#2409)
+- Completed import jobs whose archive flags (`archive_pending` or
+  `archive_failed`) had nothing left able to retry them, either because the
+  job predates the retry mechanism or because its dataset was deleted or
+  its staged upload path was never recorded, no longer stay flagged forever
+  while holding their staged upload. They are now settled: confirmed once
+  the archive is actually in storage, or marked with an `archive_review`
+  reason an operator can see in Admin > Jobs, next to `archive_failed` in
+  the job's metadata. RUNBOOK section 9 documents the retry schedule and
+  the review reasons. (#2412)
+- The TypeScript SDK now follows redirects itself instead of leaving them
+  to `fetch`, so a hop to another origin, such as an S3 redirect, never
+  carries GeoLens credentials or custom headers; only `Range` and
+  conditional-request headers cross with it. In a browser, a credentialed
+  GET or HEAD that redirects off the GeoLens origin now fails with the new
+  `RedirectError` instead of silently following with those credentials
+  attached; request a download token (`POST
+  /auth/download-token/{dataset_id}`) for COG downloads instead. (#2414)
+- When a VRT regeneration's publish commit lands but the worker's
+  acknowledgement of it is lost, and the database confirms the commit
+  landed, the regenerated VRT now purges the catalog cache and refreshes
+  its search embedding, matching the normal path. Previously these two
+  steps were skipped in that case, so a regenerated VRT could keep serving
+  cached catalog responses and a stale embedding until an unrelated write
+  refreshed them. (#2418)
+- Deleting a dataset while its vector import is still archiving the
+  original file now waits briefly, about 2 seconds, and returns 409 instead
+  of succeeding and leaving the original behind with no dataset pointing at
+  it. A bulk delete reports that item as a conflict, and retrying once the
+  archive finishes deletes the dataset and its archive together. (#2420)
+- A presigned upload is no longer deleted while it may be the only copy of
+  an import's original file. A completed job that owed its archive but had
+  no recorded staged-file path could previously have its presigned upload
+  deleted in the same pass that flagged the archive for review, losing the
+  only copy; the upload, and its later expiry sweep, now wait until the
+  archive is confirmed or the dataset is deleted. (#2422)
+- On an Azure-backed install, a published raster's STAC item and OGC
+  record now link its COG and quicklook images to the routes that serve
+  them. Previously an Azure-stored raster listed no data, thumbnail or
+  overview asset at all, because the asset builder only knew how to link
+  an S3 key, by presigning, or a local storage key, by route. (#2425)
+- A VRT's reported member count, in its status, dataset detail and list,
+  OGC record item and search results, now counts only the members the
+  caller can read, matching the member list shown beside it, instead of the
+  raw total. An administrator still sees the true count, and a generation
+  history entry's member count stays visible only to the VRT's owner or an
+  admin. (#2426)
+- Adding a layer to an already-public map, or setting a map to Public while
+  adding layers in the same request, is now refused with the same check
+  used when first publishing a map, so those two paths can no longer leave
+  a public map drawing a non-public dataset. A public map that already
+  holds such a layer from before this fix now withholds its stored
+  thumbnail and social-share image from any caller who cannot read every
+  dataset it draws, a terrain elevation layer included; other callers get
+  the same 404 as a map with no image, and the share card falls back to
+  the site's default image. (#2424)
+- Raster data files in STAC and records are linked only for callers who
+  may download them. (#2415)
+- The chat add-layer tool names a dataset only when the caller can read
+  it. (#2421)
+- Remote service imports and previews now send GDAL's HTTP requests
+  through a proxy that checks every connection against the same address
+  policy as the rest of the server, redirect hops included. A failed
+  service import reports the exit code and a short cause instead of the
+  service's own response text. The worker no longer applies environment
+  proxy variables or a GDAL config file (`gdalrc`) to these imports.
+  (#2427)
+- A web page on another site can now read a public, published point cloud
+  (COPC) file or 3D Tileset from the API without credentials, including by
+  byte range and with conditional requests. Previously the files carried no
+  CORS headers and the range preflight was refused unless the page's origin
+  was added to `CORS_ALLOWED_ORIGINS`. Private datasets and credentialed
+  requests still follow that allowlist. (#2434)
+- A map's thumbnail and share image are no longer captured while its
+  raster, hillshade, 3D terrain or raster basemap tiles are still loading,
+  which could store a partly painted map. The builder now waits for those
+  tiles to settle, and drops the capture if the map was edited, switched
+  or saved again in the meantime. (#2435)
+
+### Known limitations
+
+- The optional `cloud-dev` Compose profile pins MinIO images
+  (`quay.io/minio/minio`, `quay.io/minio/mc`) that can no longer be pulled
+  anonymously, so `docker compose --profile cloud-dev up` fails on a
+  machine without them cached (#2407). Default installs do not use the
+  profile. A working alternative is to run an S3-compatible server
+  separately and point GeoLens at it with `STORAGE_PROVIDER=s3`,
+  `S3_ENDPOINT` (a full `http://` or `https://` URL), `S3_BUCKET`,
+  `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY`. For MinIO, also set
+  `S3_ADDRESSING_STYLE=path`; without it, raster tiles fail because TiTiler
+  addresses the bucket as a subdomain of the endpoint. This was verified
+  with `bitnamilegacy/minio` for uploads, COG downloads, and raster and
+  vector tiles.
+- Deleting a dataset while its import is still archiving the original file
+  returns 409 for a few seconds instead of failing outright; retrying once
+  the archive finishes succeeds. (#2412, #2420)
+- Replacing a mosaic (VRT) member whose old COG is kept alive because
+  another mosaic still reads it has two open quota gaps: the request-time
+  quota check credits the old COG right away, so a replacement that passes
+  near the cap can still be refused at publish once the file is actually
+  kept; and a VRT registered between the replacement's reader check and
+  its publish commit can push the owner slightly over their quota cap
+  until the kept bytes are reclaimed. (#2403)
+- Presigned S3 URLs, for STAC asset links and presigned uploads, are
+  signed against `S3_ENDPOINT`, so a browser or external client cannot use
+  them when that endpoint is a container hostname or a private address,
+  such as `http://minio:9000` in the `cloud-dev` profile. The COG download
+  route already avoids this by streaming or redirecting depending on
+  whether presigned downloads are enabled; other presigned surfaces do not
+  yet have that switch. (#2408)
+- When a mosaic (VRT) member is replaced, the mosaic keeps drawing the
+  member's old file until someone regenerates it, and the member's owner
+  is charged for that kept file even when another user's mosaic is the one
+  still reading it. Whether a replacement should automatically rebuild the
+  mosaics that depend on it, and who should pay for a kept file another
+  user's mosaic reads, are open product decisions. (#2376)
+- Stale-job recovery still spreads its commit, counter and cleanup
+  ordering across several callers, the sweep, the admin endpoint, the
+  worker and single-job polling, instead of owning it in one module, so a
+  new cleanup step needs coordinated edits in each caller. No incorrect
+  behavior is known today; this is a maintenance and testing gap. (#2395)
+- A VRT regeneration whose commit lands but whose acknowledgement is lost,
+  and whose outcome the database probe then reads as inconclusive rather
+  than confirmed, still skips purging the catalog cache and refreshing the
+  search embedding; the regenerated VRT can serve cached responses and a
+  stale embedding until an unrelated write refreshes them. The more common
+  case, where the probe confirms the commit landed, is fixed. (#2417)
+- If the worker's database connection drops while it is still writing an
+  import's archived original to storage, the row lock holding back a
+  concurrent dataset delete is released early. The delete can then commit
+  and reap the dataset's prefix before the late write lands, leaving an
+  orphaned file in storage with no dataset pointing at it. Reaching this
+  needs a lost connection during the write and a delete in the same
+  window. (#2419)
+- On an S3-backed install, an OGC record for a published raster
+  (`/collections/datasets/items/{id}` and OGC record search) has no
+  thumbnail or overview asset, because the record builder does not pass
+  the storage provider its asset resolver needs to presign one. STAC items
+  are unaffected. (#2423)
+- Operators still have no dedicated action to retry or release a job whose
+  archive is held for review; recovery today needs a direct database
+  query, documented in RUNBOOK section 9. (#2367)
+- <!-- more known limitations added at release -->
+
 ## [1.20.0] - 2026-09-18
 
 ### Added
@@ -3951,7 +5297,13 @@ regression-covered fixes:
 - Initial public release of the GeoLens catalog, API, map builder, CLI, SDKs,
   Docker development stack, and public documentation entrypoints.
 
-[Unreleased]: https://github.com/geolens-io/geolens/compare/v1.20.0...HEAD
+[Unreleased]: https://github.com/geolens-io/geolens/compare/v1.24.0...HEAD
+[1.24.0]: https://github.com/geolens-io/geolens/compare/v1.23.1...v1.24.0
+[1.23.1]: https://github.com/geolens-io/geolens/compare/v1.23.0...v1.23.1
+[1.23.0]: https://github.com/geolens-io/geolens/compare/v1.22.0...v1.23.0
+[1.22.0]: https://github.com/geolens-io/geolens/compare/v1.21.1...v1.22.0
+[1.21.1]: https://github.com/geolens-io/geolens/compare/v1.21.0...v1.21.1
+[1.21.0]: https://github.com/geolens-io/geolens/compare/v1.20.0...v1.21.0
 [1.20.0]: https://github.com/geolens-io/geolens/compare/v1.19.1...v1.20.0
 [1.19.1]: https://github.com/geolens-io/geolens/compare/v1.19.0...v1.19.1
 [1.19.0]: https://github.com/geolens-io/geolens/compare/v1.18.1...v1.19.0

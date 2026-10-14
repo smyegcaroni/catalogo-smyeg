@@ -10,18 +10,12 @@ from typing import Literal
 from fastapi import HTTPException, Query, status
 from pydantic import BaseModel, field_validator
 
+from app.core.geo import check_wrap_turns
+from app.core.record_types import RECORD_TYPES
 from app.modules.catalog.features.service import parse_bbox
 from app.modules.catalog.search.service import SearchFilters
 
-_ALLOWED_RECORD_TYPES = {
-    "vector_dataset",
-    "raster_dataset",
-    "vrt_dataset",
-    "map",
-    "service",
-    "collection",
-    "table",
-}
+_ALLOWED_RECORD_TYPES = frozenset(RECORD_TYPES)
 _ALLOWED_SORT_BY = {"relevance", "date_added", "name", "title", "last_updated"}
 
 # fix(#687): page-size ceiling for offset-paged routes (SearchQueryParams),
@@ -40,7 +34,7 @@ def parse_spatial_params(
     geometry_geojson: str | None = None
     if geometry:
         try:
-            parsed = json.loads(geometry)
+            check_wrap_turns(parsed := json.loads(geometry))
             if "type" not in parsed or "coordinates" not in parsed:
                 raise ValueError("missing type or coordinates")
             geometry_geojson = geometry
@@ -195,6 +189,12 @@ class SearchQueryParams(BaseModel):
             else None,
             "vintage_end": self.vintage_end.isoformat() if self.vintage_end else None,
             "sort_by": self.sort_by if self.sort_by != "relevance" else None,
+            "sort_desc": None
+            if self.sort_desc is None
+            else str(self.sort_desc).lower(),
+            "spatial_predicate": self.spatial_predicate
+            if self.spatial_predicate != "intersects"
+            else None,
             "datetime": self.datetime_param,
             "exclude_synthetic": "false" if not self.exclude_synthetic else None,
             "filter": self.cql2_filter,

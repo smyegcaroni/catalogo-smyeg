@@ -245,9 +245,9 @@ class DefaultCatalogPort:
         )
 
     def reupload_file_task(self):  # type: ignore[no-untyped-def]
-        from app.processing.ingest.tasks import reupload_file
+        from app.processing.ingest.tasks import reupload_verified_file
 
-        return reupload_file
+        return reupload_verified_file
 
     def reupload_service_task(self):  # type: ignore[no-untyped-def]
         from app.processing.ingest.tasks import reupload_service
@@ -268,6 +268,11 @@ class DefaultCatalogPort:
         from app.processing.ingest.tasks import refresh_postgis
 
         return refresh_postgis
+
+    def restore_previous_version_task(self):  # type: ignore[no-untyped-def]
+        from app.processing.ingest.tasks import restore_previous_version
+
+        return restore_previous_version
 
     def refresh_stac_task(self):  # type: ignore[no-untyped-def]
         from app.processing.ingest.tasks import refresh_stac
@@ -348,6 +353,17 @@ class DefaultCatalogPort:
 
         schema, _role = self._data_plane_target(schema)
         return await get_column_info(session, table_name, schema=schema)
+
+    def stored_column_name(self, source_name: str) -> str:
+        from app.platform.column_names import stored_column_names
+
+        return stored_column_names([source_name])[0]
+
+    async def get_geometry_types(self, session, table_name, *, schema=None):  # type: ignore[no-untyped-def]
+        from app.processing.ingest.metadata import get_geometry_types
+
+        schema, _role = self._data_plane_target(schema)
+        return await get_geometry_types(session, table_name, schema=schema)
 
     async def generate_attribute_metadata(
         self,
@@ -540,6 +556,11 @@ class DefaultCatalogPort:
             select(VrtGeneration.source_count).where(VrtGeneration.id == generation_id)
         )
         return result.scalar_one_or_none()
+
+    async def cog_may_be_read(self, session, dataset_id):  # type: ignore[no-untyped-def]
+        from app.processing.raster.vrt_members import cog_may_be_read
+
+        return await cog_may_be_read(session, dataset_id)
 
     async def get_ingest_job_or_404(self, session, job_id, user):  # type: ignore[no-untyped-def]
         from app.processing.ingest.service import get_job_or_404

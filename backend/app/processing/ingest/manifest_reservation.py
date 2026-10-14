@@ -1,35 +1,38 @@
-"""Whether a manifest key is busy, and the reservation that claims it.
+"""Whether a manifest key is busy or held, and the reservation that claims it.
 
-fix(#1814): the key lock, the in-flight read, the staleness rule and the fenced
+The key lock, the in-flight and held reads, the staleness rule and the fenced
 stage exits answer one question, so they live together rather than in step.
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from pathlib import Path
 
 import structlog
-from sqlalchemy import desc, func, select, text, update
+from sqlalchemy import desc, func, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import set_committed_value
 
-from app.core.failure_reason import redact_failure_reason
-from app.platform.jobs.models import IngestJob
-from app.platform.jobs.sweep import JOB_TIMEOUT_SECONDS
+from app.platform.jobs import ledger
+from app.platform.jobs.models import (
+    ACTIVE_STATUSES,
+    MANIFEST_FINGERPRINT_METADATA_KEY,
+    MANIFEST_STAGE_METADATA_KEY,
+    IngestJob,
+)
+from app.platform.jobs.sweep import settle_stale_jobs
+from app.platform.refresh.models import DatasetRefreshRun
+from app.processing.ingest.manifest_schemas import (
+    ManifestApplyEntryResult,
+    ManifestDataset,
+)
 
 log = structlog.get_logger()
 
-# fix(#1814): the pre-queue stage a manifest job is in. This module's exits
-# clear it; a row the running sweep or worker recovery settles keeps it, which
-# is inert because the in-flight read filters on status.
-MANIFEST_STAGE_METADATA_KEY = "manifest_stage"
 MANIFEST_STAGE_DOWNLOADING = "downloading"
-
-# fix(#1814): what the running sweep would have written, when a later apply
-# reaches the row first.
-STALE_RESERVATION_MESSAGE = "Stale: manifest source was never staged"
 
 # fix(#1814): names no id. The row this attempt owned is terminal, and the row
 # that replaced it belongs to a different request.
@@ -61,7 +64,7 @@ async def latest_in_flight_manifest_job(db: AsyncSession, key: str) -> IngestJob
     result = await db.execute(
         select(IngestJob)
         .where(
-            IngestJob.status.in_(["pending", "running"]),
+            IngestJob.status.in_(ACTIVE_STATUSES),
             IngestJob.user_metadata["manifest_key"].astext == key,
         )
         .order_by(desc(IngestJob.created_at))
@@ -70,19 +73,64 @@ async def latest_in_flight_manifest_job(db: AsyncSession, key: str) -> IngestJob
     return result.scalar_one_or_none()
 
 
-def _reservation_lease_clauses(now: datetime, key: str) -> tuple:
-    """Every predicate that identifies an abandoned reservation for ``key``.
+async def held_entry(
+    db: AsyncSession,
+    entry: ManifestDataset,
+    fingerprint: str,
+    completed_job: IngestJob,
+    dataset: object,
+) -> ManifestApplyEntryResult | None:
+    """The ``blocked`` result for an entry whose last apply is held for review.
 
-    fix(#1814): the running sweep's own predicate, narrowed to one key's
-    downloading stage, so the two cannot disagree about which rows are live.
+    None unless applying the unchanged entry again would only repeat the hold:
+    the key's newest held job must carry ``fingerprint``, postdate the last
+    completed import, and still be acceptable: its acceptance unspent, the
+    dataset's data at the version it was held against, and the copy apply
+    staged still on disk. A raw seed is the entry's own source, so applying
+    again could not restage it.
     """
-    return (
-        IngestJob.status == "running",
-        func.coalesce(IngestJob.heartbeat_at, IngestJob.started_at)
-        < now - timedelta(seconds=JOB_TIMEOUT_SECONDS),
-        IngestJob.user_metadata["manifest_key"].astext == key,
-        IngestJob.user_metadata[MANIFEST_STAGE_METADATA_KEY].astext
-        == MANIFEST_STAGE_DOWNLOADING,
+    row = (
+        await db.execute(
+            select(IngestJob, DatasetRefreshRun)
+            .join(DatasetRefreshRun, DatasetRefreshRun.ingest_job_id == IngestJob.id)
+            .where(
+                IngestJob.user_metadata["manifest_key"].astext == entry.key,
+                DatasetRefreshRun.status == "blocked",
+            )
+            .order_by(desc(IngestJob.created_at))
+            .limit(1)
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    job, run = row
+    verification = run.verification or {}
+    if (
+        (job.user_metadata or {}).get(MANIFEST_FINGERPRINT_METADATA_KEY) != fingerprint
+        or job.dataset_id != getattr(dataset, "id", None)
+        or job.created_at <= completed_job.created_at
+        or "acceptance_consumed_by_run_id" in verification
+        or verification.get("live_version") != getattr(dataset, "current_version", None)
+        or not job.file_path
+    ):
+        return None
+    staged = Path(job.file_path)
+    if staged.name.startswith(f"{job.id}_") and not await asyncio.to_thread(
+        staged.exists
+    ):
+        return None
+    return ManifestApplyEntryResult(
+        dataset_key=entry.key,
+        action="blocked",
+        job_id=job.id,
+        dataset_id=run.dataset_id,
+        run_id=run.id,
+        review_reasons=[str(r) for r in verification.get("review_reasons") or ()],
+        message=(
+            "Manifest dataset entry is unchanged since its last apply, which "
+            f"is blocked for review, so nothing was queued. Accept run {run.id} "
+            "to publish it, or change the entry."
+        ),
     )
 
 
@@ -97,27 +145,42 @@ def _without_stage_marker():
     )
 
 
+def _still_downloading():
+    """Whether the reservation is still downloading its source, as SQL."""
+    return (
+        IngestJob.user_metadata[MANIFEST_STAGE_METADATA_KEY].astext
+        == MANIFEST_STAGE_DOWNLOADING
+    )
+
+
 async def expire_stale_manifest_reservations(
     db: AsyncSession, key: str, *, now: datetime | None = None
 ) -> int:
     """Settle reservations for ``key`` whose apply never came back. Returns the count.
 
+    The stale-job pass, limited to this key's downloading reservations, so the
+    expiry and the running sweep cannot disagree about which rows are live or
+    what a settled one says. Does not commit.
+
     fix(#1814): settling rather than ignoring is what lets the staging bind's
     fence catch a slow attempt whose reservation was replaced.
     """
-    now = now or datetime.now(timezone.utc)
-    result = await db.execute(
-        update(IngestJob)
-        .where(*_reservation_lease_clauses(now, key))
-        .values(
-            status="failed",
-            error_message=STALE_RESERVATION_MESSAGE,
-            completed_at=now,
-            user_metadata=_without_stage_marker(),
+    reservations = (
+        await db.execute(
+            select(IngestJob.id).where(
+                IngestJob.status == "running",
+                IngestJob.user_metadata["manifest_key"].astext == key,
+                _still_downloading(),
+            )
         )
-        .execution_options(synchronize_session=False)
+    ).scalars()
+    job_ids = list(reservations)
+    if not job_ids:
+        return 0
+    outcome = await settle_stale_jobs(
+        db, now or datetime.now(timezone.utc), job_ids=job_ids
     )
-    return result.rowcount or 0
+    return outcome.running_failed
 
 
 async def bind_reservation_to_staged_source(
@@ -129,37 +192,19 @@ async def bind_reservation_to_staged_source(
     from staging rather than from a creation that predates the download.
     """
     now = now or datetime.now(timezone.utc)
-    # Snapshotted before the statement: a SQL-expression values() clause
-    # would otherwise expire this attribute and lazy-load it in the mirror below.
-    metadata = {
-        name: value
-        for name, value in (job.user_metadata or {}).items()
-        if name != MANIFEST_STAGE_METADATA_KEY
-    }
-    metadata["staged_at"] = now.isoformat()
-    result = await db.execute(
-        update(IngestJob)
-        .where(
-            IngestJob.id == job.id,
-            (
-                IngestJob.attempt_id == job.attempt_id
-                if job.attempt_id is not None
-                else IngestJob.attempt_id.is_(None)
-            ),
-            IngestJob.status == "running",
-            IngestJob.user_metadata[MANIFEST_STAGE_METADATA_KEY].astext
-            == MANIFEST_STAGE_DOWNLOADING,
-        )
-        .values(
-            status="pending",
-            file_path=file_path,
-            user_metadata=_without_stage_marker().op("||", return_type=JSONB)(
+    if not await ledger.stage(
+        db,
+        job.id,
+        job.attempt_id,
+        values={
+            "file_path": file_path,
+            "user_metadata": _without_stage_marker().op("||", return_type=JSONB)(
                 func.jsonb_build_object("staged_at", now.isoformat())
             ),
-        )
-        .execution_options(synchronize_session=False)
-    )
-    if not result.rowcount:
+        },
+        require=(_still_downloading(),),
+        mirror=job,
+    ):
         # fix(#2017): distinguishes a sweep reaping the row from a cancel,
         # for the same job the CAS just missed on.
         observed = (
@@ -171,54 +216,27 @@ async def bind_reservation_to_staged_source(
             observed_status=observed,
         )
         return False
-    # fix(#1814): `set_committed_value`, not assignment — a dirty attribute
-    # would have the caller's own commit flush a second, unfenced update.
-    set_committed_value(job, "status", "pending")
-    set_committed_value(job, "file_path", file_path)
-    set_committed_value(job, "user_metadata", metadata)
     return True
 
 
 async def release_manifest_reservation(
-    db: AsyncSession, job: IngestJob, message: str, *, now: datetime | None = None
+    db: AsyncSession, job: IngestJob, message: str
 ) -> bool:
     """Fenced running -> failed for a reservation that never staged its source.
 
-    fix(#1814): the shared settlement fences on ``pending``, so the lease needs
-    its own exit. The trap: ``user_metadata`` is not mirrored, reading queries.
-
-    fix(#1953): ``message`` is redacted HERE, not at the caller. This is the
-    sink, and the manifest door composes it from an exception.
+    The shared settlement fences on ``pending``, so the lease needs its own
+    exit. The ledger stores ``message`` redacted, since the manifest door
+    composes it from an exception.
     """
-    now = now or datetime.now(timezone.utc)
-    message = redact_failure_reason(message)
-    result = await db.execute(
-        update(IngestJob)
-        .where(
-            IngestJob.id == job.id,
-            (
-                IngestJob.attempt_id == job.attempt_id
-                if job.attempt_id is not None
-                else IngestJob.attempt_id.is_(None)
-            ),
-            IngestJob.status == "running",
-            IngestJob.user_metadata[MANIFEST_STAGE_METADATA_KEY].astext
-            == MANIFEST_STAGE_DOWNLOADING,
-        )
-        .values(
-            status="failed",
-            error_message=message,
-            completed_at=now,
-            user_metadata=_without_stage_marker(),
-        )
-        .execution_options(synchronize_session=False)
+    return await ledger.fail(
+        db,
+        job.id,
+        job.attempt_id,
+        reason=message,
+        values={"user_metadata": _without_stage_marker()},
+        require=(_still_downloading(),),
+        mirror=job,
     )
-    if not result.rowcount:
-        return False
-    set_committed_value(job, "status", "failed")
-    set_committed_value(job, "error_message", message)
-    set_committed_value(job, "completed_at", now)
-    return True
 
 
 async def staged_source_is_referenced(

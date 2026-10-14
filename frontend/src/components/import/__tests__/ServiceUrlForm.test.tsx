@@ -380,6 +380,56 @@ describe('ServiceUrlForm ArcGIS auth method select', () => {
   });
 });
 
+describe('ServiceUrlForm credential reset notice', () => {
+  const OTHER_ORG_URL =
+    'https://services7.arcgis.com/other-org/arcgis/rest/services/Bar/FeatureServer';
+
+  it('tells the user when an origin change clears the chosen method', async () => {
+    const user = await typeArcGisUrl(userEvent.setup());
+    await chooseAuthMethod(user, 'Paste a token or API key');
+    await user.type(screen.getByLabelText('Token or API key'), 'stale-token');
+
+    const urlInput = screen.getByPlaceholderText('serviceUrl.placeholder');
+    await user.clear(urlInput);
+    await user.type(urlInput, OTHER_ORG_URL);
+
+    expect(screen.getByTestId('credentials-reset-notice')).toBeInTheDocument();
+  });
+
+  it('stays quiet while the first URL is typed and when nothing was set', async () => {
+    const user = await typeArcGisUrl(userEvent.setup());
+    expect(screen.queryByTestId('credentials-reset-notice')).not.toBeInTheDocument();
+
+    const urlInput = screen.getByPlaceholderText('serviceUrl.placeholder');
+    await user.clear(urlInput);
+    await user.type(urlInput, OTHER_ORG_URL);
+
+    expect(screen.queryByTestId('credentials-reset-notice')).not.toBeInTheDocument();
+  });
+
+  it('stays quiet when only the path changes on the same origin', async () => {
+    const user = await typeArcGisUrl(userEvent.setup());
+    await chooseAuthMethod(user, 'Sign in with username and password');
+
+    await user.type(screen.getByPlaceholderText('serviceUrl.placeholder'), '/1');
+
+    expect(screen.queryByTestId('credentials-reset-notice')).not.toBeInTheDocument();
+  });
+
+  it('clears the notice on the next method change', async () => {
+    const user = await typeArcGisUrl(userEvent.setup());
+    await chooseAuthMethod(user, 'Paste a token or API key');
+
+    const urlInput = screen.getByPlaceholderText('serviceUrl.placeholder');
+    await user.clear(urlInput);
+    await user.type(urlInput, OTHER_ORG_URL);
+    expect(screen.getByTestId('credentials-reset-notice')).toBeInTheDocument();
+
+    await chooseAuthMethod(user, 'Sign in with username and password');
+    expect(screen.queryByTestId('credentials-reset-notice')).not.toBeInTheDocument();
+  });
+});
+
 describe('ServiceUrlForm ArcGIS sign-in', () => {
   async function fillSigninForm(user: ReturnType<typeof userEvent.setup>) {
     await chooseAuthMethod(user, 'Sign in with username and password');
@@ -757,5 +807,22 @@ describe('ServiceUrlForm ArcGIS sign-in', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('ServiceUrlForm portal URL guidance', () => {
+  it('explains that a portal homepage needs a layer URL and does not probe it', async () => {
+    const user = userEvent.setup();
+    render(<ServiceUrlForm />);
+
+    await user.type(
+      screen.getByPlaceholderText('serviceUrl.placeholder'),
+      'https://myorg.maps.arcgis.com/home/index.html',
+    );
+
+    expect(screen.getByTestId('arcgis-portal-url-hint')).toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: 'Authentication' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Probe →' })).toBeDisabled();
+    expect(mockProbeService).not.toHaveBeenCalled();
   });
 });

@@ -92,7 +92,6 @@ export const MAP_COLORS = {
   icon: {
     fallback: LIGHT_THEME_TOKEN_COLORS.viz[7],
     outline: '#666666',
-    invalidColor: '#333333',
   },
   /** Fixed colors for the exported map-image title, legend, attribution and
    *  branding footer. Deliberately a fixed LIGHT palette: an exported artifact
@@ -119,6 +118,12 @@ export const MAP_COLORS = {
      *  whenever the on-screen space backdrop is active. It is the sRGB form of
      *  the `--map-space` token, held to it by map-colors.test.ts. */
     globeBackground: '#030713',
+    /** The raster glyph chip the builder legend draws for its terrain row, as the
+     *  sRGB forms of the light `--type-raster-bg` and `--type-raster` tokens. */
+    rasterChip: {
+      background: '#ffe3cc',
+      glyph: '#9a3e00',
+    },
   },
   /** Transparent MapLibre paint value. */
   transparent: 'rgba(0,0,0,0)',
@@ -126,8 +131,6 @@ export const MAP_COLORS = {
   previewOutline: 'rgba(0,0,0,0.35)',
   /** Data-driven style fallback color */
   fallback: '#cccccc',
-  /** Legend outline fallback when no explicit outline-color is set */
-  legendOutline: 'rgba(0,0,0,0.15)',
   /** Select mode handle/midpoint colors */
   handle: {
     point: '#ffffff',

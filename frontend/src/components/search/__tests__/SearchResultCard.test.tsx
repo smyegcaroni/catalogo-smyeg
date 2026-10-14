@@ -1,4 +1,4 @@
-import { render, screen } from '@/test/test-utils';
+import { render, screen, within } from '@/test/test-utils';
 import type { OGCRecordResponse } from '@/types/api';
 import { useQuicklook } from '@/components/maps/hooks/use-quicklook';
 import { SearchResultCard } from '../SearchResultCard';
@@ -56,6 +56,13 @@ function makeFeature(
 describe('SearchResultCard', () => {
   // Vector card tests
   describe('Vector records', () => {
+    it('exposes the title as a heading inside the card link', () => {
+      render(<SearchResultCard feature={makeFeature()} />, { route: '/' });
+      const link = screen.getByRole('link');
+      expect(within(link).getByRole('heading', { level: 3, name: 'World Countries' })).toBeInTheDocument();
+      expect(link.className).toContain('focus-visible:ring-2');
+    });
+
     it('renders title and links to /datasets/:id', () => {
       render(<SearchResultCard feature={makeFeature()} />);
 
@@ -559,6 +566,22 @@ describe('SearchResultCard', () => {
       expect(desc).toBeInTheDocument();
       expect(desc).toHaveTextContent('4 bands');
       expect(desc).toHaveTextContent('10 m');
+    });
+
+    it('describes a 3D Tiles tileset without a description as a tileset', () => {
+      render(
+        <SearchResultCard
+          feature={makeFeature({
+            description: null,
+            record_type: 'tiles3d_dataset',
+            geometry_type: null,
+            feature_count: null,
+            crs: null,
+          })}
+        />,
+      );
+
+      expect(screen.getByTestId('dataset-card-description')).toHaveTextContent('3D Tiles tileset');
     });
 
     it('does not render description testid for collection records', () => {

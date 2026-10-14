@@ -47,6 +47,12 @@ AUDIT_ACTIONS: frozenset[str] = frozenset(
         "dataset.delete",
         "dataset.download_cog",
         "dataset.export",
+        "dataset.pointcloud_read",
+        # A dataset's retained previous version: dropped on request, or
+        # published again as its live data.
+        "dataset.previous_version_dropped",
+        "dataset.restore",
+        "dataset.transfer_owner",
         "dataset.view",
         "embed_token.bulk_revoke",
         "embed_token.create",
@@ -78,6 +84,7 @@ AUDIT_ACTIONS: frozenset[str] = frozenset(
         "map.remove_layer",
         "map.revoke_share",
         "map.share",
+        "map.transfer_owner",
         "map.update",
         "map.update_share_token",
         "metadata.edit",

@@ -1,6 +1,7 @@
 import { renderHook, waitFor } from '@/test/test-utils';
 import { act, renderHook as renderHookRTL } from '@testing-library/react';
 import { vi } from 'vitest';
+import { ApiError } from '@/api/client';
 import { createElement, useRef, type ReactNode } from 'react';
 import { useQueryClient, QueryClient, QueryClientProvider, focusManager } from '@tanstack/react-query';
 
@@ -45,6 +46,26 @@ describe('useDataset', () => {
     vi.clearAllMocks();
   });
 
+  it('does not retry a 404 but retries other failures once', async () => {
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(
+        QueryClientProvider,
+        { client: new QueryClient({ defaultOptions: { queries: { retry: 1, retryDelay: 0 } } }) },
+        children,
+      );
+
+    mockGetDataset.mockRejectedValue(new ApiError('Not found', 404));
+    const missing = renderHookRTL(() => useDataset('gone'), { wrapper });
+    await waitFor(() => expect(missing.result.current.isError).toBe(true));
+    expect(mockGetDataset).toHaveBeenCalledTimes(1);
+
+    mockGetDataset.mockReset();
+    mockGetDataset.mockRejectedValue(new ApiError('Boom', 500));
+    const failing = renderHookRTL(() => useDataset('flaky'), { wrapper });
+    await waitFor(() => expect(failing.result.current.isError).toBe(true));
+    expect(mockGetDataset).toHaveBeenCalledTimes(2);
+  });
+
   it('fetches dataset by id', async () => {
     const mockData = { id: 'ds-1', title: 'Test Dataset' };
     mockGetDataset.mockResolvedValueOnce(mockData as never);
@@ -63,15 +84,16 @@ describe('useDataset', () => {
   });
 
   it('returns error state on failure', async () => {
-    mockGetDataset.mockRejectedValueOnce(new Error('Not found'));
+    mockGetDataset.mockRejectedValue(new Error('Boom'));
 
     const { result } = renderHook(() => useDataset('bad-id'));
 
-    await waitFor(() => expect(result.current.isError).toBe(true));
+    // One retry with the default backoff before the error surfaces.
+    await waitFor(() => expect(result.current.isError).toBe(true), { timeout: 3000 });
   });
 
   it('returns error state on 404', async () => {
-    mockGetDataset.mockRejectedValueOnce(Object.assign(new Error('Not Found'), { status: 404 }));
+    mockGetDataset.mockRejectedValueOnce(new ApiError('Not Found', 404));
 
     const { result } = renderHook(() => useDataset('nonexistent'));
 
@@ -86,6 +108,58 @@ describe('useDataset', () => {
 
     expect(result.current.isLoading).toBe(true);
     expect(result.current.data).toBeUndefined();
+  });
+});
+
+describe('useDataset focus refetching', () => {
+  const appWrapper = ({ children }: { children: ReactNode }) =>
+    createElement(
+      QueryClientProvider,
+      {
+        client: new QueryClient({
+          defaultOptions: { queries: { staleTime: 30_000, retry: false, refetchOnWindowFocus: false } },
+        }),
+      },
+      children,
+    );
+
+  async function refocus() {
+    await act(async () => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetDataset.mockResolvedValue({ id: 'ds-1' } as never);
+  });
+
+  afterEach(() => {
+    focusManager.setFocused(undefined);
+  });
+
+  it('refetches on focus when asked, despite the app default', async () => {
+    const { result } = renderHookRTL(
+      () => useDataset('ds-1', { staleTime: 0, refetchOnWindowFocus: true }),
+      { wrapper: appWrapper },
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    await refocus();
+
+    await waitFor(() => expect(mockGetDataset).toHaveBeenCalledTimes(2));
+  });
+
+  it('keeps the app default for callers that do not ask', async () => {
+    const { result } = renderHookRTL(() => useDataset('ds-1', { staleTime: 0 }), {
+      wrapper: appWrapper,
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    await refocus();
+
+    expect(mockGetDataset).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -152,8 +226,20 @@ describe('useReuploadCommit', () => {
     });
   });
 
+  it('invalidates the refresh run history on success', async () => {
+    mockReuploadCommit.mockResolvedValueOnce({ message: 'ok' } as never);
+    const { result, qc } = renderWithClient();
+    const spy = vi.spyOn(qc, 'invalidateQueries');
+
+    await result.current.mutateAsync({ datasetId: 'ds-1', jobId: 'j1' });
+
+    expect(spy).toHaveBeenCalledWith({
+      queryKey: queryKeys.datasets.refreshRunsPrefix('ds-1'),
+    });
+  });
+
   // fix(#1768): expectedOriginKind joined the positional tail.
-  it('passes datasetId, jobId, sridOverride, token, layerName, expectedOriginKind through to reuploadCommit', async () => {
+  it('passes datasetId, jobId, sridOverride, token, layerName, expectedOriginKind, reviewFingerprint through to reuploadCommit', async () => {
     mockReuploadCommit.mockResolvedValueOnce({ message: 'ok' } as never);
     const { result } = renderWithClient();
 
@@ -164,6 +250,7 @@ describe('useReuploadCommit', () => {
       token: 'tok',
       layerName: 'layer-a',
       expectedOriginKind: 'service',
+      reviewFingerprint: 'f'.repeat(64),
     });
 
     expect(mockReuploadCommit).toHaveBeenCalledWith(
@@ -173,6 +260,7 @@ describe('useReuploadCommit', () => {
       'tok',
       'layer-a',
       'service',
+      'f'.repeat(64),
     );
   });
 
@@ -185,6 +273,7 @@ describe('useReuploadCommit', () => {
     expect(mockReuploadCommit).toHaveBeenCalledWith(
       'ds-1',
       'j1',
+      undefined,
       undefined,
       undefined,
       undefined,
@@ -471,6 +560,8 @@ describe('useDatasetRefreshWatch', () => {
     // fix(#1285 codex round 5): the joined related-record rows a mounted
     // RelatedRecordsPanel section renders — stale after a data replace.
     queryKeys.relationships.recordsPrefix('ds-1'),
+    // Relationship lists carry broken flags that depend on either endpoint.
+    queryKeys.relationships.listPrefix,
   ];
 
   function renderWithClient() {

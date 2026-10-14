@@ -114,6 +114,8 @@ const EXACT_ERROR_KEYS: Record<string, ApiErrorDescriptor['key']> = {
     'errors.refreshOriginUnavailable',
   'A refresh is already running for this dataset. Wait for it to finish, then try again.':
     'errors.refreshDatasetBusy',
+  'The dataset changed after this replacement was held. Upload the file again.':
+    'errors.refreshReviewSuperseded',
   "This dataset's source changed while the refresh was being queued, so it was not started. Check the new source and try again.":
     'errors.refreshOriginChanged',
   // fix(#1768): the re-upload commit door's own `origin_changed`. Same code,
@@ -152,6 +154,7 @@ const EXACT_ERROR_KEYS: Record<string, ApiErrorDescriptor['key']> = {
 // of one user-facing key per backend code rather than per call site.
 const SOURCE_VALIDATION_CODE_KEYS: Record<string, ApiErrorDescriptor['key']> = {
   crs_mismatch: 'errors.sourceValidationCrsMismatch', // VAL-01
+  crs_unverified: 'errors.sourceValidationCrsUnverified', // VAL-01
   band_count_mismatch: 'errors.sourceValidationBandCountMismatch', // VAL-02
   single_band_required: 'errors.sourceValidationSingleBandRequired', // VAL-03
   dtype_mismatch: 'errors.sourceValidationDtypeMismatch', // VAL-04
@@ -160,6 +163,91 @@ const SOURCE_VALIDATION_CODE_KEYS: Record<string, ApiErrorDescriptor['key']> = {
   rotated_raster: 'errors.sourceValidationRotatedRaster', // VAL-07
   unknown_pixel_geometry: 'errors.sourceValidationUnknownPixelGeometry', // VAL-08
 };
+
+/**
+ * The upload, presigned, URL-import and re-upload doors' stable refusal
+ * codes (`detail.code`), one key per code. `geometry_loss` keeps its own
+ * branch below; it is listed here too so the backend registry test finds it
+ * mapped. Checked against the backend's codes in both directions by
+ * `backend/tests/test_upload_refusal_codes.py`.
+ */
+const UPLOAD_REFUSAL_CODE_KEYS: Record<string, ApiErrorDescriptor['key']> = {
+  content_type_mismatch: 'errors.uploadContentTypeMismatch',
+  corrupt_archive_member: 'errors.uploadCorruptArchiveMember',
+  disallowed_extension: 'errors.uploadDisallowedExtension',
+  driver_metadata_member: 'errors.uploadDriverMetadataMember',
+  empty_upload: 'errors.uploadEmpty',
+  file_size_exceeded: 'errors.uploadFileSizeExceeded',
+  file_size_limit_exceeded: 'errors.uploadFileSizeLimitExceeded',
+  filename_control_characters: 'errors.uploadFilenameControlCharacters',
+  filename_missing_extension: 'errors.uploadFilenameMissingExtension',
+  geometry_loss: 'errors.reuploadGeometryLoss',
+  ingest_cell_limit_exceeded: 'errors.uploadIngestCellLimitExceeded',
+  ingest_row_limit_exceeded: 'errors.uploadIngestRowLimitExceeded',
+  invalid_flatgeobuf_file: 'errors.uploadInvalidFlatgeobuf',
+  invalid_import_url: 'errors.uploadInvalidImportUrl',
+  invalid_parquet_file: 'errors.uploadInvalidParquet',
+  invalid_vrt_body: 'errors.uploadInvalidVrtBody',
+  invalid_zip_container: 'errors.uploadInvalidZipContainer',
+  missing_filename: 'errors.uploadMissingFilename',
+  pointcloud_decode_failed: 'errors.uploadPointCloudDecodeFailed',
+  pointcloud_invalid: 'errors.uploadPointCloudInvalid',
+  pointcloud_kind_required: 'errors.uploadPointCloudKindRequired',
+  pointcloud_no_crs: 'errors.uploadPointCloudNoCrs',
+  pointcloud_not_copc: 'errors.uploadPointCloudNotCopc',
+  pointcloud_reupload_unsupported: 'errors.reuploadPointCloudUnsupported',
+  presigned_size_mismatch: 'errors.uploadPresignedSizeMismatch',
+  preview_failed: 'errors.uploadPreviewFailed',
+  raster_preview_failed: 'errors.uploadRasterPreviewFailed',
+  reupload_unsupported: 'errors.reuploadUnsupported',
+  service_preview_failed: 'errors.uploadServicePreviewFailed',
+  sqlite_schema_too_large: 'errors.uploadSqliteSchemaTooLarge',
+  sqlite_too_many_schema_objects: 'errors.uploadSqliteTooManySchemaObjects',
+  sqlite_virtual_table: 'errors.uploadSqliteVirtualTable',
+  standalone_vrt_not_supported: 'errors.uploadStandaloneVrtNotSupported',
+  tileset_bounding_volume: 'errors.uploadTilesetBoundingVolume',
+  tileset_content_uri: 'errors.uploadTilesetContentUri',
+  tileset_entry_characters: 'errors.uploadTilesetEntryCharacters',
+  tileset_entry_collision: 'errors.uploadTilesetEntryCollision',
+  tileset_entry_length: 'errors.uploadTilesetEntryLength',
+  tileset_entry_path: 'errors.uploadTilesetEntryPath',
+  tileset_extension_mismatch: 'errors.uploadTilesetExtensionMismatch',
+  tileset_geometric_error: 'errors.uploadTilesetGeometricError',
+  tileset_json: 'errors.uploadTilesetJsonInvalid',
+  tileset_json_depth: 'errors.uploadTilesetJsonTooDeep',
+  tileset_json_size: 'errors.uploadTilesetJsonTooLarge',
+  tileset_kind_required: 'errors.uploadTilesetKindRequired',
+  tileset_layout: 'errors.uploadTilesetLayout',
+  tileset_region: 'errors.uploadTilesetRegion',
+  tileset_reupload_unsupported: 'errors.reuploadTilesetUnsupported',
+  tileset_special_entry: 'errors.uploadTilesetSpecialEntry',
+  tileset_unpacked_too_large: 'errors.uploadTilesetUnpackedTooLarge',
+  tileset_unreadable_entry: 'errors.uploadTilesetUnreadableEntry',
+  tileset_version: 'errors.uploadTilesetVersion',
+  unreadable_database_file: 'errors.uploadUnreadableDatabase',
+  unsafe_upload_content: 'errors.uploadRefused',
+  unsafe_vrt_source: 'errors.uploadUnsafeVrtSource',
+  unsupported_zip_compression: 'errors.uploadUnsupportedZipCompression',
+  vrt_body_too_large: 'errors.uploadVrtBodyTooLarge',
+  zip_bomb_ratio: 'errors.uploadZipBombRatio',
+  zip_bomb_unpacked_size: 'errors.uploadZipBombUnpackedSize',
+  zip_directory_too_large: 'errors.uploadZipDirectoryTooLarge',
+  zip_entries_overlap: 'errors.uploadZipEntriesOverlap',
+  zip_nested_archive: 'errors.uploadZipNestedArchive',
+  zip_too_many_entries: 'errors.uploadZipTooManyEntries',
+};
+
+/**
+ * A coded upload-refusal detail: `{code, message, ...values}`, matching
+ * `refusal_detail()` in `backend/app/core/upload_errors.py`.
+ */
+function uploadRefusalDescriptor(value: Record<string, unknown>): ApiErrorDescriptor | undefined {
+  if (typeof value.code !== 'string') return undefined;
+  const key = UPLOAD_REFUSAL_CODE_KEYS[value.code];
+  if (!key) return undefined;
+  const { code: _code, message: _message, ...values } = value;
+  return { key, values: values as TranslationValues };
+}
 
 /**
  * Detects a `SourceValidationError` array entry by its `source_id`+`code`
@@ -420,6 +508,15 @@ function validationDescriptor(entry: unknown): ApiErrorDescriptor | undefined {
   if (type === 'literal_error' || type === 'enum') {
     return { key: 'errors.validationInvalidChoice', values: { field } };
   }
+  // A door that reuses pydantic's own HttpUrl parsing inside a field
+  // validator (STAC's `_validate_stac_http_url`, among others) surfaces
+  // pydantic-core's OWN error type here rather than the generic
+  // `value_error` a raised ValueError would produce, so it needs its own
+  // branch or it falls through to the field-name-only message below and
+  // hides that the concrete, fixable problem is the URL's scheme.
+  if (type === 'url_scheme') {
+    return { key: 'errors.validationUrlSchemeInvalid', values: { field } };
+  }
   return { key: 'errors.validationInvalidField', values: { field } };
 }
 
@@ -441,6 +538,24 @@ export function classifyApiError(detail: unknown, status = 0): ApiErrorDescripto
 
   if (detail && typeof detail === 'object') {
     const value = detail as Record<string, unknown>;
+    // The workflow seam names the refused edge and the steps this actor may
+    // take instead as fields, so a stage name can hold any text.
+    if (
+      value.code === 'workflow_transition_denied' &&
+      typeof value.current_stage === 'string' &&
+      typeof value.requested_stage === 'string'
+    ) {
+      const values = { from: value.current_stage, to: value.requested_stage };
+      const allowed = Array.isArray(value.allowed_stages)
+        ? value.allowed_stages.filter((stage): stage is string => typeof stage === 'string')
+        : [];
+      return allowed.length > 0
+        ? {
+            key: 'errors.workflowTransitionDenied',
+            values: { ...values, allowed: allowed.join(', ') },
+          }
+        : { key: 'errors.workflowTransitionDeniedNoneAllowed', values };
+    }
     if (value.code === 'duplicate_source') {
       return {
         key: 'errors.duplicateSource',
@@ -543,6 +658,11 @@ export function classifyApiError(detail: unknown, status = 0): ApiErrorDescripto
       return { key: 'errors.refreshServiceTokenRequired' };
     }
 
+    // Checked after the specific codes above, so it never shadows one of
+    // them; `geometry_loss`'s own branch above still wins first.
+    const uploadRefusal = uploadRefusalDescriptor(value);
+    if (uploadRefusal) return uploadRefusal;
+
     if (typeof value.message === 'string') {
       return descriptorForMessage(value.message, status);
     }
@@ -555,6 +675,28 @@ export function classifyApiError(detail: unknown, status = 0): ApiErrorDescripto
 
 export function translateApiErrorDetail(detail: unknown, status = 0): string {
   const descriptor = classifyApiError(detail, status);
+  return i18n.t(descriptor.key, {
+    ns: 'common',
+    ...(descriptor.values ?? {}),
+  }) as string;
+}
+
+/** The statuses describeUploadRefusal treats as a real refusal, each mapped to its generic fallback key. */
+export const UPLOAD_REFUSAL_FALLBACK_KEYS: Record<number, ApiErrorDescriptor['key']> = {
+  400: 'errors.badRequest',
+  422: 'errors.validationFailed',
+};
+
+/**
+ * Like translateApiErrorDetail, except that a 400 or 422 whose string detail
+ * the table doesn't recognize is returned as the server wrote it. Arrays,
+ * objects and recognized strings translate as usual.
+ */
+export function describeUploadRefusal(detail: unknown, status: number): string {
+  const descriptor = classifyApiError(detail, status);
+  if (typeof detail === 'string' && descriptor.key === UPLOAD_REFUSAL_FALLBACK_KEYS[status]) {
+    return detail;
+  }
   return i18n.t(descriptor.key, {
     ns: 'common',
     ...(descriptor.values ?? {}),

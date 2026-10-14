@@ -47,7 +47,8 @@ class Record(Base):
             name="chk_records_sensitivity",
         ),
         CheckConstraint(
-            "record_type IN ('vector_dataset', 'raster_dataset', 'vrt_dataset', 'map', 'service', 'collection', 'table')",
+            "record_type IN ('vector_dataset', 'raster_dataset', 'vrt_dataset', 'map', 'service', 'collection', 'table', "
+            "'tiles3d_dataset', 'pointcloud_dataset')",
             name="chk_records_record_type",
         ),
         CheckConstraint(
@@ -350,14 +351,14 @@ class Dataset(Base):
             name="chk_datasets_geometry_type",
         ),
         CheckConstraint(
-            # fix(#541): allow-list of accepted source formats; a .kmz
-            # normalizes to 'kml', a zipped .gdb to 'fgdb' (see
-            # ingest/source_format.py). Migration 0053 is the source of truth.
+            # The accepted source formats; a .kmz normalizes to 'kml', a
+            # zipped .gdb to 'fgdb' (see ingest/source_format.py). Migration
+            # 0070 is the source of truth.
             "source_format IS NULL OR source_format IN ("
             "'geojson', 'shapefile', 'shp', 'gpkg', 'csv', 'kml', 'gml', "
             "'wfs', 'arcgis_featureserver', 'fgdb', 'created', 'geotiff', "
             "'ogcapi_features', 'stac', 'parquet', 'json', 'xlsx', 'xls', "
-            "'fgb')",
+            "'fgb', '3dtiles', 'copc')",
             name="chk_datasets_source_format",
         ),
         CheckConstraint(
@@ -467,6 +468,37 @@ class Dataset(Base):
     n_dims: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     z_min: Mapped[float | None] = mapped_column(Float, nullable=True)
     z_max: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # A 3D Tiles tileset's asset.version, root geometricError and root
+    # bounding volume kind, read from its tileset.json at upload.
+    tileset_version: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    tileset_geometric_error: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tileset_bounding_volume: Mapped[str | None] = mapped_column(
+        String(10), nullable=True
+    )
+    # Its tile formats and required extensions, found by reading every file at
+    # upload; null for a tileset published before the upload recorded them.
+    tileset_content_types: Mapped[list[str] | None] = mapped_column(
+        ARRAY(Text), nullable=True
+    )
+    tileset_extensions_required: Mapped[list[str] | None] = mapped_column(
+        ARRAY(Text), nullable=True
+    )
+    # A COPC point cloud's point count, point data record format and vertical
+    # CRS name, read from its header at upload.
+    pointcloud_point_count: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    pointcloud_point_format: Mapped[int | None] = mapped_column(
+        SmallInteger, nullable=True
+    )
+    pointcloud_vertical_crs: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    # The upload attempt whose file the 'pointcloud' asset row names, which
+    # the file's URL carries. Written in the same transaction as that row.
+    pointcloud_attempt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
     quicklook_256_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Source info
@@ -512,6 +544,24 @@ class Dataset(Base):
     # Version tracking
     current_version: Mapped[int] = mapped_column(Integer, server_default="1", default=1)
 
+    # The data a replacement or restore replaced, kept in the table named by
+    # `previous_version_table`. NULL number: there is none.
+    previous_version_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    previous_version_retained_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    previous_version_bytes: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    # The kept data's own last_refreshed_at, which a restore reinstates.
+    previous_version_refreshed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Why scheduled refreshes are refused until released: 'restored'.
+    scheduled_refresh_hold: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+
     # fix(#525): URL-keyed tile cache-buster. current_version only bumps on
     # reupload, so non-versioning content mutations (feature edits, column
     # DDL) bump this instead, rolling CDN/browser caches the Valkey purge
@@ -525,6 +575,12 @@ class Dataset(Base):
     # ordinary edit but not the state change that granted it.
     publication_version: Mapped[int] = mapped_column(
         Integer, server_default="0", default=0
+    )
+
+    # Rolls with every feature or column write to the live table, in that
+    # write's transaction, so a replacement can tell it would discard one.
+    data_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default="0", default=0
     )
 
     # Per-dataset tile cache TTL override (null = use global settings.tile_cache_ttl)

@@ -21,6 +21,8 @@ from keyring.errors import KeyringError
 from rich.table import Table
 
 from . import analysis as _analysis
+from . import arcgis_inventory as _arcgis_inventory
+from . import arcgis_plan as _arcgis_plan
 from . import auth as _auth
 from . import config as _config
 from . import export_stac as _export_stac
@@ -32,6 +34,7 @@ from . import replace as _replace
 from . import scan as _scan
 from ._sdk_helpers import (
     EXIT_AUTH,
+    EXIT_BLOCKED,
     EXIT_GENERIC,
     EXIT_NETWORK,
     EXIT_USAGE,
@@ -47,6 +50,10 @@ export_app = typer.Typer(no_args_is_help=True, help="Export commands")
 app.add_typer(export_app, name="export")
 analysis_app = typer.Typer(no_args_is_help=True, help="Analysis commands")
 app.add_typer(analysis_app, name="analysis")
+arcgis_app = typer.Typer(
+    no_args_is_help=True, help="ArcGIS Online and Portal for ArcGIS commands"
+)
+app.add_typer(arcgis_app, name="arcgis")
 
 
 @dataclass
@@ -314,6 +321,15 @@ def print_manifest_schema(
     typer.echo(str(output))
 
 
+def _require_wait_sdk(state: "AppState") -> None:
+    """Refuse a --wait command before it submits anything an old SDK cannot follow."""
+    try:
+        _refresh.require_run_polling_sdk()
+    except _refresh.RefreshRequestError as exc:
+        state.output.error(exc.message)
+        raise typer.Exit(exc.exit_code)
+
+
 @app.command("apply")
 def apply_manifest_command(
     ctx: typer.Context,
@@ -343,12 +359,22 @@ def apply_manifest_command(
             ),
         ),
     ] = None,
+    wait: Annotated[
+        bool,
+        typer.Option(
+            "--wait/--no-wait",
+            help=(
+                "Follow each queued job to its end and report its outcome. "
+                "Exits 1 if any entry failed, else 6 if any is blocked for review."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Apply a geolens.yaml manifest through the configured GeoLens API.
 
     NOTE: apply only POSTs the manifest document — it does NOT upload local
     data files. Manifest sources must reference data the server can already
-    reach (http(s)/s3/gs/az/abfs URIs, or files pre-staged server-side). To
+    reach (http(s)/s3 URIs, or files pre-staged server-side). To
     publish a LOCAL file, use `geolens publish <file>` instead. apply errors
     early (GAP-020) if any source URI is a local path.
 
@@ -416,7 +442,7 @@ def apply_manifest_command(
             f"{len(local_uris)} manifest source(s) reference local files ({sample}). "
             "`apply` does not upload them — the server resolves scheme-less paths from "
             "its own staging dir. If it can't see them, run `geolens publish <file>` "
-            "first or use a remote URL (http(s)/s3/gs/az/abfs)."
+            "first or use a remote URL (http(s)/s3)."
         )
 
     # fix(#1778 review round 21): resolved BEFORE the network call so an
@@ -429,6 +455,8 @@ def apply_manifest_command(
         state.output.error(str(exc))
         raise typer.Exit(EXIT_USAGE)
 
+    if wait and not dry_run:
+        _require_wait_sdk(state)
     sdk = state.sdk()
     payload = _manifest_apply.build_apply_payload(document, dry_run=dry_run)
     try:
@@ -476,6 +504,15 @@ def apply_manifest_command(
         state.output.error(exc.message)
         raise typer.Exit(exc.exit_code)
 
+    if wait and not dry_run and response.get("accepted", False):
+        response = _manifest_apply.wait_for_apply_jobs(
+            sdk.client,
+            response,
+            instance=state.active_instance(),
+            credential_kind=sdk.credential_kind,
+            credential_provenance=sdk.credential_provenance,
+        )
+
     report = _manifest_apply.apply_report_payload(path, response)
     if state.json_mode:
         state.output.json(report)
@@ -489,8 +526,24 @@ def apply_manifest_command(
     if not response.get("accepted", False):
         state.output.error("Manifest apply response had accepted=false.")
         raise typer.Exit(EXIT_GENERIC)
-    if _manifest_apply.has_apply_errors(response):
-        raise typer.Exit(EXIT_GENERIC)
+    for result in response.get("results", []):
+        if (
+            not state.json_mode
+            and _manifest_apply.is_blocked(result)
+            and result.get("run_id")
+        ):
+            state.output.error(
+                f"{result.get('dataset_key')} is blocked for review; nothing was published."
+            )
+            for reason in result.get("review_reasons", []):
+                state.output.info(_refresh.review_reason_sentence(reason))
+            state.output.info(
+                f"Accept with: geolens refresh {result.get('dataset_id')} "
+                f"--accept-blocked-run {result.get('run_id')}"
+            )
+    code = _manifest_apply.apply_exit_code(response)
+    if code:
+        raise typer.Exit(code)
 
 
 def _read_secret_from_stdin() -> str:
@@ -739,11 +792,13 @@ def whoami(ctx: typer.Context) -> None:
         getattr(user, "email", None) or getattr(user, "username", None) or "<unknown>"
     )
     if state.json_mode:
+        roles = list(getattr(user, "roles", None) or [])
         payload = {
             "instance": instance,
             "email": email,
             "id": getattr(user, "id", None),
-            "role": getattr(user, "role", None),
+            "roles": roles,
+            "role": "admin" if "admin" in roles else (roles[0] if roles else None),
         }
         state.output.json(payload)
     else:
@@ -1156,6 +1211,9 @@ def publish(
                         f"after {int(_publish._DEFAULT_POLL_TIMEOUT_SECONDS)}s "
                         f"and has not finished. Check GET /jobs/{job_id}."
                     )
+            else:
+                wait_outcome_known = True
+                publish_status = late_status or outcome.status
 
         # Stage 5 — fix(#569): apply --tags / --collection now that the
         # dataset id exists. Failures here are PARTIAL: the dataset was
@@ -1242,7 +1300,7 @@ def refresh(
         Optional[str],
         typer.Option(
             "--accept-blocked-run",
-            help="UUID of a blocked run to approve its matching source and changes once.",
+            help="UUID of a blocked run to approve its matching source and changes for this refresh.",
         ),
     ] = None,
     wait: Annotated[
@@ -1294,6 +1352,8 @@ def refresh(
         state.output.error(str(exc))
         raise typer.Exit(EXIT_USAGE)
 
+    if wait:
+        _require_wait_sdk(state)
     sdk = state.sdk()
     active_client = sdk.client
 
@@ -1350,12 +1410,16 @@ def refresh(
             f"Refresh complete for dataset {payload['dataset_id']} "
             f"(job {payload['job_id']}, run {payload['run_id']})"
         )
+    elif poll.status == "blocked":
+        state.output.error("Refresh is blocked for review; nothing was published.")
+        for line in _refresh.blocked_guidance(dataset_uuid, poll):
+            state.output.info(line)
     else:
         message = poll.error_message or f"Refresh job ended with status {poll.status}."
         state.output.error(message)
 
     if poll is not None and not poll.succeeded:
-        raise typer.Exit(EXIT_GENERIC)
+        raise typer.Exit(EXIT_BLOCKED if poll.status == "blocked" else EXIT_GENERIC)
 
 
 @app.command()
@@ -1429,6 +1493,8 @@ def replace(
         state.output.error("--json requires --yes to confirm a replace.")
         raise typer.Exit(EXIT_USAGE)
 
+    if wait:
+        _require_wait_sdk(state)
     sdk = state.sdk()
 
     from geolens.api.datasets_reupload import (
@@ -1459,6 +1525,9 @@ def replace(
         if is_raster and layer is not None:
             state.output.error("--layer does not apply to raster datasets.")
             raise typer.Exit(EXIT_USAGE)
+
+        # Built before the upload so an SDK too old for --srid refuses early.
+        preview_body = None if is_raster else _replace.build_preview_request(layer, srid)
 
         # Stage 1: Upload (multipart workaround).
         # fix(#1739): route through call_sdk so a network failure during
@@ -1491,7 +1560,7 @@ def replace(
                     dataset_id=dataset_uuid,
                     job_id=job_id,
                     client=sdk.client,
-                    body=_replace.build_preview_request(layer),
+                    body=preview_body,
                 )
             preview = _replace.unwrap_or_raise(
                 preview_resp, expected=_replace.PREVIEW_OK_STATUS
@@ -1507,12 +1576,22 @@ def replace(
                 f"Layer '{summary['layer_name']}': {summary['feature_count']} "
                 f"features, SRID {summary['srid'] if summary['srid'] is not None else 'unknown'}"
             )
+            # The prompt can acknowledge these reasons, so --quiet must not hide them.
+            if not state.json_mode and (summary["review_reasons"] or not state.quiet):
+                for line in _replace.review_lines(summary):
+                    state.output.console_stdout.print(line, soft_wrap=True, markup=False)
 
-        if not yes and not typer.confirm(
-            f"Replace dataset {dataset_uuid}'s data with {file}?", err=True
-        ):
-            state.output.error("Replace cancelled; no changes were made.")
-            raise typer.Exit(EXIT_GENERIC)
+        # --yes only skips the prompt. The fingerprint acknowledges the
+        # preview's review reasons, so only a person reading them sends it.
+        review_fingerprint = None
+        if not yes:
+            if not typer.confirm(
+                f"Replace dataset {dataset_uuid}'s data with {file}?", err=True
+            ):
+                state.output.error("Replace cancelled; no changes were made.")
+                raise typer.Exit(EXIT_GENERIC)
+            if not is_raster:
+                review_fingerprint = _replace.preview_review_fingerprint(preview)
 
         # Stage 3: Commit.
         commit_resp = call_sdk(
@@ -1524,6 +1603,7 @@ def replace(
                 layer_name=layer,
                 srid_override=srid,
                 expected_origin_kind=expected_origin_kind,
+                review_fingerprint=review_fingerprint,
             ),
         )
         commit = _replace.unwrap_or_raise(commit_resp, expected=_replace.COMMIT_OK_STATUS)
@@ -1545,10 +1625,27 @@ def replace(
             state.output.success(f"Replace queued for dataset {dataset_uuid} (job {job_id})")
         return
 
-    poll = _refresh.wait_for_refresh(sdk.client, job_id)
+    try:
+        poll = _refresh.wait_for_refresh_run(
+            sdk.client,
+            dataset_uuid,
+            None,
+            ingest_job_id=job_id,
+            instance=state.active_instance(),
+            credential_kind=sdk.credential_kind,
+            credential_provenance=sdk.credential_provenance,
+        )
+    except _refresh.RefreshRequestError as exc:
+        state.output.error(exc.message)
+        raise typer.Exit(exc.exit_code)
     payload["status"] = poll.status
+    if poll.run_id is not None:
+        payload["run_id"] = poll.run_id
     if poll.error_message:
         payload["error_message"] = poll.error_message
+    blocked = poll.status == "blocked"
+    if blocked:
+        payload["review_reasons"] = _refresh.blocked_review_reasons(poll)
 
     if state.json_mode:
         state.output.json(payload)
@@ -1556,13 +1653,17 @@ def replace(
         state.output.success(
             f"Replace complete for dataset {dataset_uuid} (job {job_id})"
         )
+    elif blocked:
+        state.output.error("Replace is blocked for review; nothing was published.")
+        for line in _refresh.blocked_guidance(dataset_uuid, poll):
+            state.output.info(line)
     else:
         state.output.error(
             poll.error_message or f"Replace job ended with status {poll.status}."
         )
 
     if not poll.succeeded:
-        raise typer.Exit(EXIT_GENERIC)
+        raise typer.Exit(EXIT_BLOCKED if blocked else EXIT_GENERIC)
 
 
 @export_app.command("stac")
@@ -1856,8 +1957,8 @@ def analysis_materialize(
     materialize_failure: Optional[str] = None
     materialize_message: Optional[str] = None
     materialize_exit_code = EXIT_GENERIC
+    late_status: Optional[str] = None
     if resolved is None:
-        late_status: Optional[str] = None
         if outcome.stopped_because in ("timeout", "poll_failed"):
             # fix(#1778, codex round 3): resolve_dataset_id now reports WHY
             # it stopped instead of collapsing every reason into None — see
@@ -1982,6 +2083,8 @@ def analysis_materialize(
                     f"Check GET /jobs/{job_id}."
                 )
 
+    if resolved is not None:
+        materialize_status = late_status or outcome.status
     url = _publish.construct_dataset_url(
         instance, dataset_id=resolved, job_id=job_id
     )
@@ -2003,3 +2106,162 @@ def analysis_materialize(
             state.output.success(url)
     if materialize_failure:
         raise typer.Exit(materialize_exit_code)
+
+
+@arcgis_app.command("inventory")
+def arcgis_inventory(
+    ctx: typer.Context,
+    portal_url: Annotated[
+        str,
+        typer.Option(
+            "--portal-url",
+            help="ArcGIS Online organization URL, or https://<host>/portal for ArcGIS Enterprise",
+        ),
+    ] = _arcgis_inventory.DEFAULT_PORTAL_URL,
+    token: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token",
+            envvar="ARCGIS_TOKEN",
+            show_envvar=True,
+            help="Existing ArcGIS token (prefer ARCGIS_TOKEN or --token-stdin)",
+        ),
+    ] = None,
+    token_stdin: Annotated[
+        bool, typer.Option("--token-stdin", help="Read the ArcGIS token from stdin")
+    ] = False,
+    username: Annotated[
+        Optional[str],
+        typer.Option(
+            "--username",
+            help="Built-in ArcGIS account; the password comes from ARCGIS_PASSWORD, "
+            "--password-stdin or a prompt",
+        ),
+    ] = None,
+    password_stdin: Annotated[
+        bool,
+        typer.Option("--password-stdin", help="Read the ArcGIS password from stdin"),
+    ] = False,
+    scope: Annotated[
+        _arcgis_inventory.InventoryScope,
+        typer.Option(
+            "--scope",
+            help="user: the signed-in user's items; org: every item the user can see",
+        ),
+    ] = _arcgis_inventory.InventoryScope.user,
+    max_items: Annotated[
+        int, typer.Option("--max-items", help="Stop listing after this many items")
+    ] = _arcgis_inventory.DEFAULT_MAX_ITEMS,
+    concurrency: Annotated[
+        int,
+        typer.Option(
+            "--concurrency", help="Parallel item reads (1-4)"
+        ),
+    ] = 1,
+    output_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            "-o",
+            "--output-dir",
+            help="Write arcgis-inventory.json and arcgis-inventory.md here (mode 0600)",
+        ),
+    ] = None,
+    strict: Annotated[
+        bool, typer.Option("--strict", help="Exit 1 when any item could not be read")
+    ] = False,
+    allow_insecure_http: Annotated[
+        bool,
+        typer.Option(
+            "--allow-insecure-http", help="Allow an http:// portal URL (test portals)"
+        ),
+    ] = False,
+    read_all_item_data: Annotated[
+        bool,
+        typer.Option(
+            "--read-all-item-data",
+            help="Read the data of every other item too, and record the item ids "
+            "a JSON document names (one request per item)",
+        ),
+    ] = False,
+    groups: Annotated[
+        bool,
+        typer.Option(
+            "--groups/--no-groups",
+            help="Read each item's group sharing (one request per item)",
+        ),
+    ] = True,
+) -> None:
+    """Read-only inventory of an ArcGIS organization's content.
+
+    Lists items, classifies what GeoLens can import, flags item types Esri is
+    retiring, records item metadata, folders, owners and group sharing, and
+    records web map and app dependencies. Prints Markdown, or
+    JSON with --json. Nothing on the portal or in GeoLens is changed, and no
+    GeoLens sign-in is needed.
+    """
+    state: AppState = ctx.obj
+    options = _arcgis_inventory.InventoryOptions(
+        portal_url=portal_url,
+        token=token,
+        token_stdin=token_stdin,
+        username=username,
+        password_stdin=password_stdin,
+        scope=scope.value,
+        max_items=max_items,
+        concurrency=concurrency,
+        output_dir=output_dir,
+        strict=strict,
+        allow_insecure_http=allow_insecure_http,
+        json_mode=state.json_mode,
+        read_groups=groups,
+        read_all_item_data=read_all_item_data,
+    )
+    code = _arcgis_inventory.run_cli(state.output, options)
+    if code:
+        raise typer.Exit(code)
+
+
+@arcgis_app.command("plan")
+def arcgis_plan(
+    ctx: typer.Context,
+    inventory: Annotated[
+        Path,
+        typer.Argument(help="arcgis-inventory.json written by `geolens arcgis inventory`"),
+    ],
+    output_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            "-o",
+            "--output-dir",
+            help="Where to write arcgis-migration-plan.json (default: next to the inventory)",
+        ),
+    ] = None,
+    owner_map: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--owner-map",
+            help="JSON object of ArcGIS usernames to GeoLens usernames or emails",
+        ),
+    ] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Replace a plan file that differs from this one"),
+    ] = False,
+) -> None:
+    """Turn an inventory into an editable migration plan.
+
+    Writes arcgis-migration-plan.json (mode 0600) with a default action for
+    every item, the owners, groups and basemaps to map, and the order items
+    depend on. Edit the file, then migrate from it. Nothing on the portal or
+    in GeoLens is read or changed.
+    """
+    state: AppState = ctx.obj
+    code = _arcgis_plan.run_cli(
+        state.output,
+        inventory_path=inventory,
+        output_dir=output_dir,
+        owner_map_path=owner_map,
+        force=force,
+    )
+    if code:
+        raise typer.Exit(code)

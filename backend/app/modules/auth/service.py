@@ -1,6 +1,7 @@
 """Auth service: JWT token creation, refresh tokens, and user registration."""
 
 import hashlib
+import re
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -10,10 +11,28 @@ from sqlalchemy import delete, func, literal_column, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.identity import Identity
 from app.core.tenancy import is_multi_tenant
 from app.modules.auth.models import ApiKey, RefreshToken, Role, User, UserRole
 from app.modules.auth.providers import AuthenticatedIdentity
-from app.modules.auth.providers.local import hash_password
+from app.modules.auth.providers.local import hash_password_async
+
+# Covers the exchange queueing behind a few other tabs' cookie-lock holders,
+# each bounded to 30 seconds by its own request timeout.
+SSO_EXCHANGE_TTL_SECONDS = 120
+
+# A SHA-256 hex digest never contains ":", so no refresh token, however
+# chosen, hashes to a pending sign-in's row.
+_SSO_EXCHANGE_HASH_PREFIX = "sso-exchange:"
+# Codes, bindings and the page's sign-in nonce are all 32 random bytes in
+# unpadded base64url.
+SIGN_IN_NONCE_PATTERN = r"^[A-Za-z0-9_-]{43}$"
+_SSO_EXCHANGE_SECRET = re.compile(r"\A[A-Za-z0-9_-]{43}\Z")
+
+
+def _sso_exchange_hash(code: str, binding: str, sign_in_nonce: str) -> str:
+    digest = hashlib.sha256(f"{code}.{binding}.{sign_in_nonce}".encode()).hexdigest()
+    return _SSO_EXCHANGE_HASH_PREFIX + digest
 
 
 class AuthService:
@@ -157,6 +176,24 @@ class AuthService:
         Returns None if the token is missing, expired, revoked, the linked
         user doesn't exist, or the row predates the owner's revocation horizon.
         """
+        stored = await self._usable_refresh_token(raw_token)
+        if stored is None:
+            return None
+        user_result = await self.db.execute(
+            select(User).where(User.id == stored.user_id)
+        )
+        return user_result.scalar_one_or_none()
+
+    async def get_refresh_session_id(self, raw_token: str) -> uuid.UUID | None:
+        """The session (token family) *raw_token* belongs to, if it is usable.
+
+        Same acceptance rules as get_user_from_refresh_token, so a guessed or
+        retired token never names a session.
+        """
+        stored = await self._usable_refresh_token(raw_token)
+        return stored.family_id if stored is not None else None
+
+    async def _usable_refresh_token(self, raw_token: str) -> RefreshToken | None:
         token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
         result = await self.db.execute(
             select(RefreshToken)
@@ -180,13 +217,7 @@ class AuthService:
                 ),
             )
         )
-        stored = result.scalar_one_or_none()
-        if stored is None:
-            return None
-        user_result = await self.db.execute(
-            select(User).where(User.id == stored.user_id)
-        )
-        return user_result.scalar_one_or_none()
+        return result.scalar_one_or_none()
 
     async def rotate_refresh_token(
         self,
@@ -273,6 +304,117 @@ class AuthService:
 
         await self.db.commit()
         return new_access, new_refresh
+
+    async def stage_sso_sign_in(
+        self, user_id: uuid.UUID, *, family_id: uuid.UUID, sign_in_nonce: str
+    ) -> tuple[str, str]:
+        """Stage a completed SSO sign-in for one exchange; returns (code, binding).
+
+        The pending row joins the new session's family, so logout-everywhere
+        and the revocation horizon reach it like any refresh token. Its hash
+        covers the code, the binding and the starting page's nonce, so
+        redeeming needs all three. Expired
+        staged rows are swept here, since an abandoned callback is never
+        redeemed or rotated.
+        """
+        expired = (
+            select(RefreshToken.id)
+            .where(
+                RefreshToken.token_hash.startswith(_SSO_EXCHANGE_HASH_PREFIX),
+                RefreshToken.expires_at < datetime.now(UTC),
+                RefreshToken.user_id.in_(select(User.id)),
+            )
+            .with_for_update(skip_locked=True)
+        )
+        await self.db.execute(delete(RefreshToken).where(RefreshToken.id.in_(expired)))
+        code = secrets.token_urlsafe(32)
+        binding = secrets.token_urlsafe(32)
+        self.db.add(
+            RefreshToken(
+                user_id=user_id,
+                token_hash=_sso_exchange_hash(code, binding, sign_in_nonce),
+                family_id=family_id,
+                expires_at=datetime.now(UTC)
+                + timedelta(seconds=SSO_EXCHANGE_TTL_SECONDS),
+            )
+        )
+        return code, binding
+
+    async def redeem_sso_sign_in(
+        self,
+        code: str,
+        binding: str,
+        sign_in_nonce: str,
+        *,
+        expire_minutes: int | None = None,
+        expire_days: int | None = None,
+    ) -> tuple[str, str]:
+        """Consume a staged sign-in once; returns (access_token, refresh_token).
+
+        Raises ValueError when the values name no live staged sign-in: wrong,
+        expired, already redeemed, revoked, or its user is no longer active.
+        """
+        if not all(
+            _SSO_EXCHANGE_SECRET.match(value)
+            for value in (code, binding, sign_in_nonce)
+        ):
+            raise ValueError("Invalid or expired sign-in code")
+        token_hash = _sso_exchange_hash(code, binding, sign_in_nonce)
+        user_id = (
+            await self.db.execute(
+                select(RefreshToken.user_id)
+                .join(User, RefreshToken.user_id == User.id)
+                .where(
+                    RefreshToken.token_hash == token_hash,
+                    RefreshToken.revoked == False,  # noqa: E712
+                    RefreshToken.expires_at > datetime.now(UTC),
+                )
+            )
+        ).scalar_one_or_none()
+        if user_id is None:
+            raise ValueError("Invalid or expired sign-in code")
+
+        # The owner lock every family mutation takes, as in rotate_refresh_token.
+        user = (
+            await self.db.execute(
+                select(User)
+                .where(User.id == user_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if user is None or not user.is_active or user.status != "active":
+            raise ValueError("Invalid or expired sign-in code")
+        # DELETE is the single-use gate: a concurrent redemption finds no row.
+        staged = (
+            await self.db.execute(
+                delete(RefreshToken)
+                .where(
+                    RefreshToken.token_hash == token_hash,
+                    RefreshToken.user_id == user.id,
+                    RefreshToken.revoked == False,  # noqa: E712
+                    RefreshToken.expires_at > datetime.now(UTC),
+                )
+                .returning(RefreshToken.family_id, RefreshToken.created_at)
+            )
+        ).one_or_none()
+        if staged is None or (
+            user.sessions_revoked_at is not None
+            and staged.created_at <= user.sessions_revoked_at
+        ):
+            raise ValueError("Invalid or expired sign-in code")
+
+        identity = AuthenticatedIdentity(
+            user_id=user.id, username=user.username, email=user.email
+        )
+        access_token = await self.create_access_token(
+            identity, expire_minutes=expire_minutes, family_id=staged.family_id
+        )
+        refresh_token = self.create_refresh_token(
+            user.id, expire_days=expire_days, family_id=staged.family_id
+        )
+        await self.db.commit()
+        return access_token, refresh_token
 
     async def cleanup_refresh_tokens(self) -> None:
         """Keep hashes through original expiry plus one day, even after rotation."""
@@ -466,7 +608,7 @@ class AuthService:
 
         user = User(
             username=username,
-            password_hash=hash_password(password),
+            password_hash=await hash_password_async(password),
             email=email,
             status="pending",
             is_active=False,
@@ -484,6 +626,11 @@ class AuthService:
             .where(UserRole.user_id == user_id)
         )
         return {row[0] for row in result.all()}
+
+
+async def get_user_identity(db: AsyncSession, user_id: uuid.UUID) -> Identity | None:
+    """The account ``user_id`` names, or None when the caller's scope has none."""
+    return await db.get(User, user_id)
 
 
 # Shared API key helper (used by admin and self-service routers).

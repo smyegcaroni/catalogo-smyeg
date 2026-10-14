@@ -158,7 +158,9 @@ class CatalogPort(Protocol):
         self, file_path: str, *, layer_name: str | None = None, sample_limit: int = 5
     ) -> dict[str, Any]: ...
 
-    def reupload_file_task(self) -> Any: ...
+    def reupload_file_task(self) -> Any:
+        """The verified file-replacement task, under a name pre-change workers lack."""
+        ...
 
     def reupload_service_task(self) -> Any: ...
 
@@ -167,6 +169,10 @@ class CatalogPort(Protocol):
     def reupload_raster_task(self) -> Any: ...
 
     def refresh_postgis_task(self) -> Any: ...
+
+    # REQUIRED (EXTENSION_API_VERSION 15 -> 16): the previous-version restore
+    # route defers it.
+    def restore_previous_version_task(self) -> Any: ...
 
     def refresh_stac_task(self) -> Any: ...
 
@@ -217,6 +223,16 @@ class CatalogPort(Protocol):
         *,
         schema: str | None = None,
     ) -> list[dict[str, Any]]: ...
+
+    def stored_column_name(self, source_name: str) -> str: ...
+
+    async def get_geometry_types(
+        self,
+        session: AsyncSession,
+        table_name: str,
+        *,
+        schema: str | None = None,
+    ) -> list[str] | None: ...
 
     async def generate_attribute_metadata(
         self,
@@ -322,6 +338,17 @@ class CatalogPort(Protocol):
     async def get_vrt_generation_source_count(
         self, session: AsyncSession, generation_id: uuid.UUID
     ) -> int | None: ...
+
+    # Whether a VRT, or a build in flight, may still read the COG the dataset
+    # serves now. A replacement publish keeps such a COG charged, so the quota
+    # door asks before crediting it.
+    #
+    # REQUIRED (EXTENSION_API_VERSION 12 -> 13): every reupload request reaches
+    # it through the quota check, so an overlay without it would answer
+    # AttributeError instead of admitting or refusing.
+    async def cog_may_be_read(
+        self, session: AsyncSession, dataset_id: uuid.UUID
+    ) -> bool: ...
 
     async def get_ingest_job_or_404(
         self, session: AsyncSession, job_id: uuid.UUID, user: Any

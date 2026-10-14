@@ -14,7 +14,7 @@ from pathlib import Path
 
 import structlog
 import uvicorn
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, select, text
 
 from app.core.config import settings
 from app.core.logging_config import setup_logging
@@ -51,32 +51,25 @@ RECOVERY_LOCK_KEY = 224_001
 
 
 async def _recover_stale_jobs_for_current_scope() -> None:
-    """Mark stale jobs as failed using an advisory lock + heartbeat lease.
+    """Settle stale jobs once, before this worker takes its first delivery.
 
-    Running workers renew ``heartbeat_at``; recovery falls back to
-    ``started_at`` for pre-migration rows and only fails jobs whose liveness
-    signal is older than ``JOB_TIMEOUT_SECONDS``.
-
-    Handles two cases: (1) a worker killed mid-job, reclaimed on the next
-    worker's startup; (2) a job created but never queued (e.g. the defer
-    request got a 502), pending with no procrastinate task.
-
-    An advisory lock keeps recovery single-flight across a rolling restart;
-    a worker that fails to acquire it skips recovery.
+    Runs the lifespan sweep's settlement pass (``settle_stale_jobs``) and the
+    same post-commit artifact reap. The retention purge and the staging
+    housekeeping stay with the sweep. A worker that fails to take the
+    advisory lock skips recovery.
     """
     from app.core.db import async_session
-    from app.platform.jobs.models import IngestJob
-    from app.platform.jobs.router import (
-        JOB_TIMEOUT_SECONDS,
-        audit_settled_embedding_backfill,
+    from app.platform.jobs.sweep import (
+        _reap_committed_staged_paths,
+        collect_unreaped_artifacts,
+        publish_refresh_reconciliation,
+        settle_stale_jobs,
     )
 
-    now = datetime.now(timezone.utc)
-    stale_cutoff = now - timedelta(seconds=JOB_TIMEOUT_SECONDS)
-
     async with async_session() as session:
-        # pg_try_advisory_xact_lock releases automatically when the
-        # transaction ends, so no explicit unlock is needed.
+        # The lock only keeps two workers' recoveries apart. The lifespan
+        # sweep never takes it; the pass's own row locks keep the two from
+        # settling one row twice. Released when the transaction ends.
         lock_result = await session.execute(
             text("SELECT pg_try_advisory_xact_lock(:key)"),
             {"key": RECOVERY_LOCK_KEY},
@@ -85,163 +78,30 @@ async def _recover_stale_jobs_for_current_scope() -> None:
             log.info("Stale job recovery skipped — another worker holds the lock")
             return
 
-        # Mirrors fail_stale_jobs (router.py:39), which the lifespan sweeper
-        # runs every 5 minutes for the same purpose; the advisory lock keeps
-        # startup recovery and the sweeper from colliding.
-        #
-        # fix(#1778): candidate set read via its own `FOR UPDATE SKIP
-        # LOCKED` subquery, mirroring fail_stale_jobs's fix for the same race
-        # — a `lock_timeout` on this set-based UPDATE would abort the WHOLE
-        # batch on one busy row instead of skipping just that row.
-        stale_candidates = (
-            select(IngestJob.id)
-            .where(
-                IngestJob.status == "running",
-                func.coalesce(IngestJob.heartbeat_at, IngestJob.started_at)
-                < stale_cutoff,
-            )
-            .with_for_update(skip_locked=True)
-        )
-        stale_result = await session.execute(
-            update(IngestJob)
-            .where(IngestJob.id.in_(stale_candidates))
-            .values(
-                status="failed",
-                error_message=(
-                    f"Stale: running for over {JOB_TIMEOUT_SECONDS // 60} minutes"
-                ),
-                completed_at=now,
-            )
-            .returning(IngestJob)
-        )
-        stale_jobs = list(stale_result.scalars())
-        for job in stale_jobs:
-            # RETURNING refreshes these in production; the explicit
-            # assignment also keeps lightweight session doubles representative.
-            job.status = "failed"
-            job.error_message = (
-                f"Stale: running for over {JOB_TIMEOUT_SECONDS // 60} minutes"
-            )
-            job.completed_at = now
-            log.warning(
-                "Recovered stale running job",
-                job_id=str(job.id),
-            )
-            # fix(#1556): the fourth actor that can settle an embedding
-            # backfill row (#1550 taught the other three). Matters most
-            # after a hard kill, when this startup pass reaches the row
-            # before any later sweep would. No-op for every other job kind.
-            await audit_settled_embedding_backfill(
-                session,
-                job_id=job.id,
-                user_metadata=job.user_metadata,
-                created_by=job.created_by,
-                error_code="worker_lost",
-            )
-
-        # fix(#1235): recover orphaned pending jobs (never queued) through
-        # the shared clauses — this site was missing both the live-queue
-        # predicate (#724) and the bound/unbound split (#1234).
-        from app.platform.jobs.router import (
-            ABANDONED_UPLOAD_MESSAGE,
-            STALE_PENDING_UNBOUND_MESSAGE,
-            is_abandoned_upload,
-            stale_pending_clauses,
-            stale_pending_unbound_values,
-        )
-
-        orphaned_result = await session.execute(
-            update(IngestJob)
-            .where(*stale_pending_clauses(now, completion_bound=False))
-            .values(
-                **stale_pending_unbound_values(
-                    now, message=STALE_PENDING_UNBOUND_MESSAGE
-                )
-            )
-            .returning(IngestJob)
-        )
-        orphaned_jobs = list(orphaned_result.scalars())
-        for job in orphaned_jobs:
-            # fix(#1556): must reproduce the CASE the database just
-            # evaluated, not a constant — a flat `job.status = "failed"`
-            # here would push `failed` back over the `cancelled` the UPDATE wrote.
-            abandoned = is_abandoned_upload(job.user_metadata)
-            job.status = "cancelled" if abandoned else "failed"
-            job.error_message = (
-                ABANDONED_UPLOAD_MESSAGE if abandoned else STALE_PENDING_UNBOUND_MESSAGE
-            )
-            job.completed_at = now
-            log.warning(
-                "Recovered orphaned pending job",
-                job_id=str(job.id),
-                status=job.status,
-            )
-            # fix(#1556): the other half. A backfill whose dispatch never
-            # landed is `pending` with no queue row — the unique index
-            # counts it, holding the single active-backfill slot while its
-            # trail still reads `requested`.
-            await audit_settled_embedding_backfill(
-                session,
-                job_id=job.id,
-                user_metadata=job.user_metadata,
-                created_by=job.created_by,
-                error_code="never_started",
-            )
-
-        # GAP-002: sweep VRT assets stuck `regenerating` past the timeout,
-        # using the same stale_cutoff as the running-jobs sweep above.
-        from app.platform.jobs.router import (
-            _reap_stale_generation_storage,
-            _reap_unadopted_analysis_outputs,
-            reap_unpublished_storage_keys,
-            sweep_stale_vrt_assets,
-            unadopted_analysis_tables_from_metadata,
-            unpublished_storage_keys_from_metadata,
-        )
-
-        (
-            vrt_assets_recovered,
-            vrt_gens_failed,
-            stale_generation_storage_keys,
-        ) = await sweep_stale_vrt_assets(session, stale_cutoff)
-
+        outcome = await settle_stale_jobs(session, datetime.now(timezone.utc))
+        outcome = await collect_unreaped_artifacts(session, outcome)
         await session.commit()
-        # fix(#1322): reap only after the commit above lands — deleting
-        # before ownership-restoring reconciliation is durable can orphan a
-        # 'ready' asset against bytes a rolled-back commit never freed.
-        await _reap_stale_generation_storage(stale_generation_storage_keys)
-        # fix(#1778): the same treatment for a killed raster
-        # ingest/replace's pre-commit objects, through the shared reaper
-        # (survivor check + tenant resolution) so this pass can't delete a
-        # key a live row still names. Matters more than the periodic sweep:
-        # an OOM-killed worker's restart runs this before any lifespan sweeper.
-        await reap_unpublished_storage_keys(
-            tuple(
-                key
-                for job in stale_jobs
-                for key in unpublished_storage_keys_from_metadata(job.user_metadata)
-            )
+
+    publish_refresh_reconciliation(outcome)
+    # Only after the commit: a reap before it could delete an artifact that a
+    # rolled-back settlement still owns.
+    outcome = await _reap_committed_staged_paths(outcome)
+    from app.processing.ingest.publish_followups import run_owed_publish_followups
+
+    await run_owed_publish_followups()
+    for job_id in outcome._settled_running_ids:
+        log.warning("Recovered stale running job", job_id=str(job_id))
+    for job_id, status in outcome._settled_pending:
+        log.warning("Recovered orphaned pending job", job_id=str(job_id), status=status)
+    if outcome.total_affected or outcome._refresh_runs_reconciled:
+        log.info(
+            "Stale job recovery complete",
+            running_recovered=outcome.running_failed,
+            pending_recovered=len(outcome._settled_pending),
+            vrt_assets_recovered=outcome.vrt_assets_recovered,
+            vrt_gens_failed=outcome.vrt_generations_failed,
+            refresh_runs_reconciled=outcome._refresh_runs_reconciled,
         )
-        # fix(#1778): the analysis peer, same pass/ordering.
-        # (job, table) pairs so a drop can refuse a table the job it's
-        # reaping didn't create; ALL names a row records, since it
-        # accumulates across attempts.
-        await _reap_unadopted_analysis_outputs(
-            tuple(
-                (job.id, name)
-                for job in stale_jobs
-                for name in unadopted_analysis_tables_from_metadata(job.user_metadata)
-            )
-        )
-        total = len(stale_jobs) + len(orphaned_jobs)
-        if total or vrt_assets_recovered:
-            log.info(
-                "Stale job recovery complete",
-                running_recovered=len(stale_jobs),
-                pending_recovered=len(orphaned_jobs),
-                vrt_assets_recovered=vrt_assets_recovered,
-                vrt_gens_failed=vrt_gens_failed,
-            )
 
 
 # fix(#624): a worker killed mid-job leaves its queue row in `doing` forever.
@@ -652,6 +512,53 @@ async def run_terminal_job_purges() -> None:
         await _purge_terminal_jobs_safely()
 
 
+# Scheduled refreshes use an immutable short claim deadline rather than the
+# hour-long generic ingest timeout. This neutral core sweep releases the
+# active-run reservation if an optional overlay scheduler enqueued work that no
+# live subscriber ever claims.
+SCHEDULED_REFRESH_EXPIRY_SWEEP_INTERVAL_SECONDS = 60
+
+
+async def _expire_unclaimed_scheduled_refreshes_safely() -> None:
+    """Settle expired pending scheduled runs without depending on an overlay."""
+    from app.core.db import async_session
+    from app.platform.refresh.service import expire_unclaimed_admitted_runs
+
+    try:
+        async with async_session() as session:
+            expired = await expire_unclaimed_admitted_runs(session)
+            await session.commit()
+        if expired:
+            log.warning(
+                "scheduled_refresh_claims_expired",
+                count=len(expired),
+                run_ids=[str(run_id) for run_id in expired],
+            )
+    except Exception:  # broad: a recovery sweep must not take down the job worker
+        log.exception("scheduled_refresh_expiry_sweep_failed")
+
+
+async def _queue_crs_facts_repair_safely() -> None:
+    """Queue one CRS facts repair now rather than wait for its periodic slot."""
+    from procrastinate.exceptions import AlreadyEnqueued
+
+    from app.processing.ingest.tasks_crs_facts import repair_crs_facts
+
+    try:
+        await repair_crs_facts.defer_async()
+    except AlreadyEnqueued:
+        pass
+    except Exception:  # broad: the periodic run still fills these rows
+        log.warning("crs_facts_repair_queue_failed", exc_info=True)
+
+
+async def run_scheduled_refresh_expiry_sweeps() -> None:
+    """Sweep expired unclaimed scheduled admissions for the worker lifetime."""
+    while True:
+        await asyncio.sleep(SCHEDULED_REFRESH_EXPIRY_SWEEP_INTERVAL_SECONDS)
+        await _expire_unclaimed_scheduled_refreshes_safely()
+
+
 async def run_health_server() -> None:
     """Run the worker health server on port 8001."""
     config = uvicorn.Config(
@@ -671,12 +578,17 @@ async def main() -> None:
     import app.modules.auth.models  # noqa: F401
     import app.modules.audit.models  # noqa: F401
     import app.modules.catalog.datasets.domain.models  # noqa: F401
+    import app.modules.catalog.collections.models  # noqa: F401
     import app.processing.embeddings.models  # noqa: F401
 
     from app.observability.metrics.jobs import update_job_metrics
     from app.observability.metrics.memory import update_memory_metrics
     from app.observability.metrics.pool import update_pool_metrics
     from app.platform.refresh.credentials import renew_credentials_periodically
+    from app.platform.extensions import get_scheduled_refresh_lifecycle
+    from app.platform.extensions.scheduled_refresh import (
+        supervised_scheduled_refresh_lifecycle,
+    )
     from app.processing.ingest.tasks import task_app
 
     # MIG-02: fail closed if the schema heads are skewed from this image's
@@ -774,31 +686,46 @@ async def main() -> None:
             # fix(#1778): early, before the jobs-by-events join this query
             # builds has a large table to sort.
             await _purge_terminal_jobs_safely()
+            await _expire_unclaimed_scheduled_refreshes_safely()
+            await _queue_crs_facts_repair_safely()
             sweep_task = asyncio.create_task(run_stalled_queue_sweeps())
             purge_task = asyncio.create_task(run_terminal_job_purges())
+            scheduled_expiry_task = asyncio.create_task(
+                run_scheduled_refresh_expiry_sweeps()
+            )
             try:
-                await task_app.run_worker_async(
-                    queues=queues,
-                    concurrency=settings.worker_concurrency,
-                    listen_notify=not settings.db_use_external_pooler,
-                    install_signal_handlers=True,
-                    delete_jobs="successful",
-                    shutdown_graceful_timeout=shutdown_timeout,
-                    # fix(#624): MUST match the sweep's own window.
-                    # worker_id is ON DELETE SET NULL, and
-                    # select_stalled_jobs_by_heartbeat treats a NULL
-                    # worker_id as stalled OUTRIGHT — at the 30s default, a
-                    # merely-stalled live worker gets pruned and its
-                    # in-flight jobs fail despite our cushion. Equal windows
-                    # mean NULL worker_id can only be a genuinely dead worker.
-                    stalled_worker_timeout=stalled_worker_seconds(),
-                )
+                lifecycle = get_scheduled_refresh_lifecycle()
+                async with supervised_scheduled_refresh_lifecycle(
+                    lifecycle, task_app=task_app
+                ):
+                    await task_app.run_worker_async(
+                        queues=queues,
+                        concurrency=settings.worker_concurrency,
+                        listen_notify=not settings.db_use_external_pooler,
+                        install_signal_handlers=True,
+                        delete_jobs="successful",
+                        shutdown_graceful_timeout=shutdown_timeout,
+                        # fix(#624): MUST match the sweep's own window.
+                        # worker_id is ON DELETE SET NULL, and
+                        # select_stalled_jobs_by_heartbeat treats a NULL
+                        # worker_id as stalled OUTRIGHT — at the 30s default, a
+                        # merely-stalled live worker gets pruned and its
+                        # in-flight jobs fail despite our cushion. Equal windows
+                        # mean NULL worker_id can only be a genuinely dead worker.
+                        stalled_worker_timeout=stalled_worker_seconds(),
+                    )
             finally:
                 # Cancel inside the connector context — a sweep mid-query when
                 # the pool closes would raise on the way out.
                 sweep_task.cancel()
                 purge_task.cancel()
-                await asyncio.gather(sweep_task, purge_task, return_exceptions=True)
+                scheduled_expiry_task.cancel()
+                await asyncio.gather(
+                    sweep_task,
+                    purge_task,
+                    scheduled_expiry_task,
+                    return_exceptions=True,
+                )
     finally:
         # 7. Clean up background tasks after worker exits
         metrics_task.cancel()

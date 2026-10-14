@@ -76,7 +76,17 @@
     "quotaShort": "已跳过；已达数据集上限",
     "quotaBannerTitle": "已达到数据集上限",
     "quotaBannerHint": "删除现有数据集以释放空间，或联系管理员提高上限。",
-    "reportProblem": "报告此问题"
+    "reportProblem": "报告此问题",
+    "kindLegend": "要上传什么？",
+    "kindFiles": "地理空间文件",
+    "kindFilesHint": "矢量、栅格或表格数据",
+    "kindTileset": "3D Tiles 瓦片集",
+    "kindTilesetHint": "根目录或单个文件夹中包含 tileset.json 的 .zip 或 .3tz 压缩包",
+    "kindTilesetUnavailable": "需管理员允许上传 .zip 或 .3tz 文件后才能使用",
+    "kindLocked": "已锁定：拖入的文件正在等待上传设置加载",
+    "kindPointCloud": "COPC 点云",
+    "kindPointCloudHint": "COPC 格式的 .laz 文件；其他 LAS/LAZ 文件需先转换",
+    "kindPointCloudUnavailable": "管理员允许上传 .laz 文件后可用"
   },
   "warnings": {
     "bannerTitle": "导入已完成，但存在警告",
@@ -104,21 +114,36 @@
     "temporalParseErrors": {
       "title": "时间字段已丢弃",
       "description": "以下时间值无法解析为 ISO-8601 日期，已被丢弃。请在数据集元数据编辑器中重新输入以恢复。"
-    }
+    },
+    "compactSummary_one": "{{count}} 条导入警告 · 查看详情",
+    "compactSummary_other": "{{count}} 条导入警告 · 查看详情",
+    "compactDataLoss_one": "{{count}} 条数据警告 · 部分数据可能已更改 · 查看详情",
+    "compactDataLoss_other": "{{count}} 条数据警告 · 部分数据可能已更改 · 查看详情",
+    "compactArchiveFailure_one": "{{count}} 条导入警告 · 原始文件不可用 · 查看详情",
+    "compactArchiveFailure_other": "{{count}} 条导入警告 · 原始文件不可用 · 查看详情"
   },
   "complete": {
     "heroTitle_one": "已将 {{count}} 个数据集添加到目录",
     "heroTitle_many": "已将 {{count}} 个数据集添加到目录",
     "heroTitle_other": "已将 {{count}} 个数据集添加到目录",
     "heroDesc": "所有文件均已完成导入、切片和索引。可随时查询、设置样式并添加到地图。",
+    "heroDescTilesets": "可在 3D Tiles 客户端中加载。瓦片集 URL 位于数据集的“访问”选项卡中。",
     "statDatasets": "数据集",
     "statVector": "矢量",
     "statRaster": "栅格",
     "statTabular": "表格",
+    "statTilesets": "3D Tiles",
     "next": "下一步：",
     "viewCatalog": "在目录中查看",
     "importMore": "导入更多",
-    "aiMetadata": "添加 AI 元数据"
+    "aiMetadata": "添加 AI 元数据",
+    "statPointClouds": "点云",
+    "heroDescPointClouds": "可在 COPC 客户端中打开。文件 URL 位于数据集的“访问”选项卡。",
+    "partialTitle": "已添加 {{completed}} 个数据集 · {{failed}} 个失败或取消",
+    "partialDesc": "部分导入未完成。请查看失败的任务，并打开已就绪的数据集。",
+    "heroDescTables": "行和表结构已可供查询及复用。非空间表没有地图预览。",
+    "heroDescMixed": "数据集已在目录中就绪。打开各数据集可查看数据和访问方式。",
+    "failedJobs": "失败或取消的任务"
   },
   "dropzone": {
     "ariaLabel": "上传文件",
@@ -128,10 +153,18 @@
     "subtext": "GeoLens 会在提交到目录之前检测几何、CRS 和字段结构。每批最多 {{max}} 个文件。",
     "dropHere": "将文件拖到此处",
     "unsupportedType": "不支持此文件类型",
+    "rejectionReason": {
+      "fileInvalidType": "文件类型必须是以下之一：{{types}}",
+      "fileTooLarge": "文件超过 {{size}} MB 的限制",
+      "fileTooSmall": "文件小于最小大小",
+      "tooManyFiles": "每批最多 {{max}} 个文件",
+      "kindOnly": "此模式不导入 {{ext}} 文件。请改选“{{mode}}”"
+    },
     "sizeLimit": "每个文件最大 500 MB",
     "sizeLimitDynamic": "每个文件最大 {{size}} MB",
     "batchLimit": "每批最多 {{max}} 个文件",
-    "fileRejected": "{{filename}}：{{reason}}"
+    "fileRejected": "{{filename}}：{{reason}}",
+    "tilesetSubtext": "GeoLens 会在存储前检查每个压缩包并读取其 tileset.json。"
   },
   "stac": {
     "label": "STAC API URL；粘贴目录根端点",
@@ -175,6 +208,10 @@
     "assetCount_one": "{{count}} 个资产",
     "assetCount_other": "{{count}} 个资产",
     "noCogAsset": "无 COG 资产",
+    "unsupportedAssetScheme": "发布于 GeoLens 无法读取的 {{scheme}}:// 地址",
+    "assetUrlInvalid": "其地址不是有效的 http 或 https URL",
+    "assetHasCredentials": "使用了带签名或凭证的 URL，GeoLens 不会存储此类地址",
+    "assetHrefTooLong": "其地址过长，GeoLens 无法存储",
     "catalogHelp": "浏览并导入来自公共 STAC 目录的栅格数据集，例如",
     "matchedTotal": "（共 {{count}} 个）",
     "confirm": {
@@ -184,9 +221,10 @@
       "itemsLabel": "条目",
       "totalSizeLabel": "预计总大小",
       "sizeUnavailable": "大小不可用",
+      "sizeChecking": "正在检查大小...",
       "partialSizeNote_one": "{{count}} 个条目缺少大小信息；总计为下限值。",
       "partialSizeNote_other": "{{count}} 个条目缺少大小信息；总计为下限值。",
-      "estimateSource": "估算值来自 STAC 清单（file:size）。实际下载量可能有所不同。",
+      "estimateSource": "估算值来自 STAC 清单（file:size）；目录未提供时来自资源服务器。实际下载量可能有所不同。",
       "backToSelection": "返回选择列表",
       "confirmImport_one": "确认并导入 {{count}} 个条目",
       "confirmImport_other": "确认并导入 {{count}} 个条目"
@@ -206,20 +244,35 @@
     "credentialHeaderNamePlaceholder": "例如 Ocp-Apim-Subscription-Key",
     "credentialHeaderValueLabel": "请求头值",
     "credentialHeaderValuePlaceholder": "您的 API 密钥",
-    "credentialHelpText": "选择您的目录文档说明的方式。Bearer 令牌会通过 Authorization 请求头发送；用户名和密码会通过 HTTP Basic 身份验证发送；API 密钥可放在服务提供商指定的任意请求头中，例如 X-API-Key、Ocp-Apim-Subscription-Key 或 key。它用于验证目录及其集合和条目；瓦片由资源 URL 渲染，不携带凭据。"
+    "credentialHelpText": "选择您的目录文档说明的方式。Bearer 令牌会通过 Authorization 请求头发送；用户名和密码会通过 HTTP Basic 身份验证发送；API 密钥可放在服务提供商指定的任意请求头中，例如 X-API-Key、Ocp-Apim-Subscription-Key 或 key。它用于验证目录及其集合和条目；瓦片由资源 URL 渲染，不携带凭据。",
+    "filterStart": "起始",
+    "filterEnd": "截止",
+    "filterBbox": "区域（西、南、东、北）",
+    "filterBboxPlaceholder": "-74.3, 40.5, -73.7, 40.9",
+    "filterApply": "应用筛选",
+    "filterDateOrder": "开始日期不能晚于结束日期。",
+    "filterBboxInvalid": "请按西、南、东、北输入四个数字（经度 -180 到 180，纬度 -90 到 90，南不大于北）。",
+    "loadMore": "加载更多",
+    "filterCloud": "最大云量（%）",
+    "filterCloudInvalid": "请输入 0 到 100 之间的云量。",
+    "selectionLimit": "一次最多可导入 {{count}} 个条目。"
   },
   "serviceUrl": {
     "label": "服务 URL",
     "placeholder": "https://example.com/wfs、ArcGIS 要素服务或 OGC API 端点",
     "helpText": "粘贴 WFS、ArcGIS 要素服务或 OGC API Features URL",
+    "arcgisPortalUrlHint": "这看起来是 ArcGIS 组织或门户页面，而不是图层。请打开图层的项目页面，复制其 REST URL（以 /FeatureServer/0 或 /MapServer/0 结尾）并粘贴到此处。受保护的图层会在粘贴图层 URL 后要求登录。",
     "detectedLabel": "服务 URL；已检测到",
     "clear": "清空",
-    "layersAvailable": "{{count}} 个可用图层",
+    "layersAvailable_one": "{{count}} 个可用图层",
+    "layersAvailable_other": "{{count}} 个可用图层",
     "noLayers": "此服务中未找到图层。",
+    "unsupportedLayerType": "{{type}} 不包含要素。请改为导入其中的要素图层。",
     "probe": "探测 →",
     "supported": "支持：",
     "tokenPlaceholder": "ArcGIS 令牌、API 密钥或 WFS 访问令牌",
     "credentialMethodLabel": "身份验证",
+    "credentialsReset": "由于服务地址已更改，身份验证已重置。",
     "credentialMethodNone": "无身份验证",
     "credentialMethodBearer": "Bearer 令牌",
     "credentialMethodBasic": "用户名和密码",
@@ -294,7 +347,7 @@
     "reviewTitle": "核对检测结果",
     "reviewDesc": "确认每个文件的几何类型、CRS、字段结构和预览。",
     "importTitle": "导入并编目",
-    "importDesc": "切片、索引、发布；数据集会立即出现在目录中。",
+    "importDesc": "根据数据类型准备各数据集并将其添加到目录。",
     "workflow": "工作流",
     "whatImported": "导入的内容",
     "vectorLabel": "矢量",
@@ -322,7 +375,17 @@
     "urlHint": "从文件 URL 导入",
     "urlDesc": "GeoLens 会在服务器端将文件下载到暂存区，然后运行与上传相同的检测和导入流水线。",
     "urlNote": "下载前会验证 URL 并限制大小 · 数据会复制到 GeoLens 中",
-    "compareUrl": "上传从您的计算机发送文件。文件 URL 从网络抓取；相同的检查、相同的结果，无需本地下载。"
+    "compareUrl": "上传从您的计算机发送文件。文件 URL 从网络抓取；相同的检查、相同的结果，无需本地下载。",
+    "tiles3dLabel": "3D Tiles",
+    "tiles3dDesc": "解压后原样提供给 3D Tiles 客户端。",
+    "partialDesc": "部分导入失败或取消。请查看任务详情。",
+    "partialStatus": "需要处理",
+    "completeTableDesc": "行和表结构可供查询及复用；没有地图预览。",
+    "completeTilesetDesc": "在数据集的“访问”标签页获取 3D Tiles 客户端网址。",
+    "completePointCloudDesc": "在数据集的“访问”标签页获取 COPC 文件网址。",
+    "completeDesc": "已完成的数据集可在目录中查看。",
+    "pointcloudLabel": "COPC 点云",
+    "pointcloudDesc": "供外部 COPC 客户端使用；没有内置地图预览。"
   },
   "register": {
     "helpText": "将数据库中现有的 PostGIS 表收录为 GeoLens 数据集。当数据库中已有未通过 GeoLens 导入的地理数据时，可使用此方式。选定的表将添加到数据集目录，并自动检测元数据。",
@@ -351,6 +414,11 @@
     "successToast_one": "{{count}} 张表注册成功",
     "successToast_other": "{{count}} 张表注册成功",
     "registerFailed": "表注册失败",
+    "internalFailure": "注册失败的原因服务器无法安全报告。请让运维人员检查服务器日志。",
+    "refusal": {
+      "source_srid_undeclared": "其 geom 列未声明 SRID，GeoLens 无法确定其坐标所在的位置。请先设置 SRID（例如使用 UpdateGeometrySRID），然后再注册该表。",
+      "source_gid_unusable": "GeoLens 通过名为 gid 的列来识别要素：该列必须是 NOT NULL 且唯一的整数（例如主键），并且所在的表没有被其他表继承。此表不满足该条件。请添加或修正 gid 列，或将无法使用的 gid 列重命名以便 GeoLens 添加自己的 gid 列，然后再注册该表。"
+    },
     "unknownError": "未知错误",
     "searchPlaceholder": "搜索表…",
     "selectHint": "从列表中选择一个表以查看其字段结构并进行注册。",
@@ -384,6 +452,7 @@
   },
   "preview": {
     "title": "文件预览",
+    "serviceTitle": "服务预览",
     "raster": "栅格",
     "crs": "CRS：",
     "bands": "波段：",
@@ -515,7 +584,15 @@
     "rasterCount_one": "{{value}} 个栅格",
     "rasterCount_other": "{{value}} 个栅格",
     "tableCount_one": "{{value}} 个表格数据集",
-    "tableCount_other": "{{value}} 个表格数据集"
+    "tableCount_other": "{{value}} 个表格数据集",
+    "tilesetSummary": "3D Tiles {{version}} · {{size}} · {{volume}}",
+    "tilesetCount_one": "{{value}} 个瓦片集",
+    "tilesetCount_other": "{{value}} 个瓦片集",
+    "tilesetActionSummary": "{{files}} · {{tilesets}}",
+    "pointcloudSummary": "{{points}} 个点 · {{crs}} · {{size}}",
+    "pointcloudCount_one": "{{value}} 个点云",
+    "pointcloudCount_other": "{{value}} 个点云",
+    "singleActionHint": "检查上方设置，然后导入此数据集。"
   },
   "detect": {
     "rasterInfo": "栅格信息",
@@ -535,12 +612,20 @@
       "cog": "COG",
       "type": "类型",
       "features": "要素",
-      "layer": "图层"
+      "layer": "图层",
+      "version": "版本",
+      "geometricError": "几何误差",
+      "volume": "包围体",
+      "extent": "范围",
+      "unpacked": "解压后",
+      "entries": "条目"
     },
     "table": {
       "column": "列",
       "type": "类型"
-    }
+    },
+    "tilesetInfo": "瓦片集",
+    "noExtent": "无；包围体未经地理配准"
   },
   "eyebrow": "导入",
   "pageDescription": "上传文件、注册 Postgres 中的表，或连接远程服务。GeoLens 会检测几何、字段结构和 CRS，然后使其可查询、可设置样式、可嵌入。",
@@ -581,7 +666,13 @@
     "createVrtMosaic": "创建 VRT 镶嵌",
     "importAsVrt": "作为 VRT 镶嵌导入",
     "ingestAllLayers": "将全部 {{count}} 个图层作为独立数据集导入",
-    "uploadProgressLabel": "{{name}} 的上传进度"
+    "uploadProgressLabel": "{{name}} 的上传进度",
+    "toggleDetails": "显示或隐藏 {{name}} 的详情",
+    "removeNamedFile": "移除 {{name}}",
+    "defaultsConfirmTitle": "使用默认值导入批次？",
+    "defaultsConfirmDescription": "将使用文件名作为数据集名称并设置为私有。审核表单中的所有修改（包括名称、描述、可见性、几何、坐标参考系和栅格设置）将被舍弃。多图层文件仅导入所选图层。",
+    "confirmDefaults": "使用默认值导入",
+    "progressDetailWithFailures": "{{done}} 个已完成 · {{failed}} 个失败或取消 · {{active}} 个进行中 · {{queued}} 个排队中"
   },
   "status": {
     "uploading": "正在上传",
@@ -590,5 +681,11 @@
     "importing": "正在导入",
     "ready": "已就绪",
     "failed": "已失败"
+  },
+  "pointcloud": {
+    "points": "点数",
+    "crs": "坐标参考系",
+    "pointFormat": "点格式",
+    "size": "大小"
   }
 }

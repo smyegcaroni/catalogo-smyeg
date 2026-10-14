@@ -1,7 +1,8 @@
 import { useEffect, useRef } from 'react';
 import { Link } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { describeFailureReason } from '@/lib/failure-reason';
+import { getIngestSourceLabel } from '@/i18n/labels';
+import { describeFailureReason, fixedFailureReason } from '@/lib/failure-reason';
 import {
   useJobStatus,
   useRetryJob,
@@ -25,6 +26,7 @@ import {
 import { ApiError } from '@/api/client';
 import { downloadCog, getCogDownloadUrl } from '@/api/datasets';
 import { IngestWarningsBanner } from './IngestWarningsBanner';
+import { usePermissions } from '@/hooks/use-permissions';
 
 interface JobProgressProps {
   jobId: string;
@@ -95,6 +97,7 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 export function JobProgress({ jobId, onReset, isRasterEntry = false }: JobProgressProps) {
+  const { can } = usePermissions();
   const { t } = useTranslation('import');
   const { data: job, isLoading, isError, error, refetch, isFetching } = useJobStatus(jobId);
   const retryMutation = useRetryJob();
@@ -232,7 +235,7 @@ export function JobProgress({ jobId, onReset, isRasterEntry = false }: JobProgre
           </div>
           <div className="flex items-center gap-2">
             {job.source_filename && (
-              <span className="text-sm text-muted-foreground">{job.source_filename}</span>
+              <span className="text-sm text-muted-foreground">{getIngestSourceLabel(t, job.source_filename)}</span>
             )}
             {isPolling && (
               <Button
@@ -302,12 +305,14 @@ export function JobProgress({ jobId, onReset, isRasterEntry = false }: JobProgre
                   <Download className="me-1 size-3" />
                   {t('jobProgress.downloadCog')}
                 </Button>
-                <Button variant="outline" size="sm" asChild>
-                  <Link to={`/datasets/${job.dataset_id}`}>
-                    <Map className="me-1 size-3" />
-                    {t('jobProgress.addToMap')}
-                  </Link>
-                </Button>
+                {can('edit_metadata') && (
+                  <Button variant="outline" size="sm" asChild>
+                    <Link to={`/datasets/${job.dataset_id}`}>
+                      <Map className="me-1 size-3" />
+                      {t('jobProgress.addToMap')}
+                    </Link>
+                  </Button>
+                )}
                 <ConnectDropdownInline datasetId={job.dataset_id} />
               </>
             )}
@@ -318,7 +323,11 @@ export function JobProgress({ jobId, onReset, isRasterEntry = false }: JobProgre
           <div className="space-y-3">
             {job.error_message && (
               <p className="text-sm text-destructive">
-                {describeFailureReason(job.error_message, t('common:errors.internalFailureReason'))}
+                {describeFailureReason(
+                  job.error_message,
+                  t('common:errors.internalFailureReason'),
+                  job.error_code,
+                )}
               </p>
             )}
             {job.retry_reason && (
@@ -360,7 +369,9 @@ export function JobProgress({ jobId, onReset, isRasterEntry = false }: JobProgre
             "Import another" button. */}
         {job.status === 'cancelled' && (
           <div className="space-y-3">
-            <p className="text-sm text-muted-foreground">{t('jobProgress.cancelledMessage')}</p>
+            <p className="text-sm text-muted-foreground">
+              {fixedFailureReason(job.error_code) ?? t('jobProgress.cancelledMessage')}
+            </p>
             <Button variant="outline" onClick={onReset}>
               {t('jobProgress.startOver')}
             </Button>

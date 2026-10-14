@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -82,11 +83,50 @@ def test_role_reset_closes_sibling_cursor_when_reset_fails(monkeypatch):
         f'ALTER TABLE "{_SCHEMA_A}"."roads" ADD COLUMN name text',
         f'WITH changed AS (DELETE FROM "{_SCHEMA_A}"."roads" RETURNING gid) '
         "SELECT gid FROM changed",
+        f'SELECT xmin FROM "{_SCHEMA_A}"."roads" WHERE gid = 1 FOR UPDATE',
+        f'SELECT gid FROM "{_SCHEMA_A}"."roads" FOR NO KEY UPDATE',
+        f'SELECT gid FROM "{_SCHEMA_A}"."roads" for key share',
+        f'LOCK TABLE "{_SCHEMA_A}"."roads" IN ACCESS EXCLUSIVE MODE',
     ],
 )
 def test_mutating_sql_uses_tenant_writer(monkeypatch, statement):
     cursor, _context = _bind(monkeypatch, statement)
     cursor.execute.assert_called_once_with(f'SET LOCAL ROLE "{_WRITER_A}"')
+
+
+@pytest.mark.anyio
+async def test_a_replacement_takes_its_live_table_under_the_tenant_roles(monkeypatch):
+    """The existence check reads as the tenant reader; the lock runs as its writer."""
+    from app.processing.ingest.tasks_reupload import _hold_live_table
+
+    executed: list[tuple[str, dict]] = []
+
+    class _Session:
+        no_autoflush = contextlib.nullcontext()
+
+        async def scalar(self, statement, parameters=None):
+            executed.append((str(statement), parameters or {}))
+            return "0" if "current_setting" in str(statement) else True
+
+        async def execute(self, statement, parameters=None):
+            executed.append((str(statement), parameters or {}))
+
+        async def refresh(self, *args, **kwargs):
+            return None
+
+    await _hold_live_table(
+        _Session(), SimpleNamespace(table_name="roads"), schema=_SCHEMA_A
+    )
+
+    roles = []
+    for statement, parameters in executed:
+        cursor, _context = _bind(monkeypatch, statement, parameters)
+        if cursor.execute.call_args is not None:
+            roles.append(cursor.execute.call_args.args[0])
+    assert roles == [
+        f'SET LOCAL ROLE "{_READER_A}"',
+        f'SET LOCAL ROLE "{_WRITER_A}"',
+    ]
 
 
 def test_bound_schema_parameter_triggers_reader_binding(monkeypatch):
@@ -128,6 +168,7 @@ def test_catalog_payload_tenant_shaped_string_does_not_trigger_binding(monkeypat
         f'SELECT \'UPDATE {_SCHEMA_B}.roads\' FROM "{_SCHEMA_A}"."roads"',
         f'-- UPDATE "{_SCHEMA_B}"."roads"\nSELECT * FROM "{_SCHEMA_A}"."roads"',
         f'/* UPDATE "{_SCHEMA_B}"."roads" */ SELECT * FROM "{_SCHEMA_A}"."roads"',
+        f'SELECT \'FOR UPDATE\' FROM "{_SCHEMA_A}"."roads" -- FOR SHARE',
     ],
 )
 def test_update_in_literal_or_comment_remains_reader_only(monkeypatch, statement):

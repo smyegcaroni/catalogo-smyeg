@@ -4,6 +4,8 @@
   "rowCount_one": "{{count}} row",
   "rowCount_other": "{{count}} rows",
   "page": {
+    "showMapPreview": "Show map preview",
+    "hideMapPreview": "Hide map preview",
     "loading": "Loading dataset...",
     "errorTitle": "Dataset not found",
     "errorMessage": "The requested dataset could not be loaded.",
@@ -63,13 +65,17 @@
     "notOwner": "Only the dataset owner or an admin can edit this record."
   },
   "connect": {
+    "openInstructions": "Open connection instructions",
+    "instructionsTools": "QGIS, Python, and curl",
     "copyCogUrl": "Copy COG URL",
     "copyXyzTileUrl": "Copy XYZ Tile URL",
     "copyS3Uri": "Copy S3 URI",
     "copyCsvExportUrl": "Copy CSV Export URL",
     "copyOgcFeaturesUrl": "Copy OGC Features URL",
     "copyVectorTilesUrl": "Copy Vector Tiles URL",
-    "copied": "Copied: {{preview}}"
+    "copied": "Copied: {{preview}}",
+    "copyTilesetUrl": "Copy tileset URL",
+    "instructionsTileset": "CesiumJS"
   },
   "addToMap": {
     "button": "Add to Map",
@@ -229,7 +235,8 @@
     "actions": {
       "metadataEdit": "Metadata updated",
       "datasetDelete": "Dataset deleted",
-      "datasetCreate": "Dataset created"
+      "datasetCreate": "Dataset created",
+      "datasetTransferOwner": "Owner changed"
     }
   },
   "versionHistory": {
@@ -239,8 +246,29 @@
     "version": "Version {{number}}",
     "current": "Current",
     "unknownFile": "Unknown file",
+    "detailsUnrecorded": "Details of this version were not recorded.",
     "features": "{{count}} features",
-    "srid": "SRID {{value}}"
+    "srid": "SRID {{value}}",
+    "restore": "Restore",
+    "restoreBusyHint": "A refresh, replacement or restore is already in progress. See refresh history.",
+    "restoreSelectionHint": "Deselect the feature selected on the map to restore."
+  },
+  "restoreDialog": {
+    "title": "Restore version {{number}}?",
+    "description": "Version {{number}} becomes the current data again. The data it replaces is kept, so the restore can be undone until the next replacement.",
+    "consequenceEdits": "Feature edits made since version {{number}} are discarded.",
+    "consequenceMosaics": "Mosaics that use this dataset keep reading the current member until they are rebuilt.",
+    "confirmPrompt": "Type the dataset name to confirm:",
+    "restoring": "Restoring...",
+    "restore": "Restore version",
+    "failed": "Failed to restore version",
+    "queued": "Restore of version {{number}} queued. It appears in refresh history.",
+    "refusal": {
+      "dataset_busy": "Another refresh, replacement or restore is running for this dataset. Wait for it to finish, then try again.",
+      "previous_version_changed": "The kept previous version changed while this dialog was open. Close it and review the history again.",
+      "no_previous_version": "This dataset no longer has a previous version to restore.",
+      "restore_not_applicable": "This dataset has no feature table, so there is nothing to restore."
+    }
   },
   "deleteDialog": {
     "title": "Delete Dataset",
@@ -266,6 +294,7 @@
       "committing": "Committing re-upload...",
       "tracking": "The dataset is being updated in the background.",
       "complete": "The dataset has been updated successfully.",
+      "held": "This replacement was held for review.",
       "error": "Something went wrong during the re-upload."
     },
     "sourceSelector": {
@@ -283,6 +312,7 @@
       "connecting": "Connecting to service...",
       "layerStep": "Select a layer",
       "emptyState": "No layers were found for this service.",
+      "unsupportedLayerType": "{{type}} holds no features and cannot be re-uploaded from.",
       "previewLayer": "Preview Layer",
       "previewing": "Preparing re-upload preview...",
       "layerLabel": "Layer:",
@@ -314,6 +344,7 @@
     "uploadingMessage": "Uploading and analyzing file...",
     "file": "File:",
     "schemaChangeAdvisory": "Schema differs from previous version: {{added}} columns added, {{removed}} removed.",
+    "reviewReasonsLabel": "Changes that need review",
     "warningSchemaChanges": "Warning: This re-upload includes schema changes that may affect existing queries.",
     "confirmReupload": "Confirm Re-Upload",
     "committingMessage": "Committing re-upload...",
@@ -333,6 +364,10 @@
   },
   "quality": {
     "title": "Quality Score",
+    "assessedAt": "Quality assessed {{date}} ({{age}})",
+    "assessmentVsSource": "This date is for the quality assessment. See Source for when the dataset was updated and its source freshness.",
+    "scoreExplanation": "The overall score combines available quality dimensions. Percentages show each dimension’s share.",
+    "metadataExplanation": "Quality metadata completeness counts populated optional record fields (10 total). Metadata validation progress uses a separate check.",
     "metadataCompleteness": "Metadata Completeness",
     "geometryValidity": "Geometry Validity",
     "attributeCompleteness": "Attribute Completeness",
@@ -342,28 +377,30 @@
       "absolute": "Last checked {{date}}",
       "relative": "Checked {{relative}}",
       "cadence": "Expected {{cadence}} refresh cadence.",
-      "cadenceDaily": "Expected daily refresh cadence.",
-      "cadenceWeekly": "Expected weekly refresh cadence.",
-      "cadenceMonthly": "Expected monthly refresh cadence.",
-      "cadenceQuarterly": "Expected quarterly refresh cadence.",
-      "cadenceAnnually": "Expected annual refresh cadence.",
-      "cadenceUnknown": "Cadence is unknown; confirm the refresh schedule.",
+      "cadenceDaily": "Assessment recency uses the stated daily update cadence.",
+      "cadenceWeekly": "Assessment recency uses the stated weekly update cadence.",
+      "cadenceMonthly": "Assessment recency uses the stated monthly update cadence.",
+      "cadenceQuarterly": "Assessment recency uses the stated quarterly update cadence.",
+      "cadenceAnnually": "Assessment recency uses the stated annual update cadence.",
+      "cadenceUnknown": "No periodic cadence is set; assessment recency uses a 45-day reference.",
       "state": {
-        "fresh": "Fresh",
-        "stale": "Stale",
-        "missing": "Freshness missing"
+        "fresh": "Assessment recent",
+        "stale": "Assessment due",
+        "missing": "No assessment date"
       },
       "remediation": {
-        "fresh": "No immediate refresh action required.",
-        "stale": "Recompute quality metrics and verify recent source updates were ingested.",
-        "missing": "Run quality validation to generate a freshness timestamp."
+        "fresh": "No assessment action needed.",
+        "stale": "Recompute the quality assessment to check the current dataset.",
+        "missing": "Run quality validation to create an assessment date."
       },
       "notAvailable": "Not available",
-      "unknownAge": "Unknown age"
+      "unknownAge": "Unknown age",
+      "readOnlyGuidance": "Ask the dataset owner or a contact listed above to update the quality assessment."
     }
   },
   "serviceUrls": {
-    "authHelpSimple": "These endpoints accept an X-Api-Key or Authorization: Bearer header.",
+    "authHelpSimple": "Downloads, OGC Features and vector tile endpoints accept an X-Api-Key or Authorization: Bearer header.",
+    "vectorTilesKeyHint": "Vector tiles of a non-public dataset need an API key. In QGIS, add a Vector Tiles connection with the tile URL minus the api_key parameter, then under Authentication pick the API Header method with the header X-Api-Key. Clients that can't send headers can keep ?api_key=. Use a read-only key.",
     "manageApiKeys": "Manage API keys"
   },
   "schema": {
@@ -403,6 +440,10 @@
     "ariaLabel": "Dataset map",
     "featureSaved": "Feature saved",
     "featureSaveFailed": "Failed to save feature",
+    "featureSavedThenChanged": "This feature was already saved, and someone else has changed it since, so your latest edits were not applied. Save again to replace their changes with yours, or discard to keep theirs.",
+    "featureSavedThenRemoved": "The earlier save was removed. Save will create the feature again.",
+    "featureSavedThenReplaced": "This dataset's data was replaced after your earlier save, so your edits were not applied. Save will create the feature again.",
+    "featureDatasetReplaced": "This dataset's data was replaced after you started editing, so your change was not saved.",
     "featureUpdated": "Feature updated",
     "featureUpdateFailed": "Failed to update feature",
     "featureDeleted": "Feature deleted",
@@ -412,9 +453,13 @@
     "attributesUpdated": "Attributes updated",
     "attributesUpdateFailed": "Failed to update attributes",
     "unsavedDiscarded": "Unsaved changes discarded",
+    "sketchStillSaving": "The previous feature is still saving. Try again once it has saved.",
     "discardChangesTitle": "Discard unsaved map edits?",
     "discardChangesDescription": "Your geometry changes have not been saved. You can continue editing or discard them.",
+    "discardChangesAccessLostDescription": "You can no longer edit this dataset, so discarding removes these unsaved geometry changes from the map.",
     "discardChangesAction": "Discard changes",
+    "editAccessLostNotice": "You can no longer edit this dataset, so these map changes can't be saved.",
+    "editLostOnReloadNotice": "The map reloaded, and your unsaved change to this feature was lost.",
     "deleteFeatureTitle": "Delete Feature",
     "deleteFeatureDescription": "Delete this feature? This cannot be undone.",
     "multiPartNotEditable": "This feature has multiple parts and cannot be edited on the map.",
@@ -445,7 +490,8 @@
       "publisher": "Publisher",
       "distributor": "Distributor",
       "custodian": "Custodian"
-    }
+    },
+    "remove": "Remove contact {{name}}"
   },
   "keywords": {
     "title": "Keywords",
@@ -464,7 +510,8 @@
     "inheritedConfirmTitle": "Share inherited keywords?",
     "inheritedConfirmBody": "These keywords were copied from a source dataset the wider audience cannot open. Continue to share them, or cancel and remove them first.",
     "inheritedConfirmContinue": "Change visibility",
-    "inheritedGeneric": "This dataset carries keywords inherited from its source. Review the full keyword list before sharing."
+    "inheritedGeneric": "This dataset carries keywords inherited from its source. Review the full keyword list before sharing.",
+    "remove": "Remove keyword {{keyword}}"
   },
   "validation": {
     "title": "Validation Status",
@@ -478,6 +525,7 @@
     "helperWarnings": "{{warningCount}} warning(s) found. Review likely causes before publishing.",
     "likelyCompact": "Likely:",
     "troubleshootAction": "Troubleshoot",
+    "readOnlyGuidance": "Ask the dataset owner or a contact listed above to address these validation issues.",
     "health": {
       "title": "Dataset Health",
       "required": "Required {{count}}",
@@ -524,6 +572,24 @@
       "invalid": "Invalid {{field}}",
       "conflicting": "Conflicting {{field}}",
       "needsReview": "{{field}} needs review"
+    },
+    "fields": {
+      "title": "Title",
+      "summary": "Summary",
+      "license": "License",
+      "spatialExtent": "Spatial extent",
+      "lineageSummary": "Lineage summary",
+      "srid": "Coordinate reference system",
+      "contacts": "Contacts",
+      "keywords": "Keywords",
+      "geometry": "Geometry",
+      "attributeDescriptions": "Attribute descriptions",
+      "sourceUrl": "Source URL",
+      "sourceOrganization": "Source organization",
+      "qualityStatement": "Quality statement",
+      "updateFrequency": "Update frequency",
+      "temporalExtent": "Temporal extent",
+      "attribution": "Attribution"
     }
   },
   "attributeMetadata": {
@@ -540,12 +606,15 @@
     "editingDisabled": "Attribute editing is disabled for this deployment."
   },
   "distributions": {
-    "title": "Access Points",
+    "title": "Downloads and connections",
     "download": "Downloads",
     "api": "API Endpoints",
     "tiles": "Tile Services",
     "other": "Additional Access",
-    "noDistributions": "No distributions available.",
+    "noDistributions": "No additional downloads or services are listed here.",
+    "connectWithClient": "Connect with QGIS, Python, or curl",
+    "otherFormats": "Download another format",
+    "accessPermissions": "Who can access this dataset",
     "auto": "auto",
     "primary": "Primary",
     "copyUrl": "Copy URL",
@@ -582,7 +651,9 @@
     "noRecords": "No related records",
     "showingCount": "Showing {{shown}} of {{total}} records",
     "error": "Failed to load relationships",
-    "loadError": "Failed to load related records"
+    "loadError": "Failed to load related records",
+    "broken": "Broken",
+    "brokenMessage": "A join column no longer exists in its dataset. Delete or recreate this relationship."
   },
   "iso": {
     "lineage": "Lineage",
@@ -674,6 +745,9 @@
     "nodata": "Nodata",
     "ogcApiFeatures": "OGC API Features",
     "percentComplete": "{{percent}}% complete",
+    "validationProgress": "Validation checks clear: {{percent}}%",
+    "validationProgressHelp": "Estimate based on 12 baseline checks minus reported errors and warnings. The quality metadata score counts optional fields separately.",
+    "askMaintainer": "Ask the dataset owner or a contact listed below to fill in {{field}}",
     "rasterProperties": "Raster Properties",
     "recommendedCount_one": "{{count}} recommended",
     "recommendedCount_other": "{{count}} recommended",
@@ -731,7 +805,7 @@
       "table": "Registered table",
       "serviceType": "Service type",
       "layer": "Layer identifier",
-      "endpoint": "Safe source pointer",
+      "endpoint": "Source URL (credentials removed)",
       "collection": "STAC collection",
       "asset": "STAC asset",
       "item": "STAC item"
@@ -755,6 +829,7 @@
         "unknown": "Not compared"
       }
     },
+    "healthUnknownHint": "Checked when the source is refreshed.",
     "healthDetail": {
       "not_found": "The source resource was not found.",
       "item_withdrawn": "The STAC item was withdrawn.",
@@ -785,6 +860,10 @@
       "dialogDescription": "Re-pull this dataset's data from where it was originally imported. The dataset keeps serving its current data until the new data is ready.",
       "reviewDialogTitle": "Review and retry refresh",
       "reviewDialogDescription": "Fetch the source again and publish only if it matches the run you reviewed.",
+      "uploadReviewDialogTitle": "Publish the reviewed replacement",
+      "uploadReviewDialogDescription": "Publish the file this run held back, from the upload it kept. It is published only if its changes still match the ones listed for this run.",
+      "uploadConfirm": "Publish replacement",
+      "uploadToastAccepted": "Replacement started (run {{runId}}).",
       "tokenLabel": "Access token (optional)",
       "tokenPlaceholder": "Only needed for a protected source",
       "tokenHint": "Used for this refresh only; not stored with the dataset.",
@@ -844,6 +923,7 @@
         "empty": "No refresh runs yet.",
         "featureDelta": "{{before}} → {{after}} features",
         "triggeredBy": "Started by {{username}}",
+        "scheduledFor": "Scheduled for {{time}}",
         "mechanismLabel": "Method: {{mechanism}}",
         "mechanismTooltip": "How this run executed, not the dataset's origin",
         "status": {
@@ -852,7 +932,8 @@
           "succeeded": "Succeeded",
           "failed": "Failed",
           "cancelled": "Cancelled",
-          "blocked": "Needs review"
+          "blocked": "Needs review",
+          "accepted": "Accepted"
         },
         "sourceCountUnavailable": "Source count unavailable.",
         "identityUnavailable": "Record identities were not compared.",
@@ -863,12 +944,145 @@
         "permalink": "Link",
         "reason": {
           "source_count_unavailable": "GeoLens could not compare the fetched row count with the source, so publication requires review.",
-          "empty_result": "The refresh would replace a non-empty dataset with an empty result.",
-          "destructive_schema_change": "The refresh removes columns or changes their types."
+          "empty_result": "The new data would replace a non-empty dataset with an empty one.",
+          "destructive_schema_change": "The new data removes columns or changes their types.",
+          "geometry_type_changed": "The new data changes the geometry type.",
+          "srid_changed": "The new data changes the coordinate system.",
+          "coordinate_dimension_reduced": "The new data drops coordinate dimensions such as elevation.",
+          "arcgis_id_coverage_unavailable": "GeoLens could not verify ArcGIS object ID coverage.",
+          "arcgis_source_membership_changed": "The ArcGIS source changed while this refresh was running.",
+          "live_data_changed": "Features were edited while this replacement ran. Publishing it would discard those edits."
         },
         "reviewAndRetry": "Review and retry",
+        "acceptedReasonsLabel": "Review reasons that were accepted:",
         "loadMore": "Load older runs"
       }
+    },
+    "sync": {
+      "title": "Scheduled sync",
+      "description": "Keep this ArcGIS source current on a UTC schedule.",
+      "loading": "Loading scheduled sync",
+      "unavailable": "Scheduled sync is available when the Enterprise scheduling capability is active.",
+      "unsupportedSource": "This source cannot be scheduled. ArcGIS FeatureServer layers with an integer layer identifier are supported.",
+      "reader": "You can view this dataset’s source. An owner or administrator can configure scheduled sync.",
+      "notConfigured": "No schedule is configured. Create a draft, run verification, then explicitly enable it.",
+      "setup": "Set up schedule",
+      "setupTitle": "Set up scheduled sync",
+      "editTitle": "Edit scheduled sync",
+      "dialogDescription": "The source binding stays fixed. Times use UTC.",
+      "replacementWarningTitle": "Scheduled refresh replaces local data",
+      "replacementWarning": "Each scheduled refresh replaces the dataset’s local copy. Local changes may be overwritten.",
+      "createDraft": "Create draft",
+      "save": "Save schedule",
+      "edit": "Edit",
+      "runNow": "Run verification",
+      "pause": "Pause",
+      "enable": "Enable schedule",
+      "detach": "Detach",
+      "detachTitle": "Detach scheduled sync?",
+      "detachDescription": "Future unclaimed scheduled work will be cancelled. Runs already claimed continue and remain in history.",
+      "enableTitle": "Enable scheduled sync?",
+      "enableDescription": "Each scheduled refresh replaces the dataset’s local copy. Local changes may be overwritten. Enable only if this is expected.",
+      "runAccepted": "Verification run queued.",
+      "paused": "Scheduled sync paused.",
+      "enabled": "Scheduled sync enabled.",
+      "detached": "Scheduled sync detached.",
+      "cadenceLabel": "Schedule",
+      "nextDue": "Next due",
+      "credential": "Credential",
+      "publicSource": "Public source",
+      "lastRun": "Last sync run",
+      "noRuns": "No scheduled runs yet",
+      "verificationRun": "Verification run",
+      "occurrenceState": {
+        "planned": "Queued",
+        "admitted": "Admitted",
+        "delivered": "Delivered",
+        "claimed": "Running",
+        "completed": "Completed",
+        "failed": "Failed",
+        "cancelled": "Cancelled",
+        "expired": "Expired"
+      },
+      "status": {
+        "draft": "Draft",
+        "enabled": "Enabled",
+        "paused": "Paused"
+      },
+      "cadence": {
+        "hourly": "Hourly",
+        "daily": "Daily",
+        "weekly": "Weekly",
+        "hourlyAt": "Hourly at {{time}}",
+        "dailyAt": "Daily at {{time}}",
+        "weeklyAt": "{{weekday}} at {{time}}"
+      },
+      "weekday": {
+        "0": "Monday",
+        "1": "Tuesday",
+        "2": "Wednesday",
+        "3": "Thursday",
+        "4": "Friday",
+        "5": "Saturday",
+        "6": "Sunday"
+      },
+      "form": {
+        "cadence": "Cadence",
+        "weekday": "Weekday",
+        "hour": "Hour",
+        "minute": "Minute",
+        "utc": "All schedule times are UTC.",
+        "credential": "Credential",
+        "publicSource": "No credential (public source)",
+        "newCredential": "Store a new credential",
+        "credentialName": "Credential name",
+        "token": "ArcGIS token",
+        "tokenHint": "The token is sent once and never shown or stored in this browser.",
+        "replaceToken": "Replace stored token",
+        "cancelReplace": "Keep current token",
+        "credentialRequired": "Enter a credential name and token.",
+        "tokenRequired": "Enter a token.",
+        "invalidTime": "Enter a valid UTC time."
+      },
+      "eligibility": {
+        "qualifying_run_required": "Run verification successfully before enabling this schedule.",
+        "verification_policy_changed": "The verification policy changed. Run verification again before enabling this schedule.",
+        "source_or_credential_changed": "The source or credential changed. Run verification again before enabling this schedule."
+      },
+      "pauseReason": {
+        "qualification_required": "A qualifying verification run is required.",
+        "review_required": "Review the latest refresh before enabling this schedule.",
+        "transient_failures": "The schedule paused after repeated transient failures.",
+        "credential_invalid": "The stored credential is no longer valid.",
+        "authorization_changed": "Source authorization changed.",
+        "source_changed": "The source binding changed and needs verification.",
+        "source_or_credential_changed": "The source or credential changed and needs verification.",
+        "database_restored": "The schedule was paused after a database restore.",
+        "restored": "The schedule was restored in a paused state.",
+        "manual": "The schedule was paused manually."
+      },
+      "errors": {
+        "loadFailed": "Scheduled sync could not be loaded.",
+        "credentialsUnavailable": "Stored credentials could not be loaded. You can still schedule a public source or store a new credential.",
+        "saveFailed": "Scheduled sync could not be saved.",
+        "revisionConflict": "This schedule changed on the server. Review the latest details and try again.",
+        "notEligible": "This source is not eligible for a verification run.",
+        "runFailed": "Verification run could not be started.",
+        "qualificationRequired": "Run verification successfully before enabling this schedule.",
+        "statusFailed": "Schedule status could not be changed.",
+        "detachFailed": "Scheduled sync could not be detached.",
+        "occurrenceError": {
+          "admissionMetadataError": "The schedule could not be admitted because its source metadata changed. Review the source and try again.",
+          "admissionInvalid": "The schedule could not be admitted. Review the source and schedule settings, then try again.",
+          "admissionFailed": "The schedule could not be admitted. Try again or review the source settings.",
+          "sourceChanged": "The source changed. Review the source and run verification before enabling the schedule.",
+          "localEditsChanged": "Local edits changed the dataset. Review and resolve local changes before the next run.",
+          "credentialExpired": "The stored credential expired. Update it and run verification again.",
+          "failed": "This scheduled run did not complete. Review the schedule and try again.",
+          "expired": "This scheduled run expired before it could start. It will be retried at the next scheduled time."
+        }
+      },
+      "verificationHelp": "Verification checks that every source ID was fetched and that the ID set stayed the same. Source attributes may still change during the refresh."
     },
     "vrt": {
       "title": "VRT members",
@@ -1025,5 +1239,41 @@
     "description": "You have unsaved changes. Are you sure you want to leave? Your changes will be lost.",
     "stay": "Stay",
     "leave": "Leave"
+  },
+  "pointcloud": {
+    "title": "COPC point cloud",
+    "pointCount": "Points",
+    "crs": "Horizontal CRS",
+    "size": "File size",
+    "pointFormat": "Point format",
+    "bounds": "Geographic bounds",
+    "elevationRange": "Elevation range",
+    "verticalCrs": "Vertical CRS",
+    "accessTitle": "Open in a point cloud client",
+    "urlLabel": "COPC URL",
+    "copyUrl": "Copy COPC URL",
+    "privateHint": "This point cloud needs a read-only API key. Use X-Api-Key in clients that support headers. The examples contain a placeholder, never your key.",
+    "clientLabel": "Point cloud client",
+    "potreeHint": "Potree cannot send an X-Api-Key header for COPC. Replace the placeholder in its URL with your read-only key; treat the resulting URL as a secret.",
+    "copySnippet": "Copy client snippet",
+    "qgisSteps": "QGIS {{version}} → Layer > Add Layer > Add Point Cloud Layer\nSource type: Protocol: HTTP(S), cloud, etc.\nURL: {{url}}",
+    "qgisAuthentication": "Authentication: API Header → X-Api-Key: YOUR_API_KEY",
+    "qgisPrivateVersionHint": "QGIS 4.0 or later is required to use API Header authentication with a point cloud layer.",
+    "instructions": "QGIS, Potree, and copc.js"
+  },
+  "tileset": {
+    "title": "3D Tiles tileset",
+    "version": "Version",
+    "geometricError": "Geometric error",
+    "boundingVolume": "Bounding volume",
+    "size": "Unpacked size",
+    "extent": "Extent",
+    "noExtent": "No extent recorded for this tileset.",
+    "contentTypes": "Content types",
+    "extensionsRequired": "Required extensions",
+    "accessTitle": "Load in a 3D Tiles client",
+    "urlLabel": "Tileset URL",
+    "headerHint": "Internal, restricted and private tilesets all need an API key in the X-Api-Key header. Use a read-only key, since CesiumJS sends it with every request it makes while loading the tileset.",
+    "copySnippet": "Copy CesiumJS snippet"
   }
 }

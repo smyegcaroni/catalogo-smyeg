@@ -3,6 +3,13 @@ import userEvent from '@testing-library/user-event';
 import { JobProgress } from '../JobProgress';
 import { ApiError } from '@/api/client';
 
+const permissions = vi.hoisted(() => ({ editMetadata: false }));
+vi.mock('@/hooks/use-permissions', () => ({
+  usePermissions: () => ({ can: (capability: string) => capability === 'edit_metadata' && permissions.editMetadata }),
+}));
+
+afterEach(() => { permissions.editMetadata = false; });
+
 const { mockUseJobStatus, mockRetry, mockCancel } = vi.hoisted(() => ({
   mockUseJobStatus: vi.fn(),
   mockRetry: vi.fn(),
@@ -73,6 +80,32 @@ function cancelledJob(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+it.each([true, false])('gates the raster map handoff on effective permission: %s', (granted) => {
+  permissions.editMetadata = granted;
+  mockUseJobStatus.mockReturnValue({ data: failedJob({ status: 'complete', dataset_id: 'ds-1', error_message: null }), isLoading: false });
+  render(<JobProgress jobId="job-1" onReset={vi.fn()} isRasterEntry />);
+  expect(screen.getByRole('link', { name: 'View Dataset' })).toHaveAttribute('href', '/datasets/ds-1');
+  if (granted) expect(screen.getByRole('link', { name: 'Add to Map' })).toBeInTheDocument();
+  else expect(screen.queryByRole('link', { name: 'Add to Map' })).not.toBeInTheDocument();
+});
+
+describe('JobProgress source label', () => {
+  beforeEach(() => mockUseJobStatus.mockReset());
+
+  it('shows a virtual raster job by its label, not its type token', () => {
+    mockUseJobStatus.mockReturnValue({ data: runningJob({ source_filename: 'vrt_mosaic' }), isLoading: false });
+    render(<JobProgress jobId="job-1" onReset={vi.fn()} />);
+    expect(screen.getByText('Virtual raster (mosaic)')).toBeInTheDocument();
+    expect(screen.queryByText('vrt_mosaic')).not.toBeInTheDocument();
+  });
+
+  it('keeps an uploaded filename as it is', () => {
+    mockUseJobStatus.mockReturnValue({ data: runningJob({ source_filename: 'roads.geojson' }), isLoading: false });
+    render(<JobProgress jobId="job-1" onReset={vi.fn()} />);
+    expect(screen.getByText('roads.geojson')).toBeInTheDocument();
+  });
+});
 
 describe('JobProgress retry capability', () => {
   beforeEach(() => {
@@ -180,6 +213,21 @@ describe('JobProgress cancelled state', () => {
     await user.click(screen.getByRole('button', { name: 'Start Over' }));
 
     expect(onReset).toHaveBeenCalledTimes(1);
+  });
+
+  // The stale sweep settles an upload nobody ever committed as `cancelled`,
+  // not `failed`, with error_code: 'upload_abandoned' -- the generic
+  // "cancelled" line above hid that from the abandoned-upload case too.
+  it('shows the fixed reason for a cancelled job that carries a code', () => {
+    mockUseJobStatus.mockReturnValue({
+      data: cancelledJob({ error_code: 'upload_abandoned' }),
+      isLoading: false,
+    });
+
+    render(<JobProgress jobId="job-1" onReset={vi.fn()} />);
+
+    expect(screen.getByText('Abandoned: upload was never completed')).toBeInTheDocument();
+    expect(screen.queryByText('This job was cancelled.')).not.toBeInTheDocument();
   });
 });
 

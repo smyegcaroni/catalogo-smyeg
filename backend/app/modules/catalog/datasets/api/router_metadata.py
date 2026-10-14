@@ -7,16 +7,18 @@ from fastapi import (
     Depends,
     HTTPException,
     Query,
+    Request,
     Response,
     status,
 )
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.audit.service import AuditEvent, audit_emit
 from app.core.identity import Identity
-from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
+from app.core.record_types import capabilities
 from app.modules.auth.dependencies import (
     get_current_active_user,
     get_optional_user,
@@ -101,6 +103,7 @@ async def get_dataset_versions_endpoint(
                 file_hash=v.file_hash if can_view_provenance else None,
                 uploaded_by=v.uploaded_by if can_view_provenance else None,
                 uploaded_at=v.uploaded_at,
+                restored_from_version=v.restored_from_version,
             )
             for v in versions
         ],
@@ -324,7 +327,7 @@ async def get_column_values(
     # fix(#315): raster/VRT datasets have a synthetic table_name with no
     # backing data.<table>, so a column query would raise
     # UndefinedTableError -> 500. Return a fast 404 first instead.
-    if dataset.record.record_type in RASTER_FAMILY_RECORD_TYPES:
+    if not capabilities(dataset.record.record_type).feature_table:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=(
@@ -444,7 +447,10 @@ async def create_dataset_relationship(
     current_user: Identity = Depends(require_permission("edit_metadata")),
 ) -> DatasetRelationshipResponse:
     """Create a new FK relationship. Editor+ required."""
-    from app.modules.catalog.datasets.domain.service import create_relationship
+    from app.modules.catalog.datasets.domain.service import (
+        create_relationship,
+        validate_relationship_columns,
+    )
 
     # Resolve dataset_id to record_id (FK references catalog.records.id)
     dataset = await get_dataset(db, dataset_id)
@@ -480,6 +486,12 @@ async def create_dataset_relationship(
     # Normalize the target to its record_id (the FK column references
     # catalog.records.id) regardless of which id form the client supplied.
     body = body.model_copy(update={"target_dataset_id": target_dataset.record_id})
+    try:
+        validate_relationship_columns(dataset, target_dataset, body)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        )
     rel = await create_relationship(db, dataset.record_id, body)
     await db.commit()
     # fix(#315): FK columns store catalog.records.id, but the response
@@ -545,6 +557,7 @@ async def get_feature_related_records(
     dataset_id: uuid.UUID,
     gid: int,
     relationship_id: uuid.UUID,
+    request: Request,
     limit: int = Query(50, ge=1, le=500),
     after: int = Query(0, ge=0),
     user: Identity | None = Depends(get_optional_user),
@@ -575,6 +588,27 @@ async def get_feature_related_records(
         )
     await check_dataset_access_or_anonymous(db, target_dataset, target_dataset.id, user)
 
+    async def may_repair(candidate_id: uuid.UUID) -> bool:
+        # A read-only API key must not reach a catalog write through its owner.
+        if (
+            user is None
+            or request.headers.get("X-Api-Key")
+            or request.query_params.get("api_key")
+        ):
+            return False
+        # The refresh path rolled the session back, which expired the caller.
+        user_state = sa_inspect(user, raiseerr=False)
+        if user_state is not None and user_state.session is db.sync_session:
+            await db.refresh(user)
+        candidate = await get_dataset(db, candidate_id)
+        if candidate is None:
+            return False
+        try:
+            await check_dataset_write_access(db, candidate, candidate_id, user)
+        except HTTPException:
+            return False
+        return True
+
     try:
         result = await get_related_records(
             db,
@@ -584,6 +618,7 @@ async def get_feature_related_records(
             source_record_id=dataset.record_id,
             limit=limit,
             after=after,
+            may_repair=may_repair,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))

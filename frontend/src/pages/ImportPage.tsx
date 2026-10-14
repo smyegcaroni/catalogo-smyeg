@@ -1,7 +1,10 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router';
+import { releaseTerminalImportSession } from '@/components/import/start-again';
 import { useTranslation } from 'react-i18next';
 import { Upload, Link, Database, Globe, Satellite } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
+import { LoadingState } from '@/components/layout/LoadingState';
 import { PageShell } from '@/components/layout/PageShell';
 import { AppErrorBoundary } from '@/components/error';
 import { UploadForm } from '@/components/import/UploadForm';
@@ -12,7 +15,7 @@ import { StacImportForm } from '@/components/import/StacImportForm';
 import { WorkflowRail } from '@/components/import/WorkflowRail';
 import { useDocumentTitle } from '@/hooks/use-document-title';
 import { cn } from '@/lib/utils';
-import type { BatchPhase } from '@/types/api';
+import type { BatchPhase, DataKind } from '@/types/api';
 
 type Tab = 'upload' | 'url' | 'register' | 'service' | 'stac';
 
@@ -27,8 +30,38 @@ const MODE_TABS: { value: Tab; icon: typeof Upload; labelKey: string }[] = [
 
 export function ImportPage() {
   const { t } = useTranslation('import');
-  const [activeTab, setActiveTab] = useState<Tab>('upload');
+  // A "Start again" link from Admin Jobs opens the URL or service tab with its URL.
+  const [searchParams] = useSearchParams();
+  const tabParam = searchParams.get('tab');
+  const restartTab = tabParam === 'url' || tabParam === 'service' ? tabParam : null;
+  // null while a retained import session's job is being looked up.
+  const [prefillUrl, setPrefillUrl] = useState<string | null>(restartTab ? null : '');
+  const requestedUrl = searchParams.get('url') ?? '';
+  useEffect(() => {
+    if (!restartTab) return;
+    let cancelled = false;
+    // An active import keeps the form; the link's URL is dropped.
+    void releaseTerminalImportSession(restartTab).then((released) => {
+      if (!cancelled) setPrefillUrl(released ? requestedUrl : '');
+    });
+    return () => {
+      cancelled = true;
+    };
+    // Decided once per arrival; later URL edits in the address bar don't redo it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const [activeTab, setActiveTab] = useState<Tab>(
+    tabParam === 'url' || tabParam === 'service' ? tabParam : 'upload',
+  );
   const [uploadPhase, setUploadPhase] = useState<BatchPhase>('idle');
+  const [uploadOutcome, setUploadOutcome] = useState<{ state: 'complete' | 'partial' | null; kinds: DataKind[] }>({ state: null, kinds: [] });
+  const handlePhaseChange = useCallback((phase: BatchPhase) => {
+    setUploadPhase(phase);
+    if (phase !== 'tracking') setUploadOutcome({ state: null, kinds: [] });
+  }, []);
+  const handleOutcomeChange = useCallback((state: 'complete' | 'partial' | null, kinds: DataKind[]) => {
+    setUploadOutcome({ state, kinds });
+  }, []);
   useDocumentTitle(t('common:pageTitle.import'));
 
   return (
@@ -51,7 +84,13 @@ export function ImportPage() {
             <button
               key={value}
               type="button"
-              onClick={() => setActiveTab(value)}
+              onClick={() => {
+                setActiveTab(value);
+                if (value !== 'upload') {
+                  setUploadPhase('idle');
+                  setUploadOutcome({ state: null, kinds: [] });
+                }
+              }}
               aria-current={activeTab === value ? 'page' : undefined}
               className={cn(
                 'inline-flex items-center gap-2 border-b-2 px-4 pb-3 pt-3 text-sm font-medium transition-colors',
@@ -76,17 +115,23 @@ export function ImportPage() {
       {/* Two-column layout */}
       <div className="grid grid-cols-1 gap-6 pb-12 xl:grid-cols-[1fr_320px]">
         <div className="min-w-0">
+          {prefillUrl === null ? (
+            <LoadingState />
+          ) : (
           <AppErrorBoundary>
-            {activeTab === 'upload' && <UploadForm onPhaseChange={setUploadPhase} />}
-            {activeTab === 'url' && <UrlImportForm />}
+            {activeTab === 'upload' && <UploadForm onPhaseChange={handlePhaseChange} onOutcomeChange={handleOutcomeChange} />}
+            {activeTab === 'url' && <UrlImportForm initialUrl={tabParam === 'url' ? prefillUrl : ''} />}
             {activeTab === 'register' && <RegisterForm />}
-            {activeTab === 'service' && <ServiceUrlForm />}
+            {activeTab === 'service' && <ServiceUrlForm initialUrl={tabParam === 'service' ? prefillUrl : ''} />}
             {activeTab === 'stac' && <StacImportForm />}
           </AppErrorBoundary>
+          )}
         </div>
         <WorkflowRail
           mode={activeTab}
           phase={activeTab === 'upload' ? uploadPhase : 'idle'}
+          outcome={activeTab === 'upload' ? uploadOutcome.state : null}
+          completedKinds={uploadOutcome.kinds}
         />
       </div>
     </PageShell>

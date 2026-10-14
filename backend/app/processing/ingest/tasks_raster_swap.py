@@ -1,25 +1,18 @@
-"""Catalog writes that publish a replaced raster, and the work that follows.
+"""Catalog writes that publish a replaced raster.
 
-fix(#1290): a pure extraction from ``tasks_raster_replace`` (crossed the
-1000-line ratchet threshold) — every function moved verbatim. The seam
-matches the task's own shape: ``tasks_raster_replace`` holds the pipeline
-(claim, validate, convert, verify, terminal cleanup deciding what the
-uploaded bytes were worth); this module holds what happens once those
-bytes are a COG worth publishing — the field swap, the asset-row upsert,
-the superseded-object reap, and the post-commit follow-ups. One produces
-an artifact; the other makes the catalog point at it.
+The raster strategy in ``tasks_raster_replace`` converts the upload and puts
+the new objects; this module makes the catalog point at them: the field swap,
+the kept original, the quota reservation and the asset-row upserts.
 """
 
 import uuid
 from datetime import datetime, timezone
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func
 
-from app.platform.cache.tiles import invalidate_catalog_cache
 from app.platform.dataset_origin import set_dataset_origin
 from app.platform.storage.titiler_url import resolve_current_storage_key
-from app.processing.ingest.tasks_raster_common import _cleanup_orphaned_storage_keys
 
 logger = structlog.get_logger(__name__)
 
@@ -66,7 +59,7 @@ def _write_swapped_fields(
     raster_asset.storage_backend = "local"
     raster_asset.driver = cog_meta.get("driver")
     raster_asset.ingested_at = datetime.now(timezone.utc)
-    raster_asset.crs_wkt = cog_meta.get("crs_wkt")
+    raster_asset.set_crs(cog_meta)
     raster_asset.epsg = cog_meta.get("epsg")
     raster_asset.band_count = cog_meta.get("band_count")
     raster_asset.dtype = cog_meta.get("dtype")
@@ -393,39 +386,26 @@ async def reserve_replacement_bytes(
     new_size: int,
     archived_bytes: int = 0,
     archived_asset_key: str | None = None,
-) -> None:
-    """Reserve the replacement's NET byte increase under the owner's quota lock.
+    credit_superseded: bool = True,
+) -> int:
+    """Reserve the replacement's net byte increase under the owner's quota lock.
 
-    fix(#1290): the swap rewrites the quota-counted
-    ``dataset_assets.data.size_bytes`` with no reservation at all — only
-    first ingest took the lock. So a small source expanding into a large
-    COG, or two replaces of DIFFERENT datasets owned by one user running
-    concurrently, both committed past ``MAX_STORAGE_BYTES_PER_USER``. (Two
-    replaces of the SAME dataset can't race: the one-active-run index
-    refuses the second at the door.)
-
-    Net, not absolute, composing with the existing primitive rather than
-    forking a second lock discipline: ``reserve_storage_bytes`` adds its
-    argument to a LIVE recount, and at this point the recount still
-    includes the row this swap is about to overwrite, so the delta asks
-    exactly "will the post-swap total fit". Must run BEFORE
-    ``_upsert_managed_asset_rows`` — after it, the recount already holds
-    the new value and the delta would be counted twice.
+    Returns the bytes the superseded ``data`` row counts. ``reserve_storage_bytes``
+    adds its argument to a live recount that still includes that row, so
+    crediting it asks whether the post-swap total fits. This must run before
+    ``_upsert_managed_asset_rows``, or the new size would count twice. With
+    ``credit_superseded`` False the superseded bytes stay charged, for a COG
+    that is kept after the swap.
 
     The credit comes from the ``dataset_assets`` row rather than the
-    ``RasterAsset``, because that row is what the quota sums: a
-    STAC-imported dataset has an asset carrying bytes and no counted row,
-    and crediting bytes the quota never counted would admit an overshoot.
-
-    A shrinking replacement reserves nothing and needs no special case —
-    usage is a live sum, so it self-corrects the moment the smaller row
-    commits.
+    ``RasterAsset``, because that row is what the quota sums: a STAC-imported
+    dataset has an asset carrying bytes and no counted row. A credited
+    replacement that shrinks reserves nothing, since usage is a live sum.
 
     ``owner_id`` is None for an ownerless dataset and handed to
-    ``reserve_storage_bytes`` unexamined, so this seam and the
-    request-time door reach the same answer through the same code. The
-    shared policy, and why it's an exemption rather than a bug, is stated
-    once in ``app.modules.quota.service``'s module docstring (#1293).
+    ``reserve_storage_bytes`` unexamined, so this seam and the request-time
+    door reach the same answer. ``app.modules.quota.service`` states the
+    shared policy.
     """
     from sqlalchemy import text
 
@@ -463,10 +443,12 @@ async def reserve_replacement_bytes(
             )
             or 0
         )
-    delta = (new_size - int(counted_data or 0)) + (archived_bytes - existing_archive)
-    if delta <= 0:
-        return
-    await reserve_storage_bytes(session, owner_id, delta)
+    counted_data = int(counted_data or 0)
+    credit = counted_data if credit_superseded else 0
+    delta = (new_size - credit) + (archived_bytes - existing_archive)
+    if delta > 0:
+        await reserve_storage_bytes(session, owner_id, delta)
+    return counted_data
 
 
 async def _upsert_managed_asset_rows(
@@ -545,105 +527,6 @@ async def _upsert_managed_asset_rows(
     )
 
 
-async def _run_post_swap_followups(
-    *,
-    dataset_uuid: uuid.UUID,
-    dataset_cls: type,
-    prior_physical_keys: list[str],
-    written_storage_keys: list[str],
-    job_id: str,
-) -> None:
-    """Work that happens once the replacement is durably published.
-
-    Extracted (fix(#1290)) so the caller can fence the whole of it in one
-    place — every statement here is optional, none may be confused with a
-    failed replace.
-
-    Reaping the superseded objects is safe only now: up to the commit every
-    exit left the previous COG both pointed at and present, past it the
-    pointer is durably elsewhere so those objects have no reader left. The
-    ``not in written`` filter makes re-uploading the identical file a no-op
-    rather than a self-inflicted delete.
-
-    "No reader left" is true of the DATABASE. An API process that served a
-    tile in the last minute may still hold this dataset in the tile
-    router's ``_resolve_raster_meta`` cache, whose entries carry the OLD
-    asset_uri. fix(#1329): that cache is keyed on the request's ``v``, so
-    the ``tile_cache_version`` bump this swap already made in the write
-    transaction IS the invalidation — the first request carrying the new
-    version misses in every API process and reads the new pointer, no
-    separate coordination channel needed (``regenerate_vrt`` and the STAC
-    moved-asset refresh bump the same counter). What's left is requests
-    still carrying the OLD ``v`` (a tab that hasn't refetched its tile
-    URL): those keep the pre-swap asset_uri until the entry expires
-    (``_RASTER_META_CACHE_TTL``, 60s), a bounded self-healing window. The
-    bumped ``tile_cache_version`` also changes the tile URL, so browser and
-    CDN caches roll over immediately.
-    """
-    from app.core.db import async_session
-    from sqlalchemy.orm import joinedload
-
-    await invalidate_catalog_cache()
-    await _cleanup_orphaned_storage_keys(
-        [key for key in prior_physical_keys if key not in written_storage_keys],
-        job_id=job_id,
-    )
-    async with async_session() as embed_session:
-        embed_dataset = (
-            await embed_session.execute(
-                select(dataset_cls)
-                .options(joinedload(dataset_cls.record))
-                .where(dataset_cls.id == dataset_uuid)
-            )
-        ).scalar_one_or_none()
-        if embed_dataset is not None:
-            from app.processing.embeddings.helpers import defer_embedding
-
-            await defer_embedding(embed_dataset)
-
-
-async def run_post_swap_followups_best_effort(
-    *,
-    dataset_uuid: uuid.UUID,
-    dataset_cls: type,
-    prior_physical_keys: list[str],
-    written_storage_keys: list[str],
-    job_id: str,
-    dataset_id: str,
-) -> None:
-    """``_run_post_swap_followups`` with the caller's fence built in.
-
-    fix(#1778): the replace tail reaches this from two places — the
-    ordinary success path and the stand-down a lost commit acknowledgement
-    takes — and both need the identical rule: the swap is durable, so a
-    cache purge that can't reach Valkey, a reap that can't reach storage,
-    or an embedding defer against a busy queue are things to log and move
-    on from, never reasons to fail a job whose outcome is already
-    committed and reported as succeeded. One home for that rule rather
-    than two copies of the try/except, so the two paths can't drift.
-
-    The reap inside is what makes this worth running on the stand-down
-    path at all: it's the ONLY deletion of the superseded COG and
-    quicklooks, and the committed pointer already names the new keys, so
-    skipping it strands objects no row references and no quota counts.
-    """
-    try:
-        await _run_post_swap_followups(
-            dataset_uuid=dataset_uuid,
-            dataset_cls=dataset_cls,
-            prior_physical_keys=prior_physical_keys,
-            written_storage_keys=written_storage_keys,
-            job_id=job_id,
-        )
-    except Exception:  # broad: nothing after the commit may fail the job
-        structlog.get_logger().warning(
-            "raster_replace_post_swap_followup_failed",
-            job_id=job_id,
-            dataset_id=dataset_id,
-            exc_info=True,
-        )
-
-
 def _prior_asset_keys_to_reap(
     *,
     asset_uri: str | None,
@@ -652,16 +535,12 @@ def _prior_asset_keys_to_reap(
 ) -> list[str]:
     """Resolve the superseded objects, in the same physical form as the puts.
 
-    Mirrors ``tasks_vrt._prior_generation_storage_keys_to_reap``: catalog rows
-    hold logical keys and storage holds tenant-prefixed ones, so the two lists
-    the caller compares must both be physical or a same-key replace would reap
-    the object it just wrote.
+    Catalog rows hold logical keys and storage holds tenant-prefixed ones, so
+    the two lists the caller compares must both be physical or a same-key
+    replace would reap the object it just wrote.
     """
     return [
         resolve_current_storage_key(key)
         for key in (asset_uri, quicklook_256_uri, quicklook_512_uri)
         if key
     ]
-
-
-# No legacy alias: the sibling tasks carry `app.ingest.tasks.*` aliases because

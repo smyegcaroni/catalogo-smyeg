@@ -9,6 +9,8 @@ them, and both the catalog and the ingest router reach the VRT admission here.
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import Any
 
@@ -19,10 +21,13 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from app.core.db.sqlstate import is_lock_conflict, sqlstate
 
-# The budget a REQUEST spends waiting for the pair. A worker passes
-# ``lock_timeout=None``: ``SET LOCAL`` applies for the rest of the transaction,
+# The budget a REQUEST spends waiting for the pair. A worker passes its own
+# (``WORKER_LOCK_TIMEOUT``, or None): ``SET LOCAL`` lasts the whole transaction,
 # and this budget would fail an ingest on contention it must wait out.
 REQUEST_LOCK_TIMEOUT = "2s"
+
+# Long enough to wait out contention, bounded so a stuck holder fails the job.
+WORKER_LOCK_TIMEOUT = "60s"
 
 # Resolved at call time, not bound as a default, so the constant above stays
 # the single source of truth.
@@ -83,8 +88,11 @@ class CatalogLockConflict(Exception):
     """Another transaction holds the catalog rows this one needs.
 
     One handler (``app/api/main.py``) answers 409 for it, wherever the
-    acquisition was reached from. A worker lets it propagate and fails its job.
+    acquisition was reached from. A worker lets it propagate and fails its job
+    with ``error_code``.
     """
+
+    error_code = CATALOG_LOCK_CONFLICT_CODE
 
 
 async def lock_catalog_rows(
@@ -141,6 +149,33 @@ async def lock_catalog_rows(
         await _raise_rolled_back_conflict(session, exc)
 
 
+async def lock_request_key(
+    session: AsyncSession,
+    *,
+    scope: str,
+    lock_timeout: str | None = _USE_REQUEST_DEFAULT,
+) -> None:
+    """Serialise transactions on one named key until this one ends.
+
+    A transaction-scoped advisory lock on the hash of ``scope``. Take it before
+    any data-table or catalog lock, so waiting here holds neither and cannot be
+    one side of a cycle. Same timeout and exception contract as
+    :func:`lock_catalog_rows`; two scopes that hash alike only wait on each
+    other needlessly.
+    """
+    await _install_lock_timeout(session, lock_timeout)
+    try:
+        with session.no_autoflush:
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:scope, 0))"),
+                {"scope": scope},
+            )
+    except DBAPIError as exc:
+        if not is_lock_conflict(exc):
+            raise
+        await _raise_rolled_back_conflict(session, exc)
+
+
 async def lock_ingest_jobs(
     session: AsyncSession,
     *,
@@ -165,6 +200,36 @@ async def lock_ingest_jobs(
         if not is_lock_conflict(exc):
             raise
         await _raise_rolled_back_conflict(session, exc)
+
+
+@asynccontextmanager
+async def worker_lock_budget(session: AsyncSession) -> AsyncIterator[None]:
+    """Wait at most ``WORKER_LOCK_TIMEOUT`` for each row lock taken in the block.
+
+    The transaction's previous budget is restored when the block ends, so a
+    later wait keeps it. A wait in the block that fails rolls back and raises
+    ``CatalogLockConflict``.
+    """
+    # A flush here would run a pending write ahead of the budget and of the
+    # caller's lock order.
+    with session.no_autoflush:
+        previous = await session.scalar(text("SELECT current_setting('lock_timeout')"))
+        await _set_lock_timeout(session, WORKER_LOCK_TIMEOUT)
+    try:
+        yield
+    except DBAPIError as exc:
+        if not is_lock_conflict(exc):
+            raise
+        await _raise_rolled_back_conflict(session, exc)
+    with session.no_autoflush:
+        await _set_lock_timeout(session, previous)
+
+
+async def _set_lock_timeout(session: AsyncSession, value: str) -> None:
+    # `set_config(..., true)` is `SET LOCAL` taking a bind parameter.
+    await session.execute(
+        text("SELECT set_config('lock_timeout', :value, true)"), {"value": value}
+    )
 
 
 async def _install_lock_timeout(
@@ -278,6 +343,34 @@ async def bump_tile_cache_version_on(session: AsyncSession, dataset: Any) -> int
     if version is not None:
         set_committed_value(dataset, "tile_cache_version", version)
     return version
+
+
+async def record_live_data_write(session: AsyncSession, dataset: Any) -> int | None:
+    """Roll ``data_revision`` and ``tile_cache_version`` for a live-table write.
+
+    For a write to the rows or columns of a loaded ``Dataset``'s live table, in
+    the write's transaction. One UPDATE, evaluated at write time like
+    :func:`bump_tile_cache_version_atomic`. Returns the new tile cache version,
+    set on the instance without marking it dirty; None when the row is gone.
+    """
+    cls = type(dataset)
+    row = (
+        await session.execute(
+            update(cls)
+            .where(cls.id == dataset.id)
+            .values(
+                tile_cache_version=func.coalesce(cls.tile_cache_version, 1) + 1,
+                data_revision=cls.data_revision + 1,
+            )
+            .returning(cls.tile_cache_version, cls.data_revision)
+            .execution_options(synchronize_session=False)
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    set_committed_value(dataset, "tile_cache_version", row.tile_cache_version)
+    set_committed_value(dataset, "data_revision", row.data_revision)
+    return row.tile_cache_version
 
 
 def vrt_admission_lock_key(dataset_id: uuid.UUID) -> int:

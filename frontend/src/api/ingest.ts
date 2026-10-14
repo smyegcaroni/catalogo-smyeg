@@ -1,15 +1,17 @@
-import { apiFetch, ApiError, attemptRefresh, notifySessionExpired, tryRefresh, type RefreshOutcome } from './client';
+import { apiFetch, ApiError, sendInSession } from './client';
 import { uploadChunks } from './_presignedUpload';
 import { API_BASE } from '@/lib/constants';
-import { translateApiErrorDetail } from '@/lib/error-map';
+import { describeUploadRefusal, UPLOAD_REFUSAL_FALLBACK_KEYS } from '@/lib/error-map';
 import i18n from '@/i18n/i18n';
-import { useAuthStore } from '@/stores/auth-store';
 import { reportNetworkError } from '@/lib/report';
 import type {
   UploadResponse,
   JobCancelResponse,
   JobStatusResponse,
   FilePreviewResponse,
+  RasterPreviewResponse,
+  TilesetPreviewResponse,
+  PointCloudPreviewResponse,
   CommitImportRequest,
   CommitImportResponse,
   ProbeResponse,
@@ -20,6 +22,8 @@ import type {
   BulkRegisterResponse,
   UploadConfig,
   PresignedUploadResponse,
+  UploadKind,
+  UrlUploadKind,
   VrtCreateRequest,
   VrtCreateResponse,
   ArcgisSigninRequest,
@@ -30,10 +34,40 @@ import type {
 /** Byte-transfer progress callback (0–1). */
 export type UploadProgress = (fraction: number) => void;
 
+/** No upload progress within this window means a stalled connection while bytes are still being sent. */
+const UPLOAD_INACTIVITY_TIMEOUT_MS = 120_000;
+/**
+ * Once the body is sent the server stages and validates it, which is not
+ * bounded by transfer speed. Outlive the proxy's 600s read timeout so the
+ * proxy's verdict reaches the caller instead of a client-side abort.
+ */
+const UPLOAD_RESPONSE_TIMEOUT_MS = 630_000;
+
+/**
+ * Rethrows err, rebuilding an ApiError's message through describeUploadRefusal
+ * only when its status is a key of UPLOAD_REFUSAL_FALLBACK_KEYS and its body
+ * is a string. A transport failure (no body) rethrows unchanged.
+ */
+export function rethrowAsUploadRefusal(err: unknown): never {
+  if (
+    err instanceof ApiError &&
+    typeof err.body === 'string' &&
+    UPLOAD_REFUSAL_FALLBACK_KEYS[err.status] !== undefined
+  ) {
+    const message = describeUploadRefusal(err.body, err.status);
+    if (message !== err.message) {
+      const rebuilt = new ApiError(message, err.status, err.body);
+      rebuilt.unconfirmed = err.unconfirmed;
+      throw rebuilt;
+    }
+  }
+  throw err;
+}
+
 /**
  * XHR-based POST so we can report upload-byte progress — `fetch()` cannot.
- * Mirrors authenticatedRawFetch's proactive-refresh + single 401 retry so a
- * first-after-idle upload doesn't hard-fail on a stale JWT.
+ * Sent through sendInSession, so a first-after-idle upload refreshes a stale
+ * JWT and an upload outliving its session never acts on the next one.
  * A 401 retry re-sends the whole body — acceptable, since the proactive refresh
  * makes it rare.
  */
@@ -41,12 +75,8 @@ async function xhrUpload<T>(
   path: string,
   formData: FormData,
   onProgress?: UploadProgress,
+  signal?: AbortSignal,
 ): Promise<T> {
-  const { token, expiresAt } = useAuthStore.getState();
-  if (token && expiresAt && Date.now() > expiresAt - 30_000) {
-    await tryRefresh();
-  }
-
   // A direct-POST upload (uploadFile) previously bypassed the problem
   // reporter entirely: it's called from a plain try/catch in UploadForm, not
   // a TanStack mutation, so the shared MutationCache.onError tap in main.tsx
@@ -56,47 +86,83 @@ async function xhrUpload<T>(
   const filename = uploadedFile instanceof File ? uploadedFile.name : undefined;
   const reportUrl = filename ? `${path} (${filename})` : path;
 
-  const attempt = (): Promise<{ status: number; body: string }> =>
-    new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', `${API_BASE}${path}`);
-      const jwt = useAuthStore.getState().token;
-      if (jwt) xhr.setRequestHeader('Authorization', `Bearer ${jwt}`);
-      if (onProgress) {
-        xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) onProgress(e.loaded / e.total);
-        };
+  const attempt = (jwt: string | null): Promise<{ status: number; body: string }> =>
+    new Promise<{ status: number; body: string }>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
       }
-      xhr.onload = () => resolve({ status: xhr.status, body: xhr.responseText });
+      const xhr = new XMLHttpRequest();
+      let settled = false;
+      let inactivityTimer: ReturnType<typeof setTimeout>;
+
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(inactivityTimer);
+        signal?.removeEventListener('abort', onAbort);
+        fn();
+      };
+      // Reset on every byte of progress, so a slow upload that keeps moving is
+      // never cut off.
+      const armTimer = (ms: number) => {
+        clearTimeout(inactivityTimer);
+        inactivityTimer = setTimeout(() => {
+          settle(() => {
+            xhr.abort();
+            reject(new ApiError(i18n.t('common:errors.requestTimeout'), 0));
+          });
+        }, ms);
+      };
+      const armInactivityTimer = () => armTimer(UPLOAD_INACTIVITY_TIMEOUT_MS);
+      const onAbort = () => {
+        settle(() => {
+          xhr.abort();
+          reject(new DOMException('Aborted', 'AbortError'));
+        });
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+
+      xhr.open('POST', `${API_BASE}${path}`);
+      if (jwt) xhr.setRequestHeader('Authorization', `Bearer ${jwt}`);
+      xhr.upload.onprogress = (e) => {
+        armInactivityTimer();
+        if (onProgress && e.lengthComputable) onProgress(e.loaded / e.total);
+      };
+      xhr.upload.onload = () => armTimer(UPLOAD_RESPONSE_TIMEOUT_MS);
+      xhr.onload = () => settle(() => resolve({ status: xhr.status, body: xhr.responseText }));
       xhr.onerror = () =>
-        reject(new ApiError(i18n.t('common:errors.networkUnavailable'), 0));
+        settle(() => reject(new ApiError(i18n.t('common:errors.networkUnavailable'), 0)));
+      xhr.onabort = onAbort;
+      xhr.ontimeout = () =>
+        settle(() => reject(new ApiError(i18n.t('common:errors.requestTimeout'), 0)));
+      armInactivityTimer();
       xhr.send(formData);
+    }).catch((err: unknown) => {
+      // A caller's own cancellation is not a failure worth reporting.
+      if (!(err instanceof DOMException && err.name === 'AbortError')) {
+        reportNetworkError({ status: 0, url: reportUrl, detail: err instanceof Error ? err.message : undefined });
+      }
+      throw err;
     });
 
-  let res: { status: number; body: string };
-  try {
-    res = await attempt();
-  } catch (err) {
-    reportNetworkError({ status: 0, url: reportUrl, detail: err instanceof Error ? err.message : undefined });
-    throw err;
-  }
-  // fix(#1446): capture the dead session BEFORE refreshing, matching
-  // authenticatedRawFetch — every concurrent failure then keys the
-  // notification latch on the same value.
-  let deadSessionKey: string | null = null;
-  let refreshOutcome: RefreshOutcome | null = null;
-  if (res.status === 401) {
-    deadSessionKey = useAuthStore.getState().token;
-    refreshOutcome = await attemptRefresh();
-    if (refreshOutcome === 'refreshed') {
-      try {
-        res = await attempt();
-      } catch (err) {
-        reportNetworkError({ status: 0, url: reportUrl, detail: err instanceof Error ? err.message : undefined });
-        throw err;
-      }
-    }
-  }
+  // sendInSession can wait on a shared token refresh before it sends anything;
+  // a cancel during that wait settles here without cancelling the refresh.
+  const sending = sendInSession(attempt);
+  const { response: res, refresh } = await (signal
+    ? Promise.race([
+        sending,
+        new Promise<never>((_, reject) => {
+          const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+          if (signal.aborted) onAbort();
+          else signal.addEventListener('abort', onAbort, { once: true });
+          sending.then(
+            () => signal.removeEventListener('abort', onAbort),
+            () => signal.removeEventListener('abort', onAbort),
+          );
+        }),
+      ])
+    : sending);
 
   if (res.status < 200 || res.status >= 300) {
     let detail: unknown;
@@ -107,20 +173,10 @@ async function xhrUpload<T>(
       // Non-JSON failures use the localized status category below.
     }
     reportNetworkError({ status: res.status, url: reportUrl, detail });
-    // fix(#1446): route terminal auth failure through the shared path, so
-    // uploads get the same single signed-out prompt every other surface shows.
-    // fix(#2038): and only when the refresh credential was actually rejected.
-    if (res.status === 401 && refreshOutcome !== 'transient') {
-      if (deadSessionKey) {
-        notifySessionExpired(deadSessionKey);
-      } else {
-        useAuthStore.getState().logout();
-      }
-    }
-    const failure = new ApiError(translateApiErrorDetail(detail, res.status), res.status, detail);
-    // fix(#2038): same flag as authenticatedRawFetch — a 401 whose refresh only
-    // failed transiently is no evidence the credential was rejected.
-    if (res.status === 401 && refreshOutcome === 'transient') failure.unconfirmed = true;
+    const failure = new ApiError(describeUploadRefusal(detail, res.status), res.status, detail);
+    // Same flag as authenticatedRawFetch: only a 401 that ended the session is
+    // evidence the credential was rejected.
+    if (res.status === 401 && refresh !== 'rejected') failure.unconfirmed = true;
     throw failure;
   }
 
@@ -144,11 +200,14 @@ async function xhrUpload<T>(
 export async function uploadFile(
   file: File,
   onProgress?: UploadProgress,
+  kind?: UploadKind | null,
+  signal?: AbortSignal,
 ): Promise<UploadResponse> {
   const formData = new FormData();
   formData.append('file', file);
+  if (kind) formData.append('kind', kind);
 
-  return xhrUpload<UploadResponse>('/ingest/upload', formData, onProgress);
+  return xhrUpload<UploadResponse>('/ingest/upload', formData, onProgress, signal);
 }
 
 /**
@@ -173,18 +232,19 @@ const URL_SUBMIT_TIMEOUT_MS = 90_000;
 export async function uploadFromUrl(
   url: string,
   filename?: string,
+  kind?: UrlUploadKind | null,
 ): Promise<UploadResponse> {
   try {
     return await apiFetch<UploadResponse>('/ingest/upload/url', {
       method: 'POST',
-      body: JSON.stringify({ url, ...(filename && { filename }) }),
+      body: JSON.stringify({ url, ...(filename && { filename }), ...(kind && { kind }) }),
       timeoutMs: URL_SUBMIT_TIMEOUT_MS,
     });
   } catch (err) {
     // Direct call from UrlImportForm's try/catch (not a TanStack mutation),
     // so report here — metadata only, same reasoning as uploadFile above.
     reportApiCallFailure('/ingest/upload/url', err);
-    throw err;
+    rethrowAsUploadRefusal(err);
   }
 }
 
@@ -216,12 +276,12 @@ export async function getJobStatusByDataset(
 // form as a real verdict rather than a client-side abort.
 const PREVIEW_TIMEOUT_MS = 630_000;
 
-export async function previewFile(jobId: string, layerName?: string): Promise<FilePreviewResponse> {
+export async function previewFile(jobId: string, layerName?: string): Promise<FilePreviewResponse | RasterPreviewResponse | TilesetPreviewResponse | PointCloudPreviewResponse> {
   const url = layerName
     ? `/ingest/preview/${jobId}?layer_name=${encodeURIComponent(layerName)}`
     : `/ingest/preview/${jobId}`;
   try {
-    return await apiFetch<FilePreviewResponse>(url, {
+    return await apiFetch<FilePreviewResponse | RasterPreviewResponse | TilesetPreviewResponse | PointCloudPreviewResponse>(url, {
       method: 'POST',
       timeoutMs: PREVIEW_TIMEOUT_MS,
     });
@@ -238,7 +298,7 @@ export async function previewFile(jobId: string, layerName?: string): Promise<Fi
     // silently fell through this guard uncaptured. reportApiCallFailure
     // handles every error shape uniformly.
     reportApiCallFailure('/ingest/preview', err);
-    throw err;
+    rethrowAsUploadRefusal(err);
   }
 }
 
@@ -258,7 +318,7 @@ export async function commitImport(
     });
   } catch (err) {
     reportApiCallFailure('/ingest/commit', err);
-    throw err;
+    rethrowAsUploadRefusal(err);
   }
 }
 
@@ -361,25 +421,35 @@ export async function requestPresignedUpload(
   filename: string,
   fileSize: number,
   contentType?: string,
+  kind?: UploadKind | null,
 ): Promise<PresignedUploadResponse> {
-  return apiFetch<PresignedUploadResponse>('/ingest/upload/presigned', {
-    method: 'POST',
-    body: JSON.stringify({
-      filename,
-      file_size: fileSize,
-      ...(contentType && { content_type: contentType }),
-    }),
-  });
+  try {
+    return await apiFetch<PresignedUploadResponse>('/ingest/upload/presigned', {
+      method: 'POST',
+      body: JSON.stringify({
+        filename,
+        file_size: fileSize,
+        ...(contentType && { content_type: contentType }),
+        ...(kind && { kind }),
+      }),
+    });
+  } catch (err) {
+    rethrowAsUploadRefusal(err);
+  }
 }
 
 export async function completePresignedUpload(
   jobId: string,
   parts?: { etag: string; part_number: number }[],
 ): Promise<UploadResponse> {
-  return apiFetch<UploadResponse>(`/ingest/upload/presigned/${jobId}/complete`, {
-    method: 'POST',
-    body: JSON.stringify({ parts: parts ?? [] }),
-  });
+  try {
+    return await apiFetch<UploadResponse>(`/ingest/upload/presigned/${jobId}/complete`, {
+      method: 'POST',
+      body: JSON.stringify({ parts: parts ?? [] }),
+    });
+  } catch (err) {
+    rethrowAsUploadRefusal(err);
+  }
 }
 
 /**
@@ -422,13 +492,18 @@ function reportPresignFailure(stage: string, filename: string, err: unknown): vo
 export async function uploadPresigned(
   file: File,
   onProgress?: UploadProgress,
+  kind?: UploadKind | null,
 ): Promise<UploadResponse> {
+  // The presigned PUT URL is signed for this content type, and fetch sends no
+  // Content-Type for a Blob whose type is empty, so both sides name it.
+  const contentType = file.type || 'application/octet-stream';
   let job_id: string, urls: string[], upload_id: string | null | undefined, part_size: number | null | undefined;
   try {
     ({ job_id, urls, upload_id, part_size } = await requestPresignedUpload(
       file.name,
       file.size,
-      file.type || undefined,
+      contentType,
+      kind,
     ));
   } catch (err) {
     reportPresignFailure('request', file.name, err);
@@ -441,7 +516,7 @@ export async function uploadPresigned(
     onProgress?.(0);
     let resp: Response;
     try {
-      resp = await fetch(urls[0], { method: 'PUT', body: file });
+      resp = await fetch(urls[0], { method: 'PUT', headers: { 'Content-Type': contentType }, body: file });
     } catch (err) {
       reportPresignFailure('put', file.name, err);
       throw err;

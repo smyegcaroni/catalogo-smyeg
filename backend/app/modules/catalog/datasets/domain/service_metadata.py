@@ -15,6 +15,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.catalog.datasets.domain._sql_safety import SAFE_TABLE_NAME_RE
+from app.modules.catalog.datasets.domain.helpers import WorkflowTransitionDenied
 from app.modules.catalog.datasets.domain.models import (
     AttributeMetadata,
     Dataset,
@@ -30,6 +31,7 @@ logger = structlog.stdlib.get_logger(__name__)
 
 __all__ = [
     "compute_schema_diff",
+    "defer_metadata_embedding",
     "get_attribute",
     "list_attributes",
     "reset_attribute",
@@ -45,12 +47,49 @@ _TYPE_EQUIVALENCES = {
     "real": "double precision",
     "int": "integer",
     "int64": "bigint",
+    "integer64": "bigint",
+    "datetime": "timestamp with time zone",
+    "time": "time without time zone",
     "float": "double precision",
 }
 
+# GDAL field subtypes the PostgreSQL driver stores as a narrower column
+# type than the bare OGR type would suggest, keyed by (type, subtype)
+# lowercased: Integer/Boolean -> boolean, Integer/Int16 -> smallint,
+# Real/Float32 -> real, String/JSON -> json.
+_SUBTYPE_TYPE_EQUIVALENCES = {
+    ("integer", "boolean"): "boolean",
+    ("integer", "int16"): "smallint",
+    ("real", "float32"): "real",
+    ("string", "json"): "json",
+}
 
-def _normalize_col_type(col_type: str) -> str:
-    return _TYPE_EQUIVALENCES.get(col_type.lower(), col_type.lower())
+
+def _normalize_col_type(column: dict) -> str:
+    """Normalize one column's reported type for case-insensitive comparison.
+
+    Which vocabulary a value is in depends on the value, not on whether it
+    is the "old" or "new" argument: a reupload preview diffs a PostgreSQL
+    type against an OGR type, but the post-swap drift recompute diffs two
+    PostgreSQL types. Every attribute column's PostgreSQL type reaching
+    this diff is lowercase (a PostGIS geometry column would report the
+    non-lowercase ``USER-DEFINED``, but ``column_info`` excludes those
+    before they get here). Every OGR type name starts with a capital
+    letter, so a lowercase value is already canonical and returned as-is,
+    while a capitalized one maps to the PostgreSQL type ogr2ogr would
+    create for it, honoring a GDAL subtype the driver stores narrower
+    than the bare type.
+    """
+    raw_type = column["type"]
+    base_type = raw_type.lower()
+    if raw_type == base_type:
+        return base_type
+    subtype = column.get("subtype")
+    if subtype:
+        mapped = _SUBTYPE_TYPE_EQUIVALENCES.get((base_type, subtype.lower()))
+        if mapped is not None:
+            return mapped
+    return _TYPE_EQUIVALENCES.get(base_type, base_type)
 
 
 def compute_schema_diff(
@@ -63,7 +102,9 @@ def compute_schema_diff(
 
     Column matching is case-insensitive (ogr2ogr lowercases on import,
     but remote sources report original case). Type comparison normalizes
-    common OGR-to-PostgreSQL type mappings (e.g. String ↔ character varying).
+    common OGR-to-PostgreSQL type mappings (e.g. String ↔ character varying),
+    including GDAL field subtypes that store as a narrower column type
+    (e.g. Integer/Boolean ↔ boolean).
     """
     old_by_lower = {c["name"].lower(): c for c in old_columns}
     new_by_lower = {c["name"].lower(): c for c in new_columns}
@@ -83,11 +124,16 @@ def compute_schema_diff(
             {
                 "name": new_by_lower[n]["name"],
                 "old_type": old_by_lower[n]["type"],
-                "new_type": new_by_lower[n]["type"],
+                # The raw type reads as an unrelated label ("integer" next
+                # to "Integer" for a mapped subtype, or "String" for a
+                # CSV's actual "character varying"). Report the type the
+                # import will actually store, using the same normalization
+                # the comparison above uses.
+                "new_type": _normalize_col_type(new_by_lower[n]),
             }
             for n in sorted(old_keys & new_keys)
-            if _normalize_col_type(old_by_lower[n]["type"])
-            != _normalize_col_type(new_by_lower[n]["type"])
+            if _normalize_col_type(old_by_lower[n])
+            != _normalize_col_type(new_by_lower[n])
         ],
         "row_count_old": old_feature_count,
         "row_count_new": new_feature_count,
@@ -226,10 +272,7 @@ async def _apply_record_status_change(
     )
     allowed = await workflow.allowed_transitions(context)
     if new_status not in allowed:
-        raise ValueError(
-            f"Cannot transition from '{current_status}' to '{new_status}'. "
-            f"Allowed: {allowed}"
-        )
+        raise WorkflowTransitionDenied(current_status, new_status, allowed)
 
     if new_status == "published" and current_status != "published":
         from app.core.persistent_config import REQUIRE_METADATA_FOR_PUBLISH
@@ -263,13 +306,16 @@ async def _apply_is_dem(
     return True
 
 
-async def _maybe_defer_embedding(record_id: uuid.UUID, dataset_id: uuid.UUID) -> None:
-    """Best-effort defer of embedding regeneration. Failures are logged, not raised."""
+async def defer_metadata_embedding(
+    meta: "DatasetMeta", record_id: uuid.UUID, dataset_id: uuid.UUID
+) -> None:
+    """Queue re-embedding once an edit to embedded text has committed; best-effort."""
+    # model_fields_set, not is-not-None: an explicit clear must also re-embed.
+    if not {"title", "summary", "lineage_summary"} & meta.model_fields_set:
+        return
     try:
         await get_catalog_port().defer_embed_record(record_id)
-    except (
-        Exception
-    ):  # broad: defer is non-fatal; embedding will catch up on next edit or backfill
+    except Exception:  # broad: non-fatal; the next edit or a backfill catches up
         # Traceback logged so operators can notice a consistent failure
         # (e.g. broker down) instead of silently dropping edits from the index.
         logger.warning(
@@ -295,11 +341,18 @@ async def update_user_metadata(
     explicitly set. Raises ValueError if dataset not found.
     Does not commit; caller controls transaction scope.
 
+    ``actor`` defaults to the identity ``actor_id`` names, since a workflow
+    decides status transitions by the actor's roles.
+
     ``warnings_out`` collects non-blocking warnings from the metadata extension.
     """
     dataset = await get_dataset(session, dataset_id)
     if dataset is None:
         raise ValueError(f"Dataset {dataset_id} not found.")
+    if actor is None and actor_id is not None:
+        from app.modules.catalog.datasets.domain.helpers import _load_actor_identities
+
+        actor = (await _load_actor_identities(session, [actor_id])).get(actor_id)
 
     from app.modules.catalog.features.service import lock_catalog_rows_for_write
 
@@ -367,11 +420,6 @@ async def update_user_metadata(
         record.updated_by = actor_id
 
     await session.flush()
-
-    # model_fields_set, not is-not-None: an explicit clear must also re-embed.
-    if {"title", "summary", "lineage_summary"} & meta.model_fields_set:
-        await _maybe_defer_embedding(record.id, dataset.id)
-
     return dataset
 
 

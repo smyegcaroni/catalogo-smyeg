@@ -44,9 +44,11 @@ from app.processing.ingest.metadata_extent import (
     detect_3d_metadata,  # noqa: F401
     extract_metadata,  # noqa: F401
     get_column_info,  # noqa: F401
+    get_declared_srid,  # noqa: F401
     get_extent,  # noqa: F401
     get_feature_count,  # noqa: F401
     get_geometry_type,  # noqa: F401
+    get_geometry_types,  # noqa: F401
     get_sample_values,  # noqa: F401
     get_table_srid,  # noqa: F401
     promote_z_to_elev,  # noqa: F401
@@ -75,11 +77,14 @@ from app.processing.ingest.metadata_projection import (
     REPAIR_NO_GEOMETRY,  # noqa: F401
     Geom4326Repair,  # noqa: F401
     Geom4326State,  # noqa: F401
+    GID_UNUSABLE_SQL,  # noqa: F401
     add_4326_column,  # noqa: F401
+    add_gid_column,  # noqa: F401
     ensure_geom_4326_gist_index,  # noqa: F401
     grant_reader_access,  # noqa: F401
     linearize_existing_4326,  # noqa: F401
     probe_geom_4326,  # noqa: F401
+    probe_gid,  # noqa: F401
     rederive_geom_4326,  # noqa: F401
 )
 from app.processing.ingest.metadata_quality import (
@@ -88,6 +93,7 @@ from app.processing.ingest.metadata_quality import (
     _score_geometry_validity,  # noqa: F401
     _score_metadata_completeness,  # noqa: F401
     compute_quality_score,  # noqa: F401
+    score_quality,  # noqa: F401
 )
 from app.processing.ingest.metadata_sql import (
     _TABLE_NAME_RE,  # noqa: F401
@@ -97,6 +103,7 @@ from app.processing.ingest.metadata_sql import (
 )
 
 __all__ = [
+    "GID_UNUSABLE_SQL",
     "REPAIR_APPLIED",
     "REPAIR_GENERATED",
     "REPAIR_NO_GEOMETRY",
@@ -130,6 +137,7 @@ __all__ = [
     "_table_has_geometry",
     "_validate_table_name",
     "add_4326_column",
+    "add_gid_column",
     "clip_to_mercator_bounds",
     "compute_quality_score",
     "compute_table_content_digest",
@@ -142,16 +150,20 @@ __all__ = [
     "extract_metadata",
     "generate_attribute_metadata",
     "get_column_info",
+    "get_declared_srid",
     "get_extent",
     "get_feature_count",
     "get_geometry_type",
+    "get_geometry_types",
     "get_sample_values",
     "get_table_srid",
     "grant_reader_access",
     "linearize_existing_4326",
     "probe_geom_4326",
+    "probe_gid",
     "promote_z_to_elev",
     "rederive_geom_4326",
     "refresh_attribute_metadata",
     "rename_reserved_columns",
+    "score_quality",
 ]

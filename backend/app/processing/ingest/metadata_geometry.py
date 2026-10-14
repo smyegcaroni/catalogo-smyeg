@@ -11,13 +11,16 @@ go wrong — shapefile DBF truncates to 10 characters — and is reported to
 the user rather than repaired.
 """
 
-import re
-
 import structlog
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.platform.column_names import (
+    RESERVED_COLUMN_NAMES,
+    free_name,
+    reserved_rename_base,
+)
 from app.processing.ingest.metadata_sql import (
     _TABLE_NAME_RE,
     _qtable,
@@ -26,6 +29,39 @@ from app.processing.ingest.metadata_sql import (
 )
 
 logger = structlog.stdlib.get_logger(__name__)
+
+_FLOAT8_SPECIAL_RE = r"^\s*[+-]?(nan|inf(inity)?)\s*$"
+# SQLAlchemy's text() reads a bare ":" as a bind parameter, which POSIX's
+# [[:space:]] class would trip; \s (also valid in Postgres's regex dialect)
+# avoids it.
+_FLOAT8_DECIMAL_RE = r"^\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d{1,4})?\s*$"
+_FLOAT8_MIN_POSITIVE = "4.9e-324"
+_FLOAT8_MAX = "1.7976931348623157e308"
+# With the 4-digit exponent cap, text this short keeps ::numeric within its
+# 16383-digit scale limit; longer text is no coordinate.
+_FLOAT8_MAX_TEXT_LENGTH = 2000
+
+
+def _float8_predicate(col_expr: str) -> str:
+    """SQL predicate: does col_expr's text cast to double precision without error?
+
+    Replaces pg_input_is_valid (PG16+) with regex operators available on
+    PG13. A shape match can still overflow double precision on cast (e.g.
+    "1e400"), so it's also bounded via ::numeric. Capping the exponent at 4
+    digits and the text's length keeps that cast itself from overflowing
+    numeric's own range, so the predicate never raises.
+    """
+    return (
+        f"CASE "
+        f"WHEN length({col_expr}) > {_FLOAT8_MAX_TEXT_LENGTH} THEN false "
+        f"WHEN {col_expr} ~* '{_FLOAT8_SPECIAL_RE}' THEN true "
+        f"WHEN {col_expr} ~ '{_FLOAT8_DECIMAL_RE}' THEN ("
+        f"abs({col_expr}::numeric) = 0 OR "
+        f"abs({col_expr}::numeric) BETWEEN {_FLOAT8_MIN_POSITIVE} AND {_FLOAT8_MAX}"
+        f") "
+        f"ELSE false "
+        f"END"
+    )
 
 
 async def construct_point_geometry(
@@ -50,12 +86,13 @@ async def construct_point_geometry(
     y_col = _sql_quote_ident(y_column)
     finite_floor = "-1.7976931348623157e308"
     finite_ceiling = "1.7976931348623157e308"
+    x_is_float8 = _float8_predicate(f"{x_col}::text")
+    y_is_float8 = _float8_predicate(f"{y_col}::text")
     unparseable = await session.execute(
         text(
             f"SELECT COUNT(*) FROM {tref} "
             f"WHERE {x_col} IS NOT NULL AND {y_col} IS NOT NULL "
-            f"AND (NOT pg_input_is_valid({x_col}::text, 'double precision') "
-            f"OR NOT pg_input_is_valid({y_col}::text, 'double precision'))"
+            f"AND (NOT ({x_is_float8}) OR NOT ({y_is_float8}))"
         )
     )
     unparseable_count = int(unparseable.scalar_one())
@@ -162,11 +199,18 @@ async def construct_wkt_geometry(
             # still isolated by the validation savepoint.
             sample = await session.execute(
                 text(
-                    f"SELECT GeometryType({parsed_geom}) "
+                    f"SELECT GeometryType({parsed_geom}), ST_Zmflag({parsed_geom}) "
                     f"FROM {tref} WHERE {wkt_col} IS NOT NULL LIMIT 1"
                 )
             )
-            geom_type = sample.scalar_one_or_none() or "GEOMETRY"
+            row = sample.first()
+            geom_type = "GEOMETRY"
+            if row:
+                # GeometryType spells M but not Z, and a typmod that omits the
+                # dimensions rejects the rows that carry them.
+                geom_type = row[0].removesuffix("M") + {1: "M", 2: "Z", 3: "ZM"}.get(
+                    row[1], ""
+                )
     except DBAPIError as exc:
         raise ValueError("WKT column contains malformed geometry text") from exc
 
@@ -258,8 +302,6 @@ async def rename_reserved_columns(
     Returns rename records (``{"original": ..., "renamed": ...}``) for
     ``job.user_metadata['warnings']``.
     """
-    from app.processing.ingest.ogr import RESERVED_COLUMN_NAMES
-
     _validate_table_name(table_name)
     _validate_table_name(schema)
 
@@ -299,20 +341,7 @@ async def rename_reserved_columns(
                 if col_name not in RESERVED_COLUMN_NAMES and ":" not in col_name:
                     continue
 
-                if ":" in col_name:
-                    # fix(#640): launder to a safe name; must start with a
-                    # letter or the identifier validator rejects it
-                    # (":id" -> "id", not "_id").
-                    base = re.sub(r"[^A-Za-z0-9_]", "_", col_name).strip("_")
-                    if not base or not base[0].isalpha():
-                        base = f"col_{base}" if base else "col"
-                    # A laundered name may hit an internal one (":geom" ->
-                    # "geom") — apply the reserved-name rule so staging's
-                    # own geometry columns stay uncontested.
-                    if base in RESERVED_COLUMN_NAMES:
-                        base = f"src_{base}"
-                    base = base[:63]
-                else:
+                if ":" not in col_name:
                     if col_name == "gid":
                         is_pipeline_gid = (
                             col_default is not None and "nextval" in str(col_default)
@@ -324,13 +353,9 @@ async def rename_reserved_columns(
                         if data_type == "USER-DEFINED" and udt_name == "geometry":
                             continue
 
-                    base = f"src_{col_name}"
+                base = reserved_rename_base(col_name)
 
-                target = base
-                suffix = 2
-                while target in all_column_names:
-                    target = f"{base[:60]}_{suffix}"
-                    suffix += 1
+                target = free_name(base, all_column_names)
 
                 q_orig = _sql_quote_ident(col_name)
                 q_target = _sql_quote_ident(target)

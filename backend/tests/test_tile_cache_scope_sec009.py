@@ -12,6 +12,7 @@ directly with a valid signature mocked and assert the resolved cache scope.
 
 import types
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 
@@ -19,9 +20,9 @@ import app.processing.tiles.router as tile_router
 from app.processing.tiles.router import (
     _DatasetMeta,
     _authorize_vector_tile_request,
-    _is_publicly_cacheable,
     _tile_headers,
 )
+from app.platform.cache.scope import is_publicly_cacheable
 
 
 class _FakeRequest:
@@ -53,6 +54,8 @@ def _meta(visibility: str, record_status: str = "published") -> _DatasetMeta:
         tile_cache_ttl=None,
         tile_columns=None,
         publication_version=0,
+        tile_cache_version=1,
+        updated_at=datetime.now(timezone.utc),
     )
 
 
@@ -136,7 +139,7 @@ async def test_non_public_without_signature_is_rejected(monkeypatch):
 )
 def test_is_publicly_cacheable(visibility, record_status, expected):
     """Raster cache scope: publicly cacheable only when public AND published."""
-    assert _is_publicly_cacheable(visibility, record_status) is expected
+    assert is_publicly_cacheable(visibility, record_status) is expected
 
 
 @pytest.mark.anyio

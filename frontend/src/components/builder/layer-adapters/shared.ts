@@ -196,7 +196,7 @@ export function getFeatureOpacity(
 }
 
 /**
- * fix(#1625): drive the master `layer.opacity` slider on a live vector layer.
+ * Drive the master `layer.opacity` slider on a live vector layer.
  *
  * Fill and line layers carry two opacity tiers — the Style Editor's per-feature
  * `fill-opacity`/`line-opacity` and the master slider — and multiplying them into
@@ -206,10 +206,6 @@ export function getFeatureOpacity(
  * `fill-layer-opacity`/`line-layer-opacity` composite the whole layer once AFTER
  * the per-feature pass, which is exactly the two-tier model: per-feature stays on
  * `<geom>-opacity` unmultiplied, the master rides on `<geom>-layer-opacity`.
- *
- * Every master-opacity write for a fill/line/circle layer goes through here —
- * addLayers (via finalizeLayer), syncPaint, and the slider's direct path in
- * use-layer-map-sync — so the split cannot drift between entry points.
  */
 export function applyMasterOpacity(
   map: Pick<MaplibreMap, 'setPaintProperty'>,
@@ -443,6 +439,16 @@ export function syncLayerFilter(
   }
 }
 
+/** The `source-layer` key of a layer spec. A GeoJSON source has no layers to name. */
+export function sourceLayerSpec(input: { sourceType?: 'vector' | 'geojson'; sourceLayer: string }): { 'source-layer'?: string } {
+  return input.sourceType === 'geojson' ? {} : { 'source-layer': input.sourceLayer };
+}
+
+/** The `filter` key of a layer spec, left out when the layer has no filter. */
+export function filterSpec(filter: FilterSpecification | null | undefined): { filter?: FilterSpecification } {
+  return Array.isArray(filter) && filter.length > 0 ? { filter } : {};
+}
+
 /** Infer adapter type from paint property key prefixes (fallback for null geometry). */
 function inferTypeFromPaint(paint?: Record<string, unknown>): string | null {
   if (!paint) return null;
@@ -541,7 +547,7 @@ function debugPropertySyncFailure(
 
 /** Reconcile an explicit paint ownership set against the live MapLibre layer. */
 export function syncOwnedPaintProperties(
-  map: MaplibreMap,
+  map: Pick<MaplibreMap, 'getLayer' | 'getPaintProperty' | 'setPaintProperty'>,
   layerId: string,
   rawPaint: Record<string, unknown>,
   options: OwnedPaintSyncOptions,
@@ -587,7 +593,7 @@ export function syncOwnedPaintProperties(
 
 /** Reconcile an explicit layout ownership set against the live MapLibre layer. */
 export function syncOwnedLayoutProperties(
-  map: MaplibreMap,
+  map: Pick<MaplibreMap, 'getLayer' | 'getLayoutProperty' | 'setLayoutProperty'>,
   layerId: string,
   layout: Record<string, unknown>,
   options: OwnedLayoutSyncOptions,

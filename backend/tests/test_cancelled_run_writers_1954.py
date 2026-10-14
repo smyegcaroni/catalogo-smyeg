@@ -1,4 +1,4 @@
-"""The two writers of the `cancelled` run status (#1954, ADR-002 4d).
+"""The two writers of the `cancelled` run status (#1954).
 
 The sweep's guard comment claimed the status is never a stop signal while
 the module beside it wrote one for an explicit user cancel. The resolution
@@ -25,6 +25,7 @@ from app.platform.refresh.service import (
     sweep_abandoned_refresh_runs,
 )
 from tests.factories import create_dataset, get_user_id
+from tests.stale_settlers import STALE_SETTLERS
 
 pytestmark = pytest.mark.anyio
 
@@ -110,6 +111,22 @@ class TestBothWritersAreDistinguishableByErrorCode:
         assert stored.error_code == USER_CANCELLED_ERROR_CODE
 
 
+@STALE_SETTLERS
+async def test_every_settler_cancels_an_abandoned_run(test_db_session, settle) -> None:
+    """Both settlers run the abandoned-run pass and write its own code."""
+    _, _job, run = await _seed(test_db_session)
+    run.started_at = datetime.now(timezone.utc) - timedelta(
+        seconds=ABANDONED_RUN_CUTOFF_SECONDS + 60
+    )
+    await test_db_session.commit()
+
+    await settle(test_db_session)
+
+    await test_db_session.refresh(run)
+    assert run.status == "cancelled"
+    assert run.error_code == ABANDONED_ERROR_CODE
+
+
 class TestTheGuardCommentMatchesTheModule:
     """The comment is load-bearing: it is the argument for the sweep's two
     proofs, and a reader who finds it contradicted has no rule at all."""
@@ -128,4 +145,7 @@ class TestTheGuardCommentMatchesTheModule:
         ).read_text()
 
         assert "never a stop signal" not in source
-        assert "told apart by `error_code`" in source
+        assert "two writers, told apart by `error_code`" in source
+        # The rule is stated, not credited to a record that says the sweep
+        # is the status's only writer.
+        assert "ADR-002 4d" not in source

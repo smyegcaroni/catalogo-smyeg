@@ -31,28 +31,40 @@ import { SectionCapabilityHint } from '@/components/dataset/SectionCapabilityHin
 import { SECTION_EYEBROW } from '@/components/dataset/SectionEyebrow';
 import { RelatedDatasets } from '@/components/dataset/RelatedDatasets';
 import { UsedInMaps } from '@/components/dataset/UsedInMaps';
+import { TilesetCard } from '@/components/dataset/TilesetCard';
+import { PointCloudCard } from '@/components/dataset/PointCloudCard';
 import type { DatasetEditCapabilities } from '@/components/dataset/hooks/use-dataset-edit-capabilities';
 import { getSourceFormatLabel } from '@/i18n/labels';
 import { cn } from '@/lib/utils';
 import { vrtRasterStatusColors } from '@/lib/status-colors';
+import { recordTypeCapabilities } from '@/lib/record-types';
 
 /** Compact key-value row for sidebar cards — grid layout matching design */
-function SideKV({ label, value, mono, title, children }: {
+function SideKV({ label, value, mono, title, wrap, children }: {
   label: string;
   value?: string;
   mono?: boolean;
   title?: string;
+  /** Use for human-readable reuse terms, which must remain available without hover. */
+  wrap?: boolean;
   children?: React.ReactNode;
 }) {
   return (
-    <div className="grid grid-cols-[110px_1fr] gap-3 py-2 text-xs items-baseline">
+    <div className="grid grid-cols-[110px_minmax(0,1fr)] gap-3 py-2 text-xs items-baseline">
       {/* Quiet sans field label — tier 2 of the label system, deliberately
           distinct from the mono-caps SectionEyebrow marker above it. */}
       <span className="text-xs text-muted-foreground pt-px">
         {label}
       </span>
       {children ?? (
-        <span className={cn('font-medium truncate', mono && 'font-mono text-xs tracking-wide')} title={title ?? value}>
+        <span
+          className={cn(
+            'font-medium min-w-0',
+            wrap ? 'whitespace-normal break-words' : 'truncate',
+            mono && 'font-mono text-xs tracking-wide',
+          )}
+          title={wrap ? undefined : title ?? value}
+        >
           {value}
         </span>
       )}
@@ -178,6 +190,7 @@ export function OverviewTab({
 
   const isRaster = dataset.record_type === 'raster_dataset';
   const isVrt = dataset.record_type === 'vrt_dataset';
+  const hasFeatureTable = recordTypeCapabilities(dataset.record_type).featureTable;
 
   // VRT derivation -- pass empty string for non-VRT so the hook's enabled:!!datasetId
   // disables the query. fix(#644): also gate on authentication — the endpoint needs
@@ -204,21 +217,26 @@ export function OverviewTab({
         <CardContent className="pt-0">
           <div className="divide-y divide-border/60">
             {dataset.license && (
-              <SideKV label={t('metadata.license', { defaultValue: 'License' })} value={dataset.license} />
+              <SideKV label={t('metadata.license', { defaultValue: 'License' })} value={dataset.license} wrap />
             )}
             {dataset.source_organization && (
-              <SideKV label={t('overview.source', { defaultValue: 'Source' })} value={dataset.source_organization} />
+              <SideKV label={t('overview.source', { defaultValue: 'Source' })} value={dataset.source_organization} wrap />
             )}
             {!isVrt && dataset.source_format && (
               <SideKV label={t('metadata.sourceFormat')} value={getSourceFormatLabel(t, dataset.source_format)} />
             )}
-            {dataset.table_name && (
+            {dataset.table_name && hasFeatureTable && (
               <SideKV label={t('metadata.tableName', { defaultValue: 'Table' })} value={dataset.table_name} mono />
             )}
             <SideKV label={t('overview.maintainer', { defaultValue: 'Maintainer' })} value={createdByIdentity} />
             <SideKV label={t('overview.created', { defaultValue: 'Created' })} value={formatDate(dataset.created_at)} mono />
             {dataset.update_frequency && (
-              <SideKV label={t('overview.cadence', { defaultValue: 'Cadence' })} value={dataset.update_frequency} />
+              <SideKV
+                label={t('overview.cadence')}
+                value={t(`iso.updateFrequencyOptions.${dataset.update_frequency}`, {
+                  defaultValue: dataset.update_frequency,
+                })}
+              />
             )}
           </div>
           {canEdit && onTabChange && (
@@ -517,6 +535,11 @@ export function OverviewTab({
               </CardContent>
             </Card>
           )}
+
+          {dataset.tileset && (
+            <TilesetCard tileset={dataset.tileset} extentBbox={dataset.extent_bbox} />
+          )}
+          {dataset.pointcloud && <PointCloudCard dataset={dataset} />}
         </div>
 
         {/* ── Sidebar ── */}

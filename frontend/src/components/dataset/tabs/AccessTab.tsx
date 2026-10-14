@@ -4,6 +4,7 @@ import { Link } from 'react-router';
 import { Copy, Check } from 'lucide-react';
 import { toast } from 'sonner';
 import { useDatasetAccessEndpoints } from '@/components/dataset/hooks/use-dataset-access';
+import { useDistributions } from '@/components/dataset/hooks/use-records';
 import { useUpdateDataset } from '@/components/dataset/hooks/use-dataset';
 import { useCanSetPublicVisibility } from '@/hooks/use-settings';
 import { listKeywords } from '@/api/records';
@@ -34,6 +35,9 @@ import { VisibilityIcon } from '@/components/maps/VisibilityIcon';
 import { getVisibilityLabel } from '@/i18n/labels';
 import { DistributionsList } from '@/components/dataset/DistributionsList';
 import { ExportButton } from '@/components/dataset/ExportButton';
+import { TilesetAccess } from '@/components/dataset/TilesetAccess';
+import { PointCloudAccess } from '@/components/dataset/PointCloudAccess';
+import { recordTypeCapabilities } from '@/lib/record-types';
 import { cn } from '@/lib/utils';
 
 // Syntax highlight tokens — mapped to CSS custom properties in index.css
@@ -204,7 +208,7 @@ function ApiSnippet({
     <section>
       <div className="flex items-baseline justify-between mb-3">
         <h2 className="text-base font-semibold tracking-tight">
-          {t('overview.apiTitle', { defaultValue: 'Access via API' })}
+          {t('distributions.connectWithClient')}
         </h2>
         <span className="font-mono text-mini text-muted-foreground tracking-wide">
           {t('overview.ogcApiFeatures', { defaultValue: 'OGC API Features' })}
@@ -222,7 +226,7 @@ function ApiSnippet({
                 : 'bg-transparent text-muted-foreground hover:text-foreground',
             )}
           >
-            {tab}
+            {tab === 'qgis' ? 'QGIS' : tab === 'python' ? 'Python' : 'curl'}
           </button>
         ))}
       </div>
@@ -348,39 +352,63 @@ export function AccessTab({ dataset, canEdit = false }: AccessTabProps) {
     }
     applyVisibility(visibility);
   }
-  const isRaster = dataset.record_type === 'raster_dataset';
-  const isVrt = dataset.record_type === 'vrt_dataset';
+  const { featureTable, tileToken } = recordTypeCapabilities(dataset.record_type);
+  // 3D files have their own client URLs below; an empty list would only read as missing.
+  const { data: distributionData } = useDistributions(dataset.record_id);
+  const showDistributions =
+    !['tiles3d_dataset', 'pointcloud_dataset'].includes(dataset.record_type) ||
+    (distributionData?.distributions.length ?? 0) > 0;
 
   return (
     <>
-      {/* Distributions */}
-      <Card>
-        <CardHeader>
-          <CardTitle level={2} className="text-base">{t('distributions.title')}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {dataset.record_id ? (
-            <DistributionsList recordId={dataset.record_id} canEdit={canEdit} />
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              {t('distributions.noDistributions')}
+      {/* Downloads and service endpoints */}
+      {showDistributions && (
+        <Card>
+          <CardHeader>
+            <CardTitle level={2} className="text-base">{t('distributions.title')}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {dataset.record_id ? (
+              <DistributionsList
+                recordId={dataset.record_id}
+                canEdit={canEdit}
+                visibility={dataset.visibility}
+              />
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                {t('distributions.noDistributions')}
+              </p>
+            )}
+            {featureTable && (
+              <div className="mt-4 border-t pt-4 space-y-2">
+                <h3 className="text-sm font-medium">{t('distributions.otherFormats')}</h3>
+                <ExportButton datasetId={dataset.id} datasetName={dataset.title} recordType={dataset.record_type} />
+              </div>
+            )}
+            {/* XYZ Tile URL for raster/VRT datasets */}
+            {tileToken === 'raster' && dataset.raster?.connect?.tile_url && (
+              <TileUrlSection tileUrl={dataset.raster.connect.tile_url} />
+            )}
+            {tileToken === 'vector' && dataset.record_type !== 'table' && dataset.visibility !== 'public' && (
+              <p className="text-xs text-muted-foreground mt-4">{t('serviceUrls.vectorTilesKeyHint')}</p>
+            )}
+            <p className="text-xs text-muted-foreground mt-4">
+              {t('serviceUrls.authHelpSimple')}{' '}
+              <Link to="/settings" className="underline hover:text-foreground">
+                {t('serviceUrls.manageApiKeys')}
+              </Link>
             </p>
-          )}
-          {/* XYZ Tile URL for raster/VRT datasets */}
-          {(isRaster || isVrt) && dataset.raster?.connect?.tile_url && (
-            <TileUrlSection tileUrl={dataset.raster.connect.tile_url} />
-          )}
-          <p className="text-xs text-muted-foreground mt-4">
-            {t('serviceUrls.authHelpSimple')}{' '}
-            <Link to="/settings" className="underline hover:text-foreground">
-              {t('serviceUrls.manageApiKeys')}
-            </Link>
-          </p>
-        </CardContent>
-      </Card>
+          </CardContent>
+        </Card>
+      )}
+
+      {dataset.tileset && <TilesetAccess tileset={dataset.tileset} visibility={dataset.visibility} />}
+      {dataset.pointcloud?.url && (
+        <PointCloudAccess url={dataset.pointcloud.url} visibility={dataset.visibility} />
+      )}
 
       {/* API access snippet */}
-      {!isRaster && !isVrt && endpoints.ogcFeaturesUrl && publicApiBaseUrl && (
+      {featureTable && endpoints.ogcFeaturesUrl && publicApiBaseUrl && (
         <ApiSnippet
           apiBaseUrl={publicApiBaseUrl}
           collectionId={dataset.id}
@@ -389,21 +417,12 @@ export function AccessTab({ dataset, canEdit = false }: AccessTabProps) {
         />
       )}
 
-      {/* Export -- vector datasets only */}
-      {!isRaster && !isVrt && (
-        <Card>
-          <CardHeader>
-            <CardTitle level={2} className="text-base">{t('page.export')}</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <ExportButton datasetId={dataset.id} datasetName={dataset.title} recordType={dataset.record_type} />
-          </CardContent>
-        </Card>
-      )}
-
       {/* Visibility */}
       <Card>
-        <CardContent className="pt-6">
+        <CardHeader>
+          <CardTitle level={2} className="text-base">{t('distributions.accessPermissions')}</CardTitle>
+        </CardHeader>
+        <CardContent>
           <div className="flex items-center gap-2">
             <span className="text-sm font-medium text-muted-foreground">
               {t('metadata.visibility')}:

@@ -1,6 +1,6 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { INTERNAL_FAILURE_REASON } from '@/lib/failure-reason';
+import { INTERNAL_FAILURE_REASON, fixedFailureReason } from '@/lib/failure-reason';
 import { useNavigate } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
@@ -9,11 +9,25 @@ import { ApiError } from '@/api/client';
 import { useJobStatus } from '@/components/import/hooks/use-ingest';
 import { useAnalysisFormStore } from '@/stores/analysis-form-store';
 import {
-  analysisAddToMap,
+  useAnalysisAddToMapStore,
   useAnalysisAddedStore,
   useAnalysisJobStore,
   type TrackedAnalysisJob,
 } from '@/stores/analysis-job-store';
+
+/** A finished run's success toast. */
+interface Completion {
+  toastId: string;
+  message: string;
+  datasetId: string | null;
+  mapId: string | null;
+}
+
+/** The add handler of a mounted builder for `mapId`, or null when there's none. */
+function builderAddFor(mapId: string | null) {
+  const builder = useAnalysisAddToMapStore.getState();
+  return builder.mapId === mapId ? builder.add : null;
+}
 
 /**
  * Global notifier for a materialize-analysis job (renders nothing).
@@ -42,6 +56,12 @@ export function AnalysisJobWatcher() {
   // A departed job still owed its document-local cleanup, waiting for the
   // claim that says how it ended.
   const pendingCleanupRef = useRef<TrackedAnalysisJob | null>(null);
+  // Success toasts still open, by toast id, with whether each offers "Add to
+  // map". Raising a closed toast's id again would bring it back, so every way
+  // of closing one deletes its entry.
+  const openCompletionsRef = useRef(
+    new Map<string, { completion: Completion; addsToMap: boolean }>(),
+  );
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   // Shares its query key with the Analysis panel, so both watching costs one poll.
@@ -54,6 +74,71 @@ export function AnalysisJobWatcher() {
   // most likely.
   const gone =
     error instanceof ApiError && [401, 403, 404].includes(error.status);
+
+  // Raises a success toast, or updates an open one in place under the same
+  // id. The label, the placement and the click all follow the builder
+  // registration, so they can't disagree while the toast stays open.
+  const showCompletion = useCallback(
+    (completion: Completion) => {
+      const { toastId, datasetId, mapId } = completion;
+      const addsToMap = !!builderAddFor(mapId);
+      const forget = () => openCompletionsRef.current.delete(toastId);
+      openCompletionsRef.current.set(toastId, { completion, addsToMap });
+      toast.success(completion.message, {
+        id: toastId,
+        // The default corner covers the Analysis panel's own "Add to map"
+        // button, so the toast sits top-center while that builder is open.
+        position: addsToMap ? ('top-center' as const) : undefined,
+        // A long job lands when attention has moved on, so the default 4s
+        // notification is one the user is likely to miss entirely. The
+        // Toaster is configured with closeButton, so this stays until
+        // acknowledged.
+        duration: Infinity,
+        onDismiss: forget,
+        action: datasetId
+          ? {
+              label: addsToMap
+                ? t('analysisTools.addToMap', { defaultValue: 'Add to map' })
+                : t('analysisTools.viewDataset', { defaultValue: 'View dataset' }),
+              onClick: () => {
+                forget();
+                // Read again here: Sonner shows an update a moment after the
+                // registration changes.
+                const add = builderAddFor(mapId);
+                if (!add) {
+                  navigate(`/datasets/${datasetId}`);
+                  return;
+                }
+                // The panel's own button adds the same dataset, and the exit
+                // animation leaves time for a second click, so every analysis
+                // affordance shares one single-use guard.
+                const added = useAnalysisAddedStore.getState();
+                if (
+                  added.addedDatasetIds.includes(datasetId) ||
+                  added.pendingAddIds.includes(datasetId)
+                ) {
+                  return;
+                }
+                added.markPending(datasetId);
+                add(datasetId);
+              },
+            }
+          : undefined,
+      });
+    },
+    [t, navigate],
+  );
+
+  // A builder mounting, leaving or switching maps updates the toasts it affects.
+  useEffect(
+    () =>
+      useAnalysisAddToMapStore.subscribe(() => {
+        for (const { completion, addsToMap } of openCompletionsRef.current.values()) {
+          if (!!builderAddFor(completion.mapId) !== addsToMap) showCompletion(completion);
+        }
+      }),
+    [showCompletion],
+  );
 
   useEffect(() => {
     if (!job) return;
@@ -121,67 +206,17 @@ export function AnalysisJobWatcher() {
         // is what makes it one across tabs.
         const toastId = `analysis-job-${job.jobId}`;
         if (status === 'complete') {
-          const datasetId = data?.dataset_id;
-          const canAddToMap =
-            !!analysisAddToMap.current && analysisAddToMap.mapId === job.mapId;
-          // Sonner dismisses a toast when its action is clicked, but the exit
-          // animation leaves a window for a second click — and the panel's own
-          // "Add to map" button is a second affordance for the same add.
-          // fix(#833): the single-use guard is the SHARED useAnalysisAddedStore
-          // (it used to be a local flag per affordance, so toast + panel button
-          // together added the layer twice); the add itself stays repeatable
-          // elsewhere (adding a dataset twice is legitimate).
-          toast.success(
-            job.title
+          showCompletion({
+            toastId,
+            message: job.title
               ? t('analysisTools.jobCompleteNamed', {
                   defaultValue: '“{{title}}” is ready',
                   title: job.title,
                 })
               : t('analysisTools.jobComplete', { defaultValue: 'Dataset created' }),
-            {
-              id: toastId,
-              // fix(#725): the default bottom-right placement lands exactly on
-              // the rail panel's own "Add to map" button, and with an infinite
-              // duration the overlap is permanent, leaving the button visible
-              // but unclickable. When a builder for this map is mounted, raise
-              // the notification top-center, clear of the right rail; everywhere
-              // else the default corner stays.
-              position: canAddToMap ? ('top-center' as const) : undefined,
-              // A long job lands when attention has moved on, so the default 4s
-              // notification is one the user is likely to miss entirely. The
-              // Toaster is configured with closeButton, so this stays until
-              // acknowledged.
-              duration: Infinity,
-              action: datasetId
-                ? {
-                    label: canAddToMap
-                      ? t('analysisTools.addToMap', { defaultValue: 'Add to map' })
-                      : t('analysisTools.viewDataset', { defaultValue: 'View dataset' }),
-                    onClick: () => {
-                      // Re-check: the builder may have unmounted since this toast
-                      // was raised.
-                      if (
-                        analysisAddToMap.current &&
-                        analysisAddToMap.mapId === job.mapId
-                      ) {
-                        const added = useAnalysisAddedStore.getState();
-                        if (
-                          added.addedDatasetIds.includes(datasetId) ||
-                          added.pendingAddIds.includes(datasetId)
-                        ) {
-                          return;
-                        }
-                        added.markPending(datasetId);
-                        analysisAddToMap.current(datasetId);
-                      } else {
-                        // View-dataset path: navigation is idempotent, no guard.
-                        navigate(`/datasets/${datasetId}`);
-                      }
-                    },
-                  }
-                : undefined,
-            },
-          );
+            datasetId: data?.dataset_id ?? null,
+            mapId: job.mapId,
+          });
           // The backend persists a collision note (e.g. the output was renamed
           // to avoid clobbering an existing dataset) in warning_message; surface
           // it beside the success toast, mirroring the upload path's
@@ -199,21 +234,28 @@ export function AnalysisJobWatcher() {
           // another tab, or from the dataset's owner or an admin cancelling
           // a run this user started, and the panel is about to re-enable
           // with no other explanation of why the run stopped.
+          //
+          // The stale sweep also settles an abandoned run as `cancelled`
+          // with a code, not a title-worthy deliberate cancel, so a coded
+          // reason takes priority over the named/generic text below it.
           toast.info(
-            job.title
-              ? t('analysisTools.jobCancelledNamed', {
-                  defaultValue: '“{{title}}” was cancelled',
-                  title: job.title,
-                })
-              : t('analysisTools.jobCancelled', {
-                  defaultValue: 'Analysis run cancelled',
-                }),
+            fixedFailureReason(data?.error_code) ??
+              (job.title
+                ? t('analysisTools.jobCancelledNamed', {
+                    defaultValue: '“{{title}}” was cancelled',
+                    title: job.title,
+                  })
+                : t('analysisTools.jobCancelled', {
+                    defaultValue: 'Analysis run cancelled',
+                  })),
             { id: toastId },
           );
         } else {
           // fix(#1953): the coded reason is not a detail worth showing.
           const reason = data?.error_message;
-          const message = reason === INTERNAL_FAILURE_REASON ? null : reason;
+          const message =
+            fixedFailureReason(data?.error_code) ??
+            (reason === INTERNAL_FAILURE_REASON ? null : reason);
           // Interpolate the detail through i18n rather than concatenating onto
           // t(): check:i18n:toast-strings flags any toast call whose first
           // argument opens with a quote or backtick, template literals included.
@@ -269,6 +311,7 @@ export function AnalysisJobWatcher() {
     navigate,
     claimCompletion,
     clearJobIfCurrent,
+    showCompletion,
     t,
   ]);
 

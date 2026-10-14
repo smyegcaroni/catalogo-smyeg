@@ -2,6 +2,7 @@
 
 import hashlib
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from time import monotonic
 from collections.abc import Mapping
@@ -13,6 +14,7 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.core.config import settings
 from app.core.dependencies import get_db
@@ -21,8 +23,10 @@ from app.modules.auth.models import ApiKey, User
 from app.modules.auth.permissions import get_user_roles
 from app.platform.extensions import get_identity_extension, get_permission_extension
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
-oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+oauth2_scheme_optional = OAuth2PasswordBearer(
+    tokenUrl="/api/auth/login", auto_error=False
+)
 log = structlog.get_logger()
 
 
@@ -289,7 +293,9 @@ async def _resolve_api_key(request: Request, db: AsyncSession) -> User | None:
                 .values(last_used_at=now)
             )
             await side_session.commit()
-        api_key_obj.last_used_at = now
+        # Recorded as already committed: a pending change here would be
+        # written again by any later commit on `db`, maybe over a newer bump.
+        set_committed_value(api_key_obj, "last_used_at", now)
     # fix(#875): least-privilege scope enforced HERE — the one chokepoint
     # every API-key lane passes through (header, deprecated query, every
     # optional-user router). Must RAISE, not return None, or a scope
@@ -326,6 +332,38 @@ def request_carries_credentials(request: Request) -> bool:
     request that should have been served anonymously.
     """
     return bool(request.headers.get("Authorization") or _supplied_api_key(request))
+
+
+@dataclass(frozen=True, slots=True)
+class ReadCredential:
+    """The credential a read authenticates with, in a form a dedupe may key on.
+
+    ``fingerprint`` is a SHA-256 digest of the credential, never the
+    credential itself.
+    """
+
+    kind: str
+    fingerprint: str
+
+
+def read_credential(request: Request) -> ReadCredential:
+    """The credential this read authenticates with, from its headers and query alone.
+
+    It covers the whole Authorization header rather than a parsed bearer
+    token, so two different headers never share a fingerprint.
+    """
+    api_key = _supplied_api_key(request) or ""
+    authorization = request.headers.get("Authorization") or ""
+    if api_key and authorization:
+        kind = "api_key+authorization"
+    elif api_key:
+        kind = "api_key"
+    elif authorization:
+        kind = "authorization"
+    else:
+        kind = "anonymous"
+    material = "\0".join((kind, api_key, authorization))
+    return ReadCredential(kind, hashlib.sha256(material.encode()).hexdigest())
 
 
 def reject_unresolvable_credentials(request: Request, user: Identity | None) -> None:

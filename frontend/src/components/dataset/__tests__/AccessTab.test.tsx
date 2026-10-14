@@ -8,7 +8,7 @@ import { useCanSetPublicVisibility, useTileConfig } from '@/hooks/use-settings';
 import { listKeywords } from '@/api/records';
 import { toast } from 'sonner';
 import { AccessTab } from '../tabs/AccessTab';
-import type { DatasetResponse } from '@/types/api';
+import type { DatasetResponse, RecordType } from '@/types/api';
 
 vi.mock('@/components/dataset/hooks/use-records', () => ({
   useDistributions: vi.fn(),
@@ -157,7 +157,9 @@ describe('AccessTab', () => {
   it('renders a distribution-backed OGC snippet and csv-only export for table datasets', () => {
     render(<AccessTab dataset={makeDataset()} />);
 
-    expect(screen.getByText('Access via API')).toBeInTheDocument();
+    expect(screen.getByText('Connect with QGIS, Python, or curl')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Download another format' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Export' })).not.toBeInTheDocument();
 
     const codeBlock = document.querySelector('pre');
     expect(codeBlock).not.toBeNull();
@@ -173,6 +175,10 @@ describe('AccessTab', () => {
   });
 
   it('hides the API snippet for raster datasets that do not expose OGC features', () => {
+    mockUseDistributions.mockReturnValue({
+      data: { distributions: [], total: 0 },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useDistributions>);
     render(
       <AccessTab
         dataset={makeDataset({
@@ -189,8 +195,151 @@ describe('AccessTab', () => {
       />,
     );
 
-    expect(screen.queryByText('Access via API')).not.toBeInTheDocument();
+    expect(screen.queryByText('Connect with QGIS, Python, or curl')).not.toBeInTheDocument();
+    expect(screen.getByText('No additional downloads or services are listed here.')).toBeInTheDocument();
+    expect(screen.getByText('https://tiles.example.com/{z}/{x}/{y}.png')).toBeInTheDocument();
   });
+
+  describe('a tileset', () => {
+    const tilesetDataset = makeDataset({
+      record_type: 'tiles3d_dataset',
+      tileset: {
+        url: '/api/datasets/ds-1/tiles3d/tileset.json',
+        size_bytes: 1024,
+        version: '1.1',
+        geometric_error: 16,
+        bounding_volume: 'region',
+      },
+    });
+    const noDistributions = {
+      data: { distributions: [], total: 0 },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useDistributions>;
+
+    it('gets its client URL and no API snippet, export or empty access points', () => {
+      mockUseDistributions.mockReturnValue(noDistributions);
+      render(<AccessTab dataset={tilesetDataset} />);
+
+      expect(screen.getByRole('heading', { name: 'Load in a 3D Tiles client' })).toBeInTheDocument();
+      expect(
+        screen.getByText(`${window.location.origin}/api/datasets/ds-1/tiles3d/tileset.json`),
+      ).toBeInTheDocument();
+      expect(screen.queryByRole('heading', { name: 'Downloads and connections' })).not.toBeInTheDocument();
+      expect(screen.queryByText('Connect with QGIS, Python, or curl')).not.toBeInTheDocument();
+      expect(screen.queryByRole('combobox', { name: 'Export format' })).not.toBeInTheDocument();
+    });
+
+    it('puts the key header in the snippet only for a tileset that is not public', () => {
+      mockUseDistributions.mockReturnValue(noDistributions);
+      const snippet = () => screen.getByText(/Cesium3DTileset\.fromUrl/).textContent;
+      const { unmount } = render(<AccessTab dataset={tilesetDataset} />);
+      expect(snippet()).not.toContain('X-Api-Key');
+      unmount();
+
+      render(<AccessTab dataset={{ ...tilesetDataset, visibility: 'restricted' }} />);
+      expect(snippet()).toContain('headers: { "X-Api-Key": "YOUR_API_KEY" }');
+    });
+
+    it('keeps the access points when it has distributions', () => {
+      render(<AccessTab dataset={tilesetDataset} />);
+
+      expect(screen.getByRole('heading', { name: 'Downloads and connections' })).toBeInTheDocument();
+    });
+
+    it('leaves the access points of other record types alone when they have no distributions', () => {
+      mockUseDistributions.mockReturnValue(noDistributions);
+      render(<AccessTab dataset={makeDataset()} />);
+
+      expect(screen.getByRole('heading', { name: 'Downloads and connections' })).toBeInTheDocument();
+    });
+  });
+
+  it('offers no API snippet or export for an unknown record type', () => {
+    render(<AccessTab dataset={makeDataset({ record_type: 'hologram_dataset' as RecordType })} />);
+
+    expect(screen.queryByText('Connect with QGIS, Python, or curl')).not.toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: 'Export format' })).not.toBeInTheDocument();
+  });
+  describe('vector tile service URL', () => {
+    const tilesDistribution = {
+      id: 'tiles-1',
+      record_id: 'rec-1',
+      distribution_type: 'vector_tiles',
+      format: 'pbf',
+      url: '/tiles/data.public_parks/{z}/{x}/{y}.pbf',
+      title: 'Vector Tiles',
+      description: null,
+      protocol: 'XYZ',
+      media_type: 'application/vnd.mapbox-vector-tile',
+      is_primary: false,
+      auto_generated: true,
+    };
+
+    beforeEach(() => {
+      mockUseDistributions.mockReturnValue({
+        data: { distributions: [tilesDistribution], total: 1 },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useDistributions>);
+    });
+
+    it('lists the tile service for a public dataset', () => {
+      render(<AccessTab dataset={makeDataset({ visibility: 'public' })} />);
+      expect(screen.getByText('Tile Services')).toBeInTheDocument();
+    });
+
+    it('shows a public dataset the plain tile URL and no key hint', () => {
+      render(<AccessTab dataset={makeDataset({ visibility: 'public', record_type: 'vector_dataset' })} />);
+      expect(screen.getByText(/\/tiles\/data\.public_parks\/\{z\}\/\{x\}\/\{y\}\.pbf$/)).toBeInTheDocument();
+      expect(screen.queryByText(/In QGIS, add a Vector Tiles connection/)).not.toBeInTheDocument();
+    });
+
+    it.each(['internal', 'restricted', 'private'] as const)(
+      'lists the tile service with a key placeholder and a QGIS hint for a %s dataset',
+      (visibility) => {
+        render(<AccessTab dataset={makeDataset({ visibility, record_type: 'vector_dataset' })} />);
+        expect(screen.getByText('Tile Services')).toBeInTheDocument();
+        expect(
+          screen.getByText(/\/tiles\/data\.public_parks\/\{z\}\/\{x\}\/\{y\}\.pbf\?api_key=\{your_key\}$/),
+        ).toBeInTheDocument();
+        expect(screen.getByText(/In QGIS, add a Vector Tiles connection/)).toBeInTheDocument();
+      },
+    );
+
+    it('keeps an externally hosted tile service on a non-public dataset', () => {
+      mockUseDistributions.mockReturnValue({
+        data: {
+          distributions: [
+            tilesDistribution,
+            { ...tilesDistribution, id: 'tiles-2', title: 'Partner Tiles', url: 'https://tiles.example.org/{z}/{x}/{y}.pbf' },
+          ],
+          total: 2,
+        },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useDistributions>);
+      render(<AccessTab dataset={makeDataset({ visibility: 'private' })} />);
+      expect(screen.getByText('https://tiles.example.org/{z}/{x}/{y}.pbf')).toBeInTheDocument();
+    });
+
+    it('keeps an external tile service even when it uses the same path as GeoLens', () => {
+      mockUseDistributions.mockReturnValue({
+        data: {
+          distributions: [
+            { ...tilesDistribution, id: 'tiles-3', title: 'Mirror Tiles', url: 'https://partner.example/api/tiles/data.parks/{z}/{x}/{y}.pbf' },
+          ],
+          total: 1,
+        },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useDistributions>);
+      render(<AccessTab dataset={makeDataset({ visibility: 'private' })} />);
+      expect(screen.getByText('https://partner.example/api/tiles/data.parks/{z}/{x}/{y}.pbf')).toBeInTheDocument();
+    });
+
+    it('names the endpoints that accept an API key or bearer token', () => {
+      render(<AccessTab dataset={makeDataset({ visibility: 'private' })} />);
+      expect(screen.getByText(/Downloads, OGC Features and vector tile endpoints accept/)).toBeInTheDocument();
+    });
+  });
+
   // fix(#927): visibility was read-only after import — the only way to publish a
   // private dataset was to re-import it.
   describe('visibility control', () => {

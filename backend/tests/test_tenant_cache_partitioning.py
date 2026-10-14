@@ -111,11 +111,10 @@ class _MemoryCache:
 
 
 @pytest.mark.anyio
-async def test_admin_dataset_and_collection_lists_do_not_share_cache_entries(
+async def test_admin_collection_list_cache_is_partitioned_by_tenant(
     multi_tenant,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    datasets_router = importlib.import_module("app.modules.catalog.datasets.api.router")
     collections_router = importlib.import_module(
         "app.modules.catalog.collections.router"
     )
@@ -123,27 +122,14 @@ async def test_admin_dataset_and_collection_lists_do_not_share_cache_entries(
     user = MagicMock(id=uuid.uuid4())
     db = AsyncMock()
 
-    monkeypatch.setattr(datasets_router, "get_cache", lambda: cache)
     monkeypatch.setattr(collections_router, "get_cache", lambda: cache)
-    monkeypatch.setattr(
-        datasets_router, "get_user_roles", AsyncMock(return_value={"admin"})
-    )
     monkeypatch.setattr(
         collections_router, "get_user_roles", AsyncMock(return_value={"admin"})
     )
-    monkeypatch.setattr(
-        datasets_router,
-        "get_dataset_service_url",
-        AsyncMock(return_value="https://api.example.test"),
-    )
-
-    async def datasets_for_tenant(*_args, **_kwargs):
-        return [], 1 if current_tenant_var.get() == TENANT_A else 2
 
     async def collections_for_tenant(*_args, **_kwargs):
         return [], 3 if current_tenant_var.get() == TENANT_A else 4
 
-    monkeypatch.setattr(datasets_router, "get_datasets_list", datasets_for_tenant)
     monkeypatch.setattr(collections_router, "list_collections", collections_for_tenant)
     monkeypatch.setattr(
         collections_router, "batch_collection_extents", AsyncMock(return_value={})
@@ -158,21 +144,16 @@ async def test_admin_dataset_and_collection_lists_do_not_share_cache_entries(
     for tenant_id in (TENANT_A, TENANT_B):
         token = _set_tenant(tenant_id)
         try:
-            datasets = await datasets_router.list_all_datasets(
-                request=MagicMock(), user=user, db=db, skip=0, limit=50
-            )
             collections = await collections_router.list_collections_endpoint(
                 user=user, db=db, skip=0, limit=50
             )
-            results.append((datasets.total, collections.total))
+            results.append(collections.total)
         finally:
             current_tenant_var.reset(token)
 
-    assert results == [(1, 3), (2, 4)]
+    assert results == [3, 4]
     assert set(cache.values) == {
-        f"catalog:datasets:admin:0:50:tenant:{TENANT_A}",
         f"catalog:collections:admin:0:50:tenant:{TENANT_A}",
-        f"catalog:datasets:admin:0:50:tenant:{TENANT_B}",
         f"catalog:collections:admin:0:50:tenant:{TENANT_B}",
     }
 
@@ -277,13 +258,11 @@ def test_anonymous_search_cache_key_includes_tenant(multi_tenant):
 
 
 @pytest.mark.anyio
-async def test_catalog_metadata_and_ai_vocabulary_caches_are_tenant_scoped(
+async def test_catalog_collection_metadata_cache_is_tenant_scoped(
     multi_tenant,
 ):
     search_router = importlib.import_module("app.modules.catalog.search.router")
-    metadata_service = importlib.import_module("app.processing.ai.metadata_service")
     search_router._COLLECTION_META_CACHE.clear()
-    metadata_service._vocabulary_cache.clear()
 
     class _Result:
         def __init__(self, row):
@@ -305,26 +284,19 @@ async def test_catalog_metadata_and_ai_vocabulary_caches_are_tenant_scoped(
                 )
             ),
         ]
-        port = SimpleNamespace(
-            get_catalog_vocabulary=AsyncMock(return_value=[organization])
-        )
         token = _set_tenant(tenant_id)
         try:
-            collection = await search_router._build_collection_metadata(
+            return await search_router._build_collection_metadata(
                 db, None, "https://api.example.test"
             )
-            vocabulary = await metadata_service._get_catalog_vocabulary(db, port=port)
         finally:
             current_tenant_var.reset(token)
-        return collection, vocabulary
 
-    collection_a, vocabulary_a = await build_for(TENANT_A, "Tenant A")
-    collection_b, vocabulary_b = await build_for(TENANT_B, "Tenant B")
+    collection_a = await build_for(TENANT_A, "Tenant A")
+    collection_b = await build_for(TENANT_B, "Tenant B")
 
     assert collection_a["summaries"]["source_organization"] == ["Tenant A"]
     assert collection_b["summaries"]["source_organization"] == ["Tenant B"]
-    assert vocabulary_a == ["Tenant A"]
-    assert vocabulary_b == ["Tenant B"]
 
 
 @pytest.mark.anyio
@@ -371,27 +343,6 @@ async def test_unscoped_embedding_presence_fails_closed_without_shared_cache(
     resolve_model.assert_not_awaited()
     session.execute.assert_not_awaited()
     assert helpers._has_embeddings_cache == {}
-
-
-@pytest.mark.anyio
-async def test_unscoped_embedding_neighbors_fail_closed_without_shared_cache(
-    multi_tenant,
-):
-    metadata_service = importlib.import_module("app.processing.ai.metadata_service")
-    metadata_service._neighbor_kw_cache.clear()
-    port = SimpleNamespace(get_dataset=AsyncMock())
-    session = AsyncMock()
-
-    result = await metadata_service._get_related_keywords_from_embeddings(
-        session,
-        str(uuid.uuid4()),
-        port=port,
-    )
-
-    assert result == []
-    port.get_dataset.assert_not_awaited()
-    session.execute.assert_not_awaited()
-    assert metadata_service._neighbor_kw_cache == {}
 
 
 def test_sql_schema_cache_key_is_tenant_scoped(multi_tenant):

@@ -1,5 +1,5 @@
 import { useCallback, useMemo } from 'react';
-import { useDropzone, type FileRejection } from 'react-dropzone';
+import { useDropzone, ErrorCode, type FileError, type FileRejection } from 'react-dropzone';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { Upload } from 'lucide-react';
@@ -24,6 +24,12 @@ export function effectiveBatchLimit(remainingQuota: number | null | undefined): 
     : MAX_BATCH_FILES;
 }
 
+// Extensions the geospatial-files mode never takes, and the mode that does.
+const KIND_ONLY_MODES = [
+  { ext: '.3tz', modeKey: 'upload.kindTileset' },
+  { ext: '.laz', modeKey: 'upload.kindPointCloud' },
+];
+
 interface FileDropzoneProps {
   onFilesAccepted: (files: File[]) => void;
   allowedExtensions?: string[];
@@ -31,16 +37,22 @@ interface FileDropzoneProps {
   /** Remaining per-user dataset quota; null = unlimited. Caps the batch so the
    *  UI never offers more files than the user can actually create. */
   remainingQuota?: number | null;
+  /** The drop takes 3D Tiles tileset archives rather than geospatial files. */
+  tileset?: boolean;
+  /** The drop takes COPC point clouds. */
+  pointcloud?: boolean;
+  /** Mode-only extensions the instance allows; only these get a "choose that mode" hint. */
+  enabledKindOnlyExtensions?: string[];
 }
 
 /** Group deduped extensions by data kind for the format pills */
-function groupByKind(extensions: string[]): { kind: DataKind; ext: string }[] {
+function groupByKind(extensions: string[], only?: DataKind): { kind: DataKind; ext: string }[] {
   const deduped = deriveFormatBadges(extensions);
-  const order: DataKind[] = ['vector', 'raster', 'table'];
+  const order: DataKind[] = only ? [only] : ['vector', 'raster', 'table'];
   const groups = new Map<DataKind, string[]>();
 
   for (const ext of deduped) {
-    const kind = kindFromExtension(ext);
+    const kind = only ?? kindFromExtension(ext);
     if (!groups.has(kind)) groups.set(kind, []);
     groups.get(kind)!.push(ext);
   }
@@ -54,7 +66,7 @@ function groupByKind(extensions: string[]): { kind: DataKind; ext: string }[] {
   return result;
 }
 
-export function FileDropzone({ onFilesAccepted, allowedExtensions, maxSizeMb, remainingQuota }: FileDropzoneProps) {
+export function FileDropzone({ onFilesAccepted, allowedExtensions, maxSizeMb, remainingQuota, tileset = false, pointcloud = false, enabledKindOnlyExtensions = [] }: FileDropzoneProps) {
   const { t } = useTranslation('import');
 
   // Client-side UX guard only; the cap is enforced server-side at
@@ -65,22 +77,58 @@ export function FileDropzone({ onFilesAccepted, allowedExtensions, maxSizeMb, re
     if (!allowedExtensions || allowedExtensions.length === 0) return undefined;
     return buildAcceptMap(allowedExtensions);
   }, [allowedExtensions]);
+  // An empty list allows nothing; only a list not yet known accepts every file.
+  const rejectAll = allowedExtensions?.length === 0;
 
   const formatPills = useMemo(() => {
     if (!allowedExtensions || allowedExtensions.length === 0) return [];
-    return groupByKind(allowedExtensions);
-  }, [allowedExtensions]);
+    return groupByKind(allowedExtensions, tileset ? 'tiles3d' : pointcloud ? 'pointcloud' : undefined);
+  }, [allowedExtensions, tileset, pointcloud]);
+
+  // react-dropzone's own FileError.message is English-only. rejectAll's
+  // validator (below) already builds a translated file-invalid-type message;
+  // every other code is the library's own built-in check, mapped here.
+  const rejectionReason = useCallback((error: FileError): string => {
+    switch (error.code) {
+      case ErrorCode.FileInvalidType:
+        return rejectAll
+          ? t('dropzone.unsupportedType')
+          : t('dropzone.rejectionReason.fileInvalidType', { types: allowedExtensions?.join(', ') ?? '' });
+      case ErrorCode.FileTooLarge:
+        return maxSizeMb != null
+          ? t('dropzone.rejectionReason.fileTooLarge', { size: maxSizeMb })
+          : error.message;
+      case ErrorCode.FileTooSmall:
+        return t('dropzone.rejectionReason.fileTooSmall');
+      case ErrorCode.TooManyFiles:
+        return t('dropzone.rejectionReason.tooManyFiles', { max: effectiveMaxFiles });
+      default:
+        return error.message;
+    }
+  }, [t, rejectAll, allowedExtensions, maxSizeMb, effectiveMaxFiles]);
 
   const onDropRejected = useCallback((rejections: FileRejection[]) => {
     for (const { file, errors } of rejections) {
-      const reason = errors.map((e) => e.message).join(', ');
+      const kindOnly = !tileset && !pointcloud && errors.some((e) => e.code === ErrorCode.FileInvalidType)
+        ? KIND_ONLY_MODES.find(({ ext }) => file.name.toLowerCase().endsWith(ext) && enabledKindOnlyExtensions.includes(ext))
+        : undefined;
+      const reason = (kindOnly
+        ? [
+            t('dropzone.rejectionReason.kindOnly', { ext: kindOnly.ext, mode: t(kindOnly.modeKey) }),
+            ...errors.filter((e) => e.code !== ErrorCode.FileInvalidType).map(rejectionReason),
+          ]
+        : errors.map(rejectionReason)
+      ).join(', ');
       toast.error(t('dropzone.fileRejected', { filename: file.name, reason }));
     }
-  }, [t]);
+  }, [t, rejectionReason, tileset, pointcloud, enabledKindOnlyExtensions]);
 
   const { getRootProps, getInputProps, isDragActive, isDragReject } =
     useDropzone({
       accept,
+      validator: rejectAll
+        ? () => ({ code: 'file-invalid-type', message: t('dropzone.unsupportedType') })
+        : undefined,
       maxFiles: effectiveMaxFiles,
       maxSize: maxSizeMb ? maxSizeMb * 1024 * 1024 : undefined,
       multiple: true,
@@ -132,10 +180,12 @@ export function FileDropzone({ onFilesAccepted, allowedExtensions, maxSizeMb, re
       </h3>
 
       <p className="mb-5 text-xs text-muted-foreground">
-        {t('dropzone.subtext', {
-          max: effectiveMaxFiles,
-          defaultValue: 'GeoLens will detect geometry, CRS, and schema before committing to the catalog. Batches up to {{max}} files.',
-        })}
+        {tileset
+          ? t('dropzone.tilesetSubtext')
+          : t('dropzone.subtext', {
+              max: effectiveMaxFiles,
+              defaultValue: 'GeoLens will detect geometry, CRS, and schema before committing to the catalog. Batches up to {{max}} files.',
+            })}
       </p>
 
       {/* Format pills */}

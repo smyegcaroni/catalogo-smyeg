@@ -2,6 +2,7 @@ import { render, screen } from '@/test/test-utils';
 import userEvent from '@testing-library/user-event';
 import { ExportButton } from '../ExportButton';
 import { downloadExport } from '@/api/datasets';
+import type { RecordType } from '@/types/api';
 
 vi.mock('@/api/datasets', () => ({
   downloadExport: vi.fn(),
@@ -94,5 +95,19 @@ describe('ExportButton', () => {
     const options = await screen.findAllByRole('option');
     expect(options).toHaveLength(1);
     expect(options[0]).toHaveTextContent('CSV');
+  });
+
+  it('offers no export for an unknown record type', () => {
+    render(<ExportButton datasetId="ds-1" datasetName="test" recordType={'hologram_dataset' as RecordType} />);
+
+    expect(screen.queryByRole('combobox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  });
+
+  it.each(['tiles3d_dataset', 'pointcloud_dataset'] as const)('offers no export for a %s', (recordType) => {
+    render(<ExportButton datasetId="ds-1" datasetName="test" recordType={recordType} />);
+
+    expect(screen.queryByRole('combobox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
   });
 });

@@ -19,6 +19,10 @@ from pydantic import (
 from app.core.edition import is_enterprise
 from app.core.text import normalize_nfc as _nfc
 from app.modules.catalog.maps.filter_grammar import validate_filter
+from app.modules.catalog.maps.publish_vocabulary import (
+    LABEL_CONFIG_DESCRIPTION,
+    STYLE_CONFIG_DESCRIPTION,
+)
 from app.modules.catalog.maps.sharing_policy import (
     SHARE_EXPIRATION_SELECTION_ERROR,
     ShareExpirationPresetDays,
@@ -659,19 +663,14 @@ class MapLayerInput(BaseModel):
     )
     filter: list | None = Field(default=None, description="MapLibre filter expression")
     label_config: dict | None = Field(
-        default=None, description="Text label configuration"
+        default=None, description=LABEL_CONFIG_DESCRIPTION
     )
     popup_config: PopupConfig | None = Field(
         default=None,
         description="Popup configuration: {enabled, expression, visible_fields}",
     )
     style_config: dict | None = Field(
-        default=None,
-        description=(
-            "Data-driven and builder UI style configuration. Builder-only state "
-            "lives under builder, e.g. fill_disabled, stroke_disabled, outline "
-            "settings, heatmap metadata, and height_column."
-        ),
+        default=None, description=STYLE_CONFIG_DESCRIPTION
     )
 
     _validate_paint = field_validator("paint")(_validate_maplibre_style_dict)
@@ -1165,6 +1164,7 @@ class MapSummaryResponse(BaseModel):
     created_by_username: str | None = None
     created_at: datetime
     updated_at: datetime
+    created_by: uuid.UUID | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -1229,6 +1229,9 @@ class SharedLayerResponse(BaseModel):
     # shared/embed viewer is the surface a license's display obligation most
     # needs to reach, since it is the one shown to people outside the instance.
     dataset_attribution: str | None = None
+    # Viewer parity with MapLayerResponse.dataset_extent_bbox: an RFC 7946
+    # bbox, with west > east on an antimeridian crossing.
+    dataset_extent_bbox: list[float] | None = None
 
 
 class SharedMapResponse(BaseModel):

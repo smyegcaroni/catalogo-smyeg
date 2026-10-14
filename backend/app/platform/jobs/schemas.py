@@ -81,6 +81,12 @@ class JobStatusResponse(BaseModel):
     dataset_id: uuid.UUID | None
     source_filename: str | None
     error_message: str | None
+    error_code: str | None = Field(
+        default=None,
+        description="Stable code for a fixed failure reason, so a client can show "
+        "it in the reader's language; `error_message` keeps its English text. "
+        "Null when the reason is free text.",
+    )
     # Computed by ``_job_to_status_response``; required in OpenAPI so
     # generated clients match the hand-maintained frontend boundary type.
     can_retry: bool
@@ -120,6 +126,12 @@ class JobStatusResponse(BaseModel):
     # backfill after a FORCE run). Read from generic `user_metadata["rows_failed"]`.
     rows_failed: Annotated[int, Field(ge=0)] | None = None
     archive_failed: bool = False
+    quicklook_pending: bool = Field(
+        default=False,
+        description="True while the dataset's quicklook image is still owed after "
+        "publication, so a client showing the thumbnail can poll again until the "
+        "image has been replaced.",
+    )
     # TYPE-3: the temporal parser only ever emits these two keys; pin the
     # shape so adding a third key requires touching the contract deliberately.
     temporal_parse_errors: dict[Literal["temporal_start", "temporal_end"], str] = Field(

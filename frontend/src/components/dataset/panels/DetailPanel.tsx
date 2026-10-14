@@ -3,13 +3,15 @@ import { useTranslation } from 'react-i18next';
 import type { DatasetResponse } from '@/types/api';
 import type { DatasetEditCapabilities } from '@/components/dataset/hooks/use-dataset-edit-capabilities';
 import type { PendingDraftField } from '@/components/dataset/hooks/use-draft-editing';
-import type { DatasetRefreshWatch } from '@/components/dataset/hooks/use-dataset';
+import { useDatasetRefreshRuns, type DatasetRefreshWatch } from '@/components/dataset/hooks/use-dataset';
+import { useDatasetSync } from '@/components/dataset/hooks/use-dataset-sync';
+import { useEdition } from '@/hooks/use-edition';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { OverviewTab } from '../tabs/OverviewTab';
 import { MetadataTab } from '../tabs/MetadataTab';
 import { DataTab } from '../tabs/DataTab';
 import { StructureTab } from '../tabs/StructureTab';
-import { SourcePanel } from '../SourcePanel';
+import { SourcePanel, type BlockedRunToAccept } from '../SourcePanel';
 import { REFRESHABLE_ORIGINS, SourceRefreshAction } from '../SourceRefreshAction';
 import { datasetOrigin } from '../OriginBadge';
 import { AccessTab } from '../tabs/AccessTab';
@@ -70,7 +72,13 @@ export function DetailPanel(props: DetailPanelProps) {
   // dispatch table.
   const origin = dataset.origin ?? datasetOrigin(dataset);
   const canRefresh = origin != null && REFRESHABLE_ORIGINS.has(origin);
-  const [acceptBlockedRunId, setAcceptBlockedRunId] = useState<string>();
+  const [acceptBlockedRun, setAcceptBlockedRun] = useState<BlockedRunToAccept>();
+  const { features } = useEdition();
+  const scheduledSync = useDatasetSync(dataset.id, features.includes('scheduled_sync'));
+  // This observer stays mounted while switching Sources and Data tabs. It shares
+  // the refresh-runs cache with the page watch so runs begun by the scheduler
+  // are detected even if the source card is not currently mounted.
+  useDatasetRefreshRuns(dataset.id, { limit: 1, pollWhenScheduled: Boolean(scheduledSync.data) });
 
   const showData = isVector;
   const showStructure = isVector;
@@ -100,7 +108,10 @@ export function DetailPanel(props: DetailPanelProps) {
 
   return (
     <Tabs value={effectiveTab} onValueChange={onTabChange}>
-      <TabsList className="w-full sticky top-0 z-20 bg-background border-b">
+      <TabsList
+        className="w-full"
+        wrapperClassName="sticky top-[calc(3.5rem+env(safe-area-inset-top))] z-20 bg-background border-b"
+      >
         <TabsTrigger value="overview">{t('tabs.overview')}</TabsTrigger>
         <TabsTrigger value="metadata">{t('tabs.metadata')}</TabsTrigger>
         {showData && <TabsTrigger value="data">{t('tabs.data')}</TabsTrigger>}
@@ -131,6 +142,7 @@ export function DetailPanel(props: DetailPanelProps) {
           onDraftSave={stagePendingDraft}
           onDraftDirtyChange={handleDraftDirtyChange}
           onNavigateToValidationField={onNavigateToValidationField}
+          refreshWatch={refreshWatch}
         />
       </TabsContent>
 
@@ -162,15 +174,19 @@ export function DetailPanel(props: DetailPanelProps) {
           dataset={dataset}
           canEdit={canEdit}
           refreshBusy={refreshWatch.isBusy}
-          onAcceptBlockedRun={setAcceptBlockedRunId}
+          onAcceptBlockedRun={setAcceptBlockedRun}
+          onSyncRunDispatched={refreshWatch.trackDispatchedRun}
           actions={
-            canEdit && canRefresh
+            // A held-back file replacement can be accepted on any dataset,
+            // including one with no source to refresh from.
+            canEdit && (canRefresh || acceptBlockedRun?.upload)
               ? (
                 <SourceRefreshAction
                   dataset={dataset}
                   watch={refreshWatch}
-                  acceptBlockedRunId={acceptBlockedRunId}
-                  onAcceptHandled={() => setAcceptBlockedRunId(undefined)}
+                  showTrigger={canRefresh}
+                  acceptBlockedRun={acceptBlockedRun}
+                  onAcceptHandled={() => setAcceptBlockedRun(undefined)}
                 />
               )
               : undefined

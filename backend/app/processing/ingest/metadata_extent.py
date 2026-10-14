@@ -18,6 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.geo import seam_extent_wkt_for_table
+from app.platform.timestamptz_text import utc_timestamptz_text
 from app.processing.ingest.metadata_sql import (
     _qtable,
     _sql_quote_ident,
@@ -70,6 +71,33 @@ async def get_table_srid(
     return int(row) if row is not None else None
 
 
+async def get_declared_srid(
+    session: AsyncSession, table_name: str, schema: str = "data"
+) -> int | None:
+    """The SRID PostGIS reports for a geometry ``geom`` column the session can read.
+
+    0 when it reports none: an SRID of 0, or a column ``geometry_columns``
+    does not list, such as a domain over geometry, where
+    :func:`get_table_srid` raises. None when there is no such column or the
+    session cannot read the table.
+    """
+    _validate_table_name(table_name)
+    _validate_table_name(schema)
+    return await session.scalar(
+        text(
+            "SELECT COALESCE(gc.srid, 0) FROM pg_attribute a "
+            "JOIN pg_type t ON t.oid = a.atttypid "
+            "LEFT JOIN geometry_columns gc ON gc.f_table_schema = :schema "
+            "AND gc.f_table_name = :t AND gc.f_geometry_column = 'geom' "
+            "WHERE a.attrelid = to_regclass("
+            "format('%I.%I', CAST(:schema AS text), CAST(:t AS text))) "
+            "AND a.attname = 'geom' AND NOT a.attisdropped "
+            "AND 'geometry'::regtype IN (t.oid, t.typbasetype) "
+            "AND has_table_privilege(a.attrelid, 'SELECT')"
+        ).bindparams(schema=schema, t=table_name)
+    )
+
+
 # Phase 1057 WFS-04: map abstract OGC GML 3 geometry types (returned by
 # PostGIS GeometryType() when the source WFS stores them, e.g. GeoServer's
 # opengeo:countries) to the closest concrete subtype, since
@@ -92,14 +120,16 @@ _ABSTRACT_TO_CONCRETE_GEOMETRY_TYPE: dict[str, str] = {
 
 
 def _normalize_geometry_type(value: str | None) -> str | None:
-    """Normalize abstract OGC geometry type names to concrete subtypes.
+    """Normalize a PostGIS geometry type name to the catalog's plain form.
 
-    Returns the uppercased input unchanged when it is already a concrete
-    type, ``None`` when the input is ``None`` or empty.
+    Drops the ``M`` PostGIS appends to a measured (XYM) type, then maps an
+    abstract OGC name to its closest concrete subtype. ``None`` when the input
+    is ``None`` or empty.
     """
     if not value:
         return None
-    upper = value.upper()
+    # No OGC type name ends in M, so this removes only the XYM suffix.
+    upper = value.upper().removesuffix("M")
     return _ABSTRACT_TO_CONCRETE_GEOMETRY_TYPE.get(upper, upper)
 
 
@@ -117,11 +147,57 @@ async def get_geometry_type(
         text(
             # codeql[py/sql-injection] fix(#1615): identifiers validated by _qtable (metadata_sql.py)
             f"SELECT GeometryType(geom) FROM "
-            f"{_qtable(table_name, schema=schema)} LIMIT 1"
+            f"{_qtable(table_name, schema=schema)} WHERE geom IS NOT NULL LIMIT 1"
         )
     )
     value = result.scalar_one_or_none()
     return _normalize_geometry_type(value)
+
+
+async def get_geometry_types(
+    session: AsyncSession, table_name: str, *, schema: str = "data"
+) -> list[str] | None:
+    """Return every distinct geometry type in the table, normalized and sorted.
+
+    ``None`` when the table has no geometry column; empty when it has one but
+    no row holds a non-empty geometry.
+    """
+    if not await _table_has_geometry(session, table_name, schema=schema):
+        return None
+    result = await session.execute(
+        text(
+            # codeql[py/sql-injection] fix(#1615): identifiers validated by _qtable (metadata_sql.py)
+            f"SELECT DISTINCT GeometryType(geom) FROM "
+            f"{_qtable(table_name, schema=schema)} "
+            "WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom)"
+        )
+    )
+    return sorted({_normalize_geometry_type(value) for value in result.scalars()})
+
+
+async def _generic_column_type(
+    session: AsyncSession, sampled: str | None, table_name: str, schema: str
+) -> str | None:
+    """``sampled``, corrected for a ``geom`` column declared as generic GEOMETRY.
+
+    The generic type when the non-empty rows span several kinds. A multi-part
+    row and its single-part form count as one kind, so a file mixing POLYGON
+    and MULTIPOLYGON still reports a concrete type: the sampled one when some
+    row has it, since the sampled row may be empty.
+    """
+    declared = await session.scalar(
+        text(
+            "SELECT type FROM geometry_columns "
+            "WHERE f_table_schema = :schema AND f_table_name = :t "
+            "AND f_geometry_column = 'geom'"
+        ).bindparams(schema=schema, t=table_name)
+    )
+    if _normalize_geometry_type(declared) != "GEOMETRY":
+        return sampled
+    types = await get_geometry_types(session, table_name, schema=schema) or []
+    if len({t.removeprefix("MULTI") for t in types}) > 1:
+        return "GEOMETRY"
+    return sampled if sampled in types or not types else types[0]
 
 
 async def get_feature_count(
@@ -204,10 +280,11 @@ async def detect_3d_metadata(
 ) -> dict:
     """Detect 3D geometry properties from a PostGIS table.
 
-    Uses ``ST_NDims`` to determine whether any geometry is 3D and
-    ``ST_3DExtent`` to derive z-range metadata.
-    Returns dict with keys: is_3d, n_dims, z_min, z_max.
-    All values are None if the table has no geometry or no rows.
+    ``is_3d`` comes from ``ST_Zmflag`` (2 = Z, 3 = ZM), not from a raw
+    dimension count: an XYM row also has 3 ordinates but no Z. ``ST_NDims``
+    still gives the raw dimension count, and ``ST_3DExtent`` derives the
+    z-range for rows that do have Z. Returns dict with keys: is_3d, n_dims,
+    z_min, z_max. All values are None if the table has no geometry or no rows.
     """
     _validate_table_name(table_name)
 
@@ -223,21 +300,20 @@ async def detect_3d_metadata(
                 # codeql[py/sql-injection] fix(#1615): identifiers validated by _qtable (metadata_sql.py)
                 f"SELECT "
                 f"  MAX(ST_NDims(geom)) AS n_dims, "
+                f"  BOOL_OR(ST_Zmflag(geom) IN (2, 3)) AS has_z, "
                 f"  CASE "
-                f"    WHEN MAX(ST_NDims(geom)) > 2 THEN ST_3DExtent(geom)::text "
+                f"    WHEN BOOL_OR(ST_Zmflag(geom) IN (2, 3)) THEN ST_3DExtent(geom)::text "
                 f"    ELSE NULL "
                 f"  END AS extent_3d "
                 f"FROM {_qtable(table_name, schema=schema)} "
                 f"WHERE geom IS NOT NULL"
             )
         )
-    except (
-        Exception
-    ):  # broad: ST_NDims/ST_3DExtent may not exist in older PostGIS; degrade gracefully
+    except Exception:  # broad: ST_NDims/ST_Zmflag/ST_3DExtent may not exist in older PostGIS; degrade gracefully
         logger.warning(
             "3d_metadata_detection_failed",
             table=table_name,
-            hint="ST_NDims or ST_3DExtent may not be available in this PostGIS version",
+            hint="ST_NDims, ST_Zmflag or ST_3DExtent may not be available in this PostGIS version",
         )
         return _NO_3D
 
@@ -246,7 +322,7 @@ async def detect_3d_metadata(
         return {"is_3d": False, "n_dims": 2, "z_min": None, "z_max": None}
 
     n_dims = row.n_dims if row.n_dims is not None else 2
-    is_3d = bool(n_dims and n_dims > 2)
+    is_3d = bool(row.has_z)
     z_min, z_max = _parse_box3d_z_bounds(row.extent_3d if is_3d else None)
 
     return {
@@ -404,7 +480,7 @@ async def get_sample_values(
     if not live_columns:
         return {}
 
-    candidates: list[tuple[str, str]] = []
+    candidates: list[tuple[str, str, str]] = []
     for col in column_info:
         col_name = col.get("name", "")
         col_type = col.get("type", "")
@@ -414,7 +490,12 @@ async def get_sample_values(
             continue
         if col_name not in live_columns:
             continue
-        candidates.append((col_name, _sql_quote_ident(col_name)))
+        quoted = _sql_quote_ident(col_name)
+        if col_type.lower() == "timestamp with time zone":
+            sample_expr = utc_timestamptz_text(quoted)
+        else:
+            sample_expr = f"{quoted}::text"
+        candidates.append((col_name, quoted, sample_expr))
 
     if not candidates:
         return {}
@@ -422,12 +503,12 @@ async def get_sample_values(
     # Tag each row with its column index; names are looked up by index on
     # the Python side so the SQL never embeds arbitrary identifiers as
     # literals in SELECT aliases.
-    select_cols = ", ".join(q for _, q in candidates)
+    select_cols = ", ".join(q for _, q, _ in candidates)
     union_branches: list[str] = []
-    for idx, (_, quoted) in enumerate(candidates):
+    for idx, (_, quoted, sample_expr) in enumerate(candidates):
         union_branches.append(
             f"(SELECT {idx} AS col_idx, val FROM "
-            f"(SELECT DISTINCT {quoted}::text AS val FROM sampled "
+            f"(SELECT DISTINCT {sample_expr} AS val FROM sampled "
             f"WHERE {quoted} IS NOT NULL LIMIT 10) s)"
         )
     union_sql = " UNION ALL ".join(union_branches)
@@ -561,7 +642,9 @@ async def extract_metadata(
             ).bindparams(schema=schema, t=table_name)
         )
         row = result.one()
-        geometry_type = _normalize_geometry_type(row.geometry_type)
+        geometry_type = await _generic_column_type(
+            session, _normalize_geometry_type(row.geometry_type), table_name, schema
+        )
         # fix(#934): emit the two-ring MULTIPOLYGON for a Pacific-crossing
         # source instead of storing the naive fold; see get_extent above.
         extent_wkt = row.extent_wkt
@@ -586,7 +669,12 @@ async def extract_metadata(
             exc_info=True,
         )
         srid = await get_table_srid(session, table_name, schema=schema)
-        geometry_type = await get_geometry_type(session, table_name, schema=schema)
+        geometry_type = await _generic_column_type(
+            session,
+            await get_geometry_type(session, table_name, schema=schema),
+            table_name,
+            schema,
+        )
         extent_wkt = await get_extent(session, table_name, schema=schema)
         feature_count = await get_feature_count(session, table_name, schema=schema)
         return {

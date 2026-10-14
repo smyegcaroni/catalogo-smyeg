@@ -12,20 +12,26 @@ Import domain service façades, never another domain's split internals (datasets
 
 Frontend API calls use `apiFetch()` in `frontend/src/api/client.ts`. Auth comes from `useAuthStore` (persisted as `geolens-auth`); outside React use `useAuthStore.getState().token`. Reuse `components/ui/`, TanStack Query and existing zustand stores.
 
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues using the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Triage uses the five default canonical label names. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Domain documentation uses the single-context layout. See `docs/agents/domain.md`.
+
 ## Working Principles
 
 - Inspect relevant code and the working tree; preserve unrelated edits. Build requested behavior with the smallest correct diff; avoid speculative features and unrelated refactors.
 - Prefer project helpers, standard library/native platform features, then installed dependencies. Add a dependency only when these cannot reasonably meet the need; explain why and update its manifest and lockfile together.
 - Avoid abstractions, factories and configuration without a current need. Keep one definition per domain fact; a small copy beats violating a layer boundary.
 - Preserve validation, authorization, SSRF defenses, accessibility and error handling that prevents data loss. Test non-trivial behavior, not implementation trivia.
-- Use `rg`/`rg --files` and bounded reads. Load detailed docs/skills when relevant; avoid dumping generated files or entire trees into context.
-
-### Subagents
-
-- Keep small or tightly coupled tasks local. Delegate bounded independent work; avoid duplicate exploration and unnecessary nested delegation.
-- Pass the objective, owned files, constraints, relevant paths and expected verification. Prefer a concise brief over full conversation history when supported; ensure applicable `AGENTS.md` instructions are available without copying them twice.
-- Tell workers they share the workspace: preserve others' edits and avoid overlapping ownership. Coordinate shared files and generated artifacts through the parent.
-- Request concise findings/changes, file references, checks/results and blockers. Reuse agents for follow-ups; the parent runs shared gates after integration, repeating only when changes or failures warrant it.
 
 ## Commands and Verification
 
@@ -35,7 +41,7 @@ Commands start at the repository root unless specified. Setup: [.github/CONTRIBU
 - Schema changes: `make migrate`, then `make alembic-check` against a compatible DB at migration heads.
 - Backend: `make test` / `make test-cov` use the API container. Python changes require `cd backend && uv run ruff check . && uv run ruff format --check .`. Coverage floor: 80%; McCabe limit: 15; `backend/pyproject.toml`'s `per-file-ignores` may only shrink.
 - Frontend: `cd frontend && API_PROXY_TARGET=http://localhost:8001 npm run dev`. Gates: `npm run build && npm run lint && npm run typecheck && npm run test:coverage` from `frontend/`; `npx tsc --noEmit` does not check this project. Focused test: `npx vitest run src/path/foo.test.ts`.
-- E2E needs a running stack: `npm run e2e` / `npm run e2e:smoke`; focused: `npx playwright test e2e/foo.spec.ts --project=chromium`. Run relevant smoke groups for user-flow changes; see the contributor guide.
+- E2E needs a running stack: `npm run e2e` / `npm run e2e:smoke`; focused: `npx playwright test e2e/foo.spec.ts --project=chromium`. Run relevant smoke groups for user-flow changes; see the contributor guide. For a manual browser check through the Playwright MCP (sign-in, locators, screenshots, cleanup), read `docs/agents/browser-smoke.md`.
 - Contracts: `make openapi-check`, `make sdks-check` (regenerates files), `make cli-test` (includes DB integration), `make mcp-test`.
 - Versions: `make bump VERSION=X.Y.Z`; never edit versions individually. Gate: `make version-check`.
 
@@ -98,11 +104,11 @@ Invalid supplied credentials must not silently become anonymous access; preserve
 GDAL/ogr2ogr/rasterio need structural defenses; never add the ineffective `GDAL_HTTP_FOLLOWLOCATION`:
 
 1. Prefer managed storage (`/vsis3/`, `/vsiaz/`, validated local keys); never probe caller-controlled remote sources in-process.
-2. Remote service imports/previews require URL validation, `gdal_service_safe_env()` and worker egress restrictions.
+2. Remote service imports/previews require URL validation and run GDAL inside `async with service_egress_proxy(idle_seconds=<the GDAL HTTP timeout>) as egress:` (`platform/egress_proxy.py`) with `gdal_service_safe_env(egress)`. The proxy checks and pins every connection, redirect hops included. Never set proxy variables by hand: libcurl honours an inherited `NO_PROXY`, and a GDAL config file can tell GDAL to ignore the environment, so the helper drops the proxy variables and loads no config file.
 3. Raster subprocesses/opens use `gdal_safe_env()` / `gdal_safe_open_env()` from `backend/app/processing/raster/vrt.py`. Local vector subprocesses require both `local_input_driver_args()` from `processing/ingest/gdal_drivers.py` and `gdal_vector_safe_env()` from `platform/gdal_env.py` (paths under `backend/app/`). Service drivers use the service environment. `GDAL_SKIP` splits on spaces/commas; unknown driver names only warn.
 4. GPKG/SQLite virtual tables can follow pointers. Preserve `validate_content_directives()` in `processing/ingest/validation.py` at upload and staged-upload GDAL entry points: read raw `sqlite_master.sql` read-only/immutable, allow only sanctioned virtual-table modules, identify SQLite archive members by bytes and reject VRT despite disguised names/BOMs. Run `validate_zip_safety` first under a shared byte budget. `PRAGMA`, `SPATIALITE_SECURITY=strict`, `OGR_SQLITE_LOAD_EXTENSIONS=NONE` and `OGR_SQLITE_LIST_ALL_TABLES=NO` are not substitutes.
 
-Run `backend/tests/test_rule2_structural.py` and relevant `backend/tests/test_gdal_driver_clamp_1846.py` tests for these changes; the latter needs real GDAL. Only the GDAL CLI exception allowlist is empty; rasterio exceptions are separately counted.
+Run `backend/tests/test_rule2_structural.py`, `backend/tests/test_service_egress_proxy.py` and relevant `backend/tests/test_gdal_driver_clamp_1846.py` tests for these changes; the latter needs real GDAL. Only the GDAL CLI exception allowlist is empty; rasterio exceptions are separately counted.
 
 **Rule 3 — Credentials.** Never introduce known-public credential literals as defaults, fallbacks, examples or new test values; `validate_known_bad_credentials` in `backend/app/core/config.py` rejects them. MinIO credentials are outside `Settings`: preserve entrypoint blank-credential rejection and parse-safe `${MINIO_ROOT_USER:-}` / `${MINIO_ROOT_PASSWORD:-}` in `docker-compose.yml`; `:?required` breaks parsing even with the profile inactive.
 
@@ -112,6 +118,6 @@ Run `backend/tests/test_rule2_structural.py` and relevant `backend/tests/test_gd
 
 Use scoped Conventional Commits and DCO sign-off (`git commit -s`). Follow `.github/PULL_REQUEST_TEMPLATE.md`: describe behavior, link issues, note schema/API/config impacts, list verification and include screenshots for UI work.
 
-Root docs: `README.md` (overview), `SUPPORT.md`, `CHANGELOG.md` (release notes), `EDITIONS.md` (open-core boundary), `RUNBOOK.md` (recovery). Contributor docs: `.github/`; README images: `.github/assets/`; product docs: docs.getgeolens.com; private notes: ignored `docs-internal/`. Do not add root `docs/` or duplicate product docs. Brand assets come from a tagged `geolens-io/branding` release; changes flow branding → this repo → marketing → docs.
+Root docs: `README.md` (overview), `SUPPORT.md`, `CHANGELOG.md` (release notes), `EDITIONS.md` (open-core boundary), `RUNBOOK.md` (recovery). Contributor docs: `.github/`; README images: `.github/assets/`; shared agent configuration: `docs/agents/`; architectural decisions: `docs/adr/`; product docs: docs.getgeolens.com; private notes: ignored `docs-internal/`. Do not add other root `docs/` content or duplicate product docs. Brand assets come from a tagged `geolens-io/branding` release; changes flow branding → this repo → marketing → docs.
 
 Use `.env.example` / `.env.test.example` as templates. Never commit secrets, environments, dependencies, coverage or Playwright output. Keep ignored assistant/internal directories (`.claude/`, `.planning/`, `docs-internal/`) out of tracked changes.

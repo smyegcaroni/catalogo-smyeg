@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from geoalchemy2.shape import to_shape
-from sqlalchemy import and_, case, column, func, or_, select, text
+from sqlalchemy import (
+    Integer,
+    and_,
+    case,
+    cast,
+    column,
+    func,
+    or_,
+    select,
+    text,
+    true,
+)
 from sqlalchemy import table as sql_table
+from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 if TYPE_CHECKING:
@@ -443,6 +456,137 @@ def make_bbox_filter(
         return and_(geom_col.op("&&")(envelope), spatial_fn(geom_col, envelope))
 
 
+# World copies wrap_geometry_longitudes folds per member; check_wrap_turns
+# refuses wider input so nothing is ever truncated.
+MAX_WRAP_TURNS = 8
+
+
+def _member_coordinates(geometry: dict) -> Iterator[object]:
+    """Coordinates of each member of a GeoJSON geometry, split as ST_Dump splits it."""
+    kind = geometry.get("type")
+    if kind == "GeometryCollection":
+        for member in geometry.get("geometries") or []:
+            if isinstance(member, dict):
+                yield from _member_coordinates(member)
+    elif kind in ("MultiPoint", "MultiLineString", "MultiPolygon"):
+        yield from geometry.get("coordinates") or []
+    else:
+        yield geometry.get("coordinates")
+
+
+def _longitudes(coordinates: object) -> Iterator[float]:
+    if not isinstance(coordinates, list) or not coordinates:
+        return
+    if isinstance(coordinates[0], int | float):
+        try:
+            lng = float(coordinates[0])
+        except OverflowError as exc:
+            raise ValueError("a coordinate is too large") from exc
+        if math.isfinite(lng):
+            yield lng
+        return
+    for nested in coordinates:
+        yield from _longitudes(nested)
+
+
+def check_wrap_turns(geometry: object) -> None:
+    """Raise ``ValueError`` if a GeoJSON member spans more than ``MAX_WRAP_TURNS``
+    world copies, counted as :func:`wrap_geometry_longitudes` counts them.
+
+    Malformed geometry passes; PostGIS rejects it when it is parsed.
+    """
+    if not isinstance(geometry, dict):
+        return
+    for coordinates in _member_coordinates(geometry):
+        xs = list(_longitudes(coordinates))
+        if not xs:
+            continue
+        first = math.ceil((min(xs) - 180) / 360.0)
+        last = math.floor((max(xs) + 180) / 360.0)
+        if last - first + 1 > MAX_WRAP_TURNS:
+            raise ValueError(
+                f"a member spans more than {MAX_WRAP_TURNS} world copies of longitude"
+            )
+
+
+def wrap_geometry_longitudes(geom: ColumnElement) -> ColumnElement:
+    """Fold a 4326 geometry drawn on a wrapped web map into ``[-180, 180]``.
+
+    Returns ``geom`` itself when it is valid and every longitude lies strictly
+    inside ``(-180, 180)``. Otherwise each member is repaired, cut into the world copies it
+    spans (at most ``MAX_WRAP_TURNS``; :func:`check_wrap_turns` refuses wider
+    input), each slice is shifted by whole turns into range, and the union of the
+    slices is returned. Slices keep their member's dimension, so collapsed
+    repair output and seam slivers are dropped. Non-finite input yields NULL.
+    """
+    members = func.ST_Dump(geom).table_valued("geom")
+    member = members.c.geom
+    dimension = func.ST_Dimension(member)
+    # Closed world copies: a member on ±180 lands on both sides of the seam.
+    first_turn = func.ceil((func.ST_XMin(member) - 180) / 360.0)
+    last_turn = func.floor((func.ST_XMax(member) + 180) / 360.0)
+    extra_turns = func.least(last_turn - first_turn, MAX_WRAP_TURNS - 1)
+    steps = func.generate_series(0, cast(extra_turns, Integer))
+    steps = steps.table_valued("value").render_derived().lateral()
+    turn = first_turn + steps.c.value
+    # Repairing overlapping polygons together would drop their shared area, and
+    # ST_Intersection raises on an invalid one; repair each polygon on its own.
+    repaired = case(
+        (dimension == 2, func.ST_CollectionExtract(func.ST_MakeValid(member), 3)),
+        else_=member,
+    )
+    world = func.ST_MakeEnvelope(turn * 360 - 180, -90, turn * 360 + 180, 90, 4326)
+    piece = func.ST_CollectionExtract(
+        func.ST_Intersection(repaired, world), dimension + 1
+    )
+    folded = (
+        select(
+            func.ST_UnaryUnion(
+                func.ST_Collect(func.ST_Translate(piece, turn * -360, 0))
+            )
+        )
+        .select_from(members)
+        .join(steps, true())
+        .scalar_subquery()
+    )
+    xmin, xmax = func.ST_XMin(geom), func.ST_XMax(geom)
+    # Non-finite input matches nothing; GEOS raises on it.
+    finite = xmax - xmin + func.ST_YMax(geom) - func.ST_YMin(geom) < math.inf
+    return case(
+        (and_(xmin > -180, xmax < 180, func.ST_IsValid(geom)), geom),
+        (finite, folded),
+    )
+
+
+def wrapped_spatial_filter(
+    entity: Any, folded: ColumnElement, predicate: str = "intersects"
+) -> ColumnElement:
+    """Rows of ``entity`` whose ``spatial_extent`` meets ``folded`` under ``predicate``.
+
+    A fold across ±180 has pieces at both ends, so its single envelope spans every
+    longitude. Both the ``&&`` prefilter and the index condition PostGIS adds for
+    the predicate then admit the whole latitude band. Probing the index once per
+    piece keeps each probe to its own side of the seam. Intersection decomposes
+    over pieces; ``within`` is checked against the whole fold.
+    """
+    candidate = aliased(entity)
+    pieces = func.ST_Dump(folded).table_valued("geom")
+    spatial_fn = func.ST_Within if predicate == "within" else func.ST_Intersects
+    target = folded if predicate == "within" else pieces.c.geom
+    matches = (
+        select(candidate.id)
+        .select_from(pieces)
+        .join(
+            candidate,
+            and_(
+                candidate.spatial_extent.op("&&")(func.ST_Envelope(pieces.c.geom)),
+                spatial_fn(candidate.spatial_extent, target),
+            ),
+        )
+    )
+    return entity.id.in_(matches)
+
+
 @lru_cache(maxsize=512)
 def _proj_knows_epsg(srid: int) -> bool:
     """True when PROJ, GDAL's registry, has this EPSG code.
@@ -498,16 +642,17 @@ _RADIANS_PER_DEGREE = math.pi / 180.0
 def _parse_crs(crs_wkt: str) -> object | None:
     """Parse stored CRS WKT with PROJ, or None when PROJ will not accept it.
 
-    fix(#939): a regex scan of WKT structure cannot reliably answer "is this
-    geographic" or "what are its axis units" -- WKT is a nested grammar, so a
-    flat scan can't tell which subtree a unit belongs to (PRIMEM, MERIDIAN,
-    BEARING, conversion PARAMETERs all carry angular units). Ask PROJ instead,
-    which reads the actual tree and handles a BoundCRS's SOURCE units or a 3D
+    A regex scan of WKT structure cannot reliably answer "is this geographic"
+    or "what are its axis units" -- WKT is a nested grammar, so a flat scan
+    can't tell which subtree a unit belongs to (PRIMEM, MERIDIAN, BEARING,
+    conversion PARAMETERs all carry angular units). Ask PROJ instead, which
+    reads the actual tree and handles a BoundCRS's SOURCE units or a 3D
     geographic CRS's axis unit correctly.
 
-    Import is function-scope because rasterio pulls in GDAL and ``core`` is
-    the lowest layer. Results are cached: callers run this per row over a
-    small set of distinct CRSs.
+    PROJ may open files the text names, so only the raster probe child calls
+    this. Import is function-scope because rasterio pulls in GDAL and ``core``
+    is the lowest layer; results are cached because callers repeat the same
+    few CRSs.
     """
     try:
         from rasterio.crs import CRS
@@ -538,7 +683,11 @@ def wkt_is_geographic(crs_wkt: str | None) -> bool | None:
     # mocks; a non-string is an unknown CRS, not a crash.
     if not isinstance(crs_wkt, str) or not crs_wkt:
         return None
-    crs = _parse_crs(crs_wkt)
+    return _is_geographic(_parse_crs(crs_wkt), crs_wkt)
+
+
+def _is_geographic(crs: object | None, crs_wkt: str | None) -> bool | None:
+    """:func:`wkt_is_geographic`'s answer for ``crs``, PROJ's parse of ``crs_wkt``."""
     if crs is not None:
         try:
             if crs.is_geographic:
@@ -548,6 +697,8 @@ def wkt_is_geographic(crs_wkt: str | None) -> bool | None:
         except Exception:  # broad: exotic CRSs raise from PROJ rather than answering; fall through to the sniff
             pass
         # Parsed but neither geographic nor projected: geocentric/engineering.
+    if not isinstance(crs_wkt, str) or not crs_wkt:
+        return None
     # Blank quoted content BEFORE truncating: a pathologically long quoted
     # name could otherwise push a real keyword past the truncation point.
     head = re.sub(r'"[^"]*"', '""', crs_wkt)[:2000].upper()
@@ -612,16 +763,15 @@ def crs_metres_per_unit(crs: object | None) -> float | None:
     """Metres per linear unit of a PROJECTED CRS, or None when that is not a
     question with an answer.
 
-    fix(#1375): STAC's ``gsd`` is in metres, but a stored resolution is
-    in whatever unit its CRS measures. ``units_factor`` reports ``('metre',
-    1.0)`` for UTM/Web Mercator and ``('US survey foot', 0.3048006...)`` for
-    state-plane systems.
+    STAC's ``gsd`` is in metres, but a stored resolution is in whatever unit
+    its CRS measures. ``units_factor`` reports ``('metre', 1.0)`` for UTM/Web
+    Mercator and ``('US survey foot', 0.3048006...)`` for state-plane systems.
 
     Returns None for a GEOGRAPHIC CRS on purpose: ``units_factor`` reports
     RADIANS per unit there, and an angular resolution has no fixed length (a
     degree of longitude is 111 km at the equator, 0 at the pole) without a
     latitude this function isn't given. Callers must omit the value rather
-    than publish it unconverted -- see ``RasterAsset.to_stac_properties``.
+    than publish it unconverted, as the STAC item serializer does.
     """
     if crs is None:
         return None
@@ -646,6 +796,79 @@ def wkt_metres_per_unit(crs_wkt: str | None) -> float | None:
     if not isinstance(crs_wkt, str) or not crs_wkt:
         return None
     return crs_metres_per_unit(_parse_crs(crs_wkt))
+
+
+def crs_facts_of(crs: object | None, crs_wkt: str | None) -> dict:
+    """What request paths read about a raster's CRS, keyed by ``raster_assets`` column.
+
+    ``crs`` is PROJ's parse of ``crs_wkt``, or None when there is none.
+    """
+    return {
+        "crs_is_geographic": _is_geographic(crs, crs_wkt),
+        "crs_has_degree_unit": crs_has_degree_unit(crs),
+        "crs_metres_per_unit": crs_metres_per_unit(crs),
+    }
+
+
+def wkt_crs_facts(crs_wkt: str | None) -> dict:
+    """:func:`crs_facts_of` for CRS text, parsed here."""
+    if not isinstance(crs_wkt, str) or not crs_wkt:
+        return crs_facts_of(None, None)
+    return crs_facts_of(_parse_crs(crs_wkt), crs_wkt)
+
+
+CRS_FACT_COLUMNS = ("crs_is_geographic", "crs_has_degree_unit", "crs_metres_per_unit")
+
+
+def crs_columns(meta: dict) -> dict:
+    """A raster's CRS text and the facts derived from it, as ``raster_assets`` columns.
+
+    Every writer stores them together, so the facts describe the stored text.
+    ``crs_facts_digest`` is the SHA-256 of the text's UTF-8 bytes, which
+    migration 0073's trigger compares with ``sha256(convert_to(crs_wkt,
+    'UTF8'))`` to keep these facts when the text changes.
+    """
+    crs_wkt = meta.get("crs_wkt")
+    return {
+        "crs_wkt": crs_wkt,
+        **{column: meta.get(column) for column in CRS_FACT_COLUMNS},
+        "crs_facts_digest": (
+            hashlib.sha256(crs_wkt.encode("utf-8")).digest()
+            if isinstance(crs_wkt, str)
+            else None
+        ),
+    }
+
+
+@lru_cache(maxsize=256)
+def crs_facts_for_epsg(epsg: int) -> dict:
+    """:func:`crs_facts_of` for an EPSG code, read from the PROJ database.
+
+    Only a positive integer is looked up; anything else has no facts.
+    """
+    if not isinstance(epsg, int) or isinstance(epsg, bool) or epsg <= 0:
+        return crs_facts_of(None, None)
+    from rasterio.crs import CRS
+    from rasterio.errors import CRSError
+
+    try:
+        crs = CRS.from_epsg(epsg)
+    except CRSError:
+        return crs_facts_of(None, None)
+    return crs_facts_of(crs, crs.to_wkt(version="WKT2_2019"))
+
+
+def raster_crs_facts(raster: object) -> dict:
+    """A raster row's stored CRS facts or, while none are stored, its EPSG code's.
+
+    Stored facts always win. A row's facts stay NULL until the worker's repair
+    job fills them, and its EPSG code answers meanwhile; that code is PROJ's
+    lenient match for the text, so the job replaces these with the text's own.
+    """
+    stored = {column: getattr(raster, column, None) for column in CRS_FACT_COLUMNS}
+    if any(value is not None for value in stored.values()):
+        return stored
+    return dict(crs_facts_for_epsg(getattr(raster, "epsg", None)))
 
 
 def pixel_size_from_affine(

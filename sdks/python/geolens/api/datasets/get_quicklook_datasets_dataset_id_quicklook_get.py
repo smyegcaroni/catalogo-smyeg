@@ -1,5 +1,5 @@
 from http import HTTPStatus
-from typing import Any, cast
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -9,7 +9,9 @@ from ...types import Response, UNSET
 from ... import errors
 
 from ...models.problem_detail import ProblemDetail
+from ...types import File
 from ...types import Unset
+from io import BytesIO
 from uuid import UUID
 
 
@@ -17,11 +19,19 @@ def _get_kwargs(
     dataset_id: UUID,
     *,
     size: int | Unset = 256,
+    v: None | str | Unset = UNSET,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
 
     params["size"] = size
+
+    json_v: None | str | Unset
+    if isinstance(v, Unset):
+        json_v = UNSET
+    else:
+        json_v = v
+    params["v"] = json_v
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -38,9 +48,10 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | ProblemDetail | None:
+) -> File | ProblemDetail | None:
     if response.status_code == 200:
-        response_200 = cast(Any, None)
+        response_200 = File(payload=BytesIO(response.content))
+
         return response_200
 
     if response.status_code == 400:
@@ -96,7 +107,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | ProblemDetail]:
+) -> Response[File | ProblemDetail]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -108,9 +119,10 @@ def _build_response(
 def sync_detailed(
     dataset_id: UUID,
     *,
-    client: AuthenticatedClient,
+    client: AuthenticatedClient | Client,
     size: int | Unset = 256,
-) -> Response[Any | ProblemDetail]:
+    v: None | str | Unset = UNSET,
+) -> Response[File | ProblemDetail]:
     """Get Quicklook
 
      Serve a quicklook PNG image for a dataset.
@@ -118,18 +130,21 @@ def sync_detailed(
     Args:
         dataset_id (UUID):
         size (int | Unset): Quicklook size in pixels (256 or 512) Default: 256.
+        v (None | str | Unset): The record's `quicklook_version`; it only keys caches and does not
+            change the response.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | ProblemDetail]
+        Response[File | ProblemDetail]
     """
 
     kwargs = _get_kwargs(
         dataset_id=dataset_id,
         size=size,
+        v=v,
     )
 
     response = client.get_httpx_client().request(
@@ -142,9 +157,10 @@ def sync_detailed(
 def sync(
     dataset_id: UUID,
     *,
-    client: AuthenticatedClient,
+    client: AuthenticatedClient | Client,
     size: int | Unset = 256,
-) -> Any | ProblemDetail | None:
+    v: None | str | Unset = UNSET,
+) -> File | ProblemDetail | None:
     """Get Quicklook
 
      Serve a quicklook PNG image for a dataset.
@@ -152,28 +168,32 @@ def sync(
     Args:
         dataset_id (UUID):
         size (int | Unset): Quicklook size in pixels (256 or 512) Default: 256.
+        v (None | str | Unset): The record's `quicklook_version`; it only keys caches and does not
+            change the response.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | ProblemDetail
+        File | ProblemDetail
     """
 
     return sync_detailed(
         dataset_id=dataset_id,
         client=client,
         size=size,
+        v=v,
     ).parsed
 
 
 async def asyncio_detailed(
     dataset_id: UUID,
     *,
-    client: AuthenticatedClient,
+    client: AuthenticatedClient | Client,
     size: int | Unset = 256,
-) -> Response[Any | ProblemDetail]:
+    v: None | str | Unset = UNSET,
+) -> Response[File | ProblemDetail]:
     """Get Quicklook
 
      Serve a quicklook PNG image for a dataset.
@@ -181,18 +201,21 @@ async def asyncio_detailed(
     Args:
         dataset_id (UUID):
         size (int | Unset): Quicklook size in pixels (256 or 512) Default: 256.
+        v (None | str | Unset): The record's `quicklook_version`; it only keys caches and does not
+            change the response.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | ProblemDetail]
+        Response[File | ProblemDetail]
     """
 
     kwargs = _get_kwargs(
         dataset_id=dataset_id,
         size=size,
+        v=v,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -203,9 +226,10 @@ async def asyncio_detailed(
 async def asyncio(
     dataset_id: UUID,
     *,
-    client: AuthenticatedClient,
+    client: AuthenticatedClient | Client,
     size: int | Unset = 256,
-) -> Any | ProblemDetail | None:
+    v: None | str | Unset = UNSET,
+) -> File | ProblemDetail | None:
     """Get Quicklook
 
      Serve a quicklook PNG image for a dataset.
@@ -213,13 +237,15 @@ async def asyncio(
     Args:
         dataset_id (UUID):
         size (int | Unset): Quicklook size in pixels (256 or 512) Default: 256.
+        v (None | str | Unset): The record's `quicklook_version`; it only keys caches and does not
+            change the response.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | ProblemDetail
+        File | ProblemDetail
     """
 
     return (
@@ -227,5 +253,6 @@ async def asyncio(
             dataset_id=dataset_id,
             client=client,
             size=size,
+            v=v,
         )
     ).parsed

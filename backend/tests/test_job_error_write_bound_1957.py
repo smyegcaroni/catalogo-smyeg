@@ -35,14 +35,11 @@ pytestmark = pytest.mark.anyio
 _TEST_BUDGET_MS = 400
 
 # The remaining sites and the routine each reaches its terminal job write
-# through. ``regenerate_vrt`` arms directly: its handler writes two more rows
-# in the same session and the budget belongs to that whole transaction.
+# through. ``regenerate_vrt`` and the settlement seam arm directly: each writes
+# more rows in the same transaction, and the budget belongs to all of it.
 _REMAINING_SITES = {
-    ("app.processing.ingest.tasks_postgis_refresh", "refresh_postgis"): (
-        "write_job_failure_for_attempt"
-    ),
-    ("app.processing.ingest.tasks_stac_refresh", "refresh_stac"): (
-        "write_job_failure_for_attempt"
+    ("app.processing.ingest.publication", "_record_failure"): (
+        "arm_job_error_write_budget"
     ),
     ("app.processing.analysis.tasks", "_fail_cancelled_job"): (
         "write_job_failure_for_attempt"
@@ -81,8 +78,15 @@ def _call_names(node: ast.AST) -> set[str]:
 
 
 def _writes_failed_status(node: ast.AST) -> bool:
-    """Whether *node* writes ``status="failed"``, mapped or as a keyword."""
+    """Whether *node* fails a job: ``ledger.fail``, or ``status="failed"`` written out."""
     for sub in ast.walk(node):
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr == "fail"
+            and getattr(sub.func.value, "id", None) == "ledger"
+        ):
+            return True
         if isinstance(sub, ast.Dict):
             pairs = list(zip(sub.keys, sub.values))
         elif isinstance(sub, ast.Call):
@@ -171,6 +175,19 @@ class TestEveryRemainingSiteIsArmed:
             "leaves the UPDATE in a transaction carrying no SET LOCAL"
         )
 
+    def test_the_shared_helper_arms_before_its_write(self) -> None:
+        """The budget is armed before the helper's failure write."""
+        tree = ast.parse(inspect.getsource(write_job_failure_for_attempt))
+        arms = _call_lines(tree, "arm_job_error_write_budget")
+        writes = _call_lines(tree, "fail") + _call_lines(
+            tree, "update_ingest_job_for_attempt"
+        )
+        assert len(arms) == 1 and len(writes) == 1, (arms, writes)
+        assert arms[0] < min(writes), (
+            "the helper writes the failure before arming the budget, so a held "
+            "row parks the worker on that write"
+        )
+
     def test_the_shared_helper_swallows_its_own_failure(self) -> None:
         tree = ast.parse(inspect.getsource(write_job_failure_for_attempt))
         handlers = [
@@ -216,14 +233,6 @@ class TestOneBudgetConstant:
             f"the error-write budget is defined at {defined}. Two constants for "
             "one budget agree until one of them is retuned"
         )
-
-    def test_the_raster_replace_bracket_reads_the_shared_budget(self) -> None:
-        import app.processing.ingest.tasks_raster_replace as tasks_raster_replace
-
-        assert (
-            tasks_raster_replace.JOB_ERROR_WRITE_TIMEOUT_MS
-            is JOB_ERROR_WRITE_TIMEOUT_MS
-        ), "the replace tail no longer reads the shared budget"
 
 
 async def _admin_id(session) -> uuid.UUID:
@@ -311,7 +320,7 @@ class TestAHeldJobRowEndsTheRemainingWrites:
                             err_session,
                             job_id,
                             attempt_id,
-                            values={"status": "failed", "error_message": "boom"},
+                            reason="boom",
                             task_name="refresh_postgis",
                         ),
                         timeout=30,

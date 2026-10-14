@@ -2,10 +2,11 @@ import { lazy, Suspense, useState, useCallback, useEffect, useMemo, useRef } fro
 import { useParams, Link, useNavigate, useLocation } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, ArrowLeft, Download, Trash2, Upload, Globe, GlobeLock, Layers, Eye, EyeOff, ShieldAlert, Database } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, Download, Trash2, Upload, Globe, GlobeLock, Layers, Eye, EyeOff, ShieldAlert, Database, ChevronDown } from 'lucide-react';
 import { toast } from 'sonner';
 import { PageShell } from '@/components/layout/PageShell';
 import { ErrorState } from '@/components/layout/ErrorState';
+import { ApiError } from '@/api/client';
 import { useDataset, useUpdateDataset, useSetTargetStatus, useValidation, useDatasetRefreshWatch } from '@/components/dataset/hooks/use-dataset';
 import { useDatasetJobStatus } from '@/components/import/hooks/use-ingest';
 import { IngestWarningsBanner } from '@/components/import/IngestWarningsBanner';
@@ -15,6 +16,7 @@ import { useFeatureGid } from '@/components/dataset/hooks/use-feature-gid';
 import { useHeroState } from '@/components/dataset/hooks/use-hero-state';
 import { useFeatureFlags } from '@/hooks/use-settings';
 import { useCanMutate } from '@/hooks/use-can-mutate';
+import { usePermissions } from '@/hooks/use-permissions';
 import { useAuthStore } from '@/stores/auth-store';
 import { useDrawingStore } from '@/stores/drawing-store';
 import { DatasetDeleteDialog } from '@/components/dataset/DatasetDeleteDialog';
@@ -76,6 +78,7 @@ import { useUnsavedGuard } from '@/hooks/use-unsaved-guard';
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import { cn } from '@/lib/utils';
+import { recordTypeCapabilities } from '@/lib/record-types';
 import { ingestionStatusColors, visibilityColors } from '@/lib/status-colors';
 import type { DatasetResponse } from '@/types/api';
 import { downloadCog } from '@/api/datasets';
@@ -171,6 +174,7 @@ function TableHero() {
 
 export function DatasetPage() {
   const { t } = useTranslation('dataset');
+  const { can } = usePermissions();
   const { id } = useParams<{ id: string }>();
   const queryClient = useQueryClient();
   const { data: dataset, isLoading, error, refetch } = useDataset(id ?? '', {
@@ -179,14 +183,17 @@ export function DatasetPage() {
       return data?.raster?.status === 'regenerating' ? 5_000 : false;
     },
   });
+  // A missing dataset has no job, validation or refresh runs to ask about.
+  const notFound = error instanceof ApiError && error.status === 404;
+  const relatedId = notFound ? undefined : id;
   // fix(#1285 codex round 4): mounted at the page level, not inside the
   // Source tab, so a dispatched refresh's tracking survives a tab switch —
   // the "sources" TabsContent unmounts on Radix Tabs when it isn't active.
-  const refreshWatch = useDatasetRefreshWatch(id ?? '');
+  const refreshWatch = useDatasetRefreshWatch(relatedId ?? '');
   const [activeDialog, setActiveDialog] = useState<'delete' | 'reupload' | 'vrt' | 'unpublish' | null>(null);
   const setTargetStatus = useSetTargetStatus();
   const token = useAuthStore((s) => s.token);
-  const { data: validationData } = useValidation(token ? id : undefined);
+  const { data: validationData } = useValidation(token ? relatedId : undefined);
   const { data: featureFlags } = useFeatureFlags();
   const [activeTab, setActiveTab] = useState(getInitialTab);
   const navigate = useNavigate();
@@ -197,6 +204,16 @@ export function DatasetPage() {
 
   const [isDataTabExpanded, setIsDataTabExpanded] = useState(false);
   const toggleDataTabExpand = useCallback(() => setIsDataTabExpanded((prev) => !prev), []);
+  const [isTaskMapPreviewOpen, setIsTaskMapPreviewOpen] = useState(false);
+  // This page stays mounted across a dataset id change (only DetailPanel's
+  // key remounts), so per-dataset UI state needs its own reset. A dataset
+  // with no Data tab (tiles3d_dataset, pointcloud_dataset) has no control
+  // left to clear this if it survives from a previous, table-backed dataset —
+  // it would otherwise hide the map-preview section (and stats bar) for good.
+  useEffect(() => {
+    setIsTaskMapPreviewOpen(false);
+    setIsDataTabExpanded(false);
+  }, [id]);
   // fix(#583): pad the page clear of the open AI chat panel — the fixed panel
   // otherwise floats over the sticky detail tabs and header stat cells.
   const [isChatOpen, setIsChatOpen] = useState(false);
@@ -222,6 +239,7 @@ export function DatasetPage() {
   const capabilities = useDatasetEditCapabilities(capabilityHelperOverrides, canEdit);
   const isDrawing = useDrawingStore((s) => s.isDrawing);
   const isGeometryEditDirty = useDrawingStore((s) => s.isEditDirty);
+  const hasUnsavedMapWork = useDrawingStore((s) => s.hasUnsavedMapWork);
   useDocumentTitle(dataset?.title ?? t('common:pageTitle.dataset'));
 
   const {
@@ -255,7 +273,7 @@ export function DatasetPage() {
   // temporal_parse_errors).
   // 404 is a normal case — the dataset was registered from an existing table
   // or created via a non-ingest path.
-  const { data: datasetJob } = useDatasetJobStatus(id ?? null);
+  const { data: datasetJob } = useDatasetJobStatus(relatedId ?? null);
 
   const handleTabChange = useCallback(
     (value: string) => {
@@ -268,12 +286,13 @@ export function DatasetPage() {
       if (value !== 'data') {
         setIsDataTabExpanded(false);
       }
+      setIsTaskMapPreviewOpen(false);
     },
     [navigate, location.search],
   );
 
   const updateDataset = useUpdateDataset();
-  const hasUnsavedChanges = metadataPendingCount > 0 || isGeometryEditDirty;
+  const hasUnsavedChanges = metadataPendingCount > 0 || isGeometryEditDirty || hasUnsavedMapWork;
   const blocker = useUnsavedGuard(hasUnsavedChanges);
 
   const handleSaveName = useCallback(
@@ -291,6 +310,9 @@ export function DatasetPage() {
 
       if (action.tab) {
         handleTabChange(action.tab);
+      }
+      if (action.anchor === 'dataset_map') {
+        setIsTaskMapPreviewOpen(true);
       }
       setPendingNavigationAnchor(action.anchor);
     },
@@ -312,6 +334,7 @@ export function DatasetPage() {
       const normalized = getTabFromHash(window.location.hash);
       if (normalized) {
         setActiveTab(normalized);
+        setIsTaskMapPreviewOpen(false);
       }
     };
     window.addEventListener('hashchange', handler);
@@ -347,7 +370,7 @@ export function DatasetPage() {
         <ErrorState
           title={t('page.errorTitle')}
           message={error instanceof Error ? error.message : t('page.errorMessage')}
-          onRetry={() => refetch()}
+          onRetry={notFound ? undefined : () => refetch()}
           action={
             <Link
               to="/"
@@ -370,6 +393,27 @@ export function DatasetPage() {
   const isRaster = dataset.record_type === 'raster_dataset';
   const isVrt = dataset.record_type === 'vrt_dataset';
   const isTable = dataset.record_type === 'table';
+  const isTileset = dataset.record_type === 'tiles3d_dataset';
+  const isPointCloud = dataset.record_type === 'pointcloud_dataset';
+  // Neither type has in-app tiles to draw, so the preview would otherwise
+  // request nothing and show an empty box. An extent still orients the
+  // reader, drawn as an outline over the basemap with no data layer.
+  const showFootprintOnly = (isTileset || isPointCloud) && bbox !== null;
+  const { featureTable, mapLayerType, tileToken: tileKind } = recordTypeCapabilities(dataset.record_type);
+  const canAddToMap = !isTable && mapLayerType !== null;
+  const canReupload = featureTable || isRaster;
+  // DetailPanel deep-links Data/Structure to Overview for any record type
+  // without those tabs (raster/VRT, and now tiles3d/pointcloud's footprint-
+  // only preview). Keep the page-level map in that same effective layout, or
+  // an activeTab left over from an earlier, table-backed dataset (its real
+  // Data tab) renders this one's footprint in the collapsed task-tab state
+  // instead of the prominent overview one.
+  const effectivePageTab = (isRaster || isVrt || isTileset || isPointCloud)
+    && (activeTab === 'data' || activeTab === 'structure')
+    ? 'overview'
+    : activeTab;
+  const isOverview = effectivePageTab === 'overview';
+  const isMapPreviewOpen = isOverview || isDrawing || isTaskMapPreviewOpen;
 
   const isPublished = dataset.record_status === 'published';
   const hasValidationErrors = validationData ? validationData.errors.length > 0 : false;
@@ -379,6 +423,12 @@ export function DatasetPage() {
   // Gate geometry drawing and attribute cell editing behind the feature flag.
   // Metadata editing (overview/metadata tabs) and management actions remain ungated.
   const canEditData = canEdit && dataEditingEnabled;
+
+  // A 422 carries the workflow's own refusal, already localized by the API client.
+  const publishFailureMessage = (err: unknown) =>
+    err instanceof ApiError && err.status === 422
+      ? err.message
+      : t('publish.failed');
 
   const handlePublishToggle = async () => {
     if (!id) return;
@@ -399,8 +449,8 @@ export function DatasetPage() {
       if (result.metadata_warnings?.length) {
         toast.warning(result.metadata_warnings[0]);
       }
-    } catch {
-      toast.error(t('publish.failed'));
+    } catch (err) {
+      toast.error(publishFailureMessage(err));
     }
   };
 
@@ -409,8 +459,8 @@ export function DatasetPage() {
     try {
       await setTargetStatus.mutateAsync({ datasetId: id, status: UNPUBLISH_TARGET });
       toast.success(t('publish.unpublished'));
-    } catch {
-      toast.error(t('publish.failed'));
+    } catch (err) {
+      toast.error(publishFailureMessage(err));
     } finally {
       setActiveDialog(null);
     }
@@ -430,7 +480,7 @@ export function DatasetPage() {
   // in the header is the "works with your existing GIS tools" affordance
   // (psql, QGIS, ogr2ogr can hit it directly). Raster/VRT data lives in
   // object storage, not a queryable table, so those skip the readout.
-  const showTableReadout = !isRaster && !isVrt && Boolean(dataset.table_name);
+  const showTableReadout = featureTable && Boolean(dataset.table_name);
 
   const statsLine = (
     <>
@@ -457,7 +507,7 @@ export function DatasetPage() {
           data-testid="dataset-table-readout"
         >
           {dataset.table_name}
-          <CopyButton value={dataset.table_name} className="inline-flex size-5 items-center justify-center rounded-sm hover:bg-muted transition-colors" />
+          <CopyButton value={dataset.table_name} className="inline-flex size-5 items-center justify-center rounded-sm hover:bg-muted transition-colors pointer-coarse:-m-3 pointer-coarse:size-11" />
         </span>
       )}
     </>
@@ -483,7 +533,7 @@ export function DatasetPage() {
       // #1289: raster now has a reupload flow too (upload -> commit,
       // skipping the vector schema-preview step); VRT stays excluded — VRT
       // datasets keep the regenerate action instead.
-      visible: canEdit && !isVrt,
+      visible: canEdit && canReupload,
       variant: 'outline',
     },
     {
@@ -520,12 +570,12 @@ export function DatasetPage() {
         actions={headerActions}
         statsLine={statsLine}
         leadingContent={
-          <div className="flex items-center gap-2">
-            {!isTable && isEditor && <AddToMapButton datasetId={dataset.id} datasetTitle={dataset.title} />}
-            {!token && (
+          <div className="flex flex-wrap items-center gap-2">
+            {canAddToMap && can('edit_metadata') && <AddToMapButton datasetId={dataset.id} datasetTitle={dataset.title} />}
+            {!token && (canAddToMap || isTable) && (
               <AuthPrompt
                 action={
-                  !isTable
+                  canAddToMap
                     ? t('actions.addToMap', { defaultValue: 'add to a map' })
                     : t('actions.edit', { defaultValue: 'edit' })
                 }
@@ -539,88 +589,119 @@ export function DatasetPage() {
                 {t('actions.downloadCog', { defaultValue: 'Download COG' })}
               </Button>
             )}
-            <ConnectDropdown dataset={dataset} />
+            <ConnectDropdown dataset={dataset} onShowInstructions={() => handleTabChange('access')} />
           </div>
         }
       />
 
-      {/* S3: persistent ingest warnings (reserved renames, DBF collisions,
-          archive failures, temporal parse errors). Rendered permanently for
-          successfully-completed jobs only — a failed re-import may have
-          partially-recorded warnings that don't apply to the live dataset. */}
+      {/* Failed re-import warnings may not describe the live dataset. */}
       {datasetJob?.status === 'complete' && (
-        <IngestWarningsBanner job={datasetJob} className="mb-3" />
+        <IngestWarningsBanner key={datasetJob.id} job={datasetJob} compact className="mb-3" />
       )}
 
       {/* Hero Data Grid for table datasets (no map) */}
       {isTable && <TableHero />}
 
-      {/* Hero Map -- visible for all spatial dataset types */}
-      {!isDataTabExpanded && !isTable && (
-        <div
-          ref={mapContainerRef}
-          data-field-anchor="dataset_map"
-          tabIndex={-1}
-          className={cn(
-            'rounded-lg border shadow-sm overflow-hidden relative transition-[height] duration-300 ease-in-out',
-            isDrawing ? 'h-[60vh]' : 'h-72 lg:h-96'
-          )}
+      {/* Keep the spatial canvas prominent for orientation, but let task tabs
+          lead with their own work instead of a full-height map. The map has
+          no in-app renderer for 3D Tiles or COPC, so those pages get a map
+          section only to show the dataset's extent, and only when one exists.
+          Expanding the Data tab normally unmounts this section — but that
+          would destroy an in-progress geometry edit, which lives only in
+          this map's own TerraDraw instance and nowhere the app could restore
+          it from. Toggling isDataTabExpanded doesn't change the route, so
+          the unsaved-changes guard (route-navigation only) never sees it.
+          Keep the section mounted, just hidden, while a session is active. */}
+      {(!isDataTabExpanded || isDrawing) && !isTable && (!(isTileset || isPointCloud) || showFootprintOnly) && (
+        <section
+          aria-label={t('page.mapPreview')}
+          className={cn('rounded-lg border shadow-sm overflow-hidden', isDataTabExpanded && 'hidden')}
         >
-          {tracksHero && heroState === 'loading' && (
-            <Skeleton data-testid="hero-skeleton" className="absolute inset-0 z-10 rounded-lg" />
-          )}
-          <MapErrorBoundary>
-            <Suspense
-              fallback={
-                <Skeleton
-                  data-testid="dataset-map-suspense"
-                  className="absolute inset-0 z-10 rounded-lg"
-                />
-              }
+          {!isOverview && !isDrawing && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="w-full justify-between rounded-none px-3"
+              aria-expanded={isMapPreviewOpen}
+              aria-controls="dataset-map-preview"
+              onClick={() => setIsTaskMapPreviewOpen((open) => !open)}
             >
-              {/* fix(#430 codex r18/r19): geometryType stays the concrete
-                  display type (rendering); hasGenericGeometry separately
-                  gates the drawing toolbar so generic sketch layers keep
-                  every draw mode. */}
-              <DatasetMap
-                key={isRasterOrVrt ? mapKey : undefined}
-                bbox={bbox}
-                tableName={dataset.table_name}
-                geometryType={dataset.geometry_type}
-                hasGenericGeometry={dataset.has_generic_geometry}
-                datasetId={id}
-                columnInfo={dataset.column_info}
-                containerRef={mapContainerRef}
-                canEdit={canEditData && !isRaster && !isVrt && !isTable}
-                recordType={dataset.record_type}
-                rasterTileUrl={dataset.raster?.tile_url}
-                tileVersion={dataset.updated_at}
-                attribution={dataset.attribution}
-                onFeatureClick={setReadOnlyFeatureGid}
-                {...(tracksHero ? {
-                  onMapReady,
-                  onTileError,
-                } : {})}
-              />
-            </Suspense>
-          </MapErrorBoundary>
-          {dataset.record_type === 'raster_dataset' && !dataset.raster?.tile_url && heroState === 'loaded' && (
-            <div className="absolute bottom-2 start-2 z-10 px-2 py-1 rounded-sm bg-muted/80 text-xs text-muted-foreground">
-              {t('raster.noTiles')}
-            </div>
+              <span>{t(isMapPreviewOpen ? 'page.hideMapPreview' : 'page.showMapPreview')}</span>
+              <ChevronDown className={cn('size-4 transition-transform', isMapPreviewOpen && 'rotate-180')} />
+            </Button>
           )}
-          {tracksHero && heroState === 'error' && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center bg-background/80 rounded-lg z-10">
-              <AlertTriangle className="size-8 text-destructive mb-2" />
-              <p className="text-sm text-muted-foreground mb-3">{t('raster.previewUnavailable')}</p>
-              {retryCount < 3 ? (
-                <Button size="sm" onClick={handleRetry}>{t('raster.retry')}</Button>
-              ) : (
-                <p className="text-xs text-muted-foreground">{t('raster.tilesProcessing')}</p>
-              )}
-            </div>
-          )}
-        </div>
+          <div
+            id="dataset-map-preview"
+            ref={mapContainerRef}
+            data-field-anchor="dataset_map"
+            tabIndex={-1}
+            className={cn(
+              'relative overflow-hidden transition-[height] duration-300 ease-in-out',
+              !isMapPreviewOpen && 'hidden',
+              isDrawing ? 'h-[60vh]' : isOverview ? 'h-72 lg:h-96' : 'h-52 lg:h-56',
+            )}
+          >
+            {tracksHero && heroState === 'loading' && (
+              <Skeleton data-testid="hero-skeleton" className="absolute inset-0 z-10 rounded-lg" />
+            )}
+            <MapErrorBoundary>
+              <Suspense
+                fallback={
+                  <Skeleton
+                    data-testid="dataset-map-suspense"
+                    className="absolute inset-0 z-10 rounded-lg"
+                  />
+                }
+              >
+                {/* fix(#430 codex r18/r19): geometryType stays the concrete
+                    display type (rendering); hasGenericGeometry separately
+                    gates the drawing toolbar so generic sketch layers keep
+                    every draw mode. */}
+                <DatasetMap
+                  // A map keeps every source it was given, so each dataset
+                  // needs its own instance (and, for raster/VRT, each tile kind, DEM or imagery source type and DEM extent).
+                  key={`${dataset.id}:${isRasterOrVrt ? `${mapKey}:${dataset.raster?.is_dem ? `dem:${bbox?.join(',')}` : 'img'}` : tileKind ?? 'no-tiles'}`}
+                  bbox={bbox}
+                  tableName={dataset.table_name}
+                  geometryType={dataset.geometry_type}
+                  hasGenericGeometry={dataset.has_generic_geometry}
+                  datasetId={id}
+                  columnInfo={dataset.column_info}
+                  containerRef={mapContainerRef}
+                  canEdit={canEditData && featureTable && !isTable}
+                  recordType={dataset.record_type}
+                  rasterTileUrl={dataset.raster?.tile_url}
+                  isDem={dataset.raster?.is_dem ?? false}
+                  tileVersion={dataset.updated_at}
+                  attribution={dataset.attribution}
+                  shortcutsEnabled={!isDataTabExpanded}
+                  onFeatureClick={setReadOnlyFeatureGid}
+                  {...(tracksHero ? {
+                    onMapReady,
+                    onTileError,
+                  } : {})}
+                />
+              </Suspense>
+            </MapErrorBoundary>
+            {dataset.record_type === 'raster_dataset' && !dataset.raster?.tile_url && heroState === 'loaded' && (
+              <div className="absolute bottom-2 start-2 z-10 px-2 py-1 rounded-sm bg-muted/80 text-xs text-muted-foreground">
+                {t('raster.noTiles')}
+              </div>
+            )}
+            {tracksHero && heroState === 'error' && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center bg-background/80 rounded-lg z-10">
+                <AlertTriangle className="size-8 text-destructive mb-2" />
+                <p className="text-sm text-muted-foreground mb-3">{t('raster.previewUnavailable')}</p>
+                {retryCount < 3 ? (
+                  <Button size="sm" onClick={handleRetry}>{t('raster.retry')}</Button>
+                ) : (
+                  <p className="text-xs text-muted-foreground">{t('raster.tilesProcessing')}</p>
+                )}
+              </div>
+            )}
+          </div>
+        </section>
       )}
 
       {/* Stats instrument bar — key metrics at a glance */}
@@ -672,12 +753,13 @@ export function DatasetPage() {
       {/* Dataset-scoped AI chat (dataset-chat v1) — vector/table datasets only,
           mirroring the backend record_type gate; the panel further self-gates
           on AI availability + use_ai_chat, so anonymous visitors see nothing. */}
-      {token && !isRaster && !isVrt && (
+      {token && featureTable && (
         <DatasetChatPanel
           datasetId={dataset.id}
           datasetTitle={dataset.title}
           showOpenInBuilder={!isTable}
           onOpenChange={setIsChatOpen}
+          abovePendingBar={metadataPendingCount > 0}
         />
       )}
 
@@ -690,7 +772,7 @@ export function DatasetPage() {
         />
       )}
 
-      {canEdit && !isVrt && (
+      {canEdit && canReupload && (
         <Suspense fallback={null}>
           <ReuploadDialog
             dataset={dataset}

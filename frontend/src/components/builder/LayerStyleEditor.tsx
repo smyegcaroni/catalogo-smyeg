@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, memo, lazy, Suspense, useEffect, useRef } from 'react';
+import { useId, useState, useMemo, useCallback, memo, lazy, Suspense, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, RotateCcw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -10,7 +10,7 @@ import type { EditorDispatchKey } from './LayerStyleEditor/RenderModeSwitch';
 import { buildBuilderControlPaint, routeBuilderPaintProp } from './LayerStyleEditor/builder-paint-map';
 import {
   FILL_DEFAULTS, LINE_DEFAULTS, CIRCLE_DEFAULTS, getPaintValue,
-  withBuilderConfig, compactBuilder, stylePreviewStyle, hasUnsupportedBuilderState,
+  withBuilderConfig, compactBuilder, hasUnsupportedBuilderState,
   hasUnsavedStyleChanges as hasUnsavedStyleChangesImpl,
 } from './LayerStyleEditor/utils';
 import { LazyLoadErrorBoundary } from '@/components/error';
@@ -19,6 +19,7 @@ import { isNumericColumn } from '@/lib/column-utils';
 import { stripLegacyBuilderPaint } from '@/lib/normalize-style-config';
 import { GeometrySwatch } from '@/components/map/LegendEntries';
 import { getLayerColors } from '@/components/map/layer-icons';
+import { legendFacts } from '@/components/map/legend-facts';
 import { MAP_COLORS } from '@/lib/map-colors';
 import type { BuilderStyleConfig, MapLayerResponse, StyleConfig, SymbolStyleConfig } from '@/types/api';
 
@@ -80,12 +81,12 @@ function StyleControlSection({
 
 function StylePreview({ layer, onRevert }: { layer: MapLayerResponse; onRevert: () => void }) {
   const { t } = useTranslation('builder');
-  const colors = getLayerColors(layer);
-  const swatchColor = colors[0] ?? MAP_COLORS.icon.fallback;
+  const facts = legendFacts(layer);
+  const swatchColor = getLayerColors(facts)[0] ?? MAP_COLORS.icon.fallback;
   return (
     <div className="flex items-center justify-between gap-3 rounded-md border bg-background p-2">
       <div className="flex min-w-0 items-center gap-2">
-        <GeometrySwatch geometryType={layer.dataset_geometry_type} color={swatchColor} style={stylePreviewStyle(layer)} />
+        <GeometrySwatch geometryType={layer.dataset_geometry_type} color={swatchColor} style={facts?.swatch} />
         <div className="min-w-0">
           <div className="truncate text-xs font-medium">{t('style.preview.title')}</div>
           <p className="truncate text-mini text-muted-foreground">{t('style.preview.description')}</p>
@@ -137,6 +138,7 @@ export const LayerStyleEditor = memo(function LayerStyleEditor({
   onLayoutChange,
   onRevertToSaved,
 }: LayerStyleEditorProps) {
+  const layerOpacityHelpId = useId();
   const { t } = useTranslation('builder');
   const geomType = getLayerType(layer.dataset_geometry_type);
   const paint = layer.paint;
@@ -576,28 +578,6 @@ export const LayerStyleEditor = memo(function LayerStyleEditor({
         </div>
       )}
 
-      {/* Data-driven style editor — hidden when in heatmap/symbol/cluster mode */}
-      {renderMode !== 'heatmap' && renderMode !== 'symbol' && renderMode !== 'cluster' && (
-        <StyleControlSection title={t('style.sections.dataDriven')} description={t('style.sections.dataDrivenDescription')}>
-          <LazyLoadErrorBoundary>
-            <Suspense fallback={null}>
-              <DataDrivenStyleEditor
-                // fix(#461): DataDrivenStyleEditor seeds its
-                // ramp/mode/column into local useState on mount. A banner Revert
-                // rewrites layer.style_config externally, but that local state
-                // stays stale and its effect would immediately re-apply the
-                // discarded ramp. Bumping this key on revert remounts the editor
-                // so it re-seeds from the restored config. (Normal edits don't
-                // bump it, so typing/interaction is unaffected.)
-                key={`dds-${revertNonce}`}
-                layer={layer}
-                onStyleConfigChange={onStyleConfigChange}
-              />
-            </Suspense>
-          </LazyLoadErrorBoundary>
-        </StyleControlSection>
-      )}
-
       {/* Per-render-mode appearance controls — dispatched via RenderModeSwitch
           Section title/description adapts to the active mode (heatmap/symbol/cluster
           have their own section labels; fill/line/circle share the generic appearance label). */}
@@ -655,8 +635,10 @@ export const LayerStyleEditor = memo(function LayerStyleEditor({
               max={1}
               step={0.01}
               format="percent"
+              describedBy={layerOpacityHelpId}
               onChange={setLocalOpacity}
             />
+            <p id={layerOpacityHelpId} className="text-xs text-muted-foreground">{t('style.layerOpacityHelp')}</p>
           </>
         )}
 
@@ -681,6 +663,28 @@ export const LayerStyleEditor = memo(function LayerStyleEditor({
           onChange={(val) => onLayoutChange(layer.id, { ...layoutObj, '_maxzoom': val })}
         />
       </StyleControlSection>
+
+      {/* Data-driven style editor — hidden when in heatmap/symbol/cluster mode */}
+      {renderMode !== 'heatmap' && renderMode !== 'symbol' && renderMode !== 'cluster' && (
+        <StyleControlSection title={t('style.sections.dataDriven')} description={t('style.sections.dataDrivenDescription')}>
+          <LazyLoadErrorBoundary>
+            <Suspense fallback={null}>
+              <DataDrivenStyleEditor
+                // fix(#461): DataDrivenStyleEditor seeds its
+                // ramp/mode/column into local useState on mount. A banner Revert
+                // rewrites layer.style_config externally, but that local state
+                // stays stale and its effect would immediately re-apply the
+                // discarded ramp. Bumping this key on revert remounts the editor
+                // so it re-seeds from the restored config. (Normal edits don't
+                // bump it, so typing/interaction is unaffected.)
+                key={`dds-${revertNonce}`}
+                layer={layer}
+                onStyleConfigChange={onStyleConfigChange}
+              />
+            </Suspense>
+          </LazyLoadErrorBoundary>
+        </StyleControlSection>
+      )}
 
       <StyleControlSection title={t('style.sections.advanced')} description={t('style.sections.advancedDescription')}>
         <AdvancedJsonEditor

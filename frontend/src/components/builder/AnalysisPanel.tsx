@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { INTERNAL_FAILURE_REASON } from '@/lib/failure-reason';
+import { INTERNAL_FAILURE_REASON, fixedFailureReason } from '@/lib/failure-reason';
 import { useMutation } from '@tanstack/react-query';
 import { TerraDraw, TerraDrawPolygonMode } from 'terra-draw';
 import { TerraDrawMapLibreGLAdapter } from 'terra-draw-maplibre-gl-adapter';
@@ -33,6 +33,8 @@ import type { LayerActions } from '@/components/builder/ChatPanel';
 import { isAnalysableLayer } from '@/components/builder/analysis-eligibility';
 import type { EphemeralAnalysisHandoff } from '@/components/builder/hooks/use-ephemeral-layers';
 import type { AnalysisOperation, MapLayerResponse } from '@/types/api';
+import { randomId } from '@/lib/random-id';
+import { maplibreFilterToCql2, type Cql2Expression } from '@/lib/maplibre-filter-utils';
 
 const MAX_BUFFER_METERS = 100_000;
 // shadcn Select items can't carry an empty value — sentinels for "none".
@@ -42,6 +44,15 @@ const MASK_LAYER_NONE = '__none__';
 // backend/app/modules/catalog/datasets/api/router_analysis.py — the server
 // rejects any other mask dataset with a 422.
 const POLYGONAL_GEOMETRY_TYPES = new Set(['POLYGON', 'MULTIPOLYGON']);
+
+/** The request field for one layer filter, omitted when there is none to send. */
+function cql2Field<K extends string>(
+  key: K,
+  value: Cql2Expression | null | 'unsupported',
+): Partial<Record<K, Cql2Expression>> {
+  if (value === null || value === 'unsupported') return {};
+  return { [key]: value } as Record<K, Cql2Expression>;
+}
 // fix(#1097 review): mirrors _ROW_FILTERING_OPERATIONS in
 // backend/app/modules/catalog/datasets/domain/service_analysis.py. These drop
 // or multiply source rows, so the source's feature count says nothing about
@@ -71,6 +82,8 @@ const SAFE_COLUMN_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 // SAFE_COLUMN_RE above has already restricted these names to ASCII.
 const MAX_IDENTIFIER_LENGTH = 63;
 const NON_GROUPABLE_COLUMN_TYPES = new Set(['json', 'xml']);
+// The app turns focus refetching off globally; these queries need it.
+const FRESH_COLUMNS = { staleTime: 0, refetchOnWindowFocus: true };
 // ux(#686): buffer distances are metres on the wire; the picker converts so a
 // user thinking in feet or miles doesn't have to.
 const BUFFER_UNIT_METERS = { m: 1, km: 1000, ft: 0.3048, mi: 1609.344 } as const;
@@ -543,7 +556,7 @@ export function AnalysisPanel({
         td.start();
         td.addFeatures([
           {
-            id: crypto.randomUUID(),
+            id: randomId(),
             type: 'Feature',
             geometry: maskGeometry,
             properties: { mode: 'polygon' },
@@ -755,10 +768,18 @@ export function AnalysisPanel({
   // already has join_zone — routinely, because it is the output of an earlier
   // spatial join — collides with a join layer's `zone`, and the server rejects
   // both Preview and Create with a 422 the picker gave no warning of.
+  // Fetched fresh on mount and focus: a filter typed from columns that predate
+  // a re-upload can keep features the map hides.
   const datasetDetail = useDataset(
-    operation === 'dissolve' || operation === 'spatial_join'
+    operation === 'dissolve' || operation === 'spatial_join' || selectedLayer?.filter
       ? (selectedLayer?.dataset_id ?? '')
       : '',
+    FRESH_COLUMNS,
+  );
+  const maskFilterApplies = usesMaskLayer && !mask && !!maskLayer;
+  const maskDatasetDetail = useDataset(
+    maskFilterApplies && maskLayer?.filter ? maskLayer.dataset_id : '',
+    FRESH_COLUMNS,
   );
   const sourceColumnNames = new Set(
     (datasetDetail.data?.column_info ?? []).map((c) => c.name),
@@ -777,7 +798,50 @@ export function AnalysisPanel({
   // across. Fetched only while a join layer is actually selected.
   const joinDatasetDetail = useDataset(
     operation === 'spatial_join' ? (joinLayer?.dataset_id ?? '') : '',
+    FRESH_COLUMNS,
   );
+  // Each layer is analysed as the map shows it: through its own filter, sent
+  // as CQL2-JSON and typed from the dataset's current columns. The map's own
+  // copy of them predates any re-upload made while the builder is open. Only
+  // the layers the request names count.
+  const sourceCql2 = maplibreFilterToCql2(
+    selectedLayer?.filter,
+    datasetDetail.data?.column_info,
+  );
+  const maskCql2 = maskFilterApplies
+    ? maplibreFilterToCql2(maskLayer?.filter, maskDatasetDetail.data?.column_info)
+    : null;
+  const joinCql2 =
+    operation === 'spatial_join' && joinLayer
+      ? maplibreFilterToCql2(joinLayer.filter, joinDatasetDetail.data?.column_info)
+      : null;
+  const filterUnsupported = [sourceCql2, maskCql2, joinCql2].includes('unsupported');
+  // A failed or paused refetch keeps the previous columns, which may predate a
+  // re-upload.
+  const columnsSettled = (detail: { isSuccess: boolean; fetchStatus: string }) =>
+    detail.isSuccess && detail.fetchStatus === 'idle';
+  const filterColumnsPending =
+    (sourceCql2 !== null && !columnsSettled(datasetDetail)) ||
+    (maskCql2 !== null && !columnsSettled(maskDatasetDetail)) ||
+    (joinCql2 !== null && !columnsSettled(joinDatasetDetail));
+  const failedColumnQueries = (
+    [
+      [sourceCql2, datasetDetail],
+      [maskCql2, maskDatasetDetail],
+      [joinCql2, joinDatasetDetail],
+    ] as const
+  )
+    .filter(([cql2, detail]) => cql2 !== null && detail.isError && detail.fetchStatus === 'idle')
+    .map(([, detail]) => detail);
+  const filterColumnsFailed = failedColumnQueries.length > 0;
+  const filterColumnsLoading = filterColumnsPending && !filterColumnsFailed;
+  const filterFields = {
+    ...cql2Field('filter', sourceCql2),
+    ...cql2Field('mask_filter', maskCql2),
+    ...cql2Field('join_filter', joinCql2),
+  };
+  // A filter edited in the layer panel changes what a preview or a run means.
+  const filterKey = JSON.stringify([sourceCql2, maskCql2, joinCql2]);
   const joinFieldColumns = (joinDatasetDetail.data?.column_info ?? [])
     .filter((c) => {
       if (!SAFE_COLUMN_RE.test(c.name)) return false;
@@ -870,6 +934,12 @@ export function AnalysisPanel({
       setOutputTitle('');
     }
   }, [onClearPreview]);
+  const lastFilterKeyRef = useRef(filterKey);
+  useEffect(() => {
+    if (lastFilterKeyRef.current === filterKey) return;
+    lastFilterKeyRef.current = filterKey;
+    handleInputsChanged();
+  }, [filterKey, handleInputsChanged]);
 
   // feat(#790): switching the source layer is now reachable from two places —
   // the Layer select below and the chain affordance in the completion state —
@@ -1071,6 +1141,7 @@ export function AnalysisPanel({
           // undefined) when the map ref is empty, matching every other
           // mapInstanceRef guard in this panel.
           ...(bbox ? { bbox } : {}),
+          ...filterFields,
         },
         controller.signal,
       );
@@ -1265,6 +1336,7 @@ export function AnalysisPanel({
                 : {}),
             }
           : {}),
+        ...filterFields,
       });
       // fix(#793 review): mark the job as this instance's own BEFORE the
       // store learns about it — the adoption effect must not treat it as a
@@ -1315,7 +1387,9 @@ export function AnalysisPanel({
     !!selectedLayer?.dataset_id &&
     !previewMutation.isPending &&
     operation !== 'dissolve' &&
-    paramsValid;
+    paramsValid &&
+    !filterUnsupported &&
+    !filterColumnsPending;
   const canSave =
     !!selectedLayer?.dataset_id &&
     !materializeMutation.isPending &&
@@ -1323,6 +1397,8 @@ export function AnalysisPanel({
     // letting the click earn a 429.
     !analysisJobRunning &&
     paramsValid &&
+    !filterUnsupported &&
+    !filterColumnsPending &&
     outputTitle.trim().length > 0;
   // Create dataset went disabled with no reason: the role="status" region
   // below explains only the job case. A validation reason lives in this
@@ -1332,13 +1408,19 @@ export function AnalysisPanel({
     ? ('name' as const)
     : !paramsValid
       ? ('params' as const)
-      : null;
+      : filterUnsupported
+        ? ('filter' as const)
+        : filterColumnsFailed
+          ? ('filterColumns' as const)
+          : filterColumnsLoading
+            ? ('filterColumnsLoading' as const)
+            : null;
 
   if (datasetLayers.length === 0) {
     return (
       <div className="flex h-full items-center justify-center p-6 text-center text-sm text-muted-foreground">
         {t('analysisTools.noLayers', {
-          defaultValue: 'Add a dataset layer to use analysis tools',
+          defaultValue: 'Add a vector dataset layer to use analysis tools. Raster layers are not supported.',
         })}
       </div>
     );
@@ -1404,6 +1486,47 @@ export function AnalysisPanel({
             ))}
           </SelectContent>
         </Select>
+        {sourceCql2 !== null && sourceCql2 !== 'unsupported' && (
+          <p className="text-xs text-muted-foreground">
+            {t('analysisTools.layerFilterApplied', {
+              defaultValue: "Analysis uses only the features this layer's filter shows.",
+            })}
+          </p>
+        )}
+        {filterUnsupported && (
+          <p id="analysis-filter-unsupported" className="text-xs text-destructive">
+            {t('analysisTools.layerFilterUnsupported', {
+              defaultValue:
+                "A layer's filter uses an expression analysis can't apply. Simplify it in the layer's filter settings, or remove it.",
+            })}
+          </p>
+        )}
+        {filterColumnsFailed && (
+          <div className="flex items-center gap-2">
+            <p id="analysis-filter-columns-failed" className="text-xs text-destructive">
+              {t('analysisTools.layerFilterColumnsFailed', {
+                defaultValue:
+                  "Couldn't load a filtered layer's columns, so its filter can't be checked yet.",
+              })}
+            </p>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              onClick={() => failedColumnQueries.forEach((query) => void query.refetch())}
+            >
+              {t('analysisTools.layerFilterColumnsRetry', { defaultValue: 'Try again' })}
+            </Button>
+          </div>
+        )}
+        {filterColumnsLoading && (
+          <p id="analysis-filter-columns-loading" className="text-xs text-muted-foreground">
+            {t('analysisTools.layerFilterColumnsLoading', {
+              defaultValue: "Checking the filtered layer's columns…",
+            })}
+          </p>
+        )}
       </div>
 
       <div className="space-y-1.5">
@@ -1810,6 +1933,15 @@ export function AnalysisPanel({
           <Button
             type="submit"
             aria-busy={previewMutation.isPending || undefined}
+            aria-describedby={
+              filterUnsupported
+                ? 'analysis-filter-unsupported'
+                : filterColumnsFailed
+                  ? 'analysis-filter-columns-failed'
+                  : filterColumnsLoading
+                    ? 'analysis-filter-columns-loading'
+                    : undefined
+            }
             disabled={!canRun}
           >
             {previewMutation.isPending
@@ -1857,7 +1989,17 @@ export function AnalysisPanel({
               aria-busy={materializeMutation.isPending || undefined}
               // The validation hint below says WHY this is disabled; the
               // job cases are narrated by the status region instead.
-              aria-describedby={saveBlockedReason ? 'analysis-save-hint' : undefined}
+              aria-describedby={
+                saveBlockedReason === 'filter'
+                  ? 'analysis-filter-unsupported'
+                  : saveBlockedReason === 'filterColumns'
+                    ? 'analysis-filter-columns-failed'
+                    : saveBlockedReason === 'filterColumnsLoading'
+                      ? 'analysis-filter-columns-loading'
+                      : saveBlockedReason
+                    ? 'analysis-save-hint'
+                    : undefined
+              }
               onClick={() => {
                 // fix(#682 review): reset only this panel's local status line.
                 // Clearing the GLOBAL tracking here would orphan a job that is
@@ -1875,7 +2017,7 @@ export function AnalysisPanel({
             </Button>
             {/* Static hint, deliberately NOT in the role="status" region —
                 a polite live region would narrate it on every keystroke. */}
-            {saveBlockedReason && (
+            {(saveBlockedReason === 'name' || saveBlockedReason === 'params') && (
               <p id="analysis-save-hint" className="text-xs text-muted-foreground">
                 {saveBlockedReason === 'name'
                   ? t('analysisTools.saveHintNeedsName', {
@@ -1924,7 +2066,7 @@ export function AnalysisPanel({
                       job.error_message !== INTERNAL_FAILURE_REASON
                       ? t('analysisTools.jobFailedDetail', {
                           defaultValue: 'Analysis job failed: {{message}}',
-                          message: job.error_message,
+                          message: fixedFailureReason(job.error_code) ?? job.error_message,
                         })
                       : t('analysisTools.jobFailed', {
                           defaultValue: 'Analysis job failed',
@@ -1938,9 +2080,10 @@ export function AnalysisPanel({
                         // query state, so it outlives the watcher's store
                         // clear rather than disappearing with it.
                         job.status === 'cancelled'
-                        ? t('analysisTools.jobCancelled', {
-                            defaultValue: 'Analysis run cancelled',
-                          })
+                        ? (fixedFailureReason(job.error_code) ??
+                            t('analysisTools.jobCancelled', {
+                              defaultValue: 'Analysis run cancelled',
+                            }))
                         : job.current_step === 'registering'
                         ? t('analysisTools.jobSaving', {
                             defaultValue: 'Saving the dataset…',

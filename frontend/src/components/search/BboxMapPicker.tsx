@@ -6,12 +6,14 @@ import type { Map as MaplibreMap } from 'maplibre-gl';
 import { useTranslation } from 'react-i18next';
 import { useTheme } from '@/components/theme-provider';
 import { useBasemaps } from '@/hooks/use-settings';
+import { useMapLocale } from '@/hooks/use-map-locale';
 import {
   getThemeBasemap,
   toMaplibreStyle,
   FALLBACK_BASEMAP_STYLE_URL,
   FALLBACK_BASEMAP_STYLE_URL_DARK,
 } from '@/lib/basemap-utils';
+import { normalizeBboxLongitudes } from '@/lib/bbox';
 import { MAP_COLORS } from '@/lib/map-colors';
 import 'maplibre-gl/dist/maplibre-gl.css';
 // feat(#846): wires maplibre v6's worker URL. Side-effect import, kept out of
@@ -24,6 +26,7 @@ interface BboxMapPickerProps {
 
 export function BboxMapPicker({ onBboxSelected }: BboxMapPickerProps) {
   const { t } = useTranslation('search');
+  const mapLocale = useMapLocale();
   const { resolvedTheme } = useTheme();
   const { data: basemaps } = useBasemaps();
   const drawRef = useRef<TerraDraw | null>(null);
@@ -84,7 +87,7 @@ export function BboxMapPicker({ onBboxSelected }: BboxMapPickerProps) {
         if (lat > maxY) maxY = lat;
       }
 
-      onBboxSelectedRef.current(`${minX},${minY},${maxX},${maxY}`);
+      onBboxSelectedRef.current(normalizeBboxLongitudes(`${minX},${minY},${maxX},${maxY}`));
       td.removeFeatures([id]);
     });
 
@@ -106,6 +109,7 @@ export function BboxMapPicker({ onBboxSelected }: BboxMapPickerProps) {
           initialViewState={{ longitude: 0, latitude: 20, zoom: 1 }}
           style={{ width: '100%', height: 250 }}
           mapStyle={basemapStyle as string}
+          locale={mapLocale}
           onLoad={handleMapLoad}
         />
       </div>

@@ -1,4 +1,4 @@
-"""The reupload swap's post-swap catalog wait carries an explicit budget (#1921).
+"""The reupload swap's post-swap catalog wait runs on the worker budget (#1921).
 
 The swap holds AccessExclusiveLock on the table it installed across that wait,
 so its duration is the dataset's unreadable window. Expiry rolls the whole swap
@@ -16,18 +16,16 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import joinedload
 
 from app.modules.catalog.datasets.domain.models import Dataset
-from app.processing.ingest.tasks_common import _apply_reupload_swap
+from app.platform import catalog_locks
+from app.processing.ingest import publication
 from app.platform.catalog_locks import (
     CATALOG_LOCK_CONFLICT_CODE,
     CatalogLockConflict,
 )
-from app.processing.ingest import tasks_common
-from app.processing.ingest.tasks_reupload import (
-    _file_refresh_error_code,
-    _service_refresh_error_code,
-)
+from app.processing.ingest.tasks_reupload import _service_refresh_error_code
+from app.processing.ingest.tasks_reupload import _file_refresh_error_code
 
-from tests.test_reupload_swap_lock_retry import _minimal_metadata
+from tests.test_reupload_swap_lock_retry import _minimal_measurement, swap_in
 from tests.test_swap_lock_timeout_scope_1917 import (
     _run_swap,
     _stub_downstream,
@@ -47,13 +45,13 @@ async def swap_target(client, test_db_session):
 _TEST_BUDGET = "500ms"
 _TEST_BUDGET_MS = 500
 
-_POST_SWAP_BUDGET = tasks_common._POST_SWAP_CATALOG_TIMEOUT
+_POST_SWAP_BUDGET = catalog_locks.WORKER_LOCK_TIMEOUT
 # What `current_setting` reports back for the constant above.
 _NORMALIZED_BUDGET = "1min"
 
 
 class TestPostSwapCatalogWaitBudget:
-    async def test_the_wait_runs_on_the_swaps_own_budget(
+    async def test_the_wait_runs_on_the_worker_budget(
         self, swap_target, monkeypatch
     ) -> None:
         """A budget is in force for the duration of the catalog acquisition."""
@@ -66,7 +64,6 @@ class TestPostSwapCatalogWaitBudget:
 
         async def _recording_lock(session, **kwargs):
             observed["lock_timeout"] = kwargs.get("lock_timeout")
-            # fix(#1919): the DDL budget is gone by the time this wait starts.
             observed["on_entry"] = await session.scalar(
                 text("SELECT current_setting('lock_timeout')")
             )
@@ -77,23 +74,18 @@ class TestPostSwapCatalogWaitBudget:
 
         async with db_module.async_session() as session:
             _stub_downstream(monkeypatch, session)
-            arrived_with = await session.scalar(
-                text("SELECT current_setting('lock_timeout')")
-            )
-            monkeypatch.setattr(locks_module, "lock_catalog_rows", _recording_lock)
+            monkeypatch.setattr(publication, "lock_catalog_rows", _recording_lock)
             await _run_swap(session, stub, staging)
             await session.rollback()
 
-        assert observed["lock_timeout"] == tasks_common._POST_SWAP_CATALOG_TIMEOUT, (
-            "the swap asked for "
-            f"{observed['lock_timeout']!r}, not the module's post-swap budget. "
-            "An unbounded wait here is an unbounded outage: the transaction "
-            "holds AccessExclusiveLock on the table it just installed."
+        assert observed["lock_timeout"] is None, (
+            f"the acquisition asked for {observed['lock_timeout']!r} of its own; "
+            "the worker budget around it is the one that bounds the wait."
         )
-        assert observed["on_entry"] == arrived_with, (
-            f"the wait started on {observed['on_entry']!r}, not the "
-            f"{arrived_with!r} the transaction arrived with: the swap's DDL "
-            "budget leaked past the savepoint that set it (#1919)."
+        assert observed["on_entry"] == _NORMALIZED_BUDGET, (
+            f"the wait started on {observed['on_entry']!r}, not the worker "
+            "budget: an unbounded wait here is an unbounded outage, since the "
+            "transaction holds AccessExclusiveLock on the table it installed."
         )
         assert observed["in_force"] == _NORMALIZED_BUDGET, (
             f"lock_timeout read {observed['in_force']!r} inside the "
@@ -124,7 +116,7 @@ class TestPostSwapCatalogWaitBudget:
         )
         assert acquired[0]["log_level"] == "info"
         assert acquired[0]["table_name"] == stub.table_name
-        assert acquired[0]["budget"] == tasks_common._POST_SWAP_CATALOG_TIMEOUT
+        assert acquired[0]["budget"] == _POST_SWAP_BUDGET
         assert isinstance(acquired[0]["waited_ms"], int)
 
     async def test_a_holder_past_the_budget_fails_the_swap_as_contention(
@@ -137,7 +129,7 @@ class TestPostSwapCatalogWaitBudget:
         )
         await test_db_session.commit()
 
-        monkeypatch.setattr(tasks_common, "_POST_SWAP_CATALOG_TIMEOUT", _TEST_BUDGET)
+        monkeypatch.setattr(catalog_locks, "WORKER_LOCK_TIMEOUT", _TEST_BUDGET)
         import app.core.db as db_module
 
         async with (
@@ -194,7 +186,7 @@ class TestPostSwapCatalogWaitBudget:
     ) -> None:
         """A real ORM instance still reports contention, not a greenlet error."""
         stub, staging = swap_target
-        monkeypatch.setattr(tasks_common, "_POST_SWAP_CATALOG_TIMEOUT", _TEST_BUDGET)
+        monkeypatch.setattr(catalog_locks, "WORKER_LOCK_TIMEOUT", _TEST_BUDGET)
         import app.core.db as db_module
 
         async with (
@@ -215,12 +207,11 @@ class TestPostSwapCatalogWaitBudget:
             with structlog.testing.capture_logs() as captured:
                 with pytest.raises(CatalogLockConflict):
                     await asyncio.wait_for(
-                        _apply_reupload_swap(
+                        swap_in(
                             api,
                             dataset=loaded,
                             staging_table=staging,
-                            metadata=_minimal_metadata(),
-                            sample_values={},
+                            measurement=_minimal_measurement(),
                             user_id=str(uuid.uuid4()),
                             source_filename="x.csv",
                             source_format="csv",
@@ -261,14 +252,13 @@ class TestPostSwapCatalogWaitBudget:
         """A lost deadlock and an unreadable cause are not reported as expiry."""
         stub, staging = swap_target
         import app.core.db as db_module
-        import app.platform.catalog_locks as locks_module
 
         async def _raise_conflict(session, **kwargs):
             conflict = CatalogLockConflict("held")
             conflict.__cause__ = cause
             raise conflict
 
-        monkeypatch.setattr(locks_module, "lock_catalog_rows", _raise_conflict)
+        monkeypatch.setattr(publication, "lock_catalog_rows", _raise_conflict)
         async with db_module.async_session() as session:
             _stub_downstream(monkeypatch, session)
             with structlog.testing.capture_logs() as captured:

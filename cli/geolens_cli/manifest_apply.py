@@ -14,9 +14,11 @@ from urllib.parse import urlsplit
 import typer
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from ._sdk_helpers import (
     EXIT_AUTH,
+    EXIT_BLOCKED,
     EXIT_GENERIC,
     EXIT_NETWORK,
     EXIT_SERVER,
@@ -27,7 +29,7 @@ from ._sdk_helpers import (
 )
 
 APPLY_ENDPOINT = "/ingest/manifest/apply"
-_COUNT_KEYS = ("create", "update", "skip", "error")
+_COUNT_KEYS = ("create", "update", "skip", "blocked", "error")
 
 # ---------------------------------------------------------------------------
 # fix(#1778 review round 18): batch-aware apply timeout
@@ -231,7 +233,7 @@ def resolve_apply_timeout(raw: float | None) -> float | None | Any:
 #: URI schemes the backend manifest-apply path fetches server-side. Anything
 #: without one of these schemes is a LOCAL relative path that must already
 #: exist under the server's upload_staging_dir — `apply` never transfers it.
-_REMOTE_URI_SCHEMES = frozenset({"http", "https", "s3", "gs", "az", "abfs"})
+_REMOTE_URI_SCHEMES = frozenset({"http", "https", "s3"})
 
 
 def find_local_source_uris(document: Mapping[str, Any]) -> list[str]:
@@ -245,7 +247,7 @@ def find_local_source_uris(document: Mapping[str, Any]) -> list[str]:
     instead of getting opaque backend skips/errors.
 
     A URI is treated as local when it has no recognized remote scheme
-    (http/https/s3/gs/az/abfs). Matches the backend classifier in
+    (http/https/s3). Matches the backend classifier in
     ``app.processing.ingest.manifest_sources.classify_manifest_source``.
     """
     local: list[str] = []
@@ -579,10 +581,109 @@ def apply_report_payload(path: Path, response: Mapping[str, Any]) -> dict[str, A
         "accepted": bool(response.get("accepted")),
         "counts": summarize_results(response),
         "dry_run": bool(response.get("dry_run")),
-        "ok": bool(response.get("accepted")) and not has_apply_errors(response),
+        "ok": bool(response.get("accepted"))
+        and not has_apply_errors(response)
+        and not has_blocked_results(response),
         "path": str(path),
         "results": response.get("results", []),
     }
+
+
+def wait_for_apply_jobs(
+    client: Any,
+    response: Mapping[str, Any],
+    *,
+    instance: str,
+    credential_kind: str,
+    credential_provenance: str | None,
+) -> dict[str, Any]:
+    """Follow every queued job to its end and stamp each result with the outcome.
+
+    A skip that names a job is an identical manifest already queued or finished,
+    so its job is followed too. An update runs under a refresh run, found through
+    the job that queued it. A job with no run (a first import) is followed through the job itself.
+    ``final_status`` is one of complete, failed, blocked or cancelled.
+    """
+    from uuid import UUID
+
+    from . import refresh as _refresh
+
+    active_client = client
+
+    def replace_client(replacement: Any) -> None:
+        nonlocal active_client
+        active_client = replacement
+
+    waited = copy.deepcopy(dict(response))
+    results = waited.get("results")
+    if not isinstance(results, list):
+        return waited
+    for result in results:
+        if not (
+            isinstance(result, dict)
+            and result.get("action") in {"create", "update", "skip"}
+            and result.get("job_id")
+        ):
+            continue
+        job_id = UUID(str(result["job_id"]))
+        def follow_run(job_id=job_id, result=result):
+            if not result.get("dataset_id"):
+                return None
+            try:
+                return _refresh.wait_for_refresh_run(
+                    active_client,
+                    UUID(str(result["dataset_id"])),
+                    None,
+                    ingest_job_id=job_id,
+                    instance=instance,
+                    credential_kind=credential_kind,
+                    credential_provenance=credential_provenance,
+                    on_reauthenticated=replace_client,
+                )
+            except _refresh.RefreshRequestError:
+                return None
+
+        poll = follow_run()
+        if poll is None:
+            poll = _refresh.wait_for_refresh(
+                active_client,
+                job_id,
+                instance=instance,
+                credential_kind=credential_kind,
+                credential_provenance=credential_provenance,
+                on_reauthenticated=replace_client,
+            )
+            # The job can end before its run exists (a retry racing the original
+            # request); a review hold shows only on the run, so look again.
+            poll = follow_run() or poll
+        result["final_status"] = "complete" if poll.succeeded else poll.status
+        result["run_id"] = poll.run_id
+        if poll.error_message:
+            result["error_message"] = poll.error_message
+        if poll.status == "blocked":
+            result["review_reasons"] = _refresh.blocked_review_reasons(poll)
+    return waited
+
+
+def apply_exit_code(response: Mapping[str, Any]) -> int:
+    """1 if anything errored or failed, else 6 if anything is blocked, else 0."""
+    if has_apply_errors(response):
+        return EXIT_GENERIC
+    return EXIT_BLOCKED if has_blocked_results(response) else 0
+
+
+def is_blocked(result: Any) -> bool:
+    """True for an entry held for review: reported blocked, or followed to a hold."""
+    return isinstance(result, Mapping) and "blocked" in (
+        result.get("action"),
+        result.get("final_status"),
+    )
+
+
+def has_blocked_results(response: Mapping[str, Any]) -> bool:
+    """True when any entry is held for review."""
+    results = response.get("results")
+    return isinstance(results, list) and any(is_blocked(result) for result in results)
 
 
 def has_apply_errors(response: Mapping[str, Any]) -> bool:
@@ -594,7 +695,11 @@ def has_apply_errors(response: Mapping[str, Any]) -> bool:
     if not isinstance(results, list):
         return False
     return any(
-        isinstance(result, Mapping) and result.get("action") == "error"
+        isinstance(result, Mapping)
+        and (
+            result.get("action") == "error"
+            or result.get("final_status") in {"failed", "cancelled", "timed_out"}
+        )
         for result in results
     )
 
@@ -606,6 +711,12 @@ def _cell(result: Mapping[str, Any], key: str) -> str:
     if isinstance(value, list):
         return "; ".join(str(item) for item in value) or "-"
     return str(value)
+
+
+def _message_key(result: Mapping[str, Any]) -> str:
+    """A failed or cancelled follow-up shows why in place of the queued message."""
+    failed = result.get("final_status") in {"failed", "cancelled"}
+    return "error_message" if failed and result.get("error_message") else "message"
 
 
 def render_apply_summary(
@@ -621,9 +732,11 @@ def render_apply_summary(
         (
             f"{mode}: {path} "
             f"(create={counts['create']}, update={counts['update']}, "
-            f"skip={counts['skip']}, error={counts['error']})"
+            f"skip={counts['skip']}, blocked={counts['blocked']}, "
+            f"error={counts['error']})"
         ),
         soft_wrap=True,
+        markup=False,
     )
 
     table = Table(title="Manifest apply results")
@@ -631,19 +744,36 @@ def render_apply_summary(
     table.add_column("ACTION")
     table.add_column("DATASET ID", overflow="fold")
     table.add_column("JOB ID", overflow="fold")
+    results = response.get("results", [])
+    waited = isinstance(results, list) and any(
+        isinstance(result, Mapping) and "final_status" in result for result in results
+    )
+    if waited:
+        table.add_column("STATUS")
+    with_run = isinstance(results, list) and any(
+        isinstance(result, Mapping) and result.get("run_id") for result in results
+    )
+    if with_run:
+        table.add_column("RUN ID", overflow="fold")
     table.add_column("MESSAGE", overflow="fold")
 
-    results = response.get("results", [])
     if isinstance(results, list):
         for result in results:
             if not isinstance(result, Mapping):
                 continue
             table.add_row(
-                _cell(result, "dataset_key"),
-                _cell(result, "action"),
-                _cell(result, "dataset_id"),
-                _cell(result, "job_id"),
-                _cell(result, "message"),
+                *(
+                    Text(_cell(result, key))
+                    for key in (
+                        "dataset_key",
+                        "action",
+                        "dataset_id",
+                        "job_id",
+                        *(("final_status",) if waited else ()),
+                        *(("run_id",) if with_run else ()),
+                        _message_key(result),
+                    )
+                )
             )
 
     console.print(table)

@@ -4,6 +4,7 @@ import { toast } from 'sonner';
 import { Map as MapGL, NavigationControl, ScaleControl, FullscreenControl, AttributionControl, TerrainControl } from '@vis.gl/react-maplibre';
 import { useBasemaps, useBranding, useTileConfig } from '@/hooks/use-settings';
 import { useEdition } from '@/hooks/use-edition';
+import { useMapLocale } from '@/hooks/use-map-locale';
 import {
   findBasemapById,
   makeStyleImageMissingResolver,
@@ -12,7 +13,7 @@ import {
   BLANK_BASEMAP_ID,
   FALLBACK_BASEMAP_STYLE_URL,
 } from '@/lib/basemap-utils';
-import { buildClusterTileUrl, buildSignedTileUrl, buildTileTransformRequest, getMvtSourceLayerName, isMvtSourceLayerConfigReady, isThirdPartyTileUrl, refreshRasterTileSources, resolveTileBaseUrl } from '@/lib/tile-utils';
+import { buildTileTransformRequest, isMvtSourceLayerConfigReady, isThirdPartyTileUrl, refreshRasterTileSources, resolveTileBaseUrl } from '@/lib/tile-utils';
 import { useRemoteBasemapStyle } from '@/components/map/hooks/use-remote-basemap-style';
 import { isRasterTileAuthError, isRefreshableRasterAuthError, logUnhandledMapError } from '@/lib/map-error-log';
 import { reportTileTokenRemint } from '@/lib/report';
@@ -29,14 +30,16 @@ import {
   isClusterFeature,
 } from '@/components/map/cluster-interactions';
 import { MapCoordReadout } from '@/components/map/MapCoordReadout';
+import type { DrawnLayer } from '@/components/map/legend-facts';
 import { substitutePopupTemplate } from '@/lib/popup-template';
 import i18n from '@/i18n/i18n';
-import type { MapLibreEvent, MapMouseEvent, VectorTileSource } from 'maplibre-gl';
+import { GEOLENS_SITE_URL } from '@/lib/external-links';
+import type { MapLibreEvent, MapMouseEvent } from 'maplibre-gl';
 import type { Map as MaplibreMap } from 'maplibre-gl';
 import type { MapBasemapConfig, MapTerrainConfig, SharedLayerResponse } from '@/types/api';
 import { getAdapter } from '@/components/builder/layer-adapters/registry';
-import type { AdapterLayerInput } from '@/components/builder/layer-adapters/types';
-import { resolveAdapterType, prefixed, getDataDrivenColumnsForLayer, isDemTerrainVisualSuppressed, registerBasemapStyleGeneration } from '@/components/builder/map-sync';
+import { adapterInputFor, describeLayers } from '@/components/builder/layer-description';
+import { prefixed, isDemTerrainVisualSuppressed, registerBasemapStyleGeneration, syncRenderContext } from '@/components/builder/map-sync';
 import { applyMapBasemapAppearance, syncMapComposition } from '@/components/builder/map-composition-sync';
 import type { SyncLayerInput } from '@/components/builder/map-sync';
 import { asFeatureCollection, fetchBoundedGeoJson } from '@/api/geojson-z';
@@ -46,8 +49,7 @@ import {
   createViewerLayerEntries,
   isTerrainBackingLiveVisible,
 } from '@/components/viewer/layer-identity';
-import { getClusterSourceEligibility, getClusterSourceStrategy, isClusterRenderMode, shouldFetchClusterGeoJson } from '@/components/builder/cluster-source';
-import { effectiveDemRenderMode } from '@/lib/dem-render-mode';
+import { getClusterSourceEligibility, getClusterSourceStrategy, shouldFetchClusterGeoJson } from '@/components/builder/cluster-source';
 import { AccessibleMapDataPanel } from '@/components/viewer/AccessibleMapDataPanel';
 import {
   toAccessibleMapFeatures,
@@ -92,11 +94,8 @@ interface ViewerMapProps {
   basemapConfig?: MapBasemapConfig | null;
   showBasemapLabels?: boolean;
   terrainConfig?: MapTerrainConfig | null;
-  /** When true and edition is community (or enterprise with show_badge !== false),
-   *  renders an inline "Powered by GeoLens" overlay anchored to the map canvas.
-   *  Defaults to false — non-embed callers stay clean.
-   */
-  showInlineBranding?: boolean;
+  /** Receives what the map draws each layer as, by layer key, once any bounded cluster GeoJSON has settled. */
+  onDrawnChange?: (drawn: ReadonlyMap<string, DrawnLayer>) => void;
 }
 
 /** Convert a SharedLayerResponse to the normalized SyncLayerInput.
@@ -131,35 +130,7 @@ export function toViewerSyncInput(
     // fix(#394) VT-02: thread the dataset content version through so the
     // viewer's tile URLs carry the same `_v=` cache-buster as the builder.
     tile_version: layer.tile_version,
-  };
-}
-
-/** Build an AdapterLayerInput for viewer visibility syncing (no tile URL needed). */
-function toAdapterInput(
-  layer: SharedLayerResponse,
-  layerKey: string,
-  visibleLayers: Set<string>,
-  mvtSourceLayerPrefix?: string | null,
-): AdapterLayerInput {
-  return {
-    id: layerKey,
-    dataset_table_name: layer.table_name,
-    dataset_geometry_type: layer.geometry_type,
-    opacity: layer.opacity ?? 1,
-    visible: visibleLayers.has(layerKey),
-    paint: layer.paint ?? {},
-    layout: layer.layout ?? {},
-    filter: layer.filter ?? null,
-    label_config: layer.label_config,
-    style_config: layer.style_config,
-    is_dem: layer.is_dem,
-    sourceId: prefixed('source', layerKey, VIEWER_PREFIX),
-    layerId: prefixed('layer', layerKey, VIEWER_PREFIX),
-    // fix(#394) VT-03: derive via the shared helper instead of a hand-rolled
-    // template — the URL path and source-layer name must come from one place
-    // or a drift is a silent empty layer (see tile-utils parity test, VT-04).
-    sourceLayer: getMvtSourceLayerName(layer.table_name, mvtSourceLayerPrefix),
-    tileUrl: '',
+    bounds: layer.dataset_extent_bbox ?? null,
   };
 }
 
@@ -174,17 +145,15 @@ export const ViewerMap = memo(function ViewerMap({
   basemapConfig = null,
   showBasemapLabels = true,
   terrainConfig = null,
-  showInlineBranding = false,
+  onDrawnChange,
 }: ViewerMapProps) {
   const { t } = useTranslation('common');
-  const { isEnterprise } = useEdition();
+  const mapLocale = useMapLocale();
+  const { isEnterprise, isResolved } = useEdition();
   const { data: branding } = useBranding();
-  // Gate on branding !== undefined so enterprise users with show_badge:false do
-  // not see a flash of the badge while the branding query is still loading (IN-02).
-  const showBranding = showInlineBranding && (
-    branding !== undefined &&
-    (!isEnterprise || branding?.show_badge !== false)
-  );
+  // isEnterprise defaults to false until the edition resolves, and only Enterprise
+  // can opt out, so Enterprise also waits for branding to avoid flashing the credit.
+  const showBranding = isResolved && (!isEnterprise || (branding !== undefined && branding.show_badge !== false));
   const mapRef = useRef<MaplibreMap | null>(null);
   const managedSourcesRef = useRef<Set<string>>(new Set());
   const prevOrderKeyRef = useRef('');
@@ -199,11 +168,20 @@ export const ViewerMap = memo(function ViewerMap({
     () => collectLayerAttributions(layers, visibleLayers),
     [layers, visibleLayers],
   );
+  const attributionCredits = useMemo(
+    () => showBranding
+      ? [
+          ...layerAttributions,
+          `<a href="${GEOLENS_SITE_URL}" target="_blank" rel="noopener noreferrer">GeoLens</a>`,
+        ]
+      : layerAttributions,
+    [layerAttributions, showBranding],
+  );
 
   // Tile token management (fetch, auto-refresh, error toast)
   const { tokenMap, refreshTokens } = useViewerTokens({ layers, apiKey, embedToken });
-  // fix(#621): shared tile-auth recovery — a vector tile 401/403 kicks one
-  // throttled token re-mint; the token-refresh effect below re-signs sources.
+  // Shared tile-auth recovery: a vector tile 401/403 kicks one throttled token
+  // re-mint, and the sync pass re-signs the sources once the new token lands.
   // fix(#890): report every mint the recovery path actually kicks (suppressed),
   // so a tab-return recovery still leaves a trace now that it no longer arrives
   // wrapped in a 403 burst.
@@ -268,13 +246,10 @@ export const ViewerMap = memo(function ViewerMap({
     return () => clearTimeout(timer);
   }, [revealed]);
 
-  // Bounded GeoJSON data for small 3D datasets and eligible cluster layers.
+  // Bounded GeoJSON for cluster layers small enough to cluster in the browser.
   const geojsonDataRef = useRef<Map<string, GeoJSON.FeatureCollection>>(new Map());
   const boundedGeoJsonLayers = useMemo(
-    () => layerEntries.filter(({ layer }) => (
-      (layer.is_3d && layer.feature_count != null && layer.feature_count <= 5000)
-      || shouldFetchClusterGeoJson(layer)
-    )),
+    () => layerEntries.filter(({ layer }) => shouldFetchClusterGeoJson(layer)),
     [layerEntries],
   );
   const boundedGeoJsonRequest = useMemo(() => ({
@@ -382,8 +357,7 @@ export const ViewerMap = memo(function ViewerMap({
     setTilesIdle(false);
   }, []);
 
-  // Fetch bounded GeoJSON data for small 3D datasets (auto-switch from MVT per D-07)
-  // and for eligible point cluster layers.
+  // Fetch bounded GeoJSON for the eligible cluster layers.
   // Fetch is independent of map readiness — data lands in a ref, repaint is separate.
   useEffect(() => {
     if (boundedGeoJsonLayers.length === 0) {
@@ -394,20 +368,18 @@ export const ViewerMap = memo(function ViewerMap({
       return;
     }
     let cancelled = false;
+    const controller = new AbortController();
     async function fetchAll() {
       const newMap = new Map<string, GeoJSON.FeatureCollection>();
       await Promise.all(
         boundedGeoJsonLayers.map(async ({ layer, key }) => {
           try {
-            const data = await fetchBoundedGeoJson(layer.dataset_id, { apiKey, embedToken });
-            if (!cancelled) {
-              const eligibility = getClusterSourceEligibility(layer);
-              const isClusterLayer = isClusterRenderMode(layer);
-              if (!isClusterLayer || (!data.truncated && data.total_count <= eligibility.limit)) {
-                newMap.set(key, asFeatureCollection(data));
-              }
+            const data = await fetchBoundedGeoJson(layer.dataset_id, { apiKey, embedToken, signal: controller.signal });
+            if (!cancelled && !data.truncated && data.total_count <= getClusterSourceEligibility(layer).limit) {
+              newMap.set(key, asFeatureCollection(data));
             }
           } catch (e) {
+            if (controller.signal.aborted) return;
             if (import.meta.env.DEV) console.warn(`[ViewerMap] Bounded GeoJSON fetch failed for ${layer.dataset_id}:`, e);
             toast.error(t('viewer.geoJsonLoadError', { defaultValue: 'Failed to load layer data' }), { id: `geojson-z-error-${layer.dataset_id}` });
           }
@@ -422,15 +394,43 @@ export const ViewerMap = memo(function ViewerMap({
     fetchAll().catch(() => {
       // Individual layer errors are already toasted above; this only fires on unexpected scaffolding failure
     });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [boundedGeoJsonLayers, boundedGeoJsonRequest, apiKey, embedToken, t]);
 
-  // Trigger repaint when GeoJSON-Z data arrives and map is ready
+  // Trigger repaint when bounded GeoJSON arrives and map is ready
   useEffect(() => {
     if (geojsonVersion === 0) return;
     const map = mapRef.current;
     if (map && mapReady) map.triggerRepaint();
   }, [geojsonVersion, mapReady]);
+
+  // A cluster draws single points while its GeoJSON loads, so reporting waits
+  // for the fetch to settle and reports a fallback only when it stays.
+  const onDrawnChangeRef = useRef(onDrawnChange);
+  onDrawnChangeRef.current = onDrawnChange;
+  const hasReportedRef = useRef(false);
+  useEffect(() => {
+    if (!tileConfigReady || !boundedGeoJsonReady) {
+      // The last report describes the last request, so withdraw it while this one loads.
+      if (hasReportedRef.current) onDrawnChangeRef.current?.(new Map());
+      hasReportedRef.current = false;
+      return;
+    }
+    const context = syncRenderContext(new Map(), undefined, geojsonDataRef.current, {
+      idPrefix: VIEWER_PREFIX,
+      mvtSourceLayerPrefix: tileConfig?.mvt_source_layer_prefix,
+    });
+    const drawn = new Map<string, DrawnLayer>();
+    for (const { layer, key } of layerEntries) {
+      const [described] = describeLayers([toViewerSyncInput(layer, key, visibleLayers)], context).layers;
+      if (described) drawn.set(key, { drawsAs: described.drawsAs });
+    }
+    onDrawnChangeRef.current?.(drawn);
+    hasReportedRef.current = drawn.size > 0;
+  }, [layerEntries, visibleLayers, geojsonVersion, tileConfigReady, boundedGeoJsonReady, tileConfig?.mvt_source_layer_prefix]);
 
   const handleLoad = useCallback(
     (e: MapLibreEvent) => {
@@ -475,11 +475,10 @@ export const ViewerMap = memo(function ViewerMap({
           });
           return;
         }
-        // fix(#621): a first-party tile 401/403 means the signed tile URL has
-        // gone stale (expired sig / stranded session). Kick one throttled
-        // token re-mint — the token-refresh effect re-signs the sources when
-        // it lands, and a conclusively dead session surfaces through the
-        // global signed-out handling (#628) via the mint request itself.
+        // A first-party tile 401/403 means the signed tile URL has gone stale
+        // (expired signature or stranded session). Kick one throttled token
+        // re-mint: the sync pass re-signs the sources when it lands, and a dead
+        // session surfaces through the global signed-out handling via the mint.
         if ((status === 401 || status === 403) && !isThirdPartyUrl(e.error?.url)) {
           // audit(w3-maps A2): recoverTileAuth() returning false is
           // contractual — a recent re-mint didn't cure the error (revoked
@@ -699,6 +698,7 @@ export const ViewerMap = memo(function ViewerMap({
           properties: props,
           layerName: layer.display_name || layer.dataset_name || fallbackName,
           columnInfo: layer.column_info ?? null,
+          datasetId: layer.dataset_id,
           title: cfg?.expression ? substitutePopupTemplate(cfg.expression, props) : null,
           visibleFields: cfg?.visible_fields ?? null,
           zoomAtClick: map.getZoom(),
@@ -948,72 +948,6 @@ export const ViewerMap = memo(function ViewerMap({
   // Note: visibleLayers intentionally excluded — the dedicated visibility effect below handles it
   }, [layers, mapReady, tileConfigReady, tileConfig?.cdn_base_url, tileConfig?.mvt_source_layer_prefix, tokenMap, showBasemapLabels, runSync, embedToken, geojsonVersion]);
 
-  // Update tile URLs in-place when vector tokens refresh (token rotation).
-  // Narrow the dep to the single primitive the effect actually reads so the
-  // hook only re-runs when the CDN base URL changes (not on any tileConfig
-  // object identity churn).
-  //
-  // IMPORTANT: raster sources also expose `setTiles`, so the old
-  // `'setTiles' in source` check matched both vector and raster sources
-  // indiscriminately — and `buildSignedTileUrl` always produces a vector
-  // URL. That meant on every token refresh we were overwriting raster
-  // sources' correct `/raster-tiles/.../tiles/{z}/{x}/{y}.png` URLs with
-  // broken vector `.pbf` URLs, which the server rejects and the raster
-  // never renders again.
-  // Gate on `source.type === 'vector'` and on the token also being the
-  // vector kind so rasters (which have stable URLs and no expiration) are
-  // left untouched.
-  // NOTE: The setTiles call intentionally duplicates what syncLayersToMap does —
-  // this effect fires on token refresh alone without triggering a full layer sync.
-  const cdnBaseUrl = tileConfig?.cdn_base_url;
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !mapReady || (!embedToken && tokenMap.size === 0)) return;
-    const tileBaseUrl = resolveTileBaseUrl({ cdn_base_url: cdnBaseUrl });
-
-    let rearmed = false;
-    for (const { layer, key } of layerEntries) {
-      const token = tokenMap.get(layer.dataset_id) ?? null;
-      // Skip rasters — their tile_url is stable, no refresh needed.
-      if (token && token.kind !== 'vector') continue;
-      const sourceId = prefixed('source', key, VIEWER_PREFIX);
-      const source = map.getSource(sourceId);
-      // Only vector sources need query-param URL refreshes.
-      if (source && source.type === 'vector') {
-        if (!rearmed) {
-          markMapLoading();
-          rearmed = true;
-        }
-        const strategy = getClusterSourceStrategy(layer);
-        const builder = layer.style_config?.builder;
-        // Per-layer source in viewer context (no dedupe by table_name), so
-        // the column set comes from THIS layer only. fix(#403): the
-        // server-cluster path needs the cols= opt-in too — its unclustered
-        // features are styled/popup-inspected like plain vector features.
-        const cols = getDataDrivenColumnsForLayer({
-          style_config: layer.style_config ?? null,
-          paint: (layer.paint as Record<string, unknown> | undefined) ?? {},
-          label_config: layer.label_config ?? null,
-          // codex P2 on fix(#403): include filter-only columns, or a layer
-          // whose filter references a column unused by paint/labels/popups
-          // loses it from cols= on the first token refresh (parity with the
-          // initial getDataDrivenColumnsForSource build).
-          filter: layer.filter ?? null,
-          popup_config: layer.popup_config ?? null,
-        });
-        // fix(#394) VT-02 (codex P2): keep the `_v=` cache-buster on
-        // token-refresh rebuilds (parity with the initial source build).
-        const newUrl = strategy.kind === 'server-tile'
-          ? buildClusterTileUrl(layer.table_name, token, tileBaseUrl, layer.tile_version ?? undefined, {
-              clusterRadius: typeof builder?.clusterRadius === 'number' ? builder.clusterRadius : 48,
-              clusterMaxZoom: typeof builder?.clusterMaxZoom === 'number' ? builder.clusterMaxZoom : 14,
-            }, cols)
-          : buildSignedTileUrl(layer.table_name, token, tileBaseUrl, layer.tile_version ?? undefined, cols);
-        (source as VectorTileSource).setTiles([newUrl]);
-      }
-    }
-  }, [tokenMap, layerEntries, mapReady, cdnBaseUrl, embedToken, markMapLoading]);
-
   // Toggle visibility when visibleLayers set changes.
   // Note: runSync also calls syncVisibility via syncLayersToMap, but this
   // dedicated effect is needed for *visibility-only* changes where other
@@ -1025,26 +959,24 @@ export const ViewerMap = memo(function ViewerMap({
 
     const applyVisibilityDiff = () => {
       const prev = prevVisibleRef.current;
+      // A toggle reads ids and adapters, never sources, so it needs no tokens.
+      const context = syncRenderContext(new Map(), undefined, geojsonDataRef.current, {
+        idPrefix: VIEWER_PREFIX,
+        mvtSourceLayerPrefix: tileConfig?.mvt_source_layer_prefix,
+      });
       for (const { layer, key } of layerEntries) {
         const wasVisible = prev.has(key);
         const isVisible = visibleLayers.has(key);
         if (wasVisible === isVisible) continue;
 
-        const type = layer.is_dem === true && effectiveDemRenderMode(layer.style_config, layer.is_dem) === 'hillshade'
-          ? 'hillshade'
-          : resolveAdapterType(layer.geometry_type, layer.style_config, layer.paint as Record<string, unknown>);
-        const adapter = getAdapter(type);
-        const adapterInput = toAdapterInput(
-          layer,
-          key,
-          visibleLayers,
-          tileConfig?.mvt_source_layer_prefix,
-        );
-        adapter.syncVisibility(map, adapterInput);
-
-        const labelId = prefixed('label', key, VIEWER_PREFIX);
-        if (map.getLayer(labelId)) {
-          map.setLayoutProperty(labelId, 'visibility', isVisible ? 'visible' : 'none');
+        const input = toViewerSyncInput(layer, key, visibleLayers);
+        const [described] = describeLayers([input], context).layers;
+        try {
+          // Carries the label companion's visibility too, per its own spec.
+          if (described) getAdapter(described.drawsAs).syncVisibility(map, adapterInputFor(input, described));
+        } catch (e) {
+          // An adapter can throw on a saved style it cannot read; the sync pass never drew that layer.
+          if (import.meta.env.DEV) console.warn(`[viewer] setting the visibility of ${described?.id} failed:`, e);
         }
       }
       prevVisibleRef.current = new Set(visibleLayers);
@@ -1145,7 +1077,7 @@ export const ViewerMap = memo(function ViewerMap({
 
   return (
     <div
-      className={`relative h-full w-full ${!mapReady ? 'bg-muted animate-pulse' : ''}`}
+      className={`relative h-full w-full [&_.maplibregl-ctrl-bottom-right]:max-w-[calc(50%-4.5rem)] max-[399px]:[&_.maplibregl-ctrl-bottom-right]:max-w-[calc(50%-1.75rem)] [&_.maplibregl-ctrl-attrib-inner]:[overflow-wrap:break-word] ${!mapReady ? 'bg-muted animate-pulse' : ''}`}
       // audit(w3-maps): aria-label on <MapGL> is silently dropped —
       // @vis.gl/react-maplibre v8 forwards only id/ref/style, and MapLibre
       // labels its canvas "Map". Label the wrapper region instead (same
@@ -1160,6 +1092,7 @@ export const ViewerMap = memo(function ViewerMap({
         initialViewState={defaultView}
         mapStyle={mapStyle}
         styleDiffing={false}
+        locale={mapLocale}
         // feat(#845): the prop covers the cold-mount window — react-maplibre
         // applies it on the initial style.load, before our onLoad-captured
         // appearance sync can run. Frozen at mount: a CHANGED projection prop
@@ -1191,11 +1124,11 @@ export const ViewerMap = memo(function ViewerMap({
             attributionControlKey owns the derivation so its injectivity can be
             tested directly — see the note there. */}
         <AttributionControl
-          key={attributionControlKey(layerAttributions)}
+          key={attributionControlKey(attributionCredits)}
           position="bottom-right"
           compact={true}
           customAttribution={
-            layerAttributions.length > 0 ? layerAttributions : undefined
+            attributionCredits.length > 0 ? attributionCredits : undefined
           }
         />
         {popupInfo && (
@@ -1225,16 +1158,8 @@ export const ViewerMap = memo(function ViewerMap({
         data-testid="viewer-entry-veil"
         className={`pointer-events-none absolute inset-0 z-20 bg-muted transition-opacity duration-500 ${revealed ? 'opacity-0' : 'opacity-100'}`}
       />
-      {showBranding && (
-        <span
-          data-testid="viewer-branding-overlay"
-          className="absolute bottom-2 left-2 z-10 text-xs text-muted-foreground bg-background/70 rounded-sm px-2 py-1 pointer-events-none"
-        >
-          {t('export.poweredBy', { defaultValue: 'Powered by GeoLens' })}
-        </span>
-      )}
       {contextLost && (
-        <div className="absolute inset-0 z-50 flex items-center justify-center bg-background/80">
+        <div role="alert" className="absolute inset-0 z-50 flex items-center justify-center bg-background/80">
           <div className="text-center space-y-2">
             <p className="text-sm text-muted-foreground">{t('errorBoundary.mapMessage')}</p>
             <button type="button" onClick={reload} className="text-sm underline text-primary hover:text-primary/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring rounded-sm px-1">{t('reload')}</button>

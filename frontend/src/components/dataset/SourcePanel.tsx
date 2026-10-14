@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
+import { getServiceTypeLabel } from '@/i18n/labels';
 import { describeFailureReason } from '@/lib/failure-reason';
 import { Link } from 'react-router';
 import { AlertCircle, Loader2 } from 'lucide-react';
@@ -10,6 +11,7 @@ import {
   useDatasetVersions,
 } from '@/components/dataset/hooks/use-dataset';
 import { OriginBadge, datasetOrigin } from '@/components/dataset/OriginBadge';
+import { SourceSyncPanel } from '@/components/dataset/SourceSyncPanel';
 import { useVrtGenerations, useVrtSources, useVrtStatus } from '@/components/import/hooks/use-vrt';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -23,7 +25,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { formatDateTimeSmart, formatNumber } from '@/lib/format';
+import { formatDateTimeSmart, formatDateTimeUtc, formatNumber } from '@/lib/format';
 import {
   healthDotColors,
   refreshRunStatusColors,
@@ -31,8 +33,11 @@ import {
   vrtGenerationColors,
 } from '@/lib/status-colors';
 import { useAuthStore } from '@/stores/auth-store';
+import { useDrawingStore } from '@/stores/drawing-store';
 import type {
   DatasetOrigin,
+  DatasetRefreshRequest,
+  DatasetRefreshRunResponse,
   DatasetResponse,
   DatasetVersionResponse,
   SchemaDriftStatus,
@@ -54,7 +59,15 @@ export interface SourcePanelProps {
    *  active run row in the refresh history. */
   canEdit?: boolean;
   refreshBusy?: boolean;
-  onAcceptBlockedRun?: (runId: string) => void;
+  onAcceptBlockedRun?: (run: BlockedRunToAccept) => void;
+  onSyncRunDispatched?: (runId: string) => void;
+}
+
+/** A blocked run a person chose to accept. `upload` marks a held-back file replacement. */
+export interface BlockedRunToAccept {
+  id: string;
+  verificationPolicy?: DatasetRefreshRequest['verification_policy'];
+  upload?: boolean;
 }
 
 type PointerField = {
@@ -88,6 +101,9 @@ const HEALTH_DETAILS = new Set<HealthDetail>([
 ]);
 
 const MAX_REFRESH_HISTORY_LIMIT = 200;
+
+// Service refreshes leave health unset, so only these origins get a verdict from a refresh.
+const HEALTH_CHECKED_ON_REFRESH: ReadonlySet<string> = new Set(['postgis', 'stac']);
 
 const healthClasses: Record<SourceHealth, string> = {
   healthy: semanticBadgeColors.success,
@@ -149,6 +165,19 @@ function matchesCurrentServiceBinding(
     && binding.layer_id === currentLayer
     && typeof binding.url === 'string'
     && safeHttpPointer(binding.url) === currentUrl;
+}
+
+// A later published run replaced the data this held upload was measured
+// against, so accepting it would be refused.
+function heldUploadSuperseded(
+  run: DatasetRefreshRunResponse,
+  runs: DatasetRefreshRunResponse[],
+): boolean {
+  if (run.origin_kind !== 'upload') return false;
+  const heldAt = Date.parse(run.started_at);
+  return runs.some((other) => other.status === 'succeeded'
+    && other.dataset_version_id != null
+    && Date.parse(other.started_at) > heldAt);
 }
 
 function trustedRef(dataset: DatasetResponse, origin: DatasetOrigin): Record<string, unknown> | null {
@@ -320,7 +349,7 @@ function RefreshRunHistory({
   dataset: DatasetResponse;
   canEdit: boolean;
   refreshBusy?: boolean;
-  onAcceptBlockedRun?: (runId: string) => void;
+  onAcceptBlockedRun?: (run: BlockedRunToAccept) => void;
 }) {
   const { t, i18n } = useTranslation('dataset');
   const [limit, setLimit] = useState(5);
@@ -328,6 +357,10 @@ function RefreshRunHistory({
   const refreshRunQuery = skip > 0 ? { skip, limit } : { limit };
   const { data, isLoading, isError, isFetching } = useDatasetRefreshRuns(dataset.id, refreshRunQuery);
   const cancelRefreshJob = useCancelRefreshJob();
+  // The refresh action refuses while a feature of this dataset is selected.
+  const hasSelectedFeature = useDrawingStore(
+    (s) => s.targetDatasetId === dataset.id && s.selectedFeature !== null,
+  );
   const runs = useMemo(() => data?.runs ?? [], [data?.runs]);
   const targetRunId = typeof window !== 'undefined' && window.location.hash.startsWith('#refresh-run-')
     ? window.location.hash.slice(1)
@@ -372,8 +405,22 @@ function RefreshRunHistory({
               className="border-s-2 border-muted ps-4"
             >
               <div className="flex flex-wrap items-center gap-2">
-                <Badge variant="outline" className={refreshRunStatusColors[run.status] ?? ''}>
-                  {t(`sourcePanel.refresh.history.status.${run.status}`, { defaultValue: run.status })}
+                <Badge
+                  variant="outline"
+                  className={refreshRunStatusColors[
+                    run.status === 'blocked' && run.verification?.acceptance_consumed_by_run_id
+                      ? 'succeeded'
+                      : run.status
+                  ] ?? ''}
+                >
+                  {t(
+                    `sourcePanel.refresh.history.status.${
+                      run.status === 'blocked' && run.verification?.acceptance_consumed_by_run_id
+                        ? 'accepted'
+                        : run.status
+                    }`,
+                    { defaultValue: run.status },
+                  )}
                 </Badge>
                 {/* fix(#1325): run.origin_kind is the run's execution door,
                     not the dataset's origin shown by the OriginBadge above —
@@ -429,6 +476,9 @@ function RefreshRunHistory({
                 {run.triggered_by_username
                   ? ` · ${t('sourcePanel.refresh.history.triggeredBy', { username: run.triggered_by_username })}`
                   : ''}
+                {run.trigger === 'scheduled' && run.scheduled_for
+                  ? ` · ${t('sourcePanel.refresh.history.scheduledFor', { time: formatDateTimeUtc(run.scheduled_for) })}`
+                  : ''}
                 {' · '}
                 <a className="underline" href={`#refresh-run-${run.id}`}>
                   {t('sourcePanel.refresh.history.permalink')}
@@ -439,20 +489,36 @@ function RefreshRunHistory({
                   {describeFailureReason(
                     run.error_message,
                     t('common:errors.internalFailureReason'),
+                    run.error_code,
+                  )}
+                </p>
+              )}
+              {run.status === 'cancelled' && run.error_message && (
+                // Not text-destructive: the sweep also settles an abandoned
+                // run as `cancelled` (error_code: 'abandoned'), and neither
+                // that nor a deliberate cancel is an error to flag in red.
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {describeFailureReason(
+                    run.error_message,
+                    t('common:errors.internalFailureReason'),
+                    run.error_code,
                   )}
                 </p>
               )}
               {run.verification && (
                 <div className="mt-2 space-y-1 text-xs text-muted-foreground">
-                  <p>
-                    {run.verification.source_count == null
-                      ? t('sourcePanel.refresh.history.sourceCountUnavailable')
-                      : t('sourcePanel.refresh.history.countEvidence', {
-                        source: run.verification.source_count.toLocaleString(i18n.language),
-                        fetched: (run.verification.fetched_count ?? 0).toLocaleString(i18n.language),
-                      })}
-                  </p>
-                  {run.verification.identity_check === 'unavailable' && (
+                  {/* A file has no source to count or identify records against. */}
+                  {run.origin_kind !== 'upload' && (
+                    <p>
+                      {run.verification.source_count == null
+                        ? t('sourcePanel.refresh.history.sourceCountUnavailable')
+                        : t('sourcePanel.refresh.history.countEvidence', {
+                          source: run.verification.source_count.toLocaleString(i18n.language),
+                          fetched: (run.verification.fetched_count ?? 0).toLocaleString(i18n.language),
+                        })}
+                    </p>
+                  )}
+                  {run.origin_kind !== 'upload' && run.verification.identity_check === 'unavailable' && (
                     <p>{t('sourcePanel.refresh.history.identityUnavailable')}</p>
                   )}
                   {typeof run.verification.source_binding.url === 'string'
@@ -462,6 +528,9 @@ function RefreshRunHistory({
                         source: safeHttpPointer(run.verification.source_binding.url),
                       })}
                     </p>
+                  )}
+                  {run.status === 'succeeded' && run.verification.review_reasons.length > 0 && (
+                    <p>{t('sourcePanel.refresh.history.acceptedReasonsLabel')}</p>
                   )}
                   {run.verification.review_reasons.map((reason) => (
                     <p key={reason}>{t(`sourcePanel.refresh.history.reason.${reason}`)}</p>
@@ -483,18 +552,35 @@ function RefreshRunHistory({
                   {run.status === 'blocked'
                     && canEdit
                     && run.verification
-                    && matchesCurrentServiceBinding(dataset, run.verification.source_binding)
+                    && (run.origin_kind === 'upload'
+                      || matchesCurrentServiceBinding(dataset, run.verification.source_binding))
                     && run.verification.review_fingerprint
                     && !run.verification.acceptance_consumed_by_run_id
+                    && !heldUploadSuperseded(run, runs)
                     && onAcceptBlockedRun && (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={refreshBusy}
-                      onClick={() => onAcceptBlockedRun(run.id)}
-                    >
-                      {t('sourcePanel.refresh.history.reviewAndRetry')}
-                    </Button>
+                    <>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={refreshBusy || hasSelectedFeature}
+                        onClick={() => {
+                          const sourcePolicy = run.verification?.source_binding.verification_policy;
+                          const verificationPolicy = sourcePolicy === 'arcgis_id_set_v1'
+                            ? sourcePolicy
+                            : run.verification?.verification_policy === 'arcgis_id_set_v1'
+                              ? run.verification.verification_policy
+                              : undefined;
+                          onAcceptBlockedRun(run.origin_kind === 'upload'
+                            ? { id: run.id, upload: true }
+                            : { id: run.id, verificationPolicy });
+                        }}
+                      >
+                        {t('sourcePanel.refresh.history.reviewAndRetry')}
+                      </Button>
+                      {hasSelectedFeature && (
+                        <p>{t('sourcePanel.refresh.featureEditBlockedHint')}</p>
+                      )}
+                    </>
                   )}
                 </div>
               )}
@@ -677,6 +763,7 @@ export function SourcePanel({
   canEdit = false,
   refreshBusy = false,
   onAcceptBlockedRun,
+  onSyncRunDispatched,
 }: SourcePanelProps) {
   const { t } = useTranslation('dataset');
   const isAuthenticated = useAuthStore((state) => Boolean(state.token));
@@ -690,6 +777,11 @@ export function SourcePanel({
   const translatedHealthDetail = healthDetail && HEALTH_DETAILS.has(healthDetail as HealthDetail)
     ? t(`sourcePanel.healthDetail.${healthDetail}`)
     : null;
+  const healthNote =
+    translatedHealthDetail ??
+    (health === 'unknown' && origin != null && HEALTH_CHECKED_ON_REFRESH.has(origin)
+      ? t('sourcePanel.healthUnknownHint')
+      : null);
   const originKey = isVrt ? 'vrt' : origin ?? 'unknown';
   const storageKey = isVrt ? 'vrt' : origin ?? 'unknown';
 
@@ -726,7 +818,7 @@ export function SourcePanel({
                     {t(`sourcePanel.pointer.${pointer.label}`)}
                   </dt>
                   <dd className="mt-1 break-all font-mono text-xs" title={pointer.value}>
-                    {pointer.value}
+                    {pointer.label === 'serviceType' ? getServiceTypeLabel(t, pointer.value) : pointer.value}
                   </dd>
                 </div>
               ))}
@@ -745,9 +837,9 @@ export function SourcePanel({
             </SourceMetric>
             <SourceMetric label={t('sourcePanel.health')}>
               <StatusBadge kind="health" value={health} />
-              {translatedHealthDetail && (
+              {healthNote && (
                 <span className="mt-1 block text-xs font-normal text-muted-foreground">
-                  {translatedHealthDetail}
+                  {healthNote}
                 </span>
               )}
             </SourceMetric>
@@ -765,6 +857,7 @@ export function SourcePanel({
         <VrtSection dataset={dataset} isAuthenticated={isAuthenticated} />
       ) : (
         <>
+          <SourceSyncPanel dataset={dataset} canEdit={canEdit} onRunDispatched={onSyncRunDispatched} />
           <SourceHistory dataset={dataset} />
           {/* Gated the same way SourceRefreshAction is: no origin, nothing
               could ever have been refreshed, so no history to show. */}

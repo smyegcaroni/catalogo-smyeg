@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -222,7 +223,8 @@ class TestGetJobStatus:
         resp = await client.get(f"/jobs/{job.id}", headers=admin_auth_header)
         assert resp.status_code == 200
         assert resp.json()["status"] == "failed"
-        assert "heartbeat expired" in resp.json()["error_message"]
+        assert resp.json()["error_message"] == "Stale: running for over 60 minutes"
+        assert resp.json()["error_code"] == "worker_lost"
 
     async def test_get_job_auto_fails_analysis_job_at_materialize_lease(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
@@ -258,7 +260,7 @@ class TestGetJobStatus:
         resp = await client.get(f"/jobs/{analysis.id}", headers=admin_auth_header)
         assert resp.status_code == 200
         assert resp.json()["status"] == "failed"
-        assert "heartbeat expired" in resp.json()["error_message"]
+        assert resp.json()["error_message"] == "Stale: running for over 5 minutes"
 
         resp = await client.get(f"/jobs/{ingest.id}", headers=admin_auth_header)
         assert resp.status_code == 200
@@ -431,6 +433,26 @@ class TestGetJobStatus:
         resp = await client.get(f"/jobs/{job.id}", headers=admin_auth_header)
         assert resp.status_code == 200
         assert resp.json()["archive_failed"] is True
+
+    async def test_get_job_reports_a_quicklook_still_owed(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """quicklook_pending holds from publication until the image's pointer lands."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        job = await _create_job(test_db_session, created_by=admin_id, status="complete")
+        job.user_metadata = {
+            "publish_obligations": {"quicklook": "t_abc", "embedding": True}
+        }
+        await test_db_session.commit()
+
+        resp = await client.get(f"/jobs/{job.id}", headers=admin_auth_header)
+        assert resp.json()["quicklook_pending"] is True
+
+        job.user_metadata = {"publish_obligations": {"embedding": True}}
+        await test_db_session.commit()
+
+        resp = await client.get(f"/jobs/{job.id}", headers=admin_auth_header)
+        assert resp.json()["quicklook_pending"] is False
 
     async def test_get_job_surfaces_temporal_parse_errors(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
@@ -839,6 +861,7 @@ class TestGetJobStatusByDataset:
             error_message="ogr2ogr failed reading /srv/private-staging/parcels.gdb",
         )
         job.dataset_id = dataset.id
+        job.error_code = "worker_lost"
         job.progress = 0.5
         job.current_step = "ogr2ogr"
         job.rows_processed = 120
@@ -893,6 +916,7 @@ class TestGetJobStatusByDataset:
 
         # Redacted: every field enumerated on _redacted_job_status.
         assert data["error_message"] is None
+        assert data["error_code"] is None
         assert data["source_filename"] is None
         assert data["warning_message"] is None
         assert data["warnings"] == []
@@ -945,6 +969,7 @@ class TestGetJobStatusByDataset:
             data["error_message"]
             == "ogr2ogr failed reading /srv/private-staging/parcels.gdb"
         )
+        assert data["error_code"] == "worker_lost"
         assert data["source_filename"] == "quarterly-internal-extract.geojson"
         assert data["warnings"][0]["kind"] == "reserved_rename"
         assert data["rows_failed"] == 7
@@ -1264,6 +1289,19 @@ class TestCleanupStaleJobs:
         """POST /jobs/cleanup/stale/ without auth returns 401."""
         resp = await client.post("/jobs/cleanup/stale/")
         assert resp.status_code == 401
+
+    async def test_cleanup_reconciles_orphaned_quicklooks(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        """An operator's immediate cleanup also reaps unreferenced quicklook images."""
+        with patch(
+            "app.platform.jobs.router.reconcile_orphaned_quicklooks",
+            new_callable=AsyncMock,
+        ) as reconcile:
+            resp = await client.post("/jobs/cleanup/stale/", headers=admin_auth_header)
+
+        assert resp.status_code == 200
+        reconcile.assert_awaited_once()
 
     async def test_cleanup_returns_counts(
         self, client: AsyncClient, admin_auth_header: dict

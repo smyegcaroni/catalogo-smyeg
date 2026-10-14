@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Map as MapGL, Source, Layer, NavigationControl } from '@vis.gl/react-maplibre';
 import { useTheme } from '@/components/theme-provider';
 import { useBasemaps, useMapDefaults, useTileConfig } from '@/hooks/use-settings';
+import { useMapLocale } from '@/hooks/use-map-locale';
 import {
   getThemeBasemap,
   makeStyleImageMissingResolver,
@@ -14,17 +15,19 @@ import {
 import { BasemapToggle } from '@/components/map/BasemapToggle';
 import { useDrawingStore } from '@/stores/drawing-store';
 import { useTerraDraw } from '@/components/drawing/hooks/use-terra-draw';
-import { useFeatureEditing, showAllFeaturesInTiles } from '@/components/dataset/hooks/use-feature-editing';
+import { useFeatureEditing, showAllFeaturesInTiles, renderedFeatureGid } from '@/components/dataset/hooks/use-feature-editing';
 import { DrawingToolbar } from '@/components/drawing/DrawingToolbar';
 import { AttributeForm } from '@/components/drawing/AttributeForm';
 import { useTileToken, useInvalidateTileTokens } from '@/hooks/use-tile-token';
 import { isSessionRenewalPending, useTileAuthRecovery, useVisibleTileTokenRefresh } from '@/hooks/use-tile-auth-recovery';
-import { useMapLayers, getSourceLayerName } from '@/components/maps/hooks/use-map-layers';
+import { useMapLayers, getSourceLayerName, previewSourceId } from '@/components/maps/hooks/use-map-layers';
 import { computeLargeExtentView, isLargeExtent } from '@/lib/map-extent';
 import { splitBbox, toFitBounds } from '@/lib/bbox';
 import { findElevationColumn } from '@/lib/geo-utils';
 import { useWebGLRecovery } from '@/hooks/use-webgl-recovery';
 import { MAP_COLORS } from '@/lib/map-colors';
+import { recordTypeCapabilities } from '@/lib/record-types';
+import { toMapLibreAttribution } from '@/lib/attribution-safety';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -61,15 +64,54 @@ const SYSTEM_COLUMNS = new Set(['gid', 'geom', 'geom_4326']);
 // ids, so switching vector → raster stacked the entire old vector basemap
 // (~100 layers) on top of the new one.
 const APP_SOURCE_IDS = new Set([
-  'vector-tile-source', // use-map-layers addVectorLayers
   'raster-tile-source', // use-map-layers addRasterLayers
   'drawn-overlay', // use-map-layers addOverlaySource
   'bbox-source', // declarative <Source> below
 ]);
 
-/** True for a source id owned by this app (incl. TerraDraw's `td-*` sources). */
-function isAppSourceId(id: string): boolean {
-  return APP_SOURCE_IDS.has(id) || id.startsWith('td-');
+/** True for a source id owned by this app (incl. TerraDraw's `td-*` sources and the preview's vector source). */
+function isAppSourceId(id: string, vectorSourceId: string | null): boolean {
+  return APP_SOURCE_IDS.has(id) || id.startsWith('td-') || id === vectorSourceId;
+}
+
+/**
+ * Whether the drawing store's session belongs to THIS map's dataset. Used
+ * both to gate the toolbar render and to decide whether an inherited
+ * session should be torn down on mount (see the staleSessionCheckedRef
+ * effect). `targetDatasetId === null` means nothing has adopted a target —
+ * drawing-store.ts's `setDrawing` always sets it together with
+ * `isDrawing: true`, so a real active session always has one — treated as
+ * "not a mismatch" rather than as belonging to no dataset.
+ */
+function targetsDataset(targetDatasetId: string | null, datasetId: string | undefined): boolean {
+  return targetDatasetId === null || targetDatasetId === (datasetId ?? null);
+}
+
+/**
+ * True when a document-level keyboard shortcut should defer to the target's
+ * own native handling instead — a hidden drawing session (see the
+ * isDataTabExpanded gate in DatasetPage) keeps this map's document-level
+ * listeners attached while the Data tab's own table is what has focus. Same
+ * check MapToolbar.tsx and MapBuilderPage.tsx already use for their own
+ * hotkeys, shared here between this file's two document-level listeners.
+ */
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable;
+}
+
+/** Stands in for Save when this map can't save an unsaved edit, so the only way out is an explicit discard. */
+function UnsavedEditNotice({ message, onDiscard, disabled }: { message: string; onDiscard: () => void; disabled: boolean }) {
+  const { t } = useTranslation('dataset');
+  return (
+    <div role="alert" className="max-w-md rounded-lg shadow-lg border bg-background p-2 flex items-center gap-2">
+      <p className="text-sm">{message}</p>
+      <Button type="button" variant="destructive" size="sm" onClick={onDiscard} disabled={disabled}>
+        {t('map.discardChangesAction')}
+      </Button>
+    </div>
+  );
 }
 
 /**
@@ -106,6 +148,7 @@ interface DatasetMapProps {
   canEdit?: boolean;
   recordType?: string;
   rasterTileUrl?: string | null;
+  isDem?: boolean;
   /** ISO timestamp or version string appended to tile URLs to bust browser cache after mutations */
   tileVersion?: string | null;
   onMapReady?: () => void;
@@ -115,6 +158,13 @@ interface DatasetMapProps {
   /** fix(#1472 review): the dataset's required credit line, rendered in the
    *  preview's attribution control alongside the basemap's. */
   attribution?: string | null;
+  /** False while this instance is kept mounted but hidden (DatasetPage's
+   *  isDataTabExpanded gate, so an active drawing session survives the
+   *  Data tab's own table expanding over it) — its document-level Ctrl/
+   *  Meta+Z and Escape handlers must not act on geometry the user can't
+   *  see, even from a target isEditableTarget doesn't otherwise catch
+   *  (e.g. a focused button in that table). */
+  shortcutsEnabled?: boolean;
 }
 
 export const DatasetMap = memo(function DatasetMap({
@@ -128,13 +178,16 @@ export const DatasetMap = memo(function DatasetMap({
   canEdit = false,
   recordType,
   rasterTileUrl,
+  isDem,
   tileVersion,
   onMapReady,
   onTileError,
   onFeatureClick,
   attribution,
+  shortcutsEnabled = true,
 }: DatasetMapProps) {
   const { t } = useTranslation(['dataset', 'common']);
+  const mapLocale = useMapLocale();
   const { resolvedTheme } = useTheme();
   const { data: basemaps } = useBasemaps();
   const { data: mapDefaults } = useMapDefaults();
@@ -144,17 +197,13 @@ export const DatasetMap = memo(function DatasetMap({
   // the current tile config without re-registering (same pattern as ViewerMap).
   const tileConfigRef = useRef(tileConfig);
   tileConfigRef.current = tileConfig;
-  const { data: rawTileToken } = useTileToken(datasetId);
+  const tileKind = recordTypeCapabilities(recordType).tileToken;
+  const { data: rawTileToken } = useTileToken(tileKind ? datasetId : undefined);
   // Narrow to the vector-tile shape expected by downstream hooks.
   // Raster tokens are a separate payload with a preformatted tile_url and
   // are consumed via the rasterTileUrl prop path instead.
-  const tileToken = useMemo(
-    () =>
-      rawTileToken && rawTileToken.kind === 'vector'
-        ? { sig: rawTileToken.sig, exp: rawTileToken.exp, scope: rawTileToken.scope }
-        : null,
-    [rawTileToken],
-  );
+  const tileToken = rawTileToken?.kind === 'vector' ? rawTileToken : null;
+  const vectorSourceId = tileKind === 'vector' && tableName ? previewSourceId(tableName) : null;
   const [userBasemapId, setUserBasemapId] = useState<string | null>(null);
   const themeBasemap = getThemeBasemap(basemaps ?? [], resolvedTheme);
   const activeBasemap = useMemo(
@@ -242,11 +291,16 @@ export const DatasetMap = memo(function DatasetMap({
   const drawGeometryType = hasGenericGeometry ? 'GEOMETRY' : geometryType;
 
   const { addVectorLayers, addRasterLayers, addOverlaySource } = useMapLayers({
-    tableName,
+    datasetId,
+    // The hook also adds the vector source after load, once the tile config
+    // settles, so only a type with vector tiles hands it a table.
+    tableName: tileKind === 'vector' ? tableName : null,
     geometryType: drawGeometryType,
     rasterTileUrl,
+    isDem,
+    bounds: bbox,
     tileVersion,
-    tileToken: tileToken ?? null,
+    tileToken,
     tileConfigCdnBaseUrl: tileConfig?.cdn_base_url ?? undefined,
     mvtSourceLayerPrefix: tileConfig?.mvt_source_layer_prefix,
     mvtSourceLayerReady: tileConfigReady,
@@ -257,18 +311,44 @@ export const DatasetMap = memo(function DatasetMap({
 
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [pendingGeometry, setPendingGeometry] = useState<Geometry | null>(null);
+  const [autoSavingGeometry, setAutoSavingGeometry] = useState<Geometry | null>(null);
+  // A ref, because a finish event can land before the render that applies the
+  // state above.
+  const autoSaveInFlightRef = useRef<Geometry | null>(null);
   const [editingAttributes, setEditingAttributes] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
   const discardActionRef = useRef<(() => void) | null>(null);
 
   const isDrawing = useDrawingStore((s) => s.isDrawing);
+  const drawingTargetDatasetId = useDrawingStore((s) => s.targetDatasetId);
   const activeMode = useDrawingStore((s) => s.activeMode);
   const setDrawing = useDrawingStore((s) => s.setDrawing);
   const setMode = useDrawingStore((s) => s.setMode);
   const clearDrawing = useDrawingStore((s) => s.clearDrawing);
   const selectedFeature = useDrawingStore((s) => s.selectedFeature);
+  const isEditDirty = useDrawingStore((s) => s.isEditDirty);
+  const setHasUnsavedMapWork = useDrawingStore((s) => s.setHasUnsavedMapWork);
+  const canEditRef = useRef(canEdit);
+  canEditRef.current = canEdit;
   const sessionEpoch = useDrawingStore((s) => s.sessionEpoch);
+  // Whether the store's session actually belongs to THIS map's dataset —
+  // gates the toolbar so a render before the stale-session effect above
+  // has run never shows controls for a different dataset's selection.
+  const isOwnDrawingSession = isDrawing && targetsDataset(drawingTargetDatasetId, datasetId);
+  // The tdId of a DIRTY selection already present when this instance first
+  // rendered — i.e. inherited, not made by clicking within this instance
+  // (which could only happen after this first render). Read directly here,
+  // during render, like initialBasemapStyle above: the mount effect below
+  // only runs AFTER the first paint, so a ref it set would still show
+  // Save for that one paint. `undefined` (not yet computed) vs `null` (no
+  // orphaned selection) distinguishes "first render" from "checked, none".
+  const orphanedSelectionTdIdRef = useRef<string | null | undefined>(undefined);
+  if (orphanedSelectionTdIdRef.current === undefined) {
+    const initial = useDrawingStore.getState();
+    orphanedSelectionTdIdRef.current =
+      initial.isEditDirty && initial.selectedFeature ? initial.selectedFeature.tdId : null;
+  }
   const requestScopeRef = useRef({ datasetId, sessionEpoch });
   if (
     requestScopeRef.current.datasetId !== datasetId
@@ -285,7 +365,9 @@ export const DatasetMap = memo(function DatasetMap({
 
   // Refs to break circular dependency: handleDrawFinish needs saveAndRefresh,
   // and onEditFinish needs setEditDirty — both come from hooks that need TerraDraw.
-  const saveAndRefreshRef = useRef<(g: Geometry, p: Record<string, unknown>) => void>(() => {});
+  const saveAndRefreshRef = useRef<
+    (g: Geometry, p: Record<string, unknown>) => Promise<{ saved: boolean; refused?: boolean }>
+  >(async () => ({ saved: false }));
   const editFinishRef = useRef<(tdId: string, feature: Feature) => void>(() => {});
   const stableEditFinish = useCallback((tdId: string, feature: Feature) => {
     editFinishRef.current(tdId, feature);
@@ -308,13 +390,30 @@ export const DatasetMap = memo(function DatasetMap({
     (feature: Feature<Geometry, GeoJsonProperties>) => {
       const geom = feature.geometry;
       if (!geom) return;
-      if (editableColumns.length > 0) {
-        setPendingGeometry(geom);
-      } else {
-        saveAndRefreshRef.current(geom, {});
+      // A sketch that finishes while an automatic save is in flight is dropped,
+      // so the held shape can't be replaced before that save settles.
+      if (autoSaveInFlightRef.current) {
+        toast.info(t('map.sketchStillSaving'));
+        return;
       }
+      // TerraDraw drops the shape once it finishes, so it stays unsaved work
+      // until a create succeeds. Without edit rights the save would be
+      // refused, so it waits for Discard instead of being sent. With no
+      // attributes to ask for, it saves at once, and a refusal leaves it held.
+      setPendingGeometry(geom);
+      if (editableColumns.length > 0 || !canEdit) return;
+      autoSaveInFlightRef.current = geom;
+      setAutoSavingGeometry(geom);
+      void saveAndRefreshRef.current(geom, {})
+        .then(({ refused }) => {
+          if (!refused) setPendingGeometry((current) => (current === geom ? null : current));
+        })
+        .finally(() => {
+          if (autoSaveInFlightRef.current === geom) autoSaveInFlightRef.current = null;
+          setAutoSavingGeometry((current) => (current === geom ? null : current));
+        });
     },
-    [editableColumns],
+    [canEdit, editableColumns, t],
   );
 
   // --- Terra Draw hook ---
@@ -330,6 +429,20 @@ export const DatasetMap = memo(function DatasetMap({
     canUndo,
     resetHistory,
   } = useTerraDraw(mapInstance, handleDrawFinish, stableEditFinish, stableHistoryBaseline, stableSelectionLost);
+
+  const hasSketchInProgress = canUndo && activeMode !== null && activeMode !== 'select';
+  // A drag in progress has undoable changes before its finish marks the edit dirty.
+  const hasUnsavedWork = (selectedFeature !== null && (isEditDirty || canUndo))
+    || hasSketchInProgress
+    || pendingGeometry !== null
+    || editingAttributes;
+
+  useEffect(() => {
+    setHasUnsavedMapWork(hasUnsavedWork);
+  }, [hasUnsavedWork, setHasUnsavedMapWork]);
+  // The sketch, pending geometry and attribute editor all die with this
+  // instance, so a stale true must not keep blocking navigation.
+  useEffect(() => () => setHasUnsavedMapWork(false), [setHasUnsavedMapWork]);
 
   // --- Feature editing hook (all CRUD logic) ---
   const {
@@ -419,12 +532,17 @@ export const DatasetMap = memo(function DatasetMap({
     performDeselect();
   }, [performDeselect, requestDiscardConfirmation]);
 
-  // Sync activeMode from store to Terra Draw
+  // Sync activeMode from store to Terra Draw. A finished sketch that can't be
+  // edited (the map lost edit rights) or is being saved stops drawing input,
+  // so a second sketch can't replace it; switching earlier would drop the
+  // unfinished sketch.
+  const holdsFinishedSketch = pendingGeometry !== null
+    && (!canEdit || pendingGeometry === autoSavingGeometry);
   useEffect(() => {
     if (isReady && activeMode) {
-      tdSetMode(activeMode);
+      tdSetMode(holdsFinishedSketch ? 'static' : activeMode);
     }
-  }, [isReady, activeMode, tdSetMode]);
+  }, [isReady, activeMode, holdsFinishedSketch, tdSetMode]);
 
   // --- Select mode click handler ---
   // Use canvas click instead of map.on('click') because TerraDraw's adapter
@@ -479,7 +597,7 @@ export const DatasetMap = memo(function DatasetMap({
           .map((l) => l.id) ?? [],
       });
       if (features.length > 0) {
-        const gid = features[0].properties?.gid;
+        const gid = renderedFeatureGid(features[0]);
         if (gid != null) onFeatureClick(Number(gid));
       }
     };
@@ -493,6 +611,18 @@ export const DatasetMap = memo(function DatasetMap({
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        // shortcutsEnabled is false while this instance is hidden
+        // (isDataTabExpanded) — that table's own focusable elements
+        // (e.g. a button) aren't caught by isEditableTarget below, so this
+        // catches those too, on top of typed-in inputs.
+        if (!shortcutsEnabled) return;
+        // AttributeTable's cell editor also uses Escape (to cancel an edit)
+        // without stopping propagation — without this check Escape there
+        // would also deselect or open a discard dialog for a feature the
+        // user can't see.
+        if (isEditableTarget(e.target)) return;
+        // Discarding now would end the session under the write in flight.
+        if (isFeatureMutationPending) return;
         const hasSketchInProgress = canUndo && useDrawingStore.getState().activeMode !== 'select';
         if (selectedFeature) {
           if (useDrawingStore.getState().isEditDirty) {
@@ -515,7 +645,7 @@ export const DatasetMap = memo(function DatasetMap({
     return () => {
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [activeMode, canUndo, clear, performDeselect, requestDiscardConfirmation, selectedFeature, tdSetMode]);
+  }, [activeMode, canUndo, clear, isFeatureMutationPending, performDeselect, requestDiscardConfirmation, selectedFeature, shortcutsEnabled, tdSetMode]);
 
   // --- Ctrl+Z / Meta+Z undo shortcut ---
   useEffect(() => {
@@ -523,6 +653,13 @@ export const DatasetMap = memo(function DatasetMap({
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+        // shortcutsEnabled is false while this instance is hidden
+        // (isDataTabExpanded) — that table's own focusable elements aren't
+        // caught by isEditableTarget below, so this catches those too.
+        if (!shortcutsEnabled) return;
+        // Don't hijack the input's native undo while typing.
+        if (isEditableTarget(e.target)) return;
+        if (isFeatureMutationPending) return;
         // Only undo in drawing modes, not select mode
         const currentMode = useDrawingStore.getState().activeMode;
         if (currentMode && currentMode !== 'select') {
@@ -536,7 +673,7 @@ export const DatasetMap = memo(function DatasetMap({
     return () => {
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [isDrawing, undo]);
+  }, [isDrawing, isFeatureMutationPending, shortcutsEnabled, undo]);
 
   // --- Fullscreen state sync ---
   useEffect(() => {
@@ -592,7 +729,7 @@ export const DatasetMap = memo(function DatasetMap({
           // audit(w3-maps B11): allowlist app-owned sources/layers instead of
           // denylisting the raster-style id `basemap` — see APP_SOURCE_IDS.
           for (const [id, src] of Object.entries(_prev.sources || {})) {
-            if (!isAppSourceId(id) || next.sources?.[id]) continue;
+            if (!isAppSourceId(id, vectorSourceId) || next.sources?.[id]) continue;
             customSources[id] = src;
           }
           // Only carry over layers whose source exists in the merged style
@@ -605,7 +742,7 @@ export const DatasetMap = memo(function DatasetMap({
             const src = (layer as { source?: string }).source;
             // App-owned = a TerraDraw layer or a layer drawing from an
             // app-owned source; every basemap layer fails both checks.
-            if (!layer.id.startsWith('td-') && !(src && isAppSourceId(src))) continue;
+            if (!layer.id.startsWith('td-') && !(src && isAppSourceId(src, vectorSourceId))) continue;
             if (src && !mergedSourceIds.has(src)) continue;
             customLayers.push(layer);
           }
@@ -617,7 +754,7 @@ export const DatasetMap = memo(function DatasetMap({
         } as StyleSpecification;
       },
     });
-  }, [activeBasemap]);
+  }, [activeBasemap, vectorSourceId]);
 
   const [minx, miny, maxx, maxy] = hasBbox ? bbox : [0, 0, 0, 0];
 
@@ -652,6 +789,10 @@ export const DatasetMap = memo(function DatasetMap({
         : null,
     [hasBbox, minx, miny, maxx, maxy],
   );
+  // Only when there's no vector/raster source of this dataset's own to
+  // carry it (tileKind null: tiles3d/pointcloud's footprint-only preview) —
+  // otherwise that source already shows it, and this would duplicate it.
+  const bboxAttribution = tileKind === null ? toMapLibreAttribution(attribution) : null;
 
   const handleLoad = useCallback(
     (e: MapLibreEvent) => {
@@ -745,7 +886,7 @@ export const DatasetMap = memo(function DatasetMap({
       };
       map.on('error', tileAuthErrorHandlerRef.current);
 
-      if (recordType === 'raster_dataset' || recordType === 'vrt_dataset') {
+      if (tileKind === 'raster') {
         addRasterLayers(map);
 
         const handleRasterError = (e: { error: { message?: string; status?: number } }) => {
@@ -791,7 +932,7 @@ export const DatasetMap = memo(function DatasetMap({
           error: handleRasterError,
           sourcedata: handleRasterSourceData,
         };
-      } else {
+      } else if (tileKind === 'vector') {
         addVectorLayers(map);
         addOverlaySource(map);
 
@@ -807,7 +948,7 @@ export const DatasetMap = memo(function DatasetMap({
         const handleVectorError = (e: { error: { message?: string; status?: number } }) => {
           const status = e.error?.status;
           if (status && status >= 400 && status < 500) return;
-          if (e.error?.message?.includes('vector-tile-source') ||
+          if ((vectorSourceId && e.error?.message?.includes(vectorSourceId)) ||
               e.error?.message?.includes('Error: HTTP') ||
               (status && status >= 500)) {
             tileStats.failed++;
@@ -819,7 +960,7 @@ export const DatasetMap = memo(function DatasetMap({
           }
         };
         const handleVectorSourceData = (e: { sourceId?: string; isSourceLoaded?: boolean }) => {
-          if (e.sourceId === 'vector-tile-source' && e.isSourceLoaded) {
+          if (vectorSourceId && e.sourceId === vectorSourceId && e.isSourceLoaded) {
             tileStats.total++;
             fireReadyOnce(true);
           }
@@ -832,9 +973,11 @@ export const DatasetMap = memo(function DatasetMap({
           sourcedata: handleVectorSourceData,
         };
         fireReadyOnce(false);
+      } else {
+        fireReadyOnce(false);
       }
     },
-    [recordType, addRasterLayers, addVectorLayers, addOverlaySource, onMapReady, onTileError, recoverTileAuth],
+    [tileKind, vectorSourceId, addRasterLayers, addVectorLayers, addOverlaySource, onMapReady, onTileError, recoverTileAuth],
   );
 
   const finishDrawingSession = useCallback(() => {
@@ -847,6 +990,9 @@ export const DatasetMap = memo(function DatasetMap({
     clear();
     tdSetMode('select');
     setPendingGeometry(null);
+    // The save still in flight belongs to the session that just ended.
+    autoSaveInFlightRef.current = null;
+    setAutoSavingGeometry(null);
     setEditingAttributes(false);
     // fix(#1761 review round 4, sweep): the delete/discard confirmation
     // dialogs are the same class as pendingGeometry/editingAttributes —
@@ -885,8 +1031,66 @@ export const DatasetMap = memo(function DatasetMap({
     finishDrawingSession();
   }, [sessionEpoch, finishDrawingSession]);
 
+  // The drawing store is global but this component is remounted per dataset
+  // (DatasetPage keys it on dataset id), so a client-side navigation away
+  // from an in-progress edit — with nothing dirty, so the unsaved guard lets
+  // it through — can land here with the store still holding the previous
+  // dataset's session, even between two datasets that can both edit (no
+  // canEdit mismatch to catch it, and no identity change to bump
+  // sessionEpoch). A map must not inherit a session for a dataset that
+  // is not its own: besides hiding the toolbar below, end the session so
+  // its mutation hooks, now bound to this dataset's id and table, never
+  // act on the old selection. A session of this dataset that this map
+  // can't edit is left to the edit-rights effect below.
+  const staleSessionCheckedRef = useRef(false);
+  useEffect(() => {
+    if (staleSessionCheckedRef.current) return;
+    staleSessionCheckedRef.current = true;
+    const state = useDrawingStore.getState();
+    if (!state.isDrawing) return;
+    if (!targetsDataset(state.targetDatasetId, datasetId)) {
+      finishDrawingSession();
+    } else if (canEdit && state.selectedFeature) {
+      if (state.isEditDirty) {
+        // A dirty selection is kept rather than dropped (see
+        // orphanedSelectionTdIdRef above, computed at render time), so
+        // DatasetPage's unsaved-changes guard still warns before a further
+        // navigation. Its edited geometry lives only in the TerraDraw
+        // instance that made the edit, which this fresh mount is not, so
+        // the toolbar offers a discard for it in place of Save.
+        return;
+      }
+      // Same route in, no map mounted in between (e.g. a table dataset
+      // with no preview), then back to this same, still-editable dataset:
+      // the session belongs here, but this is a brand-new TerraDraw
+      // instance that never made this selection. performDeselect() drops
+      // it (and its edit-dirty/undo state) and restores any tile filter
+      // hidden for its gid, the same cleanup a real deselect does, without
+      // touching isDrawing/activeMode/targetDatasetId — a legitimate
+      // resume keeps its drawing session, just not a selection this
+      // instance never had.
+      performDeselect();
+    }
+  }, [canEdit, datasetId, finishDrawingSession, performDeselect]);
+
+  // Edit rights can go away mid-session: the editing flag is switched off,
+  // or a refetch changes the user's permission. A clean session ends once
+  // any feature write in flight has settled, since ending it first would
+  // drop that write's result. One with unsaved work stays, with a discard
+  // notice in place of the toolbar, so the unsaved-changes guard never
+  // warns about an edit the page offers no way to resolve.
+  useEffect(() => {
+    if (canEdit || !isDrawing || hasUnsavedWork || isFeatureMutationPending) return;
+    finishDrawingSession();
+  }, [canEdit, isDrawing, hasUnsavedWork, isFeatureMutationPending, finishDrawingSession]);
+  // A delete confirmed before rights were lost must not reappear if they return.
+  useEffect(() => {
+    if (!canEdit) setDeleteConfirmOpen(false);
+  }, [canEdit]);
+
   // Handle close / stop drawing
   const handleCloseDrawing = useCallback(() => {
+    if (isFeatureMutationPending) return;
     const hasDirtyFeatureEdit = Boolean(useDrawingStore.getState().selectedFeature) &&
       useDrawingStore.getState().isEditDirty;
     const hasSketchInProgress = canUndo && activeMode !== null && activeMode !== 'select';
@@ -897,11 +1101,11 @@ export const DatasetMap = memo(function DatasetMap({
     }
 
     finishDrawingSession();
-  }, [activeMode, canUndo, finishDrawingSession, requestDiscardConfirmation]);
+  }, [activeMode, canUndo, finishDrawingSession, isFeatureMutationPending, requestDiscardConfirmation]);
 
   const handleModeChange = useCallback(
     (nextMode: string) => {
-      if (nextMode === activeMode) return;
+      if (nextMode === activeMode || isFeatureMutationPending) return;
 
       const sf = useDrawingStore.getState().selectedFeature;
       const hasDirtyFeatureEdit = Boolean(sf) && useDrawingStore.getState().isEditDirty;
@@ -932,8 +1136,12 @@ export const DatasetMap = memo(function DatasetMap({
 
       setMode(nextMode);
     },
-    [activeMode, canUndo, clear, performDeselect, requestDiscardConfirmation, setMode],
+    [activeMode, canUndo, clear, isFeatureMutationPending, performDeselect, requestDiscardConfirmation, setMode],
   );
+
+  const handleUndo = useCallback(() => {
+    if (!isFeatureMutationPending) undo();
+  }, [isFeatureMutationPending, undo]);
 
   // Attribute form handlers (new feature creation)
   const handleAttributeSubmit = useCallback(
@@ -941,7 +1149,7 @@ export const DatasetMap = memo(function DatasetMap({
       if (pendingGeometry) {
         const submittedGeometry = pendingGeometry;
         const submittedScope = requestScopeRef.current;
-        const saved = await saveAndRefresh(submittedGeometry, properties);
+        const { saved } = await saveAndRefresh(submittedGeometry, properties);
         if (saved && requestScopeRef.current === submittedScope) {
           setPendingGeometry((current) => current === submittedGeometry ? null : current);
         }
@@ -993,7 +1201,10 @@ export const DatasetMap = memo(function DatasetMap({
 
   return (
     <div
-      className="relative h-full"
+      // The basemap thumbnail owns the bottom-left corner (12px inset + 64px
+      // image + borders), so the attribution control stops short of it
+      // instead of expanding across it on a phone-width map.
+      className="relative h-full [&_.maplibregl-ctrl-bottom-right]:max-w-[calc(100%-5.5rem)]"
       role="region"
       aria-label={t('map.ariaLabel', { defaultValue: 'Dataset map' })}
       data-map-interactive={isDrawing ? 'true' : 'false'}
@@ -1007,6 +1218,7 @@ export const DatasetMap = memo(function DatasetMap({
         mapStyle={initialBasemapStyle.current ?? ''}
         style={{ width: '100%', height: '100%' }}
         cursor={cursor}
+        locale={mapLocale}
         interactive
         scrollZoom={isFullscreen}
         onLoad={handleLoad}
@@ -1019,7 +1231,7 @@ export const DatasetMap = memo(function DatasetMap({
 
         {/* Bbox overlay for spatial context */}
         {bboxGeojson && (
-          <Source id="bbox-source" type="geojson" data={bboxGeojson}>
+          <Source id="bbox-source" type="geojson" data={bboxGeojson} attribution={bboxAttribution ?? undefined}>
             <Layer
               id="bbox-fill"
               type="fill"
@@ -1092,8 +1304,11 @@ export const DatasetMap = memo(function DatasetMap({
         )}
       </div>
 
-      {/* Drawing toolbar overlay */}
-      {isDrawing && (
+      {/* Drawing toolbar overlay. isOwnDrawingSession guards a session left
+          by a DIFFERENT dataset (see the staleSessionCheckedRef effect
+          above, which ends it). A map that can't edit shows only the
+          discard notice, and only while there is unsaved work to resolve. */}
+      {isOwnDrawingSession && (canEdit ? (
         <DrawingToolbar
           geometryType={drawGeometryType}
           onClose={handleCloseDrawing}
@@ -1102,15 +1317,30 @@ export const DatasetMap = memo(function DatasetMap({
           onCancelEdit={handleDeselect}
           onEditAttributes={() => setEditingAttributes(true)}
           onDeleteFeature={() => setDeleteConfirmOpen(true)}
-          onUndo={undo}
+          onUndo={handleUndo}
           canUndo={canUndo}
           isMutating={isFeatureMutationPending}
+          selectionNotice={selectedFeature != null && selectedFeature.tdId === orphanedSelectionTdIdRef.current ? (
+            <UnsavedEditNotice
+              message={t('map.editLostOnReloadNotice')}
+              onDiscard={() => requestDiscardConfirmation(performDeselect)}
+              disabled={isFeatureMutationPending}
+            />
+          ) : undefined}
         />
-      )}
+      ) : hasUnsavedWork && (
+        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10">
+          <UnsavedEditNotice
+            message={t('map.editAccessLostNotice')}
+            onDiscard={() => requestDiscardConfirmation(finishDrawingSession)}
+            disabled={isFeatureMutationPending}
+          />
+        </div>
+      ))}
 
       {/* Attribute form dialog (new feature creation) */}
       <AttributeForm
-        open={pendingGeometry !== null}
+        open={canEdit && pendingGeometry !== null && pendingGeometry !== autoSavingGeometry}
         onOpenChange={(open) => {
           if (!open) setPendingGeometry(null);
         }}
@@ -1121,25 +1351,24 @@ export const DatasetMap = memo(function DatasetMap({
 
       {/* Attribute form dialog (edit existing feature) */}
       <AttributeForm
-        open={editingAttributes}
+        open={canEdit && editingAttributes}
         onOpenChange={(open) => {
           if (!open) setEditingAttributes(false);
         }}
         columns={columnInfo ?? []}
         onSubmit={async (properties) => {
-          // fix(#1761 review round 4): only close on `applied` — a
-          // stale-epoch result means a second identity may have this
-          // dialog open for their own feature, and unconditionally
-          // closing it here would discard that in-progress edit.
-          const { applied } = await handleEditAttributeSubmit(properties);
-          if (applied) setEditingAttributes(false);
+          // A stale result may belong to a different identity's own open
+          // editor. A write refused after this map lost edit rights stays
+          // open as unsaved work, to leave through the discard notice.
+          const { applied, refused } = await handleEditAttributeSubmit(properties);
+          if (applied && !(refused && !canEditRef.current)) setEditingAttributes(false);
         }}
         onCancel={() => setEditingAttributes(false)}
         initialValues={selectedFeature?.properties}
       />
 
       {/* Delete confirmation dialog */}
-      <AlertDialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
+      <AlertDialog open={canEdit && deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t('map.deleteFeatureTitle')}</AlertDialogTitle>
@@ -1172,7 +1401,7 @@ export const DatasetMap = memo(function DatasetMap({
           <AlertDialogHeader>
             <AlertDialogTitle>{t('map.discardChangesTitle')}</AlertDialogTitle>
             <AlertDialogDescription>
-              {t('map.discardChangesDescription')}
+              {canEdit ? t('map.discardChangesDescription') : t('map.discardChangesAccessLostDescription')}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

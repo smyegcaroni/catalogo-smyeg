@@ -167,7 +167,7 @@ export function UserList() {
   }
 
   const skip = page * PAGE_SIZE;
-  const { data, isLoading, error, refetch } = useUserList({
+  const { data, isLoading, isFetching, error, refetch } = useUserList({
     skip,
     limit: PAGE_SIZE,
     status: statusFilter || undefined,
@@ -252,10 +252,9 @@ export function UserList() {
         <CardHeader className="has-data-[slot=card-action]:grid-cols-1 md:has-data-[slot=card-action]:grid-cols-[1fr_auto]">
           <CardTitle
             level={2}
-            aria-label={t('users.title')}
             className="flex items-center gap-2 text-sm font-medium"
           >
-            {t('users.title')}
+            {t('users.listHeading')}
             {data ? <Badge variant="secondary">{data.total}</Badge> : null}
           </CardTitle>
           <CardAction className="col-start-1 row-start-2 row-span-1 flex w-full flex-wrap items-center gap-2 justify-self-stretch md:col-start-2 md:row-start-1 md:row-span-2 md:w-auto md:justify-self-end">
@@ -365,6 +364,9 @@ export function UserList() {
                       icon={Users}
                       title={hasFilters ? t('users.empty.noResults') : t('users.empty.noUsers')}
                       description={hasFilters ? t('users.empty.noResultsHint') : undefined}
+                      // keepPreviousData holds the old empty page while a new query loads.
+                      announce={!isFetching}
+                      announceTrigger={`${searchQuery}|${statusFilter}|${roleFilter}`}
                       className="border-0 py-12"
                       action={
                         hasFilters ? (

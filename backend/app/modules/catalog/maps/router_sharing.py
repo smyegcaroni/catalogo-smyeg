@@ -48,6 +48,7 @@ from app.modules.catalog.maps.service import (
     check_map_ownership,
     create_share_token,
     filter_layer_rows_by_dataset_visibility,
+    terrain_dataset_ids_visible_to,
     get_active_share_token,
     get_map,
     get_map_with_layers,
@@ -58,6 +59,7 @@ from app.modules.catalog.maps.service import (
 )
 from app.modules.catalog.maps.style_json import build_maplibre_style
 from app.modules.embed_tokens.service import revoke_embed_tokens_by_map
+from app.platform.cache.scope import public_cache_control
 from app.standards.ogc.errors import FORBIDDEN_RESPONSE, GONE_RESPONSE
 
 router = APIRouter()
@@ -122,7 +124,7 @@ async def shared_map_card_endpoint(
     )
     return HTMLResponse(
         content=card_html,
-        headers={"Cache-Control": "public, max-age=300"},
+        headers={"Cache-Control": public_cache_control(300)},
     )
 
 
@@ -264,10 +266,14 @@ async def export_map_style_endpoint(
         raise HTTPException(status_code=404, detail="Map not found")
     await _check_map_read_access(map_obj, user, db)
     layer_tuples = await filter_layer_rows_by_dataset_visibility(db, layer_tuples, user)
+    layers = _layers_from_tuples(layer_tuples)
     style = build_maplibre_style(
         map_obj,
-        _layers_from_tuples(layer_tuples),
+        layers,
         mvt_source_layer_prefix=tenant_data_schema(tenant_id),
+        terrain_dataset_ids=await terrain_dataset_ids_visible_to(
+            db, map_obj.terrain_config, [layer.dataset_id for layer in layers], user
+        ),
     )
     return JSONResponse(
         content=style,

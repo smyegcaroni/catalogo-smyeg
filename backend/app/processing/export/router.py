@@ -8,19 +8,20 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse
+import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.background import BackgroundTask
 
 from app.modules.audit.service import AuditEvent, audit_emit
+from app.core.failure_reason import redact_failure_reason
 from app.core.identity import Identity
-from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
+from app.core.record_types import capabilities
 from app.modules.auth.dependencies import get_optional_user
-from app.modules.auth.permissions import get_effective_permissions
 from app.core.dependencies import get_db
 from app.core.db.tenant_schema import tenant_data_schema
 from app.core.db.tenant_session import current_tenant_var
-from app.platform.extensions import get_permission_extension, get_processing_port
+from app.platform.extensions import get_processing_port
 from app.platform.http.ranges import (
     if_match_passes,
     if_none_match_matches,
@@ -30,6 +31,8 @@ from app.platform.http.ranges import (
 from app.platform.storage import get_storage
 from app.processing.export import artifact_cache, artifact_response
 from app.processing.export.ogr import (
+    FORMAT_MAP,
+    PARQUET_MEDIA_TYPE,
     ExportError,
     bbox_where_sql,
     pmtiles_maxzoom_for_extent,
@@ -52,6 +55,8 @@ from app.standards.ogc.errors import (
     PRECONDITION_FAILED_RESPONSE,
 )
 
+logger = structlog.stdlib.get_logger(__name__)
+
 router = APIRouter(
     prefix="/datasets",
     tags=["Datasets"],
@@ -62,6 +67,17 @@ router = APIRouter(
         413: PAYLOAD_TOO_LARGE_RESPONSE,
     },
 )
+
+# Bytes per format, so sync()/asyncio() return a File, not None. Derived from
+# FORMAT_MAP/PARQUET_MEDIA_TYPE. Excludes "application/geo+json" (geojson):
+# it also names unrelated GeoJSON model responses elsewhere in the API.
+_EXPORT_BODY = {
+    media_type: {"schema": {"type": "string", "format": "binary"}}
+    for media_type in (
+        [fmt["media"] for fmt in FORMAT_MAP.values()] + [PARQUET_MEDIA_TYPE]
+    )
+    if media_type != "application/geo+json"
+}
 
 # fix(#430): ceiling for full-table exports (by feature count) — an
 # unbounded ogr2ogr writes an arbitrarily large temp file and holds a worker
@@ -248,7 +264,15 @@ def _head_export_response(dataset_title: str, format_key: str) -> Response:
     # fix(#1778): the handler raises 412 on both the
     # cache-hit and rebuild branches (If-Match no longer matching); the
     # published contract omitted it.
-    responses={412: PRECONDITION_FAILED_RESPONSE},
+    responses={
+        200: {"description": "The exported file", "content": _EXPORT_BODY},
+        206: {
+            "description": "One byte range of the exported file",
+            "content": _EXPORT_BODY,
+        },
+        304: {"description": "The caller already holds this version of the file"},
+        412: PRECONDITION_FAILED_RESPONSE,
+    },
 )
 async def export_dataset_endpoint(
     dataset_id: uuid.UUID,
@@ -261,9 +285,8 @@ async def export_dataset_endpoint(
     where: str | None = Query(
         None, description="Attribute filter expression, e.g. pop > 1000"
     ),
-    # IA-P1-01 (Phase 1069/1157 EXP-01): "export" is enforced only on the
-    # authenticated branch (see body) — anonymous callers get
-    # public+published datasets without a capability check (OGC/tiles parity).
+    # Optional: every caller gets public+published datasets without the
+    # export capability (OGC/tiles parity); the body gates the rest.
     user: Identity | None = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
@@ -297,45 +320,23 @@ async def export_dataset_endpoint(
             detail="Dataset not found",
         )
 
-    # 2. Visibility + permission check (branches on authenticated vs
-    # anonymous). Function-level import: processing/ must not import
-    # app.modules.catalog at module scope (test_layering.py).
+    # 2. Visibility + permission check. Function-level import: processing/
+    # must not import app.modules.catalog at module scope (test_layering.py).
     from app.modules.catalog.authorization import (
-        check_dataset_access,
+        can_export_dataset,
         check_dataset_access_or_anonymous,
-        get_user_roles,
     )
 
-    if user is None:
-        # Anonymous export: enforce public+published gate via the anon-aware
-        # helper (raises 404 to hide existence on denial), then a
-        # defense-in-depth guard requiring public visibility.
-        await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
-        if dataset.record.visibility != "public":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Anonymous export requires public dataset",
-            )
-    else:
-        # Authenticated path: full RBAC visibility check + export capability.
-        await check_dataset_access(db, dataset, dataset_id, user)
-        user_roles = await get_user_roles(db, user)
-        matrix = await get_effective_permissions(db)
-        # Enforce via the permission extension (same path as
-        # require_permission("export")) so a custom PermissionExtension's
-        # policy applies here too; default reduces to role/matrix check.
-        granted = await get_permission_extension().check_permission(
-            db,
-            user,
-            "export",
-            user_roles=user_roles,
-            permission_matrix=matrix,
+    user_roles = await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
+    if not await can_export_dataset(db, dataset, dataset_id, user, user_roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Anonymous export requires public dataset"
+                if user is None
+                else "Missing permission: export"
+            ),
         )
-        if not granted:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Missing permission: export",
-            )
 
     # fix(#1778): read once, here, while the session that loaded it is still
     # in a transaction — `user` is the ORM instance on this session, and the
@@ -385,7 +386,7 @@ async def export_dataset_endpoint(
     # 5. Reject raster/VRT: no tabular feature table. Keyed on record_type,
     # NOT geometry_type (a non-spatial TABLE dataset also has
     # geometry_type=None but IS CSV-exportable).
-    if dataset.record.record_type in RASTER_FAMILY_RECORD_TYPES:
+    if not capabilities(dataset.record.record_type).feature_table:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
@@ -675,7 +676,13 @@ async def export_dataset_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         )
-    except ExportError:
+    except ExportError as exc:
+        logger.warning(
+            "export_failed",
+            dataset_id=str(dataset_id),
+            format=format.value,
+            reason=redact_failure_reason(str(exc)),
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Export failed",

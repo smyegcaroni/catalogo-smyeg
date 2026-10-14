@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.audit.service import AuditEvent, audit_emit
 from app.core.db.sqlstate import is_operational, sqlstate
 from app.core.identity import Identity
+from app.core.record_types import capabilities
 from app.modules.auth.dependencies import require_permission
 from app.core.dependencies import get_db
 from app.modules.catalog.authorization import (
@@ -35,7 +36,7 @@ from app.modules.catalog.layers.service import (
     rename_column,
 )
 from app.platform.cache.provider import get_tile_cache
-from app.platform.catalog_locks import bump_tile_cache_version_on
+from app.platform.catalog_locks import record_live_data_write
 from app.standards.ogc.errors import ERROR_RESPONSES_WRITE
 
 
@@ -49,6 +50,14 @@ async def _invalidate_tiles(table_name: str) -> None:
 
 
 logger = structlog.stdlib.get_logger(__name__)
+
+
+def _require_data_table(dataset) -> None:
+    if not capabilities(dataset.record.record_type).feature_table:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This dataset has no data table",
+        )
 
 
 async def _raise_ddl_db_error(db: AsyncSession, exc: DBAPIError, action: str) -> None:
@@ -154,6 +163,7 @@ async def add_column_endpoint(
         )
     await check_dataset_write_access(db, dataset, dataset_id, user)
     await require_dataset_editing_enabled(db)
+    _require_data_table(dataset)
 
     try:
         columns = await add_column(db, dataset, body.column.name, body.column.type)
@@ -187,9 +197,7 @@ async def add_column_endpoint(
             },
         ),
     )
-    # fix(#1902): evaluated at write time, so a counter read before the lock
-    # wait is never written back over a peer's commit.
-    await bump_tile_cache_version_on(db, dataset)
+    await record_live_data_write(db, dataset)
     await db.commit()
     await _invalidate_tiles(dataset.table_name)
 
@@ -216,6 +224,7 @@ async def rename_column_endpoint(
         )
     await check_dataset_write_access(db, dataset, dataset_id, user)
     await require_dataset_editing_enabled(db)
+    _require_data_table(dataset)
 
     try:
         columns = await rename_column(db, dataset, column_name, body.new_name)
@@ -246,9 +255,7 @@ async def rename_column_endpoint(
             details={"old_name": column_name, "new_name": body.new_name},
         ),
     )
-    # fix(#1902): evaluated at write time, so a counter read before the lock
-    # wait is never written back over a peer's commit.
-    await bump_tile_cache_version_on(db, dataset)
+    await record_live_data_write(db, dataset)
     await db.commit()
     await _invalidate_tiles(dataset.table_name)
     return ColumnListResponse(columns=columns)
@@ -278,6 +285,7 @@ async def alter_column_type_endpoint(
         )
     await check_dataset_write_access(db, dataset, dataset_id, user)
     await require_dataset_editing_enabled(db)
+    _require_data_table(dataset)
 
     try:
         columns = await alter_column_type(db, dataset, column_name, body.new_type)
@@ -311,9 +319,7 @@ async def alter_column_type_endpoint(
             details={"column_name": column_name, "new_type": body.new_type},
         ),
     )
-    # fix(#1902): evaluated at write time, so a counter read before the lock
-    # wait is never written back over a peer's commit.
-    await bump_tile_cache_version_on(db, dataset)
+    await record_live_data_write(db, dataset)
     await db.commit()
     await _invalidate_tiles(dataset.table_name)
     return ColumnListResponse(columns=columns)
@@ -338,6 +344,7 @@ async def drop_column_endpoint(
         )
     await check_dataset_write_access(db, dataset, dataset_id, user)
     await require_dataset_editing_enabled(db)
+    _require_data_table(dataset)
 
     try:
         columns = await drop_column(db, dataset, column_name)
@@ -367,9 +374,7 @@ async def drop_column_endpoint(
             details={"column_name": column_name},
         ),
     )
-    # fix(#1902): evaluated at write time, so a counter read before the lock
-    # wait is never written back over a peer's commit.
-    await bump_tile_cache_version_on(db, dataset)
+    await record_live_data_write(db, dataset)
     await db.commit()
     await _invalidate_tiles(dataset.table_name)
 

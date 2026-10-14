@@ -6,18 +6,16 @@ there for backward compatibility.
 """
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import func, select, text, update
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.failure_reason import redact_failure_reason
 from app.core.db.sqlstate import is_lock_conflict
 from app.core.dependencies import get_client_ip, get_db
 from app.core.identity import Identity
@@ -29,10 +27,13 @@ from app.modules.auth.dependencies import (
 from app.processing.ingest.schemas import UploadResponse
 from app.processing.ingest.service import queue_ingest_job
 from app.platform.extensions import get_permission_extension
-from app.platform.jobs.heartbeat import ANALYSIS_MATERIALIZE_LEASE_SECONDS
+from app.platform.jobs.ledger import Outcome, cancel, retry
 from app.platform.jobs.models import (
     EMBEDDING_BACKFILL_METADATA_KEY,
     FAN_OUT_INTERRUPTED_METADATA_KEY,
+    PUBLISH_OBLIGATIONS_FIELD,
+    QUICKLOOK_ITEM,
+    TERMINAL_STATUSES,
     URL_DOWNLOAD_IN_FLIGHT_METADATA_KEY,
     IngestJob,
 )
@@ -44,32 +45,23 @@ from app.platform.jobs.schemas import (
     ReservedRenameWarning,
     StaleCleanupResponse,
 )
+from app.platform.jobs.originals_reconcile import reconcile_orphaned_originals
+from app.platform.jobs.quicklook_reconcile import reconcile_orphaned_quicklooks
 from app.platform.jobs.staging_reconcile import reconcile_orphaned_staging_objects
 from app.platform.jobs.sweep import (
-    ABANDONED_UPLOAD_MESSAGE,  # noqa: F401 -- re-exported, see __all__
-    JOB_TIMEOUT_SECONDS,
-    no_unclaimed_queue_entry,
-    _READY_WORTHY_SQL,
-    audit_settled_embedding_backfill,
-    STALE_PENDING_BOUND_MESSAGE,
-    STALE_PENDING_UNBOUND_MESSAGE,  # noqa: F401 -- re-exported, see __all__
+    JOB_TIMEOUT_SECONDS,  # noqa: F401 -- re-exported, see __all__
     StaleCleanupOutcome,  # noqa: F401 -- re-exported, see __all__
     _RECHECK_TRANSFER_MARGIN_SECONDS,  # noqa: F401 -- re-exported, see __all__
     _reap_committed_staged_paths,
-    _reap_stale_generation_storage,  # noqa: F401 -- re-exported, see __all__
     _sweep_expired_presigned_staging,
     fail_stale_jobs,
+    is_held_back,
+    may_be_stale,
     post_expiry_sweep_after_seconds,  # noqa: F401 -- re-exported, see __all__
     publish_refresh_reconciliation,
-    is_abandoned_upload,  # noqa: F401 -- re-exported, see __all__
-    stale_pending_clauses,
-    stale_pending_cutoff_seconds,
-    stale_pending_unbound_values,
+    settle_stale_jobs,
+    stale_pending_cutoff_seconds,  # noqa: F401 -- re-exported, see __all__
     sweep_stale_vrt_assets,  # noqa: F401 -- re-exported, see __all__
-    unadopted_analysis_tables_from_metadata,  # noqa: F401 -- re-exported, see __all__
-    unpublished_storage_keys_from_metadata,  # noqa: F401 -- re-exported, see __all__
-    _reap_unadopted_analysis_outputs,  # noqa: F401 -- re-exported, see __all__
-    reap_unpublished_storage_keys,  # noqa: F401 -- re-exported, see __all__
 )
 from app.platform.storage.titiler_url import resolve_current_storage_key
 from app.standards.ogc.errors import CONFLICT_RESPONSE, ERROR_RESPONSES_AUTH
@@ -225,6 +217,15 @@ async def cleanup_stale_jobs(
             # sweeper runs; the fleet helper (multi-tenant) already
             # reconciles per tenant.
             await reconcile_orphaned_staging_objects(db)
+            await reconcile_orphaned_originals(db)
+            await reconcile_orphaned_quicklooks(db)
+            from app.processing.ingest.publish_followups import (
+                run_owed_publish_followups,
+            )
+            from app.processing.raster.vrt_members import reclaim_retained_cogs
+
+            await run_owed_publish_followups()
+            await reclaim_retained_cogs()
             details = outcome.as_dict()
     except Exception as exc:  # broad: cleanup spans DB and artifact deletion
         await db.rollback()
@@ -326,115 +327,16 @@ async def get_job_status(
         )
 
     now = datetime.now(timezone.utc)
-
-    # Auto-fail jobs whose worker lease has expired. Fall back to started_at
-    # for jobs created before heartbeat support was deployed.
-    #
-    # fix(#691): analysis materialize jobs use the short materialize lease,
-    # not the 60-minute backstop — the frontend polls this route, so a
-    # hard-killed analysis job flips to failed within the lease window and
-    # the Create button re-enables at the same moment the server would admit
-    # a new materialize.
-    liveness_at = job.heartbeat_at or job.started_at
-    if job.status == "running" and liveness_at is not None:
-        is_analysis = "analysis" in (job.user_metadata or {})
-        lease_seconds = (
-            ANALYSIS_MATERIALIZE_LEASE_SECONDS if is_analysis else JOB_TIMEOUT_SECONDS
-        )
-        elapsed = (now - liveness_at).total_seconds()
-        if elapsed > lease_seconds:
-            lease_result = await db.execute(
-                update(IngestJob)
-                .where(
-                    IngestJob.id == job.id,
-                    IngestJob.attempt_id == job.attempt_id,
-                    IngestJob.status == "running",
-                    func.coalesce(IngestJob.heartbeat_at, IngestJob.started_at)
-                    < now - timedelta(seconds=lease_seconds),
-                    # fix(#1710): a row whose task is still queued has no
-                    # worker lease to expire; see the predicate's docstring.
-                    no_unclaimed_queue_entry(),
-                )
-                .values(
-                    status="failed",
-                    error_message=f"Worker heartbeat expired after {int(elapsed)}s",
-                    completed_at=now,
-                )
-            )
-            # fix(#1550): gated on the UPDATE landing, as the
-            # stale-pending branch below already is. The predicate is
-            # conditional — a renewal or the worker's own finalize committing
-            # between read and write makes it match zero rows, and auditing
-            # anyway would put "worker_lost" over a still-running job.
-            #
-            # Same transaction as the status change, so the two can't disagree.
-            if lease_result.rowcount:
-                await audit_settled_embedding_backfill(
-                    db,
-                    job_id=job.id,
-                    user_metadata=job.user_metadata,
-                    created_by=job.created_by,
-                    error_code="worker_lost",
-                )
-            await db.commit()
-            await db.refresh(job)
-
-    # Auto-fail jobs stuck 'pending' beyond the timeout (orphaned/never
-    # queued). fix(#724): gated on the same live-queue predicate the
-    # sweeper uses — this is the path that fires, since the frontend polls
-    # every 2s for any job it is tracking.
-    if job.status == "pending" and job.created_at is not None:
-        elapsed = (now - job.created_at).total_seconds()
-        # fix(#1235): both halves, through the shared clauses — this
-        # is the path that fires, so old predicates left the completion race
-        # intact: a poll blocked on a completing job's lock resumes
-        # post-commit and fails the row it waited for.
-        for completion_bound, message in (
-            (False, f"Stale: pending for {int(elapsed)}s without being processed"),
-            (True, STALE_PENDING_BOUND_MESSAGE),
-        ):
-            # fix(#1235): a fast-path skip, not a correctness gate —
-            # the SQL clauses below re-check the same age and stay the
-            # authority. Restores the outer `elapsed` check the r2 rewrite
-            # dropped: without it, every 2s poll of every pending job issued
-            # both UPDATEs.
-            if elapsed <= stale_pending_cutoff_seconds(
-                completion_bound=completion_bound
-            ):
-                continue
-            # fix(#1556): the unbound half takes the shared ACTION (settles a
-            # never-bound presigned upload as `cancelled`); the bound half
-            # writes `failed` outright — same split the background sweep and
-            # the worker's startup recovery apply.
-            values = (
-                {
-                    "status": "failed",
-                    "error_message": redact_failure_reason(message),
-                    "completed_at": now,
-                }
-                if completion_bound
-                else stale_pending_unbound_values(now, message=message)
-            )
-            result = await db.execute(
-                update(IngestJob)
-                .where(
-                    IngestJob.id == job.id,
-                    IngestJob.attempt_id == job.attempt_id,
-                    *stale_pending_clauses(now, completion_bound=completion_bound),
-                )
-                .values(**values)
-            )
-            if result.rowcount:
-                await audit_settled_embedding_backfill(
-                    db,
-                    job_id=job.id,
-                    user_metadata=job.user_metadata,
-                    created_by=job.created_by,
-                    error_code="never_started",
-                )
-                await db.commit()
-                await db.refresh(job)
-                break
+    # Clients poll every few seconds. A job inside its lease costs no statement
+    # here, and a stale one its queue or children still hold costs one read.
+    if may_be_stale(job, now) and not await is_held_back(db, job):
+        outcome = await settle_stale_jobs(db, now, job_ids=(job.id,))
+        await db.commit()
+        publish_refresh_reconciliation(outcome)
+        # Only after the commit: a reap before it could delete what a
+        # rolled-back settlement still owns.
+        await _reap_committed_staged_paths(outcome)
+        await db.refresh(job)
 
     # fix(#1860): this handler already refused non-creators without policy
     # access, so every caller here is entitled to the full payload.
@@ -515,7 +417,11 @@ async def _retry_capability(job: IngestJob) -> tuple[bool, str | None]:
         return True, None
     if not job.file_path:
         return False, "The source is no longer available. Start the import again."
+    return await staged_input_available(job)
 
+
+async def staged_input_available(job: IngestJob) -> tuple[bool, str | None]:
+    """Whether the staged file ``job.file_path`` names is still there to read."""
     from app.core.tenancy import is_multi_tenant
 
     candidate = Path(job.file_path)
@@ -580,7 +486,8 @@ def _redacted_job_status(job: IngestJob) -> JobStatusResponse:
       because a FAILED run's filename never reaches the dataset row — this
       is the only door it reaches a stranger through. Nulled unconditionally
       so the rule stays decidable from the job row alone.
-    - ``error_message``: the field refresh-runs redacts by name.
+    - ``error_message`` / ``error_code``: the fields refresh-runs redacts by
+      name.
     - ``warning_message`` / ``warnings``: name source columns, including
       ORIGINAL names a renaming ingest never publishes (the ``schema_diff``
       class).
@@ -601,6 +508,7 @@ def _redacted_job_status(job: IngestJob) -> JobStatusResponse:
         dataset_id=job.dataset_id,
         source_filename=None,
         error_message=None,
+        error_code=None,
         can_retry=False,
         retry_reason=None,
         warning_message=None,
@@ -690,6 +598,7 @@ async def _job_to_status_response(
                     temporal_parse_errors[cast(TemporalParseKey, key)] = str(v)
 
     can_retry, retry_reason = await _retry_capability(job)
+    obligations = (job.user_metadata or {}).get(PUBLISH_OBLIGATIONS_FIELD)
 
     return JobStatusResponse(
         id=job.id,
@@ -697,8 +606,11 @@ async def _job_to_status_response(
         dataset_id=job.dataset_id,
         source_filename=job.source_filename,
         error_message=job.error_message,
+        error_code=job.error_code,
         can_retry=can_retry,
         retry_reason=retry_reason,
+        quicklook_pending=isinstance(obligations, dict)
+        and QUICKLOOK_ITEM in obligations,
         warning_message=warning_message,
         warnings=warnings,
         # REMED-02 / ingest-audit P2-07: surface worker-written progress fields.
@@ -863,35 +775,7 @@ async def retry_job(
     # orphan guard in queue_ingest_job can flip it back to failed if
     # the queue is down (RESILIENCE-2).
     previous_attempt_id = job.attempt_id
-    next_attempt_id = uuid.uuid4()
-    retried_at = datetime.now(timezone.utc)
-    retry_result = await db.execute(
-        update(IngestJob)
-        .where(
-            IngestJob.id == job.id,
-            IngestJob.status == "failed",
-            IngestJob.attempt_id == previous_attempt_id,
-        )
-        .values(
-            status="pending",
-            attempt_id=next_attempt_id,
-            error_message=None,
-            started_at=None,
-            heartbeat_at=None,
-            completed_at=None,
-            dataset_id=None,
-            # fix(#1556): the pending clock restarts HERE. Ageing from
-            # `coalesce(staged_at, created_at)`, an hour-old failure is stale
-            # the instant it commits, before the queue row can land.
-            user_metadata=func.coalesce(
-                IngestJob.user_metadata, text("'{}'::jsonb")
-            ).op("||", return_type=JSONB)(
-                func.jsonb_build_object("staged_at", retried_at.isoformat())
-            ),
-        )
-        .execution_options(synchronize_session=False)
-    )
-    if not retry_result.rowcount:
+    if await retry(db, job) is not Outcome.LANDED:
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -913,7 +797,7 @@ async def retry_job(
                     if previous_attempt_id is not None
                     else None
                 ),
-                "next_attempt_id": str(next_attempt_id),
+                "next_attempt_id": str(job.attempt_id),
                 "cross_user": job.created_by != user.id,
             },
             ip_address=get_client_ip(request),
@@ -930,10 +814,6 @@ async def retry_job(
         message="Job re-queued for ingestion",
     )
 
-
-# Statuses the cancel endpoint reports as "too late" (409). `cancelled` is
-# handled separately as the idempotent repeat, and everything else is active.
-_CANCEL_TERMINAL_STATUSES = ("complete", "failed", "fanned_out")
 
 # SQL to find the live Procrastinate row(s) for one ingest job — same
 # args->>'job_id' correlation the sweeps use. At most one row is live in
@@ -957,96 +837,6 @@ def _is_lock_conflict(exc: DBAPIError) -> bool:
     rename, not a policy change.
     """
     return is_lock_conflict(exc)
-
-
-# The three VRT regeneration dispatch sites (regenerate_vrt_endpoint,
-# add_vrt_source, remove_vrt_source) all create their IngestJob with this
-# source_filename literal, and nothing else does.
-_VRT_REGENERATE_JOB_FILENAME = "vrt_regenerate"
-
-
-async def _reconcile_cancelled_vrt_regeneration(
-    db: AsyncSession, dataset_id: uuid.UUID, now: datetime
-) -> None:
-    """Release the VRT state a cancelled ``vrt_regenerate`` job would strand.
-
-    fix(#1709): VRT dispatch commits a ``pending`` VrtGeneration
-    and flips the RasterAsset to ``regenerating`` BEFORE deferring the job;
-    that status 409-blocks every later regenerate/add/remove-source call.
-    The worker only unwinds it on its ``except Exception`` path — a task the
-    cancel beat to the claim never reaches it, and a delivered abort raises
-    CancelledError, a BaseException that handler never sees — so without
-    this, a cancelled regeneration stays blocked until
-    ``sweep_stale_vrt_assets``'s JOB_TIMEOUT_SECONDS cutoff.
-
-    Runs inside the cancel transaction, after the job CAS won, as guarded
-    conditional updates so the fence-wins discipline holds:
-
-    - The generation flips to ``failed`` only from ``pending``/``running``
-      (no ``cancelled`` literal in the CHECK constraint; same convention the
-      stale sweep writes). A terminal row means another actor finished
-      first, and nothing here is touched.
-    - The asset restore reuses the sweep's ``_READY_WORTHY_SQL`` branches:
-      ``ready`` only when composition still matches the catalog and the
-      prior attempt didn't fail, else ``failed``. Either branch clears
-      ``current_generation_id`` so the 409 block lifts immediately.
-    - A worker that publishes cannot lose to this: its publish carries the
-      fenced job-complete update, so it either committed before the cancel's
-      job CAS (cancel then 409s, never reaches here) or rolls back at the
-      fence. Late arrival on either side is a zero-row no-op, never a clobber.
-
-    Lock order (fix(#1709)): the caller already holds the
-    RasterAsset row lock, taken FIRST to match the worker's publish order
-    (asset FOR UPDATE -> generation -> job); everything here stays within it.
-    """
-    # Deferred by design: platform -> processing imports stay function-local
-    # (D-17), mirroring the worker/task_app imports elsewhere in this module.
-    from app.processing.raster.models import RasterAsset, VrtGeneration
-
-    pointer = await db.scalar(
-        select(RasterAsset.current_generation_id).where(
-            RasterAsset.dataset_id == dataset_id,
-            RasterAsset.status == "regenerating",
-        )
-    )
-    if pointer is None:
-        # Nothing in flight: already published, already reconciled, or the
-        # dispatch's orphan-guard rollback restored the asset itself.
-        return
-    generation_cas = await db.execute(
-        update(VrtGeneration)
-        .where(
-            VrtGeneration.id == pointer,
-            VrtGeneration.status.in_(("pending", "running")),
-        )
-        .values(
-            status="failed",
-            completed_at=now,
-            error_message="Cancelled by user",
-        )
-        .returning(VrtGeneration.id)
-    )
-    if generation_cas.scalar_one_or_none() is None:
-        # The pointed-at generation is already terminal — another actor's
-        # record stands, and the asset is that actor's to reconcile.
-        return
-    asset_predicate = (
-        RasterAsset.dataset_id == dataset_id,
-        RasterAsset.status == "regenerating",
-        RasterAsset.current_generation_id == pointer,
-    )
-    restored = await db.execute(
-        update(RasterAsset)
-        .where(*asset_predicate, text(_READY_WORTHY_SQL))
-        .values(status="ready", current_generation_id=None)
-        .returning(RasterAsset.dataset_id)
-    )
-    if restored.scalar_one_or_none() is None:
-        await db.execute(
-            update(RasterAsset)
-            .where(*asset_predicate, text(f"NOT ({_READY_WORTHY_SQL})"))
-            .values(status="failed", current_generation_id=None)
-        )
 
 
 async def _may_cancel_job(
@@ -1122,7 +912,6 @@ async def cancel_job(
     """
     # Deferred by design to preserve the platform -> modules layer boundary.
     from app.modules.audit.service import AuditEvent, audit_emit
-    from app.platform.refresh.service import cancel_active_run_for_job
 
     result = await db.execute(select(IngestJob).where(IngestJob.id == job_id))
     job = result.scalar_one_or_none()
@@ -1143,49 +932,21 @@ async def cancel_job(
         return JobCancelResponse(
             id=job.id, status="cancelled", run_id=None, already=True
         )
-    if job.status in _CANCEL_TERMINAL_STATUSES:
+    # `cancelled` is answered above as the idempotent repeat, so a terminal
+    # status here is "too late".
+    if job.status in TERMINAL_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "job_already_finished", "status": job.status},
         )
 
-    # One transaction: fenced job CAS + run CAS + VRT reconciliation + audit,
-    # then commit. The attempt-id predicate mirrors retry_job's own CAS — a
-    # stale cancel aimed at attempt N can never kill a retried attempt N+1.
-    # The 2s lock_timeout keeps this request from blocking behind a finalize
-    # transaction holding its locks through the swap to commit.
-    #
-    # fix(#1709): the try covers the WHOLE transactional block;
-    # fix(#1847): every job type leads with the job row, matching the
-    # worker/dataset-delete order.
+    # One transaction: the ledger's fenced cancel, which ends the job's linked
+    # rows with it, and this request's audit event, then commit. The ledger's
+    # 2 s lock_timeout covers the audit write too.
     previous_attempt_id = job.attempt_id
-    now = datetime.now(timezone.utc)
-    attempt_predicate = (
-        IngestJob.attempt_id == previous_attempt_id
-        if previous_attempt_id is not None
-        else IngestJob.attempt_id.is_(None)
-    )
-    is_vrt_job = (
-        job.source_filename == _VRT_REGENERATE_JOB_FILENAME
-        and job.dataset_id is not None
-    )
     try:
-        await db.execute(text("SET LOCAL lock_timeout = '2s'"))
-        cancel_result = await db.execute(
-            update(IngestJob)
-            .where(
-                IngestJob.id == job.id,
-                IngestJob.status.in_(("pending", "running")),
-                attempt_predicate,
-            )
-            .values(
-                status="cancelled",
-                error_message="Cancelled by user",
-                completed_at=now,
-            )
-        )
-
-        if not cancel_result.rowcount:
+        ended = await cancel(db, job, actor=user.id)
+        if ended.outcome is not Outcome.LANDED:
             # Another actor moved the row between the read and the CAS.
             # Report what it became; nothing was written.
             await db.rollback()
@@ -1196,7 +957,7 @@ async def cancel_job(
                 )
             code = (
                 "job_already_finished"
-                if job.status in _CANCEL_TERMINAL_STATUSES
+                if job.status in TERMINAL_STATUSES
                 # Still active under a different attempt id: retried
                 # concurrently — a cancel on the old attempt must not kill
                 # the new one.
@@ -1207,30 +968,7 @@ async def cancel_job(
                 detail={"code": code, "status": job.status},
             )
 
-        run_id = await cancel_active_run_for_job(db, job.id, cancelled_by=user.id)
-        if is_vrt_job:
-            # fix(#1709): same transaction as the job CAS, so the
-            # VRT state this job stranded and the job's terminal status land
-            # together.
-            await _reconcile_cancelled_vrt_regeneration(db, job.dataset_id, now)
-        # fix(#1709): an embedding backfill's dispatch commits an
-        # `embedding.backfill` audit event at outcome="requested"; sweep.py's
-        # rule is that the job row and audit trail settle together by
-        # whoever settles the job. A cancelled queued backfill never runs,
-        # so no in-process path ever closes that trail — this is the only
-        # one left. No-op for every other job kind, SAVEPOINT-guarded
-        # against a concurrently settling worker.
-        await audit_settled_embedding_backfill(
-            db,
-            job_id=job.id,
-            user_metadata=job.user_metadata,
-            created_by=job.created_by,
-            error_code="user_cancelled",
-            # fix(#1709): the terminal event names the CANCELLER,
-            # matching job.cancel and refresh.cancelled in this same
-            # transaction — not the run's original requester.
-            settled_by=user.id,
-        )
+        run_id = ended.linked.get("run")
         await audit_emit(
             db,
             AuditEvent(
@@ -1299,30 +1037,15 @@ async def cancel_job(
 
 
 __all__ = [
-    "ABANDONED_UPLOAD_MESSAGE",
     "JOB_TIMEOUT_SECONDS",
-    "STALE_PENDING_BOUND_MESSAGE",
-    "STALE_PENDING_UNBOUND_MESSAGE",
     "StaleCleanupOutcome",
     "TemporalParseKey",
     "_RECHECK_TRANSFER_MARGIN_SECONDS",
-    "_reap_stale_generation_storage",
-    # fix(#1556): the worker's startup recovery settles the same rows this
-    # module's sweep does, so it needs the same helper through the same façade.
-    "audit_settled_embedding_backfill",
     "fail_stale_jobs",
     "get_retry_capability",
-    "is_abandoned_upload",
     "post_expiry_sweep_after_seconds",
     "router",
-    "stale_pending_clauses",
+    "staged_input_available",
     "stale_pending_cutoff_seconds",
-    "stale_pending_unbound_values",
     "sweep_stale_vrt_assets",
-    # fix(#1778): the startup recovery pass reaps the same pre-commit raster
-    # objects and analysis outputs the periodic sweep does, via the same façade.
-    "_reap_unadopted_analysis_outputs",
-    "reap_unpublished_storage_keys",
-    "unadopted_analysis_tables_from_metadata",
-    "unpublished_storage_keys_from_metadata",
 ]

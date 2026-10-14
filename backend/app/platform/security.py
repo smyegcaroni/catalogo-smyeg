@@ -63,6 +63,12 @@ async def _resolve_and_validate(host: str, port: int | None) -> str:
     between validation-time and connect-time DNS. Raises SSRFError if
     resolution fails or any resolved address is blocked.
     """
+    return (await _resolve_all_and_validate(host, port))[0]
+
+
+async def _resolve_all_and_validate(host: str, port: int | None) -> list[str]:
+    """Every address *host* resolves to, in resolver order, once each, after
+    the same checks as :func:`_resolve_and_validate`."""
     try:
         results = await asyncio.to_thread(
             socket.getaddrinfo, host, port, proto=socket.IPPROTO_TCP
@@ -75,7 +81,7 @@ async def _resolve_and_validate(host: str, port: int | None) -> str:
         ip = ipaddress.ip_address(sockaddr[0])
         if _is_blocked_ip(ip):
             raise SSRFError("URLs targeting private/internal networks are not allowed")
-    return str(ipaddress.ip_address(results[0][4][0]))
+    return list(dict.fromkeys(str(ipaddress.ip_address(r[4][0])) for r in results))
 
 
 async def validate_url_for_ssrf(url: str) -> None:
@@ -224,6 +230,46 @@ def _redirect_hook(credential_header: str | None):
     return _hook
 
 
+# The statuses httpx follows when the response names a Location.
+_FOLLOWED_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+# Headers that describe a body the redirect no longer has.
+_REDIRECT_BODY_HEADERS = frozenset(
+    {b"content-length", b"content-encoding", b"transfer-encoding"}
+)
+
+
+async def _without_redirect_body(response: httpx.Response) -> httpx.Response:
+    """The same redirect with its body discarded unread, or *response* as is.
+
+    With ``follow_redirects`` on, httpx reads each redirect's body in full,
+    decompressed, before it follows the Location, ahead of any size limit the
+    caller applies to the response it actually wants. Nothing reads a redirect
+    body usefully, so the upstream stream is closed here and the caller gets
+    an empty one under the same status and headers.
+    """
+    if (
+        response.status_code not in _FOLLOWED_REDIRECT_STATUSES
+        or "location" not in response.headers
+    ):
+        return response
+    await response.aclose()
+    return httpx.Response(
+        response.status_code,
+        headers=[
+            (name, value)
+            for name, value in response.headers.raw
+            if name.lower() not in _REDIRECT_BODY_HEADERS
+        ],
+        stream=httpx.ByteStream(b""),
+        extensions={
+            key: value
+            for key, value in response.extensions.items()
+            if key in ("http_version", "reason_phrase")
+        },
+    )
+
+
 class _SSRFGuardTransport(httpx.AsyncHTTPTransport):
     """Transport that re-resolves, re-validates, and PINS the IP at connect time.
 
@@ -244,7 +290,9 @@ class _SSRFGuardTransport(httpx.AsyncHTTPTransport):
         request.url = original_url.copy_with(host=validated_ip)
         request.extensions["sni_hostname"] = host
         try:
-            return await super().handle_async_request(request)
+            return await _without_redirect_body(
+                await super().handle_async_request(request)
+            )
         finally:
             # fix(#1271): restore the hostname after connect — leaving the
             # pinned IP would break relative-redirect resolution (next hop's

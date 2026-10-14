@@ -16,6 +16,16 @@ from app.platform.service_auth import (
 
 Visibility = Literal["private", "restricted", "internal", "public"]
 
+TILESET_KIND_DESCRIPTION = (
+    "'tiles3d' uploads a 3D Tiles tileset as a .zip or .3tz archive holding "
+    "tileset.json. Omit it for any other file; a .zip without it is read as "
+    "geospatial data, and a .3tz without it is refused."
+)
+UPLOAD_KIND_DESCRIPTION = (
+    f"{TILESET_KIND_DESCRIPTION} 'pointcloud' uploads a COPC point cloud as a "
+    ".laz file; a .laz without it is refused."
+)
+
 
 class UrlUploadRequest(BaseModel):
     """Request body for importing a file from a URL.
@@ -43,6 +53,9 @@ class UrlUploadRequest(BaseModel):
             "Must carry an allowed extension. Defaults to the URL path's "
             "basename."
         ),
+    )
+    kind: Literal["tiles3d"] | None = Field(
+        default=None, description=TILESET_KIND_DESCRIPTION
     )
 
 
@@ -147,12 +160,84 @@ class RasterPreviewResponse(BaseModel):
     )
 
 
+class TilesetPreviewResponse(BaseModel):
+    """What a staged 3D Tiles tileset archive holds, read without unpacking it."""
+
+    job_id: uuid.UUID = Field(
+        description="Identifier of the tileset ingestion job being previewed."
+    )
+    source_filename: str | None = Field(
+        description="Original filename of the uploaded tileset archive."
+    )
+    version: Literal["1.0", "1.1"] = Field(
+        description="The tileset's asset.version from its tileset.json."
+    )
+    geometric_error: float | None = Field(
+        description="The root tile's geometricError, or null when tileset.json gives none."
+    )
+    bounding_volume: Literal["region", "box", "sphere"] = Field(
+        description="The kind of the root tile's bounding volume."
+    )
+    extent_bbox: list[float] | None = Field(
+        description=(
+            "The root bounding volume's extent as [west, south, east, north] in "
+            "degrees; west > east when it crosses the antimeridian. Null for a "
+            "box or sphere that is not placed in Earth-centred coordinates."
+        )
+    )
+    unpacked_bytes: int = Field(
+        description="Total size of the archive's files once unpacked."
+    )
+    entry_count: int = Field(
+        description="Number of entries, files and folders, in the archive."
+    )
+
+
+class PointCloudPreviewResponse(BaseModel):
+    """What a staged COPC point cloud holds, read from its header and hierarchy."""
+
+    job_id: uuid.UUID = Field(
+        description="Identifier of the point cloud ingestion job being previewed."
+    )
+    source_filename: str | None = Field(
+        description="Original filename of the uploaded point cloud."
+    )
+    point_count: int = Field(description="Number of points in the file.")
+    point_format: Literal[6, 7, 8] = Field(
+        description="The file's LAS point data record format."
+    )
+    srid: int = Field(
+        description="EPSG code of the horizontal coordinate reference system."
+    )
+    vertical_crs: str | None = Field(
+        description="Name of the vertical coordinate reference system, if any."
+    )
+    extent_bbox: list[float] = Field(
+        description=(
+            "The extent as [west, south, east, north] in degrees; west > east "
+            "when it crosses the antimeridian."
+        )
+    )
+    z_min: float = Field(description="Lowest elevation, in the file's units.")
+    z_max: float = Field(description="Highest elevation, in the file's units.")
+    size_bytes: int = Field(description="Size of the file in bytes.")
+
+
+StagedPreviewResponse = (
+    PreviewResponse
+    | RasterPreviewResponse
+    | TilesetPreviewResponse
+    | PointCloudPreviewResponse
+)
+
+
 class BaseCommitRequest(BaseModel):
     """Fields common to every commit request type.
 
     Not meant to be instantiated directly — the router always selects
-    one of VectorCommitRequest, RasterCommitRequest, or
-    ServiceCommitRequest based on server-side job state.
+    one of VectorCommitRequest, RasterCommitRequest, ServiceCommitRequest,
+    TilesetCommitRequest or PointCloudCommitRequest based on server-side job
+    state.
     """
 
     title: str = Field(
@@ -296,6 +381,14 @@ class ServiceCommitRequest(BaseCommitRequest):
     _reject_auth_conflict = model_validator(mode="after")(reject_service_auth_conflict)
 
 
+class TilesetCommitRequest(BaseCommitRequest):
+    """Commit request for a 3D Tiles tileset archive: the common fields only."""
+
+
+class PointCloudCommitRequest(BaseCommitRequest):
+    """Commit request for a COPC point cloud: the common fields only."""
+
+
 class CommitRequest(BaseModel):
     """Wire-level schema for ``POST /ingest/commit/{job_id}``.
 
@@ -309,6 +402,7 @@ class CommitRequest(BaseModel):
       - ``VectorCommitRequest`` — default for file uploads
       - ``RasterCommitRequest`` — when ``job.user_metadata['file_type'] == 'raster'``
       - ``ServiceCommitRequest`` — when ``job.source_url`` is set and ``job.file_path`` is None
+      - ``TilesetCommitRequest`` — when ``job.user_metadata['file_type'] == 'tiles3d'``
 
     For new internal code that constructs a commit view, prefer importing
     the appropriate subclass directly. This flat class is the wire contract,
@@ -434,6 +528,15 @@ class TableRegisterResponse(BaseModel):
     table_name: str = Field(description="Source PostgreSQL table that was registered.")
 
 
+# Discovery's refusal for a geom column that declares no SRID. A refresh that
+# finds one fails its run with the same code.
+UNDECLARED_SRID_CODE = "source_srid_undeclared"
+
+# Discovery's refusal for a gid column readers cannot key features on. A
+# refresh that finds one fails its run with the same code.
+UNUSABLE_GID_CODE = "source_gid_unusable"
+
+
 class DiscoveredTable(BaseModel):
     table_name: str = Field(description="PostgreSQL table name in the `data` schema.")
     geometry_type: str | None = Field(
@@ -445,11 +548,20 @@ class DiscoveredTable(BaseModel):
     estimated_rows: int | None = Field(
         description="PostgreSQL row count estimate from `pg_class.reltuples`."
     )
+    refusal_reason: str | None = Field(
+        default=None,
+        description=(
+            "Why registration would refuse this table, as one of a fixed set "
+            f"of GeoLens codes: {UNDECLARED_SRID_CODE}, {UNUSABLE_GID_CODE}. "
+            "Null when discovery finds none, though registration can still "
+            "refuse a table for a reason discovery does not check."
+        ),
+    )
 
 
 class DiscoverResponse(BaseModel):
     tables: list[DiscoveredTable] = Field(
-        description="Tables in the `data` schema that are eligible for registration as datasets."
+        description="Tables in the `data` schema not yet registered as datasets. `refusal_reason` marks those discovery knows registration would refuse."
     )
 
 
@@ -506,6 +618,9 @@ class PresignedUploadRequest(BaseModel):
         default="application/octet-stream",
         max_length=255,  # RFC 6838 practical upper bound
         description="MIME type to associate with the uploaded object.",
+    )
+    kind: Literal["tiles3d", "pointcloud"] | None = Field(
+        default=None, description=UPLOAD_KIND_DESCRIPTION
     )
 
 
@@ -565,9 +680,9 @@ class UploadConfigResponse(BaseModel):
 
 class VrtCreateRequest(BaseModel):
     source_dataset_ids: list[uuid.UUID] = Field(
-        min_length=1,
+        min_length=2,
         max_length=500,
-        description="Source raster dataset IDs to include in the VRT mosaic or band stack (1-500).",
+        description="Source raster dataset IDs to include in the VRT mosaic or band stack (2-500).",
     )
     vrt_type: Literal["mosaic", "band_stack"] = Field(
         description="Type of VRT to create. 'mosaic' tiles sources spatially; 'band_stack' aligns same-extent sources as multi-band output."

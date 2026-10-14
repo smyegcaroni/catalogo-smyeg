@@ -1,14 +1,17 @@
 import { type ReactNode, useRef } from 'react';
 import { Database, Loader2, SearchX, Upload, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { useShallow } from 'zustand/react/shallow';
 import { Link } from 'react-router';
 import { PageShell } from '@/components/layout/PageShell';
 import { ErrorState } from '@/components/layout/ErrorState';
 import { EmptyState } from '@/components/layout/EmptyState';
+import { LiveAnnouncement } from '@/components/ui/live-announcement';
 import { Button } from '@/components/ui/button';
 import { SearchBar } from '@/components/search/SearchBar';
 import { SavedSearches } from '@/components/search/SavedSearches';
 import { FilterPanel } from '@/components/search/FilterPanel';
+import { SearchSpatialSheet } from '@/components/search/SearchSpatialSheet';
 import { SearchResultCard } from '@/components/search/SearchResultCard';
 import { DatasetCardSkeleton } from '@/components/search/DatasetCardSkeleton';
 import { Pagination } from '@/components/layout/Pagination';
@@ -22,10 +25,11 @@ import { usePermissions } from '@/hooks/use-permissions';
 
 interface SearchControlsProps {
   totalResults: number | undefined;
+  allTypesTotal: number | undefined;
   children?: ReactNode;
 }
 
-function SearchControls({ totalResults, children }: SearchControlsProps) {
+function SearchControls({ totalResults, allTypesTotal, children }: SearchControlsProps) {
   return (
     <>
       <SearchBar mode="compact" />
@@ -36,7 +40,7 @@ function SearchControls({ totalResults, children }: SearchControlsProps) {
       ) : null}
       <div className="mt-3 border-t border-border/40 pt-3 lg:hidden">
         <div className="md:px-1">
-          <FilterPanel totalResults={totalResults} showDesktop={false} />
+          <FilterPanel totalResults={totalResults} allTypesTotal={allTypesTotal} showDesktop={false} />
         </div>
       </div>
     </>
@@ -48,7 +52,15 @@ export function SearchPage() {
   useDocumentTitle(t('common:pageTitle.search'));
   const { data, isLoading, error, isFetching, refetch } = useSearchResults();
   // Map search uses the visibility-scoped maps endpoint because catalog search indexes datasets only.
-  const { data: mapResults } = useMapSearchResults();
+  const {
+    data: mapResults,
+    isLoading: isLoadingMaps,
+    isFetching: isFetchingMaps,
+    error: mapsError,
+    refetch: refetchMaps,
+  } = useMapSearchResults();
+  const mapQuery = useSearchStore((s) => s.q).trim();
+  const searchParams = useSearchStore(useShallow((s) => s.toParams()));
   const offset = useSearchStore((s) => s.offset);
   const limit = useSearchStore((s) => s.limit);
   const token = useAuthStore((s) => s.token);
@@ -76,6 +88,29 @@ export function SearchPage() {
   // logged in AND allowed. See Navbar.tsx CreateMenu.
   const canImport = !!token && can('upload');
   const totalMatched = data ? Math.max(data.numberMatched ?? 0, data.features.length) : 0;
+  const allTypesTotal = data ? (data.numberMatchedAllTypes ?? data.numberMatched) : undefined;
+  const hasMapTextQuery = mapQuery.length > 0;
+  const isMapSearchPending = hasMapTextQuery && (isLoadingMaps || isFetchingMaps);
+  const hasMapMatches = (mapResults?.maps.length ?? 0) > 0;
+  const searchKey = JSON.stringify(searchParams);
+  const catalogEmpty = !!data && data.features.length === 0;
+  const mapMatchText = hasMapMatches ? t('mapMatchCount', { count: mapResults?.total ?? 0 }) : '';
+  const catalogText = catalogEmpty
+    ? t('empty.catalogResultsTitle')
+    : t('catalogResults', { count: totalMatched });
+  // A failed catalog query with no cache still lets settled map results announce.
+  const liveStatus: string = !(data || error)
+    ? ''
+    : data && isFetching
+      ? t('updating')
+      : catalogEmpty && isMapSearchPending
+        ? '' // the map section announces its own pending state
+        : !data
+          ? mapMatchText
+          : mapMatchText
+            ? `${catalogText}${catalogEmpty ? '.' : ','} ${mapMatchText}`
+            : catalogText;
+  const shouldShowMapSearch = hasMapTextQuery && (isMapSearchPending || !!mapsError || hasMapMatches);
 
   useUrlSearchSync();
 
@@ -95,6 +130,7 @@ export function SearchPage() {
             <div className="sticky top-16 max-h-[calc(100vh-5rem)] overflow-y-auto">
               <FilterPanel
                 totalResults={totalMatched > 0 ? totalMatched : undefined}
+                allTypesTotal={allTypesTotal}
                 showMobile={false}
                 desktopLayout="rail"
               />
@@ -103,13 +139,15 @@ export function SearchPage() {
 
           <div className="min-w-0 space-y-6">
             <section className="rounded-lg border bg-card p-4 shadow-sm sm:px-6">
-              <SearchControls totalResults={totalMatched > 0 ? totalMatched : undefined}>
+              <SearchControls totalResults={totalMatched > 0 ? totalMatched : undefined} allTypesTotal={allTypesTotal}>
                 {token ? <SavedSearches className="justify-center md:justify-start" /> : null}
               </SearchControls>
             </section>
 
+            <LiveAnnouncement text={liveStatus} trigger={searchKey} />
+
             {isFetching && data && (
-              <div role="status" aria-live="polite" className="inline-flex items-center gap-2 rounded-md border bg-card px-3 py-1.5 text-sm text-muted-foreground shadow-sm">
+              <div aria-hidden="true" className="inline-flex items-center gap-2 rounded-md border bg-card px-3 py-1.5 text-sm text-muted-foreground shadow-sm">
                 <Loader2 className="size-4 animate-spin" aria-hidden="true" />
                 {t('updating')}
               </div>
@@ -128,28 +166,50 @@ export function SearchPage() {
               <ErrorState message={t('error.message', { message: error.message })} onRetry={() => refetch()} />
             )}
 
-            {/* A query can match a map without matching any datasets. */}
-            {mapResults && mapResults.maps.length > 0 && (
-              <section className="space-y-3" aria-label={t('mapsSectionTitle', { defaultValue: 'Maps' })}>
-                <h2 className="text-sm font-medium text-foreground px-0.5">
-                  {t('mapsSectionTitle', { defaultValue: 'Maps' })}
-                </h2>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  {mapResults.maps.map((map) => (
-                    <MapCard key={map.id} map={map} />
-                  ))}
+            {shouldShowMapSearch && (
+              <section className="space-y-3" aria-labelledby="map-search-results-heading">
+                <div className="space-y-1 px-0.5">
+                  <h2 id="map-search-results-heading" className="text-sm font-medium text-foreground">
+                    {t('mapsMatchingQuery', { query: mapQuery })}
+                  </h2>
+                  <p className="text-sm text-muted-foreground">{t('mapsScopeHint')}</p>
                 </div>
+
+                {isMapSearchPending && (
+                  <div role="status" aria-live="polite" className="inline-flex items-center gap-2 text-sm text-muted-foreground">
+                    <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+                    {t('loadingMaps')}
+                  </div>
+                )}
+
+                {mapsError && (
+                  <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                    <span>{t('mapsError')}</span>
+                    <Button variant="outline" size="sm" onClick={() => refetchMaps()}>
+                      {t('retryMaps')}
+                    </Button>
+                  </div>
+                )}
+
+                {hasMapMatches && (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    {mapResults?.maps.map((map) => (
+                      <MapCard key={map.id} map={map} />
+                    ))}
+                  </div>
+                )}
               </section>
             )}
 
-            {/* Map-only matches must not render the dataset empty state. */}
-            {data && data.features.length === 0 && !(mapResults && mapResults.maps.length > 0) && (
+            {/* Wait for text-only map matching before treating the whole search as empty. */}
+            {data && data.features.length === 0 && !isMapSearchPending && !hasMapMatches && (
               // A positive total with an empty page means the current offset is out of range.
               hasActiveSearch || totalMatched > 0 ? (
                 <EmptyState
+                  announce={false}
                   icon={SearchX}
-                  title={t('empty.title')}
-                  description={t('empty.description')}
+                  title={t('empty.catalogResultsTitle')}
+                  description={t('empty.catalogResultsDescription')}
                   action={
                     <Button variant="outline" onClick={() => resetFilters()}>
                       <X className="h-4 w-4 me-1" />
@@ -159,11 +219,20 @@ export function SearchPage() {
                 />
               ) : (
                 <EmptyState
+                  announce={false}
                   icon={Database}
-                  title={t('empty.catalogTitle', { defaultValue: 'Your catalog is empty' })}
-                  description={t('empty.catalogDescription', {
-                    defaultValue: 'Import a dataset to start building your geospatial catalog.',
-                  })}
+                  title={
+                    canImport
+                      ? t('empty.catalogTitle')
+                      : t('empty.catalogTitleViewer')
+                  }
+                  description={
+                    canImport
+                      ? t('empty.catalogDescription')
+                      : token
+                        ? t('empty.catalogDescriptionViewer')
+                        : t('empty.catalogDescriptionAnonymous')
+                  }
                   action={
                     canImport ? (
                       <Button asChild>
@@ -172,10 +241,29 @@ export function SearchPage() {
                           {t('empty.cta')}
                         </Link>
                       </Button>
+                    ) : !token ? (
+                      <Button asChild variant="outline">
+                        <Link to="/login">{t('empty.signIn')}</Link>
+                      </Button>
                     ) : undefined
                   }
                 />
               )
+            )}
+
+            {data && data.features.length === 0 && !isMapSearchPending && hasMapMatches && (
+              <section className="flex flex-wrap items-center justify-between gap-3 rounded-md border bg-muted/30 px-4 py-3" aria-labelledby="catalog-empty-heading">
+                <div className="space-y-0.5">
+                  <h2 id="catalog-empty-heading" className="text-sm font-medium text-foreground">
+                    {t('empty.catalogResultsTitle')}
+                  </h2>
+                  <p className="text-sm text-muted-foreground">{t('empty.catalogResultsDescription')}</p>
+                </div>
+                <Button variant="outline" size="sm" onClick={() => resetFilters()}>
+                  <X className="h-4 w-4 me-1" />
+                  {t('empty.clear')}
+                </Button>
+              </section>
             )}
 
             {data && data.features.length > 0 && (
@@ -183,13 +271,17 @@ export function SearchPage() {
                 {/* Keep the result count visible at every viewport width. */}
                 <div className="flex items-center justify-between gap-3 px-0.5">
                   <h2 className="text-sm font-medium text-foreground">
-                    {t('resultCount', { count: totalMatched })}
+                    {t('catalogResults', { count: totalMatched })}
                   </h2>
                 </div>
-                <section className="space-y-3" aria-label={t('results', { defaultValue: 'Search results' })}>
-                  {data.features.map((feature) => (
-                    <SearchResultCard key={feature.id} feature={feature} />
-                  ))}
+                <section aria-label={t('results', { defaultValue: 'Search results' })}>
+                  <ul className="space-y-3">
+                    {data.features.map((feature) => (
+                      <li key={feature.id}>
+                        <SearchResultCard feature={feature} />
+                      </li>
+                    ))}
+                  </ul>
                 </section>
               </div>
             )}
@@ -205,6 +297,7 @@ export function SearchPage() {
           </div>
         </div>
       </PageShell>
+      <SearchSpatialSheet />
     </>
   );
 }

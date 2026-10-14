@@ -183,17 +183,6 @@ async def get_vrt_status(
     last_gen = gen_result.scalar_one_or_none()
     last_generation_at = last_gen.completed_at if last_gen else None
 
-    # Raw total link count, intentionally including ALL links, while
-    # source_health below reflects only accessible members.
-    # Recomputing from the filtered set would leak the unauthorized delta.
-    count_result = await db.execute(
-        text(
-            "SELECT COUNT(*) FROM catalog.vrt_source_links WHERE vrt_dataset_id = :id"
-        ),
-        {"id": str(dataset_id)},
-    )
-    source_count = count_result.scalar() or 0
-
     # Active generation (if regenerating)
     active_generation = None
     if vrt_status == "regenerating":
@@ -316,7 +305,7 @@ async def get_vrt_status(
     return VrtStatusResponse(
         status=vrt_status,
         last_generation_at=last_generation_at,
-        source_count=source_count,
+        source_count=len(source_health_list),
         active_generation=active_generation,
         source_health=source_health_list,
     )
@@ -325,10 +314,11 @@ async def get_vrt_status(
 def _vrt_generation_item(generation: Any, *, include_detail: bool) -> VrtGenerationItem:
     """One row of a VRT dataset's regeneration history.
 
-    ``error_message`` can name server paths and ``triggered_by`` contains a
-    raw user id. ``include_detail`` is the
-    ``can_view_dataset_provenance`` answer; both fields are null otherwise,
-    matching what ``DatasetRefreshRunResponse`` redacts for the same reader.
+    ``error_message`` can name server paths, ``triggered_by`` contains a
+    raw user id and ``source_count`` counts members the reader may not be
+    able to see. ``include_detail`` is the ``can_view_dataset_provenance``
+    answer; all three fields are null otherwise, matching what
+    ``DatasetRefreshRunResponse`` redacts for the same reader.
 
     No per-row "you triggered this one" arm: every ``VrtGeneration``
     writer goes through ``check_dataset_write_access`` (owner-or-admin),
@@ -341,7 +331,7 @@ def _vrt_generation_item(generation: Any, *, include_detail: bool) -> VrtGenerat
         completed_at=generation.completed_at,
         duration_seconds=generation.duration_seconds,
         error_message=generation.error_message if include_detail else None,
-        source_count=generation.source_count,
+        source_count=generation.source_count if include_detail else None,
         triggered_by=generation.triggered_by if include_detail else None,
     )
 
@@ -424,7 +414,7 @@ async def regenerate_vrt_endpoint(
     """Trigger manual VRT regeneration with advisory lock to prevent concurrent rebuilds."""
     from app.platform.jobs.defer_guard import (
         defer_with_orphan_guard,
-        make_vrt_regeneration_failed_rollback,
+        make_ingest_job_failed_rollback,
     )
 
     RasterAsset = get_catalog_port().raster_asset_orm_class()
@@ -476,10 +466,6 @@ async def regenerate_vrt_endpoint(
     db.add(generation)
     await db.flush()
 
-    # Capture pre-mutation values so the orphan guard rollback can restore
-    # them if Procrastinate is unreachable.
-    previous_status = vrt_asset.status
-    previous_generation_id = vrt_asset.current_generation_id
     vrt_asset.status = "regenerating"
     vrt_asset.current_generation_id = generation.id
 
@@ -502,15 +488,11 @@ async def regenerate_vrt_endpoint(
             triggered_by=str(user.id),
         )
 
-    # The VrtGeneration row was already committed via db.flush + db.commit
-    # above; rollback marks it failed and reverts vrt_asset to its
-    # pre-mutation values (captured before that commit).
-    rollback = make_vrt_regeneration_failed_rollback(
-        vrt_asset,
-        generation,
-        job,
-        previous_status=previous_status,
-        previous_generation_id=previous_generation_id,
+    # The VrtGeneration row was already committed above. Failing the job
+    # fails that generation too, and restores the asset by the rule the
+    # cancel and the stale sweep use.
+    rollback = make_ingest_job_failed_rollback(
+        job, message_prefix="Failed to queue VRT regeneration"
     )
     await defer_with_orphan_guard(_defer, rollback=rollback, db=db, job=job)
 

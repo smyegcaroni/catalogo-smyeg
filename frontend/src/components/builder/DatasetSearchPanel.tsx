@@ -34,6 +34,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { RecordTypeBadge } from '@/components/search/RecordTypeBadge';
 import { getGeometryTypeLabel } from '@/i18n/labels';
 import { formatNumber } from '@/lib/format';
+import { recordTypeCapabilities } from '@/lib/record-types';
 import { cn } from '@/lib/utils';
 import type {
   MapLayerResponse,
@@ -62,7 +63,7 @@ function tabRecordType(tab: DatasetSearchTab): string {
 }
 
 function isRasterRecord(recordType: RecordType | undefined) {
-  return recordType === 'raster_dataset' || recordType === 'vrt_dataset';
+  return recordTypeCapabilities(recordType).tileToken === 'raster';
 }
 
 // i18n: was hardcoded English ('Raster'/'Table'/'Vector') plus the raw
@@ -72,6 +73,7 @@ function typeMeta(record: OGCRecordResponse, t: TFunction<'builder'>) {
   const recordType = props.record_type ?? 'vector_dataset';
   if (isRasterRecord(recordType)) return t('search.raster', { defaultValue: 'Raster' });
   if (recordType === 'table') return t('search.table', { defaultValue: 'Table' });
+  if (!recordTypeCapabilities(recordType).featureTable) return null;
   if (props.geometry_type) return getGeometryTypeLabel(t, props.geometry_type);
   return t('search.vector', { defaultValue: 'Vector' });
 }
@@ -112,7 +114,11 @@ function DatasetPreview({ record }: { record: OGCRecordResponse }) {
   // useQuicklook solves the Bearer-JWT mismatch: apiFetchBlob attaches the
   // Authorization header, returning a blob URL instead of an anonymous <img src>.
   const enableQuicklook = !isTable && Boolean(props.has_quicklook);
-  const { url: quicklookBlobUrl } = useQuicklook(enableQuicklook ? (record.id as string) : null, 256);
+  const { url: quicklookBlobUrl } = useQuicklook(
+    enableQuicklook ? (record.id as string) : null,
+    256,
+    props.quicklook_version ?? null,
+  );
 
   if (quicklookBlobUrl) {
     return (
@@ -190,6 +196,7 @@ const DraggableDatasetRow = memo(function DraggableDatasetRow({
   const props = record.properties;
   const rowId = `dataset:${record.id}`;
   const recordType = props.record_type ?? 'vector_dataset';
+  const addable = recordTypeCapabilities(recordType).mapLayerType !== null;
   const meta = featureMeta(record, t);
 
   const { attributes, listeners, setActivatorNodeRef, setNodeRef, isDragging } = useDraggable({
@@ -200,6 +207,7 @@ const DraggableDatasetRow = memo(function DraggableDatasetRow({
       recordType,
       name: props.title ?? 'Dataset',
     },
+    disabled: !addable,
   });
 
   return (
@@ -261,7 +269,7 @@ const DraggableDatasetRow = memo(function DraggableDatasetRow({
             {meta && <span className="truncate text-xs text-muted-foreground">{meta}</span>}
           </div>
         </div>
-        {renderDatasetAction(record)}
+        {addable && renderDatasetAction(record)}
       </div>
       {expanded && (
         <div className="flex gap-3 border-t border-border/60 p-2">
@@ -271,7 +279,7 @@ const DraggableDatasetRow = memo(function DraggableDatasetRow({
             {props.description && (
               <p className="line-clamp-2 text-xs leading-snug text-muted-foreground">{props.description}</p>
             )}
-            <div className="flex justify-end">{renderDatasetAction(record, true)}</div>
+            {addable && <div className="flex justify-end">{renderDatasetAction(record, true)}</div>}
           </div>
         </div>
       )}

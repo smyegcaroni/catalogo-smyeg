@@ -17,10 +17,13 @@ from sqlalchemy.orm import joinedload
 
 from app.core.db.sqlstate import TABLE_ABSENT, sqlstate
 from app.core.identity import Identity
-from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
+from app.core.record_types import RASTER_FAMILY_RECORD_TYPES, capabilities
+from app.core.pointcloud import POINTCLOUD_ASSET_KEY
+from app.core.tiles3d import TILESET_ASSET_KEY
 from app.modules.catalog.authorization import (
     apply_visibility_filter,
     can_view_dataset_provenance,
+    visible_vrt_source_counts,
 )
 from app.modules.catalog.datasets.domain._sql_safety import (
     SAFE_TABLE_NAME_RE,
@@ -39,6 +42,8 @@ logger = structlog.stdlib.get_logger(__name__)
 
 __all__ = [
     "get_dataset",
+    "get_tileset_href",
+    "get_pointcloud_pointer",
     "list_datasets",
     "get_datasets_list",
     "get_dataset_detail",
@@ -54,6 +59,24 @@ async def get_dataset(session: AsyncSession, dataset_id: uuid.UUID) -> Dataset |
         .where(Dataset.id == dataset_id)
     )
     return result.scalar_one_or_none()
+
+
+def _carrier(rows: list[Any], key: str) -> Any | None:
+    """The internal pointer row with *key* among a dataset's asset rows."""
+    return next((row for row in rows if row.key == key), None)
+
+
+async def get_tileset_href(session: AsyncSession, dataset_id: uuid.UUID) -> str | None:
+    """The logical key of a tileset's live tileset.json, or None; never published."""
+    rows = await get_catalog_port().get_dataset_assets(session, dataset_id)
+    carrier = _carrier(rows, TILESET_ASSET_KEY)
+    return None if carrier is None else carrier.href
+
+
+async def get_pointcloud_pointer(session: AsyncSession, dataset_id: uuid.UUID) -> Any:
+    """A point cloud's live pointer row, naming its file and size, or None; never published."""
+    rows = await get_catalog_port().get_dataset_assets(session, dataset_id)
+    return _carrier(rows, POINTCLOUD_ASSET_KEY)
 
 
 async def list_datasets(
@@ -138,16 +161,7 @@ async def get_datasets_list(
         for d in datasets
         if getattr(d.record, "record_type", None) == "vrt_dataset"
     ]
-    source_counts: dict[str, int] = {}
-    if vrt_ids:
-        sc_result = await db.execute(
-            text(
-                "SELECT vrt_dataset_id, COUNT(*) AS cnt FROM catalog.vrt_source_links WHERE vrt_dataset_id = ANY(:ids) GROUP BY vrt_dataset_id"
-            ),
-            {"ids": [str(v) for v in vrt_ids]},
-        )
-        for row in sc_result.all():
-            source_counts[row.vrt_dataset_id] = row.cnt
+    source_counts = await visible_vrt_source_counts(db, vrt_ids, user, user_roles)
 
     # One visibility query for the page, not one per row.
     from app.modules.catalog.authorization import visible_lineage_summaries
@@ -162,7 +176,7 @@ async def get_datasets_list(
             actors_by_id=actors_by_id,
             raster_asset=raster_assets_by_dataset_id.get(d.id),
             is_admin=is_admin,
-            source_count=source_counts.get(str(d.id)),
+            source_count=source_counts.get(d.id),
             base_url=base_url,
             lineage_summary=lineage[d.record_id],
             # Per-row — the page can mix the caller's own
@@ -197,6 +211,9 @@ async def get_dataset_detail(
         dataset_to_response,
     )
     from app.modules.catalog.datasets.domain.schemas import StacAsset
+    from app.modules.catalog.datasets.domain.service_previous_version import (
+        previous_version_summary,
+    )
 
     if dataset is None:
         dataset = await get_dataset(db, dataset_id)
@@ -208,7 +225,7 @@ async def get_dataset_detail(
         [dataset.record.created_by, dataset.record.updated_by],
     )
 
-    # Fetch RasterAsset, vrt_source_links count, and DatasetAsset rows
+    # Fetch RasterAsset, the VRT member count, and DatasetAsset rows
     # sequentially on the caller's own session through CatalogPort so catalog
     # does not import processing-owned raster ORM classes directly.
     #
@@ -225,17 +242,21 @@ async def get_dataset_detail(
     if needs_raster:
         raster_asset = await get_catalog_port().get_raster_asset(db, dataset.id)
 
+    if user_roles is None:
+        from app.modules.catalog.authorization import get_user_roles
+
+        user_roles = await get_user_roles(db, user) if user is not None else set()
+    is_admin = "admin" in user_roles
+
     source_count = None
     if needs_vrt_count:
-        sc_result = await db.execute(
-            text(
-                "SELECT COUNT(*) FROM catalog.vrt_source_links WHERE vrt_dataset_id = :id"
-            ),
-            {"id": str(dataset.id)},
-        )
-        source_count = sc_result.scalar()
+        source_count = (
+            await visible_vrt_source_counts(db, [dataset.id], user, user_roles)
+        )[dataset.id]
 
     dataset_asset_rows = await get_catalog_port().get_dataset_assets(db, dataset.id)
+    tileset_asset = _carrier(dataset_asset_rows, TILESET_ASSET_KEY)
+    pointcloud_asset = _carrier(dataset_asset_rows, POINTCLOUD_ASSET_KEY)
     stac_assets_dict = {}
     for da in dataset_asset_rows:
         # Apply the asset allowlist before exposing href, filename, or size.
@@ -250,12 +271,6 @@ async def get_dataset_detail(
             size_bytes=da.size_bytes,
         )
 
-    if user_roles is None:
-        from app.modules.catalog.authorization import get_user_roles
-
-        user_roles = await get_user_roles(db, user) if user is not None else set()
-    is_admin = "admin" in user_roles
-
     from app.modules.catalog.authorization import (
         visible_derived_from,
         visible_lineage_summary,
@@ -266,6 +281,8 @@ async def get_dataset_detail(
         collections=collections_data,
         actors_by_id=actors_by_id,
         raster_asset=raster_asset,
+        tileset_asset=tileset_asset,
+        pointcloud_asset=pointcloud_asset,
         is_admin=is_admin,
         source_count=source_count,
         base_url=base_url,
@@ -290,6 +307,8 @@ async def get_dataset_detail(
         response.has_generic_geometry = await dataset_geom_is_generic(
             db, dataset.table_name
         )
+    if response is not None and capabilities(record_type).feature_table:
+        response.previous_version = await previous_version_summary(db, dataset)
     return response
 
 
@@ -403,13 +422,13 @@ async def get_dataset_rows(
 
         next_cursor = rows[-1]["gid"] if rows and len(rows) == limit else None
     except DBAPIError as exc:
-        # Only an absent backing table degrades to an empty page, as for raster/VRT
-        # synthetic table names. Operational failures must reach the 503 handler.
+        # Only an absent backing table degrades to an empty page. Operational
+        # failures must reach the 503 handler.
         if sqlstate(exc) not in TABLE_ABSENT:
             raise
         await db.rollback()  # transaction aborted; read-only, so safe
         # A missing schema reports 42P01 too, so the code alone
-        # can't tell a synthetic raster table from a never-provisioned
+        # can't tell an absent table from a never-provisioned
         # tenant schema. Only the second is drift and must not read as empty.
         if not await schema_exists(db, _schema):
             logger.error("Data schema %s does not exist", _schema)

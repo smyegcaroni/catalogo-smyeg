@@ -1,5 +1,7 @@
 import { act } from 'react';
-import { render, screen } from '@/test/test-utils';
+import { fireEvent, render, screen, waitFor, within } from '@/test/test-utils';
+
+const statusTexts = () => screen.queryAllByRole('status').map((node) => node.textContent);
 import { SearchPage } from '@/pages/SearchPage';
 import { useSearchResults, useMapSearchResults } from '@/components/search/hooks/use-search';
 import { useSearchStore } from '@/stores/search-store';
@@ -32,8 +34,8 @@ vi.mock('@/components/search/SavedSearches', () => ({
 }));
 
 vi.mock('@/components/search/FilterPanel', () => ({
-  FilterPanel: ({ totalResults }: { totalResults: number | undefined }) => (
-    <div data-testid="filter-panel">{totalResults ?? 'none'}</div>
+  FilterPanel: ({ totalResults, allTypesTotal }: { totalResults: number | undefined; allTypesTotal?: number }) => (
+    <div data-testid="filter-panel" data-all-total={allTypesTotal ?? 'none'}>{totalResults ?? 'none'}</div>
   ),
 }));
 
@@ -181,6 +183,150 @@ describe('SearchPage', () => {
     });
   });
 
+  it('mounts the live region empty, then announces the count and the refetch', async () => {
+    setAnonymousUser();
+    const base = {
+      data: {
+        type: 'FeatureCollection',
+        numberMatched: 12,
+        numberReturned: 2,
+        features: [makeFeature('dataset-1', 'California Watersheds'), makeFeature('dataset-2', 'Road Centerlines')],
+      },
+      isLoading: false,
+      error: null,
+    };
+    mockUseSearchResults.mockReturnValue({ ...base, isFetching: false } as ReturnType<typeof useSearchResults>);
+    const { rerender } = render(<SearchPage />, { route: '/' });
+    // Cached data is present on the first render; the region must still start empty.
+    expect(statusTexts()).not.toContain('12 catalog results');
+    await waitFor(() => expect(statusTexts()).toContain('12 catalog results'));
+
+    mockUseSearchResults.mockReturnValue({ ...base, isFetching: true } as ReturnType<typeof useSearchResults>);
+    rerender(<SearchPage />);
+    await waitFor(() => expect(statusTexts()).toContain('Updating results...'));
+  });
+
+  describe('live status for empty responses', () => {
+    const populated = {
+      type: 'FeatureCollection',
+      numberMatched: 12,
+      numberReturned: 2,
+      features: [makeFeature('dataset-1', 'California Watersheds'), makeFeature('dataset-2', 'Road Centerlines')],
+    };
+    const empty = { type: 'FeatureCollection', numberMatched: 0, numberReturned: 0, features: [] as OGCRecordResponse[] };
+    const setResults = (data: object, isFetching: boolean) =>
+      mockUseSearchResults.mockReturnValue({
+        data, isLoading: false, error: null, isFetching,
+      } as unknown as ReturnType<typeof useSearchResults>);
+
+    it('announces an empty result after a populated one', async () => {
+      setAnonymousUser();
+      setResults(populated, false);
+      const { rerender } = render(<SearchPage />, { route: '/' });
+      setResults(populated, true);
+      rerender(<SearchPage />);
+      setResults(empty, false);
+      rerender(<SearchPage />);
+      await waitFor(() => expect(statusTexts()).toContain('No catalog results found'));
+    });
+
+    it('re-announces when a different cached search has the same count', async () => {
+      setAnonymousUser();
+      setResults(populated, false);
+      render(<SearchPage />, { route: '/' });
+      await waitFor(() => expect(statusTexts()).toContain('12 catalog results'));
+
+      act(() => {
+        useSearchStore.getState().setQuery('other');
+      });
+      expect(statusTexts()).not.toContain('12 catalog results');
+      await waitFor(() => expect(statusTexts()).toContain('12 catalog results'));
+    });
+
+    it('announces both the catalog and map counts when each matched', async () => {
+      setAnonymousUser();
+      act(() => {
+        useSearchStore.getState().setQuery('Matterhorn');
+      });
+      setResults(populated, false);
+      mockUseMapSearchResults.mockReturnValue({
+        data: { maps: [{ id: 'm1', name: 'Alps' }], total: 2 },
+        isLoading: false, isFetching: false, error: null,
+      } as unknown as ReturnType<typeof useMapSearchResults>);
+      render(<SearchPage />, { route: '/' });
+      await waitFor(() =>
+        expect(statusTexts()).toContain('12 catalog results, 2 matching maps'),
+      );
+    });
+
+    it('announces the map count when the catalog query failed with no cache', async () => {
+      setAnonymousUser();
+      act(() => {
+        useSearchStore.getState().setQuery('Matterhorn');
+      });
+      mockUseSearchResults.mockReturnValue({
+        data: undefined, isLoading: false, error: new Error('Catalog unreachable'), isFetching: false,
+      } as unknown as ReturnType<typeof useSearchResults>);
+      mockUseMapSearchResults.mockReturnValue({
+        data: { maps: [{ id: 'm1', name: 'Alps' }], total: 2 },
+        isLoading: false, isFetching: false, error: null,
+      } as unknown as ReturnType<typeof useMapSearchResults>);
+      render(<SearchPage />, { route: '/' });
+      await waitFor(() => expect(statusTexts()).toContain('2 matching maps'));
+    });
+
+    it('carries the empty outcome in exactly one live region', async () => {
+      setAnonymousUser();
+      act(() => {
+        useSearchStore.getState().setQuery('Matterhorn');
+      });
+      setResults(empty, false);
+      render(<SearchPage />, { route: '/' });
+      await waitFor(() => expect(statusTexts()).toContain('No catalog results found'));
+      // Let any second announcer finish filling before counting.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(statusTexts().filter((text) => text?.includes('No catalog results found'))).toHaveLength(1);
+    });
+
+    it('still announces after a second empty search', async () => {
+      setAnonymousUser();
+      setResults(empty, false);
+      const { rerender } = render(<SearchPage />, { route: '/' });
+      await waitFor(() => expect(statusTexts()).toContain('No catalog results found'));
+      setResults(empty, true);
+      rerender(<SearchPage />);
+      await waitFor(() => expect(statusTexts()).toContain('Updating results...'));
+      setResults(empty, false);
+      rerender(<SearchPage />);
+      await waitFor(() => expect(statusTexts()).toContain('No catalog results found'));
+    });
+
+    it('announces the total map matches, not the page size', async () => {
+      setAnonymousUser();
+      act(() => {
+        useSearchStore.getState().setQuery('Matterhorn');
+      });
+      setResults(empty, false);
+      mockUseMapSearchResults.mockReturnValue({
+        data: { maps: [{ id: 'm1', name: 'Alps' }, { id: 'm2', name: 'Alps 2' }], total: 10 },
+        isLoading: false, isFetching: false, error: null,
+      } as unknown as ReturnType<typeof useMapSearchResults>);
+      render(<SearchPage />, { route: '/' });
+      await waitFor(() =>
+        expect(statusTexts()).toContain('No catalog results found. 10 matching maps'),
+      );
+    });
+  });
+
+  it('lists the results as a list of items', () => {
+    setAnonymousUser();
+    render(<SearchPage />, { route: '/' });
+
+    const list = screen.getByRole('region', { name: 'Search results' }).querySelector('ul');
+    expect(list).not.toBeNull();
+    expect(within(list as HTMLElement).getAllByRole('listitem')).toHaveLength(2);
+  });
+
   it('renders skeletons while loading with no cached data', () => {
     setAnonymousUser();
     mockUseSearchResults.mockReturnValue({
@@ -193,7 +339,7 @@ describe('SearchPage', () => {
     render(<SearchPage />, { route: '/' });
 
     // The skeleton container is announced via role=status / aria-live
-    expect(screen.getByRole('status')).toBeInTheDocument();
+    expect(screen.getAllByRole('status').length).toBeGreaterThan(0);
     expect(screen.getAllByTestId('dataset-card-skeleton').length).toBeGreaterThan(0);
     // No results or error visible yet
     expect(screen.queryByTestId('search-result-card')).not.toBeInTheDocument();
@@ -238,10 +384,47 @@ describe('SearchPage', () => {
     expect(screen.queryByTestId('dataset-card-skeleton')).not.toBeInTheDocument();
   });
 
+  it('passes the all-types total of a typed response to the filter panel as the All count', () => {
+    setAnonymousUser();
+    mockUseSearchResults.mockReturnValue({
+      data: {
+        type: 'FeatureCollection',
+        numberMatched: 3,
+        numberMatchedAllTypes: 5,
+        numberReturned: 0,
+        features: [] as OGCRecordResponse[],
+      },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    } as unknown as ReturnType<typeof useSearchResults>);
+
+    render(<SearchPage />, { route: '/' });
+
+    expect(screen.getAllByTestId('filter-panel')[0]).toHaveAttribute('data-all-total', '5');
+  });
+
+  it('passes a loaded zero total to the filter panel as the All count', () => {
+    setAnonymousUser();
+    mockUseSearchResults.mockReturnValue({
+      data: { type: 'FeatureCollection', numberMatched: 0, numberReturned: 0, features: [] as OGCRecordResponse[] },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    } as unknown as ReturnType<typeof useSearchResults>);
+
+    render(<SearchPage />, { route: '/' });
+
+    expect(screen.getAllByTestId('filter-panel')[0]).toHaveAttribute('data-all-total', '0');
+  });
+
   // fix(#430 codex r4): a query matching maps but zero datasets must show the
   // map cards WITHOUT the contradictory dataset empty state below them.
   it('map-only match renders map cards and suppresses the empty state', () => {
     setAnonymousUser();
+    act(() => {
+      useSearchStore.getState().setQuery('Matterhorn');
+    });
     mockUseSearchResults.mockReturnValue({
       data: {
         type: 'FeatureCollection',
@@ -260,9 +443,61 @@ describe('SearchPage', () => {
     render(<SearchPage />, { route: '/' });
 
     expect(screen.getByTestId('map-card')).toBeInTheDocument();
-    // Neither empty-state branch renders: no onboarding (the pre-fix branch
-    // for this scenario) and no "no results" state.
     expect(screen.queryByText(/your catalog is empty/i)).not.toBeInTheDocument();
-    expect(screen.queryByText(/no results found/i)).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /no catalog results found/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /clear search & filters/i })).toBeInTheDocument();
+  });
+
+  it('keeps the no-results state hidden while map text matches are loading', () => {
+    setAnonymousUser();
+    act(() => {
+      useSearchStore.getState().setQuery('Matterhorn');
+    });
+    mockUseSearchResults.mockReturnValue({
+      data: {
+        type: 'FeatureCollection',
+        numberMatched: 0,
+        numberReturned: 0,
+        features: [] as OGCRecordResponse[],
+      },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    } as unknown as ReturnType<typeof useSearchResults>);
+    mockUseMapSearchResults.mockReturnValue({
+      data: undefined,
+      isLoading: true,
+      isFetching: true,
+      error: null,
+    } as unknown as ReturnType<typeof useMapSearchResults>);
+
+    render(<SearchPage />, { route: '/' });
+
+    expect(screen.getByText('Maps matching "Matterhorn"')).toBeInTheDocument();
+    expect(screen.getByText(/map matches use the search text only/i)).toBeInTheDocument();
+    expect(screen.getByText(/loading map matches/i)).toBeInTheDocument();
+    expect(screen.queryByText(/no catalog results found/i)).not.toBeInTheDocument();
+  });
+
+  it('shows a retryable map error separately from catalog results', () => {
+    setAnonymousUser();
+    const refetchMaps = vi.fn();
+    act(() => {
+      useSearchStore.getState().setQuery('Matterhorn');
+    });
+    mockUseMapSearchResults.mockReturnValue({
+      data: { maps: [], total: 0 },
+      isLoading: false,
+      isFetching: false,
+      error: new Error('Maps unreachable'),
+      refetch: refetchMaps,
+    } as unknown as ReturnType<typeof useMapSearchResults>);
+
+    render(<SearchPage />, { route: '/' });
+
+    expect(screen.getByRole('alert')).toHaveTextContent("Couldn't load map matches.");
+    fireEvent.click(screen.getByRole('button', { name: /retry map search/i }));
+    expect(refetchMaps).toHaveBeenCalledOnce();
+    expect(screen.getByRole('heading', { name: '12 catalog results' })).toBeInTheDocument();
   });
 });

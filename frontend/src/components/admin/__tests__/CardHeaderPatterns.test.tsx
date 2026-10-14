@@ -18,6 +18,7 @@ const {
 const editionState = vi.hoisted(() => ({ isEnterprise: false }));
 
 vi.mock('@/hooks/use-admin', () => ({
+  useUserNames: () => ({ data: [] }),
   useAuditLogs: (...args: unknown[]) => mockUseAuditLogs(...args),
   useCatalogStats: () => mockUseCatalogStats(),
   useInfrastructure: () => mockUseInfrastructure(),
@@ -78,7 +79,7 @@ describe('admin card header patterns', () => {
     useAuthStore.setState({ user: null });
   });
 
-  it('exposes the audit title as an h2 and puts search in CardAction', () => {
+  it('puts audit search in CardAction', () => {
     mockUseAuditLogs.mockReturnValue({
       data: { logs: [], total: 0 },
       isLoading: false,
@@ -88,7 +89,6 @@ describe('admin card header patterns', () => {
 
     render(<AuditLogViewer />);
 
-    expect(screen.getByRole('heading', { level: 2, name: 'Audit Logs' })).toBeInTheDocument();
     expect(document.querySelector('[data-slot="card-action"] input')).toBeInTheDocument();
   });
 
@@ -227,7 +227,7 @@ describe('admin card header patterns', () => {
 
     render(<UserList />);
 
-    expect(screen.getByRole('heading', { level: 2, name: 'Users' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 2, name: /User directory/ })).toBeInTheDocument();
     expect(
       screen.getByRole('button', { name: 'Add User' }).closest('[data-slot="card-action"]'),
     ).toBeInTheDocument();

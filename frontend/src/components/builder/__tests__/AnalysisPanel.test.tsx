@@ -4,8 +4,10 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { TerraDraw } from 'terra-draw';
 import { render } from '@/test/test-utils';
 import { AnalysisPanel } from '../AnalysisPanel';
+import { isAnalysableLayer } from '../analysis-eligibility';
 import { ApiError } from '@/api/client';
 import { materializeAnalysis, previewAnalysis } from '@/api/analysis';
+import { useDataset } from '@/components/dataset/hooks/use-dataset';
 import { useAnalysisFormStore } from '@/stores/analysis-form-store';
 import { useAnalysisAddedStore, useAnalysisJobStore } from '@/stores/analysis-job-store';
 import { useAuthStore } from '@/stores/auth-store';
@@ -142,23 +144,57 @@ const SHARED_COLUMNS = [
 // columns cannot express it — ds1 is the source and already carries a
 // join_zone (routine, since it is what an earlier spatial join leaves behind),
 // while ds2 is the join layer offering a plain `zone`.
+// Typed columns for the layer filter tests. `retyped-ds` is a re-upload that
+// turned `seen` into text after the map loaded it as a date.
+const FILTER_TEST_COLUMNS: Record<string, { name: string; type: string }[]> = {
+  'typed-ds': [
+    { name: 'seen', type: 'date' },
+    { name: 'props', type: 'json' },
+    { name: 'tags', type: 'ARRAY' },
+  ],
+  'retyped-ds': [{ name: 'seen', type: 'text' }],
+};
+const refetchFailedColumns = vi.fn();
+
 vi.mock('@/components/dataset/hooks/use-dataset', () => ({
-  useDataset: vi.fn((datasetId?: string) => ({
-    data: {
-      column_info:
-        datasetId === 'ds1'
-          ? [
-              ...SHARED_COLUMNS,
-              { name: 'join_zone', type: 'text' },
-              // fix(#1097 review): 63 chars — what `join_` + LONG_JOIN_FIELD
-              // becomes once PostgreSQL truncates it. The untruncated alias
-              // does not match this, so a picker comparing untruncated names
-              // offers the field and the server refuses it.
-              { name: `join_${'q'.repeat(58)}`.slice(0, 63), type: 'text' },
-            ]
-          : SHARED_COLUMNS,
-    },
-  })),
+  useDataset: vi.fn((datasetId?: string) => {
+    const seen = { column_info: [{ name: 'seen', type: 'date' }] };
+    if (datasetId === 'loading-ds') {
+      return { data: undefined, isSuccess: false, isError: false, fetchStatus: 'fetching' };
+    }
+    // Offline: the refetch waits, and the cached columns may predate a re-upload.
+    if (datasetId === 'paused-ds') {
+      return { data: seen, isSuccess: true, isError: false, fetchStatus: 'paused' };
+    }
+    if (datasetId === 'refetch-failed-ds') {
+      return {
+        data: seen,
+        isSuccess: false,
+        isError: true,
+        fetchStatus: 'idle',
+        refetch: refetchFailedColumns,
+      };
+    }
+    const columns =
+      FILTER_TEST_COLUMNS[datasetId ?? ''] ??
+      (datasetId === 'ds1'
+        ? [
+            ...SHARED_COLUMNS,
+            { name: 'join_zone', type: 'text' },
+            // fix(#1097 review): 63 chars — what `join_` + LONG_JOIN_FIELD
+            // becomes once PostgreSQL truncates it. The untruncated alias
+            // does not match this, so a picker comparing untruncated names
+            // offers the field and the server refuses it.
+            { name: `join_${'q'.repeat(58)}`.slice(0, 63), type: 'text' },
+          ]
+        : SHARED_COLUMNS);
+    return {
+      data: { column_info: columns },
+      isSuccess: true,
+      isError: false,
+      fetchStatus: 'idle',
+    };
+  }),
 }));
 
 const datasetLayer = {
@@ -273,12 +309,336 @@ describe('AnalysisPanel', () => {
     useAnalysisAddedStore.setState({ addedDatasetIds: [], pendingAddIds: [] });
   });
 
+  describe('layer filters', () => {
+    // What the structured filter editor writes for "mag >= 5 and kind != x".
+    const editorFilter = [
+      'all',
+      ['>=', ['to-number', ['get', 'mag'], -1_000_000_000_000], 5],
+      ['!=', ['get', 'kind'], 'x'],
+    ];
+    const cql2 = {
+      op: 'and',
+      args: [
+        { op: '>=', args: [{ property: 'mag' }, 5] },
+        {
+          op: 'or',
+          args: [
+            { op: 'isNull', args: [{ property: 'kind' }] },
+            { op: '<>', args: [{ property: 'kind' }, 'x'] },
+          ],
+        },
+      ],
+    };
+    const filteredLayer = { ...datasetLayer, filter: editorFilter } as unknown as MapLayerResponse;
+
+    beforeEach(() => {
+      vi.mocked(previewAnalysis).mockClear();
+      vi.mocked(materializeAnalysis).mockClear();
+    });
+
+    it("sends the source layer's filter with a preview", async () => {
+      renderPanel([filteredLayer]);
+      expect(
+        screen.getByText("Analysis uses only the features this layer's filter shows."),
+      ).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+
+      await waitFor(() =>
+        expect(previewAnalysis).toHaveBeenCalledWith(
+          'ds1',
+          { operation: 'buffer', distance_meters: 500, filter: cql2 },
+          expect.any(AbortSignal),
+        ),
+      );
+    });
+
+    it("sends the source layer's filter when creating a dataset", async () => {
+      renderPanel([filteredLayer]);
+      fireEvent.change(screen.getByLabelText('New dataset name'), {
+        target: { value: 'Big quakes' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Create dataset' }));
+
+      await waitFor(() =>
+        expect(materializeAnalysis).toHaveBeenCalledWith('ds1', {
+          operation: 'buffer',
+          title: 'Big quakes',
+          distance_meters: 500,
+          filter: cql2,
+        }),
+      );
+    });
+
+    it('sends the mask layer filter with a layer mask', async () => {
+      const user = userEvent.setup();
+      const mask = {
+        ...datasetLayer,
+        id: 'm1',
+        dataset_id: 'mask-ds',
+        dataset_name: 'Districts',
+        filter: ['==', ['get', 'name'], 'North'],
+      } as unknown as MapLayerResponse;
+      renderPanel([datasetLayer, mask]);
+
+      await user.click(screen.getAllByRole('combobox')[1]);
+      await user.click(await screen.findByRole('option', { name: 'Clip' }));
+      await user.click(screen.getByRole('combobox', { name: 'Or clip to a layer' }));
+      await user.click(await screen.findByRole('option', { name: 'Districts' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+
+      await waitFor(() =>
+        expect(previewAnalysis).toHaveBeenCalledWith(
+          'ds1',
+          {
+            operation: 'clip',
+            mask_dataset_id: 'mask-ds',
+            mask_filter: { op: '=', args: [{ property: 'name' }, 'North'] },
+          },
+          expect.any(AbortSignal),
+        ),
+      );
+    });
+
+    it('sends a date filter as a typed date literal', async () => {
+      renderPanel([
+        {
+          ...datasetLayer,
+          dataset_id: 'typed-ds',
+          filter: ['==', ['get', 'seen'], '2024-02-01'],
+        } as unknown as MapLayerResponse,
+      ]);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+
+      await waitFor(() =>
+        expect(previewAnalysis).toHaveBeenCalledWith(
+          'typed-ds',
+          {
+            operation: 'buffer',
+            distance_meters: 500,
+            filter: { op: '=', args: [{ property: 'seen' }, { date: '2024-02-01' }] },
+          },
+          expect.any(AbortSignal),
+        ),
+      );
+    });
+
+    it("types the filter from the dataset's current columns, not the map's copy", async () => {
+      renderPanel([
+        {
+          ...datasetLayer,
+          dataset_id: 'retyped-ds',
+          dataset_column_info: [{ name: 'seen', type: 'date' }],
+          filter: ['==', ['get', 'seen'], '2024-02-01'],
+        } as unknown as MapLayerResponse,
+      ]);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+
+      await waitFor(() =>
+        expect(previewAnalysis).toHaveBeenCalledWith(
+          'retyped-ds',
+          {
+            operation: 'buffer',
+            distance_meters: 500,
+            filter: { op: '=', args: [{ property: 'seen' }, '2024-02-01'] },
+          },
+          expect.any(AbortSignal),
+        ),
+      );
+    });
+
+    it("refetches a filtered layer's columns on focus", () => {
+      renderPanel([filteredLayer]);
+
+      expect(useDataset).toHaveBeenCalledWith(
+        'ds1',
+        expect.objectContaining({ staleTime: 0, refetchOnWindowFocus: true }),
+      );
+    });
+
+    it("holds a filtered run until the dataset's columns arrive", () => {
+      renderPanel([
+        {
+          ...datasetLayer,
+          dataset_id: 'loading-ds',
+          dataset_column_info: [{ name: 'seen', type: 'date' }],
+          filter: ['==', ['get', 'seen'], '2024-02-01'],
+        } as unknown as MapLayerResponse,
+      ]);
+      fireEvent.change(screen.getByLabelText('New dataset name'), {
+        target: { value: 'Recent' },
+      });
+
+      const reason = "Checking the filtered layer's columns…";
+      const preview = screen.getByRole('button', { name: 'Preview' });
+      expect(preview).toBeDisabled();
+      expect(preview).toHaveAccessibleDescription(reason);
+      const create = screen.getByRole('button', { name: 'Create dataset' });
+      expect(create).toBeDisabled();
+      expect(create).toHaveAccessibleDescription(reason);
+    });
+
+    it("holds a filtered run while refetching the dataset's columns is paused", () => {
+      renderPanel([
+        {
+          ...datasetLayer,
+          dataset_id: 'paused-ds',
+          filter: ['==', ['get', 'seen'], '2024-02-01'],
+        } as unknown as MapLayerResponse,
+      ]);
+
+      expect(screen.getByRole('button', { name: 'Preview' })).toBeDisabled();
+    });
+
+    it("holds a filtered run when refetching the dataset's columns failed, and offers a retry", () => {
+      refetchFailedColumns.mockClear();
+      renderPanel([
+        {
+          ...datasetLayer,
+          dataset_id: 'refetch-failed-ds',
+          filter: ['==', ['get', 'seen'], '2024-02-01'],
+        } as unknown as MapLayerResponse,
+      ]);
+      fireEvent.change(screen.getByLabelText('New dataset name'), {
+        target: { value: 'Recent' },
+      });
+
+      const reason =
+        "Couldn't load a filtered layer's columns, so its filter can't be checked yet.";
+      const preview = screen.getByRole('button', { name: 'Preview' });
+      expect(preview).toBeDisabled();
+      expect(preview).toHaveAccessibleDescription(reason);
+      expect(screen.getByRole('button', { name: 'Create dataset' })).toHaveAccessibleDescription(
+        reason,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+      expect(refetchFailedColumns).toHaveBeenCalledTimes(1);
+    });
+
+    it('blocks a run whose layer filter reads a json column', () => {
+      renderPanel([
+        {
+          ...datasetLayer,
+          dataset_id: 'typed-ds',
+          filter: ['has', 'props'],
+        } as unknown as MapLayerResponse,
+      ]);
+
+      const preview = screen.getByRole('button', { name: 'Preview' });
+      expect(preview).toBeDisabled();
+      expect(preview).toHaveAccessibleDescription(
+        "A layer's filter uses an expression analysis can't apply. Simplify it in the layer's filter settings, or remove it.",
+      );
+      expect(screen.queryByText(/this layer's filter shows/)).not.toBeInTheDocument();
+    });
+
+    it('blocks a run whose mask layer filter reads an array column', async () => {
+      const user = userEvent.setup();
+      const mask = {
+        ...datasetLayer,
+        id: 'm1',
+        dataset_id: 'typed-ds',
+        dataset_name: 'Districts',
+        filter: ['has', 'tags'],
+      } as unknown as MapLayerResponse;
+      renderPanel([datasetLayer, mask]);
+
+      await user.click(screen.getAllByRole('combobox')[1]);
+      await user.click(await screen.findByRole('option', { name: 'Clip' }));
+      await user.click(screen.getByRole('combobox', { name: 'Or clip to a layer' }));
+      await user.click(await screen.findByRole('option', { name: 'Districts' }));
+
+      expect(screen.getByRole('button', { name: 'Preview' })).toBeDisabled();
+      expect(
+        screen.getByText(
+          "A layer's filter uses an expression analysis can't apply. Simplify it in the layer's filter settings, or remove it.",
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it('blocks a run whose layer filter analysis cannot apply', () => {
+      renderPanel([
+        {
+          ...datasetLayer,
+          filter: ['match', ['get', 'kind'], ['a', 'b'], true, false],
+        } as unknown as MapLayerResponse,
+      ]);
+
+      const preview = screen.getByRole('button', { name: 'Preview' });
+      expect(preview).toBeDisabled();
+      expect(preview).toHaveAccessibleDescription(
+        "A layer's filter uses an expression analysis can't apply. Simplify it in the layer's filter settings, or remove it.",
+      );
+    });
+
+    it('sends no filter and shows no note for an unfiltered layer', () => {
+      renderPanel([{ ...datasetLayer, filter: null } as unknown as MapLayerResponse]);
+      expect(screen.queryByText(/this layer's filter shows/)).not.toBeInTheDocument();
+    });
+
+    it("clears the panel's preview when a layer's filter changes", () => {
+      const onClearPreview = vi.fn();
+      const qc = new QueryClient();
+      const panel = (layer: MapLayerResponse) => (
+        <QueryClientProvider client={qc}>
+          <AnalysisPanel
+            layers={[layer]}
+            previewSource="analysis-panel"
+            onClearPreview={onClearPreview}
+          />
+        </QueryClientProvider>
+      );
+      const { rerender } = render(panel(filteredLayer));
+      onClearPreview.mockClear();
+
+      rerender(panel({ ...datasetLayer, filter: ['==', ['get', 'kind'], 'y'] } as unknown as MapLayerResponse));
+
+      expect(onClearPreview).toHaveBeenCalled();
+    });
+
+    it('clears the preview when a filter becomes one analysis cannot apply', () => {
+      const onClearPreview = vi.fn();
+      const qc = new QueryClient();
+      const panel = (layer: MapLayerResponse) => (
+        <QueryClientProvider client={qc}>
+          <AnalysisPanel
+            layers={[layer]}
+            previewSource="analysis-panel"
+            onClearPreview={onClearPreview}
+          />
+        </QueryClientProvider>
+      );
+      const { rerender } = render(panel({ ...datasetLayer, filter: null } as unknown as MapLayerResponse));
+      onClearPreview.mockClear();
+
+      rerender(
+        panel({
+          ...datasetLayer,
+          filter: ['match', ['get', 'kind'], 'a', true, false],
+        } as unknown as MapLayerResponse),
+      );
+
+      expect(onClearPreview).toHaveBeenCalled();
+    });
+  });
+
+  it('does not offer a folder group, which copies its first child dataset', () => {
+    const folderGroup = { ...datasetLayer, id: 'g1', display_name: 'Hazards', layer_type: 'group:folder' } as unknown as MapLayerResponse;
+    renderPanel([folderGroup]);
+    expect(screen.getByText('Add a vector dataset layer to use analysis tools. Raster layers are not supported.')).toBeInTheDocument();
+    expect(isAnalysableLayer(folderGroup)).toBe(false);
+    expect(isAnalysableLayer(datasetLayer)).toBe(true);
+  });
+
   it('treats a raster-only map as having no analysable layers (#720)', () => {
     renderPanel([rasterLayer, groupLayer]);
     // Was: a fully enabled form with the raster pre-selected, whose Preview
     // 422'd into a generic "The submitted values are invalid." toast.
     expect(
-      screen.getByText('Add a dataset layer to use analysis tools'),
+      screen.getByText('Add a vector dataset layer to use analysis tools. Raster layers are not supported.'),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole('button', { name: 'Preview' }),
@@ -296,7 +656,7 @@ describe('AnalysisPanel', () => {
   it('excludes a raster that reports a geometry type (#720 review)', () => {
     renderPanel([rasterLayerWithGeometryType, groupLayer]);
     expect(
-      screen.getByText('Add a dataset layer to use analysis tools'),
+      screen.getByText('Add a vector dataset layer to use analysis tools. Raster layers are not supported.'),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole('button', { name: 'Preview' }),
@@ -306,7 +666,7 @@ describe('AnalysisPanel', () => {
   it('excludes a raster carrying the default vector layer_type (#720 review)', () => {
     renderPanel([rasterLayerWithVectorLayerType, groupLayer]);
     expect(
-      screen.getByText('Add a dataset layer to use analysis tools'),
+      screen.getByText('Add a vector dataset layer to use analysis tools. Raster layers are not supported.'),
     ).toBeInTheDocument();
   });
 
@@ -344,7 +704,7 @@ describe('AnalysisPanel', () => {
   it('shows a hint when no dataset layers are available', () => {
     renderPanel([groupLayer]);
     expect(
-      screen.getByText('Add a dataset layer to use analysis tools'),
+      screen.getByText('Add a vector dataset layer to use analysis tools. Raster layers are not supported.'),
     ).toBeInTheDocument();
   });
 

@@ -11,6 +11,7 @@ from httpx import AsyncClient
 from sqlalchemy import text
 
 from app.modules.catalog.datasets.domain.models import Dataset, Record
+from app.modules.catalog.features.schemas import TILE_CACHE_VERSION_HEADER
 
 from tests.factories import create_raster_dataset, get_user_id
 
@@ -26,18 +27,21 @@ async def _create_test_table_and_dataset(
     created_by: uuid.UUID,
     table_name: str | None = None,
     geometry_type: str = "POINT",
+    pg_geometry_type: str | None = None,
     visibility: str = "public",
     srid: int = 4326,
 ) -> Dataset:
     """Create a PostGIS data table and register it as a dataset.
 
     Returns the Dataset record. The table has geom, geom_4326, name, and
-    status columns.
+    status columns. ``pg_geometry_type`` overrides the geom column's own
+    PostGIS typmod (e.g. ``PointM``) when it must differ from the dataset's
+    plain, chk_datasets_geometry_type-satisfying ``geometry_type``.
     """
     if table_name is None:
         table_name = f"test_crud_{uuid.uuid4().hex[:8]}"
 
-    pg_geom_type = geometry_type.title().replace(" ", "")
+    pg_geom_type = pg_geometry_type or geometry_type.title().replace(" ", "")
 
     await session.execute(
         text(
@@ -258,6 +262,11 @@ POINT_GEOJSON = {
 POINT_GEOJSON_2 = {
     "type": "Point",
     "coordinates": [-118.2437, 34.0522],
+}
+
+LINESTRING_GEOJSON = {
+    "type": "LineString",
+    "coordinates": [[-73.99, 40.74], [-73.98, 40.75]],
 }
 
 POLYGON_GEOJSON = {
@@ -527,7 +536,7 @@ class TestDeleteFeature:
         admin_auth_header: dict,
         test_layer: Dataset,
     ):
-        """Insert then DELETE. Assert 204. GET confirms 404."""
+        """Insert then DELETE. Assert 204 with the bumped tile version header. GET confirms 404."""
         # Insert
         create_resp = await client.post(
             f"/datasets/{test_layer.id}/features/",
@@ -539,6 +548,7 @@ class TestDeleteFeature:
         )
         assert create_resp.status_code == 201
         gid = create_resp.json()["id"]
+        created_version = create_resp.json()["tile_cache_version"]
 
         # Delete
         resp = await client.delete(
@@ -546,6 +556,11 @@ class TestDeleteFeature:
             headers=admin_auth_header,
         )
         assert resp.status_code == 204
+        # The tile routes' `_v` freshness check needs the version THIS write
+        # committed, so a stale API worker can be told to re-read the
+        # dataset instead of serving its own cached snapshot. A 204 has no
+        # body to carry it in, so it rides a response header instead.
+        assert int(resp.headers[TILE_CACHE_VERSION_HEADER]) == created_version + 1
 
         # Confirm gone
         get_resp = await client.get(
@@ -1064,6 +1079,207 @@ class TestRasterDatasetFeatureGuard:
         )
         assert resp.status_code == 404, resp.text
         assert "raster collection" in resp.json()["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Measured (M) layer guard tests
+# ---------------------------------------------------------------------------
+
+_MEASURED_LAYER_ERROR = (
+    "This layer stores measure (M) values, which GeoJSON can't carry, so "
+    "its geometry can't be edited here. Edit the source file and upload "
+    "it again."
+)
+
+_MEASURED_CASES = [
+    pytest.param("PointM", "POINT", "POINT M (-73.9857 40.7484 5)", id="pointm"),
+    pytest.param(
+        "LineStringZM",
+        "LINESTRING",
+        "LINESTRING ZM (-73.99 40.74 10 1, -73.98 40.75 20 2)",
+        id="linestringzm",
+    ),
+]
+
+# Each payload matches its layer's declared type, so without the guard the
+# write passes the app's own type check and fails in PostGIS (22023).
+_GEOJSON_BY_MEASURED_TYPE = {"POINT": POINT_GEOJSON, "LINESTRING": LINESTRING_GEOJSON}
+
+
+class TestMeasuredLayerFeatureGuard:
+    """A layer whose geom column declares M refuses a GeoJSON geometry write.
+
+    GeoJSON has no measure ordinate, so ST_GeomFromGeoJSON always comes out
+    XY/XYZ; writing that into an M-typed column fails on the typmod. The
+    write functions refuse up front with a readable message instead of
+    surfacing that as a generic PostGIS fault.
+    """
+
+    async def _seeded_layer(
+        self, session, pg_geometry_type: str, dataset_geometry_type: str, wkt: str
+    ) -> tuple[Dataset, int]:
+        admin_id = await get_user_id(session, "admin")
+        dataset = await _create_test_table_and_dataset(
+            session,
+            created_by=admin_id,
+            geometry_type=dataset_geometry_type,
+            pg_geometry_type=pg_geometry_type,
+        )
+        gid = await session.scalar(
+            text(
+                f"INSERT INTO data.{dataset.table_name} (geom, name) "
+                "VALUES (ST_GeomFromText(:wkt, 4326), 'seed') RETURNING gid"
+            ),
+            {"wkt": wkt},
+        )
+        await session.commit()
+        return dataset, gid
+
+    async def _assert_unchanged(self, session, dataset: Dataset, gid: int, wkt: str):
+        row = (
+            await session.execute(
+                text(
+                    f"SELECT name, ST_AsText(geom) AS wkt "
+                    f"FROM data.{dataset.table_name} WHERE gid = :gid"
+                ),
+                {"gid": gid},
+            )
+        ).one()
+        expected_wkt = await session.scalar(
+            text("SELECT ST_AsText(ST_GeomFromText(:wkt, 4326))"), {"wkt": wkt}
+        )
+        assert row.name == "seed"
+        assert row.wkt == expected_wkt
+
+    async def _cleanup(self, session, dataset: Dataset) -> None:
+        await _cleanup_table(session, dataset.table_name)
+        await session.execute(
+            text("DELETE FROM catalog.records WHERE id = :id"),
+            {"id": dataset.record_id},
+        )
+        await session.commit()
+
+    @pytest.mark.parametrize(
+        ("pg_geometry_type", "dataset_geometry_type", "wkt"), _MEASURED_CASES
+    )
+    async def test_insert_on_a_measured_layer_is_refused(
+        self,
+        client: AsyncClient,
+        test_db_session,
+        admin_auth_header: dict,
+        pg_geometry_type: str,
+        dataset_geometry_type: str,
+        wkt: str,
+    ):
+        """POST on an empty measured layer is refused; the table stays empty."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_test_table_and_dataset(
+            test_db_session,
+            created_by=admin_id,
+            geometry_type=dataset_geometry_type,
+            pg_geometry_type=pg_geometry_type,
+        )
+        try:
+            resp = await client.post(
+                f"/datasets/{dataset.id}/features/",
+                json={
+                    "geometry": _GEOJSON_BY_MEASURED_TYPE[dataset_geometry_type],
+                    "properties": {"name": "x"},
+                },
+                headers=admin_auth_header,
+            )
+
+            assert resp.status_code == 400, resp.text
+            assert resp.json()["detail"] == _MEASURED_LAYER_ERROR
+            count = await test_db_session.scalar(
+                text(f"SELECT count(*) FROM data.{dataset.table_name}")
+            )
+            assert count == 0
+        finally:
+            await self._cleanup(test_db_session, dataset)
+
+    @pytest.mark.parametrize(
+        ("pg_geometry_type", "dataset_geometry_type", "wkt"), _MEASURED_CASES
+    )
+    async def test_replace_on_a_measured_layer_is_refused(
+        self,
+        client: AsyncClient,
+        test_db_session,
+        admin_auth_header: dict,
+        pg_geometry_type: str,
+        dataset_geometry_type: str,
+        wkt: str,
+    ):
+        """PUT on a measured layer is refused; the seeded row is unchanged."""
+        dataset, gid = await self._seeded_layer(
+            test_db_session, pg_geometry_type, dataset_geometry_type, wkt
+        )
+        try:
+            resp = await client.put(
+                f"/datasets/{dataset.id}/features/{gid}",
+                json={
+                    "geometry": _GEOJSON_BY_MEASURED_TYPE[dataset_geometry_type],
+                    "properties": {"name": "replaced"},
+                },
+                headers=admin_auth_header,
+            )
+
+            assert resp.status_code == 400, resp.text
+            assert resp.json()["detail"] == _MEASURED_LAYER_ERROR
+            await self._assert_unchanged(test_db_session, dataset, gid, wkt)
+        finally:
+            await self._cleanup(test_db_session, dataset)
+
+    @pytest.mark.parametrize(
+        ("pg_geometry_type", "dataset_geometry_type", "wkt"), _MEASURED_CASES
+    )
+    async def test_update_geometry_on_a_measured_layer_is_refused(
+        self,
+        client: AsyncClient,
+        test_db_session,
+        admin_auth_header: dict,
+        pg_geometry_type: str,
+        dataset_geometry_type: str,
+        wkt: str,
+    ):
+        """PATCH with a geometry on a measured layer is refused, row unchanged."""
+        dataset, gid = await self._seeded_layer(
+            test_db_session, pg_geometry_type, dataset_geometry_type, wkt
+        )
+        try:
+            resp = await client.patch(
+                f"/datasets/{dataset.id}/features/{gid}",
+                json={"geometry": _GEOJSON_BY_MEASURED_TYPE[dataset_geometry_type]},
+                headers=admin_auth_header,
+            )
+
+            assert resp.status_code == 400, resp.text
+            assert resp.json()["detail"] == _MEASURED_LAYER_ERROR
+            await self._assert_unchanged(test_db_session, dataset, gid, wkt)
+        finally:
+            await self._cleanup(test_db_session, dataset)
+
+    async def test_attribute_only_update_on_a_measured_layer_succeeds(
+        self,
+        client: AsyncClient,
+        test_db_session,
+        admin_auth_header: dict,
+    ):
+        """A PATCH carrying no geometry still works on a measured layer."""
+        dataset, gid = await self._seeded_layer(
+            test_db_session, "PointM", "POINT", "POINT M (-73.9857 40.7484 5)"
+        )
+        try:
+            resp = await client.patch(
+                f"/datasets/{dataset.id}/features/{gid}",
+                json={"properties": {"name": "updated"}},
+                headers=admin_auth_header,
+            )
+
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["properties"]["name"] == "updated"
+        finally:
+            await self._cleanup(test_db_session, dataset)
 
 
 class TestCreateEmptyDatasetGenericGeometry:

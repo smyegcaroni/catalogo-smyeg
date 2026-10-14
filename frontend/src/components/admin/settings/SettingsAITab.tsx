@@ -7,22 +7,33 @@ import { toast } from 'sonner';
 import { Switch } from '@/components/ui/switch';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Separator } from '@/components/ui/separator';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { Badge } from '@/components/ui/badge';
 import { SettingSourceBadge } from './SettingSourceBadge';
 import { findSetting } from './utils';
-import { useSettingsForm } from './useSettingsForm';
+import { useSettingsForm, type ResetHandler } from './useSettingsForm';
 import { useApiKeyStatus } from '@/hooks/use-settings';
 import {
   useEmbeddingStats,
   useBackfillEmbeddings,
   useBackfillJobStatus,
-  useUpdateSemanticSearch,
 } from '@/hooks/use-admin';
 import { usePermissions } from '@/hooks/use-permissions';
 import { useAIStatusReader } from '@/hooks/use-ai-status-reader';
+import { useEdition } from '@/hooks/use-edition';
 import { detectEmbeddingDims } from '@/api/settings';
 import type { SettingItem } from '@/api/settings';
 import { probeAIStatus } from '@/api/admin';
@@ -31,9 +42,10 @@ import type { AIProbeCheck, AIProbeReport } from '@/types/api';
 interface TabProps {
   settings: SettingItem[];
   envOnly: boolean;
-  onSave: (changes: Record<string, unknown>) => void;
-  onReset: (key: string) => void;
+  onSave: (changes: Record<string, unknown>) => void | Promise<boolean>;
+  onReset: ResetHandler;
   isSaving: boolean;
+  settingsUpdatedAt?: number;
   saveFailed?: boolean;
   onDirtyChange?: (dirty: boolean) => void;
 }
@@ -41,6 +53,7 @@ interface TabProps {
 const AI_FIELDS = [
   { key: 'ai_enabled', defaultValue: true },
   { key: 'ai_send_sample_values', defaultValue: true },
+  { key: 'semantic_search_enabled', defaultValue: false },
   { key: 'max_ai_tokens_per_user_per_day', defaultValue: 0 },
   { key: 'llm_provider', defaultValue: 'anthropic' },
   { key: 'llm_model', defaultValue: '' },
@@ -50,13 +63,18 @@ const AI_FIELDS = [
   { key: 'embedding_dims', defaultValue: '0', coerce: String },
 ] as const;
 
-export function SettingsAITab({ settings, envOnly, onSave, onReset, isSaving, saveFailed, onDirtyChange }: TabProps) {
+export function SettingsAITab({ settings, envOnly, onSave, onReset: submitReset, isSaving, settingsUpdatedAt, saveFailed, onDirtyChange }: TabProps) {
   const { t } = useTranslation('admin');
   const { can } = usePermissions();
   const canManageUsers = can('manage_users');
   // fix(#653): the #652 inline gate moved into the shared useAIStatusReader
   // hook so ai-status surfaces can't drift from require_ai_status_reader again.
   const canProbe = useAIStatusReader();
+  // The regeneration after a width or model change asks for every tenant, which
+  // takes the same mode permission: manage_tenants when hosted, manage_users
+  // otherwise.
+  const canRegenerateAfterChange = canProbe;
+  const { isMultiTenant } = useEdition();
   const { data: keyStatus } = useApiKeyStatus();
   // Coverage/backfill are manage_users operations in BOTH tenancy modes
   // (see /admin/embedding-stats + /admin/backfill-embeddings) — deliberately
@@ -76,9 +94,8 @@ export function SettingsAITab({ settings, envOnly, onSave, onReset, isSaving, sa
     backfillJob.data?.status === 'pending' ||
     backfillJob.data?.status === 'running' ||
     Boolean(embeddingStats?.current_run);
-  const semanticToggle = useUpdateSemanticSearch();
 
-  const { values, setters, dirty, hasDirty, discard } = useSettingsForm(settings, AI_FIELDS, isSaving, saveFailed);
+  const { values, setters, dirty, hasDirty, discard, onReset } = useSettingsForm(settings, AI_FIELDS, isSaving, settingsUpdatedAt, saveFailed, submitReset);
   const [isDetecting, setIsDetecting] = useState(false);
   const [isProbing, setIsProbing] = useState(false);
   const [probe, setProbe] = useState<AIProbeReport | null>(null);
@@ -99,13 +116,7 @@ export function SettingsAITab({ settings, envOnly, onSave, onReset, isSaving, sa
   const embeddingModel = values.embedding_model as string;
   const embeddingBaseUrl = values.embedding_base_url as string;
   const embeddingDims = values.embedding_dims as string;
-  const semanticSearchEnabled = Boolean(
-    findSetting(settings, 'semantic_search_enabled')?.value,
-  );
-
-  const handleSemanticToggle = (checked: boolean) => {
-    semanticToggle.mutate(checked);
-  };
+  const semanticSearchEnabled = Boolean(values.semantic_search_enabled);
 
   const handleBackfill = (force = false) => {
     if (!canManageUsers) return;
@@ -114,14 +125,116 @@ export function SettingsAITab({ settings, envOnly, onSave, onReset, isSaving, sa
     // the 600s edge timeout. There are no counts to report yet.
     // fix(#1550 review P2): keep the job id so the run is actually tracked to
     // its end, rather than acknowledged and forgotten.
-    backfill.mutate(force, {
+    backfill.mutate({ force }, {
       onSuccess: (data) => {
         setBackfillJobId(data.job_id);
+        setRegenPending(null);
         toast.info(t('ai.backfillQueued'));
       },
     });
   };
 
+  const savedDims = findSetting(settings, 'embedding_dims')?.value;
+  const widthEdited = savedDims !== undefined && String(embeddingDims) !== String(savedDims);
+  const widthChangeWipesEmbeddings =
+    Boolean(embeddingStats && embeddingStats.embedded_records > 0) && widthEdited;
+  const [regenerate, setRegenerate] = useState(true);
+  const [regenPending, setRegenPending] = useState<'queue' | 'ai' | null>(null);
+  const [missedTenants, setMissedTenants] = useState(0);
+  const [pending, setPending] = useState<
+    { kind: 'save'; changes: Record<string, unknown> } | { kind: 'reset'; key: string } | null
+  >(null);
+
+  const handleSave = (changes: Record<string, unknown>) => {
+    if ('embedding_dims' in changes || 'embedding_model' in changes) {
+      setRegenerate(true);
+      setPending({ kind: 'save', changes });
+      return;
+    }
+    onSave(changes);
+  };
+
+  const handleReset = (key: string) => {
+    if (key === 'embedding_dims' || key === 'embedding_model') {
+      setRegenerate(true);
+      setPending({ kind: 'reset', key });
+      return;
+    }
+    onReset(key);
+  };
+
+  // A save can toggle AI in the same request; a reset never does.
+  const aiEnabledAfter = (change: NonNullable<typeof pending>) => {
+    const next = change.kind === 'save' ? change.changes.ai_enabled : undefined;
+    return next === undefined ? findSetting(settings, 'ai_enabled')?.value !== false : next !== false;
+  };
+
+  const confirmEmbeddingChange = async () => {
+    if (!pending) return;
+    const current = pending;
+    const queueAfter = regenerate && canRegenerateAfterChange;
+    const aiOff = !aiEnabledAfter(current);
+    setPending(null);
+    const saved = current.kind === 'save' ? await onSave(current.changes) : await onReset(current.key);
+    if (saved === false || !queueAfter) return;
+    // With AI off the backfill skips every record yet finishes as a success,
+    // so queuing it would clear the warning and leave search empty.
+    if (aiOff) {
+      setRegenPending('ai');
+      return;
+    }
+    // The save already succeeded; a run that cannot start leaves the
+    // embeddings to regenerate by hand.
+    queueRegeneration();
+  };
+
+  // The width and model are shared by every tenant of a hosted deployment, so
+  // there the run covers all of them.
+  const queueRegeneration = () => {
+    backfill.mutate({ force: false, allTenants: isMultiTenant }, {
+      onSuccess: (data) => {
+        // A run that was already in flight started before this change, so it
+        // does not regenerate for it; ask for a rerun. Reading another user's
+        // job takes manage_users, so follow it only with that permission.
+        if (data.status === 'already_running') {
+          if (canManageUsers && data.job_id) setBackfillJobId(data.job_id);
+          setRegenPending('queue');
+        } else {
+          setBackfillJobId(data.job_id);
+          setRegenPending(null);
+          toast.info(t('ai.backfillQueued'));
+        }
+        setMissedTenants((data.other_tenants ?? []).filter((run) => run.status !== 'pending').length);
+      },
+      onError: () => setRegenPending('queue'),
+    });
+  };
+
+  const retryRegenerationButton = (
+    <Button
+      size="sm"
+      variant="outline"
+      onClick={queueRegeneration}
+      disabled={backfill.isPending || findSetting(settings, 'ai_enabled')?.value === false}
+    >
+      {backfill.isPending && <Loader2 className="me-1.5 h-3 w-3 animate-spin" />}
+      {t('common:actions.retry')}
+    </Button>
+  );
+
+  const dimsSetting = findSetting(settings, 'embedding_dims');
+  // The backend rebuilds against live storage, which may have moved since this
+  // page loaded, so the dialog always opens; only its wording softens.
+  const resetKeepsWidth =
+    pending?.kind === 'reset' &&
+    pending.key === 'embedding_dims' &&
+    dimsSetting?.default_value !== undefined &&
+    dimsSetting.default_value !== null &&
+    String(dimsSetting.default_value) === String(dimsSetting.value);
+  const autoRegenerate = regenerate && canRegenerateAfterChange && pending !== null && aiEnabledAfter(pending);
+  const pendingChangesWidth =
+    pending !== null &&
+    (pending.kind === 'save' ? 'embedding_dims' in pending.changes : pending.key === 'embedding_dims');
   const handleDetectDims = async () => {
     setIsDetecting(true);
     try {
@@ -316,8 +429,8 @@ export function SettingsAITab({ settings, envOnly, onSave, onReset, isSaving, sa
             <Switch
               id="semantic-toggle"
               checked={semanticSearchEnabled}
-              onCheckedChange={handleSemanticToggle}
-              disabled={semanticToggle.isPending}
+              onCheckedChange={setters.semantic_search_enabled}
+              disabled={envOnly}
             />
           </div>
 
@@ -325,7 +438,7 @@ export function SettingsAITab({ settings, envOnly, onSave, onReset, isSaving, sa
           <div className="space-y-2">
             <div className="flex items-center gap-2">
               <Label htmlFor="embedding-model">{t('ai.labels.embeddingModel')}</Label>
-              <SettingSourceBadge source={findSetting(settings, 'embedding_model')?.source ?? 'default'} settingKey="embedding_model" onReset={onReset} />
+              <SettingSourceBadge source={findSetting(settings, 'embedding_model')?.source ?? 'default'} settingKey="embedding_model" onReset={handleReset} />
             </div>
             <Input
               id="embedding-model"
@@ -360,7 +473,7 @@ export function SettingsAITab({ settings, envOnly, onSave, onReset, isSaving, sa
           <div className="space-y-2">
             <div className="flex items-center gap-2">
               <Label htmlFor="embedding-dims">{t('ai.labels.embeddingDims')}</Label>
-              <SettingSourceBadge source={findSetting(settings, 'embedding_dims')?.source ?? 'default'} settingKey="embedding_dims" onReset={onReset} />
+              <SettingSourceBadge source={findSetting(settings, 'embedding_dims')?.source ?? 'default'} settingKey="embedding_dims" onReset={handleReset} />
             </div>
             <div className="flex items-center gap-3">
               <Input
@@ -388,9 +501,7 @@ export function SettingsAITab({ settings, envOnly, onSave, onReset, isSaving, sa
             </div>
             <p className="text-sm text-muted-foreground">{t('ai.embeddingDimsAutoDescription')}</p>
             {/* Dimension change warning when embeddings exist */}
-            {embeddingStats && embeddingStats.embedded_records > 0 &&
-              findSetting(settings, 'embedding_dims') &&
-              String(embeddingDims) !== String(findSetting(settings, 'embedding_dims')!.value) && (
+            {embeddingStats && widthChangeWipesEmbeddings && (
               <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 p-3">
                 <AlertTriangle className="h-4 w-4 text-warning mt-0.5 flex-shrink-0" />
                 <p className="text-sm text-foreground">
@@ -410,6 +521,52 @@ export function SettingsAITab({ settings, envOnly, onSave, onReset, isSaving, sa
               <p className="text-sm text-foreground">
                 {t('ai.openaiKeyRequired')}
               </p>
+            </div>
+          )}
+
+          {regenPending !== null && (
+            <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 p-3 max-w-md">
+              <AlertTriangle className="h-4 w-4 text-warning mt-0.5 flex-shrink-0" />
+              {!canManageUsers && canRegenerateAfterChange ? (
+                // Without manage_users the coverage buttons are hidden, so the
+                // rerun is offered here; it waits for AI to be saved as enabled.
+                <div className="space-y-2">
+                  <p className="text-sm text-foreground">
+                    {t(regenPending === 'ai' ? 'ai.regenerationPendingAiOffRetry' : 'ai.regenerationPendingRetry')}
+                  </p>
+                  {retryRegenerationButton}
+                </div>
+              ) : (
+                <p className="text-sm text-foreground">{t(regenPending === 'ai' ? 'ai.regenerationPendingAiOff' : 'ai.regenerationPending')}</p>
+              )}
+            </div>
+          )}
+
+          {missedTenants > 0 && canRegenerateAfterChange && (
+            // The coverage buttons queue only this tenant, so the fleet rerun
+            // is offered here.
+            <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 p-3 max-w-md">
+              <AlertTriangle className="h-4 w-4 text-warning mt-0.5 flex-shrink-0" />
+              <div className="space-y-2">
+                <p className="text-sm text-foreground">{t('ai.backfillOtherTenantsMissed', { count: missedTenants })}</p>
+                {retryRegenerationButton}
+              </div>
+            </div>
+          )}
+
+          {isMultiTenant && canRegenerateAfterChange && (
+            // The coverage buttons queue only this tenant and need manage_users,
+            // so the fleet-wide run stays available here after a reload.
+            <div className="rounded-lg border p-4 max-w-md space-y-2">
+              <p className="text-sm text-muted-foreground">{t('ai.fleetRegenerateDescription')}</p>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={queueRegeneration}
+                disabled={backfill.isPending || findSetting(settings, 'ai_enabled')?.value === false}
+              >
+                {t('ai.fleetRegenerateAction')}
+              </Button>
             </div>
           )}
 
@@ -441,7 +598,7 @@ export function SettingsAITab({ settings, envOnly, onSave, onReset, isSaving, sa
                     onClick={() => handleBackfill(false)}
                     disabled={backfill.isPending || backfillRunning}
                   >
-                    {backfill.isPending && backfill.variables === false ? (
+                    {backfill.isPending && backfill.variables?.force === false ? (
                       <>
                         <Loader2 className="me-2 h-3 w-3 animate-spin" />
                         {t('ai.generating')}
@@ -462,7 +619,7 @@ export function SettingsAITab({ settings, envOnly, onSave, onReset, isSaving, sa
                     onClick={() => handleBackfill(true)}
                     disabled={backfill.isPending || backfillRunning}
                   >
-                    {backfill.isPending && backfill.variables === true ? (
+                    {backfill.isPending && backfill.variables?.force === true ? (
                       <>
                         <Loader2 className="me-2 h-3 w-3 animate-spin" />
                         {t('ai.generating')}
@@ -578,7 +735,56 @@ export function SettingsAITab({ settings, envOnly, onSave, onReset, isSaving, sa
 
       <Separator />
 
-      <SettingsFormActions dirty={dirty} hasDirty={hasDirty} envOnly={envOnly} isSaving={isSaving} onSave={onSave} onDiscard={discard} onDirtyChange={onDirtyChange} />
+      <SettingsFormActions dirty={dirty} hasDirty={hasDirty} envOnly={envOnly} isSaving={isSaving} onSave={handleSave} onDiscard={discard} onDirtyChange={onDirtyChange} />
+
+      <AlertDialog open={pending !== null} onOpenChange={(open) => { if (!open) setPending(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t(
+                resetKeepsWidth
+                  ? 'ai.dimsConfirm.titleReset'
+                  : pendingChangesWidth
+                    ? 'ai.dimsConfirm.title'
+                    : 'ai.dimsConfirm.titleModel',
+              )}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t(
+                resetKeepsWidth
+                  ? 'ai.dimsConfirm.resetSameWidthDescription'
+                  : pendingChangesWidth
+                    ? `ai.dimsConfirm.description${autoRegenerate ? 'Auto' : ''}`
+                    : pending?.kind === 'reset'
+                      ? `ai.dimsConfirm.resetModelDescription${autoRegenerate ? 'Auto' : ''}`
+                      : `ai.dimsConfirm.modelDescription${autoRegenerate ? 'Auto' : ''}`,
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {canRegenerateAfterChange && pending !== null && aiEnabledAfter(pending) && (
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="regenerate-after-save"
+                checked={regenerate}
+                onCheckedChange={(checked) => setRegenerate(checked === true)}
+              />
+              <Label htmlFor="regenerate-after-save">{t('ai.dimsConfirm.regenerate')}</Label>
+            </div>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('common:cancel')}</AlertDialogCancel>
+            <AlertDialogAction variant={resetKeepsWidth ? 'default' : 'destructive'} onClick={confirmEmbeddingChange}>
+              {t(
+                resetKeepsWidth
+                  ? 'ai.dimsConfirm.confirmReset'
+                  : pendingChangesWidth
+                    ? 'ai.dimsConfirm.confirm'
+                    : 'ai.dimsConfirm.confirmModel',
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

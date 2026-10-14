@@ -5,6 +5,7 @@ Pure dict restructuring -- no database queries.
 
 from __future__ import annotations
 
+from app.core.raster_bands import band_display_name, stac_band_nodata
 from app.standards.ogc.utils import normalize_language_tag
 
 # Conformance class URIs for the GeoLens STAC API
@@ -24,14 +25,40 @@ STAC_LANGUAGE_EXTENSION_URI = (
     "https://stac-extensions.github.io/language/v1.0.0/schema.json"
 )
 
-# STAC extension properties that should be copied from OGC record properties
-_STAC_EXTENSION_PROPS = (
-    "proj:code",
-    "proj:wkt2",
-    "proj:shape",
-    "gsd",
-    "raster:bands",
+# STAC extension properties copied from OGC record properties unchanged
+_STAC_EXTENSION_PROPS = ("proj:shape",)
+
+# The raster extension's band data types. rasterio and Titiler name the complex
+# ones after numpy.
+_DATA_TYPES = frozenset(
+    {
+        *(f"int{bits}" for bits in (8, 16, 32, 64)),
+        *(f"uint{bits}" for bits in (8, 16, 32, 64)),
+        *(f"float{bits}" for bits in (16, 32, 64)),
+        "cint16",
+        "cint32",
+        "cfloat32",
+        "cfloat64",
+    }
 )
+_NUMPY_COMPLEX_TYPES = {
+    "complex_int16": "cint16",
+    "complex64": "cfloat32",
+    "complex128": "cfloat64",
+}
+# band_info's statistics keys, as fetch_cog_info takes them from Titiler, and
+# their names in the raster extension's statistics object.
+_STATISTICS = {
+    "min": "minimum",
+    "max": "maximum",
+    "mean": "mean",
+    "std": "stddev",
+    "valid_percent": "valid_percent",
+}
+
+# The asset holding a raster's data, which its raster:bands describe: the COG,
+# or a manifest VRT.
+_DATA_ASSET_KEYS = ("data", "vrt")
 
 _RTL_LANGS = {"ar", "fa", "he", "ur"}
 
@@ -126,6 +153,55 @@ def _normalize_extension_uris(values: list[str]) -> list[str]:
     return normalized
 
 
+def _stac_data_type(dtype: object) -> str | None:
+    if not isinstance(dtype, str):
+        return None
+    data_type = _NUMPY_COMPLEX_TYPES.get(dtype, dtype)
+    return data_type if data_type in _DATA_TYPES else None
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _stac_bands(band_info: object, dtype: str | None, nodata: str | None) -> list[dict]:
+    """A raster's stored band_info as the raster extension's Band objects.
+
+    Read from band_info rather than the record's bands, which carry neither the
+    statistics a remote COG's bands hold nor its dtype. ``dtype`` and
+    ``nodata`` are the raster's, for bands without their own; a band's own
+    ``nodata`` key wins even when it is None, which local ingest writes for a
+    raster with none. A nodata the extension doesn't allow is left out, and so
+    is a band with no field, since a Band needs one.
+    """
+    stac_bands = []
+    for band in band_info if isinstance(band_info, list) else []:
+        if not isinstance(band, dict):
+            continue
+        stac_band: dict = {}
+        name = band_display_name(band)
+        if name:
+            stac_band["name"] = name
+        data_type = _stac_data_type(band.get("dtype") or dtype)
+        if data_type:
+            stac_band["data_type"] = data_type
+        band_nodata = stac_band_nodata(band.get("nodata", nodata))
+        if band_nodata is not None:
+            stac_band["nodata"] = band_nodata
+        statistics = {
+            stac_key: band[key]
+            for key, stac_key in _STATISTICS.items()
+            if _is_number(band.get(key))
+        }
+        if statistics:
+            stac_band["statistics"] = statistics
+        if band.get("description"):
+            stac_band["description"] = band["description"]
+        if stac_band:
+            stac_bands.append(stac_band)
+    return stac_bands
+
+
 def _projection_code(properties: dict) -> str | None:
     """Return a Projection Extension v2 code, accepting legacy input safely."""
     value = properties.get("proj:code")
@@ -149,6 +225,10 @@ def ogc_record_to_stac_item(
     collection_id: str | None = None,
     stac_api_url: str,
     derived_from_id: str | None = None,
+    crs_metres_per_unit: float | None = None,
+    band_info: list | None = None,
+    dtype: str | None = None,
+    nodata: str | None = None,
 ) -> dict:
     """Transform an OGC Record Feature dict into a STAC 1.0 Item dict.
 
@@ -160,6 +240,15 @@ def ogc_record_to_stac_item(
         Optional STAC collection this item belongs to.
     stac_api_url:
         Base URL for the STAC API (e.g. ``https://host/api/stac``).
+    crs_metres_per_unit:
+        The raster CRS's metres per unit. The record's ``gsd`` is in CRS units
+        and STAC's is in metres, so without this (a geographic or unknown CRS)
+        the item has no ``gsd``.
+    band_info, dtype, nodata:
+        The raster's stored band_info, dtype and nodata, which ``raster:bands``
+        is built from. A band without its own dtype or nodata key takes the
+        raster's. The raster extension defines ``raster:bands`` on assets, so
+        they go on the data asset, and an item without one has none.
     """
     props = record["properties"]
 
@@ -197,13 +286,22 @@ def ogc_record_to_stac_item(
         stac_props["proj:code"] = proj_code
 
     for key in _STAC_EXTENSION_PROPS:
-        if key != "proj:code" and key in props:
+        if key in props:
             stac_props[key] = props[key]
+    if props.get("gsd") is not None and crs_metres_per_unit is not None:
+        stac_props["gsd"] = props["gsd"] * crs_metres_per_unit
 
     if any(key.startswith("proj:") for key in stac_props):
         _append_unique(stac_extensions, STAC_PROJECTION_EXTENSION_URI)
-    if "raster:bands" in stac_props:
+
+    assets = dict(record.get("assets", {}))
+    bands = _stac_bands(band_info, dtype, nodata)
+    data_key = next((key for key in _DATA_ASSET_KEYS if key in assets), None)
+    if bands and data_key is not None:
+        assets[data_key] = {**assets[data_key], "raster:bands": bands}
         _append_unique(stac_extensions, STAC_RASTER_EXTENSION_URI)
+    elif STAC_RASTER_EXTENSION_URI in stac_extensions:
+        stac_extensions.remove(STAC_RASTER_EXTENSION_URI)
 
     # -- Build Item ---------------------------------------------------------
     item: dict = {
@@ -215,7 +313,7 @@ def ogc_record_to_stac_item(
         "links": _build_stac_links(
             record["id"], collection_id, stac_api_url, derived_from_id
         ),
-        "assets": record.get("assets", {}),
+        "assets": assets,
     }
     if record.get("bbox") is not None:
         item["bbox"] = record["bbox"]

@@ -40,6 +40,20 @@ documentation.
 > this 24-hour floor cannot be shortened by changing it. For a tighter RPO,
 > configure [PITR](#optional-point-in-time-recovery-pitr-with-wal-archiving)
 > or use a managed database, where the provider's native PITR applies.
+>
+> **Dump and archive are not one snapshot.** The staging archive is taken after
+> the dump finishes, so staged files can change in between. The dump is
+> authoritative: after a restore, staging objects may lead or lag it by the
+> archive window (dump start to the end of the tar). Three cases follow.
+> A file missing from the archive leaves its dataset or import with a restored
+> state that points at nothing, so audit the restored storage references and
+> re-upload or restore each one. A file replaced in the window keeps its path
+> but holds newer bytes than the dump describes, so re-upload any dataset or
+> import that was being changed around the backup time. A file the catalog no
+> longer references is orphan storage that costs only disk space. Keep it
+> unless you have checked every table that stores paths under the staging
+> volume (datasets, ingest jobs, map thumbnails and map icons). The
+> application's own sweep removes only stale upload files, not every orphan.
 
 ### Automated backups are on by default
 
@@ -225,7 +239,7 @@ aws s3api put-bucket-lifecycle-configuration --bucket <your-bucket> \
 
 **MinIO** — do NOT reach for `mc ilm` here. The `mc ilm rule add` command has
 no abort-incomplete-multipart flag (verified against the `mc` release pinned
-in `docker-compose.yml`, `RELEASE.2025-08-13T08-35-41Z`), and MinIO strips
+in `docker-compose.yml`, `RELEASE.2026-09-16T00-00-00Z`), and MinIO strips
 `AbortIncompleteMultipartUpload` from lifecycle JSON supplied via
 `mc ilm rule import` — the import reports success and the rule silently
 disappears ([minio/minio#19115](https://github.com/minio/minio/issues/19115),
@@ -550,7 +564,13 @@ mandatory post-restore reconciliation reapplies that boundary.
    `data.*` runtime relations. `--clean` drops schema ACLs/default privileges
    and `--no-owner` makes the restore login own every restored relation, so this
    post-restore step is mandatory.
-7. Restarts `api` and `worker` on exit (including on failure — via a trap).
+7. Restarts `api` and `worker` on exit, but only after steps 5 and 6 both
+   succeed. Any nonzero `pg_restore` exit (an error, a killed or interrupted
+   `docker compose exec`, a Docker CLI failure) or a failed reconciliation
+   leaves them stopped and makes the script exit nonzero, because the database
+   has already been `--clean`-dropped and may be only partly restored. Fix the
+   cause and re-run the restore, or restore a different dump, before starting
+   them.
 8. Runs a post-restore row-count check (`catalog.records`, `catalog.datasets`).
 9. Auto-detects any sibling `staging-<timestamp>.tar.gz` next to the dump and
    prints the exact manual object-storage extract command.
@@ -1527,21 +1547,25 @@ GeoLens exports Prometheus metrics out of the box. Reference scrape config, aler
 rules, and a Grafana dashboard ship in [`infra/monitoring/`](infra/monitoring/) —
 point your monitoring stack at them, or use them as a base for an existing one.
 
-**Liveness checks must target `/api/health/live`; `/api/health` is readiness.**
-The two answer different questions and are not interchangeable:
+**Liveness checks must target `/api/health/live`; readiness checks
+`/api/health/ready`.** The three endpoints answer different questions and are
+not interchangeable:
 
 | Probe | Endpoint | Answers | Fails when |
 |---|---|---|---|
 | Liveness | `/api/health/live` | Is the process up and its event loop turning? | The API process is wedged or gone |
-| Readiness | `/api/health` | Did every dependency answer? (JSON `status`, `version`, `build`, per-provider latencies) | The database, object store **or cache** is degraded |
+| Readiness | `/api/health/ready` | Can this process reach the database? | The database is unreachable or its catalog schema is missing |
+| Dependency report | `/api/health` | Did every dependency answer? (JSON `status`, `version`, `build`, per-provider latencies) | The database, object store **or cache** is degraded |
 
 Point an orchestrator's `livenessProbe`, an uptime monitor, and any
 restart-on-failure check at `/api/health/live`. Pointing them at `/api/health`
 restarts a container that is serving catalog reads perfectly well because
 Valkey is down — the cache path is built to survive that, falling back to an
-in-memory cache. Use `/api/health` for a `readinessProbe`, for a load
-balancer's backend check, and for a dashboard, where knowing a dependency is
-degraded is the point.
+in-memory cache. Point a `readinessProbe` at `/api/health/ready`: on
+`/api/health` a cache or object-store outage takes every replica out of
+service at once, although neither is specific to one replica and the API
+serves around the cache. Use `/api/health` for a dashboard or an alert, where
+knowing a dependency is degraded is the point.
 
 Two practical differences on top of that:
 
@@ -1550,11 +1574,15 @@ Two practical differences on top of that:
   its own before any other traffic — and a probe answered `429` reads as a
   dead process. `/api/health/live` is exempt from the limiter: it touches
   nothing.
-- `/api/health/live` is deliberately absent from the OpenAPI schema and the
-  generated SDKs, like the worker's own probes. It is infrastructure surface,
-  not API surface; call it with `curl`, not through a client.
+- `/api/health/live` and `/api/health/ready` are deliberately absent from the
+  OpenAPI schema and the generated SDKs, like the worker's own probes. They
+  are infrastructure surface, not API surface; call them with `curl`, not
+  through a client. `/api/health/ready` falls only under the default
+  per-client rate limit, which a probe interval never nears. In
+  `multi_tenant` mode it resolves the tenant like `/api/health`, so give the
+  probe a trusted `Host` header.
 
-Behind the bundled Nginx both live under `/api/`. A bare `/health` or
+Behind the bundled Nginx all three live under `/api/`. A bare `/health` or
 `/health/live` is not an API route there — the frontend SPA catch-all answers
 it with HTML `200`, which an uptime monitor will happily (and wrongly) accept.
 
@@ -2239,10 +2267,10 @@ their own remediation in the error message; neither is auto-coerced.
 ## 8. Audit log retention
 
 `catalog.audit_logs` has no built-in expiry: every login, dataset mutation,
-share change, and export is a permanent row (see `AGENTS.md`'s Security
-pre-commit checklist and `backend/app/modules/audit/router.py`'s module
-docstring, which already flags that the table can reach millions of rows on a
-busy instance). Community ships bounded CSV/JSON export
+share change, and export is a permanent row (see
+`backend/app/modules/audit/router.py`'s module docstring, which already flags
+that the table can reach millions of rows on a busy instance). Community ships
+bounded CSV/JSON export
 (`GET /admin/audit-logs/export/{format}`, capped at 100,000 rows per request)
 but no automatic pruning — an operator who wants a retention window applies it
 out of band, with `scripts/audit_retention.sh`. That is deliberately an
@@ -2514,17 +2542,19 @@ you are not surprised later by what a restore does and does not contain.
 
 | Upload | Where the data ends up | The uploaded file |
 | --- | --- | --- |
-| Vector (Shapefile, GPKG, GeoJSON, CSV, …) | PostGIS table | **Archived to `originals/`**, and the staging copy deleted |
+| Vector (Shapefile, GPKG, GeoJSON, CSV, …) | PostGIS table | **Archived to `originals/`**, and the staging copy deleted once the archive is written |
+| Vector replace (re-upload onto an existing vector dataset) | The dataset's table is swapped for the new one | **Archived to `originals/`**, and the staging copy deleted once the archive is written |
 | Raster (GeoTIFF) | A Cloud-Optimized GeoTIFF in object storage | Deleted after a **lossless** conversion; archived to `originals/` otherwise |
 | Raster replace (re-upload onto an existing raster dataset) | The dataset's COG is swapped for the new one | Deleted after a **lossless** conversion; archived to `originals/` otherwise |
 
-Vector uploads are archived rather than discarded: after a successful ingest
-the file is copied to `originals/<dataset-id>/<filename>` and only the staging
-copy is removed. That archive is best-effort — if the copy fails the ingest
-still succeeds, because the data is already in PostGIS, and the job records an
-`archive_failed` flag you can see on the admin Jobs page. So treat a vector
-original as present-but-not-guaranteed, and check the flag if you are relying
-on one.
+Vector uploads are archived rather than discarded. After a vector import or
+re-upload publishes, the file is copied to `originals/<dataset-id>/`, under a
+name that starts with an import job's ID and ends with the uploaded filename.
+The staging copy is removed only after the archive is written. If the copy
+fails, the ingest still succeeds, because the data is already in PostGIS.
+GeoLens then keeps the staging copy and retries the archive; [When a vector
+archive fails](#when-a-vector-archive-fails) below covers the schedule and what
+to do.
 
 A raster dataset **is** its COG. When the conversion is lossless the converted
 asset carries everything the upload did, and every re-processing case an
@@ -2600,7 +2630,7 @@ Its lifetime is therefore tied to the dataset, not to a job:
 | --- | --- |
 | The dataset is replaced again with a lossy conversion | The new original is kept alongside it. Every upload with distinct content persists, whatever it is called; re-uploading a byte-identical file rewrites the same object rather than adding a second copy. |
 | The dataset is replaced with a **lossless** conversion | Nothing new is kept. Earlier originals stay — they are still the only copy of what those uploads contained. |
-| The dataset is **deleted** | Removed with it. Deleting a raster dataset clears the whole `originals/<dataset-id>/` prefix. |
+| The dataset is **deleted** | Removed with it. Deleting a raster dataset clears the whole `originals/<dataset-id>/` prefix, and the periodic sweep deletes one a late archive write left behind. |
 | The `ingest_jobs` retention window passes | Nothing. This copy is not a job artifact. |
 
 **It counts against the owner's storage quota.** Every kept original gets its
@@ -2639,6 +2669,12 @@ The practical consequences:
 - Those originals are safe to delete yourself if you accept losing the only
   faithful copy. Nothing in GeoLens reads them; they exist so the choice stays
   yours.
+- The sweep treats an `originals/<uuid>/` prefix with no dataset in this
+  database as left over once its newest object is a day old, and deletes it
+  unless a job can still write it. Don't point two installs at one bucket or
+  storage directory, and expect a database restore to an earlier point to lose
+  the originals of the datasets it discarded. On a versioned bucket those leave
+  a delete marker the restore steps above can undo.
 - If you want the smaller footprint and do not need the original, ingest with a
   lossless compression and no CRS override, and accept the larger COG.
 
@@ -2666,6 +2702,124 @@ Failed uploads are visible on the admin Jobs page with their error message.
 The files themselves live under `staging/<job-id>/` — in the `upload_staging`
 volume on local storage, or under that prefix in your bucket on S3/MinIO.
 
+### When a vector archive fails
+
+Until its archive is confirmed, the staged upload may be the only copy of the
+original, so GeoLens holds on to it. The job's metadata carries
+`archive_pending` from the moment the dataset publishes until the archive is
+confirmed, and `archive_failed` with an `archive_error` message once an
+attempt has failed. To see them, open **Admin > Jobs**, find the import job and
+expand its row: the **User Metadata** block lists `archive_failed` and, for a
+job GeoLens has stopped retrying, `archive_review` (below). `archive_pending`
+and `archive_error` are internal and not shown there; the query below reads
+them from the database.
+
+While either flag is set and the dataset still exists:
+
+- the retention purge keeps the job, however old it is;
+- the retention purge, the object-storage staging reconciliation and the local
+  staging sweep all keep the file the job's `file_path` names.
+
+**Retry schedule.** The stale-job sweep retries the archive. The API runs that
+sweep every five minutes, and it also runs when a worker starts and when an
+administrator calls `POST /api/jobs/cleanup/stale/`. The first retry is due
+five minutes after a failed attempt. The delay then doubles (10, 20, 40, 80 and
+160 minutes) until it reaches four hours, and from then on the archive is
+retried every four hours. There is no attempt limit, so an archive that keeps
+failing is retried for as long as the job holds its upload.
+
+Each retry first compares any object already at the archive key with the
+staged upload. An object of the same size counts as the archive and nothing is
+copied again; an object of any other size is replaced by a fresh copy. When the
+staged upload can't be read, an existing object counts only if no attempt has
+failed, because on a local install a copy that failed in an earlier version
+could leave a truncated object behind. Once the archive is confirmed, the flags
+come off and the staged upload is released: the follow-up deletes it, or the
+retention purge and the staging sweeps do once no job still needs it, as with
+one layer of a multi-layer upload.
+
+Two cases end another way:
+
+- If the dataset was deleted, no archive is owed any more, because deleting a
+  vector dataset clears its `originals/<dataset-id>/` prefix. The job stops
+  holding its upload, a pending retry removes the flags, and the job ages out
+  with retention like any other.
+- If the job names no staged upload, nothing can be archived, and a missing
+  path is not proof that the original was archived either. An archive in
+  storage confirms the job only if no attempt has failed. Otherwise the job
+  keeps its flags, leaves the retry schedule and gets a review reason,
+  described below: `original_missing`, or `archive_unverified` when an object
+  exists but an attempt had failed. If storage can't answer, the job stays on
+  the retry schedule.
+
+**Jobs flagged by earlier versions.** Earlier versions recorded
+`archive_failed` without recording that the archive was still owed, so nothing
+retried those jobs and retention kept their uploads indefinitely. Each sweep now
+looks for complete jobs that ended more than a day ago and have a live dataset,
+an archive flag, no recorded follow-ups and no review reason, and settles each
+one:
+
+- If the staged upload is a local file in the staging directory whose name
+  starts with the job's ID (or, for a layer of a multi-layer upload, its parent
+  job's ID), the archive key is `originals/<dataset-id>/<that file name>`, a
+  name no other upload to that dataset uses. When the file is still there, the
+  archive is owed again and follows the retry schedule above, which replaces a
+  truncated object at the key. When only an archive exists at the key, it is
+  owed again and confirmed if the job's archive never failed.
+- Otherwise the job keeps its flags and its upload. GeoLens writes the reason
+  to `archive_review` in the job's metadata, where the admin Jobs page shows
+  it, and logs `archive_needs_review` once with the job ID, the dataset ID and
+  the reason. The job is not checked again.
+  - `archive_unknown`: the job doesn't show where its original belongs. Every
+    upload staged in object storage lands here: most earlier imports from
+    object storage named the archive after a temporary download that no job
+    records, and a job doesn't show which naming it used. So does a job from
+    before jobs recorded an attempt ID, and one whose archive key storage
+    would refuse, such as a file name containing `..`.
+  - `original_missing`: the archive key is known, but neither the staged
+    upload nor the archive exists. A job that names no staged upload gets this
+    reason too.
+  - `archive_unverified`: an object exists at the archive key, but the staged
+    upload is gone and an earlier archive attempt failed, so GeoLens can't tell
+    whether the object is complete. Compare it with any copy you hold before
+    relying on it.
+- If storage can't answer, the job is left for a later sweep.
+
+To list the jobs still holding an upload:
+
+```bash
+docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
+SELECT id, dataset_id, completed_at, file_path,
+       user_metadata->>'archive_review' AS review,
+       user_metadata->>'archive_error' AS archive_error,
+       user_metadata->'publish_followups'->>'next_attempt_at' AS next_attempt_at
+FROM catalog.ingest_jobs
+WHERE status = 'complete'
+  AND dataset_id IS NOT NULL
+  AND (user_metadata->>'archive_failed' IS NOT NULL
+       OR user_metadata->>'archive_pending' IS NOT NULL)
+ORDER BY completed_at;
+SQL
+```
+
+#### Recovering
+
+1. Read `archive_error` from the query above for the cause, such as a storage
+   credential or a full disk, and fix that first. Jobs on the retry schedule
+   then archive and release themselves on their next due retry. An
+   administrator's `POST /api/jobs/cleanup/stale/`, which also runs the rest of
+   the stale-job cleanup, runs retries that are already due. It does not bring
+   a later one forward, so a job on the four-hour interval can wait up to four
+   hours.
+2. Don't delete a held job's staged upload by hand. Until its archive exists it
+   may be the only copy of what the user uploaded.
+3. A job with an `archive_review` reason is held, with its upload, until an
+   operator acts on it. GeoLens does not retry or release it by itself. To keep
+   the original somewhere safe, copy the file its `file_path` names: in the
+   `upload_staging` volume on local storage, or that key in your bucket on
+   object storage. Deleting the dataset also ends the hold, together with the
+   dataset's data.
+
 ### Interaction with backups
 
 §1's `staging-<timestamp>.tar.gz` archives the `upload_staging` volume. What
@@ -2676,6 +2830,8 @@ that does and does not recover depends on which case put the file there.
 | Failed upload, still inside the retention window | Yes |
 | **Vector original, local storage** | **Yes** — archived under `originals/` in that volume |
 | Vector original, object-storage install | No — in your bucket under `originals/` |
+| Staged upload of a vector archive not yet confirmed, local storage | Yes, still in that volume |
+| Staged upload of a vector archive not yet confirmed, object-storage install | No, it is in your bucket under `staging/<job-id>/` |
 | **Retained original from a lossy ingest, local storage** | **Yes** — it lives under `originals/` inside that same volume |
 | Retained original, object-storage install | No — it is in your bucket under `originals/`, covered by whatever backs up the bucket, not by this tar |
 | Successfully ingested original from a **lossless** conversion | No — deleted before the backup ran |
@@ -2962,6 +3118,34 @@ Downgrading 0061 revokes spent refresh rows before discarding their rotation
 metadata. This prevents an older server from accepting them again until their
 original expiry; current unrotated successors remain usable.
 
+### Backfilling 3D Tiles extents
+
+A 3D Tiles dataset gets its extent from its root bounding volume. Tilesets
+published before GeoLens read `box` and `sphere` volumes have none, so search
+shows "No Extent" and the dataset has no footprint. After upgrading, record
+their extents from each stored `tileset.json`:
+
+```bash
+docker compose exec api /app/.venv/bin/python -m scripts.backfill_tileset_extents --dry-run
+docker compose exec api /app/.venv/bin/python -m scripts.backfill_tileset_extents
+```
+
+The API container's root filesystem is read-only, so `uv run` cannot create its
+cache there; call the baked virtualenv's Python directly, as above.
+Add `-f docker-compose.prod.yml` when that is the file your install runs.
+With `GEOLENS_TENANCY_MODE=multi_tenant`, run both commands once for each
+tenant, adding `--tenant <tenant id>`; without it the script exits 2 before
+reading anything. `SELECT id, slug FROM catalog.tenants;` lists the ids. The
+script reads and writes only 3D Tiles datasets with no extent, so a rerun is
+safe. Backfilled datasets show a new updated time, since each record gains an
+extent. It lists each dataset it updates, skips or fails, with the reason. Only a tileset
+in a local frame is skipped: it has no extent to record. It exits 1 when a
+dataset's tileset pointer or stored `tileset.json` is missing or unreadable.
+When every dataset fails, the API is usually not pointed at the storage that
+holds the tilesets; when one does, that dataset's catalog row or stored files
+are damaged. It exits 2 when it cannot start the way the worker does, for
+example when an overlay the install needs is not loaded.
+
 ## 11. Secret rotation
 
 GeoLens has two independent secrets an operator ever rotates: `JWT_SECRET_KEY`,
@@ -3002,8 +3186,8 @@ docker compose up -d api worker
 # 3. Re-encrypt the stored rows under the new key. The script is
 #    backend/scripts/rotate_secrets.py; the api container's working directory
 #    is the backend, so it is addressed there as a module.
-docker compose exec api uv run python -m scripts.rotate_secrets --dry-run
-docker compose exec api uv run python -m scripts.rotate_secrets
+docker compose exec api /app/.venv/bin/python -m scripts.rotate_secrets --dry-run
+docker compose exec api /app/.venv/bin/python -m scripts.rotate_secrets
 ```
 
 The API can stay up for step 3. The script locks the provider rows for the
@@ -3022,7 +3206,7 @@ Generate a new key, move the current one to `SECRET_ENCRYPTION_KEY_PREVIOUS`,
 put the new one in `SECRET_ENCRYPTION_KEY`, restart, then:
 
 ```bash
-docker compose exec api uv run python -m scripts.rotate_secrets
+docker compose exec api /app/.venv/bin/python -m scripts.rotate_secrets
 ```
 
 Remove `SECRET_ENCRYPTION_KEY_PREVIOUS` from `.env` and restart again. The API

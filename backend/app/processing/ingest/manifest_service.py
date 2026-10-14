@@ -6,7 +6,6 @@ import asyncio
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
@@ -32,18 +31,20 @@ from app.platform.extensions import get_catalog_port, get_processing_port
 from app.platform.extensions.entitlement import enforce_limit
 from app.platform.jobs.defer_guard import (
     defer_with_orphan_guard,
-    make_ingest_job_failed_rollback,
     reset_session_for_settlement,
     settle_ingest_job_failed,
 )
 from app.platform.jobs.sweep import JOB_TIMEOUT_SECONDS
+from app.platform.refresh.service import DatasetBusyError, create_pending_run
 
-from app.platform.jobs.models import IngestJob
+from app.platform.jobs import ledger
+from app.platform.jobs.models import MANIFEST_FINGERPRINT_METADATA_KEY, IngestJob
 from app.processing.ingest.manifest_reservation import (
     RESERVATION_LOST_MESSAGE,
     bind_reservation_to_staged_source,
     downloading_stage_marker,
     expire_stale_manifest_reservations,
+    held_entry,
     latest_in_flight_manifest_job,
     lock_manifest_key,
     release_manifest_reservation,
@@ -65,6 +66,7 @@ from app.processing.ingest.manifest_sources import (
     publication_to_catalog_fields,
     validate_publication_intent,
 )
+from app.processing.ingest.pointcloud import require_pointcloud_file
 from app.processing.ingest.service import queue_ingest_job, validate_file_extension
 
 # fix(#435): batch download writes so a 64 KiB httpx chunk doesn't cost one
@@ -159,6 +161,7 @@ async def _validate_prepared_source(
 ) -> None:
     allowed = await get_allowed_extensions_list(db)
     validate_file_extension(prepared.source_filename, allowed)
+    require_pointcloud_file(None, prepared.source_filename)
 
 
 async def _authorize_prepared_source(
@@ -202,9 +205,19 @@ async def _upload_max_size_bytes(db: AsyncSession) -> int:
     return (await UPLOAD_MAX_SIZE_MB.get(db)) * 1024 * 1024
 
 
+def _owned_staging_path(job_id: uuid.UUID, prepared: ManifestPreparedSource) -> Path:
+    """The staged copy a reservation writes, named for its committed job row.
+
+    The local staging reconciler attributes a ``{job id}_`` file to that row,
+    so a copy left before the reservation bound it is still reclaimable.
+    """
+    return Path(settings.upload_staging_dir) / f"{job_id}_{prepared.source_filename}"
+
+
 async def _download_http_source(
     prepared: ManifestPreparedSource,
     *,
+    job_id: uuid.UUID,
     max_size_bytes: int,
     quota_byte_limit: int | None = None,
 ) -> str:
@@ -213,11 +226,8 @@ async def _download_http_source(
     fix(#1814): a session here would hold a pooled connection for the
     download's length; the caller reads the size ceiling before committing.
     """
-    staging_dir = Path(settings.upload_staging_dir)
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    destination = staging_dir / (
-        f"manifest_{uuid.uuid4().hex}_{prepared.source_filename}"
-    )
+    destination = _owned_staging_path(job_id, prepared)
+    destination.parent.mkdir(parents=True, exist_ok=True)
 
     bytes_seen = 0
     # Rule 2 (AGENTS.md): make_safe_client for per-hop SSRF revalidation on
@@ -316,6 +326,7 @@ async def _download_http_source(
 async def _stage_source_if_needed(
     prepared: ManifestPreparedSource,
     *,
+    job_id: uuid.UUID,
     dry_run: bool,
     max_size_bytes: int,
     quota_byte_limit: int | None = None,
@@ -329,6 +340,7 @@ async def _stage_source_if_needed(
         async with asyncio.timeout(MANIFEST_STAGE_MAX_SECONDS):
             return await _stage_source(
                 prepared,
+                job_id=job_id,
                 dry_run=dry_run,
                 max_size_bytes=max_size_bytes,
                 quota_byte_limit=quota_byte_limit,
@@ -343,6 +355,7 @@ async def _stage_source_if_needed(
 async def _stage_source(
     prepared: ManifestPreparedSource,
     *,
+    job_id: uuid.UUID,
     dry_run: bool,
     max_size_bytes: int,
     quota_byte_limit: int | None = None,
@@ -352,6 +365,7 @@ async def _stage_source(
             return None
         return await _download_http_source(
             prepared,
+            job_id=job_id,
             max_size_bytes=max_size_bytes,
             quota_byte_limit=quota_byte_limit,
         )
@@ -361,9 +375,7 @@ async def _stage_source(
         import shutil
 
         source_path = Path(prepared.file_path)
-        owned_copy = Path(settings.upload_staging_dir) / (
-            f"manifest_{uuid.uuid4().hex}_{prepared.source_filename}"
-        )
+        owned_copy = _owned_staging_path(job_id, prepared)
         try:
             await run_in_thread_draining(shutil.copyfile, source_path, owned_copy)
         except BaseException:
@@ -616,7 +628,7 @@ async def _classify_dataset(
     in_flight = await latest_in_flight_manifest_job(db, dataset.key)
     if in_flight is not None:
         in_flight_fingerprint = (in_flight.user_metadata or {}).get(
-            "manifest_fingerprint"
+            MANIFEST_FINGERPRINT_METADATA_KEY
         )
         if in_flight_fingerprint == fingerprint:
             return "skip_in_flight", prepared, in_flight, None, fingerprint
@@ -626,7 +638,7 @@ async def _classify_dataset(
     if completed is not None:
         completed_job, existing_dataset = completed
         completed_fingerprint = (completed_job.user_metadata or {}).get(
-            "manifest_fingerprint"
+            MANIFEST_FINGERPRINT_METADATA_KEY
         )
         if completed_fingerprint == fingerprint:
             return (
@@ -639,6 +651,46 @@ async def _classify_dataset(
         return "update", prepared, completed_job, existing_dataset, fingerprint
 
     return "create", prepared, None, None, fingerprint
+
+
+async def _admit_refresh_run(
+    db: AsyncSession, job: IngestJob, dataset_id: uuid.UUID, user: Identity
+) -> None:
+    """Take the dataset's one active-run slot for this update.
+
+    Raises ``DatasetBusyError`` while another refresh or re-upload of the
+    dataset is active. ``trigger`` is ``api``, as the refresh endpoints record.
+    """
+    Dataset = get_processing_port().get_dataset_orm_class()
+    dataset = (
+        await db.execute(select(Dataset.feature_count).where(Dataset.id == dataset_id))
+    ).one_or_none()
+    if dataset is None:
+        raise ManifestSourceError(
+            "The dataset this entry updates was deleted while its source was "
+            "being staged."
+        )
+    await create_pending_run(
+        db,
+        dataset_id=dataset_id,
+        origin_kind="upload",
+        trigger="api",
+        triggered_by=user.id,
+        ingest_job_id=job.id,
+        feature_count_before=dataset.feature_count,
+    )
+
+
+async def _fail_unqueued_job(job: IngestJob, exc: BaseException) -> None:
+    """Fail a staged job the queue never took, and the run admitted with it.
+
+    The job ledger fails the run only when the job write lands: a miss means
+    a worker or a cancel owns both rows, and a run the worker claimed must
+    stay its own.
+    """
+    await settle_ingest_job_failed(
+        job, exc, message_prefix="Failed to queue manifest job"
+    )
 
 
 async def _queue_reupload_job(
@@ -665,7 +717,7 @@ async def _queue_reupload_job(
 
     await defer_with_orphan_guard(
         _defer_reupload,
-        rollback=make_ingest_job_failed_rollback(job),
+        rollback=lambda exc: _fail_unqueued_job(job, exc),
         db=db,
         job=job,
     )
@@ -727,18 +779,15 @@ async def _reserve_entry(
     # fix(#1814): `running`, not `pending`. A pending row with no
     # file_path and no queue task is reapable by four actors while its source
     # is still downloading; the fixed lease is not.
-    job = IngestJob(
-        dataset_id=dataset_id,
-        source_filename=prepared.source_filename,
-        file_path=None,
-        source_url=None,
-        source_layer=prepared.source_layer,
+    job = ledger.create(
+        db,
         created_by=user.id,
         status="running",
-        started_at=datetime.now(timezone.utc),
+        dataset_id=dataset_id,
+        source_filename=prepared.source_filename,
+        source_layer=prepared.source_layer,
         user_metadata=metadata,
     )
-    db.add(job)
     try:
         await db.flush()
         await _commit_reservation(db)
@@ -885,9 +934,7 @@ async def _settle_staged_entry(
         if not await release_manifest_reservation(
             db, job, prefixed_failure_reason("Failed to stage manifest source", exc)
         ):
-            await settle_ingest_job_failed(
-                job, exc, message_prefix="Failed to queue manifest job"
-            )
+            await _fail_unqueued_job(job, exc)
         failed = await _settled_failed(db, job_id)
 
     committed = await _settle_under_reset(db, job, _decide_and_settle, job_id=job_id)
@@ -915,6 +962,7 @@ async def _finalize_reserved_entry(
     try:
         file_path = await _stage_source_if_needed(
             prepared,
+            job_id=job.id,
             dry_run=False,
             max_size_bytes=reserved.max_size_bytes,
             quota_byte_limit=reserved.quota_byte_limit,
@@ -945,6 +993,10 @@ async def _finalize_reserved_entry(
                     db, job, file_path=file_path
                 ):
                     raise ManifestSourceError(RESERVATION_LOST_MESSAGE)
+                # After the bind: the job row is locked before the run insert
+                # reaches the dataset row, the order a dataset delete takes.
+                if reserved.dataset_id is not None:
+                    await _admit_refresh_run(db, job, reserved.dataset_id, user)
                 await _commit_staged_bind(db)
         except TimeoutError as exc:
             raise ManifestSourceError(
@@ -999,6 +1051,19 @@ def _error_result(dataset: ManifestDataset, exc: Exception) -> ManifestApplyEntr
     )
 
 
+def _dataset_busy_result(dataset: ManifestDataset) -> ManifestApplyEntryResult:
+    """The other doors' 409 ``dataset_busy``, with the code in ``errors``."""
+    return ManifestApplyEntryResult(
+        dataset_key=dataset.key,
+        action="error",
+        message=(
+            "A refresh is already running for this dataset. Wait for it to "
+            "finish, then apply the manifest again."
+        ),
+        errors=["dataset_busy"],
+    )
+
+
 async def _reserve_or_settle_entry(
     db: AsyncSession,
     request: ManifestApplyRequest,
@@ -1011,6 +1076,8 @@ async def _reserve_or_settle_entry(
     A result answers from what the key holds; a reservation means the caller
     owns it. fix(#1814): every exit commits, so no key lock outlives the entry.
     """
+    from app.modules.catalog.authorization import check_dataset_write_access
+
     (
         classification,
         prepared,
@@ -1038,10 +1105,6 @@ async def _reserve_or_settle_entry(
             # fix(#430): same gate as the update branch below —
             # raises 404/403 into the per-entry error wrapper, so the skip
             # response cannot disclose another user's job/dataset UUIDs.
-            from app.modules.catalog.authorization import (
-                check_dataset_write_access,
-            )
-
             await check_dataset_write_access(
                 db, existing_dataset, existing_dataset.id, user
             )
@@ -1057,14 +1120,15 @@ async def _reserve_or_settle_entry(
 
     update_dataset_id: uuid.UUID | None = None
     if classification == "update" and existing_dataset is not None:
-        # fix(#430): manifest_key is caller-supplied and globally namespaced, so
-        # the gate runs before the dry-run response too, which would otherwise
-        # leak another user's dataset id. Lazy import: PROCESS-02/04.
-        from app.modules.catalog.authorization import check_dataset_write_access
-
+        # manifest_key is caller-supplied and globally namespaced, so the gate
+        # runs before the blocked and dry-run responses, which would otherwise
+        # leak another user's dataset id.
         await check_dataset_write_access(
             db, existing_dataset, existing_dataset.id, user
         )
+        if held := await held_entry(db, dataset, fingerprint, job, existing_dataset):
+            await db.commit()
+            return held
         # Run after authorization (to avoid leaking another user's dataset
         # type) but before dry-run reporting, staging, or queue creation.
         _validate_existing_dataset_update(existing_dataset, prepared)
@@ -1152,6 +1216,9 @@ async def apply_manifest(
             # entry that raised while still holding it.
             await db.rollback()
             results.append(_error_result(dataset, exc))
+        except DatasetBusyError:
+            await db.rollback()
+            results.append(_dataset_busy_result(dataset))
         except Exception as exc:  # broad: per-entry isolation — any unexpected failure is recorded as that entry's error
             await db.rollback()
             results.append(_error_result(dataset, exc))

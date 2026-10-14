@@ -5,7 +5,7 @@ Covers the 8 SAML test scenarios specified in 217-02-PLAN.md task 03:
 - Registration: extension dual-registers under ``identity`` and ``_routers``
 - Metadata: GET /auth/saml/{slug}/metadata returns valid samlmetadata+xml
 - ACS happy path: signed assertion JIT-provisions a user, issues JWTs,
-  redirects to /oauth/callback?source=saml#token=...
+  redirects to /oauth/callback?source=saml#token=...&nonce=<login's nonce>
 - ACS rejects: invalid signature, unsigned, expired, replayed, XSW
 
 The remaining 2 SAML tests (audit-log + role-mapping) land in Plan 03.
@@ -55,6 +55,30 @@ from app.modules.auth.oauth.models import OAuthProvider
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "saml"
 FIXTURE_CERT_PEM = (FIXTURE_DIR / "idp_cert.pem").read_text()
+
+
+def _self_signed_pem() -> str:
+    from datetime import datetime, timedelta, timezone
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "idp.geolens.test")])
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=30))
+        .sign(key, hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode()
 
 
 @pytest.fixture(autouse=True)
@@ -160,6 +184,8 @@ def saml_idp_server(saml_overlay_registered, saml_response_dir):
 FIXTURE_IDP_ENTITY_ID = "https://fixture-idp.geolens.test/idp"
 FIXTURE_SP_ENTITY_ID = "https://geolens.test/auth/saml/fixture"
 FIXTURE_SLUG = "fixture"
+# The value the login page keeps in sessionStorage and sends as ?nonce=.
+SIGN_IN_NONCE = "s" * 43
 FIXTURE_NAMEID = "user@example.com"
 
 
@@ -244,6 +270,7 @@ async def _start_saml_login(
     """Start the public SAML login flow and return request id plus relay state."""
     response = await client.get(
         f"/auth/saml/{FIXTURE_SLUG}/login",
+        params={"nonce": SIGN_IN_NONCE},
         follow_redirects=False,
     )
 
@@ -374,11 +401,14 @@ async def saml_router_mounted(saml_overlay_registered, client):
     initialize edition manually so ``require_enterprise`` returns True
     while this test runs.
     """
-    del client  # Initializes the patched DB/session factory used by the router.
+    # httpx returns Secure cookies only over https, so the login and ACS calls
+    # use the public HTTPS origin the IdP posts back to, as a browser would.
+    client.base_url = "https://geolens.test"
 
     import app.core.edition as edition_mod
     import app.core.public_urls as public_urls_mod
     from app.api.main import app
+    from app.modules.auth.oauth import sign_in_redirect
     from geolens_enterprise.auth.saml import router as saml_router_mod
 
     saved_info = edition_mod._info
@@ -414,6 +444,7 @@ async def saml_router_mounted(saml_overlay_registered, client):
         # host-header trust boundary while supplying a fixed trusted origin.
         saml_router_mod.get_public_api_url = _fixture_public_url
         saml_router_mod.get_public_app_url = _fixture_public_url
+        sign_in_redirect.get_public_api_url = _fixture_public_url
 
         yield saml_overlay_registered
     finally:
@@ -422,6 +453,7 @@ async def saml_router_mounted(saml_overlay_registered, client):
         public_urls_mod.get_public_app_url = saved_get_app_url
         saml_router_mod.get_public_api_url = saved_get_api_url
         saml_router_mod.get_public_app_url = saved_get_app_url
+        sign_in_redirect.get_public_api_url = saved_get_api_url
         if not router_was_mounted:
             _unmount_saml_router()
 
@@ -510,6 +542,7 @@ async def test_saml_acs_signed_assertion_jit_provisions_user(
     )
     assert "refresh_token" in frag_pairs and frag_pairs["refresh_token"]
     assert "expires_in" in frag_pairs and frag_pairs["expires_in"].isdigit()
+    assert frag_pairs.get("nonce") == SIGN_IN_NONCE
 
     # A new User row exists with the assertion email + auth_provider='oauth'.
     result = await test_db_session.execute(
@@ -803,7 +836,7 @@ def test_oauth_provider_create_saml_accepts_all_4_fields(enterprise_edition):
         provider_type="saml",
         idp_entity_id="https://fixture-idp.geolens.test/idp",
         idp_sso_url="https://fixture-idp.geolens.test/sso",
-        idp_certificate="-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----",
+        idp_certificate=FIXTURE_CERT_PEM,
         sp_entity_id="https://geolens.test/auth/saml/complete-saml",
     )
     assert m.provider_type == "saml"
@@ -825,7 +858,7 @@ def test_oauth_provider_create_saml_rejects_community(community_edition):
             provider_type="saml",
             idp_entity_id="https://fixture-idp.geolens.test/idp",
             idp_sso_url="https://fixture-idp.geolens.test/sso",
-            idp_certificate="-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----",
+            idp_certificate=FIXTURE_CERT_PEM,
             sp_entity_id="https://geolens.test/auth/saml/community-saml",
         )
     assert "SAML SSO is not enabled for this deployment" in str(excinfo.value)
@@ -996,7 +1029,8 @@ async def test_saml_provider_update_redacts_secret_fields(
 
     from app.modules.audit.models import AuditLog
 
-    new_pem = "-----BEGIN CERTIFICATE-----\nMOCKNEWCERT\n-----END CERTIFICATE-----"
+    new_pem = _self_signed_pem()
+    pem_body = "".join(new_pem.splitlines()[1:-1])
 
     provider = await _seed_saml_provider(
         test_db_session,
@@ -1038,12 +1072,72 @@ async def test_saml_provider_update_redacts_secret_fields(
 
         # Defensive: the raw PEM must NOT appear ANYWHERE in the audit details.
         details_str = str(entry.details)
-        assert "MOCKNEWCERT" not in details_str, (
+        assert pem_body[:40] not in details_str, (
             f"raw PEM leaked into audit details: {details_str}"
         )
         assert "-----BEGIN" not in details_str, (
             f"PEM markers leaked into audit details: {details_str}"
         )
+
+
+def test_oauth_provider_create_saml_rejects_non_certificate_text(enterprise_edition):
+    from pydantic import ValidationError
+
+    from app.modules.auth.oauth.schemas import OAuthProviderCreate
+
+    for bad in (
+        "not a certificate",
+        "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----",
+    ):
+        with pytest.raises(ValidationError) as excinfo:
+            OAuthProviderCreate(
+                slug="bad-cert",
+                display_name="Bad cert",
+                provider_type="saml",
+                idp_entity_id="https://fixture-idp.geolens.test/idp",
+                idp_sso_url="https://fixture-idp.geolens.test/sso",
+                idp_certificate=bad,
+                sp_entity_id="https://geolens.test/auth/saml/bad-cert",
+            )
+        assert "idp_certificate" in str(excinfo.value)
+
+
+def test_oauth_provider_update_rejects_non_certificate_text(enterprise_edition):
+    from pydantic import ValidationError
+
+    from app.modules.auth.oauth.schemas import OAuthProviderUpdate
+
+    with pytest.raises(ValidationError):
+        OAuthProviderUpdate(idp_certificate="not a certificate")
+
+
+def test_oauth_provider_accepts_bare_base64_certificate_body(enterprise_edition):
+    from app.modules.auth.oauth.schemas import OAuthProviderUpdate
+
+    body = "".join(FIXTURE_CERT_PEM.splitlines()[1:-1])
+    assert OAuthProviderUpdate(idp_certificate=body).idp_certificate == body
+
+
+async def test_oauth_provider_list_returns_nonsecret_saml_fields_only(
+    client,
+    test_db_session,
+    admin_auth_header,
+    enterprise_edition,
+    _cleanup_saml_providers,
+):
+    """Admin list returns the persisted non-secret SAML fields, never the certificate."""
+    provider = await _seed_saml_provider(
+        test_db_session, slug=f"list-{uuid.uuid4().hex[:6]}"
+    )
+
+    resp = await client.get("/settings/oauth-providers", headers=admin_auth_header)
+    assert resp.status_code == 200, resp.text
+    row = next(p for p in resp.json() if p["id"] == str(provider.id))
+    assert row["idp_entity_id"] == FIXTURE_IDP_ENTITY_ID
+    assert row["idp_sso_url"] == "https://fixture-idp.geolens.test/sso"
+    assert row["sp_entity_id"] == FIXTURE_SP_ENTITY_ID
+    assert "idp_certificate" not in row
+    assert "BEGIN CERTIFICATE" not in resp.text
 
 
 # ---------------------------------------------------------------------------

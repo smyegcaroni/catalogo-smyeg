@@ -9,9 +9,10 @@ import {
   useReuploadCommit,
 } from '@/components/dataset/hooks/use-dataset';
 import { useJobStatus, useUploadConfig } from '@/components/import/hooks/use-ingest';
+import { useRefreshSearchWhenQuicklookLands } from '@/components/dataset/hooks/use-quicklook-settled';
 import { queryKeys } from '@/lib/query-keys';
 import { buildAcceptMap, deriveFormatBadges } from '@/lib/file-utils';
-import { describeFailureReason } from '@/lib/failure-reason';
+import { describeFailureReason, fixedFailureReason } from '@/lib/failure-reason';
 import { SchemaDiffView } from './SchemaDiffView';
 import {
   Dialog,
@@ -34,7 +35,8 @@ import {
   TableCell,
 } from '@/components/ui/table';
 import { cn } from '@/lib/utils';
-import { Globe, Loader2, CheckCircle2, AlertCircle, Upload } from 'lucide-react';
+import { recordTypeCapabilities } from '@/lib/record-types';
+import { Globe, Loader2, CheckCircle2, AlertCircle, AlertTriangle, Upload } from 'lucide-react';
 import { toast } from 'sonner';
 import { probeService } from '@/api/ingest';
 import { ApiError } from '@/api/client';
@@ -64,6 +66,7 @@ type ReuploadStep =
   | 'committing'
   | 'tracking'
   | 'complete'
+  | 'held'
   | 'error';
 
 
@@ -80,6 +83,9 @@ const AUTH_ERROR_HINTS = [
 // regenerate flow) and no reupload source produces a .vrt, so it stays
 // excluded from every reupload context as a defensive floor.
 const VRT_EXTENSION = '.vrt';
+// A .3tz holds only a 3D Tiles tileset and a .laz only a point cloud, which no
+// reupload can replace.
+const KIND_ONLY_EXTENSIONS = new Set(['.3tz', '.laz']);
 // #1289: raster reupload accepts only raster source formats; vector/table
 // reupload accepts everything the backend allows except raster/VRT formats
 // (rasters go through the branch below, VRTs through the regenerate flow).
@@ -102,18 +108,19 @@ function humanizeLayerName(layer: LayerInfo): string {
 }
 
 function findPreferredLayer(probeResult: ProbeResponse): LayerInfo | null {
-  if (probeResult.layers.length === 0) {
+  const layers = probeResult.layers.filter((layer) => layer.importable !== false);
+  if (layers.length === 0) {
     return null;
   }
   if (probeResult.selected_layer_id == null) {
-    return probeResult.layers[0];
+    return layers[0];
   }
   return (
-    probeResult.layers.find(
+    layers.find(
       (layer) =>
         layer.layer_id === probeResult.selected_layer_id ||
         layer.name === String(probeResult.selected_layer_id),
-    ) ?? probeResult.layers[0]
+    ) ?? layers[0]
   );
 }
 
@@ -139,9 +146,8 @@ export function ReuploadDialog({
   onReplaceComplete,
 }: ReuploadDialogProps) {
   const { t } = useTranslation('dataset');
-  // #1289: raster datasets now reach this dialog (DatasetPage relaxes its
-  // gate to canEdit && !isVrt); this flag drives the upload -> commit
-  // shortcut below and the raster-specific copy in the preview/tracking steps.
+  // Raster datasets take the upload -> commit shortcut below and get
+  // raster-specific copy in the preview/tracking steps.
   const isRaster = dataset.record_type === 'raster_dataset';
   const [step, setStep] = useState<ReuploadStep>('source-select');
   const [sourceType, setSourceType] = useState<ReuploadSourceType | null>(null);
@@ -215,12 +221,22 @@ export function ReuploadDialog({
   // Only poll when tracking
   const trackingJobId = step === 'tracking' ? jobId : null;
   const { data: jobData } = useJobStatus(trackingJobId);
+  const [quicklookJobId, setQuicklookJobId] = useState<string | null>(null);
+  useRefreshSearchWhenQuicklookLands(quicklookJobId);
 
   // Watch job status for completion
   useEffect(() => {
     if (step !== 'tracking' || !jobData) return;
 
+    // The run ended too, possibly blocked for review, and run history is not polled.
+    if (['complete', 'failed', 'cancelled'].includes(jobData.status)) {
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.datasets.refreshRunsPrefix(dataset.id),
+      });
+    }
+
     if (jobData.status === 'complete') {
+      if (jobData.quicklook_pending) setQuicklookJobId(jobId);
       // fix(#1362 codex r3): the await below leaves this continuation
       // in flight across a render where `step`/`jobId` can change under it —
       // closing the dialog (resetState) or starting a second reupload before
@@ -266,8 +282,14 @@ export function ReuploadDialog({
     } else if (jobData.status === 'failed') {
       const reason = jobData.error_message;
       const message = reason
-        ? describeFailureReason(reason, t('reupload.jobFailed'))
+        ? describeFailureReason(reason, t('reupload.jobFailed'), jobData.error_code)
         : t('reupload.jobFailed');
+      if (jobData.error_code === 'review_required') {
+        // A hold waits on a person's decision; retrying here would not change it.
+        setError(message);
+        setStep('held');
+        return;
+      }
       setError(
         sourceType === 'service_url'
           ? appendRetryGuidance(message)
@@ -278,12 +300,12 @@ export function ReuploadDialog({
       // fix(#1677): cancel is a reachable terminal status now. With no branch
       // here the dialog sat on the tracking spinner forever — polling had
       // already stopped, so nothing would ever move it again. No retry
-      // guidance: the run was cancelled deliberately, not by a failure the
-      // user should work around.
-      setError(t('reupload.jobCancelled'));
+      // guidance: a deliberate cancel and a sweep-abandoned upload both just
+      // start over, not retry a specific attempt.
+      setError(fixedFailureReason(jobData.error_code) ?? t('reupload.jobCancelled'));
       setStep('error');
     }
-  }, [step, jobData, dataset.id, queryClient, sourceType, isRaster, onReplaceComplete, appendRetryGuidance, t]);
+  }, [step, jobId, jobData, dataset.id, queryClient, sourceType, isRaster, onReplaceComplete, appendRetryGuidance, t]);
 
   const handleSelectSource = useCallback((nextSource: ReuploadSourceType) => {
     setSourceType(nextSource);
@@ -493,6 +515,8 @@ export function ReuploadDialog({
         // live query result, so reading it here would re-read the very change
         // this condition exists to catch and always agree with the server.
         expectedOriginKind: stagedOriginKind,
+        // The changes this dialog showed, acknowledged by confirming.
+        reviewFingerprint: preview?.review_fingerprint,
       });
       setStep('tracking');
     } catch (err) {
@@ -539,7 +563,7 @@ export function ReuploadDialog({
         }
       }
     }
-  }, [dataset.id, jobId, stagedOriginKind, sourceType, serviceToken, selectedFileLayer, commitMutation, queryClient, appendRetryGuidance, t]);
+  }, [dataset.id, jobId, stagedOriginKind, sourceType, preview, serviceToken, selectedFileLayer, commitMutation, queryClient, appendRetryGuidance, t]);
 
   const handleRetry = useCallback(() => {
     setError(null);
@@ -581,7 +605,7 @@ export function ReuploadDialog({
       .filter((extension) => {
         if (!extension) return false;
         const normalized = extension.toLowerCase();
-        if (normalized === VRT_EXTENSION) return false;
+        if (normalized === VRT_EXTENSION || KIND_ONLY_EXTENSIONS.has(normalized)) return false;
         // #1289: raster reupload offers only raster formats; every other
         // reupload (vector/table) offers everything except raster/VRT.
         const isRasterExtension = RASTER_REUPLOAD_EXTENSIONS.has(normalized);
@@ -658,6 +682,7 @@ export function ReuploadDialog({
       })
       : t('reupload.descriptions.tracking'),
     complete: t('reupload.descriptions.complete'),
+    held: t('reupload.descriptions.held'),
     error: t('reupload.descriptions.error'),
   };
 
@@ -678,6 +703,8 @@ export function ReuploadDialog({
     : selectedFileLayer !== null
       ? selectedFileLayer
       : selectedFile?.name;
+
+  if (!isRaster && !recordTypeCapabilities(dataset.record_type).featureTable) return null;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -872,16 +899,28 @@ export function ReuploadDialog({
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {probeResult.layers.map((layer) => (
+                    {probeResult.layers.map((layer) => {
+                      const unsupported = layer.importable === false;
+                      return (
                       <TableRow
                         key={`${layer.name}-${String(layer.layer_id)}`}
+                        aria-disabled={unsupported || undefined}
                         className={cn(
-                          'cursor-pointer',
+                          unsupported ? 'cursor-not-allowed opacity-60' : 'cursor-pointer',
                           selectedLayer?.name === layer.name && 'bg-accent',
                         )}
-                        onClick={() => setSelectedLayer(layer)}
+                        onClick={unsupported ? undefined : () => setSelectedLayer(layer)}
                       >
-                        <TableCell className="max-w-[300px] truncate">{humanizeLayerName(layer)}</TableCell>
+                        <TableCell className="max-w-[300px] truncate">
+                          {humanizeLayerName(layer)}
+                          {unsupported && (
+                            <span className="block truncate text-2xs text-muted-foreground">
+                              {t('reupload.service.unsupportedLayerType', {
+                                type: layer.source_layer_type ?? layer.layer_type,
+                              })}
+                            </span>
+                          )}
+                        </TableCell>
                         <TableCell>
                           {layer.geometry_type ? getGeometryTypeLabel(t, layer.geometry_type) : '-'}
                         </TableCell>
@@ -891,7 +930,8 @@ export function ReuploadDialog({
                             : '-'}
                         </TableCell>
                       </TableRow>
-                    ))}
+                      );
+                    })}
                   </TableBody>
                 </Table>
               </div>
@@ -1047,6 +1087,16 @@ export function ReuploadDialog({
                   </div>
                 )}
                 <SchemaDiffView schemaDiff={preview.schema_diff} />
+                {(preview.review_reasons?.length ?? 0) > 0 && (
+                  <ul
+                    className="space-y-1 rounded-md border border-warning/30 bg-warning/10 p-3 text-sm"
+                    aria-label={t('reupload.reviewReasonsLabel')}
+                  >
+                    {preview.review_reasons?.map((reason) => (
+                      <li key={reason}>{t(`sourcePanel.refresh.history.reason.${reason}`)}</li>
+                    ))}
+                  </ul>
+                )}
                 {hasWarning && (
                   <p className="text-sm text-warning">
                     {t('reupload.warningSchemaChanges')}
@@ -1109,6 +1159,16 @@ export function ReuploadDialog({
             <p className="text-xs text-muted-foreground">
               {t('reupload.completeMessage')}
             </p>
+            <DialogFooter className="w-full">
+              <Button onClick={() => handleOpenChange(false)}>{t('common:close')}</Button>
+            </DialogFooter>
+          </div>
+        )}
+
+        {step === 'held' && (
+          <div className="flex flex-col items-center justify-center gap-3 py-8" data-testid="reupload-held">
+            <AlertTriangle className="h-10 w-10 text-warning" />
+            <p className="text-sm font-medium">{error}</p>
             <DialogFooter className="w-full">
               <Button onClick={() => handleOpenChange(false)}>{t('common:close')}</Button>
             </DialogFooter>

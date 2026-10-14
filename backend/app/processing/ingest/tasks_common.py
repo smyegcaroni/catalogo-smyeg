@@ -8,7 +8,9 @@ acquisition and cleanup half lives in ``tasks_staging``.
 
 import asyncio
 import functools
-import time
+import hashlib
+import json
+import re
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -20,12 +22,10 @@ import structlog
 
 from procrastinate import App, PsycopgConnector
 
-from app.platform.cache.tiles import invalidate_catalog_cache
 from app.platform.dataset_origin import classify_origin, set_dataset_origin
 from app.core.config import settings
 from app.core.service_tokens import reset_registered_credential_secrets
 from app.core.url_redaction import redact_exception_text
-from app.processing.embeddings.helpers import defer_embedding
 from app.platform.storage import get_storage
 
 if TYPE_CHECKING:
@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from app.processing.ingest.catalog_projection import Measurement
     from app.processing.ingest.warnings import IngestJobWarning
     from app.platform.jobs.models import IngestJob
 
@@ -127,7 +128,7 @@ async def _emit_billing_event(
     *,
     event_id: str | None = None,
     table_name: str | None = None,
-) -> None:
+) -> bool:
     """Dispatch a billable usage event to registered BillingExtensions (METER-01).
 
     Imports ONLY ``get_billing_extensions`` from ``app.platform.extensions`` —
@@ -146,14 +147,17 @@ async def _emit_billing_event(
             idempotent at the DB layer.
         table_name: workers leave this None; the tile/OGC request path
             passes it to drive the METER-03 last_accessed_at signal.
+
+    Returns False when an extension raised, and True otherwise.
     """
     if not tenant_id:
-        return  # single_tenant no-op: no ledger, no billing (byte-identical OSS)
+        return True  # single_tenant no-op: no ledger, no billing (byte-identical OSS)
 
     # Billing-import-free: only import the extension accessor, never billing symbols
     from app.platform.extensions import get_billing_extensions
 
     _log = structlog.get_logger()
+    emitted = True
     for ext in get_billing_extensions():
         if not hasattr(ext, "on_usage_event"):
             continue  # DefaultBillingExtension + other extensions without the hook
@@ -175,6 +179,8 @@ async def _emit_billing_event(
                 ext=type(ext).__name__,
                 exc_info=True,
             )
+            emitted = False
+    return emitted
 
 
 @dataclass
@@ -205,6 +211,9 @@ class IngestContext:
     # unexpected — a credential most of all — reaches the column. Callers
     # pass their own payload rather than one being inferred here.
     origin_ref: dict[str, Any] | None = None
+    # The local copy of the upload the task archives after the commit that
+    # completes the job; that commit owes the archive in a follow-up record.
+    archive_from: str | None = None
 
 
 _connector_kwargs: dict = {
@@ -223,6 +232,9 @@ task_app = App(
     import_paths=[
         "app.processing.ingest.tasks_vector",
         "app.processing.ingest.tasks_raster",
+        "app.processing.ingest.tasks_crs_facts",
+        "app.processing.ingest.tasks_tileset",
+        "app.processing.ingest.tasks_pointcloud",
         "app.processing.ingest.tasks_vrt",
         "app.processing.ingest.tasks_reupload",
         "app.processing.embeddings.tasks",
@@ -324,27 +336,6 @@ async def cleanup_step(what: str, *, job_id: str) -> AsyncGenerator[None, None]:
             job_id=job_id,
             error=redact_exception_text(exc),
         )
-
-
-# ArcGIS esriFieldType → column_info type mapping
-_ARCGIS_TYPE_MAP = {
-    "esriFieldTypeString": "text",
-    "esriFieldTypeSmallInteger": "integer",
-    "esriFieldTypeInteger": "integer",
-    "esriFieldTypeSingle": "real",
-    "esriFieldTypeDouble": "double precision",
-    "esriFieldTypeDate": "timestamp without time zone",
-    "esriFieldTypeOID": "integer",
-    "esriFieldTypeGlobalID": "text",
-    "esriFieldTypeGUID": "text",
-    "esriFieldTypeBlob": "text",
-    "esriFieldTypeXML": "text",
-}
-
-
-def _arcgis_type_to_column_type(esri_type: str) -> str:
-    """Map an ArcGIS esriFieldType string to a PostgreSQL column type name."""
-    return _ARCGIS_TYPE_MAP.get(esri_type, "text")
 
 
 def _append_job_warning(job, warning: "IngestJobWarning") -> None:
@@ -510,6 +501,35 @@ async def apply_manifest_record_metadata(
     await _apply_manifest_tags(session, record, user_metadata.get("manifest_tags"))
 
 
+async def apply_manifest_publication(
+    session: Any, dataset: Any, user_metadata: dict | None, *, actor_id: uuid.UUID
+) -> None:
+    """Bring an existing record to a manifest re-apply's title, summary and publication.
+
+    The change goes through the metadata edit path, so a visibility or status
+    change keeps its workflow, shared-map and publish checks, and a refusal
+    fails the replacement. A field the manifest leaves blank keeps its value,
+    and a job no manifest created changes nothing. The caller holds the
+    catalog rows.
+    """
+    if not user_metadata or "manifest_key" not in user_metadata:
+        return
+    fields: dict[str, Any] = {
+        key: value
+        for key in ("title", "summary", "visibility", "record_status")
+        if (value := _manifest_text(user_metadata, key)) is not None
+    }
+    if fields:
+        from app.platform.extensions import get_processing_port
+
+        # The record was read before the lock, and the edit path skips a field
+        # that already looks equal, so an edit made since must be seen.
+        await session.refresh(dataset.record, attribute_names=[*fields, "published_at"])
+        await get_processing_port().update_dataset_metadata(
+            session, dataset.id, fields, actor_id=actor_id
+        )
+
+
 @asynccontextmanager
 async def _job_phase_session(
     job_uuid: uuid.UUID,
@@ -557,6 +577,11 @@ async def _job_phase_session(
             await session.execute(
                 text(f"SET LOCAL statement_timeout = {lock_and_statement_timeout_ms}")
             )
+        if require_status is not None:
+            from app.processing.ingest.tasks_raster_common import note_publishing_xid
+
+            # Read before the row lock; a phase whose commit publishes probes by it.
+            await note_publishing_xid(session)
         filters = [IngestJob.id == job_uuid]
         if attempt_id is not None:
             filters.append(IngestJob.attempt_id == attempt_id)
@@ -667,6 +692,7 @@ async def _detect_and_override_geometry(
     table_name: str,
     user_metadata: dict[str, Any],
     effective_srid: int,
+    renamed_columns: list[dict] | None = None,
 ) -> str | None:
     """Apply user x/y or WKT geometry overrides to a freshly-loaded table.
 
@@ -676,15 +702,25 @@ async def _detect_and_override_geometry(
     of the ogrinfo-detected value (or ``None`` if neither override is set —
     callers guard on ``user_wants_geom`` so this branch is defensive only).
 
+    ``renamed_columns`` is what ``rename_reserved_columns`` returned: a column
+    the user picked may have moved to ``src_<name>`` since the preview, and the
+    override must read it under its new name.
+
     Callers are responsible for importing the file as non-spatial (see the
     ``ogr_geometry_type = None if user_wants_geom else ...`` branch in
     ``ingest_file``) before invoking this helper. K1/KISS-3 extraction.
     """
     from app.processing.ingest.metadata import _qtable
 
-    x_column = (user_metadata.get("x_column") or "").lower() or None
-    y_column = (user_metadata.get("y_column") or "").lower() or None
-    geom_column = (user_metadata.get("geom_column") or "").lower() or None
+    moved = {r["original"]: r["renamed"] for r in renamed_columns or []}
+
+    def _chosen(key: str) -> str | None:
+        name = (user_metadata.get(key) or "").lower()
+        return moved.get(name, name) or None
+
+    x_column = _chosen("x_column")
+    y_column = _chosen("y_column")
+    geom_column = _chosen("geom_column")
 
     if x_column and y_column:
         from app.processing.ingest.metadata import construct_point_geometry
@@ -742,13 +778,12 @@ async def run_paged_arcgis_service_fetch(
     is_non_spatial: bool = False,
     on_spawn: Any = None,
     on_page: Any = None,
+    planned_ids: tuple[int, ...] | None = None,
 ) -> None:
-    """Guarded resultOffset paging for an ArcGIS FeatureServer fetch.
+    """Guarded ArcGIS paging shared by initial import and refresh/reupload.
 
-    fix(#1675): shared by initial import and the refresh/reupload executor
-    so both distrust driver-side paging the same way — a page that makes
-    no row-count progress aborts the fetch rather than looping or
-    silently stopping short.
+    Both doors distrust driver-side paging: a page that makes no row-count
+    progress aborts rather than looping or silently stopping short.
 
     ``on_spawn`` is forwarded to every page's subprocess spawn (the refresh
     door's origin-contact stamp is a monotonic OR, so repeated arming is
@@ -763,9 +798,60 @@ async def run_paged_arcgis_service_fetch(
     from app.processing.ingest.metadata import _qtable
 
     port = get_processing_port()
-    imported_rows = 0
-    append = False
-    for offset in range(0, feature_count, page_size):
+    imported_rows, append = 0, False
+    force_arcgis_geojson = bool(planned_ids and max(planned_ids) > (1 << 31) - 1)
+    if planned_ids is not None:
+        planned_chunk_size = min(page_size, _ARCGIS_OBJECT_ID_FETCH_CHUNK_SIZE)
+
+        def _fits_gdal_get_url(object_ids: tuple[int, ...]) -> bool:
+            # Use the same builder as the actual import so this includes the
+            # ArcGIS options and a query-form credential without exposing the
+            # resulting URL in an error or log.
+            page_source, _ = port.build_gdal_source(
+                service_type_raw,
+                source_url,
+                layer_name,
+                layer_id,
+                token=token,
+                order_field=order_field,
+                result_limit=None,
+                result_offset=None,
+                object_ids=object_ids,
+                force_arcgis_geojson=force_arcgis_geojson,
+            )
+            return len(page_source.encode("utf-8")) <= _ARCGIS_GDAL_GET_URL_MAX_BYTES
+
+        page_specs: list[tuple[int | None, tuple[int, ...] | None]] = []
+        start = 0
+        while start < len(planned_ids):
+            remaining = min(planned_chunk_size, len(planned_ids) - start)
+            candidate = planned_ids[start : start + remaining]
+            if _fits_gdal_get_url(candidate):
+                page_specs.append((None, candidate))
+                start += remaining
+                continue
+
+            # A count-only chunk can exceed the URL limits of proxies when
+            # object IDs are long signed 64-bit values. Find the largest
+            # prefix that the actual GDAL GET request can transport.
+            lower, upper = 1, remaining - 1
+            largest_fitting = 0
+            while lower <= upper:
+                midpoint = (lower + upper) // 2
+                if _fits_gdal_get_url(planned_ids[start : start + midpoint]):
+                    largest_fitting = midpoint
+                    lower = midpoint + 1
+                else:
+                    upper = midpoint - 1
+            if largest_fitting == 0:
+                raise ogr.IngestionError(
+                    "ArcGIS object-ID request exceeds the safe URL transport budget."
+                )
+            page_specs.append((None, planned_ids[start : start + largest_fitting]))
+            start += largest_fitting
+    else:
+        page_specs = [(offset, None) for offset in range(0, feature_count, page_size)]
+    for offset, object_ids in page_specs:
         page_source, page_layer = port.build_gdal_source(
             service_type_raw,
             source_url,
@@ -773,8 +859,10 @@ async def run_paged_arcgis_service_fetch(
             layer_id,
             token=token,
             order_field=order_field,
-            result_limit=page_size,
+            result_limit=None if object_ids is not None else page_size,
             result_offset=offset,
+            object_ids=object_ids,
+            force_arcgis_geojson=force_arcgis_geojson,
         )
         await ogr.run_ogr2ogr_service(
             page_source,
@@ -797,17 +885,21 @@ async def run_paged_arcgis_service_fetch(
         if grew <= 0:
             raise ogr.IngestionError(
                 "ArcGIS service import made no row-count progress "
-                f"at offset {offset}; upstream pagination may be "
+                f"at offset {offset if offset is not None else 'ID chunk'}; upstream pagination may be "
                 "unsupported or returned an empty page."
             )
-        expected = min(page_size, feature_count - offset)
+        expected = (
+            len(object_ids)
+            if object_ids is not None
+            else min(page_size, feature_count - offset)
+        )
         if grew != expected:
             # fix(#1675): positive growth alone isn't enough — a server
             # returning fewer rows than requested while offset advances by
             # page_size would silently skip records. A mid-fetch source
             # mutation trips this too; failing is the safe direction.
             raise ogr.IngestionError(
-                f"ArcGIS page at offset {offset} returned {grew} rows where "
+                f"ArcGIS page at offset {offset if offset is not None else 'ID chunk'} returned {grew} rows where "
                 f"{expected} were expected; the server may cap responses "
                 "below its advertised page size or the source changed "
                 "mid-fetch. Refusing to continue with a potentially "
@@ -819,63 +911,128 @@ async def run_paged_arcgis_service_fetch(
         append = True
 
 
-async def stamp_failed_origin_health(
-    session,
-    dataset_cls: Any,
-    dataset_uuid: uuid.UUID,
-    *,
-    health: str | None,
-    detail: str | None,
-    bound: tuple | None,
-) -> None:
-    """Persist what a failed refresh learned about its origin, if anything.
+_ARCGIS_SAFE_OID_FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z")
+_ARCGIS_MAX_OID = (1 << 63) - 1
+# ``build_gdal_source`` bounds the query-form objectIds request to this size.
+# The normal service page limit can be larger, so planned-ID fetches must not
+# reuse it unchecked.
+_ARCGIS_OBJECT_ID_FETCH_CHUNK_SIZE = 1_000
+# Keep GET requests below common proxy limits. The source builder includes the
+# driver prefix, endpoint, ArcGIS query parameters, and any query-form token.
+_ARCGIS_GDAL_GET_URL_MAX_BYTES = 8 * 1024
 
-    This owns the dataset-side verdict; ``record_refresh_failure`` owns the
-    run row (caller passes ``contacted_origin=False`` there so the run
-    finalizer doesn't also write the dataset).
 
-    Guarded on the ``(origin_uri, origin_ref, source_format)`` triple the
-    failing attempt read, so a refresh against an origin the dataset has
-    since been rebound to (e.g. to an upload, which has no probe/refresh of
-    its own) cannot overwrite the rebind's own, now-current verdict —
-    losing that race is a silent skip.
-
-    ``health=None`` writes nothing: a failure that established nothing about
-    the origin (statement timeout, a search that couldn't run) must leave
-    the last conclusive verdict standing rather than replace it with a guess.
-
-    feat(#1266): shared rather than duplicated per strategy so the guard
-    doesn't end up with a second, drifting spelling in the STAC strategy
-    beside ``_record_failed_origin_contact``.
-    """
-    if health is None or bound is None:
-        return
-    from sqlalchemy import update as sa_update
-
-    bound_uri, bound_ref, bound_format = bound
-    outcome = await session.execute(
-        sa_update(dataset_cls)
-        .where(
-            dataset_cls.id == dataset_uuid,
-            dataset_cls.origin_uri.is_not_distinct_from(bound_uri),
-            dataset_cls.origin_ref.is_not_distinct_from(bound_ref),
-            dataset_cls.source_format.is_not_distinct_from(bound_format),
-        )
-        .values(
-            source_health=health,
-            source_health_detail=detail,
-            # The attempt reached the origin and got an answer — a dropped
-            # relation and a withdrawn item both ARE answers, the same way
-            # the probe dates a 404. That is the whole meaning of the column.
-            last_checked_at=datetime.now(timezone.utc),
-        )
+def _arcgis_staged_oid_digest(oid_field: str, ids: list[int]) -> str:
+    payload = json.dumps(
+        {"oid_field": oid_field, "ids": sorted(ids)},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
     )
-    await session.commit()
-    if outcome.rowcount:
-        # GET /datasets/ serves these fields from a 60s cache; every other
-        # writer invalidates it, and a lost guard race changed nothing worth
-        # invalidating for.
-        await invalidate_catalog_cache()
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
+async def verify_arcgis_staged_oid_coverage(
+    session: Any,
+    *,
+    schema: str,
+    table_name: str,
+    oid_field: str,
+    planned_ids: tuple[int, ...],
+) -> dict[str, Any]:
+    """Compare staged source OIDs with one bounded, preplanned ArcGIS set.
+
+    The `gid` primary key is GeoLens-local (`-lco FID=gid`) and must never be
+    treated as upstream identity. This returns compact evidence; raw source
+    IDs remain only in worker memory.
+    """
+    from sqlalchemy import text
+
+    from app.processing.ingest.metadata import _qtable, get_column_info
+
+    if not _ARCGIS_SAFE_OID_FIELD.fullmatch(oid_field):
+        return {
+            "status": "unavailable",
+            "reason": "unsupported_oid_field",
+            "oid_field": oid_field,
+        }
+    columns = await get_column_info(session, table_name, schema=schema)
+    matching_columns = [
+        column["name"]
+        for column in columns
+        if isinstance(column.get("name"), str)
+        and column["name"].casefold() == oid_field.casefold()
+    ]
+    if len(matching_columns) != 1:
+        return {
+            "status": "unavailable",
+            "reason": "source_oid_not_preserved",
+            "oid_field": oid_field,
+        }
+
+    # The identifier is constrained above; table/schema use the existing
+    # catalog table validator. The limit detects an ignored objectIds filter
+    # without materializing an unbounded source response in worker memory.
+    safe_oid_field = matching_columns[0]
+    query = (
+        f'SELECT "{safe_oid_field}", COUNT(*) '
+        f"FROM {_qtable(table_name, schema=schema)} "
+        f'GROUP BY "{safe_oid_field}" '
+        f"LIMIT {len(planned_ids) + 1}"
+    )
+    result = await session.execute(
+        # codeql[py/sql-injection]
+        text(query)
+    )
+    rows = result.all()
+    if len(rows) > len(planned_ids):
+        return {
+            "status": "mismatched",
+            "reason": "unexpected_source_oid_cardinality",
+            "oid_field": oid_field,
+            "planned_count": len(planned_ids),
+            "staged_distinct_count": len(rows),
+        }
+
+    staged_ids: list[int] = []
+    duplicate_count = 0
+    invalid_count = 0
+    for source_id, occurrences in rows:
+        if (
+            isinstance(source_id, bool)
+            or not isinstance(source_id, int)
+            or source_id < 0
+            or source_id > _ARCGIS_MAX_OID
+        ):
+            invalid_count += int(occurrences)
+            continue
+        staged_ids.append(source_id)
+        if occurrences > 1:
+            duplicate_count += int(occurrences) - 1
+
+    planned = set(planned_ids)
+    staged = set(staged_ids)
+    missing_count = len(planned - staged)
+    unexpected_count = len(staged - planned)
+    status = (
+        "matched"
+        if not invalid_count
+        and not duplicate_count
+        and not missing_count
+        and not unexpected_count
+        else "mismatched"
+    )
+    return {
+        "status": status,
+        "oid_field": oid_field,
+        "planned_count": len(planned_ids),
+        "staged_distinct_count": len(staged),
+        "missing_count": missing_count,
+        "unexpected_count": unexpected_count,
+        "duplicate_count": duplicate_count,
+        "invalid_count": invalid_count,
+        "staged_id_set_digest": _arcgis_staged_oid_digest(oid_field, staged_ids),
+    }
 
 
 async def load_job_for_error_write(
@@ -928,31 +1085,80 @@ async def load_job_for_error_write(
         return None
 
 
-async def _generate_quicklook(
-    session, dataset, table_name: str, geometry_type: str
-) -> None:
-    """Generate and upload a vector quicklook thumbnail (non-fatal).
+# Draws in a row before a quicklook stops chasing a table that keeps changing.
+_QUICKLOOK_DRAWS = 3
 
-    Runs after the outer ingest commit so a connection-killing query
-    (OOM, timeout on complex geometry) cannot roll back the dataset.
-    Separate try/except blocks around generate+upload, rollback+URI-write,
-    and commit let operators tell which phase failed from the logs.
 
-    INGEST-01 / Phase 1091-02: caller MUST pass a FRESH session isolated
-    from the outer ``_finalize_ingest`` session (use ``_job_phase_session
-    (job_uuid, phase="quicklook")``). The generation timeout can cancel the
-    inner geom query mid-flight and poison the asyncpg cursor; the
-    defensive ``rollback()`` below then expires every ORM attribute
-    (``expire_on_rollback=True``). On the outer session that trips
-    ``MissingGreenlet`` on ``dataset.record``'s next lazy access.
+async def _generate_quicklook(session, dataset_id: uuid.UUID, table_name: str) -> bool:
+    """Draw ``table_name``'s quicklook and point the dataset at it (non-fatal).
 
-    The outer session's view of ``quicklook_256_uri`` is stale after this
-    returns — callers needing it must ``session.refresh(dataset)`` or
-    re-fetch via ``port.get_dataset``.
+    Runs after the commit that published the table, so a connection-killing
+    query (OOM, timeout on complex geometry) cannot roll back the dataset.
+    Separate try/except blocks around generate+upload, the URI write and
+    the commit let operators tell which phase failed from the logs.
+
+    The caller MUST pass a FRESH session, not the one that published the
+    table. The generation timeout can cancel the inner geom query mid-flight
+    and poison the asyncpg cursor; the defensive ``rollback()`` then expires
+    every ORM attribute (``expire_on_rollback=True``). On the publishing
+    session that trips ``MissingGreenlet`` on ``dataset.record``'s next lazy
+    access.
+
+    Every draw writes an object of its own and swings the dataset's pointer to
+    it only while the tile version is still the one the draw read, so an older
+    draw can neither overwrite a newer image nor take the pointer back. Each
+    change to the data rolls the tile version, so a draw that sees the version
+    move while it ran draws again. A new key per draw also gives the image a
+    new identity for caches and for the reconcile sweep's probe.
+    The draw holds only the caller's session, one pooled connection.
+
+    The caller's view of ``quicklook_256_uri`` is stale after this returns.
+    Returns whether the last draw landed, or True when the dataset is gone.
+    """
+    from sqlalchemy import select
+
+    from app.platform.extensions import get_processing_port
+
+    Dataset = get_processing_port().get_dataset_orm_class()
+    content_version = select(Dataset.tile_cache_version).where(Dataset.id == dataset_id)
+    landed = False
+    try:
+        for _ in range(_QUICKLOOK_DRAWS):
+            drawn = await session.scalar(content_version)
+            landed = await _draw_quicklook(session, dataset_id, table_name, drawn)
+            # A draw that failed can leave its transaction aborted.
+            await session.rollback()
+            if await session.scalar(content_version) == drawn:
+                return landed
+    except Exception as exc:  # broad: the dataset is already published
+        structlog.get_logger().warning(
+            "quicklook_failed", phase="version", table=table_name, error=str(exc)
+        )
+        return False
+    return landed
+
+
+async def _draw_quicklook(
+    session, dataset_id: uuid.UUID, table_name: str, drawn_version: int | None
+) -> bool:
+    """Draw, upload and record the quicklook once.
+
+    ``drawn_version`` is the tile version the draw started from; the pointer
+    only moves while the dataset still has it. Returns whether the image
+    landed or the dataset is gone.
     """
     import io as _io
 
+    from sqlalchemy import select, update
+
+    from app.core.db.tenant_session import current_tenant_var
+    from app.platform.extensions import get_processing_port
+    from app.platform.storage.titiler_url import resolve_storage_key
+
     _ql_log = structlog.get_logger()
+    ql_storage = get_storage()
+    ql_key = f"vectors/{dataset_id}/quicklook_256_{uuid.uuid4().hex[:12]}.png"
+    stored_key = resolve_storage_key(ql_key, tenant_id=current_tenant_var.get())
     try:
         from app.processing.vector.quicklook import (
             generate_vector_quicklook_with_timeout as generate_vector_quicklook,
@@ -961,19 +1167,19 @@ async def _generate_quicklook(
         ql_bytes = await generate_vector_quicklook(
             session,
             table_name,
-            geometry_type,
+            "",
             256,
             schema=_current_tenant_schema(),
         )
-        from app.core.db.tenant_session import current_tenant_var
-        from app.platform.storage.titiler_url import resolve_storage_key
-
-        ql_storage = get_storage()
-        ql_key = f"vectors/{dataset.id}/quicklook_256.png"
-        await ql_storage.put(
-            resolve_storage_key(ql_key, tenant_id=current_tenant_var.get()),
-            _io.BytesIO(ql_bytes),
-        )
+        # Ends the read before the upload, since its transaction holds the
+        # table against a later replacement's rename. Also recovers a cursor
+        # a wait_for cancel poisoned.
+        await session.rollback()
+        await ql_storage.put(stored_key, _io.BytesIO(ql_bytes))
+    except asyncio.CancelledError:
+        # Providers drain the write before re-raising, so the object exists.
+        await asyncio.shield(_reap_quicklook(ql_storage, stored_key, table_name))
+        raise
     except Exception as _ql_exc:  # broad: quicklook generation is non-fatal; geometry rendering can OOM/timeout
         _ql_log.warning(
             "quicklook_failed",
@@ -981,46 +1187,125 @@ async def _generate_quicklook(
             table=table_name,
             error=str(_ql_exc),
         )
-        return
+        # An upload can complete remotely and still raise, so the key is reaped.
+        await _reap_quicklook(ql_storage, stored_key, table_name)
+        return False
 
-    # INGEST-01 iter-2: recovers a cursor poisoned by a wait_for cancel;
-    # no-op on the clean path. WR-01: wrapped in try/except because
-    # rollback()/merge() are themselves IO that can raise if the
-    # connection died — an uncaught escape here would propagate to
-    # status="failed" on a job whose dataset is already committed
-    # (dataset-published + job-failed, OPS-01's disagreement).
+    # The write is IO that can raise on a dead connection, and the dataset is
+    # already published, so its failure is only logged.
+    Dataset = get_processing_port().get_dataset_orm_class()
+    previous_uri: str | None = None
     try:
-        await session.rollback()
-
-        # Re-merge into the now-clean session; the pre-generation merge
-        # entry was discarded by the rollback above.
-        merged_dataset = await session.merge(dataset)
-        merged_dataset.quicklook_256_uri = ql_key
+        previous_uri = await session.scalar(
+            select(Dataset.quicklook_256_uri)
+            .where(Dataset.id == dataset_id)
+            .with_for_update(key_share=True)
+        )
+        written = await session.execute(
+            update(Dataset)
+            .where(
+                Dataset.id == dataset_id,
+                Dataset.tile_cache_version.is_not_distinct_from(drawn_version),
+            )
+            .values(quicklook_256_uri=ql_key)
+            .execution_options(synchronize_session=False)
+        )
+        swung = bool(written.rowcount)
+        gone = not swung and (
+            await session.scalar(select(Dataset.id).where(Dataset.id == dataset_id))
+            is None
+        )
+    except asyncio.CancelledError:
+        # Nothing was committed, so the unreferenced upload is reaped.
+        await asyncio.shield(session.rollback())
+        await asyncio.shield(_reap_quicklook(ql_storage, stored_key, table_name))
+        raise
     except Exception as _ql_recovery_exc:  # broad: non-fatal contract — connection drop between upload and recovery must not propagate
         try:
             await session.rollback()
         except Exception:  # broad: best-effort cleanup; connection may be irrecoverable
             pass
+        await _reap_quicklook(ql_storage, stored_key, table_name)
         _ql_log.warning(
             "quicklook_failed",
             phase="recovery",
             table=table_name,
             error=str(_ql_recovery_exc)[:500],
         )
-        return
+        return False
+
+    if gone or not swung:
+        # A delete that reaped vectors/{id}/ before this upload left it unowned,
+        # and a draw the data outran must not leave its image behind.
+        await session.rollback()
+        await _reap_quicklook(ql_storage, stored_key, table_name)
+        return gone
 
     try:
         await session.commit()
+    except asyncio.CancelledError:
+        # The commit may or may not have landed; only an unreferenced image goes.
+        await asyncio.shield(session.rollback())
+        landed = await asyncio.shield(
+            session.scalar(
+                select(Dataset.quicklook_256_uri).where(Dataset.id == dataset_id)
+            )
+        )
+        if landed != ql_key:
+            await asyncio.shield(_reap_quicklook(ql_storage, stored_key, table_name))
+        raise
     except (
         Exception
     ) as _ql_commit_exc:  # broad: transient commit failure after successful generation
         await session.rollback()
+        # The commit may have landed, so the image stays; reaping a live one would 404.
         _ql_log.warning(
             "quicklook_failed",
             phase="commit",
             table=table_name,
             error=str(_ql_commit_exc),
         )
+        return False
+    if previous_uri and previous_uri != ql_key:
+        await _reap_quicklook(
+            ql_storage,
+            resolve_storage_key(previous_uri, tenant_id=current_tenant_var.get()),
+            table_name,
+        )
+    return True
+
+
+async def _reap_quicklook(storage, stored_key: str, table_name: str) -> None:
+    """Delete an image nothing points at; a leftover only costs storage."""
+    try:
+        await storage.delete(stored_key)
+    except Exception as exc:  # broad: an orphaned image only costs storage
+        structlog.get_logger().warning(
+            "quicklook_reap_failed", table=table_name, error=str(exc)
+        )
+
+
+async def _detect_3d_and_promote_elev(
+    session, table_name: str, metadata: dict, *, schema: str
+) -> dict:
+    """Return the table's 3D facts and give a 3D point table its ``elev`` column.
+
+    Re-reads ``metadata["column_info"]`` when ``elev`` is added.
+    """
+    from app.processing.ingest.metadata import (
+        detect_3d_metadata,
+        get_column_info,
+        promote_z_to_elev,
+    )
+
+    three_d = await detect_3d_metadata(session, table_name, schema=schema)
+    if three_d.get("is_3d") and await promote_z_to_elev(
+        session, table_name, metadata.get("geometry_type"), schema=schema
+    ):
+        metadata["column_info"] = await get_column_info(
+            session, table_name, schema=schema
+        )
+    return three_d
 
 
 async def _finalize_ingest(ctx: IngestContext):
@@ -1029,24 +1314,17 @@ async def _finalize_ingest(ctx: IngestContext):
     Steps: normalize geometry column, clip to valid bounds, add 4326
     column; grant reader access; extract column info and sample values;
     create dataset record; compute quality score; commit job + dataset
-    atomically; generate quicklook thumbnail (non-fatal); invalidate
-    caches and backfill embedding.
+    atomically, owing the quicklook, the catalog cache purge, the embedding,
+    the completion notice and the usage event in the job's follow-up record,
+    which the caller runs once its own work after the commit is done.
 
     ``ctx`` is an ``IngestContext`` bundle — see its dataclass docstring
     for field descriptions. Returns the created Dataset ORM instance.
     """
     from app.platform.extensions import get_processing_port
-    from app.processing.ingest.metadata import (
-        add_4326_column,
-        clip_to_mercator_bounds,
-        compute_quality_score,
-        detect_3d_metadata,
-        ensure_geom_column,
-        extract_metadata,
-        get_sample_values,
-        grant_reader_access,
-        promote_z_to_elev,
-    )
+    from app.processing.ingest.metadata_attributes import apply_source_field_labels
+    from app.processing.ingest.metadata import compute_quality_score
+    from app.processing.ingest.tasks_staging import _run_staging_pipeline
 
     port = get_processing_port()
 
@@ -1056,76 +1334,18 @@ async def _finalize_ingest(ctx: IngestContext):
     user_metadata = ctx.user_metadata
     source_filename = ctx.source_filename
 
-    # Normalize geometry column name to 'geom'
     _schema = _current_tenant_schema()
-    has_geometry = ctx.has_geometry
-    if has_geometry is None:
-        has_geometry = await ensure_geom_column(session, table_name, schema=_schema)
-    elif has_geometry:
-        await ensure_geom_column(session, table_name, schema=_schema)
-
-    # Clip geometries to Web Mercator bounds and add 4326 column.
-    # When has_geometry is truthy, callers always supply a non-null
-    # effective_srid — guard for mypy since the two params are independent
-    # at the signature level.
-    if has_geometry:
-        assert ctx.effective_srid is not None, (
-            "effective_srid must be set when has_geometry is True"
-        )
-        # fix(#888): the clamp is intentional, staying silent about it was not.
-        _append_mercator_clip_warning(
-            job, await clip_to_mercator_bounds(session, table_name, schema=_schema)
-        )
-        await add_4326_column(session, table_name, ctx.effective_srid, schema=_schema)
-
-    # Grant reader access (per-tenant schema+role in multi_tenant; data/geolens_reader in single_tenant)
-    await grant_reader_access(
+    staging = await _run_staging_pipeline(
         session,
-        table_name,
-        schema=_schema,
-        role=_current_tenant_role(),
+        table_name=table_name,
+        has_geometry=ctx.has_geometry,
+        effective_srid=ctx.effective_srid,
     )
-
-    # Extract metadata (CR-03: pass per-tenant schema so catalog queries target
-    # data_t_{tid} in multi_tenant, not the shared 'data' schema)
-    metadata = await extract_metadata(session, table_name, schema=_schema)
-
-    # Detect 3D geometry properties (per Phase 999.2)
-    three_d = await detect_3d_metadata(session, table_name, schema=_schema)
-
-    # Attribute promotion: extract ST_Z into elev column for 3D points
-    if three_d.get("is_3d"):
-        elev_promoted = await promote_z_to_elev(
-            session, table_name, metadata.get("geometry_type"), schema=_schema
-        )
-        if elev_promoted:
-            # Re-extract column_info so elev appears in the column list
-            from app.processing.ingest.metadata import get_column_info
-
-            metadata["column_info"] = await get_column_info(
-                session, table_name, schema=_schema
-            )
-
-    # ArcGIS column_info fallback: if the DB-based extraction returned empty
-    # column_info (e.g., non-spatial table where ogr2ogr only created a gid column),
-    # fall back to the ArcGIS fields captured at preview time and stored in user_metadata.
-    if not metadata.get("column_info") and user_metadata.get("source_columns"):
-        source_columns = user_metadata["source_columns"]
-        metadata["column_info"] = [
-            {
-                "name": col["name"],
-                "type": _arcgis_type_to_column_type(col.get("type", "string")),
-                "ordinal_position": idx + 1,
-                "is_nullable": True,
-            }
-            for idx, col in enumerate(source_columns)
-            if col.get("name")  # skip columns without a name
-        ]
-
-    # Extract sample values for attribute search
-    sample_values = await get_sample_values(
-        session, table_name, metadata.get("column_info", []), schema=_schema
-    )
+    _append_mercator_clip_warning(job, staging.mercator_clip)
+    has_geometry = staging.has_geometry
+    metadata = staging.metadata
+    three_d = staging.three_d
+    sample_values = staging.sample_values
 
     # Create Dataset record
     dataset_name = user_metadata.get("title") or source_filename or table_name
@@ -1154,6 +1374,7 @@ async def _finalize_ingest(ctx: IngestContext):
         visibility=user_metadata.get("visibility", "private"),
         ingestion=ingestion,
     )
+    await apply_source_field_labels(session, dataset.id, user_metadata)
     # fix(#430): create_dataset defaults the record to 'published',
     # so the before_insert hook has already stamped published_at by the time
     # this overwrite runs. A non-published final status must not keep that
@@ -1205,65 +1426,44 @@ async def _finalize_ingest(ctx: IngestContext):
     # success. ``rows_processed`` is the feature_count derived by
     # ``extract_metadata`` above; raster ingests (which do not call this
     # helper) leave the column NULL — see tasks_raster.ingest_raster.
-    from app.platform.jobs.heartbeat import require_ingest_job_update
+    from app.platform.jobs import ledger
+    from app.processing.ingest.publish_followups import owed_followups
 
-    await require_ingest_job_update(
-        session,
-        job.id,
-        ctx.attempt_id or job.attempt_id,
-        values={
-            "status": "complete",
-            "dataset_id": dataset.id,
-            "completed_at": datetime.now(timezone.utc),
-            "current_step": "complete",
-            "progress": 1.0,
-            "rows_processed": metadata.get("feature_count"),
-        },
+    archive = {}
+    if ctx.archive_from is not None:
+        from app.processing.ingest.tasks_staging import original_archive_key
+
+        # A fan-out layer shares its upload with its siblings, so it never deletes it.
+        archive = {
+            "reaps_staged_upload": not user_metadata.get("fan_out_parent_id"),
+            "archive_key": original_archive_key(dataset.id, ctx.archive_from),
+            "sweep_waits": True,
+        }
+    completed = {
+        "dataset_id": dataset.id,
+        "current_step": "complete",
+        "progress": 1.0,
+        "rows_processed": metadata.get("feature_count"),
+        "user_metadata": owed_followups(
+            ctx.attempt_id or job.attempt_id,
+            "ingest_file" if ctx.archive_from is not None else "ingest_service",
+            **archive,
+            catalog_cache=True,
+            quicklook=table_name if has_geometry else None,
+            embedding=True,
+            notice="ingest_complete",
+            usage="ingest_jobs",
+        ),
+    }
+    await ledger.complete(
+        session, job.id, ctx.attempt_id or job.attempt_id, values=completed
     )
     await session.commit()
-
-    # EVENT-02: notify on ingest complete (non-fatal, after commit — deferred import discipline).
-    # Placed here: status="complete" is already committed above so a notification
-    # error can never roll back or alter the terminal job write (T-1230-09 / fail-safe).
-    from app.platform.notifications.events import (
-        build_event_notification,
-        emit_event_safe,
-    )
-
-    _dataset_title = getattr(dataset, "title", None) or table_name
-    _job_id_str = str(job.id)
-    await emit_event_safe(
-        event_key="ingest_complete",
-        build=lambda: build_event_notification(
-            "ingest_complete",
-            subject=f"Ingest complete: {_dataset_title}",
-            body=f"Vector dataset '{_dataset_title}' has been successfully ingested.",
-            extra={"job_id": _job_id_str, "dataset": _dataset_title},
-        ),
-    )
-
-    # Generate vector quicklook thumbnail (non-fatal, after commit).
-    # INGEST-01 / Phase 1091-02: opens its OWN session so a cancellation
-    # inside quicklook generation can't poison `session` and trip
-    # `MissingGreenlet` on the outer `dataset.record` — see
-    # `_generate_quicklook`'s docstring.
-    if has_geometry:
-        async with _job_phase_session(job.id, phase="quicklook") as (
-            ql_session,
-            _ql_job,
-        ):
-            await _generate_quicklook(
-                ql_session, dataset, table_name, metadata.get("geometry_type", "")
-            )
-
-    # Invalidate caches after successful ingest
-    await invalidate_catalog_cache()
-
-    # Generate embedding (non-fatal)
-
-    await defer_embedding(dataset)
-
     return dataset
+
+
+class SourceURLRefused(RuntimeError):
+    """The fetch-time safety check refused a service URL."""
 
 
 def resolve_service_type(raw: str) -> tuple[str, str]:
@@ -1290,7 +1490,7 @@ def _is_lock_timeout_error(exc: BaseException) -> bool:
     asyncpg exception. Check both shapes so behavior is identical
     regardless of where the exception bubbles up from.
 
-    ING-06 / P2-08: used by ``_apply_reupload_swap`` to gate its single
+    ING-06 / P2-08: used by ``_install_reupload_table`` to gate its single
     retry. Returns False for any other exception class or SQLSTATE so
     real errors (e.g., 23505 unique violation) still propagate
     immediately.
@@ -1377,127 +1577,23 @@ async def _run_service_import_with_wfs_fallback(
             raise
 
 
-async def invalidate_tile_cache_for_table(table_name: str) -> None:
+async def invalidate_tile_cache_for_table(table_name: str) -> bool:
     """Best-effort MVT tile-cache purge after a table's contents change.
 
-    fix(#394) B-019/VT-01: reupload swaps the whole table under the same
-    ``table_name`` but was the one write path that never purged the Valkey
-    tile cache — the cache key has no content-version dimension, so stale
-    geometry/attributes kept 304-serving for up to ``tile_cache_ttl``.
+    Tile keys carry the dataset's ``tile_cache_version``, so an API process
+    stops reading pre-swap entries once it re-reads the dataset row. The purge
+    makes the new rows visible sooner wherever it can reach the cache: a
+    process still holding the old version re-renders from the swapped table.
     Call AFTER the owning transaction commits, so a concurrent tile request
-    can't re-cache pre-swap rows. Never raises.
+    can't re-cache pre-swap rows. Returns whether the purge landed, or True
+    with no tile cache; never raises.
     """
     from app.platform.cache.provider import get_tile_cache
 
     tile_cache = get_tile_cache()
-    if tile_cache is not None:
-        await tile_cache.invalidate_table(table_name)
-
-
-# What PostGIS records in ``geometry_columns.type`` for an untyped column.
-# A specific value ("POLYGON", "MULTILINESTRING", ...) describes what the
-# column will accept; this one describes nothing.
-_GENERIC_GEOMETRY_TYPE = "GEOMETRY"
-
-# The record types ``service_create.py`` derives from "does this dataset have
-# geometry". Raster and VRT records carry their own modality and must never be
-# re-derived from a geometry column they do not have.
-_DERIVED_RECORD_TYPES: frozenset[str] = frozenset({"table", "vector_dataset"})
-
-
-async def _declared_geometry_type(
-    session: Any, *, schema: str, table: str
-) -> str | None:
-    """The geom column's DECLARED type, or None when the relation has no geom.
-
-    fix(#1313): ``extract_metadata`` derives the type by sampling a row,
-    so an emptied spatial table reports None — indistinguishable from one
-    that never had geometry. Writing that None reclassifies the dataset as
-    tabular, which locks ``_require_feature_table`` out of ever
-    repopulating it and drops it from the builder. ``geometry_columns``
-    answers what the sample can't: a row there means the relation is
-    spatial regardless of current contents.
-
-    fix(#1373): shared with the reupload swap, which hits the identical
-    trap from the other direction (an empty spatial file), so the two
-    paths can't end up disagreeing via two spellings of this query.
-    """
-    from sqlalchemy import text
-
-    return await session.scalar(
-        text(
-            "SELECT type FROM geometry_columns "
-            "WHERE f_table_schema = :schema AND f_table_name = :table "
-            "AND f_geometry_column = 'geom'"
-        ),
-        {"schema": schema, "table": table},
-    )
-
-
-def _effective_geometry_type(
-    *, measured: str | None, declared: str | None, stored: str | None
-) -> str | None:
-    """The geometry type this measurement establishes, from the best evidence.
-
-    One rule in one place: both the write and the quality score use it, so a
-    second spelling of this precedence is how those two would disagree.
-
-    fix(#1382): when nothing was measured and the declared column is the
-    generic ``geometry`` sentinel, this falls back to ``stored`` rather than
-    always returning it — otherwise a never-measured dataset with a generic
-    empty column resolved to None and stayed classified ``table``, locked
-    out of feature writes despite plainly having a geometry column.
-    """
-    if measured is not None:
-        return measured
-    if declared is None:
-        return None
-    if declared != _GENERIC_GEOMETRY_TYPE:
-        return declared
-    return stored if stored is not None else _GENERIC_GEOMETRY_TYPE
-
-
-def _derived_record_type(current: str | None, geometry_type: str | None) -> str | None:
-    """``record_type`` as ``service_create.py`` derives it, for the two it owns."""
-    if current not in _DERIVED_RECORD_TYPES:
-        return current
-    return "table" if geometry_type is None else "vector_dataset"
-
-
-async def _retire_geometry_attribute_row(
-    session: Any, dataset_id: uuid.UUID, *, geometry_type: str | None
-) -> None:
-    """Retire the synthetic ``geom`` attribute row of a de-spatialized dataset.
-
-    ``refresh_attribute_metadata`` only touches this row for a non-null
-    ``geometry_type`` and excludes ``geom`` from its removed-column sweep by
-    name — right when a caller replaces contents while keeping shape, wrong
-    for the registered-PostGIS refresh (owner can drop the column) and the
-    reupload swap (CSV over a shapefile), whose relation can lose geometry
-    while keeping identity. Left stale, the attributes API and validation
-    service keep advertising a geometry field the relation no longer has.
-
-    fix(#1313) added this for the refresh path; fix(#1380) reuses it for the
-    reupload swap instead of a second copy. Pass the EFFECTIVE geometry
-    type (same value given to ``refresh_attribute_metadata``) and call
-    unconditionally — the null check lives inside so a caller can't hold
-    one half of the pair and forget the other.
-    """
-    if geometry_type is not None:
-        return
-
-    from app.platform.extensions import get_processing_port
-    from sqlalchemy import update
-
-    AttributeMetadata = get_processing_port().get_attribute_metadata_orm_class()
-    await session.execute(
-        update(AttributeMetadata)
-        .where(
-            AttributeMetadata.dataset_id == dataset_id,
-            AttributeMetadata.field_name == "geom",
-        )
-        .values(is_current=False)
-    )
+    if tile_cache is None:
+        return True
+    return await tile_cache.invalidate_table(table_name)
 
 
 # The AccessExclusiveLock budget the reupload swap DDL spends: first attempt,
@@ -1506,83 +1602,60 @@ _SWAP_FIRST_TIMEOUT = "5s"
 _SWAP_RETRY_TIMEOUT = "15s"
 _SWAP_RETRY_SLEEP_MS = 200
 
-# fix(#1921): the budget for the catalog wait that FOLLOWS the swap. The
-# transaction holds AccessExclusiveLock on the table it just installed across
-# it, so a holder that outlasts this is stuck, not working.
-_POST_SWAP_CATALOG_TIMEOUT = "60s"
 
-# fix(#1921): `lock_catalog_rows` reports an expired budget and a lost
-# deadlock alike, and the two send an operator looking for different things.
-_POST_SWAP_WAIT_FAILURES = {
-    "55P03": (
-        "reupload_swap_catalog_lock_timeout",
-        "The post-swap catalog wait expired. Find the holder of this "
-        "dataset's catalog.datasets row in pg_stat_activity.",
-    ),
-    "40P01": (
-        "reupload_swap_catalog_deadlock",
-        "PostgreSQL chose this swap as the deadlock victim. Look for the "
-        "other side of the cycle: a transaction holding this dataset's "
-        "catalog row and waiting on its live table.",
-    ),
-}
-_POST_SWAP_WAIT_UNKNOWN = (
-    "reupload_swap_catalog_lock_failed",
-    "The post-swap catalog wait failed and reported no SQLSTATE.",
-)
+async def _install_reupload_table(
+    session, *, dataset, staging_table: str, measurement: "Measurement"
+) -> None:
+    """Rename the staging table over the dataset's live table, in the caller's transaction.
+
+    The replaced table is kept as the dataset's previous version. The caller
+    takes the catalog rows next, then calls :func:`_write_reupload_catalog`.
+    """
+    await install_candidate_table(
+        session, dataset=dataset, candidate=staging_table, measurement=measurement
+    )
 
 
-async def _apply_reupload_swap(
+async def install_candidate_table(
     session,
     *,
     dataset,
-    staging_table: str,
-    metadata: dict,
-    sample_values: dict,
-    user_id: str,
-    source_filename: str | None,
-    source_format: str | None,
-    original_srid: int | None,
-    source_url: str | None = None,
-    file_hash: str | None = None,
-    origin_ref: dict[str, Any] | None = None,
-) -> Any:
-    """Apply shared atomic swap + version invariants for all reupload sources.
+    candidate: str,
+    measurement: "Measurement",
+    holding: str | None = None,
+) -> None:
+    """Make ``candidate`` the dataset's live table and keep the live one as its previous version.
 
-    ``origin_ref`` carries the typed per-origin payload for the bytes this
-    swap installs, minus the ``kind`` discriminator (derived from
-    ``source_format``). Same contract as ``IngestContext.origin_ref``: keys go
-    through the per-kind allowlist, and callers supply their own rather than
-    one being inferred here.
-
-    Returns the ``DatasetVersion`` this swap produced, flushed so its id is
-    populated. feat(#1219): the refresh run row links to that id, and building
-    the version here while resolving it by (dataset_id, version_number) at the
-    call site would be two ways to name one row.
+    Any older previous version is dropped. When ``candidate`` is the previous
+    version itself, the live table waits under ``holding`` until it can take
+    that name. The renames run on their own lock budget in the caller's
+    transaction, which keeps its ``lock_timeout`` afterwards.
     """
-    from app.modules.audit.service import (
-        AuditEvent,
-        audit_emit,
-    )  # LAZY — preserved per D-17
-    from app.platform.extensions import get_processing_port
-    from app.processing.ingest.metadata import (
-        compute_quality_score,
-        refresh_attribute_metadata,
-    )
-    from sqlalchemy import func, text
+    from sqlalchemy import text
 
-    port = get_processing_port()
-    DatasetVersion = port.get_dataset_version_orm_class()
-
-    actor_id = uuid.UUID(user_id)
-    new_version = dataset.current_version + 1
-    table_name = dataset.table_name
-
+    from app.platform.jobs.heartbeat import previous_version_table
     from app.processing.ingest.metadata import _qtable
+    from app.processing.ingest.previous_version import (
+        refuse_dependent_relations,
+        require_own_previous_version_name,
+    )
 
-    # Tenant schema for this ingest: same schema for staging, live, and _old tables
-    # (T-1209-07: staging→live RENAME must stay intra-schema so it is atomic DDL).
+    table_name = dataset.table_name
+    previous = previous_version_table(table_name, dataset.id)
+    keep = previous if candidate != previous else holding
+    if keep is None:
+        raise ValueError("Restoring the previous version needs a holding name")
+
+    # Tenant schema for this ingest: same schema for every table renamed
+    # (T-1209-07: the RENAMEs must stay intra-schema so they are atomic DDL).
     _tenant_schema = _current_tenant_schema()
+
+    def _q(name: str) -> str:
+        return _qtable(name, schema=_tenant_schema)
+
+    await require_own_previous_version_name(
+        session, dataset, previous, schema=_tenant_schema
+    )
 
     # Resolve live_exists once — independent of lock contention; this
     # SELECT does not need the AccessExclusiveLock we're about to acquire.
@@ -1594,48 +1667,56 @@ async def _apply_reupload_swap(
         {"schema": _tenant_schema, "tn": table_name},
     )
     live_exists = live_exists_result.scalar()
+    live_partitioned = await session.scalar(
+        text(
+            "SELECT EXISTS (SELECT 1 FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = :schema AND c.relname = :tn AND c.relkind = 'p')"
+        ),
+        {"schema": _tenant_schema, "tn": table_name},
+    )
 
     # ING-06 (P2-08): wrap the swap DDL in SAVEPOINTs + single retry on
     # lock_timeout. Autovacuum can hold AccessExclusiveLock long enough to
     # collide with the 5s default; bumping to 15s on retry plus a 200ms
     # sleep gives the autovacuum a chance to clear without surfacing the
     # failure to the user. Beyond this single retry we surface the error
-    # so ops can investigate. See:
-    #   .planning/audits/INGEST-AUDIT-2026-05-21.md (P2-08)
-    #   .planning/phases/1076-backend-ingest-p2-closure/1076-04-PLAN.md
+    # so ops can investigate.
 
     async def _swap_with_timeout(timeout_str: str) -> None:
-        """Run SET LOCAL lock_timeout + the 3 ALTER TABLE swap statements.
-
-        All three references (live, staging, _old) use the SAME _tenant_schema
-        so the RENAME operations are intra-schema (T-1209-07).
+        """Run SET LOCAL lock_timeout and the swap's DDL.
 
         The ``SET LOCAL`` outlives a released savepoint, so the caller restores
-        the previous value once the swap is done.
+        the previous value once the swap is done. Each table's primary key is
+        renamed as the table is, since the next rename needs the name it held.
         """
         await session.execute(text(f"SET LOCAL lock_timeout = '{timeout_str}'"))
-        if live_exists:
-            await session.execute(
-                text(
-                    f"ALTER TABLE {_qtable(table_name, schema=_tenant_schema)} "
-                    f'RENAME TO "{table_name}_old"'
-                )
-            )
-        await session.execute(
-            text(
-                f"ALTER TABLE {_qtable(staging_table, schema=_tenant_schema)} "
-                f'RENAME TO "{table_name}"'
-            )
+        await refuse_dependent_relations(
+            session, (table_name, previous), schema=_tenant_schema
         )
+        if candidate != previous:
+            # Without a live table there is nothing to keep, and an older
+            # previous version left in place would be stamped as this one's.
+            await session.execute(text(f"DROP TABLE IF EXISTS {_q(previous)}"))
         if live_exists:
             await session.execute(
-                text(
-                    f"DROP TABLE IF EXISTS {_qtable(table_name + '_old', schema=_tenant_schema)}"
-                )
+                text(f'ALTER TABLE {_q(table_name)} RENAME TO "{keep}"')
             )
-        # After the _old table (and its identically-named pkey index) is gone,
-        # give the new live table's PK its final name.
+            await rename_pkey_to_match_table(session, keep)
+        await session.execute(
+            text(f'ALTER TABLE {_q(candidate)} RENAME TO "{table_name}"')
+        )
         await rename_pkey_to_match_table(session, table_name)
+        if live_exists and keep != previous:
+            await session.execute(
+                text(f'ALTER TABLE {_q(keep)} RENAME TO "{previous}"')
+            )
+            await rename_pkey_to_match_table(session, previous)
+        if live_partitioned and candidate != previous:
+            # Its partitions would keep their own names under the renamed
+            # parent, where discovery lists them and registration accepts
+            # them, so a partitioned table is not kept.
+            await session.execute(text(f"DROP TABLE {_q(previous)}"))
 
     # fix(#1917): a `SET LOCAL` survives RELEASE SAVEPOINT, so the DDL budget
     # below outlives its savepoint and would clamp every later wait in this
@@ -1686,154 +1767,68 @@ async def _apply_reupload_swap(
         {"value": pre_swap_lock_timeout},
     )
 
-    # fix(#1373): resolve the geometry type ONCE from the relation the swap
-    # just installed, using the same `_declared_geometry_type`/
-    # `_effective_geometry_type` helpers as the refresh path — see their
-    # docstrings for the empty-relation trap this avoids. Read `stored`
-    # before the write below: it must be the PRE-swap value.
-    previous_geometry_type = dataset.geometry_type
-    effective_geometry_type = _effective_geometry_type(
-        measured=metadata["geometry_type"],
-        declared=await _declared_geometry_type(
-            session, schema=_tenant_schema, table=table_name
-        ),
-        stored=previous_geometry_type,
-    )
-
     # fix(#448): belt-and-braces after the swap — the staging pipeline is
     # responsible for the GIST index, but a re-ingest of a table that already
     # lost its index (the IF-NOT-EXISTS name-collision regression) must
     # self-heal here rather than serve full-scan tiles until the next audit.
-    if effective_geometry_type is not None:
+    if measurement.geometry_type is not None:
         from app.processing.ingest.metadata import ensure_geom_4326_gist_index
 
         await ensure_geom_4326_gist_index(session, table_name, schema=_tenant_schema)
 
-    # fix(#1847, #1917, #1921): the catalog writes start here and dirty both
-    # rows. The swap's DDL budget was put back above; this wait gets its own,
-    # and the value the transaction arrived with is restored after it.
-    from app.core.db.sqlstate import sqlstate
-    from app.platform.catalog_locks import (
-        CatalogLockConflict,
-        bump_tile_cache_version_on,
-        lock_catalog_rows,
-    )
+
+async def _write_reupload_catalog(
+    session,
+    *,
+    dataset,
+    measurement: "Measurement",
+    user_id: str,
+    source_filename: str | None,
+    source_format: str | None,
+    original_srid: int | None,
+    source_url: str | None = None,
+    file_hash: str | None = None,
+    origin_ref: dict[str, Any] | None = None,
+) -> tuple[Any, dict]:
+    """Write what the installed table holds onto the catalog rows the caller holds.
+
+    ``measurement`` is ``catalog_projection.measure`` of the staging table,
+    taken in this transaction.
+
+    ``origin_ref`` carries the typed per-origin payload for the bytes this
+    swap installs, minus the ``kind`` discriminator (derived from
+    ``source_format``). Same contract as ``IngestContext.origin_ref``: keys go
+    through the per-kind allowlist, and callers supply their own rather than
+    one being inferred here.
+
+    Returns the ``DatasetVersion`` this swap produced, flushed so the run row
+    can link to its id, and the schema diff the projection computed under the
+    lock, which is the diff the run stores. The tile-cache bump is the
+    caller's.
+    """
+    from app.modules.audit.service import (
+        AuditEvent,
+        audit_emit,
+    )  # LAZY — preserved per D-17
     from app.platform.extensions import get_processing_port
-    from sqlalchemy.exc import DBAPIError
-
-    _port = get_processing_port()
-    # fix(#1921): lock_catalog_rows rolls back before it raises, and a
-    # rolled-back session expires every loaded instance.
-    _log_dataset_id = str(dataset.id)
-    _wait_started = time.perf_counter()
-    try:
-        await lock_catalog_rows(
-            session,
-            dataset_cls=_port.get_dataset_orm_class(),
-            record_cls=_port.get_record_orm_class(),
-            dataset_id=dataset.id,
-            record_id=dataset.record_id,
-            lock_timeout=_POST_SWAP_CATALOG_TIMEOUT,
-        )
-    except CatalogLockConflict as conflict:
-        cause = conflict.__cause__
-        code = sqlstate(cause) if isinstance(cause, DBAPIError) else None
-        event, hint = _POST_SWAP_WAIT_FAILURES.get(code, _POST_SWAP_WAIT_UNKNOWN)
-        structlog.get_logger().warning(
-            event,
-            dataset_id=_log_dataset_id,
-            table_name=table_name,
-            waited_ms=round((time.perf_counter() - _wait_started) * 1000),
-            budget=_POST_SWAP_CATALOG_TIMEOUT,
-            sqlstate=code,
-            hint=(
-                f"{hint} The whole swap rolled back, so no half-swapped table is left."
-            ),
-        )
-        raise
-
-    structlog.get_logger().info(
-        "reupload_swap_catalog_lock_acquired",
-        dataset_id=_log_dataset_id,
-        table_name=table_name,
-        waited_ms=round((time.perf_counter() - _wait_started) * 1000),
-        budget=_POST_SWAP_CATALOG_TIMEOUT,
-    )
-    # fix(#1921): this wait's budget ends here, like the DDL's above it.
-    await session.execute(
-        text("SELECT set_config('lock_timeout', :value, true)"),
-        {"value": pre_swap_lock_timeout},
+    from app.processing.ingest.catalog_projection import project
+    from app.processing.ingest.previous_version import (
+        record_live_version,
+        stamp_previous_version,
     )
 
-    dataset.srid = metadata["srid"]
-    dataset.geometry_type = effective_geometry_type
-    # fix(#1361): modality is derived, so keep deriving it. `service_create.py`
-    # sets `record_type` from whether the dataset has geometry, and a reupload
-    # is one of the two operations that can change the answer afterwards.
-    # `build_assets` reads it live, so leaving it stale means a de-spatialized
-    # dataset goes on advertising vector-tile and OGC-Features links against a
-    # relation with no geometry column, and a newly-spatial one never advertises
-    # them at all. Fed the EFFECTIVE type rather than the sampled one, or an
-    # empty spatial reupload would flip a still-spatial dataset to `table`.
-    dataset.record.record_type = _derived_record_type(
-        dataset.record.record_type, effective_geometry_type
-    )
-    dataset.feature_count = metadata["feature_count"]
-    if metadata["extent_wkt"] is None:
-        dataset.record.spatial_extent = None
-    else:
-        dataset.record.spatial_extent = func.ST_GeomFromText(
-            metadata["extent_wkt"], 4326
-        )
-    dataset.column_info = metadata["column_info"]
-    dataset.sample_values = sample_values
+    DatasetVersion = get_processing_port().get_dataset_version_orm_class()
+    actor_id = uuid.UUID(user_id)
+    new_version = dataset.current_version + 1
 
-    await refresh_attribute_metadata(
-        session,
-        dataset.id,
-        metadata["column_info"],
-        geometry_type=effective_geometry_type,
-        sample_values=sample_values,
-    )
-    # fix(#1380): the one row that helper will not retire. Fed the EFFECTIVE
-    # type, like the refresh above it, so a reupload that empties a still-
-    # spatial table cannot retire the row of a relation whose geom column is
-    # right there.
-    await _retire_geometry_attribute_row(
-        session, dataset.id, geometry_type=effective_geometry_type
-    )
-
-    # fix(#1314): a reupload can flip a dataset between spatial and
-    # non-spatial, leaving the auto-generated `record_distributions` rows as
-    # stale as on the refresh path. Gated on the modality FLIP only —
-    # reconcile normalizes `is_primary`, and a reupload keeping modality has
-    # no business rewriting it.
-    #
-    # fix(#1373): the flip is read off the EFFECTIVE type — the same value
-    # written to `geometry_type`/`record_type` above — so all three agree.
-    # Demote is safe because `_declared_geometry_type` returns None exactly
-    # when there is no geom column (reconciling on a sampled None alone
-    # would wrongly delete distribution rows of a still-spatial dataset).
-    # Promote now also fires for a TABULAR dataset reuploaded from an empty
-    # spatial file, since a declared column type is written even then.
-    was_spatial = previous_geometry_type is not None
-    is_spatial = effective_geometry_type is not None
-    if was_spatial != is_spatial:
-        await port.reconcile_distributions(
-            session,
-            dataset.id,
-            dataset.record_id,
-            table_name,
-            geometry_type=effective_geometry_type,
-        )
+    await record_live_version(session, dataset)
+    schema_diff = await project(session, dataset, measurement)
+    await stamp_previous_version(session, dataset, dataset.current_version)
 
     dataset.source_format = source_format
     dataset.source_filename = source_filename
     dataset.original_srid = original_srid
     dataset.current_version = new_version
-    # fix(#1911): evaluated at write time, under the lock, so the counter read
-    # into `dataset` before the wait is never written back over a peer's commit.
-    await bump_tile_cache_version_on(session, dataset)
     dataset.record.updated_by = actor_id
     if source_url is not None:
         dataset.source_url = source_url
@@ -1872,26 +1867,20 @@ async def _apply_reupload_swap(
         dataset.last_checked_at = swap_time
     dataset.last_refreshed_at = swap_time
 
-    quality_score = await compute_quality_score(
-        session,
-        dataset.table_name,
-        metadata["column_info"],
-        dataset,
-        schema=_tenant_schema,
-    )
-    dataset.quality_detail = quality_score
-
     version = DatasetVersion(
         dataset_id=dataset.id,
         version_number=new_version,
         source_filename=source_filename,
         source_format=source_format,
-        feature_count=metadata["feature_count"],
-        srid=metadata["srid"],
+        feature_count=measurement.metadata.get("feature_count"),
+        srid=measurement.metadata.get("srid"),
         # The effective type, so the version history and the dataset row it
         # describes never disagree about what this swap installed (#1373).
-        geometry_type=effective_geometry_type,
+        geometry_type=measurement.geometry_type,
         file_hash=file_hash,
+        original_srid=original_srid,
+        is_3d=measurement.three_d.get("is_3d"),
+        n_dims=measurement.three_d.get("n_dims"),
         uploaded_by=actor_id,
     )
     session.add(version)
@@ -1911,4 +1900,4 @@ async def _apply_reupload_swap(
             },
         ),
     )
-    return version
+    return version, schema_diff

@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import uuid as uuid_mod
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal, TypedDict
 
 from fastapi import HTTPException, status
 from sqlalchemy import and_, exists, func, literal_column, or_, select
 from sqlalchemy.orm import aliased
 
-from app.core.geo import make_bbox_filter
+from app.core.geo import (
+    make_bbox_filter,
+    wrap_geometry_longitudes,
+    wrapped_spatial_filter,
+)
 from app.core.text import escape_ilike
 from app.modules.catalog.collections.models import CollectionDataset
 from app.modules.catalog.datasets.domain.models import (
@@ -219,6 +223,19 @@ def _build_text_filter(q: str):
     }
 
 
+def utc_midnight(day: date, days: int = 0) -> datetime:
+    """Midnight UTC starting ``day`` plus ``days``, saturating at year 9999.
+
+    timestamptz columns compared with a bare ``date`` bind use the database
+    session's TimeZone, which shifts the day on non-UTC servers.
+    """
+    try:
+        shifted = day + timedelta(days=days)
+    except OverflowError:
+        return datetime.max.replace(tzinfo=timezone.utc)
+    return datetime.combine(shifted, time.min, tzinfo=timezone.utc)
+
+
 def parse_ogc_datetime(datetime_str: str) -> tuple[date | None, date | None]:
     """Parse an OGC datetime interval string into (start, end) dates.
 
@@ -251,15 +268,11 @@ def _apply_common_filters(stmt, filters: SearchFilters, *, skip_text: bool = Fal
         text_clause, _parts = _build_text_filter(filters.q)
         stmt = stmt.where(text_clause)
     if filters.geometry_geojson:
-        geom = func.ST_SetSRID(func.ST_GeomFromGeoJSON(filters.geometry_geojson), 4326)
-        spatial_fn = (
-            func.ST_Within
-            if filters.spatial_predicate == "within"
-            else func.ST_Intersects
+        geom = wrap_geometry_longitudes(
+            func.ST_SetSRID(func.ST_GeomFromGeoJSON(filters.geometry_geojson), 4326)
         )
         stmt = stmt.where(
-            Record.spatial_extent.op("&&")(func.ST_Envelope(geom)),
-            spatial_fn(Record.spatial_extent, geom),
+            wrapped_spatial_filter(Record, geom, filters.spatial_predicate)
         )
     elif filters.bbox and len(filters.bbox) == 4:
         stmt = stmt.where(
@@ -303,7 +316,7 @@ def _apply_common_filters(stmt, filters: SearchFilters, *, skip_text: bool = Fal
                     and_(
                         Record.temporal_end.is_(None), Record.temporal_start.isnot(None)
                     ),
-                    and_(null_temporal, Record.created_at >= dt_start),
+                    and_(null_temporal, Record.created_at >= utc_midnight(dt_start)),
                 )
             )
         if dt_end is not None:
@@ -315,7 +328,7 @@ def _apply_common_filters(stmt, filters: SearchFilters, *, skip_text: bool = Fal
                     ),
                     and_(
                         null_temporal,
-                        Record.created_at < dt_end + timedelta(days=1),
+                        Record.created_at < utc_midnight(dt_end, 1),
                     ),
                 )
             )

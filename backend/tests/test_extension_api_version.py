@@ -102,11 +102,31 @@ class TestExtensionApiVersionConstant:
         request, inside a broad handler, as an empty list. Silent skew is what
         this check refuses, and release boundaries are not what it measures.
 
+        v13 adds the required ``cog_may_be_read`` method to ``CatalogPort``.
+        The replacement quota check asks it on every reupload request, so an
+        overlay that replaces the ``catalog_port`` key without it answers
+        AttributeError instead of admitting or refusing the upload.
+
+        v14 widens two ``ProcessingPort`` reads behind AI keyword suggestions.
+        ``get_catalog_vocabulary`` and ``get_keywords_for_records`` take the
+        caller's ``user`` and ``user_roles`` as required keywords, so the
+        vocabulary and similar-dataset keywords sent to the model come only from
+        records the caller may read. An overlay still implementing the old
+        signatures raises TypeError on every keyword suggestion request.
+
+        v15 adds the required ``stored_column_name`` and ``get_geometry_types``
+        methods to ``CatalogPort``. The file re-upload preview calls both, so
+        an overlay that replaces the ``catalog_port`` key without them answers
+        AttributeError on every file re-upload preview.
+
+        v16 adds the required ``restore_previous_version_task`` method to
+        ``CatalogPort``, which the previous-version restore route defers.
+
         Update this pin, and the note above it, whenever the constant moves.
         """
         from app.platform.extensions.version import EXTENSION_API_VERSION
 
-        assert EXTENSION_API_VERSION == 10
+        assert EXTENSION_API_VERSION == 16
 
 
 class TestCheckExtensionApiVersion:

@@ -8,6 +8,11 @@ import { semanticBadgeColors, validationLevelColors } from '@/lib/status-colors'
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
+  getValidationFieldLabel,
+  getValidationNavigationAction,
+} from '@/lib/dataset-validation-navigation';
+import type { ValidationIssue } from '@/types/api';
+import {
   deriveLikelyValidationCauses,
   ValidationTroubleshootPanel,
 } from '@/components/dataset/ValidationTroubleshootPanel';
@@ -15,12 +20,14 @@ import {
 interface ValidationStatusProps {
   datasetId: string;
   mode?: 'detailed' | 'compact';
+  canEdit?: boolean;
   onNavigateToField?: (field: string) => void;
 }
 
 export function ValidationStatus({
   datasetId,
   mode = 'detailed',
+  canEdit = false,
   onNavigateToField,
 }: ValidationStatusProps) {
   const { t } = useTranslation('dataset');
@@ -38,6 +45,23 @@ export function ValidationStatus({
   const errorCount = data.errors.length;
   const warningCount = data.warnings.length;
   const hasIssues = errorCount > 0 || warningCount > 0;
+  const renderFieldLabel = (issue: ValidationIssue) => {
+    const label = getValidationFieldLabel(issue.field, t);
+    if (!canEdit || !onNavigateToField || !getValidationNavigationAction(issue.field)) {
+      return <span className="font-medium">{label}:</span>;
+    }
+    return (
+      <button
+        type="button"
+        className="font-medium underline underline-offset-2 rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2"
+        onClick={() => onNavigateToField(issue.field)}
+        aria-label={`${t('validation.goToField')}: ${label}`}
+      >
+        {label}:
+      </button>
+    );
+  };
+
   const likelyCauses = deriveLikelyValidationCauses([...data.errors, ...data.warnings], 2, t);
 
   const helperText = errorCount > 0
@@ -82,7 +106,7 @@ export function ValidationStatus({
             onClick={() => setTroubleshootOpen(true)}
             data-testid="validation-troubleshoot-trigger"
           >
-            {t('validation.troubleshootAction')}
+            {t(canEdit ? 'validation.troubleshootAction' : 'overview.reviewIssues')}
           </Button>
         )}
         <ValidationTroubleshootPanel
@@ -90,6 +114,7 @@ export function ValidationStatus({
           onOpenChange={setTroubleshootOpen}
           errors={data.errors}
           warnings={data.warnings}
+          canEdit={canEdit}
           onNavigateToField={onNavigateToField}
         />
       </div>
@@ -103,7 +128,7 @@ export function ValidationStatus({
       {hasIssues && (
         <div className="space-y-2 rounded-md border border-border/70 bg-muted/30 px-3 py-2">
           <p className="text-sm text-foreground" data-testid="validation-helper-text">
-            {helperText}
+            {canEdit ? helperText : t('validation.readOnlyGuidance')}
           </p>
 
           {likelyCauses.length > 0 && (
@@ -125,7 +150,7 @@ export function ValidationStatus({
             onClick={() => setTroubleshootOpen(true)}
             data-testid="validation-troubleshoot-trigger"
           >
-            {t('validation.troubleshootAction')}
+            {t(canEdit ? 'validation.troubleshootAction' : 'overview.reviewIssues')}
           </Button>
         </div>
       )}
@@ -136,7 +161,7 @@ export function ValidationStatus({
             <li key={`err-${i}`} className="flex items-start gap-1.5 text-sm text-destructive">
               <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
               <span>
-                <span className="font-medium">{issue.field}:</span> {issue.message}
+                {renderFieldLabel(issue)} {issue.message}
               </span>
             </li>
           ))}
@@ -149,7 +174,7 @@ export function ValidationStatus({
             <li key={`warn-${i}`} className="flex items-start gap-1.5 text-sm text-warning">
               <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
               <span>
-                <span className="font-medium">{issue.field}:</span> {issue.message}
+                {renderFieldLabel(issue)} {issue.message}
               </span>
             </li>
           ))}
@@ -161,6 +186,7 @@ export function ValidationStatus({
         onOpenChange={setTroubleshootOpen}
         errors={data.errors}
         warnings={data.warnings}
+        canEdit={canEdit}
         onNavigateToField={onNavigateToField}
       />
     </div>

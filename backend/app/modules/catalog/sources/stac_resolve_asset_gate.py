@@ -25,7 +25,11 @@ from app.modules.catalog.sources.adapters.stac import (
     storable_href,
     storable_media_type,
 )
-from app.modules.catalog.sources.cog_info import fetch_cog_info, reconcile_epsg
+from app.modules.catalog.sources.cog_info import (
+    fetch_cog_info,
+    fetch_cog_nodata,
+    reconcile_epsg,
+)
 from app.modules.catalog.sources.origin_probe import (
     BLOCKED_BY_POLICY,
     MISSING,
@@ -42,6 +46,7 @@ from app.modules.catalog.sources.stac_resolve_identity import (
 from app.modules.catalog.sources.stac_resolve_taxonomy import (
     StacResolution,
     _ASSET_BLOCKED,
+    _ASSET_CRS_UNIDENTIFIED,
     _ASSET_GONE,
     _ASSET_UNADDRESSABLE,
     _ASSET_UNIDENTIFIED,
@@ -130,6 +135,25 @@ def _identity_refusal(
     return None
 
 
+async def _repair_nodata_if_unmoved(
+    href: str, *, moved: bool, repair_nodata: bool
+) -> str | None:
+    """The nodata-only backfill for an asset that did NOT move, or None.
+
+    Runs only when the asset stayed put. An SSRF refusal here only skips
+    the repair; the rest of the resolution is unaffected and still worth
+    adopting.
+    """
+    if moved or not repair_nodata:
+        return None
+    try:
+        await validate_url_for_ssrf(href)
+    except SSRFError:
+        return None
+    nodata = await fetch_cog_nodata(href)
+    return str(nodata) if nodata is not None else None
+
+
 async def _resolve_from_item(
     item: dict[str, Any],
     *,
@@ -143,11 +167,15 @@ async def _resolve_from_item(
     asset_key: str | None,
     credential: ServiceCredential | None = None,
     catalog_origin: str | None = None,
+    repair_nodata: bool = False,
 ) -> StacResolution:
     """Turn a fetched item document into a resolution, health included.
 
     One reading of one document, used by both paths, so the direct fetch and
     the re-search cannot reach different verdicts about the same shape.
+
+    ``repair_nodata`` asks for a nodata-only backfill when the asset did
+    not move. The caller sets it only while its stored value is missing.
 
     fix(#1764): the two reads this gate makes of its own go to addresses THIS
     DOCUMENT named, so each is gated on ``catalog_origin`` — the self link
@@ -264,7 +292,7 @@ async def _resolve_from_item(
         # so a credentialed asset that MOVED reads as unreadable rather than
         # re-describing. Carrying a key to the tiler is overlay work.
         metadata = await fetch_cog_info(href)
-        if metadata is None:
+        if metadata is None or metadata.get("not_geotiff"):
             # fix(#1266): the probe may have already settled this — 404/410
             # is conclusively gone, so keep that verdict rather than replace
             # it with an inconclusive one. Pointer is not adopted either way.
@@ -274,6 +302,12 @@ async def _resolve_from_item(
             # inconclusive, so the stored binding is unchanged and a retry
             # can succeed.
             return _ASSET_UNREADABLE
+        if metadata.get("crs_unidentified"):
+            return _ASSET_CRS_UNIDENTIFIED
+
+    repaired_nodata = await _repair_nodata_if_unmoved(
+        href, moved=href != asset_href, repair_nodata=repair_nodata
+    )
 
     # fix(#1266): properties/bbox read from the same document as the asset —
     # a canonical document that supersedes the representation supersedes its
@@ -300,6 +334,7 @@ async def _resolve_from_item(
         asset_metadata=metadata,
         epsg=reconcile_epsg(metadata or {}, declared_epsg),
         bbox=usable_bbox,
+        repaired_nodata=repaired_nodata,
     )
 
 

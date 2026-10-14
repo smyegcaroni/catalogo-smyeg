@@ -20,7 +20,7 @@ run ledger, varying only the binding unpacked and the task deferred.
 Registered PostGIS differs most (no URL, no SSRF check, no credential)
 and still goes through the same
 ``create_pending_run``/``defer_with_orphan_guard``/
-``make_refresh_run_failed_rollback`` -- parts that must not have two
+``make_ingest_job_failed_rollback`` -- parts that must not have two
 implementations.
 """
 
@@ -31,7 +31,7 @@ from dataclasses import dataclass
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import desc, select, text
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db.tenant_session import defer_async_with_tenant
@@ -39,6 +39,14 @@ from app.core.dependencies import get_db
 from app.core.identity import Identity
 from app.modules.auth.dependencies import require_permission
 from app.modules.catalog.authorization import check_dataset_write_access
+from app.modules.catalog.datasets.api.refresh_acceptance import (
+    accepted_refresh_fingerprint,
+    blocked_run_origin_kind,
+    consume_blocked_refresh_acceptance,
+    dispatch_upload_acceptance,
+    held_reupload_binding,
+    refuse_unless_reupload_source_current,
+)
 from app.modules.catalog.datasets.domain.schemas import (
     DatasetRefreshRequest,
     DatasetRefreshResponse,
@@ -56,9 +64,11 @@ from app.modules.catalog.sources.origin_probe import (
 from app.platform.dataset_origin import classify_origin, service_auth_required
 from app.platform.extensions import get_catalog_port
 from app.platform.jobs.defer_guard import (
+    RollbackCallable,
     defer_with_orphan_guard,
     make_ingest_job_failed_rollback,
 )
+from app.platform.jobs import ledger
 from app.platform.jobs.models import IngestJob
 from app.platform.refresh.credentials import (
     CredentialStoreUnavailable,
@@ -66,12 +76,7 @@ from app.platform.refresh.credentials import (
     discard_service_credential,
     stash_service_credential,
 )
-from app.platform.refresh.models import DatasetRefreshRun
-from app.platform.refresh.service import (
-    DatasetBusyError,
-    create_pending_run,
-    make_refresh_run_failed_rollback,
-)
+from app.platform.refresh.service import DatasetBusyError, create_pending_run
 from app.standards.ogc.errors import ERROR_RESPONSES_WRITE
 
 router = APIRouter(
@@ -113,41 +118,6 @@ class _ServiceOrigin:
     layer_name: str
 
 
-async def _accepted_refresh_fingerprint(
-    db: AsyncSession,
-    *,
-    dataset_id: uuid.UUID,
-    run_id: uuid.UUID | None,
-) -> str | None:
-    """Resolve the approval token from an actionable blocked run."""
-    if run_id is None:
-        return None
-    accepted_run = await db.scalar(
-        select(DatasetRefreshRun).where(
-            DatasetRefreshRun.id == run_id,
-            DatasetRefreshRun.dataset_id == dataset_id,
-            DatasetRefreshRun.status == "blocked",
-        )
-    )
-    verification = accepted_run.verification if accepted_run is not None else None
-    fingerprint = (
-        verification.get("review_fingerprint")
-        if isinstance(verification, dict)
-        else None
-    )
-    consumed_by = (
-        verification.get("acceptance_consumed_by_run_id")
-        if isinstance(verification, dict)
-        else None
-    )
-    if not isinstance(fingerprint, str) or consumed_by is not None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="The selected run is not an actionable blocked refresh.",
-        )
-    return fingerprint
-
-
 async def _prepare_blocked_refresh_acceptance(
     db: AsyncSession,
     *,
@@ -162,76 +132,30 @@ async def _prepare_blocked_refresh_acceptance(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Only service refreshes can accept a blocked publication.",
         )
-    return await _accepted_refresh_fingerprint(
+    return await accepted_refresh_fingerprint(
         db,
         dataset_id=dataset_id,
         run_id=run_id,
     )
 
 
-async def _consume_blocked_refresh_acceptance(
-    db: AsyncSession,
-    *,
-    dataset_id: uuid.UUID,
-    blocked_run_id: uuid.UUID,
-    new_run_id: uuid.UUID,
-    fingerprint: str,
-) -> None:
-    """Atomically mark the matching blocked run as consumed by this dispatch."""
-    consumed = await db.scalar(
-        text(
-            """
-            UPDATE catalog.dataset_refresh_runs
-            SET verification = verification || jsonb_build_object(
-                'acceptance_consumed_by_run_id', CAST(:new_run_id AS text)
-            )
-            WHERE id = :blocked_run_id
-              AND dataset_id = :dataset_id
-              AND status = 'blocked'
-              AND verification->>'review_fingerprint' = :fingerprint
-              AND NOT (verification ? 'acceptance_consumed_by_run_id')
-            RETURNING id
-            """
-        ),
-        {
-            "blocked_run_id": str(blocked_run_id),
-            "dataset_id": str(dataset_id),
-            "new_run_id": str(new_run_id),
-            "fingerprint": fingerprint,
-        },
-    )
-    if consumed is None:
-        await db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="The selected blocked refresh was already accepted or changed.",
-        )
+def _lease_releasing_rollback(
+    inner_rollback, *, credential_ref: str | None
+) -> RollbackCallable:
+    """A refresh door's defer rollback: the job and run, then its credential.
 
+    Failing the run gives back an acceptance it consumed; the credential is
+    discarded only when the job write landed.
+    """
 
-async def _release_blocked_refresh_acceptance(
-    db: AsyncSession,
-    *,
-    blocked_run_id: uuid.UUID | None,
-    new_run_id: uuid.UUID,
-) -> None:
-    """Make an acceptance reusable when its dispatch never reached the queue."""
-    if blocked_run_id is None:
-        return
-    await db.execute(
-        text(
-            """
-            UPDATE catalog.dataset_refresh_runs
-            SET verification = verification - 'acceptance_consumed_by_run_id'
-            WHERE id = :blocked_run_id
-              AND status = 'blocked'
-              AND verification->>'acceptance_consumed_by_run_id' = :new_run_id
-            """
-        ),
-        {
-            "blocked_run_id": str(blocked_run_id),
-            "new_run_id": str(new_run_id),
-        },
-    )
+    async def _rollback(defer_exc: BaseException) -> None:
+        if not await inner_rollback(defer_exc):
+            return
+        # Only a landed job write means no worker will redeem it. After a
+        # miss, the credential's TTL is the real guarantee.
+        await discard_service_credential(credential_ref)
+
+    return _rollback
 
 
 def _resolve_service_origin(dataset) -> _ServiceOrigin:
@@ -554,10 +478,10 @@ async def _dispatch_postgis_refresh(
             },
         )
 
-    job = IngestJob(
-        dataset_id=dataset_id,
+    job = ledger.create(
+        db,
         created_by=user.id,
-        status="pending",
+        dataset_id=dataset_id,
         # Deliberately NOT `reupload: True`. That marker means "a task is
         # replacing this dataset's data", and two pieces of shared SQL key off
         # it — the legacy-live admission probe and the abandoned-run sweep's
@@ -570,7 +494,6 @@ async def _dispatch_postgis_refresh(
             "origin_kind": "postgis",
         },
     )
-    db.add(job)
     await db.flush()
 
     try:
@@ -636,12 +559,8 @@ async def _dispatch_postgis_refresh(
     run_id = run.id
     await db.commit()
 
-    rollback = make_refresh_run_failed_rollback(
-        make_ingest_job_failed_rollback(
-            job, message_prefix="Failed to queue refresh task"
-        ),
-        db=db,
-        ingest_job_id=job_id,
+    rollback = make_ingest_job_failed_rollback(
+        job, message_prefix="Failed to queue refresh task"
     )
 
     async def _defer_refresh() -> None:
@@ -839,10 +758,10 @@ async def _dispatch_stac_refresh(
             detail=f"This dataset's stored STAC item URL is not reachable: {exc}",
         ) from exc
 
-    job = IngestJob(
-        dataset_id=dataset_id,
+    job = ledger.create(
+        db,
         created_by=user.id,
-        status="pending",
+        dataset_id=dataset_id,
         # Deliberately NOT `reupload: True`, for the reason the postgis door
         # gives: that marker means "a task is replacing this dataset's data",
         # and two pieces of shared SQL key off it to reason about swaps this
@@ -853,7 +772,6 @@ async def _dispatch_stac_refresh(
             "origin_kind": "stac",
         },
     )
-    db.add(job)
     await db.flush()
 
     try:
@@ -950,19 +868,11 @@ async def _dispatch_stac_refresh(
     run_id = run.id
     await db.commit()
 
-    inner_rollback = make_refresh_run_failed_rollback(
-        make_ingest_job_failed_rollback(
-            job, message_prefix="Failed to queue refresh task"
-        ),
-        db=db,
-        ingest_job_id=job_id,
+    inner_rollback = make_ingest_job_failed_rollback(
+        job, message_prefix="Failed to queue refresh task"
     )
 
-    async def _rollback(defer_exc: BaseException) -> None:
-        await inner_rollback(defer_exc)
-        # The worker will never come for it, and the run is already terminal.
-        # Best-effort; the TTL is the real guarantee.
-        await discard_service_credential(credential_ref)
+    _rollback = _lease_releasing_rollback(inner_rollback, credential_ref=credential_ref)
 
     async def _defer_refresh() -> None:
         await defer_async_with_tenant(
@@ -995,9 +905,9 @@ async def _prior_service_ingest_settings(
 
     Neither belongs in ``origin_ref`` — the allowlist there is deliberately
     the pointer and nothing else — but both change what a refresh produces.
-    ``object_id_field`` is the ArcGIS paging order key, and a service whose
-    key is not ``OBJECTID`` pages incorrectly without it; ``source_filename``
-    is what the version row and the dataset's display name carry forward.
+    ``object_id_field`` is the ArcGIS order key the worker falls back to
+    when it can't read the layer's own JSON; ``source_filename`` is what the
+    version row and the dataset's display name carry forward.
     Reading them from the previous job keeps a refresh reproducing the last
     good ingest rather than a default that happened to work for most
     services. Absent for a dataset whose jobs have aged out of retention, in
@@ -1051,6 +961,19 @@ async def refresh_dataset(
     Refuses with 409 ``dataset_busy`` while another refresh or re-upload is
     active for this dataset. A partial unique index prevents simultaneous
     requests from both being admitted.
+
+    ``accept_blocked_run_id`` accepts a blocked run once. A blocked service
+    refresh is fetched again and publishes only if the result matches the run
+    it accepts. A blocked service re-upload is fetched again from the dataset's
+    source and publishes only if its review reasons and changes match; it
+    answers 409 ``origin_changed`` once that source is not the one the
+    re-upload fetched. A blocked file replacement (an ``upload`` run) is replaced
+    again from the upload that run kept, and publishes only if its review
+    reasons and changes match. That answers 422 ``upload_unavailable`` once
+    the upload is gone, and 409 ``review_superseded`` once newer data has
+    replaced what the run was compared with. A review fingerprint is an acknowledgement, not a
+    secret: it keeps a replacement nobody reviewed from publishing, and any
+    caller with write access can still publish deliberately.
     """
     body = request or DatasetRefreshRequest()
     # feat(#1746): the structured credential is what the service layer takes;
@@ -1083,11 +1006,30 @@ async def refresh_dataset(
     # with it. Unnamed kinds fall through to the service path, whose
     # resolver answers `refresh_not_applicable` for originless kinds.
     origin_kind = classify_origin(dataset.source_format, dataset.record.record_type)
-    accepted_refresh_fingerprint = await _prepare_blocked_refresh_acceptance(
+    # The blocked run's door, not the dataset's origin: a file replacement of a
+    # service dataset is an upload run.
+    if (
+        await blocked_run_origin_kind(
+            db, dataset_id=dataset_id, run_id=body.accept_blocked_run_id
+        )
+        == "upload"
+    ):
+        return await dispatch_upload_acceptance(
+            db,
+            dataset=dataset,
+            dataset_id=dataset_id,
+            user=user,
+            run_id=body.accept_blocked_run_id,
+            token=service_token,
+        )
+    accepted_fingerprint = await _prepare_blocked_refresh_acceptance(
         db,
         dataset_id=dataset_id,
         run_id=body.accept_blocked_run_id,
         origin_kind=origin_kind,
+    )
+    reupload_binding = await held_reupload_binding(
+        db, dataset_id=dataset_id, run_id=body.accept_blocked_run_id
     )
     if origin_kind == "postgis":
         return await _dispatch_postgis_refresh(
@@ -1183,7 +1125,7 @@ async def refresh_dataset(
     # and quietly undo a re-upload that had already succeeded.
     #
     # Fix: read the dispatched binding only once the reservation exists.
-    # `_apply_reupload_swap`/`record_refresh_success` commit in ONE
+    # The swap and `record_refresh_success` commit in ONE
     # transaction, so a non-active run implies its swap is already
     # committed and visible (READ COMMITTED) -- either the other refresh
     # still holds the reservation (refused below, dataset_busy) or its
@@ -1195,15 +1137,14 @@ async def refresh_dataset(
     # re-read all dispatched state, refusing if the binding moved; (4)
     # fill the job from that; (5) stash the credential; (6) commit, defer.
     # Every refusal from (3) on rolls back the whole request.
-    job = IngestJob(
-        dataset_id=dataset_id,
+    job = ledger.create(
+        db,
         created_by=user_id,
-        status="pending",
+        dataset_id=dataset_id,
         # Enough to be a well-formed re-upload job; the source binding is
         # filled in below, from the read that happens after the reservation.
         user_metadata={"reupload": True, "dataset_id": str(dataset_id)},
     )
-    db.add(job)
     await db.flush()
 
     # Admission control and the history row, through the one implementation
@@ -1218,6 +1159,7 @@ async def refresh_dataset(
             triggered_by=user_id,
             ingest_job_id=job.id,
             feature_count_before=dataset.feature_count,
+            verification_policy=body.verification_policy,
         )
     except DatasetBusyError as exc:
         # The job row rolls back with the refusal, so a busy dataset leaves no
@@ -1281,12 +1223,15 @@ async def refresh_dataset(
     )
 
     if body.accept_blocked_run_id is not None:
-        await _consume_blocked_refresh_acceptance(
+        await refuse_unless_reupload_source_current(
+            db, reupload_binding, dataset.origin_ref
+        )
+        await consume_blocked_refresh_acceptance(
             db,
             dataset_id=dataset_id,
             blocked_run_id=body.accept_blocked_run_id,
             new_run_id=run.id,
-            fingerprint=accepted_refresh_fingerprint,
+            fingerprint=accepted_fingerprint,
         )
 
     # fix(#1277): the credential is judged by the policy the WORKER will
@@ -1325,17 +1270,18 @@ async def refresh_dataset(
         "layer_id": origin.layer_id,
         "source_type": "service_url",
         "object_id_field": object_id_field,
+        "verification_policy": body.verification_policy,
         # Records that this job's credential was request-scoped, so a
         # retry cannot reproduce the authenticated fetch. Same marker the
         # commit door writes; the value is a boolean, never the token.
         **({"service_auth_required": True} if service_token else {}),
-        # Distinguishes a server-side refresh from a dialog-driven
-        # re-upload in the job list, where both are `reupload: True`.
-        "refresh": True,
+        # A held re-upload's acceptance runs as a re-upload, judged on the
+        # changes its preview showed rather than on the data it fetched.
+        **({} if reupload_binding is not None else {"refresh": True}),
         **(
             {
                 "accepted_refresh_run_id": str(body.accept_blocked_run_id),
-                "accepted_refresh_fingerprint": accepted_refresh_fingerprint,
+                "accepted_refresh_fingerprint": accepted_fingerprint,
             }
             if body.accept_blocked_run_id is not None
             else {}
@@ -1379,24 +1325,11 @@ async def refresh_dataset(
     run_id = run.id
     await db.commit()
 
-    inner_rollback = make_refresh_run_failed_rollback(
-        make_ingest_job_failed_rollback(
-            job, message_prefix="Failed to queue refresh task"
-        ),
-        db=db,
-        ingest_job_id=job_id,
+    inner_rollback = make_ingest_job_failed_rollback(
+        job, message_prefix="Failed to queue refresh task"
     )
 
-    async def _rollback(defer_exc: BaseException) -> None:
-        await inner_rollback(defer_exc)
-        await _release_blocked_refresh_acceptance(
-            db,
-            blocked_run_id=body.accept_blocked_run_id,
-            new_run_id=run_id,
-        )
-        # The worker will never come for it, and the run is already terminal.
-        # Best-effort; the TTL is the real guarantee.
-        await discard_service_credential(credential_ref)
+    _rollback = _lease_releasing_rollback(inner_rollback, credential_ref=credential_ref)
 
     async def _defer_refresh() -> None:
         task = get_catalog_port().verified_refresh_service_task()
@@ -1416,6 +1349,7 @@ async def refresh_dataset(
             # ordinary service reupload. Procrastinate fails the unknown task;
             # the abandoned-run sweep then releases the pending run.
             credential_ref=credential_ref,
+            verification_policy=body.verification_policy,
         )
 
     await defer_with_orphan_guard(_defer_refresh, rollback=_rollback, db=db, job=job)

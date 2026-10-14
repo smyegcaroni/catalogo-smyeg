@@ -25,6 +25,7 @@ from app.modules.catalog.datasets.domain.models import (
     RecordKeyword,
     RecordTranslation,
 )
+from app.processing.raster.models import DatasetAsset
 
 from tests.factories import create_raster_dataset, get_user_id
 
@@ -1462,6 +1463,52 @@ async def test_number_matched_caps_collections_at_display_limit(
 
 
 @pytest.mark.anyio
+async def test_number_matched_all_types_counts_the_untyped_search(
+    client: AsyncClient,
+    test_db_session,
+    clean_tables,
+):
+    """With record_type set, numberMatchedAllTypes counts the untyped visible matches."""
+    session = test_db_session
+    admin_id = await get_user_id(session, "admin")
+    token = f"glall{uuid.uuid4().hex[:8]}"
+
+    for i in range(3):
+        await _create_search_dataset(
+            session, created_by=admin_id, name=f"{token} vector {i}"
+        )
+    await _create_search_dataset(
+        session,
+        created_by=admin_id,
+        name=f"{token} raster",
+        record_type="raster_dataset",
+    )
+    await _create_search_dataset(
+        session,
+        created_by=admin_id,
+        name=f"{token} hidden",
+        record_type="raster_dataset",
+        visibility="private",
+    )
+    session.add(
+        Collection(name=f"{token} collection", description="x", created_by=admin_id)
+    )
+    await session.commit()
+
+    typed = await client.get(
+        "/search/datasets/", params={"q": token, "record_type": "vector_dataset"}
+    )
+    assert typed.status_code == 200
+    assert typed.json()["numberMatched"] == 3
+    assert typed.json()["numberMatchedAllTypes"] == 5
+
+    untyped = await client.get("/search/datasets/", params={"q": token})
+    assert untyped.status_code == 200
+    assert untyped.json()["numberMatched"] == 5
+    assert untyped.json()["numberMatchedAllTypes"] is None
+
+
+@pytest.mark.anyio
 async def test_ogc_collections_list_raster_is_coverage_no_items_link(
     client: AsyncClient,
     admin_auth_header: dict,
@@ -1546,10 +1593,10 @@ async def test_search_datasets_raster_properties_survive_response_model(
             dtype="uint16",
             nodata="0",
             band_info=[
-                {"name": "Red", "dtype": "uint16", "nodata": 0},
-                {"name": "Green", "dtype": "uint16", "nodata": 0},
-                {"name": "Blue", "dtype": "uint16", "nodata": 0},
-                {"name": "NIR", "dtype": "uint16", "nodata": 0},
+                {"name": "Red", "dtype": "uint16", "nodata": "0.0"},
+                {"name": "Green", "dtype": "uint16", "nodata": "0.0"},
+                {"name": "Blue", "dtype": "uint16", "nodata": "0.0"},
+                {"name": "NIR", "dtype": "uint16", "nodata": "0.0"},
             ],
         ),
     )
@@ -1833,3 +1880,67 @@ async def test_search_pagination_stable_number_matched_with_collection(
     # Union of dataset ids across pages: no dupes, no drops.
     assert len(seen_dataset_ids) == len(set(seen_dataset_ids)), "duplicate dataset ids"
     assert set(seen_dataset_ids) == seeded_dataset_ids, "dropped or extra dataset ids"
+
+
+@pytest.mark.anyio
+async def test_asset_without_media_type_omits_type_key(
+    client: AsyncClient,
+    admin_auth_header: dict,
+    test_db_session,
+):
+    """STAC allows an asset with no ``type``, and both the STAC
+    import and STAC refresh paths store such an asset with
+    ``DatasetAsset.media_type=None``. ``OGCAsset.type`` used to be a
+    required str, so any OGC Records response including that asset (search,
+    the single record, and the STAC item) failed Pydantic validation.
+
+    Pins the fix across all three read paths: 200, and the asset entry
+    carries no ``type`` key (rather than an explicit null, matching how
+    ``_build_stac_assets`` already omits the key for the same reason).
+    """
+    session = test_db_session
+    admin_id = await get_user_id(session, "admin")
+    token = uuid.uuid4().hex[:10]
+
+    dataset = await create_raster_dataset(
+        session,
+        created_by=admin_id,
+        name=f"Typeless Asset {token}",
+        create_raster_asset=True,
+    )
+    session.add(
+        DatasetAsset(
+            dataset_id=dataset.id,
+            key="data",
+            href=f"https://stac.example.com/{token}/asset.tif",
+            roles=["data"],
+        )
+    )
+    await session.commit()
+
+    search_resp = await client.get(
+        "/search/datasets/",
+        params={"q": f"Typeless Asset {token}", "limit": 10},
+        headers=admin_auth_header,
+    )
+    assert search_resp.status_code == 200, search_resp.text
+    features = {f["id"]: f for f in search_resp.json()["features"]}
+    search_asset = features[str(dataset.id)]["assets"]["data"]
+    assert "type" not in search_asset
+    assert search_asset["href"] == f"https://stac.example.com/{token}/asset.tif"
+
+    record_resp = await client.get(
+        f"/collections/datasets/items/{dataset.id}",
+        headers=admin_auth_header,
+    )
+    assert record_resp.status_code == 200, record_resp.text
+    record_asset = record_resp.json()["assets"]["data"]
+    assert "type" not in record_asset
+
+    stac_resp = await client.get(
+        f"/stac/items/{dataset.id}",
+        headers=admin_auth_header,
+    )
+    assert stac_resp.status_code == 200, stac_resp.text
+    stac_asset = stac_resp.json()["assets"]["data"]
+    assert "type" not in stac_asset

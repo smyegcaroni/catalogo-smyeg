@@ -4,6 +4,8 @@ import { useAuthStore } from '@/stores/auth-store';
 import { LoadingState } from '@/components/layout/LoadingState';
 import { ErrorState } from '@/components/layout/ErrorState';
 import { AppErrorBoundary } from '@/components/error';
+import { ApiError } from '@/api/client';
+import { MapUnavailableState } from '@/components/map/MapUnavailableState';
 import { useMapAccess } from '@/hooks/use-maps';
 import { useDocumentTitle } from '@/hooks/use-document-title';
 import { useTranslation } from 'react-i18next';
@@ -14,6 +16,18 @@ const MapBuilderPage = lazy(() =>
 const PublicMapViewerPage = lazy(() =>
   import('./PublicMapViewerPage').then((m) => ({ default: m.PublicMapViewerPage })),
 );
+
+/**
+ * The Suspense fallback below, not the gate itself: only this is mounted
+ * while a branch's chunk is still loading, so only it can own the title for
+ * that window without racing the branch's own effect once it mounts. A
+ * chunk that fails to load leaves this as the last title set, since
+ * AppErrorBoundary's fallback doesn't touch it.
+ */
+function MapLoadingFallback({ title }: { title: string }) {
+  useDocumentTitle(title);
+  return <LoadingState />;
+}
 
 /**
  * Route-level gate for /maps/:id.
@@ -35,9 +49,6 @@ const PublicMapViewerPage = lazy(() =>
  */
 export function MapViewerGate() {
   const { t } = useTranslation('common');
-  // fix(#438): UX-09 — covers the gate's own loading states. Both lazy children
-  // set a more specific title once they mount.
-  useDocumentTitle(t('pageTitle.map'));
   const { id } = useParams<{ id: string }>();
   const [searchParams] = useSearchParams();
   const hasToken = useAuthStore((s) => !!s.token);
@@ -45,6 +56,15 @@ export function MapViewerGate() {
   const editorFallback = useAuthStore((s) => s.isEditor());
   const shouldCheckAccess = !!id && hasToken && !!user;
   const accessQuery = useMapAccess(id, { enabled: shouldCheckAccess });
+
+  // Own the title only for the gate's own loading/error UI below. A branch
+  // sets its own once it renders; asserting one here too can stomp it if
+  // both happen to mount in the same commit.
+  const isOwnLoadingOrError =
+    (hasToken && !user) ||
+    (shouldCheckAccess && accessQuery.isLoading) ||
+    (shouldCheckAccess && accessQuery.isError);
+  useDocumentTitle(isOwnLoadingOrError ? t('pageTitle.map') : null);
 
   // fix(#1778): React.lazy() only fires its import() at first render of
   // <MapBuilderPage/>, so the chunk download used to serialize BEHIND the
@@ -70,9 +90,15 @@ export function MapViewerGate() {
     return <LoadingState />;
   }
 
-  // fix(#438): UX-14 — a failed access check used to fall through to
-  // `data?.can_edit === true` → false, silently downgrading an editor to the
-  // read-only viewer. Surface the failure with a retry instead of guessing.
+  // A failed check offers a retry so an editor is never silently downgraded.
+  // A 404 is final for a missing or hidden map, and it has to win over the
+  // last good access data React Query keeps across a failed refetch.
+  const isAccessCheckNotFound =
+    accessQuery.error instanceof ApiError && accessQuery.error.status === 404;
+  if (shouldCheckAccess && accessQuery.isError && isAccessCheckNotFound) {
+    return <MapUnavailableState error={accessQuery.error} mapId={id} />;
+  }
+
   if (shouldCheckAccess && accessQuery.isError) {
     return (
       <div className="flex flex-1 items-center justify-center p-6">
@@ -91,7 +117,7 @@ export function MapViewerGate() {
 
   return (
     <AppErrorBoundary>
-      <Suspense fallback={<LoadingState />}>
+      <Suspense fallback={<MapLoadingFallback title={t('pageTitle.map')} />}>
         {canEdit && !previewAsViewer ? <MapBuilderPage /> : <PublicMapViewerPage />}
       </Suspense>
     </AppErrorBoundary>

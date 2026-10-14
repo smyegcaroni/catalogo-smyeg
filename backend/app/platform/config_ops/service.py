@@ -12,6 +12,7 @@ import time
 import uuid
 from collections import Counter
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -22,6 +23,8 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.platform.config_ops.exceptions import (
+    ConfigApplyError,
+    ConfigBusyError,
     ConfigLockedError,
     ConfigPreviewError,
     ConfigValidationError,
@@ -117,12 +120,22 @@ async def export_config(db: AsyncSession) -> dict:
 
     OAuth provider secrets are redacted (client_secret_encrypted omitted).
     """
-    from app.core.persistent_config import _registry
+    from app.core.persistent_config import (
+        LLM_MODEL,
+        LLM_MODEL_LIGHT,
+        LLM_PROVIDER,
+        _registry,
+    )
     from app.modules.auth.oauth import service as oauth_service
 
     settings_dict: dict[str, Any] = {}
     for cfg in _registry:
-        settings_dict[cfg.key] = await cfg.get(db)
+        if cfg in (LLM_MODEL, LLM_MODEL_LIGHT):
+            # Registry order exports the provider first; models follow it.
+            provider = settings_dict[LLM_PROVIDER.key]
+            settings_dict[cfg.key] = await cfg.for_provider(db, provider)
+        else:
+            settings_dict[cfg.key] = await cfg.get(db)
 
     providers = await oauth_service.list_providers(db, include_saml_fields=True)
     providers_list = [_provider_to_dict(p) for p in providers]
@@ -158,6 +171,7 @@ class ConfigImportPlan:
     payload_digest: str
     state_digest: str
     caller_is_enterprise: bool
+    prospective_settings: dict[str, Any] = dataclass_field(default_factory=dict)
 
 
 async def acquire_config_import_lock(db: AsyncSession) -> None:
@@ -256,12 +270,20 @@ def _issue_preview_token(plan: ConfigImportPlan, mode: ImportMode) -> str:
     return f"{_urlsafe_encode(payload)}.{_urlsafe_encode(signature)}"
 
 
+def _requires_preview(plan: ConfigImportPlan, mode: ImportMode) -> bool:
+    """Overwrite, and any import that would delete every stored embedding."""
+    return mode == "overwrite" or any(
+        change.get("reason_code") == "embedding_width_changed"
+        for change in plan.setting_changes
+    )
+
+
 def _verify_preview_token(
     token: str | None, plan: ConfigImportPlan, mode: ImportMode
 ) -> None:
     message = (
-        "A current matching dry-run is required before overwrite; preview the "
-        "configuration again and retry."
+        "A current matching dry-run is required before applying this import; "
+        "preview the configuration again and retry."
     )
     if not token:
         raise ConfigPreviewError(message)
@@ -546,16 +568,35 @@ async def _load_setting_state(
     registry: list[Any],
 ) -> tuple[dict[str, Any], set[str], set[str]]:
     """Load effective values plus source and stored-validity markers."""
-    from app.core.persistent_config import _validate_or_fallback
+    from app.core.persistent_config import (
+        LLM_MODEL,
+        LLM_MODEL_LIGHT,
+        LLM_PROVIDER,
+        _validate_or_fallback,
+        is_unset_model,
+    )
 
     result = await db.execute(select(AppSetting.key, AppSetting.value))
-    stored_settings = {key: value for key, value in result.all()}
+    stored_settings = {
+        key: value
+        for key, value in result.all()
+        if not is_unset_model(
+            key, value["v"] if isinstance(value, dict) and "v" in value else value
+        )
+    }
     overridden_keys = set(stored_settings)
     current_settings: dict[str, Any] = {}
     valid_stored_keys: set[str] = set()
+
+    async def default_of(cfg: Any) -> Any:
+        # Registry order loads the provider first; models follow this read.
+        if cfg in (LLM_MODEL, LLM_MODEL_LIGHT) and LLM_PROVIDER.key in current_settings:
+            return await cfg.default_for(db, current_settings[LLM_PROVIDER.key])
+        return await cfg.resolved_default(db)
+
     for cfg in registry:
         if cfg.key not in stored_settings:
-            current_settings[cfg.key] = cfg.env_default
+            current_settings[cfg.key] = await default_of(cfg)
             continue
         raw_value = stored_settings[cfg.key]
         unwrapped = (
@@ -564,10 +605,44 @@ async def _load_setting_state(
             else raw_value["v"]
         )
         current_value, stored_value_is_valid = _validate_or_fallback(cfg, unwrapped)
+        if not stored_value_is_valid:
+            current_value = await default_of(cfg)
         current_settings[cfg.key] = current_value
         if stored_value_is_valid:
             valid_stored_keys.add(cfg.key)
     return current_settings, overridden_keys, valid_stored_keys
+
+
+_REASONS = {
+    "unknown_setting": "Unknown setting key; retained for forward compatibility.",
+    "restricted_setting": "Setting is not writable in the current runtime.",
+    "pins_runtime_default": "Pins the current runtime default as a database override.",
+    "repairs_invalid_override": "Repairs an invalid database override.",
+    "omitted_reset_to_default": (
+        "Omitted from overwrite payload; reset to runtime default."
+    ),
+    "embedding_model_changed": (
+        "Changes the embedding model: stored embeddings from the previous "
+        "model need regenerating."
+    ),
+    "embedding_width_changed": (
+        "Changes the embedding column width: every stored embedding is deleted "
+        "and must be regenerated."
+    ),
+}
+
+
+def _reason(code: str | None) -> dict[str, str]:
+    """The ``reason`` and ``reason_code`` fields of a setting change."""
+    if code is None:
+        return {}
+    return {"reason": _REASONS[code], "reason_code": code}
+
+
+def _overwrite_reset_code(key: str, current: Any, imported: Any) -> str:
+    if key == "embedding_model" and current != imported:
+        return "embedding_model_changed"
+    return "omitted_reset_to_default"
 
 
 def _build_setting_changes(
@@ -577,11 +652,16 @@ def _build_setting_changes(
     current_settings: dict[str, Any],
     overridden_keys: set[str],
     valid_stored_keys: set[str],
+    blank_model_defaults: dict[str, str],
     *,
     caller_is_enterprise: bool,
     enterprise_only_tabs: set[str] | frozenset[str],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Create source-aware setting diffs and the exact write subset."""
+    """Create source-aware setting diffs and the exact write subset.
+
+    ``blank_model_defaults`` maps each blank model key to the provider default
+    it resets to; writing the blank removes the override.
+    """
     settings_to_apply: dict[str, Any] = {}
     changes: list[dict[str, Any]] = []
     for key, raw_value in raw_settings.items():
@@ -593,7 +673,7 @@ def _build_setting_changes(
                     current=None,
                     imported=raw_value,
                     action="skip_unknown",
-                    reason="Unknown setting key; retained for forward compatibility.",
+                    **_reason("unknown_setting"),
                 ).model_dump()
             )
             continue
@@ -604,13 +684,26 @@ def _build_setting_changes(
                     current=current_settings[key],
                     imported=raw_value,
                     action="skip_restricted",
-                    reason="Setting is not writable in the current runtime.",
+                    **_reason("restricted_setting"),
                 ).model_dump()
             )
             continue
 
         value = validated_settings[key]
         current = current_settings[key]
+        if key in blank_model_defaults:
+            resets = key in overridden_keys
+            if resets:
+                settings_to_apply[key] = value
+            changes.append(
+                SettingChange(
+                    key=key,
+                    current=current,
+                    imported=blank_model_defaults[key],
+                    action="reset" if resets else "no_change",
+                ).model_dump()
+            )
+            continue
         pins_runtime_default = key not in overridden_keys and current == value
         repairs_invalid_override = (
             key in overridden_keys and key not in valid_stored_keys
@@ -620,18 +713,20 @@ def _build_setting_changes(
         )
         if needs_write:
             settings_to_apply[key] = value
-        reason = None
+        reason_code = None
         if pins_runtime_default:
-            reason = "Pins the current runtime default as a database override."
+            reason_code = "pins_runtime_default"
         elif repairs_invalid_override:
-            reason = "Repairs an invalid database override."
+            reason_code = "repairs_invalid_override"
+        if current != value and key == "embedding_model":
+            reason_code = "embedding_model_changed"
         changes.append(
             SettingChange(
                 key=key,
                 current=current,
                 imported=value,
                 action="update" if needs_write else "no_change",
-                reason=reason,
+                **_reason(reason_code),
             ).model_dump()
         )
     return settings_to_apply, changes
@@ -665,6 +760,36 @@ async def _load_oauth_account_rows(
     return list(result.all())
 
 
+def _flag_embedding_width_deletion(
+    live: int | None,
+    setting_changes: list[dict[str, Any]],
+    validated_settings: dict[str, Any],
+    mode: ImportMode,
+    registry_map: dict[str, Any],
+) -> None:
+    """Warn when applying the import resizes the live embedding column.
+
+    The apply step reconciles against the column's real width, which can differ
+    from the saved setting, so the comparison uses storage and not the diff.
+    """
+    cfg = registry_map["embedding_dims"]
+    if cfg.key in validated_settings:
+        effective = validated_settings[cfg.key]
+    elif mode == "overwrite":
+        effective = cfg.env_default
+    else:
+        return
+    if live is None or int(effective) == live:
+        return
+    for change in setting_changes:
+        if change["key"] == cfg.key:
+            change.update(_reason("embedding_width_changed"))
+            # The apply reconciles the column even when the stored value
+            # already matches, so the change is something to apply.
+            if change["action"] == "no_change":
+                change["action"] = "update"
+
+
 async def preflight_import(
     db: AsyncSession,
     data: dict[str, Any],
@@ -676,7 +801,11 @@ async def preflight_import(
     from app.core.edition import is_enterprise
     from app.core.persistent_config import (
         ENTERPRISE_ONLY_TABS,
+        LLM_MODEL,
+        LLM_MODEL_LIGHT,
+        LLM_PROVIDER,
         _registry,
+        is_unset_model,
     )
     from app.core.public_urls import _is_env_only
     from app.modules.auth.oauth import service as oauth_service
@@ -718,6 +847,37 @@ async def preflight_import(
         db,
         _registry,
     )
+    # Model defaults follow the provider this import leaves in place.
+    final_provider = validated_settings.get(
+        "llm_provider",
+        LLM_PROVIDER.env_default
+        if mode == "overwrite"
+        else current_settings["llm_provider"],
+    )
+    # Overlay providers resolve their endpoint from settings, so the defaults
+    # must see the endpoint this import writes, not the committed one.
+    prospective_settings = dict(current_settings)
+    if mode == "overwrite":
+        prospective_settings.update(
+            {
+                cfg.key: cfg.env_default
+                for cfg in _registry
+                if cfg.key not in raw_settings
+                and (caller_is_enterprise or cfg.tab not in ENTERPRISE_ONLY_TABS)
+            }
+        )
+    prospective_settings.update(validated_settings)
+    model_defaults = {
+        cfg.key: await cfg.default_for(
+            db, final_provider, settings=prospective_settings
+        )
+        for cfg in (LLM_MODEL, LLM_MODEL_LIGHT)
+    }
+    blank_model_defaults = {
+        key: default
+        for key, default in model_defaults.items()
+        if is_unset_model(key, validated_settings.get(key))
+    }
     settings_to_apply, setting_changes = _build_setting_changes(
         raw_settings,
         registry_map,
@@ -725,6 +885,7 @@ async def preflight_import(
         current_settings,
         overridden_keys,
         valid_stored_keys,
+        blank_model_defaults,
         caller_is_enterprise=caller_is_enterprise,
         enterprise_only_tabs=ENTERPRISE_ONLY_TABS,
     )
@@ -735,15 +896,28 @@ async def preflight_import(
                 continue
             if not caller_is_enterprise and cfg.tab in ENTERPRISE_ONLY_TABS:
                 continue
+            imported = cfg.env_default
+            if cfg.key in model_defaults:
+                imported = model_defaults[cfg.key]
+            reason_code = _overwrite_reset_code(
+                cfg.key, current_settings[cfg.key], imported
+            )
             setting_changes.append(
                 SettingChange(
                     key=cfg.key,
                     current=current_settings[cfg.key],
-                    imported=cfg.env_default,
+                    imported=imported,
                     action="reset",
-                    reason="Omitted from overwrite payload; reset to runtime default.",
+                    **_reason(reason_code),
                 ).model_dump()
             )
+
+    from app.processing.embeddings.service import live_embedding_column_width
+
+    live_column_width = await live_embedding_column_width(db)
+    _flag_embedding_width_deletion(
+        live_column_width, setting_changes, validated_settings, mode, registry_map
+    )
 
     existing_providers = await oauth_service.list_providers(
         db, include_saml_fields=True
@@ -797,6 +971,7 @@ async def preflight_import(
     state_digest = _canonical_digest(
         {
             "enterprise": caller_is_enterprise,
+            "embedding_column_width": live_column_width,
             "settings": [
                 {
                     "key": cfg.key,
@@ -831,6 +1006,7 @@ async def preflight_import(
         payload_digest=payload_digest,
         state_digest=state_digest,
         caller_is_enterprise=caller_is_enterprise,
+        prospective_settings=prospective_settings,
     )
 
 
@@ -852,7 +1028,7 @@ async def dry_run_import(
             "dependent_accounts_deleted": plan.oauth_accounts_deleted,
         },
         preview_token=(
-            _issue_preview_token(plan, mode) if mode == "overwrite" else None
+            _issue_preview_token(plan, mode) if _requires_preview(plan, mode) else None
         ),
     )
 
@@ -976,101 +1152,215 @@ async def import_config(
     """Import configuration, applying settings and OAuth provider changes.
 
     Merge upserts settings and matches OAuth by slug; overwrite resets then
-    reapplies both. Preview and apply share the same preflight plan; overwrite
-    additionally requires the signed token from a matching, current dry-run.
+    reapplies both. Preview and apply share the same preflight plan; overwrite,
+    and any import that would delete the stored embeddings, additionally require
+    the signed token from a matching, current dry-run.
     """
     from app.core.persistent_config import (
+        EMBEDDING_DIMS,
+        EMBEDDING_MODEL,
         ENTERPRISE_ONLY_TABS,
         _registry,
         apply_side_effects_batch,
+        provider_model_kwargs,
     )
     from app.modules.audit.service import (
         AuditEvent,
         audit_emit,
     )  # LAZY — preserved per D-17
-
-    # Database-enforced write fence covering state recompute, confirmation
-    # check, and apply — otherwise a concurrent transaction could commit
-    # after the state read against an already-stale token.
-    await acquire_config_import_lock(db)
-    plan = await preflight_import(
-        db,
-        data,
-        mode,
-        lock_dependent_accounts=mode == "overwrite",
+    from app.processing.embeddings.service import (
+        EmbeddingColumnRebuildError,
+        EmbeddingChangeBusyError,
+        embedding_change_lock,
+        read_committed_embedding_pair,
+        rebuild_column_or_restore,
     )
-    if mode == "overwrite":
-        _verify_preview_token(preview_token, plan, mode)
 
-    registry_map = {cfg.key: cfg for cfg in _registry}
-    settings_no_change = len(plan.validated_settings) - len(plan.settings_to_apply)
-    settings_skipped = (
-        len(plan.skipped_unknown) + len(plan.skipped_restricted) + settings_no_change
+    # Invalid input, env-only mode and a stale preview get their own answer
+    # whatever the lock state: the read-only preflight runs before the lock,
+    # and again under the fence below, where its plan is the one applied.
+    early_plan = await preflight_import(db, data, mode)
+    if _requires_preview(early_plan, mode):
+        _verify_preview_token(preview_token, early_plan, mode)
+
+    # Taken before the settings fence and any write, so no request waits for
+    # the lock's connection while holding locks another write may wait on.
+    # The plan needs the fence, so the payload decides whether to lock.
+    raw_settings = data.get("settings")
+    names_embedding = isinstance(raw_settings, dict) and (
+        EMBEDDING_DIMS.key in raw_settings or EMBEDDING_MODEL.key in raw_settings
     )
-    settings_applied = len(plan.settings_to_apply)
+    reverted_on_failure: list[str] = []
+    try:
+        async with embedding_change_lock(mode == "overwrite" or names_embedding, db=db):
+            # Database-enforced write fence covering state recompute, confirmation
+            # check, and apply — otherwise a concurrent transaction could commit
+            # after the state read against an already-stale token.
+            await acquire_config_import_lock(db)
+            plan = await preflight_import(
+                db,
+                data,
+                mode,
+                lock_dependent_accounts=mode == "overwrite",
+            )
+            if _requires_preview(plan, mode):
+                _verify_preview_token(preview_token, plan, mode)
 
-    # fix(#430): with commit=False, set()/reset() DEFER their side effects
-    # (cache invalidation, _on_change hooks, rate-limit warm) — running them
-    # pre-commit flipped process-local state a rollback wouldn't restore.
-    # Apply side effects only after the terminal commit succeeds.
-    deferred_side_effects: list = []
+            # A width already stored but not matching the live column is still
+            # applied: the rebuild below reconciles it.
+            reconciles_width = EMBEDDING_DIMS.key in plan.validated_settings and (
+                EMBEDDING_DIMS.key not in plan.settings_to_apply
+                and any(
+                    change["key"] == EMBEDDING_DIMS.key
+                    and change.get("reason_code") == "embedding_width_changed"
+                    for change in plan.setting_changes
+                )
+            )
+            settings_no_change = (
+                len(plan.validated_settings)
+                - len(plan.settings_to_apply)
+                - int(reconciles_width)
+            )
+            settings_skipped = (
+                len(plan.skipped_unknown)
+                + len(plan.skipped_restricted)
+                + settings_no_change
+            )
+            settings_applied = len(plan.settings_to_apply) + int(reconciles_width)
 
-    if mode == "overwrite":
-        for cfg in _registry:
-            if cfg.key in plan.validated_settings:
-                continue
-            if not plan.caller_is_enterprise and cfg.tab in ENTERPRISE_ONLY_TABS:
-                continue
-            await cfg.reset(db, user_id=user_id, ip_address=ip_address, commit=False)
-            deferred_side_effects.append((cfg, cfg.env_default))
+            # set()/reset() with commit=False defer their side effects (cache
+            # invalidation, _on_change hooks, rate-limit warm): run before the
+            # commit, they flip process-local state a rollback wouldn't restore.
+            deferred_side_effects: list = []
 
-    for key, value in plan.settings_to_apply.items():
-        cfg = registry_map[key]
-        await cfg.set(db, value, user_id=user_id, ip_address=ip_address, commit=False)
-        deferred_side_effects.append((cfg, value))
+            # One pass in registry order, so the provider reaches its final value
+            # before a model setting that resolves against it is written or reset.
+            # Audits record the values from before the import.
+            resets = [
+                cfg
+                for cfg in _registry
+                if mode == "overwrite"
+                and cfg.key not in plan.validated_settings
+                and (plan.caller_is_enterprise or cfg.tab not in ENTERPRISE_ONLY_TABS)
+            ]
+            touched = [
+                cfg
+                for cfg in _registry
+                if cfg.key in plan.settings_to_apply or cfg in resets
+            ]
+            before = {cfg.key: await cfg.get(db) for cfg in touched}
+            snapshot = plan.prospective_settings
+            # An import that names the width reconciles the column even when the
+            # setting already holds it; the rebuild compares against the live
+            # column.
+            carries_dims = (
+                EMBEDDING_DIMS.key in plan.validated_settings
+                or EMBEDDING_DIMS in resets
+            )
+            embedding_before = new_dims = None
+            if carries_dims:
+                embedding_before = await read_committed_embedding_pair(
+                    db, with_model=EMBEDDING_MODEL in touched
+                )
+                reverted_on_failure = [EMBEDDING_DIMS.key]
+                if EMBEDDING_MODEL in touched:
+                    reverted_on_failure.append(EMBEDDING_MODEL.key)
+                new_dims = plan.validated_settings.get(
+                    EMBEDDING_DIMS.key, EMBEDDING_DIMS.env_default
+                )
+            for cfg in touched:
+                if cfg.key in plan.settings_to_apply:
+                    value = plan.settings_to_apply[cfg.key]
+                    await cfg.set(
+                        db,
+                        value,
+                        user_id=user_id,
+                        ip_address=ip_address,
+                        commit=False,
+                        old_value=before[cfg.key],
+                        **provider_model_kwargs(cfg, snapshot),
+                    )
+                    deferred_side_effects.append((cfg, value))
+                else:
+                    await cfg.reset(
+                        db,
+                        user_id=user_id,
+                        ip_address=ip_address,
+                        commit=False,
+                        old_value=before[cfg.key],
+                        **provider_model_kwargs(cfg, snapshot),
+                    )
+                    deferred_side_effects.append((cfg, cfg.env_default))
 
-    (
-        oauth_created,
-        oauth_updated,
-        oauth_deleted,
-        oauth_accounts_deleted,
-    ) = await _apply_oauth_providers(db, plan.providers_to_apply, mode)
-    if oauth_accounts_deleted != plan.oauth_accounts_deleted:
-        # Should be unreachable given the provider table fence plus dependent-
-        # row share locks. Fail closed rather than under-report a destructive
-        # cascade if a future write path bypasses those invariants.
-        raise ConfigPreviewError(
-            "OAuth account links changed during import; preview the configuration again."
+            (
+                oauth_created,
+                oauth_updated,
+                oauth_deleted,
+                oauth_accounts_deleted,
+            ) = await _apply_oauth_providers(db, plan.providers_to_apply, mode)
+            if oauth_accounts_deleted != plan.oauth_accounts_deleted:
+                # Should be unreachable given the provider table fence plus
+                # dependent-row share locks. Fail closed rather than under-report
+                # a destructive cascade if a future write path bypasses those
+                # invariants.
+                raise ConfigPreviewError(
+                    "OAuth account links changed during import; preview the configuration again."
+                )
+
+            # One aggregate import event, same transaction as the settings,
+            # per-setting audit rows, and OAuth mutations: either all of them
+            # are durable or none.
+            await audit_emit(
+                db,
+                AuditEvent(
+                    user_id=user_id,
+                    action="config_import",
+                    resource_type="config",
+                    details={
+                        "mode": mode,
+                        "settings_applied": settings_applied,
+                        "settings_skipped_unknown": plan.skipped_unknown,
+                        "settings_skipped_restricted": plan.skipped_restricted,
+                        "oauth_created": oauth_created,
+                        "oauth_updated": oauth_updated,
+                        "oauth_deleted": oauth_deleted,
+                        "oauth_accounts_deleted": oauth_accounts_deleted,
+                    },
+                    ip_address=ip_address,
+                ),
+            )
+
+            # Single commit for config changes and all associated audit rows.
+            await db.commit()
+
+            # One eviction for the whole import; a per-key loop here held the
+            # widest mismatch window of the three batch call sites.
+            await apply_side_effects_batch(deferred_side_effects)
+
+            if carries_dims:
+                await rebuild_column_or_restore(
+                    db,
+                    new_dims,
+                    embedding_before,
+                    user_id=user_id,
+                    ip_address=ip_address,
+                )
+    except EmbeddingChangeBusyError as exc:
+        raise ConfigBusyError(str(exc)) from exc
+    except EmbeddingColumnRebuildError as exc:
+        # The aggregate event above counted the settings the restore reverted.
+        await audit_emit(
+            db,
+            AuditEvent(
+                user_id=user_id,
+                action="config_import",
+                resource_type="config",
+                details={"mode": mode, "settings_reverted": reverted_on_failure},
+                ip_address=ip_address,
+            ),
         )
-
-    # One aggregate import event, same transaction as the settings, per-setting
-    # audit rows, and OAuth mutations: either all of them are durable or none.
-    await audit_emit(
-        db,
-        AuditEvent(
-            user_id=user_id,
-            action="config_import",
-            resource_type="config",
-            details={
-                "mode": mode,
-                "settings_applied": settings_applied,
-                "settings_skipped_unknown": plan.skipped_unknown,
-                "settings_skipped_restricted": plan.skipped_restricted,
-                "oauth_created": oauth_created,
-                "oauth_updated": oauth_updated,
-                "oauth_deleted": oauth_deleted,
-                "oauth_accounts_deleted": oauth_accounts_deleted,
-            },
-            ip_address=ip_address,
-        ),
-    )
-
-    # Single commit for config changes and all associated audit rows.
-    await db.commit()
-
-    # fix(#1543): one eviction for the whole import — a per-key loop here held
-    # the widest mismatch window of the three batch call sites.
-    await apply_side_effects_batch(deferred_side_effects)
+        await db.commit()
+        raise ConfigApplyError(f"{exc} The rest of the import was applied.") from exc
 
     logger.info(
         "config_imported",

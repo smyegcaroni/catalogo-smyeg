@@ -1,60 +1,102 @@
-import { uploadFile, uploadPresigned, previewFile } from './ingest';
+import { uploadFile, uploadPresigned, previewFile, commitImport } from './ingest';
+import { commitFanOut } from './datasets';
+import { ApiError } from './client';
 import { useAuthStore } from '@/stores/auth-store';
-import type { FilePreviewResponse, RasterPreviewResponse } from '@/types/api';
+import { randomId } from '@/lib/random-id';
+import { detectedGeometryRequest, inferImportedKind, isFilePreview, stripExtension } from '@/lib/import-preview';
+import type {
+  CommitImportRequest,
+  DataKind,
+  FilePreviewResponse,
+  RasterPreviewResponse,
+  TilesetPreviewResponse,
+  PointCloudPreviewResponse,
+  UploadKind,
+} from '@/types/api';
 
 /**
- * fix(#1712): the in-flight upload BATCH, owned OUTSIDE React.
+ * The Upload tab's batch, owned outside React so a tab switch cannot lose it.
  *
- * Mirrors `url-import-session.ts` (#1708) for the Upload tab: the Import
- * page renders tabs conditionally, so switching tabs mid-upload unmounts
- * `UploadForm`. The upload — and the preview call chained after it — keeps
- * running server-side regardless, staging a `pending` job with real bytes,
- * so if the returned `job_id` lands in dead component state the job and its
- * staged file are unreachable until the stale-pending sweep collects them.
- * Repeated tab switches accumulate them.
+ * The Import page mounts one tab at a time, so switching tabs unmounts
+ * `UploadForm` while its requests keep running server-side. Each file's
+ * upload, preview and commit settle here, into the entry `UploadForm`
+ * created for that file, and a remount adopts the batch as it stands.
  *
- * Upload tracks a BATCH of files rather than one job (#1708 is single-job),
- * so this session is list-shaped: one entry per file, keyed by the same id
- * `UploadForm` assigns each row. Progress callbacks write into the entry
- * here instead of component state, so a mounted form subscribes rather than
- * owning the XHR.
+ * Commit is tracked as `committing`, then `committed` or `commit-failed`.
+ * Only a `preview` entry can be re-previewed, and only a `preview` or
+ * `commit-failed` one committed, so a job is never previewed again once its
+ * commit is issued, and never committed twice. Settlement writes only into
+ * the batch and entry that issued it, so a promise that settles after a
+ * reset, a removal or an identity change is dropped. The batch is released
+ * once a form has shown its tracking view (`releaseUploadBatch`).
  *
- * Every entry here is pre-commit (`uploading` through `preview`/
- * `upload-failed`). Once a commit is ISSUED for an entry — success or
- * failure, `handleCommitSingle`/`handleCommitAll`/`handleIngestAllLayers` —
- * it is removed from this session (`removeUploadSessionEntry`): holding it
- * past that point would let a later remount re-preview an already-processed
- * job, which the API refuses with 400. Commit itself is not protected here;
- * only the upload+preview phase this session owns.
- *
- * Deliberately not persisted to storage — same reasoning as #1708: this
- * covers a tab switch inside one SPA session, not a page reload, which
- * needs a server-side "my unfinished imports" lookup that does not exist
- * yet (#1712).
+ * Not persisted: a page reload needs a server-side lookup of unfinished
+ * imports, which does not exist.
  */
 export type UploadSessionEntryStatus =
   | 'uploading'
   | 'upload-failed'
   | 'previewing'
-  | 'preview';
+  | 'preview'
+  | 'committing'
+  | 'committed'
+  | 'commit-failed';
+
+/** What a committed job is tracked as. */
+export interface UploadSubmission {
+  title: string;
+  visibility: string;
+  kind: DataKind;
+}
+
+/** One layer's outcome from an "ingest all layers" commit; `error` is the
+ * server's message, or null when there is none. */
+export interface FanOutLayerOutcome {
+  layerName: string;
+  status: 'fulfilled' | 'rejected';
+  error: string | null;
+}
 
 export interface UploadSessionEntry {
   id: string;
   fileName: string;
   status: UploadSessionEntryStatus;
   jobId: string | null;
-  previewData: FilePreviewResponse | RasterPreviewResponse | null;
+  previewData: FilePreviewResponse | RasterPreviewResponse | TilesetPreviewResponse | PointCloudPreviewResponse | null;
+  kind: UploadKind | null;
   error: unknown;
   /** Byte-transfer progress (0-1) during `uploading`; null once known/done. */
   progress: number | null;
+  /** How the latest commit was issued; selects the failure message. */
+  commitVia: 'single' | 'all' | 'fan-out' | null;
+  /** The latest commit's request, so a retry starts from what the user entered. */
+  request: CommitImportRequest | null;
+  /** Set once `committed`. */
+  submitted: UploadSubmission | null;
+  /** Per-layer outcome of this entry's failed fan-out commit. */
+  fanOut: FanOutLayerOutcome[] | null;
+}
+
+export interface UploadBatchSnapshot {
+  entries: UploadSessionEntry[];
+  /** A fan-out's per-layer results, until the form dismisses them. */
+  fanOutResults: { entryId: string; results: FanOutLayerOutcome[] } | null;
+  /** The batch was committed with "commit all as VRT". */
+  autoOpenVrt: boolean;
+  /** All entries settled, with tracking to show and no unread failure or retry. */
+  canTrack: boolean;
 }
 
 interface UploadBatchSession {
   ownerId: string | null;
   entries: Map<string, UploadSessionEntry>;
+  fanOutResults: UploadBatchSnapshot['fanOutResults'];
+  autoOpenVrt: boolean;
 }
 
 let current: UploadBatchSession | null = null;
+// Aborts an entry's in-flight direct upload when the entry is dismissed or the batch is cleared.
+const uploadAborts = new Map<string, AbortController>();
 const listeners = new Set<() => void>();
 
 function notify(): void {
@@ -70,7 +112,7 @@ export function subscribeUploadBatch(cb: () => void): () => void {
 function ensureSession(): UploadBatchSession {
   const ownerId = useAuthStore.getState().user?.id ?? null;
   if (!current || current.ownerId !== ownerId) {
-    current = { ownerId, entries: new Map() };
+    current = { ownerId, entries: new Map(), fanOutResults: null, autoOpenVrt: false };
   }
   return current;
 }
@@ -82,7 +124,12 @@ function ensureSession(): UploadBatchSession {
  * unlike `url-import-session.ts`'s single job, whose promise is also
  * awaited directly by the component and therefore must reject.
  */
-export function startUploadEntry(id: string, file: File, presigned: boolean): void {
+export function startUploadEntry(
+  id: string,
+  file: File,
+  presigned: boolean,
+  kind: UploadKind | null = null,
+): void {
   const session = ensureSession();
   const entry: UploadSessionEntry = {
     id,
@@ -90,8 +137,13 @@ export function startUploadEntry(id: string, file: File, presigned: boolean): vo
     status: 'uploading',
     jobId: null,
     previewData: null,
+    kind,
     error: null,
     progress: 0,
+    commitVia: null,
+    request: null,
+    submitted: null,
+    fanOut: null,
   };
   session.entries.set(id, entry);
   notify();
@@ -102,11 +154,15 @@ export function startUploadEntry(id: string, file: File, presigned: boolean): vo
     notify();
   };
 
+  const abort = new AbortController();
+  uploadAborts.set(id, abort);
+
   void (async () => {
     try {
       const result = presigned
-        ? await uploadPresigned(file, onProgress)
-        : await uploadFile(file, onProgress);
+        ? await uploadPresigned(file, onProgress, kind)
+        : await uploadFile(file, onProgress, kind, abort.signal);
+      uploadAborts.delete(id);
       entry.jobId = result.job_id;
       entry.status = 'previewing';
       entry.progress = null;
@@ -117,6 +173,7 @@ export function startUploadEntry(id: string, file: File, presigned: boolean): vo
       entry.status = 'preview';
       notify();
     } catch (err) {
+      uploadAborts.delete(id);
       entry.status = 'upload-failed';
       entry.error = err;
       entry.progress = null;
@@ -126,29 +183,16 @@ export function startUploadEntry(id: string, file: File, presigned: boolean): vo
 }
 
 /**
- * Re-preview an existing entry under a different layer (a multi-layer
- * GeoPackage or spreadsheet's layer picker, used while still in the
- * `preview` phase, before any commit). Both outcomes are written to the
- * SAME session entry `startUploadEntry` created, at module scope, for the
- * same reason as the initial preview: a tab switch mid-request must not
- * lose the result.
+ * Re-preview an entry under another layer of a multi-layer file. The result
+ * lands in the session entry, whose `previewData.layer_name` is the selected
+ * layer, so a remount and a later default commit both see the new choice.
  *
- * fix(codex #1763 r2): this used to be a call the component made directly
- * (`previewFile` + local `updateEntry`), entirely outside the session. That
- * left the session holding the ORIGINAL layer's preview forever, so a
- * remount after re-selecting a layer restored the original `layer_name` —
- * silently ingesting the wrong layer on a subsequent default commit. Now it
- * goes through the same entry the session already owns, and `previewData`
- * (which carries `layer_name`) is the single source of truth for "which
- * layer is selected", so writing it here is enough; no separate field to
- * keep in sync.
- *
- * No-op if the entry is not there to update (e.g. its commit was already
- * issued elsewhere, or the session was cleared by an identity change).
+ * No-op unless the entry is in `preview`: a job whose commit was issued is
+ * never previewed again.
  */
 export function startLayerPreview(id: string, jobId: string, layerName: string): void {
   const entry = current?.entries.get(id);
-  if (!entry) return;
+  if (entry?.status !== 'preview') return;
 
   entry.status = 'previewing';
   notify();
@@ -171,38 +215,225 @@ export function startLayerPreview(id: string, jobId: string, layerName: string):
   })();
 }
 
+interface CommitClaim {
+  jobId: string;
+  /** Applies the outcome and returns true, unless the batch or entry was replaced meanwhile. */
+  settle: (apply: (session: UploadBatchSession, entry: UploadSessionEntry) => void) => boolean;
+}
+
+/** Mark an entry `committing` if it can be committed. */
+function claimForCommit(
+  id: string,
+  via: NonNullable<UploadSessionEntry['commitVia']>,
+  request: CommitImportRequest | null,
+): CommitClaim | null {
+  const session = current;
+  const entry = session?.entries.get(id);
+  if (!session || !entry?.jobId) return null;
+  if (entry.status !== 'preview' && entry.status !== 'commit-failed') return null;
+
+  entry.status = 'committing';
+  entry.commitVia = via;
+  entry.request = request;
+  entry.error = null;
+  entry.fanOut = null;
+  notify();
+
+  return {
+    jobId: entry.jobId,
+    settle: (apply) => {
+      if (current !== session || session.entries.get(id) !== entry) return false;
+      apply(session, entry);
+      notify();
+      return true;
+    },
+  };
+}
+
+function commitEntry(
+  id: string,
+  request: CommitImportRequest,
+  via: 'single' | 'all',
+): Promise<boolean> {
+  const entry = current?.entries.get(id);
+  if (!entry) return Promise.resolve(false);
+  const preview = entry.previewData;
+  const layerName = preview && isFilePreview(preview) && (preview.layers?.length ?? 0) > 1
+    ? preview.layer_name : undefined;
+  const normalized = layerName ? { ...request, layer_name: layerName } : request;
+  const submission: UploadSubmission = {
+    title: normalized.title,
+    visibility: normalized.visibility ?? 'private',
+    kind: inferImportedKind(entry, normalized),
+  };
+  const claim = claimForCommit(id, via, normalized);
+  if (!claim) return Promise.resolve(false);
+  return commitImport(claim.jobId, normalized).then(
+    () =>
+      claim.settle((_session, entry) => {
+        entry.status = 'committed';
+        entry.submitted = submission;
+      }),
+    (err: unknown) => {
+      claim.settle((_session, entry) => {
+        entry.status = 'commit-failed';
+        entry.error = err;
+      });
+      return false;
+    },
+  );
+}
+
 /**
- * The current batch, if one exists AND belongs to the signed-in user.
- *
- * Same ownership rule as #1713 / `peekUrlImport`: a session belonging to a
- * different identity is CLEARED rather than merely hidden, so it cannot
- * resurface if the original identity signs back in having missed whatever
- * the intervening user did to its staged bytes. `lib/auth-cache-reset.ts`
- * is the primary teardown on identity change; this is the second layer, so
- * a missed subscription there cannot reopen the hole.
+ * Commit one reviewed entry. Resolves true once this batch records the
+ * commit as succeeded; never rejects.
  */
-export function peekUploadBatch(): UploadSessionEntry[] | null {
+export function commitUploadEntry(
+  id: string,
+  request: CommitImportRequest,
+): Promise<boolean> {
+  return commitEntry(id, request, 'single');
+}
+
+/** Commit preview-ready entries with defaults, ignoring unsent metadata drafts; never rejects. */
+export async function commitUploadEntries(
+  { autoOpenVrt = false }: { autoOpenVrt?: boolean } = {},
+): Promise<void> {
+  const entries = Array.from(current?.entries.values() ?? []).filter(
+    (entry) => entry.status === 'preview' && entry.jobId,
+  );
+  if (entries.length === 0) return;
+  if (autoOpenVrt && current) current.autoOpenVrt = true;
+  await Promise.all(entries.map((entry) => commitEntry(entry.id, {
+    title: stripExtension(entry.previewData?.source_filename ?? entry.fileName) || 'Untitled',
+    ...(entry.previewData && isFilePreview(entry.previewData)
+      ? detectedGeometryRequest(entry.previewData)
+      : {}),
+  }, 'all')));
+}
+
+/**
+ * Commit every layer of a multi-layer entry as its own dataset. Each queued
+ * layer joins the batch as a `committed` entry tracking its own job; the
+ * parent is dropped when every layer queued, and otherwise stays
+ * `commit-failed` with the per-layer outcome. Resolves with that outcome
+ * once this batch records it, or null; never rejects.
+ */
+export function commitUploadFanOut(id: string): Promise<FanOutLayerOutcome[] | null> {
+  const entry = current?.entries.get(id);
+  const preview = entry?.previewData;
+  if (!entry || !preview || !isFilePreview(preview) || !preview.layers || preview.layers.length <= 1) {
+    return Promise.resolve(null);
+  }
+  const fileBase = stripExtension(preview.source_filename ?? entry.fileName) || 'Untitled';
+  const layers = preview.layers.map((layer) => ({
+    layer_name: layer.name, title: `${fileBase}: ${layer.name}`,
+  }));
+  // Layer previews carry no per-layer geometry type, so all children use the selected layer's kind.
+  const kind: DataKind = preview.geometry_type ? 'vector' : 'table';
+  const claim = claimForCommit(id, 'fan-out', null);
+  if (!claim) return Promise.resolve(null);
+  const titles = new Map(layers.map((l) => [l.layer_name, l.title]));
+
+  return commitFanOut(claim.jobId, layers).then(
+    (response) => {
+      const results: FanOutLayerOutcome[] = response.results.map((r) => ({
+        layerName: r.layer_name,
+        status: r.status === 'queued' ? 'fulfilled' : 'rejected',
+        error: r.error,
+      }));
+      const recorded = claim.settle((session, entry) => {
+        if (results.every((r) => r.status === 'fulfilled')) {
+          session.entries.delete(id);
+        } else {
+          entry.status = 'commit-failed';
+          entry.fanOut = results;
+        }
+        for (const r of response.results) {
+          if (r.status !== 'queued' || !r.new_job_id) continue;
+          const title = titles.get(r.layer_name) ?? r.layer_name;
+          const childId = randomId();
+          session.entries.set(childId, {
+            id: childId,
+            fileName: title,
+            status: 'committed',
+            jobId: r.new_job_id,
+            previewData: null,
+            kind: null,
+            error: null,
+            progress: null,
+            commitVia: 'fan-out',
+            request: null,
+            submitted: { title, visibility: 'private', kind },
+            fanOut: null,
+          });
+        }
+        session.fanOutResults = { entryId: id, results };
+      });
+      return recorded ? results : null;
+    },
+    (err: unknown) => {
+      const results: FanOutLayerOutcome[] = layers.map((l) => ({
+        layerName: l.layer_name,
+        status: 'rejected',
+        error: err instanceof ApiError ? err.message : null,
+      }));
+      const recorded = claim.settle((session, entry) => {
+        entry.status = 'commit-failed';
+        entry.error = err;
+        entry.fanOut = results;
+        session.fanOutResults = { entryId: id, results };
+      });
+      return recorded ? results : null;
+    },
+  );
+}
+
+/** The form closed the fan-out results dialog. */
+export function dismissUploadFanOutResults(): void {
+  if (!current?.fanOutResults) return;
+  current.fanOutResults = null;
+  notify();
+}
+
+// A partial fan-out has already moved its parent job to `fanned_out`
+// server-side, so that parent cannot be committed again.
+function canRetryCommit(entry: UploadSessionEntry): boolean {
+  return entry.status === 'commit-failed' && !entry.fanOut?.some((r) => r.status === 'fulfilled');
+}
+
+/**
+ * The current batch, if it has entries AND belongs to the signed-in user.
+ *
+ * A batch belonging to a different identity is CLEARED rather than merely
+ * hidden, so it cannot resurface if the original identity signs back in.
+ * `lib/auth-cache-reset.ts` clears it on identity change too; this check
+ * covers anything that reads the batch before that runs.
+ */
+export function peekUploadBatch(): UploadBatchSnapshot | null {
   if (!current) return null;
   const ownerId = useAuthStore.getState().user?.id ?? null;
   if (current.ownerId !== ownerId) {
     clearUploadBatch();
     return null;
   }
-  return current.entries.size > 0 ? Array.from(current.entries.values()) : null;
+  if (current.entries.size === 0) return null;
+  const entries = Array.from(current.entries.values());
+  return {
+    entries,
+    fanOutResults: current.fanOutResults,
+    autoOpenVrt: current.autoOpenVrt,
+    canTrack: entries.every((entry) => ['committed', 'upload-failed', 'commit-failed'].includes(entry.status))
+      && entries.some((entry) => entry.status === 'committed')
+      && !entries.some(canRetryCommit)
+      && !current.fanOutResults?.results.some((result) => result.status === 'rejected'),
+  };
 }
 
-/** One entry's live state, if the batch still owns it. */
-export function getUploadSessionEntry(id: string): UploadSessionEntry | null {
-  return current?.entries.get(id) ?? null;
-}
-
-/**
- * Drop one entry — a commit was issued for it (see the module docstring),
- * or the user dismissed it from the review list. Clears the whole session
- * once the batch empties.
- */
+/** Drop one entry the user dismissed. Clears the session once it empties. */
 export function removeUploadSessionEntry(id: string): void {
   if (!current) return;
+  uploadAborts.get(id)?.abort();
   current.entries.delete(id);
   if (current.entries.size === 0) {
     current = null;
@@ -212,8 +443,19 @@ export function removeUploadSessionEntry(id: string): void {
 
 /** Release the whole batch — an explicit reset, or an identity change. */
 export function clearUploadBatch(): void {
+  for (const abort of uploadAborts.values()) abort.abort();
+  uploadAborts.clear();
   current = null;
   notify();
+}
+
+/**
+ * The form has shown this batch's tracking view, which it keeps rendering
+ * from its own state. Releasing here means a later visit to the tab starts
+ * from an empty dropzone instead of the finished batch.
+ */
+export function releaseUploadBatch(): void {
+  current = null;
 }
 
 /**
@@ -241,13 +483,22 @@ export function clearUploadBatch(): void {
  * from its own `useUploadConfig()` hook.
  */
 let pendingUploadFiles: File[] | null = null;
+// The upload kind chosen when the files were dropped, so a remount uploads
+// them as what they were dropped as.
+let pendingUploadKind: UploadKind | null = null;
 
 /** Queue files awaiting a still-fetching upload config; merges with any
  * already queued, matching the component-state behavior this replaces
  * (a second drop in the same window must not swallow the first). */
-export function queuePendingUploadFiles(files: File[]): File[] {
+export function queuePendingUploadFiles(files: File[], kind: UploadKind | null = null): File[] {
   pendingUploadFiles = pendingUploadFiles ? [...pendingUploadFiles, ...files] : files;
+  pendingUploadKind = kind;
   return pendingUploadFiles;
+}
+
+/** The upload kind the queued files were dropped under. */
+export function peekPendingUploadKind(): UploadKind | null {
+  return pendingUploadKind;
 }
 
 /** The queue, if a mount left one behind. Read on mount so a remount after
@@ -261,4 +512,5 @@ export function peekPendingUploadFiles(): File[] | null {
  * before validating each file). */
 export function clearPendingUploadFiles(): void {
   pendingUploadFiles = null;
+  pendingUploadKind = null;
 }

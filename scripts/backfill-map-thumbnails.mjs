@@ -24,17 +24,34 @@
 // Usage:
 //   GEOLENS_URL=https://demo.example.com \
 //   GEOLENS_ADMIN_USERNAME=... GEOLENS_ADMIN_PASSWORD=... \
-//   node scripts/backfill-map-thumbnails.mjs [--dry-run] [--include-public]
+//   node scripts/backfill-map-thumbnails.mjs [--dry-run] [--include-public] \
+//     [--refresh <map-id>...]
 //
 // Defaults to every map the credential can see that is missing a thumbnail.
-// --dry-run lists what it would open and changes nothing.
+// --refresh opens exactly the named maps and recaptures their thumbnails even
+// when one exists; ids the credential cannot see are reported and skipped, and
+// the exit code is nonzero if any map failed or was unknown.
+// --dry-run lists what it would open and changes nothing; it combines with
+// --refresh.
+
+import { randomUUID } from 'node:crypto';
 
 import { chromium } from 'playwright';
+
+import { blankThumbnail, isThumbnailUploadOk, parseArgs, selectMaps } from './lib/backfill-map-thumbnails-args.mjs';
 
 const BASE_URL = (process.env.GEOLENS_URL ?? 'http://localhost:8080').replace(/\/+$/, '');
 const USERNAME = process.env.GEOLENS_ADMIN_USERNAME ?? 'admin';
 const PASSWORD = process.env.GEOLENS_ADMIN_PASSWORD;
-const DRY_RUN = process.argv.includes('--dry-run');
+let opts;
+try {
+  opts = parseArgs(process.argv.slice(2));
+} catch (err) {
+  console.error(`FAIL: ${err.message}`);
+  process.exit(2);
+}
+const DRY_RUN = opts.dryRun;
+const REFRESH = opts.refresh;
 
 // How long to wait for auto-capture to upload. The capture runs after the map
 // idles, so this is map-render time plus the PUT, not a fixed cost we control.
@@ -46,11 +63,7 @@ if (!PASSWORD) {
   process.exit(2);
 }
 
-/**
- * Log in through the API. Returns the whole token payload, not just the access
- * token: the refresh token and expiry are what let the browser session renew
- * itself mid-batch (see the store seeding in main()).
- */
+/** Log in through the API for the Node-side calls; returns the token payload. */
 async function login() {
   const res = await fetch(`${BASE_URL}/api/auth/login`, {
     method: 'POST',
@@ -122,15 +135,21 @@ async function hasThumbnail(id) {
 }
 
 async function main() {
-  const auth = await login();
-  const token = auth.access_token;
+  const token = (await login()).access_token;
   nodeToken = token;
   const maps = await listMaps(token);
-  const missing = maps.filter((m) => !m.thumbnail_url);
+  const refreshing = REFRESH.length > 0;
+  const { targets: missing, unknown } = selectMaps(maps, REFRESH);
 
-  console.log(`${BASE_URL}: ${maps.length} maps visible, ${missing.length} without a thumbnail`);
+  console.log(
+    refreshing
+      ? `${BASE_URL}: ${maps.length} maps visible, ${missing.length} of ${REFRESH.length} named to refresh`
+      : `${BASE_URL}: ${maps.length} maps visible, ${missing.length} without a thumbnail`,
+  );
+  for (const id of unknown) console.error(`  unknown or inaccessible map id, skipped: ${id}`);
   if (missing.length === 0) {
     console.log('Nothing to do.');
+    if (unknown.length > 0) process.exit(1);
     return;
   }
   for (const m of missing) {
@@ -138,6 +157,7 @@ async function main() {
   }
   if (DRY_RUN) {
     console.log('\n--dry-run: opened nothing.');
+    if (unknown.length > 0) process.exit(1);
     return;
   }
 
@@ -145,71 +165,95 @@ async function main() {
   const context = await browser.newContext({ viewport: { width: 1600, height: 900 } });
   const page = await context.newPage();
 
-  // Seed the auth store the same way a signed-in browser holds it, so the
-  // builder's own fetches (and the thumbnail PUT) are authenticated.
-  //
-  // fix(#1501 review): seed the REAL refresh token and expiry rather than null
-  // and a hard-coded 15 minutes. Login happened in Node, so no refresh cookie
-  // was installed in this browser; discarding the body refresh token left the
-  // session with no way to renew and nothing to renew from. A backfill over
-  // many maps easily outlives one access token — more so on an instance with
-  // ACCESS_TOKEN_EXPIRE_MINUTES below the default — and every map after
-  // expiry would fail its thumbnail PUT while the script kept going.
-  //
-  // With these seeded, apiFetch's own 401 -> refresh path keeps the session
-  // alive for the whole batch using the mechanism the app already ships.
+  // The app holds its access token in memory and recovers it from the HttpOnly
+  // refresh cookie on every page load, so the browser signs in through the
+  // cookie flow and storage gets only the non-secret session marker. The app's
+  // own refresh then keeps the session alive for the whole batch, however many
+  // access tokens it outlives.
+  const signIn = await context.request.post(`${BASE_URL}/api/auth/login`, {
+    headers: { 'X-GeoLens-Auth-Mode': 'cookie' },
+    form: { username: USERNAME, password: PASSWORD },
+  });
+  if (!signIn.ok()) throw new Error(`browser sign-in failed: ${signIn.status()}`);
   await page.goto(`${BASE_URL}/`);
   const me = await (await fetch(`${BASE_URL}/api/auth/me/`, {
     headers: { Authorization: `Bearer ${token}` },
   })).json();
   await page.evaluate(
-    ([tok, refresh, expiresIn, user]) => {
-      localStorage.setItem(
-        'geolens-auth',
-        JSON.stringify({
-          state: {
-            token: tok,
-            refreshToken: refresh ?? null,
-            expiresAt: Date.now() + (expiresIn ?? 900) * 1000,
-            user,
-          },
-          version: 1,
-        }),
-      );
+    ([sessionId, user]) => {
+      localStorage.setItem('geolens-auth', JSON.stringify({ state: { sessionId, user }, version: 2 }));
     },
-    [token, auth.refresh_token ?? null, auth.expires_in ?? null, me],
+    [randomUUID(), me],
   );
 
   let filled = 0;
   const failed = [];
   for (const m of missing) {
     process.stdout.write(`  opening ${m.name} ... `);
+    let detail = null;
     try {
+      // The builder only auto-captures when the map detail reports no
+      // thumbnail, so a refresh serves it that view of the map and waits for
+      // the capture's own PUT; the upload still goes through the app.
+      detail = new RegExp(`/api/maps/${m.id}/?(\\?.*)?$`);
+      let uploaded = null;
+      let routeError = null;
+      if (refreshing) {
+        await page.route(detail, async (route) => {
+          if (route.request().method() !== 'GET') return route.continue();
+          try {
+            const res = await route.fetch();
+            if (!res.ok()) return route.fulfill({ response: res });
+            const text = await res.text();
+            const blanked = blankThumbnail(text);
+            if (blanked === null) {
+              routeError = 'map detail was not JSON';
+              return route.fulfill({ response: res, body: text });
+            }
+            return route.fulfill({ response: res, body: blanked });
+          } catch (err) {
+            routeError = err?.message ?? String(err);
+            return route.continue().catch(() => {});
+          }
+        });
+        uploaded = page.waitForResponse(
+          (r) => isThumbnailUploadOk(r.request().method(), r.url(), r.ok(), m.id),
+          { timeout: CAPTURE_TIMEOUT_MS },
+        );
+        uploaded.catch(() => {});
+      }
       await page.goto(`${BASE_URL}/maps/${m.id}`);
       await page.waitForLoadState('networkidle').catch(() => {});
 
       // Poll the API rather than guessing at a fixed wait: the upload is
       // fire-and-forget inside the app, so its completion is only observable
       // as thumbnail_url flipping non-null.
-      const deadline = Date.now() + CAPTURE_TIMEOUT_MS;
       let ok = false;
-      while (Date.now() < deadline) {
-        await page.waitForTimeout(POLL_MS);
-        if (await hasThumbnail(m.id)) { ok = true; break; }
+      if (refreshing) {
+        ok = await uploaded.then(() => true).catch(() => false);
+        if (routeError) throw new Error(routeError);
+      } else {
+        const deadline = Date.now() + CAPTURE_TIMEOUT_MS;
+        while (Date.now() < deadline) {
+          await page.waitForTimeout(POLL_MS);
+          if (await hasThumbnail(m.id)) { ok = true; break; }
+        }
       }
       if (ok) { filled++; console.log('ok'); }
       else { failed.push(m.name); console.log('TIMED OUT'); }
     } catch (err) {
       failed.push(m.name);
       console.log(`ERROR ${err?.message ?? err}`);
+    } finally {
+      if (detail) await page.unroute(detail).catch(() => {});
     }
   }
 
   await browser.close();
 
   console.log(`\nFilled ${filled}/${missing.length}.`);
-  if (failed.length > 0) {
-    console.error('Still missing a thumbnail:');
+  if (failed.length > 0 || unknown.length > 0) {
+    if (failed.length > 0) console.error(refreshing ? 'Not refreshed:' : 'Still missing a thumbnail:');
     for (const n of failed) console.error(`  - ${n}`);
     // Non-zero so a CI or cron caller notices, without pretending the run
     // achieved nothing: the count above says what did land.

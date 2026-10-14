@@ -10,6 +10,8 @@ from .admin_embed_token_list_response import AdminEmbedTokenListResponse
 from .admin_embed_token_response import AdminEmbedTokenResponse
 from .admin_job_list_response import AdminJobListResponse
 from .admin_job_response import AdminJobResponse
+from .admin_job_response_restart_source_type_0 import AdminJobResponseRestartSourceType0
+from .admin_job_response_review_state_type_0 import AdminJobResponseReviewStateType0
 from .admin_job_response_status import AdminJobResponseStatus
 from .admin_job_response_user_metadata_type_0 import AdminJobResponseUserMetadataType0
 from .admin_password_reset import AdminPasswordReset
@@ -23,12 +25,28 @@ from .ai_status_response import AIStatusResponse
 from .ai_status_update import AIStatusUpdate
 from .alter_column_type_request import AlterColumnTypeRequest
 from .analysis_materialize_request import AnalysisMaterializeRequest
+from .analysis_materialize_request_filter_type_0 import (
+    AnalysisMaterializeRequestFilterType0,
+)
+from .analysis_materialize_request_join_filter_type_0 import (
+    AnalysisMaterializeRequestJoinFilterType0,
+)
+from .analysis_materialize_request_mask_filter_type_0 import (
+    AnalysisMaterializeRequestMaskFilterType0,
+)
 from .analysis_materialize_request_mask_type_0 import (
     AnalysisMaterializeRequestMaskType0,
 )
 from .analysis_materialize_request_operation import AnalysisMaterializeRequestOperation
 from .analysis_materialize_response import AnalysisMaterializeResponse
 from .analysis_preview_request import AnalysisPreviewRequest
+from .analysis_preview_request_filter_type_0 import AnalysisPreviewRequestFilterType0
+from .analysis_preview_request_join_filter_type_0 import (
+    AnalysisPreviewRequestJoinFilterType0,
+)
+from .analysis_preview_request_mask_filter_type_0 import (
+    AnalysisPreviewRequestMaskFilterType0,
+)
 from .analysis_preview_request_mask_type_0 import AnalysisPreviewRequestMaskType0
 from .analysis_preview_request_operation import AnalysisPreviewRequestOperation
 from .analysis_preview_response import AnalysisPreviewResponse
@@ -58,6 +76,8 @@ from .backfill_estimate import BackfillEstimate
 from .backfill_response import BackfillResponse
 from .backfill_run_progress import BackfillRunProgress
 from .backfill_run_summary import BackfillRunSummary
+from .backfill_tenant_run import BackfillTenantRun
+from .backfill_tenant_run_status import BackfillTenantRunStatus
 from .basemap_config import BasemapConfig
 from .basemap_config_sublayer_overrides_type_0 import (
     BasemapConfigSublayerOverridesType0,
@@ -205,6 +225,9 @@ from .dataset_list_response import DatasetListResponse
 from .dataset_meta import DatasetMeta
 from .dataset_meta_visibility_type_0 import DatasetMetaVisibilityType0
 from .dataset_refresh_request import DatasetRefreshRequest
+from .dataset_refresh_request_verification_policy import (
+    DatasetRefreshRequestVerificationPolicy,
+)
 from .dataset_refresh_response import DatasetRefreshResponse
 from .dataset_refresh_run_list_response import DatasetRefreshRunListResponse
 from .dataset_refresh_run_response import DatasetRefreshRunResponse
@@ -222,6 +245,9 @@ from .dbf_truncation_collision_warning import DbfTruncationCollisionWarning
 from .dbf_truncation_detail import DbfTruncationDetail
 from .derived_from_response import DerivedFromResponse
 from .derived_from_response_params import DerivedFromResponseParams
+from .derived_from_response_source_filter_type_0 import (
+    DerivedFromResponseSourceFilterType0,
+)
 from .detect_embedding_dims_response import DetectEmbeddingDimsResponse
 from .discover_response import DiscoverResponse
 from .discovered_table import DiscoveredTable
@@ -303,6 +329,24 @@ from .get_collection_items_collections_dataset_id_items_get_response_202 import 
 )
 from .get_collection_queryables_collections_dataset_id_queryables_get_response_202 import (
     GetCollectionQueryablesCollectionsDatasetIdQueryablesGetResponse202,
+)
+from .get_features_geojson_z_endpoint_datasets_dataset_id_features_geojson_get_response_200 import (
+    GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponse200,
+)
+from .get_features_geojson_z_endpoint_datasets_dataset_id_features_geojson_get_response_200_features_item import (
+    GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponse200FeaturesItem,
+)
+from .get_features_geojson_z_endpoint_datasets_dataset_id_features_geojson_get_response_200_features_item_geometry_type_0 import (
+    GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponse200FeaturesItemGeometryType0,
+)
+from .get_features_geojson_z_endpoint_datasets_dataset_id_features_geojson_get_response_200_features_item_properties import (
+    GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponse200FeaturesItemProperties,
+)
+from .get_features_geojson_z_endpoint_datasets_dataset_id_features_geojson_get_response_200_features_item_type import (
+    GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponse200FeaturesItemType,
+)
+from .get_features_geojson_z_endpoint_datasets_dataset_id_features_geojson_get_response_200_type import (
+    GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponse200Type,
 )
 from .get_geolens_sprite_index_endpoint_maps_sprites_geolens_json_get_response_get_geolens_sprite_index_endpoint_maps_sprites_geolens_json_get import (
     GetGeolensSpriteIndexEndpointMapsSpritesGeolensJsonGetResponseGetGeolensSpriteIndexEndpointMapsSpritesGeolensJsonGet,
@@ -448,6 +492,7 @@ from .map_layer_response_layout import MapLayerResponseLayout
 from .map_layer_response_paint import MapLayerResponsePaint
 from .map_layer_response_style_config_type_0 import MapLayerResponseStyleConfigType0
 from .map_list_response import MapListResponse
+from .map_patch import MapPatch
 from .map_response import MapResponse
 from .map_sprite_entry import MapSpriteEntry
 from .map_style_import_request import MapStyleImportRequest
@@ -549,16 +594,23 @@ from .patch_single_feature_datasets_dataset_id_features_gid_patch_geo_json_featu
 )
 from .permissions_response import PermissionsResponse
 from .permissions_response_permissions import PermissionsResponsePermissions
+from .point_cloud_metadata import PointCloudMetadata
+from .point_cloud_preview_response import PointCloudPreviewResponse
+from .point_cloud_preview_response_point_format import (
+    PointCloudPreviewResponsePointFormat,
+)
 from .popup_config import PopupConfig
 from .presigned_complete_request import PresignedCompleteRequest
 from .presigned_part_info import PresignedPartInfo
 from .presigned_upload_request import PresignedUploadRequest
+from .presigned_upload_request_kind_type_0 import PresignedUploadRequestKindType0
 from .presigned_upload_response import PresignedUploadResponse
 from .preview_response import PreviewResponse
 from .preview_response_detected_geometry_columns_type_0 import (
     PreviewResponseDetectedGeometryColumnsType0,
 )
 from .preview_response_sample_rows_item import PreviewResponseSampleRowsItem
+from .previous_version_response import PreviousVersionResponse
 from .probe_request import ProbeRequest
 from .probe_response import ProbeResponse
 from .problem_detail import ProblemDetail
@@ -579,9 +631,18 @@ from .raster_tile_proxy_tiles_raster_proxy_dataset_id_zxy_fmt_get_stretch_type_0
 from .raster_tile_token import RasterTileToken
 from .refresh_request import RefreshRequest
 from .refresh_verification import RefreshVerification
+from .refresh_verification_arcgis_id_coverage_type_0 import (
+    RefreshVerificationArcgisIdCoverageType0,
+)
 from .refresh_verification_count_status import RefreshVerificationCountStatus
 from .refresh_verification_decision import RefreshVerificationDecision
+from .refresh_verification_geometry_contract_type_0 import (
+    RefreshVerificationGeometryContractType0,
+)
 from .refresh_verification_identity_check import RefreshVerificationIdentityCheck
+from .refresh_verification_review_acknowledged_by_type_0 import (
+    RefreshVerificationReviewAcknowledgedByType0,
+)
 from .refresh_verification_review_reasons_item import (
     RefreshVerificationReviewReasonsItem,
 )
@@ -617,6 +678,8 @@ from .replace_single_feature_datasets_dataset_id_features_gid_put_geo_json_featu
 from .resend_verification_request import ResendVerificationRequest
 from .reserved_rename_detail import ReservedRenameDetail
 from .reserved_rename_warning import ReservedRenameWarning
+from .restore_previous_version_request import RestorePreviousVersionRequest
+from .restore_previous_version_response import RestorePreviousVersionResponse
 from .reupload_commit_request import ReuploadCommitRequest
 from .reupload_commit_request_expected_origin_kind_type_0 import (
     ReuploadCommitRequestExpectedOriginKindType0,
@@ -626,6 +689,9 @@ from .reupload_preview_request import ReuploadPreviewRequest
 from .reupload_preview_response import ReuploadPreviewResponse
 from .reupload_preview_response_all_layers_type_0_item import (
     ReuploadPreviewResponseAllLayersType0Item,
+)
+from .reupload_preview_response_review_reasons_item import (
+    ReuploadPreviewResponseReviewReasonsItem,
 )
 from .reupload_preview_response_sample_rows_item import (
     ReuploadPreviewResponseSampleRowsItem,
@@ -691,7 +757,12 @@ from .sse_map_done_event import SSEMapDoneEvent
 from .sse_token_event import SSETokenEvent
 from .sse_tool_result_event import SSEToolResultEvent
 from .sse_tool_start_event import SSEToolStartEvent
+from .sso_exchange_request import SsoExchangeRequest
 from .stac_asset import StacAsset
+from .stac_asset_size import StacAssetSize
+from .stac_asset_size_target import StacAssetSizeTarget
+from .stac_asset_sizes_request import StacAssetSizesRequest
+from .stac_asset_sizes_response import StacAssetSizesResponse
 from .stac_catalog import StacCatalog
 from .stac_collection import StacCollection
 from .stac_collection_extent import StacCollectionExtent
@@ -714,10 +785,17 @@ from .stac_item_properties import StacItemProperties
 from .stac_item_response import StacItemResponse
 from .stac_item_response_assets import StacItemResponseAssets
 from .stac_item_summary import StacItemSummary
+from .stac_item_summary_data_asset_import_refusal_type_0 import (
+    StacItemSummaryDataAssetImportRefusalType0,
+)
 from .stac_link import StacLink
+from .stac_next_page import StacNextPage
 from .stac_search_body import StacSearchBody
 from .stac_search_body_intersects_type_0 import StacSearchBodyIntersectsType0
 from .stac_search_request import StacSearchRequest
+from .stac_search_request_cloud_cover_mode_type_0 import (
+    StacSearchRequestCloudCoverModeType0,
+)
 from .stac_search_response import StacSearchResponse
 from .stale_cleanup_response import StaleCleanupResponse
 from .status_update import StatusUpdate
@@ -734,6 +812,13 @@ from .tile_token_batch_response_tokens import TileTokenBatchResponseTokens
 from .tile_token_batch_response_tokens_additional_property_type_2 import (
     TileTokenBatchResponseTokensAdditionalPropertyType2,
 )
+from .tileset_metadata import TilesetMetadata
+from .tileset_metadata_bounding_volume_type_0 import TilesetMetadataBoundingVolumeType0
+from .tileset_preview_response import TilesetPreviewResponse
+from .tileset_preview_response_bounding_volume import (
+    TilesetPreviewResponseBoundingVolume,
+)
+from .tileset_preview_response_version import TilesetPreviewResponseVersion
 from .token_response import TokenResponse
 from .translation_list_response import TranslationListResponse
 from .translation_response import TranslationResponse
@@ -787,6 +872,8 @@ __all__ = (
     "AdminEmbedTokenResponse",
     "AdminJobListResponse",
     "AdminJobResponse",
+    "AdminJobResponseRestartSourceType0",
+    "AdminJobResponseReviewStateType0",
     "AdminJobResponseStatus",
     "AdminJobResponseUserMetadataType0",
     "AdminPasswordReset",
@@ -800,10 +887,16 @@ __all__ = (
     "AIStatusUpdate",
     "AlterColumnTypeRequest",
     "AnalysisMaterializeRequest",
+    "AnalysisMaterializeRequestFilterType0",
+    "AnalysisMaterializeRequestJoinFilterType0",
+    "AnalysisMaterializeRequestMaskFilterType0",
     "AnalysisMaterializeRequestMaskType0",
     "AnalysisMaterializeRequestOperation",
     "AnalysisMaterializeResponse",
     "AnalysisPreviewRequest",
+    "AnalysisPreviewRequestFilterType0",
+    "AnalysisPreviewRequestJoinFilterType0",
+    "AnalysisPreviewRequestMaskFilterType0",
     "AnalysisPreviewRequestMaskType0",
     "AnalysisPreviewRequestOperation",
     "AnalysisPreviewResponse",
@@ -829,6 +922,8 @@ __all__ = (
     "BackfillResponse",
     "BackfillRunProgress",
     "BackfillRunSummary",
+    "BackfillTenantRun",
+    "BackfillTenantRunStatus",
     "BasemapConfig",
     "BasemapConfigSublayerOverridesType0",
     "BasemapLabelMode",
@@ -946,6 +1041,7 @@ __all__ = (
     "DatasetMeta",
     "DatasetMetaVisibilityType0",
     "DatasetRefreshRequest",
+    "DatasetRefreshRequestVerificationPolicy",
     "DatasetRefreshResponse",
     "DatasetRefreshRunListResponse",
     "DatasetRefreshRunResponse",
@@ -963,6 +1059,7 @@ __all__ = (
     "DbfTruncationDetail",
     "DerivedFromResponse",
     "DerivedFromResponseParams",
+    "DerivedFromResponseSourceFilterType0",
     "DetectEmbeddingDimsResponse",
     "DiscoveredTable",
     "DiscoverResponse",
@@ -1019,6 +1116,12 @@ __all__ = (
     "GetCollectionItemsCollectionsDatasetIdItemsGetOGCFeatureItemsResponseOGCLink",
     "GetCollectionItemsCollectionsDatasetIdItemsGetResponse202",
     "GetCollectionQueryablesCollectionsDatasetIdQueryablesGetResponse202",
+    "GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponse200",
+    "GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponse200FeaturesItem",
+    "GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponse200FeaturesItemGeometryType0",
+    "GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponse200FeaturesItemProperties",
+    "GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponse200FeaturesItemType",
+    "GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponse200Type",
     "GetGeolensSpriteIndexEndpointMapsSpritesGeolensJsonGetResponseGetGeolensSpriteIndexEndpointMapsSpritesGeolensJsonGet",
     "GetGeolensSpriteIndexEndpointMapsSpritesGeolensJsonGetResponseGetGeolensSpriteIndexEndpointMapsSpritesGeolensJsonGetAdditionalProperty",
     "GetSingleFeatureDatasetsDatasetIdFeaturesGidGetGeoJSONFeature",
@@ -1111,6 +1214,7 @@ __all__ = (
     "MapLayerResponsePaint",
     "MapLayerResponseStyleConfigType0",
     "MapListResponse",
+    "MapPatch",
     "MapResponse",
     "MapSpriteEntry",
     "MapStyleImportRequest",
@@ -1174,14 +1278,19 @@ __all__ = (
     "PatchSingleFeatureDatasetsDatasetIdFeaturesGidPatchGeoJSONFeatureProperties",
     "PermissionsResponse",
     "PermissionsResponsePermissions",
+    "PointCloudMetadata",
+    "PointCloudPreviewResponse",
+    "PointCloudPreviewResponsePointFormat",
     "PopupConfig",
     "PresignedCompleteRequest",
     "PresignedPartInfo",
     "PresignedUploadRequest",
+    "PresignedUploadRequestKindType0",
     "PresignedUploadResponse",
     "PreviewResponse",
     "PreviewResponseDetectedGeometryColumnsType0",
     "PreviewResponseSampleRowsItem",
+    "PreviousVersionResponse",
     "ProbeRequest",
     "ProbeResponse",
     "ProblemDetail",
@@ -1198,9 +1307,12 @@ __all__ = (
     "RasterTileToken",
     "RefreshRequest",
     "RefreshVerification",
+    "RefreshVerificationArcgisIdCoverageType0",
     "RefreshVerificationCountStatus",
     "RefreshVerificationDecision",
+    "RefreshVerificationGeometryContractType0",
     "RefreshVerificationIdentityCheck",
+    "RefreshVerificationReviewAcknowledgedByType0",
     "RefreshVerificationReviewReasonsItem",
     "RefreshVerificationSourceBinding",
     "RegisterRequest",
@@ -1220,12 +1332,15 @@ __all__ = (
     "ResendVerificationRequest",
     "ReservedRenameDetail",
     "ReservedRenameWarning",
+    "RestorePreviousVersionRequest",
+    "RestorePreviousVersionResponse",
     "ReuploadCommitRequest",
     "ReuploadCommitRequestExpectedOriginKindType0",
     "ReuploadCommitResponse",
     "ReuploadPreviewRequest",
     "ReuploadPreviewResponse",
     "ReuploadPreviewResponseAllLayersType0Item",
+    "ReuploadPreviewResponseReviewReasonsItem",
     "ReuploadPreviewResponseSampleRowsItem",
     "ReuploadResponse",
     "ReuploadServicePreviewRequest",
@@ -1274,7 +1389,12 @@ __all__ = (
     "SSETokenEvent",
     "SSEToolResultEvent",
     "SSEToolStartEvent",
+    "SsoExchangeRequest",
     "StacAsset",
+    "StacAssetSize",
+    "StacAssetSizesRequest",
+    "StacAssetSizesResponse",
+    "StacAssetSizeTarget",
     "StacCatalog",
     "StacCollection",
     "StacCollectionExtent",
@@ -1297,10 +1417,13 @@ __all__ = (
     "StacItemResponse",
     "StacItemResponseAssets",
     "StacItemSummary",
+    "StacItemSummaryDataAssetImportRefusalType0",
     "StacLink",
+    "StacNextPage",
     "StacSearchBody",
     "StacSearchBodyIntersectsType0",
     "StacSearchRequest",
+    "StacSearchRequestCloudCoverModeType0",
     "StacSearchResponse",
     "StaleCleanupResponse",
     "StatusUpdate",
@@ -1311,6 +1434,11 @@ __all__ = (
     "TerrainConfig",
     "ThumbnailUploadRequest",
     "TileConfigResponse",
+    "TilesetMetadata",
+    "TilesetMetadataBoundingVolumeType0",
+    "TilesetPreviewResponse",
+    "TilesetPreviewResponseBoundingVolume",
+    "TilesetPreviewResponseVersion",
     "TileTokenBatchRequest",
     "TileTokenBatchResponse",
     "TileTokenBatchResponseTokens",

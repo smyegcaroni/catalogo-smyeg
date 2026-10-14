@@ -1,19 +1,16 @@
 """Shared alembic subprocess runner for migration tests.
 
-fix(#933): seven test files each carried their own ``_run_alembic`` copy, and
-none of them knew that migration ``0030_records_spatial_extent_type``
-deliberately REFUSES to downgrade while any ``catalog.records`` row holds a
-MULTIPOLYGON ``spatial_extent``. Any test that committed a seam-crossing
-extent therefore broke every migration test that later downgraded past 0030
-in the same xdist worker — and the failure surfaced in an unrelated file,
-reproducible only when both tests share a worker (each worker owns its own
-database, so a single-file run never shows it).
+Some migrations refuse to downgrade while rows would violate the older schema.
+A test that commits such a row breaks every migration test that later
+downgrades past it in the same xdist worker, and the failure shows up in an
+unrelated file only when both tests share a worker, since each worker owns its
+own database.
 
 This module is the one place that knows about refuse-to-coerce downgrades:
 
 - ``0030``: normalized automatically before every downgrade (see below).
 - ``0029_api_key_hardening``: refuses while any API key carries an expiry or
-  any user's ``key_epoch`` has been bumped (fix(#1016)). Also normalized
+  any user's ``key_epoch`` has been bumped. Also normalized
   automatically — see ``_API_KEY_STATE_NORMALIZATION`` for why this one is
   auto-cleaned while the two below are not.
 - ``0010_oauth_github_provider_type``: refuses while GitHub OAuth providers
@@ -22,6 +19,24 @@ This module is the one place that knows about refuse-to-coerce downgrades:
   its own cleanup.
 - ``0005_dormant_tenancy``: refuses while tenant-scoped data exists. Same
   reasoning; no current test trips it.
+- ``0065_tiles3d_record_type``: refuses while any record uses
+  ``tiles3d_dataset`` or any dataset uses ``3dtiles``, and
+  ``0066_tileset_asset_key`` while any ``tileset`` asset row exists. Not
+  auto-cleaned; the tests that commit such rows (test_tiles3d_record_type,
+  test_tiles3d_branches, test_tiles3d_record_type_migration,
+  test_catalog_projection, test_tileset_upload and test_tileset_quality_score)
+  remove them themselves.
+- ``0070_pointcloud_record_type``: refuses while any record uses
+  ``pointcloud_dataset`` or any dataset uses ``copc``, and
+  ``0071_pointcloud_asset_and_facts`` while any ``pointcloud`` asset row
+  exists. Not auto-cleaned; the tests that commit such rows
+  (test_pointcloud_record_type, test_pointcloud_record_type_migration,
+  test_pointcloud_branches and test_pointcloud_record_type_refusals) remove
+  them themselves.
+
+- ``0077_dataset_previous_version``: refuses while any refresh run has
+  ``origin_kind = 'restore'``. Normalized automatically, since ordinary
+  restore tests leave such runs behind.
 
 If a future migration gains a refuse-to-coerce downgrade, teach this module
 about it rather than adding cleanup to individual test files.
@@ -142,6 +157,19 @@ $$;
 """
 
 
+# Restore runs are fixture noise in a test database; 0077's downgrade refuses
+# them because the earlier CHECK has no 'restore'.
+_RESTORE_RUN_NORMALIZATION = """
+DO $$
+BEGIN
+    IF to_regclass('catalog.dataset_refresh_runs') IS NOT NULL THEN
+        DELETE FROM catalog.dataset_refresh_runs WHERE origin_kind = 'restore';
+    END IF;
+END
+$$;
+"""
+
+
 def _execute_normalization(sql: str) -> None:
     from app.core.config import settings
 
@@ -163,6 +191,11 @@ def normalize_seam_extents() -> None:
 def normalize_api_key_state() -> None:
     """Clear key expiry and epoch bumps so downgrades can cross 0029."""
     _execute_normalization(_API_KEY_STATE_NORMALIZATION)
+
+
+def normalize_restore_runs() -> None:
+    """Delete restore refresh runs so downgrades can cross 0077."""
+    _execute_normalization(_RESTORE_RUN_NORMALIZATION)
 
 
 def run_alembic(
@@ -192,6 +225,7 @@ def run_alembic(
     if normalize and args and args[0] == "downgrade":
         normalize_seam_extents()
         normalize_api_key_state()
+        normalize_restore_runs()
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(_BACKEND_DIR)

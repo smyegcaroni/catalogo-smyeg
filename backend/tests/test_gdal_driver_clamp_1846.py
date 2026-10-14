@@ -50,7 +50,9 @@ from app.processing.ingest.validation import (
     SQLITE_FAMILY_EXTENSIONS,
     UnsafeUploadError,
     validate_content_directives,
+    validate_file_content,
 )
+from app.platform.egress_proxy import ServiceEgress
 from app.processing.raster.vrt import gdal_service_safe_env, gdal_vector_safe_env
 
 # A member whose bytes tell the OGR_VRT driver to go read a local path.
@@ -63,6 +65,9 @@ OGR_VRT_MEMBER = (
 # identifies on CONTENT, so the member name is irrelevant -- which is exactly
 # why the extension refusal below cannot be the only layer.
 WFS_MEMBER = "<OGRWFSDataSource><URL>{url}</URL></OGRWFSDataSource>"
+
+# These tests read only the driver clamp, so no proxy has to be listening.
+_EGRESS = ServiceEgress("http://127.0.0.1:9")
 
 needs_ogr = pytest.mark.skipif(
     shutil.which("ogrinfo") is None,
@@ -88,7 +93,7 @@ def test_vector_env_refuses_the_pointer_and_network_drivers():
 
 
 def test_service_env_keeps_only_the_two_drivers_the_importers_need():
-    service = _skipped(gdal_service_safe_env())
+    service = _skipped(gdal_service_safe_env(_EGRESS))
     local = _skipped(gdal_vector_safe_env())
     assert local - service == {"WFS", "OAPIF"}
     assert "OGR_VRT" in service
@@ -102,7 +107,7 @@ def test_no_skipped_driver_name_contains_a_space():
     so a spaced entry would read as a clamp and be one for neither half of the
     name. Drivers in that shape are excluded by the input allowlist instead.
     """
-    for env in (gdal_vector_safe_env(), gdal_service_safe_env()):
+    for env in (gdal_vector_safe_env(), gdal_service_safe_env(_EGRESS)):
         for name in env["GDAL_SKIP"].split():
             assert "," not in name
     assert all(" " not in name for name in _skipped(gdal_vector_safe_env()))
@@ -160,9 +165,21 @@ class _FakeProc:
 
     def __init__(self, stdout=b"{}"):
         self._stdout = stdout
+        self.stdout = _Lines()
 
     async def communicate(self):
         return self._stdout, b""
+
+    async def wait(self):
+        return self.returncode
+
+
+class _Lines:
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
 
 
 @pytest.fixture
@@ -211,9 +228,11 @@ async def test_run_ogr2ogr_clamps_both_ways(spawned):
         schema="data",
         geometry_type="POINT",
     )
-    argv, env = spawned[0]
-    assert "OGR_VRT" in env["GDAL_SKIP"]
-    assert argv[argv.index("-if") + 1] == "CSV"
+    # A CSV load first probes its geometry, and both runs carry the clamps.
+    assert len(spawned) == 2
+    for argv, env in spawned:
+        assert "OGR_VRT" in env["GDAL_SKIP"]
+        assert argv[argv.index("-if") + 1] == "CSV"
 
 
 @pytest.mark.anyio
@@ -384,7 +403,7 @@ def test_every_declared_driver_name_is_a_real_driver():
     declared = (
         set(ARCHIVE_MEMBER_DRIVERS)
         | _skipped(gdal_vector_safe_env())
-        | _skipped(gdal_service_safe_env())
+        | _skipped(gdal_service_safe_env(_EGRESS))
     )
     assert declared <= known, sorted(declared - known)
 
@@ -696,8 +715,43 @@ def test_a_database_inside_an_archive_is_refused_under_any_name(
         validate_content_directives(str(archive), "upload.zip")
 
 
+@pytest.mark.parametrize("name", ["upload.laz", "nested/SITE.COPC.LAZ"])
+def test_no_driver_may_open_a_point_cloud(name):
+    """A .laz is refused by the driver lookup instead of taking the archive union."""
+    with pytest.raises(UnsafeUploadError, match="kind=pointcloud"):
+        allowed_input_drivers(name)
+    with pytest.raises(UnsafeUploadError, match="kind=pointcloud"):
+        local_input_driver_args(name)
+
+
+def test_a_database_named_as_a_point_cloud_is_refused_by_its_content(
+    tmp_path, outside_file
+):
+    """A .laz whose bytes are a database is refused on its content.
+
+    First proves GDAL WOULD open the database under the archive driver union,
+    so the refusal below is of a real threat.
+    """
+    path = _database_with_external_source(tmp_path, outside_file, name="upload.laz")
+
+    if shutil.which("ogrinfo") is not None:
+        _require_if_flag()
+        code, driver, listing = _ogrinfo(
+            str(path),
+            env_extra={"GDAL_SKIP": gdal_vector_safe_env()["GDAL_SKIP"]},
+            args=[arg for d in ARCHIVE_MEMBER_DRIVERS for arg in ("-if", d)],
+        )
+        assert (code, driver) == (0, "SQLite"), (
+            "GDAL did not open the .laz as SQLite, so this case proves nothing"
+        )
+
+    with pytest.raises(ValueError, match="not a LAS or LAZ point cloud"):
+        validate_file_content(str(path), "upload.laz")
+
+
+@pytest.mark.parametrize("suffix", [".zip", ".3tz"])
 @pytest.mark.parametrize("member", ["notes.txt", "readme", "deep/dir/x.dat"])
-def test_a_vrt_inside_an_archive_is_refused_under_any_name(tmp_path, member):
+def test_a_vrt_inside_an_archive_is_refused_under_any_name(tmp_path, member, suffix):
     """Same rule for the other content-identified driver.
 
     The OGR VRT driver searches the leading bytes for its root element, so a
@@ -708,11 +762,11 @@ def test_a_vrt_inside_an_archive_is_refused_under_any_name(tmp_path, member):
         "\ufeff<?xml version='1.0'?>\n<!-- notes -->\nleading junk\n"
         + OGR_VRT_MEMBER.format(target="/x", stem="x")
     )
-    archive = tmp_path / "upload.zip"
+    archive = tmp_path / f"upload{suffix}"
     with zipfile.ZipFile(archive, "w") as z:
         z.writestr(member, body)
 
-    if shutil.which("ogrinfo") is not None:
+    if suffix == ".zip" and shutil.which("ogrinfo") is not None:
         code, driver, listing = _ogrinfo(f"/vsizip/{archive}")
         assert (code, driver) == (0, "OGR_VRT"), (
             f"GDAL did not identify member {member!r} as a VRT, so this case "
@@ -720,7 +774,7 @@ def test_a_vrt_inside_an_archive_is_refused_under_any_name(tmp_path, member):
         )
 
     with pytest.raises(UnsafeUploadError, match="VRT"):
-        validate_content_directives(str(archive), "upload.zip")
+        validate_content_directives(str(archive), f"upload{suffix}")
 
 
 def test_the_archive_scan_bounds_its_total_decompression(tmp_path, monkeypatch):
@@ -1134,7 +1188,79 @@ async def test_preview_maps_a_damaged_archive_to_422(
     response = await client.post(f"/ingest/preview/{job.id}", headers=admin_auth_header)
 
     assert response.status_code == 422, response.text
-    assert "could not be read" in response.json()["detail"]
+    assert "could not be read" in response.json()["detail"]["message"]
+
+
+@pytest.mark.anyio
+async def test_preview_maps_an_unexpected_gdal_failure_to_a_coded_422(
+    client, admin_auth_header, test_db_session, tmp_path, monkeypatch
+):
+    """The broad `except Exception` catch still carries a stable code."""
+    from app.platform.jobs.models import IngestJob
+    from app.processing.ingest import router
+    from tests.factories import get_user_id
+
+    p = tmp_path / "update.geojson"
+    p.write_text('{"type":"FeatureCollection","features":[]}')
+    job = IngestJob(
+        source_filename="update.geojson",
+        file_path=str(p),
+        created_by=await get_user_id(test_db_session, "admin"),
+        status="pending",
+        user_metadata={"file_type": "vector"},
+    )
+    test_db_session.add(job)
+    await test_db_session.commit()
+
+    monkeypatch.setattr(
+        router,
+        "run_ogrinfo_preview",
+        mock.AsyncMock(side_effect=RuntimeError("ogrinfo subprocess crashed")),
+    )
+
+    response = await client.post(f"/ingest/preview/{job.id}", headers=admin_auth_header)
+
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "preview_failed"
+    assert detail["message"] == (
+        "Unable to preview file. The file may be malformed or unsupported."
+    )
+
+
+@pytest.mark.anyio
+async def test_raster_preview_maps_an_unexpected_failure_to_a_coded_422(
+    client, admin_auth_header, test_db_session, tmp_path, monkeypatch
+):
+    """The raster preview's own broad catch also carries a stable code."""
+    from app.platform.jobs.models import IngestJob
+    from tests.factories import get_user_id
+
+    p = tmp_path / "update.tif"
+    p.write_bytes(b"not a real tiff")
+    job = IngestJob(
+        source_filename="update.tif",
+        file_path=str(p),
+        created_by=await get_user_id(test_db_session, "admin"),
+        status="pending",
+        user_metadata={"file_type": "raster"},
+    )
+    test_db_session.add(job)
+    await test_db_session.commit()
+
+    monkeypatch.setattr(
+        "app.processing.raster.cog.extract_raster_metadata",
+        mock.Mock(side_effect=RuntimeError("rasterio could not open the file")),
+    )
+
+    response = await client.post(f"/ingest/preview/{job.id}", headers=admin_auth_header)
+
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "raster_preview_failed"
+    assert detail["message"] == (
+        "Unable to preview raster file. The file may be malformed or unsupported."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1262,18 +1388,19 @@ def test_comment_stripping_leaves_quoted_text_alone():
     assert "USING VirtualText" in stripped
 
 
-def _archive_with_unsupported_compression(tmp_path, name="upload.zip") -> Path:
-    """A ZIP whose member declares a compression method zipfile cannot inflate.
+def _archive_with_unsupported_compression(
+    tmp_path, name="upload.zip", method=99
+) -> Path:
+    """A ZIP whose deflated member declares ``method`` in both headers.
 
-    Built by rewriting the method field in both the local header and the
-    central directory, because `zipfile` will not write one it cannot read.
+    Rewritten in place because `zipfile` will not write most of these methods.
     """
     path = tmp_path / name
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("layer.geojson", '{"type":"FeatureCollection"}' * 20)
 
     raw = bytearray(path.read_bytes())
-    unsupported = (99).to_bytes(2, "little")  # 99 = AE-x encryption marker
+    unsupported = method.to_bytes(2, "little")
     # Local file header: method at offset 8. Central directory: method at 10.
     for signature, offset in ((b"PK\x03\x04", 8), (b"PK\x01\x02", 10)):
         at = raw.find(signature)
@@ -1283,11 +1410,11 @@ def _archive_with_unsupported_compression(tmp_path, name="upload.zip") -> Path:
     return path
 
 
-def _archive_with_encrypted_member(tmp_path, name="upload.zip") -> Path:
-    """A ZIP whose member sets the encryption bit in its general-purpose flags.
+def _archive_with_encrypted_member(tmp_path, name="upload.zip", flag=0x1) -> Path:
+    """A ZIP whose member sets ``flag`` in its general-purpose flags.
 
-    `zipfile` raises RuntimeError for these when no password is supplied, which
-    is an ordinary thing to receive from a user and not a bug on our side.
+    `zipfile` raises RuntimeError for the encryption bit when no password is
+    supplied and NotImplementedError for strong encryption (0x40).
     """
     path = tmp_path / name
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -1299,7 +1426,7 @@ def _archive_with_encrypted_member(tmp_path, name="upload.zip") -> Path:
         at = raw.find(signature)
         assert at >= 0, signature
         flags = int.from_bytes(raw[at + offset : at + offset + 2], "little")
-        raw[at + offset : at + offset + 2] = (flags | 0x1).to_bytes(2, "little")
+        raw[at + offset : at + offset + 2] = (flags | flag).to_bytes(2, "little")
     path.write_bytes(bytes(raw))
     return path
 
@@ -1308,8 +1435,12 @@ def _archive_with_encrypted_member(tmp_path, name="upload.zip") -> Path:
     ("build", "raises"),
     [
         (_archive_with_encrypted_member, RuntimeError),
-        (_archive_with_unsupported_compression, NotImplementedError),
+        (
+            functools.partial(_archive_with_encrypted_member, flag=0x40),
+            NotImplementedError,
+        ),
     ],
+    ids=["encrypted", "strongly-encrypted"],
 )
 def test_a_member_zipfile_will_not_decode_is_refused_not_raised(
     tmp_path, build, raises
@@ -1336,9 +1467,69 @@ def test_a_member_zipfile_will_not_decode_is_refused_not_raised(
     assert isinstance(refused.value, ValueError)
 
 
+@pytest.mark.parametrize(
+    ("method", "named"),
+    [
+        (zipfile.ZIP_BZIP2, "bzip2"),
+        (zipfile.ZIP_LZMA, "lzma"),
+        (zipfile.ZIP_ZSTANDARD, "zstd"),
+        (9, "deflate64"),
+        (99, "method 99"),
+    ],
+)
+def test_a_member_neither_stored_nor_deflated_is_refused_unread(
+    tmp_path, zip_member_reads, method, named
+):
+    """The ingest task's check and the content scan refuse by method, reading nothing."""
+    from app.processing.ingest import validation
+
+    archive = str(_archive_with_unsupported_compression(tmp_path, method=method))
+
+    with pytest.raises(ValueError, match=f"compressed with {named}\\."):
+        validation.validate_archive_safety(archive, "upload.zip")
+    with pytest.raises(UnsafeUploadError, match=f"compressed with {named}\\."):
+        validation.validate_content_directives(archive, "upload.zip")
+    assert zip_member_reads == []
+
+
+def test_a_name_whose_first_entry_is_bzip2_is_refused_unread(
+    tmp_path, zip_member_reads
+):
+    """Every entry's method is checked, not only the one its name resolves to."""
+    from app.processing.ingest import validation
+
+    archive = tmp_path / "upload.zip"
+    body = '{"type":"FeatureCollection"}' * 20
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        with zipfile.ZipFile(archive, "w") as z:
+            z.writestr("layer.geojson", body, compress_type=zipfile.ZIP_BZIP2)
+            z.writestr("layer.geojson", body, compress_type=zipfile.ZIP_DEFLATED)
+    with zipfile.ZipFile(archive) as opened:
+        assert opened.getinfo("layer.geojson").compress_type == zipfile.ZIP_DEFLATED
+
+    with pytest.raises(ValueError, match="compressed with bzip2"):
+        validation.validate_archive_safety(str(archive), "upload.zip")
+    with pytest.raises(UnsafeUploadError, match="compressed with bzip2"):
+        validation.validate_content_directives(str(archive), "upload.zip")
+    assert zip_member_reads == []
+
+
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("build", "detail"),
+    [
+        (_archive_with_a_damaged_member, "could not be read"),
+        (
+            functools.partial(
+                _archive_with_unsupported_compression, method=zipfile.ZIP_BZIP2
+            ),
+            "compressed with bzip2",
+        ),
+    ],
+    ids=["damaged", "bzip2"],
+)
 async def test_reupload_preview_maps_a_content_refusal_to_422(
-    client, admin_auth_header, test_db_session, tmp_path
+    client, admin_auth_header, test_db_session, tmp_path, build, detail
 ):
     """The sibling endpoint's mapping, which it did not have.
 
@@ -1352,7 +1543,7 @@ async def test_reupload_preview_maps_a_content_refusal_to_422(
     admin_id = await get_user_id(test_db_session, "admin")
     dataset = await _create_dataset(test_db_session, created_by=admin_id)
 
-    archive = _archive_with_a_damaged_member(tmp_path)
+    archive = build(tmp_path)
     uploaded = await client.post(
         f"/datasets/{dataset.id}/reupload",
         files={"file": ("update.zip", archive.read_bytes(), "application/zip")},
@@ -1365,4 +1556,4 @@ async def test_reupload_preview_maps_a_content_refusal_to_422(
         headers=admin_auth_header,
     )
     assert response.status_code == 422, response.text
-    assert "could not be read" in response.json()["detail"]
+    assert detail in response.json()["detail"]["message"]

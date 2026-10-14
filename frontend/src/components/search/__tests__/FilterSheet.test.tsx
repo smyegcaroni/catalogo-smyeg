@@ -2,8 +2,10 @@ import { act, fireEvent, render, screen } from '@/test/test-utils';
 import { FilterSheet } from '../FilterSheet';
 import { useSearchStore } from '@/stores/search-store';
 
+const facetCounts = vi.hoisted(() => ({ record_type: {} as Record<string, number> }));
+
 vi.mock('@/components/search/hooks/use-search', () => ({
-  useFacets: () => ({ data: { record_type: {} }, isLoading: false }),
+  useFacets: () => ({ data: facetCounts, isLoading: false }),
   useCatalogSummary: () => ({ data: undefined, isLoading: false }),
 }));
 
@@ -73,5 +75,81 @@ describe('FilterSheet date field accessible names (#1778)', () => {
 
     expect(screen.getAllByLabelText('From')).toHaveLength(2);
     expect(screen.getAllByLabelText('To')).toHaveLength(2);
+  });
+});
+
+describe('FilterSheet 3D Tiles and point cloud filters', () => {
+  afterEach(() => {
+    facetCounts.record_type = {};
+    useSearchStore.getState().resetFilters();
+  });
+
+  it('offers a 3D Tiles toggle, counted in All, when the catalog holds tilesets', () => {
+    facetCounts.record_type = { vector_dataset: 3, tiles3d_dataset: 2 };
+    render(<FilterSheet totalResults={5} allTypesTotal={5} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /Filters/i }));
+
+    expect(screen.getByRole('radio', { name: /3D Tiles/ })).toHaveTextContent('(2)');
+    expect(screen.getByRole('radio', { name: /All/ })).toHaveTextContent('(5)');
+  });
+
+  it('shows the supplied All total, not the type-narrowed result total', () => {
+    facetCounts.record_type = { vector_dataset: 10, raster_dataset: 5 };
+    useSearchStore.getState().setFilter('record_type', 'raster_dataset');
+    render(<FilterSheet totalResults={5} allTypesTotal={17} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /Filters/i }));
+
+    expect(screen.getByRole('radio', { name: /All/ })).toHaveTextContent('(17)');
+  });
+
+  it('shows All with an empty facet map for a collection-only or zero total', () => {
+    facetCounts.record_type = {};
+    const { rerender } = render(<FilterSheet totalResults={2} allTypesTotal={2} />);
+    fireEvent.click(screen.getByRole('button', { name: /Filters/i }));
+    expect(screen.getByRole('radio', { name: /All/ })).toHaveTextContent('(2)');
+
+    rerender(<FilterSheet totalResults={undefined} allTypesTotal={0} />);
+    expect(screen.getByRole('radio', { name: /All/ })).toHaveTextContent('(0)');
+  });
+
+  it('offers a Point cloud toggle, counted in All, when the catalog holds point clouds', () => {
+    facetCounts.record_type = { vector_dataset: 3, pointcloud_dataset: 2 };
+    render(<FilterSheet totalResults={5} allTypesTotal={5} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /Filters/i }));
+
+    expect(screen.getByRole('radio', { name: /Point cloud/ })).toHaveTextContent('(2)');
+    expect(screen.getByRole('radio', { name: /All/ })).toHaveTextContent('(5)');
+  });
+
+  it.each([
+    ['vector_dataset', true],
+    ['tiles3d_dataset', false],
+    ['pointcloud_dataset', false],
+  ])('offers the geometry filter only for a type with vector tiles (%s)', (recordType, offered) => {
+    facetCounts.record_type = { vector_dataset: 3, tiles3d_dataset: 2, pointcloud_dataset: 1 };
+    useSearchStore.getState().setFilter('record_type', recordType);
+    render(<FilterSheet totalResults={5} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /Filters/i }));
+
+    expect(Boolean(screen.queryByRole('combobox', { name: 'Geometry Type' }))).toBe(offered);
+  });
+});
+
+describe('FilterSheet focus restoration', () => {
+  it.each(['Escape', 'close'])('returns keyboard focus to Filters after %s', async (method) => {
+    const { default: userEvent } = await import('@testing-library/user-event');
+    const user = userEvent.setup();
+    render(<FilterSheet totalResults={10} />);
+    const trigger = screen.getByRole('button', { name: 'Filters' });
+    // jsdom has no layout; represent a visible trigger in this mobile view.
+    vi.spyOn(trigger, 'getClientRects').mockReturnValue({ length: 1 } as DOMRectList);
+    await user.click(trigger);
+    if (method === 'Escape') await user.keyboard('{Escape}');
+    else await user.click(screen.getByRole('button', { name: 'Close' }));
+    await vi.waitFor(() => expect(trigger).toHaveFocus());
   });
 });

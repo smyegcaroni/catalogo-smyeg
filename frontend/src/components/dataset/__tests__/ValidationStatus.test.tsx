@@ -58,7 +58,7 @@ describe('ValidationStatus', () => {
       }),
     );
 
-    render(<ValidationStatus datasetId="dataset-1" />);
+    render(<ValidationStatus datasetId="dataset-1" canEdit />);
 
     expect(screen.getByTestId('validation-helper-text')).toHaveTextContent(/issue\(s\).*warning\(s\).*need attention/i);
     expect(screen.getByTestId('validation-likely-causes')).toHaveTextContent(/Missing Source Url/i);
@@ -75,7 +75,7 @@ describe('ValidationStatus', () => {
       }),
     );
 
-    render(<ValidationStatus datasetId="dataset-1" />);
+    render(<ValidationStatus datasetId="dataset-1" canEdit />);
 
     await user.click(screen.getByTestId('validation-troubleshoot-trigger'));
 
@@ -103,6 +103,7 @@ describe('ValidationStatus', () => {
     render(
       <ValidationStatus
         datasetId="dataset-1"
+        canEdit
         onNavigateToField={onNavigateToField}
       />,
     );
@@ -111,6 +112,21 @@ describe('ValidationStatus', () => {
     await user.click(screen.getByRole('button', { name: 'Go to field' }));
 
     expect(onNavigateToField).toHaveBeenCalledWith('summary');
+  });
+
+  it('offers readers issue details and a maintainer route without edit instructions', async () => {
+    const user = userEvent.setup();
+    mockUseValidation.mockReturnValue(createValidationResult({
+      isValid: false,
+      errors: [{ field: 'summary', message: 'Summary is required', severity: 'error' }],
+    }));
+    render(<ValidationStatus datasetId="dataset-1" onNavigateToField={vi.fn()} />);
+
+    expect(screen.getByTestId('validation-helper-text')).toHaveTextContent('Ask the dataset owner');
+    await user.click(screen.getByTestId('validation-troubleshoot-trigger'));
+    expect(screen.getByTestId('validation-troubleshoot-errors')).toBeInTheDocument();
+    expect(screen.queryByTestId('validation-troubleshoot-next-steps')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Go to field' })).not.toBeInTheDocument();
   });
 
   it('does not show troubleshoot affordance for clean datasets', () => {
@@ -158,5 +174,36 @@ describe('ValidationStatus', () => {
     expect(screen.getByTestId('validation-status-compact')).toBeInTheDocument();
     expect(screen.getByTestId('validation-likely-causes-compact')).toHaveTextContent(/Likely:/i);
     expect(screen.getByTestId('validation-troubleshoot-trigger')).toBeInTheDocument();
+  });
+  it('shows localized field labels and links each message to its editor section', async () => {
+    const user = userEvent.setup();
+    const onNavigateToField = vi.fn();
+    mockUseValidation.mockReturnValue(createValidationResult({
+      isValid: false,
+      errors: [
+        { field: 'lineage_summary', message: 'Lineage summary is required', severity: 'error' },
+        { field: 'srid', message: 'CRS is required', severity: 'error' },
+      ],
+      warnings: [{ field: 'attribute_descriptions', message: '3 attribute(s) missing descriptions', severity: 'warning' }],
+    }));
+    render(<ValidationStatus datasetId="dataset-1" canEdit onNavigateToField={onNavigateToField} />);
+
+    expect(screen.queryByText(/lineage_summary|attribute_descriptions|srid/)).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Go to field: Lineage summary' }));
+    expect(onNavigateToField).toHaveBeenCalledWith('lineage_summary');
+    await user.click(screen.getByRole('button', { name: 'Go to field: Attribute descriptions' }));
+    expect(onNavigateToField).toHaveBeenCalledWith('attribute_descriptions');
+    expect(screen.getByText('Coordinate reference system:')).toBeInTheDocument();
+  });
+
+  it('shows a localized label without a link for readers', () => {
+    mockUseValidation.mockReturnValue(createValidationResult({
+      isValid: false,
+      errors: [{ field: 'source_url', message: 'Source URL is required', severity: 'error' }],
+    }));
+    render(<ValidationStatus datasetId="dataset-1" onNavigateToField={vi.fn()} />);
+
+    expect(screen.getByText('Source URL:')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Go to field/ })).not.toBeInTheDocument();
   });
 });

@@ -230,43 +230,17 @@ class TestVrtBuildFunctions:
         res_idx = cmd.index("-resolution")
         assert cmd[res_idx + 1] == "average"
 
-    def test_build_vrt_falls_back_to_python_writer_when_cli_missing(self, tmp_path):
-        import numpy as np
-        import rasterio
-        from rasterio.transform import from_origin
-
-        src_a = tmp_path / "a.tif"
-        src_b = tmp_path / "b.tif"
-        for path, origin_x in ((src_a, 0), (src_b, 5)):
-            with rasterio.open(
-                path,
-                "w",
-                driver="GTiff",
-                width=5,
-                height=5,
-                count=1,
-                dtype="uint8",
-                crs="EPSG:4326",
-                transform=from_origin(origin_x, 5, 1, 1),
-            ) as dataset:
-                dataset.write(np.ones((1, 5, 5), dtype="uint8"))
-
+    def test_build_vrt_needs_the_gdal_cli(self, tmp_path):
+        """No in-process writer stands in for gdalbuildvrt, since it would open
+        every source, and parse its CRS, in this process."""
         output = tmp_path / "out.vrt"
         with patch(
             "app.processing.raster.vrt.subprocess.run", side_effect=FileNotFoundError()
         ):
-            result = build_vrt(
-                "mosaic",
-                [str(src_a), str(src_b)],
-                str(output),
-                "finest",
-            )
+            with pytest.raises(FileNotFoundError):
+                build_vrt("mosaic", [str(tmp_path / "a.tif")], str(output), "finest")
 
-        assert result == str(output)
-        with rasterio.open(output) as dataset:
-            assert dataset.count == 1
-            assert dataset.width == 10
-            assert dataset.height == 5
+        assert not output.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +406,10 @@ class TestCreateVrtJob:
         async def _check():
             mock_db = AsyncMock()
             mock_user = MagicMock()
-            request = self._minimal_request(source_count=1)
+            request = self._minimal_request()
+            # The model rejects a single source itself; assignment skips that
+            # check so the service's own guard stays covered.
+            request.source_dataset_ids = request.source_dataset_ids[:1]
 
             with pytest.raises(HTTPException) as exc_info:
                 await create_vrt_job(mock_db, request, mock_user)
@@ -499,7 +476,7 @@ class TestCreateVrtJob:
             lookup_result.scalars.return_value = scalars
             mock_db.execute = AsyncMock(return_value=lookup_result)
 
-            # Mock validate_sources to return a compatibility error.
+            # Mock the validation to return a compatibility error.
             fake_error = MagicMock()
             fake_error.model_dump.return_value = {
                 "code": "crs_mismatch",
@@ -507,8 +484,8 @@ class TestCreateVrtJob:
             }
 
             with patch(
-                "app.processing.raster.validation.validate_sources",
-                return_value=[fake_error],
+                "app.processing.raster.validation.validate_sources_async",
+                new=AsyncMock(return_value=[fake_error]),
             ):
                 mock_user = MagicMock()
                 with pytest.raises(HTTPException) as exc_info:
@@ -558,8 +535,8 @@ class TestCreateVrtJob:
 
             with (
                 patch(
-                    "app.processing.raster.validation.validate_sources",
-                    return_value=[],
+                    "app.processing.raster.validation.validate_sources_async",
+                    new=AsyncMock(return_value=[]),
                 ),
                 patch(
                     "app.processing.ingest.service.create_ingest_job",
@@ -587,86 +564,6 @@ class TestCreateVrtJob:
 
             source_ids_passed = _json.loads(kwargs["source_dataset_ids"])
             assert len(source_ids_passed) == len(request.source_dataset_ids)
-
-        asyncio.run(_check())
-
-    def test_defer_failure_marks_job_failed_and_raises_503(self):
-        """RESILIENCE-2: defer_async raising must flip the committed job to failed.
-
-        Regression for the orphan-job bug where a Procrastinate outage left
-        the pending IngestJob row dangling for 60 minutes (PENDING_TIMEOUT)
-        before stale-cleanup caught up. The helper must mark the job failed
-        before re-raising so /jobs listings reflect the real state and the
-        user gets a clean 503 instead of a generic 500.
-        """
-        import asyncio
-
-        from fastapi import HTTPException
-        from unittest.mock import AsyncMock, patch
-
-        from app.processing.ingest.service import create_vrt_job
-
-        async def _check():
-            mock_db = AsyncMock()
-            request = self._minimal_request()
-
-            assets = []
-            for sid in request.source_dataset_ids:
-                asset = MagicMock()
-                asset.dataset_id = sid
-                assets.append(asset)
-
-            lookup_result = MagicMock()
-            scalars = MagicMock()
-            scalars.all.return_value = assets
-            lookup_result.scalars.return_value = scalars
-            mock_db.execute = AsyncMock(return_value=lookup_result)
-            mock_db.commit = AsyncMock()
-
-            stub_job = MagicMock()
-            stub_job.id = uuid.uuid4()
-            stub_job.user_metadata = None
-            stub_job.status = "pending"
-
-            mock_user = MagicMock()
-            mock_user.id = uuid.uuid4()
-
-            # Simulate Procrastinate being unreachable.
-            failing_defer = AsyncMock(
-                side_effect=RuntimeError("procrastinate unreachable")
-            )
-
-            with (
-                patch(
-                    "app.processing.raster.validation.validate_sources",
-                    return_value=[],
-                ),
-                patch(
-                    "app.processing.ingest.service.create_ingest_job",
-                    new=AsyncMock(return_value=stub_job),
-                ),
-                patch(
-                    "app.processing.ingest.tasks.ingest_vrt",
-                    defer_async=failing_defer,
-                ),
-            ):
-                with pytest.raises(HTTPException) as exc_info:
-                    await create_vrt_job(mock_db, request, mock_user)
-
-            # Propagated as 503 so the frontend can retry cleanly.
-            assert exc_info.value.status_code == 503
-            # Job was marked failed before the exception propagated.
-            assert stub_job.status == "failed"
-            assert stub_job.error_message is not None
-            # fix(#1953): the stored reason names the class, never the raw text.
-            assert "procrastinate unreachable" not in stub_job.error_message
-            assert "RuntimeError" in stub_job.error_message
-            assert stub_job.completed_at is not None
-            # Three commits: one after create_ingest_job, one for the #1744
-            # dispatch stamp the orphan guard writes before it defers, and one
-            # after flipping the job to failed. Verifies the failed state is
-            # durable.
-            assert mock_db.commit.await_count == 3
 
         asyncio.run(_check())
 

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useNavigate, Link } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
@@ -14,12 +14,19 @@ import { Input } from '@/components/ui/input';
 import { CheckCircle2, XCircle, Database, Search } from 'lucide-react';
 import { getGeometryTypeLabel } from '@/i18n/labels';
 import { formatNumber } from '@/lib/format';
+import { describeFailureReason } from '@/lib/failure-reason';
 
 // fix(#927/#929): `restricted` is not offered at import time — a non-admin
 // owner who picked it lost access to their own dataset, and grants have no
 // write path. The type goes with the option, so nothing keeps typechecking
 // against a value the picker cannot produce.
 type DatasetVisibilityChoice = 'private' | 'public';
+
+// The schema discovery scans for unregistered tables.
+const DISCOVERY_SCHEMA = 'data';
+
+// Discovery's refusal codes, each with a sentence under register.refusal.
+const REFUSAL_CODES = new Set(['source_srid_undeclared', 'source_gid_unusable']);
 
 function toDisplayName(tableName: string): string {
   return tableName
@@ -119,7 +126,11 @@ export function RegisterForm() {
               <div key={r.table_name} className="flex items-center gap-2 text-sm">
                 <XCircle className="h-4 w-4 text-destructive shrink-0" />
                 <span className="font-mono">{r.table_name}</span>
-                {r.error && <span className="text-xs text-muted-foreground ms-auto">{r.error}</span>}
+                {r.error && (
+                  <span className="text-xs text-muted-foreground ms-auto">
+                    {describeFailureReason(r.error, t('register.internalFailure'))}
+                  </span>
+                )}
               </div>
             ))}
           </div>
@@ -201,7 +212,7 @@ export function RegisterForm() {
 
         <div className="eyebrow px-3.5 py-1.5 flex items-center gap-1.5">
           <Database className="size-2.5" />
-          {t('register.tableCount', { schema: 'public', count: filtered.length })}
+          {t('register.tableCount', { schema: DISCOVERY_SCHEMA, count: filtered.length })}
         </div>
 
         <div className="max-h-80 overflow-y-auto">
@@ -266,11 +277,13 @@ function TableDetail({
   // feat(#1691): hide the Public option when the restrict_public_visibility
   // instance setting caps non-admins at non-public (server enforces via 403).
   const canSetPublic = useCanSetPublicVisibility();
+  const refusal = table.refusal_reason ?? null;
+  const refusalId = useId();
 
   return (
     <>
       <p className="eyebrow mb-2.5">
-        public / <span className="font-medium text-foreground normal-case">{table.table_name}</span>
+        {DISCOVERY_SCHEMA} / <span className="font-medium text-foreground normal-case">{table.table_name}</span>
       </p>
       <h2 className="text-xl font-medium tracking-tight mb-1.5">{table.table_name}</h2>
       <p className="text-xs text-muted-foreground mb-5 max-w-lg">
@@ -280,7 +293,7 @@ function TableDetail({
       </p>
 
       {/* Stats grid */}
-      <div className="mb-5 grid grid-cols-2 gap-px overflow-hidden rounded-lg border border-border bg-border sm:grid-cols-4">
+      <dl className="mb-5 grid grid-cols-2 gap-px overflow-hidden rounded-lg border border-border bg-border sm:grid-cols-4">
         {[
           { label: t('register.stats.rows'), value: table.estimated_rows != null ? formatNumber(table.estimated_rows) : '—' },
           { label: t('register.stats.geometry'), value: table.geometry_type ? getGeometryTypeLabel(t, table.geometry_type) : t('register.stats.none') },
@@ -292,7 +305,13 @@ function TableDetail({
             <dd className="text-sm font-medium tracking-tight">{stat.value}</dd>
           </div>
         ))}
-      </div>
+      </dl>
+
+      {refusal && (
+        <p id={refusalId} className="max-w-lg text-xs text-destructive">
+          {REFUSAL_CODES.has(refusal) ? t(`register.refusal.${refusal}`) : refusal}
+        </p>
+      )}
 
       {/* Actions */}
       <fieldset disabled={isPending} className="flex items-center gap-3 flex-wrap mt-5 disabled:opacity-60">
@@ -311,7 +330,11 @@ function TableDetail({
             )}
           </SelectContent>
         </Select>
-        <Button onClick={onRegister} disabled={isPending}>
+        <Button
+          onClick={onRegister}
+          disabled={isPending || refusal !== null}
+          aria-describedby={refusal ? refusalId : undefined}
+        >
           {isPending ? (
             <span className="flex items-center gap-2">
               <span className="h-3 w-3 animate-spin rounded-full border-2 border-primary-foreground border-t-transparent" />

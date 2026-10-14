@@ -4,8 +4,8 @@ Storage portability (STOR-03/04, Phase 1210):
   VRTs are stored with provider-agnostic SourceFilename nodes (logical keys +
   relativeToVRT="1"). The rewrite pass (rewrite_vrt_sources) runs AFTER metadata
   extraction and quicklook generation at each store site — the in-flight tmp .vrt
-  used by extract_raster_metadata / generate_quicklook must hold concrete,
-  resolvable paths; only the stored copy is normalised to logical keys.
+  those probe reads open must hold concrete, resolvable paths; only the stored
+  copy is normalised to logical keys.
 
   At open-time, resolve_open_path (app.platform.storage.titiler_url) reconstructs
   the concrete VSI path from the logical key + current STORAGE_PROVIDER config, so
@@ -21,31 +21,34 @@ from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
 from sqlalchemy import select
 
-from app.platform.cache.tiles import invalidate_catalog_cache
+from app.platform.jobs import ledger
 from app.platform.jobs.heartbeat import (
     JOB_ERROR_WRITE_TIMEOUT_MS,
     arm_job_error_write_budget,
     claim_job_attempt_and_start_heartbeat,
     log_job_error_write_failure,
     maintain_vrt_generation_heartbeat,
-    require_ingest_job_update,
     resolve_ingest_attempt_or_skip,
     stop_ingest_job_heartbeat,
-    update_ingest_job_for_attempt,
 )
 from app.core.failure_reason import redact_failure_reason
 from app.core.db import tenant_task
-from app.processing.embeddings.helpers import defer_embedding
-from app.processing.raster.cog import extract_raster_metadata, sha256_file
-from app.processing.raster.quicklook import generate_quicklook
-from app.processing.raster.vrt import (
-    build_vrt,
-    gdal_safe_open_env,
-    resolve_vrt_source_path,
+from app.processing.raster.cog import sha256_file
+from app.processing.raster.probe import (
+    RENDER_TIMEOUT_SECONDS,
+    read_raster_metadata,
+    render_quicklook,
 )
+from app.processing.raster.vrt import build_vrt, resolve_vrt_source_path
+from app.processing.raster.vrt_members import note_vrt_members
 from app.processing.raster.vrt_rewrite import rewrite_vrt_sources
 from app.platform.storage import get_storage
 
+from app.processing.ingest.publish_followups import (
+    note_publish_followups,
+    owed_followups,
+    run_publish_followups,
+)
 from app.processing.ingest.tasks_common import (
     _bind_task_log_context,
     cleanup_step,
@@ -55,7 +58,11 @@ from app.processing.ingest.tasks_common import (
 from app.processing.ingest.tasks_staging import _cleanup_staging_on_failure
 from app.processing.ingest.tasks_raster_common import (
     absorb_cancellation,
+    note_publishing_xid,
+    observe_publish_commit,
     publish_commit_landed,
+    publishing_xid,
+    PublishObservation,
     record_unpublished_storage_keys,
 )
 
@@ -90,59 +97,12 @@ def _log_publish_wait_failure(
 
 
 def read_vrt_metadata(vrt_path: str) -> dict:
-    """``extract_raster_metadata`` on a built VRT, under the safe open env.
+    """Metadata of a built VRT, read in the probe child.
 
-    fix(#1778): steps 6 and 8 below open every ``/vsis3`` source the
-    assembled VRT names in-process rather than through a subprocess, so
-    they're the one place ``GDAL_SUBPROCESS_TIMEOUT_SECONDS`` doesn't
-    reach. A rasterio ``Env`` sets thread-local GDAL config, so
-    ``_VRT_SAFE_ENV`` must be entered INSIDE the ``asyncio.to_thread`` call
-    rather than around it — the whole reason this is a function, not a
-    ``with`` block at the call site.
-
-    fix(#1778): lives in THIS module and calls
-    ``extract_raster_metadata`` through the module global (not a local
-    import) because that name is a patch target for
-    ``test_regenerate_vrt_integration``; a function-level import there
-    made the patch a no-op.
+    Opening the VRT reads every ``/vsis3`` source it names, so it gets the
+    render timeout rather than the read one.
     """
-    with gdal_safe_open_env():
-        return extract_raster_metadata(vrt_path)
-
-
-def render_vrt_quicklook(vrt_path: str, size: int) -> bytes:
-    """``generate_quicklook`` on a built VRT, under the safe open env.
-
-    fix(#1778): the peer of :func:`read_vrt_metadata` and the heavier of the
-    two, since it reads pixels from every source rather than headers. Same
-    module-global call for the same reason.
-    """
-    with gdal_safe_open_env():
-        return generate_quicklook(vrt_path, size)
-
-
-async def _reap_superseded_generation_objects(
-    *,
-    prior_storage_keys: list[str],
-    written_storage_keys: list[str],
-    job_id: str,
-) -> None:
-    """Delete the objects the published generation superseded.
-
-    fix(#1778): shared because ``regenerate_vrt`` reaches it from
-    two places (the success path and the stand-down for a lost commit ack)
-    — the ONLY deletion of the previous generation's artifact, so a path
-    that skips it strands bytes no row references and no quota counts.
-
-    The ``not in written`` filter makes a byte-identical regeneration a
-    no-op rather than a self-inflicted delete.
-    """
-    from app.processing.ingest.tasks_raster import _cleanup_orphaned_storage_keys
-
-    await _cleanup_orphaned_storage_keys(
-        [key for key in prior_storage_keys if key not in written_storage_keys],
-        job_id=job_id,
-    )
+    return read_raster_metadata(vrt_path, timeout=RENDER_TIMEOUT_SECONDS)
 
 
 async def _settle_failed_vrt_asset(
@@ -211,24 +171,21 @@ async def _settle_failed_vrt_asset(
     return True
 
 
-def _prior_generation_storage_keys_to_reap(
+def _prior_generation_keys_to_reap(
     *,
     vrt_key: str,
     quicklook_256_key: str | None,
     quicklook_512_key: str | None,
     replace_quicklook_256: bool,
     replace_quicklook_512: bool,
-    tenant_id: str | None,
 ) -> list[str]:
-    """Resolve only prior objects whose catalog pointers will be replaced."""
-    from app.platform.storage.titiler_url import resolve_storage_key
-
+    """The logical keys of the prior objects whose catalog pointers will be replaced."""
     logical_keys = [vrt_key]
     if replace_quicklook_256 and quicklook_256_key is not None:
         logical_keys.append(quicklook_256_key)
     if replace_quicklook_512 and quicklook_512_key is not None:
         logical_keys.append(quicklook_512_key)
-    return [resolve_storage_key(key, tenant_id=tenant_id) for key in logical_keys]
+    return logical_keys
 
 
 async def snapshot_member_sources(
@@ -448,7 +405,6 @@ async def create_vrt_dataset(
         # fix(#1290): the authoritative staleness input. The timestamp
         # above stays for legacy rows that have no built-from set.
         built_from=built_from,
-        crs_wkt=meta.get("crs_wkt"),
         epsg=meta.get("epsg"),
         band_count=meta.get("band_count"),
         dtype=meta.get("dtype"),
@@ -467,6 +423,7 @@ async def create_vrt_dataset(
         resolution_strategy=resolution_strategy,
         status="ready",
     )
+    raster_asset.set_crs(meta)
     session.add(raster_asset)
     await session.flush()
 
@@ -587,6 +544,10 @@ async def ingest_vrt(
 
             # 2. Parse source dataset IDs
             ids = [uuid.UUID(sid) for sid in _json.loads(source_dataset_ids)]
+            # Committed before the members are read, so replacing one keeps the
+            # COG this build may name until its VRT is published.
+            await note_vrt_members(session, job_uuid, attempt_uuid, ids)
+            await session.commit()
 
             # 3. Load RasterAsset rows for source datasets, stamped first.
             # fix(#1290): the creation tail had NO snapshot instant, so
@@ -670,8 +631,8 @@ async def ingest_vrt(
         ql256: bytes | None = None
         ql512: bytes | None = None
         try:
-            ql256 = await asyncio.to_thread(render_vrt_quicklook, vrt_path, 256)
-            ql512 = await asyncio.to_thread(render_vrt_quicklook, vrt_path, 512)
+            ql256 = await asyncio.to_thread(render_quicklook, vrt_path, 256)
+            ql512 = await asyncio.to_thread(render_quicklook, vrt_path, 512)
         except Exception:  # broad: quicklook generation is non-fatal
             logger_vrt.warning(
                 "Quicklook generation failed for VRT %s", job_id, exc_info=True
@@ -687,6 +648,7 @@ async def ingest_vrt(
         # adds `.with_for_update(key_share=True)` to close the SELECT-is-
         # not-a-lock window between this read and the puts completing.
         async with async_session() as session:
+            await note_publishing_xid(session)
             result = await session.execute(
                 select(IngestJob)
                 .where(
@@ -808,42 +770,37 @@ async def ingest_vrt(
                 session.add(distribution)
 
                 # 12. Finalize job
-                await require_ingest_job_update(
-                    session,
-                    job_uuid,
-                    attempt_uuid,
-                    values={
-                        "status": "complete",
-                        "dataset_id": dataset.id,
-                        "completed_at": datetime.now(timezone.utc),
-                    },
+                await note_publish_followups(
+                    session, job_uuid, attempt_uuid, "ingest_vrt"
                 )
+                await ledger.complete(
+                    session, job_uuid, attempt_uuid, values={"dataset_id": dataset.id}
+                )
+                xid = publishing_xid(session)
                 try:
                     await session.commit()
                 except BaseException as exc:
                     if not await publish_commit_landed(
-                        job_uuid, attempt_uuid, job_id=job_id, task="ingest_vrt"
+                        job_uuid,
+                        attempt_uuid,
+                        xid=xid,
+                        error=exc,
+                        job_id=job_id,
+                        task="ingest_vrt",
                     ):
                         raise
-                    # fix(#1778): stand down rather than re-raise
-                    # (same decision `regenerate_vrt` makes below) — the
-                    # dataset and its VRT object are durable, so the failure
-                    # handler would be writing about a job that succeeded.
-                    # fix(#1778): unlike `regenerate_vrt` there's
-                    # nothing to reap here; the skipped followups (cache
-                    # purge, embedding defer) are both recoverable.
+                    # Stand down, as `regenerate_vrt` does: the dataset may be
+                    # live, so the failure handler would report a job that
+                    # succeeded. Nothing here supersedes an object. The
+                    # follow-ups run once the publish is visible, or the sweep
+                    # runs them.
                     publish_committed = True
                     absorb_cancellation(exc)
+                    await run_publish_followups(job_uuid)
                     return
                 publish_committed = True
 
-                # Invalidate cache
-                await invalidate_catalog_cache()
-
-                # 13. Generate embedding (non-fatal)
-                from app.processing.embeddings.helpers import defer_embedding
-
-                await defer_embedding(dataset)
+                await run_publish_followups(job_uuid)
 
             except Exception:  # broad: re-raised below; rollback first so the
                 # outer handler can write a clean failure record via a fresh session.
@@ -852,12 +809,8 @@ async def ingest_vrt(
 
     except Exception as exc:  # broad: VRT pipeline includes GDAL subprocesses and rasterio — any step can fail
         if publish_committed:
-            # fix(#1778): the second way this handler is reached with
-            # a durable publish behind it, and the one the stand-down above
-            # cannot cover: `invalidate_catalog_cache` and `defer_embedding`
-            # run inside the same try, so a Valkey outage or a busy queue lands
-            # here after the dataset is live and the writes below would report
-            # a build that succeeded as failed.
+            # A follow-up failed after the publish; the writes below would
+            # report a build that succeeded as failed.
             structlog.get_logger().warning(
                 "vrt_post_publish_followup_failed",
                 job_id=job_id,
@@ -996,7 +949,6 @@ async def regenerate_vrt(
     heartbeat_task: asyncio.Task[None] | None = None
     generation_heartbeat_task: asyncio.Task[None] | None = None
     written_storage_keys: list[str] = []
-    prior_storage_keys: list[str] = []
     # fix(#1778): same fence as `ingest_vrt` above, for the same reason — the
     # generation swap and the job's terminal write share one transaction, so a
     # lost acknowledgement must not let the reap delete the generation the
@@ -1205,8 +1157,8 @@ async def regenerate_vrt(
         ql256: bytes | None = None
         ql512: bytes | None = None
         try:
-            ql256 = await asyncio.to_thread(render_vrt_quicklook, vrt_path, 256)
-            ql512 = await asyncio.to_thread(render_vrt_quicklook, vrt_path, 512)
+            ql256 = await asyncio.to_thread(render_quicklook, vrt_path, 256)
+            ql512 = await asyncio.to_thread(render_quicklook, vrt_path, 512)
         except Exception:  # broad: quicklook generation is non-fatal
             logger_regen.warning(
                 "Quicklook regeneration failed for VRT %s",
@@ -1219,6 +1171,28 @@ async def regenerate_vrt(
         next_vrt_storage_key = f"{generation_base_key}/source.vrt"
         next_ql256_uri = f"{generation_base_key}/quicklook_256.png"
         next_ql512_uri = f"{generation_base_key}/quicklook_512.png"
+
+        # The job row owes these until a sweep confirms them deleted or a live
+        # pointer names them. A failed generation is out of the stale
+        # generation sweep's reach, so it cannot be their only owner.
+        if not await record_unpublished_storage_keys(
+            job_uuid,
+            attempt_uuid,
+            keys=[
+                next_vrt_storage_key,
+                *([next_ql256_uri] if ql256 is not None else []),
+                *([next_ql512_uri] if ql512 is not None else []),
+            ],
+            already_published=(
+                key
+                for key in (vrt_storage_key, vrt_ql256_uri, vrt_ql512_uri)
+                if key is not None
+            ),
+            attempt_scope=str(generation_uuid),
+            job_id=job_id,
+            task="regenerate_vrt",
+        ):
+            return
 
         # 10. Write immutable generation objects. The catalog pointer switches
         # only after the job lease and current_generation_id are checked
@@ -1275,14 +1249,20 @@ async def regenerate_vrt(
             written_storage_keys.append(next_ql512_physical_key)
             await storage.put(next_ql512_physical_key, io.BytesIO(ql512))
 
-        prior_storage_keys = _prior_generation_storage_keys_to_reap(
-            vrt_key=vrt_storage_key,
-            quicklook_256_key=vrt_ql256_uri,
-            quicklook_512_key=vrt_ql512_uri,
-            replace_quicklook_256=ql256 is not None,
-            replace_quicklook_512=ql512 is not None,
-            tenant_id=_ctv.get(),
-        )
+        # Recorded with the publish, so its follow-ups delete them once it
+        # shows, whether or not this task can tell it landed.
+        superseded_keys = [
+            key
+            for key in _prior_generation_keys_to_reap(
+                vrt_key=vrt_storage_key,
+                quicklook_256_key=vrt_ql256_uri,
+                quicklook_512_key=vrt_ql512_uri,
+                replace_quicklook_256=ql256 is not None,
+                replace_quicklook_512=ql512 is not None,
+            )
+            if resolve_storage_key(key, tenant_id=_ctv.get())
+            not in written_storage_keys
+        ]
 
         # Phase 2 (short-lived session): update RasterAsset metadata, mark
         # job complete, update dataset footprint.
@@ -1300,6 +1280,7 @@ async def regenerate_vrt(
         # fix(#1847): job row first, then asset — the order every worker
         # phase, `cancel_job`, and the dataset delete hold.
         async with async_session() as session:
+            await note_publishing_xid(session)
             result = await session.execute(
                 select(IngestJob)
                 .where(
@@ -1352,7 +1333,7 @@ async def regenerate_vrt(
                 if ql512 is not None:
                     vrt_asset.quicklook_512_uri = next_ql512_uri
                 vrt_asset.size_bytes = new_size
-                vrt_asset.crs_wkt = meta.get("crs_wkt")
+                vrt_asset.set_crs(meta)
                 vrt_asset.epsg = meta.get("epsg")
                 vrt_asset.band_count = meta.get("band_count")
                 vrt_asset.dtype = meta.get("dtype")
@@ -1508,22 +1489,32 @@ async def regenerate_vrt(
                 )
 
                 # 14. Finalize job
-                await require_ingest_job_update(
+                await ledger.complete(
                     session,
                     job_uuid,
                     attempt_uuid,
                     values={
-                        "status": "complete",
                         "dataset_id": vrt_id,
-                        "completed_at": datetime.now(timezone.utc),
+                        "user_metadata": owed_followups(
+                            attempt_uuid,
+                            "regenerate_vrt",
+                            superseded_keys=superseded_keys,
+                        ),
                     },
                 )
+                xid = publishing_xid(session)
                 try:
                     await session.commit()
                 except BaseException as exc:
-                    if not await publish_commit_landed(
-                        job_uuid, attempt_uuid, job_id=job_id, task="regenerate_vrt"
-                    ):
+                    observation = await observe_publish_commit(
+                        job_uuid,
+                        attempt_uuid,
+                        xid=xid,
+                        error=exc,
+                        job_id=job_id,
+                        task="regenerate_vrt",
+                    )
+                    if observation is PublishObservation.NOT_LANDED:
                         raise
                     # fix(#1778): stand down rather than re-raise. The
                     # generation swap is durable, so every write the failure
@@ -1532,32 +1523,16 @@ async def regenerate_vrt(
                     # not fenced the way the job and asset writes are.
                     publish_committed = True
                     absorb_cancellation(exc)
-                    # fix(#1778): standing down from the FAILURE
-                    # handler is not standing down from the success work. This
-                    # is the only deletion of the superseded generation's
-                    # objects, and the committed asset already names the new
-                    # ones, so returning without it strands bytes no row
-                    # references and no quota counts. No guard: the reaper
-                    # swallows a missing provider and every per-key error, so
-                    # it cannot turn a durable publish back into a failure.
-                    await _reap_superseded_generation_objects(
-                        prior_storage_keys=prior_storage_keys,
-                        written_storage_keys=written_storage_keys,
-                        job_id=job_id,
-                    )
+                    # With the outcome unknown, the sweep runs the follow-ups
+                    # once the commit shows.
+                    if observation is PublishObservation.LANDED:
+                        await run_publish_followups(job_uuid)
                     return
                 publish_committed = True
 
-                await _reap_superseded_generation_objects(
-                    prior_storage_keys=prior_storage_keys,
-                    written_storage_keys=written_storage_keys,
-                    job_id=job_id,
-                )
-
-                # 15. Invalidate cache and defer embedding
-                await invalidate_catalog_cache()
-                if vrt_dataset is not None:
-                    await defer_embedding(vrt_dataset)
+                # 15. The follow-ups purge the catalog cache and refresh the
+                # embedding, so the sweep runs them too when the task can't.
+                await run_publish_followups(job_uuid)
 
             except Exception:  # broad: re-raised below; rollback first so the
                 # outer handler can write a clean failure record via a fresh session.
@@ -1566,15 +1541,9 @@ async def regenerate_vrt(
 
     except Exception as exc:  # broad: VRT regeneration includes GDAL subprocesses and rasterio — any step can fail
         if publish_committed:
-            # fix(#1778): the second way this handler is reached with
-            # a durable publish behind it, and the one the stand-down above
-            # cannot cover: the prior-key reap, `invalidate_catalog_cache` and
-            # `defer_embedding` all run inside the same try. The generation
-            # write below is not fenced the way the job and asset writes are,
-            # so reaching here after the swap stamped a `completed` generation
-            # `failed`, which `get_vrt_status` reads as "no completed
-            # generation" and the stale-generation sweep reads as evidence the
-            # asset was unhealthy.
+            # The follow-ups failed after a durable publish. The generation
+            # write below is unfenced and would stamp a `completed` generation
+            # `failed`, which `get_vrt_status` reads as no completed generation.
             structlog.get_logger().warning(
                 "vrt_post_publish_followup_failed",
                 job_id=job_id,
@@ -1602,16 +1571,7 @@ async def regenerate_vrt(
                 # catalog row, so this handler runs while the job row may be
                 # contended too. Both writes below share the budget.
                 await arm_job_error_write_budget(err_session)
-                await update_ingest_job_for_attempt(
-                    err_session,
-                    job_uuid,
-                    attempt_uuid,
-                    values={
-                        "status": "failed",
-                        "error_message": redact_failure_reason(exc),
-                        "completed_at": datetime.now(timezone.utc),
-                    },
-                )
+                await ledger.fail(err_session, job_uuid, attempt_uuid, reason=exc)
                 # fix(#1962): only once the asset is off this generation. A
                 # terminal generation under an asset still pointing at it is
                 # the state `sweep_stale_vrt_assets` fences itself out of.

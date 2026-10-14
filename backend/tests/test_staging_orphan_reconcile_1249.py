@@ -32,13 +32,18 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.platform.jobs.models import STAGING_REAPED_FINAL_MARKER, IngestJob
+from app.platform.jobs.models import (
+    ARCHIVE_PENDING_METADATA_KEY,
+    STAGING_REAPED_FINAL_MARKER,
+    IngestJob,
+)
 from app.platform.jobs.staging_reconcile import (
     STAGING_PREFIX,
     _job_id_from_key,
     reconcile_orphaned_staging_objects,
 )
 from app.platform.storage.provider import StoredObject
+from tests.factories import create_dataset, get_user_id
 
 pytestmark = pytest.mark.anyio
 
@@ -120,6 +125,7 @@ async def _job(
     status: str = "complete",
     file_path: str | None = None,
     user_metadata: dict | None = None,
+    dataset_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
     """Insert a committed ingest_jobs row and return its id."""
     job = IngestJob(
@@ -127,6 +133,7 @@ async def _job(
         status=status,
         file_path=file_path,
         user_metadata=user_metadata,
+        dataset_id=dataset_id,
     )
     session.add(job)
     await session.flush()
@@ -136,7 +143,13 @@ async def _job(
 
 
 async def _job_with_id(
-    session: AsyncSession, job_id: uuid.UUID, *, status: str, user_metadata: dict
+    session: AsyncSession,
+    job_id: uuid.UUID,
+    *,
+    status: str,
+    user_metadata: dict,
+    file_path: str | None = None,
+    dataset_id: uuid.UUID | None = None,
 ) -> None:
     """Insert a committed row at a CHOSEN id, for keys that name their job."""
     session.add(
@@ -144,7 +157,9 @@ async def _job_with_id(
             id=job_id,
             source_filename="orphan-test",
             status=status,
+            file_path=file_path,
             user_metadata=user_metadata,
+            dataset_id=dataset_id,
         )
     )
     await session.commit()
@@ -367,6 +382,53 @@ class TestReconciliationDecision:
 
         assert storage.deleted == [leftover]
         assert outcome.orphans_deleted == 1
+
+    @pytest.mark.parametrize(
+        "mark",
+        [{"archive_failed": True}, {ARCHIVE_PENDING_METADATA_KEY: True}, {}],
+        ids=["failed", "pending", "archived"],
+    )
+    async def test_an_unarchived_original_keeps_the_upload_its_row_names(
+        self, test_db_session: AsyncSession, mark: dict
+    ) -> None:
+        """Only the key in ``file_path`` is kept, not the rest of the job's prefix."""
+        dataset = await create_dataset(
+            test_db_session,
+            created_by=await get_user_id(test_db_session, "admin"),
+            name="Unarchived original",
+        )
+        job_id = uuid.uuid4()
+        recreated = f"staging/{job_id}/roads.geojson"
+        upload = f"staging/{job_id}/frozen/roads.geojson"
+        await _job_with_id(
+            test_db_session,
+            job_id,
+            status="complete",
+            file_path=upload,
+            user_metadata={
+                "s3_key": recreated,
+                STAGING_REAPED_FINAL_MARKER: True,
+                **mark,
+            },
+            dataset_id=dataset.id,
+        )
+        # A fan-out layer whose purged parent staged the shared upload.
+        shared_upload = f"staging/{uuid.uuid4()}/frozen/layers.gpkg"
+        await _job(
+            test_db_session,
+            status="complete",
+            file_path=shared_upload,
+            user_metadata=mark or None,
+            dataset_id=dataset.id,
+        )
+        storage = FakeStorage(
+            {recreated: _old(), upload: _old(), shared_upload: _old()}
+        )
+
+        await _run(test_db_session, storage)
+
+        kept = {upload, shared_upload} if mark else set()
+        assert set(storage.objects) == kept
 
     async def test_a_reference_that_appears_before_the_delete_saves_the_object(
         self, test_db_session: AsyncSession

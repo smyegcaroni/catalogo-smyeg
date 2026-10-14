@@ -1517,12 +1517,12 @@ class TestDuplicateMap:
             visibility="private",
         )
 
-        # Create a public map with both layers
+        # Create an internal map with both layers
         created = await _create_map(client, admin_auth_header, "RBAC Test Map")
         map_id = created["id"]
         await client.put(
             f"/maps/{map_id}",
-            json={"visibility": "public"},
+            json={"visibility": "internal"},
             headers=admin_auth_header,
         )
         await client.post(
@@ -1605,7 +1605,7 @@ class TestDuplicateMap:
         map_id = created["id"]
         await client.put(
             f"/maps/{map_id}",
-            json={"visibility": "public"},
+            json={"visibility": "internal"},
             headers=admin_auth_header,
         )
         await client.post(
@@ -1721,7 +1721,7 @@ class TestDuplicateMap:
         map_id = created["id"]
         await client.put(
             f"/maps/{map_id}",
-            json={"visibility": "public"},
+            json={"visibility": "internal"},
             headers=admin_auth_header,
         )
         for ds_id, order in [(pub_ds.id, 0), (priv_ds1.id, 1), (priv_ds2.id, 2)]:
@@ -3561,8 +3561,8 @@ class TestSearchSortFilterAuthor:
     async def test_list_maps_created_by_username(
         self, client: AsyncClient, admin_auth_header: dict
     ):
-        """response.maps[].created_by_username is a string matching the creator's username."""
-        await _create_map(client, admin_auth_header, "Username Test Map")
+        """Map summaries include the creator's stable ID and display username."""
+        created = await _create_map(client, admin_auth_header, "Username Test Map")
 
         resp = await client.get("/maps/", headers=admin_auth_header)
         assert resp.status_code == 200
@@ -3574,6 +3574,7 @@ class TestSearchSortFilterAuthor:
         test_map = next((m for m in maps if m["name"] == "Username Test Map"), None)
         assert test_map is not None
         assert test_map["created_by_username"] == "admin"
+        assert test_map["created_by"] == created["created_by"]
 
     async def test_list_maps_created_by_username_null_deleted_user(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
@@ -3619,6 +3620,7 @@ class TestSearchSortFilterAuthor:
         orphan = next((m for m in maps if m["name"] == "Orphan Map Deleted User"), None)
         assert orphan is not None
         assert orphan["created_by_username"] is None
+        assert orphan["created_by"] is None
 
     async def test_list_maps_invalid_sort_by_rejected(
         self, client: AsyncClient, admin_auth_header: dict

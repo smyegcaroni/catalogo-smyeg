@@ -4,6 +4,8 @@
   "rowCount_one": "{{count}} ligne",
   "rowCount_other": "{{count}} lignes",
   "page": {
+    "showMapPreview": "Afficher l'aperçu de la carte",
+    "hideMapPreview": "Masquer l'aperçu de la carte",
     "loading": "Chargement du jeu de données...",
     "errorTitle": "Jeu de données introuvable",
     "errorMessage": "Le jeu de données demandé n'a pas pu être chargé.",
@@ -63,13 +65,17 @@
     "notOwner": "Seul le propriétaire du jeu de données ou un administrateur peut modifier cet enregistrement."
   },
   "connect": {
+    "openInstructions": "Ouvrir les instructions de connexion",
+    "instructionsTools": "QGIS, Python et curl",
     "copyCogUrl": "Copier l'URL COG",
     "copyXyzTileUrl": "Copier l'URL XYZ Tile",
     "copyS3Uri": "Copier l'URI S3",
     "copyCsvExportUrl": "Copier l'URL d'export CSV",
     "copyOgcFeaturesUrl": "Copier l'URL OGC Features",
     "copyVectorTilesUrl": "Copier l'URL des tuiles vectorielles",
-    "copied": "Copié : {{preview}}"
+    "copied": "Copié : {{preview}}",
+    "copyTilesetUrl": "Copier l'URL du tileset",
+    "instructionsTileset": "CesiumJS"
   },
   "addToMap": {
     "button": "Ajouter à la carte",
@@ -229,7 +235,8 @@
     "actions": {
       "metadataEdit": "Métadonnées mises à jour",
       "datasetDelete": "Jeu de données supprimé",
-      "datasetCreate": "Jeu de données créé"
+      "datasetCreate": "Jeu de données créé",
+      "datasetTransferOwner": "Propriétaire modifié"
     }
   },
   "versionHistory": {
@@ -239,8 +246,29 @@
     "version": "Version {{number}}",
     "current": "Actuelle",
     "unknownFile": "Fichier inconnu",
+    "detailsUnrecorded": "Les détails de cette version n'ont pas été enregistrés.",
     "features": "{{count}} entités",
-    "srid": "SRID {{value}}"
+    "srid": "SRID {{value}}",
+    "restore": "Restaurer",
+    "restoreBusyHint": "Une actualisation, un remplacement ou une restauration est déjà en cours. Consultez l'historique des actualisations.",
+    "restoreSelectionHint": "Désélectionnez l'entité sélectionnée sur la carte pour restaurer."
+  },
+  "restoreDialog": {
+    "title": "Restaurer la version {{number}} ?",
+    "description": "La version {{number}} redevient les données actuelles. Les données remplacées sont conservées, la restauration peut donc être annulée jusqu'au prochain remplacement.",
+    "consequenceEdits": "Les modifications d'entités effectuées depuis la version {{number}} sont perdues.",
+    "consequenceMosaics": "Les mosaïques qui utilisent ce jeu de données continuent de lire le membre actuel jusqu'à leur reconstruction.",
+    "confirmPrompt": "Saisissez le nom du jeu de données pour confirmer :",
+    "restoring": "Restauration...",
+    "restore": "Restaurer la version",
+    "failed": "Échec de la restauration de la version",
+    "queued": "Restauration de la version {{number}} mise en file d'attente. Elle apparaît dans l'historique des actualisations.",
+    "refusal": {
+      "dataset_busy": "Une autre actualisation, un autre remplacement ou une autre restauration est en cours pour ce jeu de données. Attendez qu'il se termine, puis réessayez.",
+      "previous_version_changed": "La version précédente conservée a changé pendant que cette boîte de dialogue était ouverte. Fermez-la et consultez de nouveau l'historique.",
+      "no_previous_version": "Ce jeu de données n'a plus de version précédente à restaurer.",
+      "restore_not_applicable": "Ce jeu de données n'a pas de table d'entités, il n'y a donc rien à restaurer."
+    }
   },
   "vrt": {
     "mosaic": "Mosaïque VRT",
@@ -315,6 +343,7 @@
       "committing": "Validation du rechargement...",
       "tracking": "Le jeu de données est en cours de mise à jour en arrière-plan.",
       "complete": "Le jeu de données a été mis à jour avec succès.",
+      "held": "Ce remplacement a été mis en attente de révision.",
       "error": "Un problème est survenu lors du rechargement."
     },
     "sourceSelector": {
@@ -332,6 +361,7 @@
       "connecting": "Connexion au service...",
       "layerStep": "Sélectionnez une couche",
       "emptyState": "Aucune couche trouvée pour ce service.",
+      "unsupportedLayerType": "{{type}} ne contient aucune entité et ne peut pas servir à un nouvel envoi.",
       "previewLayer": "Prévisualiser la couche",
       "previewing": "Préparation de la prévisualisation du rechargement...",
       "layerLabel": "Couche :",
@@ -363,6 +393,7 @@
     "uploadingMessage": "Téléchargement et analyse du fichier...",
     "file": "Fichier :",
     "schemaChangeAdvisory": "Le schéma diffère de la version précédente : {{added}} colonnes ajoutées, {{removed}} supprimées.",
+    "reviewReasonsLabel": "Modifications à vérifier",
     "warningSchemaChanges": "Attention : ce rechargement inclut des modifications de schéma qui peuvent affecter les requêtes existantes.",
     "confirmReupload": "Confirmer le rechargement",
     "committingMessage": "Validation du rechargement...",
@@ -382,6 +413,10 @@
   },
   "quality": {
     "title": "Score de qualité",
+    "assessedAt": "Qualité évaluée le {{date}} ({{age}})",
+    "assessmentVsSource": "Cette date concerne l’évaluation qualité. Consultez Source pour connaître la dernière mise à jour des données et leur fraîcheur.",
+    "scoreExplanation": "Le score global combine les dimensions de qualité disponibles. Les pourcentages indiquent la part de chaque dimension.",
+    "metadataExplanation": "La complétude des métadonnées de qualité compte les champs facultatifs renseignés (10 au total). La progression des contrôles dans Métadonnées est distincte.",
     "metadataCompleteness": "Complétude des métadonnées",
     "geometryValidity": "Validité de la géométrie",
     "attributeCompleteness": "Complétude des attributs",
@@ -391,28 +426,30 @@
       "absolute": "Dernière vérification {{date}}",
       "relative": "Vérifié {{relative}}",
       "cadence": "Cadence de mise à jour attendue : {{cadence}}.",
-      "cadenceDaily": "Une mise à jour quotidienne est attendue.",
-      "cadenceWeekly": "Une mise à jour hebdomadaire est attendue.",
-      "cadenceMonthly": "Une mise à jour mensuelle est attendue.",
-      "cadenceQuarterly": "Une mise à jour trimestrielle est attendue.",
-      "cadenceAnnually": "Une mise à jour annuelle est attendue.",
-      "cadenceUnknown": "La cadence est inconnue ; vérifiez le calendrier de rafraîchissement.",
+      "cadenceDaily": "La récence de l’évaluation est comparée à la fréquence quotidienne indiquée.",
+      "cadenceWeekly": "La récence de l’évaluation est comparée à la fréquence hebdomadaire indiquée.",
+      "cadenceMonthly": "La récence de l’évaluation est comparée à la fréquence mensuelle indiquée.",
+      "cadenceQuarterly": "La récence de l’évaluation est comparée à la fréquence trimestrielle indiquée.",
+      "cadenceAnnually": "La récence de l’évaluation est comparée à la fréquence annuelle indiquée.",
+      "cadenceUnknown": "Sans fréquence périodique, la récence de l’évaluation est comparée à une référence de 45 jours.",
       "state": {
-        "fresh": "À jour",
-        "stale": "Obsolète",
-        "missing": "Fraîcheur manquante"
+        "fresh": "Évaluation récente",
+        "stale": "Évaluation à refaire",
+        "missing": "Aucune date d’évaluation"
       },
       "remediation": {
-        "fresh": "Aucune action immédiate n’est requise.",
-        "stale": "Recalculez les métriques de qualité et vérifiez que les mises à jour récentes de la source ont été ingérées.",
-        "missing": "Lancez la validation qualité pour générer un horodatage de fraîcheur."
+        "fresh": "Aucune action nécessaire sur l’évaluation.",
+        "stale": "Recalculez l’évaluation qualité pour vérifier les données actuelles.",
+        "missing": "Lancez la validation qualité pour obtenir une date d’évaluation."
       },
       "notAvailable": "Non disponible",
-      "unknownAge": "Âge inconnu"
+      "unknownAge": "Âge inconnu",
+      "readOnlyGuidance": "Demandez au propriétaire du jeu de données ou à un contact indiqué ci-dessus de mettre à jour l’évaluation qualité."
     }
   },
   "serviceUrls": {
-    "authHelpSimple": "Ces points d'accès acceptent un en-tête X-Api-Key ou Authorization: Bearer.",
+    "authHelpSimple": "Les téléchargements et les points d'accès OGC Features et de tuiles vectorielles acceptent un en-tête X-Api-Key ou Authorization: Bearer.",
+    "vectorTilesKeyHint": "Les tuiles vectorielles d'un jeu de données non public nécessitent une clé API. Dans QGIS, ajoutez une connexion de tuiles vectorielles avec l'URL des tuiles sans le paramètre api_key, puis, sous Authentification, choisissez la méthode API Header avec l'en-tête X-Api-Key. Les clients qui ne peuvent pas envoyer d'en-têtes peuvent garder ?api_key=. Utilisez une clé en lecture seule.",
     "manageApiKeys": "Gérer les clés API"
   },
   "schema": {
@@ -452,6 +489,10 @@
     "ariaLabel": "Carte du jeu de données",
     "featureSaved": "Entité enregistrée",
     "featureSaveFailed": "Échec de l'enregistrement de l'entité",
+    "featureSavedThenChanged": "Cette entité était déjà enregistrée et quelqu'un d'autre l'a modifiée depuis, vos dernières modifications n'ont donc pas été appliquées. Enregistrez à nouveau pour remplacer ses changements par les vôtres, ou annulez pour conserver les siens.",
+    "featureSavedThenRemoved": "L'enregistrement précédent a été supprimé. Enregistrer recréera l'entité.",
+    "featureSavedThenReplaced": "Les données de ce jeu de données ont été remplacées après votre enregistrement précédent, vos modifications n'ont donc pas été appliquées. Enregistrer recréera l'entité.",
+    "featureDatasetReplaced": "Les données de ce jeu de données ont été remplacées après le début de votre modification, votre changement n'a donc pas été enregistré.",
     "featureUpdated": "Entité mise à jour",
     "featureUpdateFailed": "Échec de la mise à jour de l'entité",
     "featureDeleted": "Entité supprimée",
@@ -461,9 +502,13 @@
     "attributesUpdated": "Attributs mis à jour",
     "attributesUpdateFailed": "Échec de la mise à jour des attributs",
     "unsavedDiscarded": "Modifications non enregistrées abandonnées",
+    "sketchStillSaving": "L'entité précédente est en cours d'enregistrement. Réessayez une fois qu'elle est enregistrée.",
     "discardChangesTitle": "Ignorer les modifications cartographiques non enregistrées ?",
     "discardChangesDescription": "Vos modifications de géométrie ne sont pas enregistrées. Vous pouvez continuer la modification ou les ignorer.",
+    "discardChangesAccessLostDescription": "Vous ne pouvez plus modifier ce jeu de données : les ignorer retire de la carte ces modifications de géométrie non enregistrées.",
     "discardChangesAction": "Ignorer les modifications",
+    "editAccessLostNotice": "Vous ne pouvez plus modifier ce jeu de données : ces modifications de la carte ne peuvent pas être enregistrées.",
+    "editLostOnReloadNotice": "La carte a été rechargée et la modification non enregistrée de cette entité a été perdue.",
     "deleteFeatureTitle": "Supprimer l'entité",
     "deleteFeatureDescription": "Supprimer cette entité ? Cette action est irréversible.",
     "zoomToExtent": "Zoomer sur l'étendue du jeu de données",
@@ -486,6 +531,7 @@
     "helperWarnings": "{{warningCount}} avertissement(s) détecté(s). Vérifiez les causes probables avant de publier.",
     "likelyCompact": "Cause probable :",
     "troubleshootAction": "Dépanner",
+    "readOnlyGuidance": "Demandez au propriétaire du jeu de données ou à un contact indiqué ci-dessus de corriger ces problèmes de validation.",
     "health": {
       "title": "Santé du jeu de données",
       "required": "Requis {{count}}",
@@ -532,6 +578,24 @@
       "invalid": "{{field}} invalide",
       "conflicting": "{{field}} en conflit",
       "needsReview": "{{field}} à vérifier"
+    },
+    "fields": {
+      "title": "Titre",
+      "summary": "Résumé",
+      "license": "Licence",
+      "spatialExtent": "Étendue spatiale",
+      "lineageSummary": "Résumé de la provenance",
+      "srid": "Système de coordonnées de référence",
+      "contacts": "Contacts",
+      "keywords": "Mots-clés",
+      "geometry": "Géométrie",
+      "attributeDescriptions": "Descriptions des attributs",
+      "sourceUrl": "URL source",
+      "sourceOrganization": "Organisation source",
+      "qualityStatement": "Déclaration de qualité",
+      "updateFrequency": "Fréquence de mise à jour",
+      "temporalExtent": "Étendue temporelle",
+      "attribution": "Attribution"
     }
   },
   "contacts": {
@@ -554,7 +618,8 @@
       "publisher": "Éditeur",
       "distributor": "Distributeur",
       "custodian": "Responsable"
-    }
+    },
+    "remove": "Supprimer le contact {{name}}"
   },
   "keywords": {
     "title": "Mots-clés",
@@ -573,7 +638,8 @@
     "inheritedConfirmTitle": "Partager les mots-clés hérités ?",
     "inheritedConfirmBody": "Ces mots-clés ont été copiés depuis un jeu de données source que le nouveau public ne peut pas ouvrir. Continuez pour les partager, ou annulez et supprimez-les d'abord.",
     "inheritedConfirmContinue": "Changer la visibilité",
-    "inheritedGeneric": "Ce jeu de données contient des mots-clés hérités de sa source. Vérifiez la liste complète des mots-clés avant de partager."
+    "inheritedGeneric": "Ce jeu de données contient des mots-clés hérités de sa source. Vérifiez la liste complète des mots-clés avant de partager.",
+    "remove": "Supprimer le mot-clé {{keyword}}"
   },
   "attributeMetadata": {
     "title": "Métadonnées des attributs",
@@ -589,12 +655,15 @@
     "editingDisabled": "La modification des attributs est désactivée pour ce déploiement."
   },
   "distributions": {
-    "title": "Points d'accès",
+    "title": "Téléchargements et connexions",
     "download": "Téléchargements",
     "api": "Points d'accès API",
     "tiles": "Services de tuiles",
     "other": "Accès supplémentaire",
-    "noDistributions": "Aucune distribution disponible.",
+    "noDistributions": "Aucun autre téléchargement ou service n’est répertorié ici.",
+    "connectWithClient": "Se connecter avec QGIS, Python ou curl",
+    "otherFormats": "Télécharger dans un autre format",
+    "accessPermissions": "Qui peut accéder à ce jeu de données",
     "auto": "auto",
     "primary": "Principal",
     "copyUrl": "Copier l'URL",
@@ -690,7 +759,9 @@
     "noRecords": "Aucun enregistrement associe",
     "showingCount": "{{shown}} sur {{total}} enregistrements",
     "error": "Echec du chargement des relations",
-    "loadError": "Echec du chargement des enregistrements associes"
+    "loadError": "Echec du chargement des enregistrements associes",
+    "broken": "Rompue",
+    "brokenMessage": "Une colonne de jointure n'existe plus dans son jeu de données. Supprimez ou recréez cette relation."
   },
   "overview": {
     "allChecksPassed": "Toutes les vérifications réussies",
@@ -723,6 +794,9 @@
     "nodata": "Nodata",
     "ogcApiFeatures": "OGC API Features",
     "percentComplete": "{{percent}}% complet",
+    "validationProgress": "Contrôles de validation réussis : {{percent}} %",
+    "validationProgressHelp": "Estimation fondée sur 12 contrôles de base, moins les erreurs et avertissements signalés. Le score des métadonnées de qualité compte séparément les champs facultatifs.",
+    "askMaintainer": "Demandez au propriétaire du jeu de données ou à un contact indiqué ci-dessous de renseigner {{field}}",
     "rasterProperties": "Propriétés raster",
     "recommendedCount_one": "{{count}} recommandé",
     "recommendedCount_other": "{{count}} recommandés",
@@ -780,7 +854,7 @@
       "table": "Table référencée",
       "serviceType": "Type de service",
       "layer": "Identifiant de couche",
-      "endpoint": "Pointeur source sécurisé",
+      "endpoint": "URL de la source (identifiants retirés)",
       "collection": "Collection STAC",
       "asset": "Ressource STAC",
       "item": "Élément STAC"
@@ -804,6 +878,7 @@
         "unknown": "Non comparé"
       }
     },
+    "healthUnknownHint": "Vérifié lors de l'actualisation de la source.",
     "healthDetail": {
       "not_found": "La ressource source est introuvable.",
       "item_withdrawn": "L’élément STAC a été retiré.",
@@ -834,6 +909,10 @@
       "dialogDescription": "Récupère à nouveau les données de ce jeu de données depuis son origine d'importation. Le jeu de données continue de servir ses données actuelles jusqu'à ce que les nouvelles soient prêtes.",
       "reviewDialogTitle": "Examiner et relancer l’actualisation",
       "reviewDialogDescription": "Interrogez à nouveau la source et publiez uniquement si elle correspond à l’exécution examinée.",
+      "uploadReviewDialogTitle": "Publier le remplacement vérifié",
+      "uploadReviewDialogDescription": "Publiez le fichier que cette exécution a retenu, à partir du téléversement qu'elle a conservé. Il n'est publié que si ses modifications correspondent toujours à celles indiquées pour cette exécution.",
+      "uploadConfirm": "Publier le remplacement",
+      "uploadToastAccepted": "Remplacement lancé (exécution {{runId}}).",
       "tokenLabel": "Jeton d'accès (facultatif)",
       "tokenPlaceholder": "Nécessaire uniquement pour une source protégée",
       "tokenHint": "Utilisé uniquement pour cette actualisation ; non stocké avec le jeu de données.",
@@ -893,6 +972,7 @@
         "empty": "Aucune actualisation pour le moment.",
         "featureDelta": "{{before}} → {{after}} entités",
         "triggeredBy": "Démarré par {{username}}",
+        "scheduledFor": "Planifiée pour {{time}}",
         "mechanismLabel": "Méthode : {{mechanism}}",
         "mechanismTooltip": "Comment cette exécution s'est déroulée, et non l'origine du jeu de données",
         "status": {
@@ -901,7 +981,8 @@
           "succeeded": "Réussie",
           "failed": "Échouée",
           "cancelled": "Annulée",
-          "blocked": "Examen requis"
+          "blocked": "Examen requis",
+          "accepted": "Accepté"
         },
         "sourceCountUnavailable": "Décompte de la source indisponible.",
         "identityUnavailable": "Les identifiants des enregistrements n’ont pas été comparés.",
@@ -912,12 +993,145 @@
         "permalink": "Lien",
         "reason": {
           "source_count_unavailable": "GeoLens n’a pas pu comparer les lignes récupérées avec la source ; la publication doit être vérifiée.",
-          "empty_result": "L’actualisation remplacerait un jeu de données non vide par un résultat vide.",
-          "destructive_schema_change": "L’actualisation supprime des colonnes ou modifie leur type."
+          "empty_result": "Les nouvelles données remplaceraient un jeu de données non vide par un jeu vide.",
+          "destructive_schema_change": "Les nouvelles données suppriment des colonnes ou modifient leur type.",
+          "geometry_type_changed": "Les nouvelles données modifient le type de géométrie.",
+          "srid_changed": "Les nouvelles données modifient le système de coordonnées.",
+          "coordinate_dimension_reduced": "Les nouvelles données suppriment des dimensions de coordonnées, comme l’altitude.",
+          "arcgis_id_coverage_unavailable": "GeoLens n’a pas pu vérifier la couverture des identifiants d’objet ArcGIS.",
+          "arcgis_source_membership_changed": "La source ArcGIS a changé pendant cette actualisation.",
+          "live_data_changed": "Des entités ont été modifiées pendant ce remplacement. Le publier supprimerait ces modifications."
         },
         "reviewAndRetry": "Examiner et relancer",
+        "acceptedReasonsLabel": "Motifs de révision acceptés :",
         "loadMore": "Charger les exécutions précédentes"
       }
+    },
+    "sync": {
+      "title": "Synchronisation planifiée",
+      "description": "Gardez cette source ArcGIS à jour selon un planning UTC.",
+      "loading": "Chargement de la synchronisation planifiée",
+      "unavailable": "La synchronisation planifiée est disponible lorsque la capacité Enterprise est active.",
+      "unsupportedSource": "Cette source ne peut pas être planifiée. Les couches ArcGIS FeatureServer avec identifiant entier sont prises en charge.",
+      "reader": "Vous pouvez consulter la source de ce jeu de données. Un propriétaire ou administrateur peut configurer la synchronisation.",
+      "notConfigured": "Aucun planning n’est configuré. Créez un brouillon, lancez la vérification, puis activez-le explicitement.",
+      "setup": "Configurer le planning",
+      "setupTitle": "Configurer la synchronisation planifiée",
+      "editTitle": "Modifier la synchronisation planifiée",
+      "dialogDescription": "La liaison de la source reste fixe. Les heures utilisent UTC.",
+      "replacementWarningTitle": "L’actualisation planifiée remplace les données locales",
+      "replacementWarning": "Chaque actualisation planifiée remplace la copie locale du jeu de données. Les modifications locales peuvent être écrasées.",
+      "createDraft": "Créer le brouillon",
+      "save": "Enregistrer le planning",
+      "edit": "Modifier",
+      "runNow": "Lancer la vérification",
+      "pause": "Suspendre",
+      "enable": "Activer le planning",
+      "detach": "Détacher",
+      "detachTitle": "Détacher la synchronisation planifiée ?",
+      "detachDescription": "Les travaux futurs non réclamés seront annulés. Les exécutions déjà réclamées continuent et restent dans l’historique.",
+      "enableTitle": "Activer la synchronisation planifiée ?",
+      "enableDescription": "Chaque actualisation planifiée remplace la copie locale du jeu de données. Les modifications locales peuvent être écrasées. Activez-la uniquement si cela est attendu.",
+      "runAccepted": "Exécution de vérification mise en file.",
+      "paused": "Synchronisation planifiée suspendue.",
+      "enabled": "Synchronisation planifiée activée.",
+      "detached": "Synchronisation planifiée détachée.",
+      "cadenceLabel": "Planning",
+      "nextDue": "Prochaine échéance",
+      "credential": "Identifiant",
+      "publicSource": "Source publique",
+      "lastRun": "Dernière exécution de synchronisation",
+      "noRuns": "Aucune exécution planifiée pour le moment",
+      "verificationRun": "Exécution de vérification",
+      "occurrenceState": {
+        "planned": "En attente",
+        "admitted": "Admise",
+        "delivered": "Transmise",
+        "claimed": "En cours",
+        "completed": "Terminée",
+        "failed": "Échouée",
+        "cancelled": "Annulée",
+        "expired": "Expirée"
+      },
+      "status": {
+        "draft": "Brouillon",
+        "enabled": "Activé",
+        "paused": "Suspendu"
+      },
+      "cadence": {
+        "hourly": "Toutes les heures",
+        "daily": "Quotidien",
+        "weekly": "Hebdomadaire",
+        "hourlyAt": "Toutes les heures à {{time}}",
+        "dailyAt": "Chaque jour à {{time}}",
+        "weeklyAt": "{{weekday}} à {{time}}"
+      },
+      "weekday": {
+        "0": "Lundi",
+        "1": "Mardi",
+        "2": "Mercredi",
+        "3": "Jeudi",
+        "4": "Vendredi",
+        "5": "Samedi",
+        "6": "Dimanche"
+      },
+      "form": {
+        "cadence": "Fréquence",
+        "weekday": "Jour",
+        "hour": "Heure",
+        "minute": "Minute",
+        "utc": "Toutes les heures de planning utilisent UTC.",
+        "credential": "Identifiant",
+        "publicSource": "Aucun identifiant (source publique)",
+        "newCredential": "Enregistrer un nouvel identifiant",
+        "credentialName": "Nom de l’identifiant",
+        "token": "Jeton ArcGIS",
+        "tokenHint": "Le jeton est envoyé une seule fois et n’est jamais affiché ni stocké dans ce navigateur.",
+        "replaceToken": "Remplacer le jeton enregistré",
+        "cancelReplace": "Conserver le jeton actuel",
+        "credentialRequired": "Saisissez un nom d’identifiant et un jeton.",
+        "tokenRequired": "Saisissez un jeton.",
+        "invalidTime": "Saisissez une heure UTC valide."
+      },
+      "eligibility": {
+        "qualifying_run_required": "Lancez une vérification réussie avant d’activer ce planning.",
+        "verification_policy_changed": "La politique de vérification a changé. Relancez la vérification avant d’activer ce planning.",
+        "source_or_credential_changed": "La source ou l’identifiant a changé. Relancez la vérification avant d’activer ce planning."
+      },
+      "pauseReason": {
+        "qualification_required": "Une vérification admissible est requise.",
+        "review_required": "Examinez la dernière actualisation avant d’activer ce planning.",
+        "transient_failures": "Le planning a été suspendu après des échecs transitoires répétés.",
+        "credential_invalid": "L’identifiant enregistré n’est plus valide.",
+        "authorization_changed": "L’autorisation de la source a changé.",
+        "source_changed": "La liaison de la source a changé et doit être vérifiée.",
+        "source_or_credential_changed": "La source ou l’identifiant a changé et doit être vérifiée.",
+        "database_restored": "Le planning a été suspendu après une restauration de base de données.",
+        "restored": "Le planning a été restauré en pause.",
+        "manual": "Le planning a été suspendu manuellement."
+      },
+      "errors": {
+        "loadFailed": "La synchronisation planifiée n’a pas pu être chargée.",
+        "credentialsUnavailable": "Impossible de charger les identifiants stockés. Vous pouvez toujours planifier une source publique ou enregistrer un nouvel identifiant.",
+        "saveFailed": "La synchronisation planifiée n’a pas pu être enregistrée.",
+        "revisionConflict": "Ce planning a changé sur le serveur. Consultez les détails récents et réessayez.",
+        "notEligible": "Cette source n’est pas admissible à une vérification.",
+        "runFailed": "La vérification n’a pas pu démarrer.",
+        "qualificationRequired": "Lancez une vérification réussie avant d’activer ce planning.",
+        "statusFailed": "L’état du planning n’a pas pu être modifié.",
+        "detachFailed": "La synchronisation planifiée n’a pas pu être détachée.",
+        "occurrenceError": {
+          "admissionMetadataError": "Le planning n’a pas pu être admis car les métadonnées de la source ont changé. Vérifiez la source et réessayez.",
+          "admissionInvalid": "Le planning n’a pas pu être admis. Vérifiez la source et les paramètres du planning, puis réessayez.",
+          "admissionFailed": "Le planning n’a pas pu être admis. Réessayez ou vérifiez les paramètres de la source.",
+          "sourceChanged": "La source a changé. Vérifiez la source et relancez la vérification avant d’activer le planning.",
+          "localEditsChanged": "Des modifications locales ont changé le jeu de données. Vérifiez et résolvez-les avant la prochaine exécution.",
+          "credentialExpired": "L’identifiant enregistré a expiré. Mettez-le à jour et relancez la vérification.",
+          "failed": "Cette exécution planifiée ne s’est pas terminée. Vérifiez le planning et réessayez.",
+          "expired": "Cette exécution planifiée a expiré avant de pouvoir démarrer. Elle sera réessayée au prochain horaire prévu."
+        }
+      },
+      "verificationHelp": "La vérification contrôle que chaque identifiant source a été récupéré et que l’ensemble des identifiants est resté identique. Les attributs de la source peuvent encore changer pendant l’actualisation."
     },
     "vrt": {
       "title": "Membres du VRT",
@@ -1025,5 +1239,41 @@
     "description": "Vous avez des modifications non sauvegardées. Êtes-vous sûr de vouloir quitter ? Vos modifications seront perdues.",
     "stay": "Rester",
     "leave": "Quitter"
+  },
+  "pointcloud": {
+    "title": "Nuage de points COPC",
+    "pointCount": "Points",
+    "crs": "SCR horizontal",
+    "size": "Taille du fichier",
+    "pointFormat": "Format des points",
+    "bounds": "Emprise géographique",
+    "elevationRange": "Plage d'altitude",
+    "verticalCrs": "SCR vertical",
+    "accessTitle": "Ouvrir dans un client de nuages de points",
+    "urlLabel": "URL COPC",
+    "copyUrl": "Copier l'URL COPC",
+    "privateHint": "Ce nuage de points nécessite une clé API en lecture seule. Utilisez X-Api-Key dans les clients qui acceptent les en-têtes. Les exemples contiennent un espace réservé, jamais votre clé.",
+    "clientLabel": "Client de nuages de points",
+    "potreeHint": "Potree ne peut pas envoyer l'en-tête X-Api-Key pour COPC. Remplacez l'espace réservé dans l'URL par votre clé en lecture seule et gardez cette URL secrète.",
+    "copySnippet": "Copier l'exemple client",
+    "qgisSteps": "QGIS {{version}} → Couche > Ajouter une couche > Ajouter une couche de nuage de points\nType de source : Protocole : HTTP(S), cloud, etc.\nURL : {{url}}",
+    "qgisAuthentication": "Authentification : API Header → X-Api-Key: YOUR_API_KEY",
+    "qgisPrivateVersionHint": "QGIS 4.0 ou une version ultérieure est nécessaire pour utiliser l'authentification API Header avec une couche de nuage de points.",
+    "instructions": "QGIS, Potree et copc.js"
+  },
+  "tileset": {
+    "title": "Tileset 3D Tiles",
+    "version": "Version",
+    "geometricError": "Erreur géométrique",
+    "boundingVolume": "Volume englobant",
+    "size": "Taille décompressée",
+    "extent": "Emprise",
+    "noExtent": "Aucune emprise enregistrée pour ce tileset.",
+    "contentTypes": "Types de contenu",
+    "extensionsRequired": "Extensions requises",
+    "accessTitle": "Charger dans un client 3D Tiles",
+    "urlLabel": "URL du tileset",
+    "headerHint": "Les tilesets internes, restreints et privés nécessitent tous une clé API dans l'en-tête X-Api-Key. Utilisez une clé en lecture seule, car CesiumJS l'envoie avec chaque requête qu'il fait en chargeant le tileset.",
+    "copySnippet": "Copier l'extrait CesiumJS"
   }
 }

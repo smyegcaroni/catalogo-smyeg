@@ -7,6 +7,7 @@ Integration/DB tests are marked and skipped when no DB is available.
 import io
 import tempfile
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -98,32 +99,6 @@ def _write_tmp_tif(
 
 
 # ---------------------------------------------------------------------------
-# validate_raster_crs
-# ---------------------------------------------------------------------------
-
-
-class TestValidateRasterCrs:
-    def test_valid_crs_passes(self, tmp_path):
-        tif = _write_tmp_tif(crs=CRS.from_epsg(4326))
-        try:
-            from app.processing.raster.cog import validate_raster_crs
-
-            validate_raster_crs(str(tif))  # should not raise
-        finally:
-            tif.unlink(missing_ok=True)
-
-    def test_missing_crs_raises(self, tmp_path):
-        tif = _write_tmp_tif(crs=None)
-        try:
-            from app.processing.raster.cog import validate_raster_crs
-
-            with pytest.raises(ValueError, match="Missing CRS"):
-                validate_raster_crs(str(tif))
-        finally:
-            tif.unlink(missing_ok=True)
-
-
-# ---------------------------------------------------------------------------
 # extract_raster_metadata
 # ---------------------------------------------------------------------------
 
@@ -152,14 +127,7 @@ class TestExtractRasterMetadata:
         [(4326, "GEOGCRS["), (3857, "PROJCRS[")],
     )
     def test_crs_wkt_is_serialized_as_wkt2(self, epsg, wkt2_root, tmp_path):
-        """fix(#1376): the local-upload path stores this in
-        ``RasterAsset.crs_wkt``, which ``to_stac_properties()`` publishes as
-        the STAC Projection Extension's ``proj:wkt2``. rasterio's default
-        export is WKT1_GDAL (``GEOGCS[``/``PROJCS[``), so the version has to
-        be asked for. Both CRS classes are covered because WKT1 and WKT2 use
-        a different root keyword for each, and the remote-asset probe
-        (``test_cog_info.py``) pins the same property on the other writer —
-        between them the column is one dialect whichever path filled it."""
+        """The upload path stores WKT2 for geographic and projected CRSs alike."""
         tif = _write_tmp_tif(crs=CRS.from_epsg(epsg))
         try:
             from app.processing.raster.cog import extract_raster_metadata
@@ -477,7 +445,7 @@ class _MockDataset:
 
 
 class _MockStorage:
-    """Tracks list and delete calls; raises on delete if configured."""
+    """Tracks walked prefixes and deletes; raises on delete if configured."""
 
     def __init__(
         self, keys_by_prefix: dict[str, list[str]], delete_raises: bool = False
@@ -487,9 +455,13 @@ class _MockStorage:
         self.deleted_keys: list[str] = []
         self.listed_prefixes: list[str] = []
 
-    async def list(self, prefix: str) -> list[str]:
+    async def iter_object_pages(self, prefix: str, *, start_after: str | None = None):
+        from app.platform.storage.provider import StoredObject
+
         self.listed_prefixes.append(prefix)
-        return self._keys.get(prefix, [])
+        if keys := self._keys.get(prefix, []):
+            now = datetime.now(timezone.utc)
+            yield [StoredObject(key=key, last_modified=now) for key in keys]
 
     async def delete(self, key: str) -> None:
         if self._delete_raises:

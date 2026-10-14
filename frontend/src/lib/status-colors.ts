@@ -42,7 +42,7 @@ export const visibilityColors: Record<string, string> = {
   public: semanticBadgeColors.success,
   internal: semanticBadgeColors.info,
   restricted: semanticBadgeColors.warning,
-  private: semanticBadgeColors.destructive,
+  private: 'border-border bg-muted text-muted-foreground',
 };
 
 export function qualityScoreClasses(score: number): string {
@@ -83,6 +83,8 @@ export const recordTypeColors: Record<string, string> = {
   raster_dataset: 'border-type-raster/30 bg-type-raster-bg text-type-raster',
   vrt_dataset: 'border-type-vrt/30 bg-type-vrt-bg text-type-vrt',
   table: 'border-type-table/30 bg-type-table-bg text-type-table',
+  tiles3d_dataset: 'border-type-tiles3d/30 bg-type-tiles3d-bg text-type-tiles3d',
+  pointcloud_dataset: 'border-type-pointcloud/30 bg-type-pointcloud-bg text-type-pointcloud',
   collection: semanticBadgeColors.warning,
   unknown: 'border-border bg-muted text-muted-foreground',
 };

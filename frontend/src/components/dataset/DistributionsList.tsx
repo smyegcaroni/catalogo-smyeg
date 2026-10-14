@@ -17,9 +17,10 @@ import {
   isAbsoluteUrl,
   isSameOriginAbsoluteUrl,
   isFetchableDistributionUrl,
+  vectorTileUrlForClients,
 } from '@/lib/dataset-access';
 import { authenticatedDownload } from '@/api/datasets';
-import type { DistributionResponse } from '@/types/api';
+import type { DatasetVisibility, DistributionResponse } from '@/types/api';
 
 interface DistributionsListProps {
   recordId: string;
@@ -27,6 +28,8 @@ interface DistributionsListProps {
    * + `_check_record_ownership` guard on the distribution PATCH endpoint.
    * Everyone else keeps the read-only view (#1395). */
   canEdit?: boolean;
+  /** A non-public dataset's own vector tile URL is listed with an API key placeholder. */
+  visibility?: DatasetVisibility;
 }
 
 const TYPE_ORDER = ['download', 'api', 'tiles', 'other'] as const;
@@ -259,7 +262,7 @@ function groupByType(
   return groups;
 }
 
-export function DistributionsList({ recordId, canEdit = false }: DistributionsListProps) {
+export function DistributionsList({ recordId, canEdit = false, visibility = 'public' }: DistributionsListProps) {
   const { t } = useTranslation('dataset');
   const { data, isLoading, error } = useDistributions(recordId);
   const { data: tileConfig } = useTileConfig();
@@ -278,7 +281,11 @@ export function DistributionsList({ recordId, canEdit = false }: DistributionsLi
     );
   }
 
-  const distributions = data?.distributions ?? [];
+  const distributions = (data?.distributions ?? []).map((d) =>
+    d.distribution_type === 'vector_tiles'
+      ? { ...d, url: vectorTileUrlForClients(d.url, visibility, publicApiBaseUrl) }
+      : d,
+  );
 
   if (distributions.length === 0) {
     return (

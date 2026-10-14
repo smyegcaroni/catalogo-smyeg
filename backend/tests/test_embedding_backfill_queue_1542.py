@@ -46,6 +46,7 @@ from app.processing.embeddings import backfill as backfill_module
 from app.processing.embeddings.models import RecordEmbedding
 
 from tests.factories import create_dataset, get_user_id
+from tests.stale_settlers import STALE_SETTLERS
 
 _URL = "/admin/backfill-embeddings/"
 _FORCE_URL = "/admin/backfill-embeddings/?force=true"
@@ -504,6 +505,7 @@ async def test_a_failed_run_marks_the_job_failed_without_leaking_the_error(
     job = await _load_job(test_db_session, job_id)
     assert job.status == "failed"
     assert job.error_message == backfill_jobs.BACKFILL_FAILED_MESSAGE
+    assert job.error_code == "backfill_failed"
     assert secret not in (job.error_message or "")
 
     status_resp = await client.get(f"/jobs/{job_id}", headers=admin_auth_header)
@@ -551,6 +553,24 @@ async def test_backfill_still_requires_admin(
 # not equally bad: a missing terminal entry leaves an administrative operation
 # looking perpetually in flight, while a terminal entry the row does not support
 # actively lies about what happened.
+
+
+async def _requested_audit_entry(
+    client: AsyncClient, headers: dict, job_id: str
+) -> dict:
+    """The `requested` audit entry for one backfill run."""
+    resp = await client.get(
+        "/admin/audit-logs/",
+        params={"action": "embedding.backfill"},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    return next(
+        entry
+        for entry in resp.json()["logs"]
+        if entry["details"].get("job_id") == job_id
+        and entry["details"]["outcome"] == "requested"
+    )
 
 
 async def _terminal_audit_entries(
@@ -621,6 +641,50 @@ async def test_a_dispatch_failure_closes_the_audit_trail(
     assert terminal[0]["details"]["outcome"] == "failed"
     assert terminal[0]["details"]["error_code"] == "dispatch_failed"
     assert terminal[0]["details"]["force"] is True
+    # The request behind the failure is named on its end as on its start.
+    assert terminal[0]["ip_address"] is not None
+    assert (
+        terminal[0]["ip_address"]
+        == (await _requested_audit_entry(client, admin_auth_header, job_id))[
+            "ip_address"
+        ]
+    )
+
+
+@pytest.mark.anyio
+async def test_a_dispatch_a_worker_claimed_leaves_the_trail_to_the_worker(
+    client: AsyncClient,
+    admin_auth_header: dict,
+    test_db_session: AsyncSession,
+    monkeypatch,
+):
+    """A defer that fails after a worker claimed the run writes no terminal entry."""
+    monkeypatch.setattr(backfill_module, "backfill_embeddings", AsyncMock())
+
+    async def _claimed_then_the_connection_dropped(_task, /, **kwargs):
+        from app.core.db import async_session
+
+        async with async_session() as worker:
+            await worker.execute(
+                update(IngestJob)
+                .where(IngestJob.id == uuid.UUID(kwargs["job_id"]))
+                .values(status="running", heartbeat_at=datetime.now(timezone.utc))
+            )
+            await worker.commit()
+        raise RuntimeError("connection dropped after the insert")
+
+    with patch.object(
+        admin_router,
+        "defer_async_with_tenant",
+        AsyncMock(side_effect=_claimed_then_the_connection_dropped),
+    ):
+        resp = await client.post(_FORCE_URL, headers=admin_auth_header)
+
+    assert resp.status_code == 503, resp.text
+    live = await _latest_backfill_row(test_db_session)
+    assert live.status == "running"
+    terminal = await _terminal_audit_entries(client, admin_auth_header, str(live.id))
+    assert terminal == [], f"the request closed a run a worker holds: {terminal}"
 
 
 @pytest.mark.anyio
@@ -1155,18 +1219,16 @@ async def test_a_failing_terminal_write_does_not_wedge_the_slot(
     session — which is the point of using a fresh one, since the session that
     just raised may be unusable.
     """
-    real_update = backfill_jobs.update_ingest_job_for_attempt
+    real_complete = backfill_jobs.ledger.complete
     calls = {"n": 0}
 
     async def _first_write_blows_up(*args, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("connection reset during terminal update")
-        return await real_update(*args, **kwargs)
+        return await real_complete(*args, **kwargs)
 
-    monkeypatch.setattr(
-        backfill_jobs, "update_ingest_job_for_attempt", _first_write_blows_up
-    )
+    monkeypatch.setattr(backfill_jobs.ledger, "complete", _first_write_blows_up)
 
     async def _worked_fine(
         session, *, force=False, should_continue=None, on_progress=None
@@ -1357,7 +1419,7 @@ async def test_recovery_does_not_block_on_the_transaction_it_is_recovering_from(
     the unique slot until the stale sweep. Measured, not asserted: the recovery
     has a 15s budget, so blocking is visible as elapsed time.
     """
-    real_update = backfill_jobs.update_ingest_job_for_attempt
+    real_complete = backfill_jobs.ledger.complete
     calls = {"n": 0}
 
     async def _locks_the_row_then_dies(*args, **kwargs):
@@ -1366,14 +1428,12 @@ async def test_recovery_does_not_block_on_the_transaction_it_is_recovering_from(
         # Only the FIRST call: the recovery's own write must be allowed to
         # proceed, because whether it can is the thing being measured.
         calls["n"] += 1
-        result = await real_update(*args, **kwargs)
+        result = await real_complete(*args, **kwargs)
         if calls["n"] == 1:
             raise RuntimeError("connection lost while committing")
         return result
 
-    monkeypatch.setattr(
-        backfill_jobs, "update_ingest_job_for_attempt", _locks_the_row_then_dies
-    )
+    monkeypatch.setattr(backfill_jobs.ledger, "complete", _locks_the_row_then_dies)
 
     async def _worked_fine(
         session, *, force=False, should_continue=None, on_progress=None
@@ -1947,9 +2007,9 @@ async def test_a_lost_ack_on_the_dispatch_settle_still_closes_the_trail(
     real_fail = backfill_jobs._fail_undispatched_pending_row
     calls = {"n": 0}
 
-    async def _commits_then_loses_the_answer(job_uuid):
+    async def _commits_then_loses_the_answer(job_uuid, **kwargs):
         calls["n"] += 1
-        await real_fail(job_uuid)  # the row really does become `failed`...
+        await real_fail(job_uuid, **kwargs)  # the row really does become `failed`...
         raise asyncio.CancelledError()  # ...and the caller never learns it
 
     monkeypatch.setattr(
@@ -1981,6 +2041,7 @@ async def test_a_lost_ack_on_the_dispatch_settle_still_closes_the_trail(
         "the undispatched run never reached a terminal row"
     )
     assert stranded.error_message == backfill_jobs.UNDISPATCHED_RUN_MESSAGE
+    assert stranded.error_code == "backfill_not_queued"
 
     terminal = await _terminal_audit_entries(
         client, admin_auth_header, str(stranded.id)
@@ -2008,7 +2069,7 @@ async def test_a_dispatch_settle_that_lost_its_answer_and_its_write_audits_nothi
 
     calls = {"n": 0}
 
-    async def _the_worker_took_it_first(job_uuid):
+    async def _the_worker_took_it_first(job_uuid, **_kwargs):
         # The fenced UPDATE matches nothing because the row is already running,
         # and then the answer is lost as well.
         calls["n"] += 1
@@ -2102,9 +2163,9 @@ async def test_a_lost_ack_does_not_claim_a_failure_another_actor_wrote(
     settles = {"n": 0}
     real_fail = backfill_jobs._fail_undispatched_pending_row
 
-    async def _matches_nothing_then_loses_the_answer(job_uuid):
+    async def _matches_nothing_then_loses_the_answer(job_uuid, **kwargs):
         settles["n"] += 1
-        applied = await real_fail(job_uuid)
+        applied = await real_fail(job_uuid, **kwargs)
         assert applied is False, "the row was still pending — wrong arrangement"
         raise asyncio.CancelledError()
 
@@ -2174,36 +2235,30 @@ async def test_a_lost_ack_does_not_claim_a_failure_another_actor_wrote(
     "job_status,error_code",
     [("running", "worker_lost"), ("pending", "never_started")],
 )
-async def test_the_worker_startup_recovery_closes_the_trail_it_settles(
+@STALE_SETTLERS
+async def test_every_settler_closes_the_trail_it_settles(
     client: AsyncClient,
     admin_auth_header: dict,
     test_db_session: AsyncSession,
     job_status: str,
     error_code: str,
+    settle,
 ):
-    """A hard kill's recovery is the restarted worker's, not the 5-minute sweep.
-
-    Both settle the row; only one of them was closing the trail. Whichever gets
-    there first is the last actor the run will ever have, because a terminal row
-    drops out of every other sweep's predicate — so the trail sits at
-    `requested` forever, over a force run that may have deleted every vector.
-    """
-    from app.platform.jobs.worker import recover_stale_jobs
-
+    """Each settler closes the audit trail of a backfill row it settles."""
     upload = await _stale_job(test_db_session, status=job_status, backfill=False)
     backfill = await _stale_job(test_db_session, status=job_status, backfill=True)
     upload_id, backfill_id = str(upload.id), str(backfill.id)
 
     assert (
         await _terminal_audit_entries(client, admin_auth_header, backfill_id) == []
-    ), "the run already had a terminal entry before the recovery — vacuous"
+    ), "the run already had a terminal entry before the settler ran, so vacuous"
 
-    await recover_stale_jobs()
+    await settle(test_db_session)
 
-    # Non-vacuity: the recovery genuinely settled both rows. If the advisory
-    # lock was held elsewhere it skips the pass entirely, and this says so.
+    # Non-vacuity: recovery skips the whole pass when another worker holds its
+    # lock, and this says so.
     assert (await _load_job(test_db_session, backfill_id)).status == "failed", (
-        "the startup recovery did not settle the row — nothing to close a trail for"
+        "the settler did not settle the row, so there was no trail to close"
     )
     assert (await _load_job(test_db_session, upload_id)).status == "failed"
 
@@ -2214,7 +2269,7 @@ async def test_the_worker_startup_recovery_closes_the_trail_it_settles(
     # The same discrimination the shared sweep owes: the ordinary upload
     # settled in the same pass gets no entry of any kind.
     assert await _audit_entries_naming(test_db_session, upload_id) == 0, (
-        "the startup recovery wrote an audit entry for an ordinary upload"
+        "the settler wrote an audit entry for an ordinary upload"
     )
 
 
@@ -2348,6 +2403,7 @@ async def test_a_failed_startup_read_settles_the_row_it_could_not_read(
         "the run that could not read its row is still holding the slot"
     )
     assert settled.error_message == backfill_jobs.START_FAILED_MESSAGE
+    assert settled.error_code == "backfill_start_failed"
 
     terminal = await _terminal_audit_entries(client, admin_auth_header, job_id)
     assert len(terminal) == 1, terminal

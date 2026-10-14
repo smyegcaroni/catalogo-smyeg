@@ -303,24 +303,26 @@ class DefaultProcessingPort:
         result = await session.execute(stmt)
         return [(row[0], row[1], row[2]) for row in result.all()]
 
-    async def get_catalog_vocabulary(self, session):  # type: ignore[no-untyped-def]
+    async def get_catalog_vocabulary(self, session, *, user, user_roles):  # type: ignore[no-untyped-def]
         from sqlalchemy import select
 
         from app.modules.catalog.datasets.domain.models import Record, RecordKeyword
 
-        # RecordKeyword is not itself tenant-scoped. Join through Record so
-        # the database's Record RLS policy constrains the vocabulary to the
-        # active tenant in hosted mode; with RLS disabled this is the same
-        # result set as the historical single-tenant query.
+        # RecordKeyword carries neither tenant nor visibility. Joining Record
+        # lets its RLS policy scope the vocabulary to the active tenant and the
+        # visibility filter scope it to records this caller may read.
         stmt = (
             select(RecordKeyword.keyword)
             .join(Record, RecordKeyword.record_id == Record.id)
             .distinct()
         )
+        stmt = self.apply_visibility_filter(
+            stmt, user, user_roles, Record, self.get_grant_orm_class()
+        )
         result = await session.execute(stmt)
         return [row[0] for row in result.all()]
 
-    async def get_keywords_for_records(self, session, record_ids):  # type: ignore[no-untyped-def]
+    async def get_keywords_for_records(self, session, record_ids, *, user, user_roles):  # type: ignore[no-untyped-def]
         from sqlalchemy import select
 
         from app.modules.catalog.datasets.domain.models import Record, RecordKeyword
@@ -333,6 +335,9 @@ class DefaultProcessingPort:
             .join(Record, RecordKeyword.record_id == Record.id)
             .where(RecordKeyword.record_id.in_(record_ids))
             .distinct()
+        )
+        stmt = self.apply_visibility_filter(
+            stmt, user, user_roles, Record, self.get_grant_orm_class()
         )
         result = await session.execute(stmt)
         return [row[0] for row in result.all()]
@@ -405,6 +410,14 @@ class DefaultProcessingPort:
 
         return await update_map(session, map_id, **kwargs)
 
+    async def update_dataset_metadata(self, session, dataset_id, fields, *, actor_id):  # type: ignore[no-untyped-def]
+        from app.modules.catalog.datasets.domain.schemas import DatasetMetaUpdate
+        from app.modules.catalog.datasets.domain.service import update_user_metadata
+
+        await update_user_metadata(
+            session, dataset_id, DatasetMetaUpdate(**fields), actor_id=actor_id
+        )
+
     def create_ingestion_result(self, **kwargs):  # type: ignore[no-untyped-def]
         from app.modules.catalog.datasets.domain.schemas import IngestionResult
 
@@ -431,6 +444,8 @@ class DefaultProcessingPort:
         order_field=None,
         result_limit=None,
         result_offset=None,
+        object_ids=None,
+        force_arcgis_geojson=False,
     ):  # type: ignore[no-untyped-def]
         from app.modules.catalog.sources.preview import build_gdal_source
 
@@ -443,6 +458,29 @@ class DefaultProcessingPort:
             order_field=order_field,
             result_limit=result_limit,
             result_offset=result_offset,
+            object_ids=object_ids,
+            force_arcgis_geojson=force_arcgis_geojson,
+        )
+
+    async def fetch_arcgis_id_plan(
+        self,
+        base_url,
+        layer_id,
+        client,
+        token=None,
+        *,
+        expected_oid_field=None,
+        current_version=None,
+    ):  # type: ignore[no-untyped-def]
+        from app.modules.catalog.sources.adapters.arcgis import fetch_arcgis_id_plan
+
+        return await fetch_arcgis_id_plan(
+            base_url,
+            layer_id,
+            client,
+            token=token,
+            expected_oid_field=expected_oid_field,
+            current_version=current_version,
         )
 
     # ORM class helpers: returned by Port so processing/* callers can pass
@@ -503,6 +541,7 @@ class DefaultProcessingPort:
         asset_key,
         credential=None,
         catalog_origin=None,
+        repair_nodata=False,
     ):
         from app.modules.catalog.sources.stac_resolve import resolve_stac_binding
 
@@ -514,6 +553,7 @@ class DefaultProcessingPort:
             asset_key=asset_key,
             credential=credential,
             catalog_origin=catalog_origin,
+            repair_nodata=repair_nodata,
         )
 
     # Preserves the joinedload semantics metadata_service._build_dataset_context

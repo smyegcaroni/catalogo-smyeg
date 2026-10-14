@@ -5,13 +5,15 @@ import { Layers, X, ChevronDown, ChevronRight, LifeBuoy } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
 import { ImportMetadataForm } from './ImportMetadataForm';
+import { TilesetFacts } from './TilesetFacts';
 import { TypeTag } from './TypeTag';
 import { StatusPill } from './StatusPill';
-import { isRasterPreview, isFilePreview, fileExt, kindFromEntry, isSpreadsheetExt } from './utils';
-import { getGeometryTypeLabel } from '@/i18n/labels';
-import { formatNumber } from '@/lib/format';
+import { isRasterPreview, isFilePreview, isTilesetPreview, isPointCloudPreview, fileExt, kindFromEntry, isSpreadsheetExt, displayLayerName } from './utils';
+import { getBoundingVolumeLabel, getGeometryTypeLabel } from '@/i18n/labels';
+import { formatBytes, formatNumber } from '@/lib/format';
 import { useReportDialog } from '@/lib/report';
 import type { FileEntry, CommitImportRequest, FilePreviewResponse } from '@/types/api';
 
@@ -46,6 +48,26 @@ function DetectionPanel({ entry }: { entry: FileEntry }) {
   const { t } = useTranslation('import');
   const preview = entry.previewData;
   if (!preview) return null;
+
+  if (isTilesetPreview(preview)) {
+    return (
+      <div className="col-span-full mt-3 border-t border-dashed border-border pt-4">
+        <TilesetFacts preview={preview} />
+      </div>
+    );
+  }
+
+  if (isPointCloudPreview(preview)) {
+    return (
+      <div className="col-span-full mt-3 border-t border-dashed border-border pt-4 text-xs">
+        {t('review.pointcloudSummary', {
+          points: formatNumber(preview.point_count),
+          crs: `EPSG:${preview.srid}`,
+          size: formatBytes(preview.size_bytes),
+        })}
+      </div>
+    );
+  }
 
   const raster = isRasterPreview(preview);
   const file = isFilePreview(preview) ? preview : null;
@@ -93,7 +115,7 @@ function DetectionPanel({ entry }: { entry: FileEntry }) {
                 )}
               </dd>
               <dt className="font-mono text-mini text-muted-foreground">{t('detect.labels.layer')}</dt>
-              <dd className="font-mono text-mini">{file.layer_name}</dd>
+              <dd className="font-mono text-mini">{displayLayerName(file.layer_name, file.job_id, file.source_filename)}</dd>
             </>
           ) : null}
         </dl>
@@ -159,24 +181,33 @@ function ReviewFormBlock({
   const preview = entry.previewData;
   if (!preview) return null;
 
+  if (isTilesetPreview(preview) || isPointCloudPreview(preview)) {
+    return (
+      <div className="col-span-full border-t border-border pt-4 mt-2">
+        <ImportMetadataForm
+          defaultName={preview.source_filename ?? entry.fileName}
+          detectedCrs={null}
+          onCommit={(req) => onCommitSingle(entry.id, req)}
+          isCommitting={isCommitting}
+          initialRequest={entry.commitRequest}
+          isTileset={isTilesetPreview(preview)}
+          isPointCloud={isPointCloudPreview(preview)}
+        />
+      </div>
+    );
+  }
+
   const raster = isRasterPreview(preview);
   const fp = isFilePreview(preview) ? preview : null;
-
-  function getLayerName(): string | undefined {
-    if (!fp?.layers || fp.layers.length <= 1) return undefined;
-    return fp.layer_name;
-  }
 
   return (
     <div className="col-span-full border-t border-border pt-4 mt-2">
       <ImportMetadataForm
         defaultName={preview.source_filename ?? entry.fileName}
         detectedCrs={raster ? preview.crs_epsg : fp?.crs ?? null}
-        onCommit={(req) => {
-          const layerName = getLayerName();
-          onCommitSingle(entry.id, layerName ? { ...req, layer_name: layerName } : req);
-        }}
+        onCommit={(req) => onCommitSingle(entry.id, req)}
         isCommitting={isCommitting}
+        initialRequest={entry.commitRequest}
         isRaster={raster}
         previewData={raster ? preview : undefined}
         previewColumns={fp?.columns}
@@ -213,16 +244,19 @@ export function BulkReviewList({
 }: BulkReviewListProps) {
   const { t } = useTranslation('import');
   const [expandedId, setExpandedId] = useState<string | null>(entries[0]?.id ?? null);
+  const [confirmDefaults, setConfirmDefaults] = useState<'batch' | 'vrt' | null>(null);
 
-  const { readyCount, rasterReadyCount, vectorCount, rasterCount, tableCount, hasMultiLayerFile } = useMemo(() => {
-    let ready = 0, rasterReady = 0, vec = 0, ras = 0, tab = 0, multiLayer = false;
+  const { readyCount, rasterReadyCount, vectorCount, rasterCount, tableCount, tilesetCount, pointcloudCount, hasMultiLayerFile } = useMemo(() => {
+    let ready = 0, rasterReady = 0, vec = 0, ras = 0, tab = 0, tiles = 0, clouds = 0, multiLayer = false;
     for (const e of entries) {
       if (e.status === 'preview') {
         ready++;
         if (e.previewData && isRasterPreview(e.previewData)) rasterReady++;
       }
       if (!e.previewData) continue;
-      if (isRasterPreview(e.previewData)) { ras++; }
+      if (isTilesetPreview(e.previewData)) { tiles++; }
+      else if (isPointCloudPreview(e.previewData)) { clouds++; }
+      else if (isRasterPreview(e.previewData)) { ras++; }
       else if ((e.previewData as FilePreviewResponse).geometry_type) { vec++; }
       else { tab++; }
       if (isFilePreview(e.previewData) && (e.previewData.layers?.length ?? 0) > 1) multiLayer = true;
@@ -233,6 +267,8 @@ export function BulkReviewList({
       vectorCount: vec,
       rasterCount: ras,
       tableCount: tab,
+      tilesetCount: tiles,
+      pointcloudCount: clouds,
       hasMultiLayerFile: multiLayer,
     };
   }, [entries]);
@@ -243,6 +279,22 @@ export function BulkReviewList({
 
   function formatPreviewSummary(preview: FileEntry['previewData']): string {
     if (!preview) return '';
+
+    if (isTilesetPreview(preview)) {
+      return t('review.tilesetSummary', {
+        version: preview.version,
+        size: formatBytes(preview.unpacked_bytes),
+        volume: getBoundingVolumeLabel(t, preview.bounding_volume),
+      });
+    }
+
+    if (isPointCloudPreview(preview)) {
+      return t('review.pointcloudSummary', {
+        points: formatNumber(preview.point_count),
+        crs: `EPSG:${preview.srid}`,
+        size: formatBytes(preview.size_bytes),
+      });
+    }
 
     if (isRasterPreview(preview)) {
       const bands = t('review.bandCount', {
@@ -288,7 +340,7 @@ export function BulkReviewList({
   }
 
   function formatReviewCount(
-    key: 'fileCount' | 'vectorCount' | 'rasterCount' | 'tableCount',
+    key: 'fileCount' | 'vectorCount' | 'rasterCount' | 'tableCount' | 'tilesetCount' | 'pointcloudCount',
     count: number,
   ) {
     return t(`review.${key}`, { count, value: formatNumber(count) });
@@ -325,24 +377,20 @@ export function BulkReviewList({
                 isExpanded && canExpand && 'bg-primary/[0.03]',
               )}
             >
-              <div
-                role={canExpand ? 'button' : undefined}
-                tabIndex={canExpand ? 0 : undefined}
-                className={cn(
-                  'grid grid-cols-[32px_1fr_auto] items-center gap-3 px-4 py-3',
-                  canExpand && 'cursor-pointer',
-                  isExpanded && canExpand && 'border-l-2 border-l-primary',
-                )}
-                onClick={() => canExpand && setExpandedId(isExpanded ? null : entry.id)}
-                onKeyDown={(e) => {
-                  if (canExpand && (e.key === 'Enter' || e.key === ' ')) {
-                    e.preventDefault();
-                    setExpandedId(isExpanded ? null : entry.id);
-                  }
-                }}
-              >
+              <div className={cn(
+                'grid grid-cols-[32px_minmax(0,1fr)_auto] items-center gap-3 px-4 py-3',
+                isExpanded && canExpand && 'border-l-2 border-l-primary',
+              )}>
                 <TypeTag kind={kind} />
-                <div className="min-w-0">
+                <button
+                  type="button"
+                  disabled={!canExpand}
+                  aria-expanded={canExpand ? isExpanded : undefined}
+                  aria-controls={canExpand ? `review-details-${entry.id}` : undefined}
+                  aria-label={t('bulk.toggleDetails', { name: entry.fileName })}
+                  onClick={() => setExpandedId(isExpanded ? null : entry.id)}
+                  className="min-w-0 text-start disabled:cursor-default enabled:rounded-sm enabled:focus-visible:outline-none enabled:focus-visible:ring-2 enabled:focus-visible:ring-ring"
+                >
                   <div className="flex items-center gap-2">
                     {canExpand && (
                       isExpanded
@@ -378,14 +426,15 @@ export function BulkReviewList({
                       {formatPreviewSummary(entry.previewData)}
                     </p>
                   )}
-                </div>
+                </button>
                 <div className="flex items-center gap-2">
                   <StatusPill status={entry.status} />
                   <button
-                    onClick={(e) => { e.stopPropagation(); onRemove(entry.id); }}
+                    type="button"
+                    onClick={() => onRemove(entry.id)}
                     disabled={entry.status === 'committing' || entry.status === 'tracking'}
                     className="rounded-sm p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-30"
-                    aria-label={t('bulk.removeFile')}
+                    aria-label={t('bulk.removeNamedFile', { name: entry.fileName })}
                   >
                     <X className="size-3.5" />
                   </button>
@@ -393,8 +442,8 @@ export function BulkReviewList({
               </div>
 
               {/* Expanded content */}
-              {isExpanded && canExpand && entry.previewData && (
-                <div className="px-4 pb-4">
+              {canExpand && entry.previewData && (
+                <div id={`review-details-${entry.id}`} hidden={!isExpanded} className="px-4 pb-4">
                   {/* Layer/sheet selector for multi-layer files. Spreadsheet
                       workbooks (.xlsx/.xls) keep "Sheet" vocabulary; every other
                       multi-layer container (GeoPackage, zipped FileGDB, ...) uses
@@ -491,36 +540,56 @@ export function BulkReviewList({
       <div className="flex items-center gap-3 border-t border-dashed border-border pt-4">
         <div className="flex-1">
           <p className="text-xs font-semibold">
-            {t('review.actionSummary', {
-              files: formatReviewCount('fileCount', entries.length),
-              vectors: formatReviewCount('vectorCount', vectorCount),
-              rasters: formatReviewCount('rasterCount', rasterCount),
-              tables: formatReviewCount('tableCount', tableCount),
-            })}
+            {(tilesetCount > 0
+              ? t('review.tilesetActionSummary', {
+                  files: formatReviewCount('fileCount', entries.length),
+                  tilesets: formatReviewCount('tilesetCount', tilesetCount),
+                })
+              : t('review.actionSummary', {
+                  files: formatReviewCount('fileCount', entries.length),
+                  vectors: formatReviewCount('vectorCount', vectorCount),
+                  rasters: formatReviewCount('rasterCount', rasterCount),
+                  tables: formatReviewCount('tableCount', tableCount),
+                })) + (pointcloudCount > 0 ? ` · ${formatReviewCount('pointcloudCount', pointcloudCount)}` : '')}
           </p>
           <p className="font-mono text-mini text-muted-foreground tracking-wide">
-            {t(hasMultiLayerFile ? 'review.actionHintMultiLayer' : 'review.actionHint')}
+            {entries.length === 1 ? t('review.singleActionHint') : t(hasMultiLayerFile ? 'review.actionHintMultiLayer' : 'review.actionHint')}
           </p>
         </div>
         <div className="flex gap-2">
-          {rasterReadyCount >= 2 && onCommitAllAsVrt && (
+          {entries.length > 1 && rasterReadyCount >= 2 && onCommitAllAsVrt && (
             <Button
               variant="secondary"
-              onClick={onCommitAllAsVrt}
+              onClick={() => setConfirmDefaults('vrt')}
               disabled={readyCount === 0 || isCommitting}
             >
               <Layers className="me-1 size-3" />
               {t('bulk.importAsVrt')}
             </Button>
           )}
-          <Button
-            onClick={onCommitAll}
-            disabled={readyCount === 0 || isCommitting}
-          >
-            {t('bulk.importAllDefaults')}
-          </Button>
+          {entries.length > 1 && (
+            <Button onClick={() => setConfirmDefaults('batch')} disabled={readyCount === 0 || isCommitting}>
+              {t('bulk.importAllDefaults')}
+            </Button>
+          )}
         </div>
       </div>
+      <Dialog open={confirmDefaults !== null} onOpenChange={(open) => { if (!open) setConfirmDefaults(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('bulk.defaultsConfirmTitle')}</DialogTitle>
+            <DialogDescription>{t('bulk.defaultsConfirmDescription')}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmDefaults(null)}>{t('common:cancel')}</Button>
+            <Button onClick={() => {
+              if (confirmDefaults === 'vrt') onCommitAllAsVrt?.();
+              else onCommitAll();
+              setConfirmDefaults(null);
+            }}>{t('bulk.confirmDefaults')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

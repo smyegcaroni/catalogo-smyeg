@@ -13,6 +13,7 @@ from fastapi import (
     APIRouter,
     Depends,
     File,
+    Form,
     HTTPException,
     Query,
     Request,
@@ -27,7 +28,6 @@ if TYPE_CHECKING:
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.failure_reason import redact_failure_reason
 from app.core.geo import unknown_srid_refusal
 from app.core.identity import Identity
 from app.core.async_io import (
@@ -38,6 +38,8 @@ from app.modules.auth.dependencies import get_current_active_user, require_permi
 from app.core.config import settings
 from app.core.db.tenant_session import defer_async_with_tenant
 from app.core.dependencies import get_db
+from app.core.pointcloud import POINTCLOUD_FILE_TYPE
+from app.core.tiles3d import TILESET_FILE_TYPE
 from app.processing.ingest.layer_guard import (
     known_layer_names as known_layer_names_for,
     reject_option_like_layer_name,
@@ -60,6 +62,7 @@ from app.processing.ingest.schemas import (
     DiscoverResponse,
     FanOutCommitRequest,
     FanOutCommitResponse,
+    PointCloudCommitRequest,
     PreviewResponse,
     PresignedCompleteRequest,
     PresignedUploadRequest,
@@ -68,10 +71,12 @@ from app.processing.ingest.schemas import (
     RasterPreviewResponse,
     RegisterRequest,
     ServiceCommitRequest,
+    StagedPreviewResponse,
     TableRegisterResponse,
+    TilesetCommitRequest,
+    UPLOAD_KIND_DESCRIPTION,
     UploadConfigResponse,
     UploadResponse,
-    UrlUploadRequest,
     VectorCommitRequest,
     VrtAddSourceRequest,
     VrtCreateRequest,
@@ -80,30 +85,29 @@ from app.processing.ingest.schemas import (
 )
 from app.processing.ingest.service import (
     PART_SIZE,
-    _assert_header_token_dispatchable,
+    _assert_commit_credential_dispatchable,
     _cleanup_saved_upload,
+    admit_import_commit,
     claim_fan_out_parent,
     create_fan_out_jobs,
     create_ingest_job,
     discover_unregistered_tables,
     job_service_format,
     raster_stamped_metadata,
+    record_preview_layers,
     restore_fan_out_parent_pending,
     get_job_or_404,
     queue_ingest_job,
     register_existing_table,
+    registration_failure_reason,
     resolve_file_path,
-    safe_upload_basename,
     save_upload_file,
     validate_file_extension,
 )
-from app.processing.ingest.url_fetch import (
-    PREFLIGHT_DNS_MAX_SECONDS,
-    clamp_filename_bytes,
-    filename_from_url,
-)
 from app.processing.ingest.presigned import (
     abort_presigned_multipart_upload,
+    admit_presigned_pointcloud,
+    admit_presigned_tileset,
     finalize_presigned_object,
     lock_presigned_job,
     require_completable_presigned_job,
@@ -111,23 +115,40 @@ from app.processing.ingest.presigned import (
     should_assemble_multipart,
     sign_url_with_deadline,
 )
+from app.processing.ingest.pointcloud import (
+    preview_staged_pointcloud,
+    require_pointcloud_file,
+    staged_pointcloud_bytes,
+    staged_pointcloud_metadata,
+)
 from app.processing.ingest.tasks import regenerate_vrt_staged
+from app.processing.ingest.tileset import (
+    TILESET_UNPACKED_BYTES_FIELD,
+    preview_staged_tileset,
+    require_tileset_archive,
+    staged_tileset_metadata,
+    staged_unpacked_bytes,
+)
+from app.core.upload_errors import CodedRefusal, refusal_detail
 from app.processing.ingest.validation import (
     UnsafeUploadError,
     validate_file_content,
 )
 from app.platform.catalog_locks import admit_vrt_mutation
 from app.platform.jobs.defer_guard import (
+    DeferFailed,
     defer_with_orphan_guard,
-    make_vrt_regeneration_failed_rollback,
+    make_ingest_job_failed_rollback,
 )
+from app.platform.jobs import ledger
 from app.core.persistent_config import (
     UPLOAD_ALLOWED_EXTENSIONS,
     UPLOAD_MAX_SIZE_MB,
     get_allowed_extensions_list,
 )
 from app.modules.quota.service import check_upload_quota, get_user_quota_usage
-from app.processing.raster.validation import validate_sources
+from app.modules.quota.service import DatasetQuotaExceededError
+from app.processing.raster.validation import validate_sources_async
 from app.platform.service_auth import (
     credential_or_422,
     service_credential_from_request,
@@ -160,19 +181,17 @@ def _fallback_allowed_extensions() -> list[str]:
 
 
 def _reject_standalone_vrt(filename: str) -> None:
-    """Reject raw VRT XML uploads at every HTTP upload boundary.
-
-    A VRT is only valid when GeoLens builds it from catalog-tracked raster
-    sources. Accepting an arbitrary .vrt file would create a ready-looking
-    dataset with no source links and may retain external paths in the XML.
-    """
+    """Reject a raw VRT XML upload; unlike one GeoLens builds, it has no catalog-tracked sources and may carry external paths."""
     if Path(filename).suffix.lower() == ".vrt":
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=(
-                "Standalone VRT uploads are not supported. Create a managed "
-                "VRT from existing raster datasets instead."
-            ),
+            detail={
+                "code": "standalone_vrt_not_supported",
+                "message": (
+                    "Standalone VRT uploads are not supported. Create a managed "
+                    "VRT from existing raster datasets instead."
+                ),
+            },
         )
 
 
@@ -200,6 +219,33 @@ async def _get_allowed_extensions_safely(db: AsyncSession) -> list[str]:
             error=str(exc),
         )
         return _fallback_allowed_extensions()
+
+
+async def _refuse_upload(db: AsyncSession, filename: str, kind: str | None) -> None:
+    """Refuse a standalone VRT, a disallowed extension, or a mismatched upload kind."""
+    _reject_standalone_vrt(filename)
+    try:
+        # Ahead of the allowed list, so a .las sent as a point cloud gets the hint.
+        require_pointcloud_file(kind, filename)
+    except UnsafeUploadError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=refusal_detail(exc),
+        ) from exc
+    allowed_list = await _get_allowed_extensions_safely(db)
+    try:
+        validate_file_extension(filename, allowed_list)
+    except CodedRefusal as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=refusal_detail(exc)
+        ) from exc
+    try:
+        require_tileset_archive(kind, filename)
+    except UnsafeUploadError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=refusal_detail(exc),
+        ) from exc
 
 
 @router.get(
@@ -255,17 +301,24 @@ async def request_presigned_upload(
             detail="Presigned uploads only available in S3 mode",
         )
 
-    allowed_list = await _get_allowed_extensions_safely(db)
-    _reject_standalone_vrt(request.filename)
-    validate_file_extension(request.filename, allowed_list)
+    await _refuse_upload(db, request.filename, request.kind)
 
     # Reject files exceeding configured size limit at request time
     max_size_mb = await UPLOAD_MAX_SIZE_MB.get(db)
     max_size_bytes = max_size_mb * 1024 * 1024
     if request.file_size > max_size_bytes:
+        size_mb = round(request.file_size / (1024 * 1024), 1)
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=f"File size ({request.file_size / (1024 * 1024):.1f} MB) exceeds the maximum allowed ({max_size_mb} MB).",
+            detail={
+                "code": "file_size_exceeded",
+                "message": (
+                    f"File size ({size_mb} MB) exceeds the maximum allowed "
+                    f"({max_size_mb} MB)."
+                ),
+                "size_mb": size_mb,
+                "limit_mb": max_size_mb,
+            },
         )
 
     await check_upload_quota(db, user.id, request.file_size, http_request)
@@ -329,6 +382,7 @@ async def request_presigned_upload(
             "upload_id": upload_id,
             "multipart": True,
             "expected_size": request.file_size,
+            **({"file_type": request.kind} if request.kind else {}),
         }
         try:
             await db.commit()
@@ -374,6 +428,7 @@ async def request_presigned_upload(
             "s3_key": s3_key,
             "multipart": False,
             "expected_size": request.file_size,
+            **({"file_type": request.kind} if request.kind else {}),
         }
         await db.commit()
         return PresignedUploadResponse(
@@ -478,6 +533,17 @@ async def complete_presigned_upload(
         user_id=user.id,
         request=http_request,
     )
+    if um.get("file_type") == TILESET_FILE_TYPE:
+        await admit_presigned_tileset(
+            db,
+            storage,
+            job,
+            frozen_key=frozen_key,
+            user_id=user.id,
+            request=http_request,
+        )
+    if um.get("file_type") == POINTCLOUD_FILE_TYPE:
+        await admit_presigned_pointcloud(storage, job, frozen_key=frozen_key)
 
     job.file_path = frozen_key
     # fix(#1186): the presigned path never stamped file_type — on S3 every
@@ -537,47 +603,6 @@ def _stamp_raster_metadata(job: "IngestJob", filename: str | None) -> None:
     job.user_metadata = raster_stamped_metadata(job.user_metadata, filename)
 
 
-def _url_import_filename(body: UrlUploadRequest) -> str:
-    """The staging filename for a URL import, or the endpoint's 400/422.
-
-    fix(#1708): both name sources go through the byte clamp (filesystems cap
-    NAME_MAX in BYTES, not the schema's 255 characters). Callers must invoke
-    this INSIDE their guarded block — urlparse can raise ValueError on a
-    malformed authority.
-    """
-    try:
-        filename = (
-            clamp_filename_bytes(safe_upload_basename(body.filename))
-            if body.filename
-            else filename_from_url(body.url)
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid URL: {exc}",
-        ) from exc
-    # fix(#1708): NUL and other control characters survive percent-
-    # decoding ('/roads%00.geojson') or arrive verbatim in the override, and
-    # pass every suffix/allowlist check — the filesystem refuses them only at
-    # open(), which sits AFTER the running-commit, and the failed open's
-    # cleanup unlink then raised on the same invalid path. Refuse them here,
-    # before any job row exists.
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in filename):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Filename contains control characters that are not allowed.",
-        )
-    if not filename or not Path(filename).suffix:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=(
-                "Could not determine a filename with an extension from the "
-                "URL path. Provide 'filename' explicitly."
-            ),
-        )
-    return filename
-
-
 @router.post(
     "/upload",
     response_model=UploadResponse,
@@ -589,6 +614,11 @@ async def upload_file(
     file: UploadFile = File(...),
     user: Identity = Depends(require_permission("upload")),
     db: AsyncSession = Depends(get_db),
+    # A pattern, not a Literal: the generated Python SDK cannot put a nullable
+    # Literal into a multipart body.
+    kind: str | None = Form(
+        None, pattern="^(tiles3d|pointcloud)$", description=UPLOAD_KIND_DESCRIPTION
+    ),
 ) -> UploadResponse:
     """Upload a geospatial file for staging.
 
@@ -598,12 +628,10 @@ async def upload_file(
     if not file.filename:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Upload missing filename",
+            detail={"code": "missing_filename", "message": "Upload missing filename"},
         )
     try:
-        allowed_list = await _get_allowed_extensions_safely(db)
-        _reject_standalone_vrt(file.filename)
-        validate_file_extension(file.filename, allowed_list)
+        await _refuse_upload(db, file.filename, kind)
 
         # IA-P0-02: enforce max_file_size_bytes at HTTP entry. Symmetric
         # with the presigned path's request-time check (:158-165).
@@ -634,21 +662,21 @@ async def upload_file(
             # Inline content validation for immediate feedback.
             try:
                 validate_file_content(validation_path, file.filename)
+                kind_metadata = await staged_tileset_metadata(validation_path, kind)
+                kind_metadata |= await staged_pointcloud_metadata(validation_path, kind)
             except ValueError as exc:
-                # fix(#1848): guarded like the bind below, so a row the sweep
-                # already reclaimed keeps its terminal status and message.
-                await db.execute(
-                    _pending_upload_update(job_id).values(
-                        status="failed",
-                        error_message=redact_failure_reason(exc),
-                        completed_at=datetime.now(timezone.utc),
-                    )
-                )
+                # Fenced like the bind below, so a row the sweep already
+                # reclaimed keeps its terminal status and message.
+                await ledger.abort(db, job, code="content_rejected", reason=exc)
                 await db.commit()
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail=str(exc),
+                    detail=refusal_detail(exc),
                 ) from exc
+            if TILESET_UNPACKED_BYTES_FIELD in kind_metadata:
+                await check_upload_quota(
+                    db, user.id, kind_metadata[TILESET_UNPACKED_BYTES_FIELD], request
+                )
 
             # fix(#1848): bind only while the row is still pending, stamping
             # `staged_at` so the pending window restarts here rather than at
@@ -658,6 +686,7 @@ async def upload_file(
                     file_path=str(saved_path),
                     user_metadata={
                         **(raster_stamped_metadata(job_metadata, file.filename) or {}),
+                        **kind_metadata,
                         "staged_at": datetime.now(timezone.utc).isoformat(),
                     },
                 )
@@ -709,176 +738,65 @@ async def upload_file(
         )
 
 
-@router.post(
-    "/upload/url",
-    response_model=UploadResponse,
-    status_code=status.HTTP_201_CREATED,
-    responses={
-        # fix(#1710): 413 stays documented. The download moved to the worker,
-        # but `check_upload_quota` still refuses an over-quota caller here,
-        # and dropping it took the branch out of both SDKs.
-        413: PAYLOAD_TOO_LARGE_RESPONSE,
-        502: BAD_GATEWAY_RESPONSE,
-    },
-)
-async def upload_from_url(
-    body: UrlUploadRequest,
-    request: Request,
-    user: Identity = Depends(require_permission("upload")),
-    db: AsyncSession = Depends(get_db),
-) -> UploadResponse:
-    """Start importing a geospatial file from an HTTP(S) URL.
+async def _preview_raster(
+    job: "IngestJob", file_path: str, downloaded_preview_path: Path | None
+) -> RasterPreviewResponse:
+    """Read a staged raster's metadata and COG compliance for the preview."""
+    from app.processing.raster import probe
 
-    The server fetches the file and sends the staged bytes through the same
-    preview and commit pipeline as a direct upload.
-
-    The download runs as a background job. This call validates the URL and
-    returns a job id immediately; poll ``GET /jobs/{job_id}`` and
-    preview once the job reaches ``pending``. While the file is downloading
-    the job reports status ``running`` with step ``downloading``.
-
-    URL validation, connection-time IP pinning, and per-hop redirect checks
-    protect the download from SSRF. The worker enforces the size cap while
-    streaming, validates the staged file like a direct upload, and gives GDAL
-    only the local staged file.
-    """
-    from datetime import datetime, timezone
-
-    from app.core.db.tenant_session import defer_async_with_tenant
-    from app.core.url_redaction import redact_url_credentials
-    from app.platform.jobs.defer_guard import (
-        defer_with_orphan_guard,
-        make_ingest_job_failed_rollback,
-    )
-    from app.platform.jobs.models import URL_DOWNLOAD_IN_FLIGHT_METADATA_KEY
-    from app.platform.security import SSRFError, validate_url_for_ssrf
-    from app.processing.ingest.tasks import fetch_url
-
-    # Exception-safe on malformed input by design (fix(#1119)) — safe to run
-    # before the guarded block below.
-    safe_url = redact_url_credentials(body.url)
+    file_size: int | None = None
     try:
-        filename = _url_import_filename(body)
-        _reject_standalone_vrt(filename)
-
-        # fix(#1708): commit here to END the auth-phase transaction before the
-        # DNS await — getaddrinfo has no bound of its own, and holding a
-        # connection through it could exhaust the pool under concurrent imports.
-        await db.commit()
-
-        # Rule 2, submission gate: refuse private/link-local/reserved targets
-        # before anything is queued. The worker's safe client re-validates at
-        # connect time and per redirect hop during the download.
-        #
-        # fix(#1708): bounded at the call site — getaddrinfo has no deadline
-        # of its own; wait_for cancels the to_thread wrapper immediately and
-        # the abandoned resolver thread ends when the OS resolver gives up.
+        inspection = await asyncio.to_thread(
+            probe.inspect_raster, file_path, timeout=probe.PREVIEW_TIMEOUT_SECONDS
+        )
         try:
-            await asyncio.wait_for(
-                validate_url_for_ssrf(body.url),
-                timeout=PREFLIGHT_DNS_MAX_SECONDS,
-            )
-        except TimeoutError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=(
-                    "DNS resolution for this URL did not finish within "
-                    f"{PREFLIGHT_DNS_MAX_SECONDS} seconds."
-                ),
-            ) from exc
-        except SSRFError as exc:
-            logger.warning(
-                "url_import_ssrf_blocked",
-                event_type="security",
-                url=safe_url,
-                reason=str(exc),
-            )
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-            ) from exc
+            import os
 
-        allowed_list = await _get_allowed_extensions_safely(db)
-        validate_file_extension(filename, allowed_list)
-
-        # QUOTA-02: refuse at the dataset-count cap before queueing anything.
-        # The byte half (QUOTA-01) runs in the worker with the size that
-        # actually landed — Content-Length may be absent or dishonest.
-        await check_upload_quota(db, user.id, 0, request)
-
-        job = await create_ingest_job(db, filename, "", user.id)
-        job_id = job.id
-        # feat(#1710): the row is committed 'running', not 'pending'. The
-        # success state of a URL import IS 'pending' (previewable), so a
-        # pending row would tell the UI the download had finished; and the
-        # stale-PENDING sweep may legally fire at 61s while a download is
-        # allowed url_import_fetch_max_seconds. Running rows are judged by
-        # the worker lease instead, which the task's heartbeat renews.
-        job.status = "running"
-        job.started_at = datetime.now(timezone.utc)
-        job.current_step = "downloading"
-        job.progress = 0.0
-        # fix(#1710): while this is set, `file_path` names a destination, not
-        # a finished file, so retry is refused. The staged transition clears
-        # it; see URL_DOWNLOAD_IN_FLIGHT_METADATA_KEY.
-        job.user_metadata = {
-            **(job.user_metadata or {}),
-            URL_DOWNLOAD_IN_FLIGHT_METADATA_KEY: True,
-        }
-        await db.commit()
-
-        async def _defer_fetch() -> None:
-            await defer_async_with_tenant(
-                fetch_url,
-                job_id=str(job_id),
-                attempt_id=str(job.attempt_id),
-                url=body.url,
-                user_id=str(user.id),
-                filename=filename,
-            )
-
-        # The URL crosses to the worker as a task argument rather than on the
-        # job row: `user_metadata` is served by GET /jobs/{id}, and a URL can
-        # carry userinfo credentials.
-        await defer_with_orphan_guard(
-            _defer_fetch,
-            rollback=make_ingest_job_failed_rollback(
-                job,
-                message_prefix="Failed to queue the download",
-                expected_status="running",
-            ),
-            db=db,
-            job=job,
-        )
-
-        logger.info("url_import_queued", url=safe_url, job_id=str(job_id))
-        return UploadResponse(
-            job_id=job_id,
-            status="running",
-            message="Downloading the file",
-        )
-    # N4 (mirrors upload_file): HTTPException before the ValueError fallback,
-    # or every deliberate 4xx above is rewritten as a 400/500.
-    except HTTPException:
-        raise
-    except (IngestionError, ValueError) as exc:
+            file_size = os.path.getsize(file_path)
+        except OSError:
+            pass
+    except Exception as exc:  # broad: any failed probe is a failed preview
+        kind = exc.kind if isinstance(exc, probe.RasterProbeError) else None
+        logger.warning("raster_preview failed", job_id=str(job.id), kind=kind)
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "raster_preview_failed",
+                "message": str(exc)
+                if kind in ("timeout", "internal")
+                else "Unable to preview raster file. The file may be malformed or unsupported.",
+            },
         )
-    except Exception:  # broad: submission involves DNS, config lookups, DB and the queue — any can throw
-        logger.exception(
-            "Unexpected error during URL import",
-            url=safe_url,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred during URL import",
-        )
+    finally:
+        if downloaded_preview_path is not None:
+            downloaded_preview_path.unlink(missing_ok=True)
+
+    meta = inspection["metadata"]
+    compliant, reason = inspection["compliant"], inspection["compliance_reason"]
+    nodata = meta.get("nodata")
+    return RasterPreviewResponse(
+        job_id=job.id,
+        source_filename=job.source_filename,
+        crs_epsg=meta.get("epsg"),
+        crs_wkt=meta.get("crs_wkt"),
+        band_count=meta["band_count"],
+        width=meta["width"],
+        height=meta["height"],
+        dtype=meta["dtype"],
+        nodata=nodata,
+        res_x=meta["res_x"],
+        res_y=meta["res_y"],
+        compression=meta.get("compression"),
+        file_size_bytes=file_size,
+        is_cog_compliant=compliant,
+        compliance_reason=reason,
+        temporal_start=meta.get("temporal_start"),
+    )
 
 
 @router.post(
     "/preview/{job_id}",
-    response_model=PreviewResponse | RasterPreviewResponse,
+    response_model=StagedPreviewResponse,
 )
 async def preview_file(
     job_id: uuid.UUID,
@@ -887,11 +805,16 @@ async def preview_file(
     ),
     user: Identity = Depends(require_permission("upload")),
     db: AsyncSession = Depends(get_db),
-) -> PreviewResponse | RasterPreviewResponse:
+) -> StagedPreviewResponse:
     """Run preview on a staged file and return preview data.
 
     For vector files: returns columns, CRS, geometry type, feature count, sample rows.
     For raster files: returns band count, CRS, resolution, compliance status.
+    For a 3D Tiles tileset: returns its version, root geometric error, bounding
+    volume kind, extent and unpacked size, read from the archive's directory
+    and tileset.json without unpacking it.
+    For a COPC point cloud: returns its point count and format, CRS, extent,
+    elevation range and size, read from its header and hierarchy.
     Only callable on jobs with status 'pending'.
     """
     # fix(#823): layer_name reaches ogrinfo argv; 422 option-like values.
@@ -911,6 +834,21 @@ async def preview_file(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Job has no associated file — upload must complete before preview",
         )
+    file_type = (job.user_metadata or {}).get("file_type")
+    try:
+        if file_type == TILESET_FILE_TYPE:
+            return await preview_staged_tileset(
+                job.id, job.source_filename, job.file_path
+            )
+        if file_type == POINTCLOUD_FILE_TYPE:
+            return await preview_staged_pointcloud(
+                job.id, job.source_filename, job.file_path
+            )
+    except UnsafeUploadError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=refusal_detail(exc),
+        ) from exc
     file_path: str = job.file_path
     downloaded_preview_path: Path | None = None
     resolved_file_path = await resolve_file_path(file_path, str(job.id))
@@ -921,56 +859,7 @@ async def preview_file(
     # Branch: raster vs vector preview
     um = job.user_metadata or {}
     if um.get("file_type") == "raster":
-        from app.processing.raster.cog import (
-            check_cog_compliance,
-            extract_raster_metadata,
-        )
-
-        file_size: int | None = None
-        try:
-            meta, (compliant, reason) = await asyncio.gather(
-                asyncio.to_thread(extract_raster_metadata, file_path),
-                asyncio.to_thread(check_cog_compliance, file_path),
-            )
-            try:
-                import os
-
-                file_size = os.path.getsize(file_path)
-            except OSError:
-                pass
-        except (
-            Exception
-        ) as exc:  # broad: rasterio/GDAL can raise various errors on malformed files
-            logger.exception(
-                "raster_preview failed", job_id=str(job_id), error=str(exc)
-            )
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Unable to preview raster file. The file may be malformed or unsupported.",
-            )
-        finally:
-            if downloaded_preview_path is not None:
-                downloaded_preview_path.unlink(missing_ok=True)
-
-        nodata = meta.get("nodata")
-        return RasterPreviewResponse(
-            job_id=job.id,
-            source_filename=job.source_filename,
-            crs_epsg=meta.get("epsg"),
-            crs_wkt=meta.get("crs_wkt"),
-            band_count=meta["band_count"],
-            width=meta["width"],
-            height=meta["height"],
-            dtype=meta["dtype"],
-            nodata=nodata,
-            res_x=meta["res_x"],
-            res_y=meta["res_y"],
-            compression=meta.get("compression"),
-            file_size_bytes=file_size,
-            is_cog_compliant=compliant,
-            compliance_reason=reason,
-            temporal_start=meta.get("temporal_start"),
-        )
+        return await _preview_raster(job, file_path, downloaded_preview_path)
 
     try:
         info = await run_ogrinfo_preview(file_path, layer_name=layer_name)
@@ -980,7 +869,7 @@ async def preview_file(
         # file "malformed or unsupported" when it's merely too large.
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
+            detail=refusal_detail(exc),
         )
     except UnsafeUploadError as exc:
         # fix(#1846, GHSA-hrf5-v3cq-frx5): server-authored refusal naming
@@ -988,13 +877,16 @@ async def preview_file(
         # first whole-file check, since the presign door only sees a header probe.
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
+            detail=refusal_detail(exc),
         )
     except Exception as exc:  # broad: GDAL subprocess can raise various errors on unsupported/malformed files
         logger.exception("ogrinfo_preview failed", job_id=str(job_id), error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Unable to preview file. The file may be malformed or unsupported.",
+            detail={
+                "code": "preview_failed",
+                "message": "Unable to preview file. The file may be malformed or unsupported.",
+            },
         )
     finally:
         if downloaded_preview_path is not None:
@@ -1004,11 +896,7 @@ async def preview_file(
     # endpoint's layer-name validation has a non-empty set — otherwise
     # known_layer_names is empty and the 422 guard is a no-op for real uploads.
     if info.get("all_layers"):
-        job.user_metadata = {
-            **(job.user_metadata or {}),
-            "all_layers": info["all_layers"],
-        }
-        await db.commit()
+        await record_preview_layers(db, job.id, info["all_layers"])
 
     # Auto-detect geometry columns for non-spatial files (CSV/XLSX with lat/lng or WKT)
     detected_geom_cols = None
@@ -1037,6 +925,8 @@ def _pick_commit_subclass(job: "IngestJob") -> type[BaseCommitRequest]:
     Mirrors ``queue_ingest_job``'s discrimination:
       - ``job.source_url`` set (no ``file_path``) -> service
       - ``job.user_metadata['file_type'] == 'raster'`` -> raster
+      - ``job.user_metadata['file_type'] == 'tiles3d'`` -> tileset
+      - ``job.user_metadata['file_type'] == 'pointcloud'`` -> point cloud
       - otherwise -> vector (default)
 
     Service jobs are discriminated by ``source_url``, NOT by
@@ -1047,6 +937,10 @@ def _pick_commit_subclass(job: "IngestJob") -> type[BaseCommitRequest]:
         return ServiceCommitRequest
     if (job.user_metadata or {}).get("file_type") == "raster":
         return RasterCommitRequest
+    if (job.user_metadata or {}).get("file_type") == TILESET_FILE_TYPE:
+        return TilesetCommitRequest
+    if (job.user_metadata or {}).get("file_type") == POINTCLOUD_FILE_TYPE:
+        return PointCloudCommitRequest
     return VectorCommitRequest
 
 
@@ -1054,6 +948,7 @@ def _pick_commit_subclass(job: "IngestJob") -> type[BaseCommitRequest]:
     "/commit/{job_id}",
     response_model=CommitResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    responses={413: PAYLOAD_TOO_LARGE_RESPONSE},
 )
 async def commit_import(
     job_id: uuid.UUID,
@@ -1064,7 +959,9 @@ async def commit_import(
     """Commit a staged file for ingestion with user-supplied metadata.
 
     Stores user metadata on the job and queues the ingest task.
-    Only callable on jobs with status 'pending'.
+    Only callable on jobs with status 'pending'. A 3D Tiles tileset's unpacked
+    size and a point cloud's size are checked against the storage quota again
+    here.
     """
     job = await get_job_or_404(db, job_id, user)
 
@@ -1073,6 +970,7 @@ async def commit_import(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Job already processed",
         )
+    observed_attempt_id = job.attempt_id
 
     # IA-P0-03: re-validate job.source_url against SSRF rules at commit time
     # — closes the preview→commit DNS-rebinding TOCTOU (default 60s job TTL).
@@ -1124,6 +1022,11 @@ async def commit_import(
     from app.modules.catalog.authorization import check_public_visibility_allowed
 
     await check_public_visibility_allowed(db, user, commit.visibility)
+    if Subclass is TilesetCommitRequest:
+        await check_upload_quota(db, user.id, staged_unpacked_bytes(job), None)
+    if Subclass is PointCloudCommitRequest:
+        size = await staged_pointcloud_bytes(job.file_path)
+        await check_upload_quota(db, user.id, size, None)
 
     # Extract the credential only for service commits (ServiceCommitRequest is
     # the only subclass carrying one). AUTH-04: never persisted.
@@ -1139,11 +1042,10 @@ async def commit_import(
         service_format=job_service_format(job),
     )
 
-    # fix(#1746): judge the credential BEFORE the write below, not just
-    # before the stash inside `queue_ingest_job` — `service_auth_required`
-    # is a one-way door (`_replay_capability` refuses retry once set), so a
-    # late-rejected credential would leave a `pending` job un-retryable.
-    _assert_header_token_dispatchable(job, token)
+    # Judge the credential and the store before the write below:
+    # `service_auth_required` is a one-way door (`_replay_capability` refuses
+    # retry once set), so a later refusal would leave the job un-retryable.
+    _assert_commit_credential_dispatchable(job, token, credential)
 
     # Persist the subclass-filtered view. `auth` is excluded like `token`,
     # and more sharply: user_metadata is durable JSONB, so a nested
@@ -1154,26 +1056,22 @@ async def commit_import(
         # Persist only the fact that retry needs fresh credentials. The
         # credential remains request-only and is never written to JSONB.
         commit_metadata["service_auth_required"] = True
-    if job.user_metadata:
-        # Service jobs already have service_type and layer_id from preview
-        merged = {**job.user_metadata, **commit_metadata}
-        job.user_metadata = merged
-    else:
-        job.user_metadata = commit_metadata
-    await db.commit()
+    await admit_import_commit(db, job, observed_attempt_id, commit_metadata)
+    staged_path = job.file_path
 
     # Dispatch routing lives in the service layer (KISS-9).
     # queue_ingest_job owns the orphan-guard: a defer failure flips the job
-    # to failed and raises 503 (RESILIENCE-2). Clean up the staging file
-    # on failure so it isn't orphaned on disk/S3.
+    # to failed and raises 503 (RESILIENCE-2). The staged file is deleted
+    # only when that flip landed: a missed one means a worker owns the job
+    # and is reading it.
     try:
         await queue_ingest_job(job, str(user.id), db=db, credential=credential)
-    except Exception:  # broad: defer failure or DB error during enqueue — clean up staging file then re-raise
-        if job.file_path:
+    except DeferFailed as exc:
+        if staged_path and exc.landed:
             saved: Path | str = (
-                Path(job.file_path) if job.file_path.startswith("/") else job.file_path
+                Path(staged_path) if staged_path.startswith("/") else staged_path
             )
-            await _cleanup_saved_upload(saved, str(job.id))
+            await _cleanup_saved_upload(saved, str(job_id))
         raise
 
     return CommitResponse(
@@ -1316,8 +1214,6 @@ async def register_table(
     Verifies the table exists, extracts metadata, and creates a
     catalog entry.
     """
-    # feat(#1691): a non-admin may not register a public dataset when the
-    # restrict_public_visibility instance setting is on.
     from app.modules.catalog.authorization import check_public_visibility_allowed
 
     await check_public_visibility_allowed(db, user, request.visibility)
@@ -1330,15 +1226,15 @@ async def register_table(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         )
-    except HTTPException:
+    except (HTTPException, DatasetQuotaExceededError):
         raise
     except Exception:  # broad: metadata extraction involves PostGIS queries that can fail unpredictably
-        await db.rollback()
         logger.exception(
             "Unexpected error during table registration",
             table_name=request.table_name,
             user_id=str(user.id),
         )
+        await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Registration failed — see server logs",
@@ -1427,7 +1323,7 @@ async def bulk_register_tables(
                 return BulkRegisterResult(
                     table_name=table_req.table_name,
                     status="error",
-                    error=str(exc),
+                    error=registration_failure_reason(exc, table_req.table_name),
                 )
 
     results = await asyncio.gather(
@@ -1596,11 +1492,11 @@ async def add_vrt_source(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"VRT dataset {dataset_id} has no vrt_type — cannot validate sources",
         )
-    errors = validate_sources(vrt_asset.vrt_type, all_assets)
+    errors = await validate_sources_async(vrt_asset.vrt_type, all_assets)
     if errors:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=[e.model_dump() for e in errors],
+            detail=[e.model_dump(mode="json") for e in errors],
         )
 
     # fix(#1327): STAGE the intended post-mutation member set on the
@@ -1614,10 +1510,6 @@ async def add_vrt_source(
         str(request.source_dataset_id)
     ]
 
-    # Capture pre-mutation values so the orphan-guard rollback (Theme H) can
-    # restore them if Procrastinate is unreachable.
-    previous_status = vrt_asset.status
-    previous_generation_id = vrt_asset.current_generation_id
     generation = VrtGeneration(
         vrt_dataset_id=dataset_id,
         status="pending",
@@ -1634,10 +1526,9 @@ async def add_vrt_source(
     job = await create_ingest_job(db, "vrt_regenerate", "", user.id)
     job.dataset_id = dataset_id
 
-    # If Procrastinate is unreachable the rollback below reverts the VRT
-    # asset state and marks the job failed before re-raising as HTTP 503 —
-    # otherwise the VRT would sit 'regenerating' until sweep_stale_vrt_assets
-    # (#1267) reconciled it, 409-ing every mutation in between.
+    # A queue outage fails the job below and releases the VRT with it before
+    # the 503; otherwise the asset sits 'regenerating', 409-ing every mutation
+    # until sweep_stale_vrt_assets reconciles it.
     await db.commit()
 
     async def _defer() -> None:
@@ -1656,12 +1547,8 @@ async def add_vrt_source(
     # fix(#1327): no link-table rollback needed — with the member set staged
     # on the generation, an undispatched request never touched
     # vrt_source_links, so nothing needs to be put back.
-    rollback = make_vrt_regeneration_failed_rollback(
-        vrt_asset,
-        generation,
-        job,
-        previous_status=previous_status,
-        previous_generation_id=previous_generation_id,
+    rollback = make_ingest_job_failed_rollback(
+        job, message_prefix="Failed to queue VRT regeneration"
     )
     await defer_with_orphan_guard(_defer, rollback=rollback, db=db, job=job)
 
@@ -1772,9 +1659,6 @@ async def remove_vrt_source(
         str(sid) for sid in existing_source_ids if sid != source_dataset_id
     ]
 
-    # Capture pre-mutation values for the orphan-guard rollback.
-    previous_status = vrt_asset.status
-    previous_generation_id = vrt_asset.current_generation_id
     generation = VrtGeneration(
         vrt_dataset_id=dataset_id,
         status="pending",
@@ -1793,7 +1677,7 @@ async def remove_vrt_source(
 
     # Commit + dispatch with orphan guard (Theme H) — a Procrastinate outage
     # would otherwise leave the VRT 'regenerating' until sweep_stale_vrt_assets
-    # reconciled it, 409-ing every mutation; the rollback below reverts state.
+    # reconciled it, 409-ing every mutation; the rollback below releases it.
     await db.commit()
 
     async def _defer() -> None:
@@ -1812,12 +1696,8 @@ async def remove_vrt_source(
     # fix(#1327): nothing to re-insert — the link row was never deleted, and
     # the post-removal set is staged on the generation until the artifact
     # swap, so an undispatched request leaves the catalog untouched.
-    rollback = make_vrt_regeneration_failed_rollback(
-        vrt_asset,
-        generation,
-        job,
-        previous_status=previous_status,
-        previous_generation_id=previous_generation_id,
+    rollback = make_ingest_job_failed_rollback(
+        job, message_prefix="Failed to queue VRT regeneration"
     )
     await defer_with_orphan_guard(_defer, rollback=rollback, db=db, job=job)
 

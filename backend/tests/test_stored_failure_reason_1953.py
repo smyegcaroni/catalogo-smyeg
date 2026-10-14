@@ -266,7 +266,20 @@ _SANCTIONED_REDACTORS = frozenset(
 _REDACTING_SINKS: dict[str, str | int] = {
     "record_refresh_failure": "error_message",
     "release_manifest_reservation": 2,
+    "abort": "reason",
+    "ledger.abort": "reason",
+    "ledger.fail": "reason",
+    "write_job_failure_for_attempt": "reason",
 }
+
+
+def _callee(func: ast.expr) -> str | None:
+    """``name`` for a bare call, ``module.name`` for a call through a module."""
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return f"{func.value.id}.{func.attr}"
+    return None
 
 
 def _sink_message(node: ast.Call, where: str | int) -> ast.expr | None:
@@ -280,7 +293,7 @@ def _reason_values(tree: ast.AST) -> list[tuple[ast.expr, str | None]]:
     values: list[tuple[ast.expr, str | None]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
-            callee = node.func.id if isinstance(node.func, ast.Name) else None
+            callee = _callee(node.func)
             values += [
                 (kw.value, callee) for kw in node.keywords if kw.arg == "error_message"
             ]
@@ -379,8 +392,8 @@ class TestEverySinkGoesThroughTheOneDoor:
 
     def test_the_dispatch_rollback_no_longer_interpolates_the_exception(self) -> None:
         fn = _function(
-            _APP / "platform" / "refresh" / "service.py",
-            "make_refresh_run_failed_rollback",
+            _APP / "platform" / "jobs" / "defer_guard.py",
+            "settle_ingest_job_failed",
         )
         assert "coded_failure_reason" in _call_names(fn)
         assert not [node for node in ast.walk(fn) if isinstance(node, ast.JoinedStr)], (
@@ -449,6 +462,20 @@ class TestEverySinkGoesThroughTheOneDoor:
         assert not _call_names(value) & _SANCTIONED_REDACTORS
         assert not _redacted_locals(tree)
 
+    def test_the_gate_reads_the_reason_a_ledger_failure_is_handed(self) -> None:
+        tree = ast.parse(
+            "try:\n    pass\n"
+            "except Exception as exc:\n"
+            "    ledger.fail(session, job_id, attempt_id, reason=str(exc))\n"
+            "    write_job_failure_for_attempt(session, job_id, attempt_id, reason=f'{exc}')\n"
+        )
+        values = _reason_values(tree)
+        assert {callee for _, callee in values} == {
+            "ledger.fail",
+            "write_job_failure_for_attempt",
+        }
+        assert not [value for value, _ in values if isinstance(value, ast.Name)]
+
     def test_the_defer_guard_rollbacks_name_the_type_only(self) -> None:
         source = (_APP / "platform" / "jobs" / "defer_guard.py").read_text()
         tree = ast.parse(source)
@@ -461,12 +488,27 @@ class TestEverySinkGoesThroughTheOneDoor:
                 for t in node.targets
             )
         ]
-        assert len(writes) == 3, "the job/generation reason writers moved"
-        for write in writes:
-            assert isinstance(write.value, (ast.Name, ast.Call))
-            if isinstance(write.value, ast.Call):
-                assert isinstance(write.value.func, ast.Name)
-                assert write.value.func.id == "coded_failure_reason"
+        assert writes == [], "the job ledger stores the reason the guard composes"
+        reasons = [
+            kw.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and _callee(node.func) == "ledger.abort"
+            for kw in node.keywords
+            if kw.arg == "reason"
+        ]
+        assert len(reasons) == 1, "the guard's reason is composed elsewhere now"
+        assert isinstance(reasons[0], ast.Call)
+        assert getattr(reasons[0].func, "id", None) == "coded_failure_reason"
+
+    def test_the_gate_reads_the_reason_an_abort_is_handed(self) -> None:
+        tree = ast.parse(
+            "try:\n    pass\n"
+            "except Exception as exc:\n"
+            "    abort(session, job, code='content_rejected', reason=str(exc))\n"
+        )
+        [(value, callee)] = _reason_values(tree)
+        assert callee == "abort"
+        assert ast.unparse(value) == "str(exc)"
 
 
 @pytest.mark.anyio
@@ -511,7 +553,6 @@ class TestTheRunRowStoresTheCodeRatherThanTheStatement:
                 ingest_job_id=job.id,
                 error_code="postgis_refresh_failed",
                 error_message=_driver_error(),
-                contacted_origin=False,
             )
             == run.id
         )

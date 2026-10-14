@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -137,6 +137,15 @@ describe('AppLayout', () => {
     expect(footer).toHaveTextContent('GitHub');
   });
 
+  it('gives every footer link a coarse-pointer touch target', () => {
+    renderAppLayout();
+    const links = within(screen.getByRole('contentinfo')).getAllByRole('link');
+    expect(links.length).toBeGreaterThan(1);
+    for (const link of links) {
+      expect(link).toHaveClass('pointer-coarse:min-h-11', 'pointer-coarse:min-w-11');
+    }
+  });
+
   it('Powered by GeoLens badge links to getgeolens.com', () => {
     renderAppLayout();
     const badge = screen.getByRole('link', { name: /powered by geolens/i });
@@ -191,9 +200,12 @@ describe('AppLayout', () => {
     expect(screen.queryByRole('contentinfo')).not.toBeInTheDocument();
   });
 
-  it('renders footer on anonymous map viewer pages', () => {
-    renderAppLayout(['/maps/map-1']);
-    expect(screen.getByRole('contentinfo')).toBeInTheDocument();
+  it('hides footer and fills the viewport on anonymous map viewer pages', () => {
+    const { container } = renderAppLayout(['/maps/map-1']);
+    expect(screen.queryByRole('contentinfo')).not.toBeInTheDocument();
+    const shell = container.firstElementChild as HTMLElement;
+    expect(shell).toHaveClass('h-dvh', 'overflow-hidden');
+    expect(screen.getByRole('main')).toHaveClass('min-h-0');
   });
 
   it('clips the shell to the viewport and gives main min-h-0 on authenticated map routes (#347 (BLDR-01))', () => {

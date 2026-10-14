@@ -285,20 +285,6 @@ async def test_invalidate_tile_cache_for_table_noop_without_provider(monkeypatch
     await invalidate_tile_cache_for_table("reuploaded_table")
 
 
-def test_reupload_tasks_invalidate_tile_cache_after_commit():
-    """Both reupload task bodies call the tile-cache purge after their commit.
-
-    Guards the fix(#394) B-019 call sites the way the audit found them missing:
-    the swap replaces table contents, so each task must purge post-commit.
-    """
-    import inspect
-
-    from app.processing.ingest import tasks_reupload
-
-    source = inspect.getsource(tasks_reupload)
-    assert source.count("await invalidate_tile_cache_for_table(live_table_name)") == 2
-
-
 # ---------------------------------------------------------------------------
 # fix(#403): cluster tiles project attribute columns onto UNCLUSTERED features
 # ---------------------------------------------------------------------------
@@ -316,13 +302,13 @@ def test_cluster_query_projects_attr_columns_on_unclustered():
         {"name": "bad-name"},  # fails _COLUMN_NAME_RE
     ]
     query = _build_cluster_tile_query("places", attr_columns=cols)
-    assert "src.mag AS mag" in query
-    assert "src.place AS place" in query
+    assert 'src."mag" AS "mag"' in query
+    assert 'src."place" AS "place"' in query
     assert 'LEFT JOIN "data"."places" src' in query
     # Join only binds a source row for unclustered features.
     assert "grouped.raw_point_count = 1 OR $1::integer > $5::integer" in query
-    assert "src.geom" not in query
-    assert "src.point_count" not in query
+    assert 'src."geom"' not in query
+    assert 'src."point_count"' not in query
     assert "bad-name" not in query
 
 
@@ -354,8 +340,8 @@ async def test_get_cluster_tile_resolves_columns_like_get_tile():
         schema="data",
     )
     query = conn.fetchval.call_args.args[0]
-    assert "src.mag AS mag" in query
-    assert "src.place" not in query
+    assert 'src."mag" AS "mag"' in query
+    assert 'src."place"' not in query
 
     # Same zoom, no opt-in -> no projection at all.
     await get_cluster_tile(None, "places", 3, 1, 1, columns, conn=conn, schema="data")

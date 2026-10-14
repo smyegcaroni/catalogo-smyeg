@@ -25,6 +25,8 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.core.db.tenant_session import tenant_task
 from app.core.persistent_config import UPLOAD_MAX_SIZE_MB
+from app.core.upload_errors import UnsafeUploadError
+from app.platform.jobs import ledger
 from app.platform.jobs.heartbeat import (
     maintain_ingest_job_heartbeat,
     stop_ingest_job_heartbeat,
@@ -41,6 +43,10 @@ from app.processing.ingest.tasks_common import (
     cleanup_step,
     purge_queued_job_arg,
     task_app,
+)
+from app.processing.ingest.tileset import (
+    TILESET_UNPACKED_BYTES_FIELD,
+    staged_tileset_metadata,
 )
 from app.processing.ingest.url_fetch import fetch_url_to_path
 from app.processing.ingest.url_import_staging import (
@@ -99,8 +105,20 @@ async def _adopt_running_lease(
     return True
 
 
+async def _stamped_file_type(session, job_id: uuid.UUID) -> str | None:
+    """The file type the door stamped on the job, which picks the staged checks."""
+    metadata = await session.scalar(
+        select(IngestJob.user_metadata).where(IngestJob.id == job_id)
+    )
+    return (metadata or {}).get("file_type")
+
+
 async def _staged_values(
-    session, job_id: uuid.UUID, staged_path: str, filename: str
+    session,
+    job_id: uuid.UUID,
+    staged_path: str,
+    filename: str,
+    tileset_metadata: dict,
 ) -> dict[str, object]:
     """The columns the running -> pending transition writes.
 
@@ -126,11 +144,11 @@ async def _staged_values(
     carried = {k: v for k, v in existing.items() if k not in dropped}
     return {
         "file_path": staged_path,
-        "status": "pending",
         "current_step": None,
         "progress": None,
         "user_metadata": {
             **(raster_stamped_metadata(carried, filename) or {}),
+            **tileset_metadata,
             "staged_at": datetime.now(timezone.utc).isoformat(),
         },
     }
@@ -158,9 +176,10 @@ async def fetch_url(
     """Download a submitted file URL into staging and make the job previewable.
 
     Sequence: adopt the running lease, download under the size cap, sniff the
-    staged bytes, copy to object storage when that is the staging store,
-    re-charge the real byte count against quota, then CAS running -> pending.
-    Any failure deletes the bytes this task owns and stamps the row failed.
+    staged bytes and check a tileset archive, copy to object storage when that
+    is the staging store, re-charge the real byte count (and a tileset's
+    unpacked total) against quota, then CAS running -> pending. Any failure
+    deletes the bytes this task owns and stamps the row failed.
     """
     _bind_task_log_context(task_name="fetch_url", job_id=job_id)
 
@@ -239,7 +258,7 @@ async def fetch_url(
             "url_import_failed",
             job_id=job_id,
             reason=type(exc).__name__,
-            exc_info=not isinstance(exc, UrlImportRefused),
+            exc_info=not isinstance(exc, (UrlImportRefused, UnsafeUploadError)),
         )
     finally:
         async with cleanup_step("fetch_url heartbeat", job_id=job_id):
@@ -282,6 +301,7 @@ async def _stage_downloaded_file(
             effective_cap_bytes, cap_error_detail = await _effective_stream_cap(
                 session, uuid.UUID(user_id), max_size_bytes
             )
+            file_type = await _stamped_file_type(session, job_uuid)
             await session.rollback()
 
         staging_dir.mkdir(parents=True, exist_ok=True)
@@ -292,8 +312,10 @@ async def _stage_downloaded_file(
             cap_error_detail=cap_error_detail,
         )
 
-        # The same staged-file content sniff a direct upload gets.
+        # The same staged-file checks a direct upload gets, before any copy
+        # reaches object storage.
         validate_file_content(str(local_dest), filename)
+        tileset_metadata = await staged_tileset_metadata(str(local_dest), file_type)
 
         if settings.storage_provider == "s3":
             s3_key = f"staging/{job_id}/{filename}"
@@ -307,18 +329,25 @@ async def _stage_downloaded_file(
             # The door charged zero: a remote server's Content-Length was
             # never evidence of anything.
             await _recheck_staged_quota(session, uuid.UUID(user_id), actual_size)
+            if TILESET_UNPACKED_BYTES_FIELD in tileset_metadata:
+                await _recheck_staged_quota(
+                    session,
+                    uuid.UUID(user_id),
+                    tileset_metadata[TILESET_UNPACKED_BYTES_FIELD],
+                )
 
             # fix(#1708): guarded CAS, running -> pending. A Core UPDATE, not
             # dirtied ORM attributes (which would flush a second, unguarded
             # UPDATE), so an external flip — a cancel, or a lease reap —
             # matches zero rows and is SURFACED instead of silently
             # part-updating a dead row.
-            if not await update_ingest_job_for_attempt(
+            if not await ledger.stage(
                 session,
                 job_uuid,
                 attempt_uuid,
-                values=await _staged_values(session, job_uuid, staged_path, filename),
-                expected_status="running",
+                values=await _staged_values(
+                    session, job_uuid, staged_path, filename, tileset_metadata
+                ),
             ):
                 raise UrlImportRefused(_LEASE_LOST_DETAIL)
             await _commit_staged_transition_guarded(session)

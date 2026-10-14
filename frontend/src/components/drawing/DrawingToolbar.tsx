@@ -17,6 +17,7 @@ import { useDrawingStore } from '@/stores/drawing-store';
 import { getAvailableModes } from '@/components/drawing/hooks/use-terra-draw';
 import { Button } from '@/components/ui/button';
 import type { LucideIcon } from 'lucide-react';
+import type { ReactNode } from 'react';
 
 interface ModeConfig {
   mode: string;
@@ -44,6 +45,9 @@ interface DrawingToolbarProps {
   onUndo?: () => void;
   canUndo?: boolean;
   isMutating?: boolean;
+  /** Replaces the selection's action bar, for a selection whose edit this
+   *  toolbar can no longer save. */
+  selectionNotice?: ReactNode;
 }
 
 export function DrawingToolbar({
@@ -57,6 +61,7 @@ export function DrawingToolbar({
   onUndo,
   canUndo,
   isMutating = false,
+  selectionNotice,
 }: DrawingToolbarProps) {
   const { t } = useTranslation('builder');
   const activeMode = useDrawingStore((s) => s.activeMode);
@@ -83,6 +88,7 @@ export function DrawingToolbar({
           aria-label={t('drawing.select')}
           aria-pressed={activeMode === 'select'}
           onClick={() => handleModeChange('select')}
+          disabled={isMutating}
         >
           <MousePointer className="h-4 w-4" />
           <span className="hidden sm:inline">{t('drawing.select')}</span>
@@ -100,6 +106,7 @@ export function DrawingToolbar({
             aria-label={t(labelKey)}
             aria-pressed={activeMode === mode}
             onClick={() => handleModeChange(mode)}
+            disabled={isMutating}
           >
             <Icon className="h-4 w-4" />
             <span className="hidden sm:inline">{t(labelKey)}</span>
@@ -114,20 +121,20 @@ export function DrawingToolbar({
           title={t('drawing.undo')}
           aria-label={t('drawing.undo')}
           onClick={onUndo}
-          disabled={!canUndo}
+          disabled={!canUndo || isMutating}
         >
           <Undo2 className="h-4 w-4" />
         </Button>
 
         <div className="w-px h-6 bg-border mx-1" />
 
-        <Button variant="ghost" size="icon-sm" title={t('drawing.done')} aria-label={t('drawing.done')} onClick={onClose}>
+        <Button variant="ghost" size="icon-sm" title={t('drawing.done')} aria-label={t('drawing.done')} onClick={onClose} disabled={isMutating}>
           <Check className="h-4 w-4" />
         </Button>
       </div>
 
       {/* Editing action bar — shown when a feature is selected */}
-      {selectedFeature && (
+      {selectedFeature && (selectionNotice ?? (
         <div className="rounded-lg shadow-lg border bg-background p-1 flex items-center gap-1">
           <Button
             variant="default"
@@ -177,7 +184,7 @@ export function DrawingToolbar({
             <span className="hidden sm:inline">{t('common:delete')}</span>
           </Button>
         </div>
-      )}
+      ))}
     </div>
   );
 }

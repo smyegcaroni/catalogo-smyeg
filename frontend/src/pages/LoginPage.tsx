@@ -36,6 +36,12 @@ function getOAuthErrorMessage(error: string, t: (key: string, opts?: Record<stri
   if (error.includes('registration_disabled')) {
     return t('oauthErrors.registrationDisabled');
   }
+  if (error.includes('account_not_linkable')) {
+    return t('oauthErrors.accountNotLinkable');
+  }
+  if (error.includes('account_inactive')) {
+    return t('oauthErrors.accountInactive');
+  }
   return t('oauthErrors.generic', { error });
 }
 
@@ -215,7 +221,7 @@ export function LoginPage() {
           </div>
 
           {configError && (
-            <p className="mb-4 text-sm text-destructive">{t('authConfig.loadFailed')}</p>
+            <p role="alert" className="mb-4 text-sm text-destructive">{t('authConfig.loadFailed')}</p>
           )}
 
           {/* In SSO-only mode, hide the password form without a flash when
@@ -224,7 +230,7 @@ export function LoginPage() {
               absent field (older servers) and a config error as true. */}
           {showPasswordForm ? (
             <>
-              <LoginForm />
+              <LoginForm signupOpen={showSignup} />
               {!passwordLoginEnabled && (
                 <Button
                   variant="link"

@@ -76,7 +76,17 @@
     "quotaShort": "Skipped; dataset limit reached",
     "quotaBannerTitle": "Dataset limit reached",
     "quotaBannerHint": "Delete existing datasets to free space, or ask an administrator to raise the limit.",
-    "reportProblem": "Report this problem"
+    "reportProblem": "Report this problem",
+    "kindLegend": "What are you uploading?",
+    "kindFiles": "Geospatial files",
+    "kindFilesHint": "Vector, raster or tabular data",
+    "kindTileset": "3D Tiles tileset",
+    "kindTilesetHint": "A .zip or .3tz archive with tileset.json at its root or in one folder",
+    "kindTilesetUnavailable": "Unavailable until an administrator allows .zip or .3tz uploads",
+    "kindLocked": "Locked while your dropped files wait for the upload settings to load",
+    "kindPointCloud": "COPC point cloud",
+    "kindPointCloudHint": "A .laz file in COPC format; other LAS/LAZ files need conversion first",
+    "kindPointCloudUnavailable": "Unavailable until an administrator allows .laz uploads"
   },
   "warnings": {
     "bannerTitle": "Import completed with warnings",
@@ -104,21 +114,36 @@
     "temporalParseErrors": {
       "title": "Temporal fields dropped",
       "description": "The following temporal values could not be parsed as ISO-8601 dates and were dropped. Re-enter them in the dataset metadata editor to restore them."
-    }
+    },
+    "compactSummary_one": "{{count}} import warning · View details",
+    "compactSummary_other": "{{count}} import warnings · View details",
+    "compactDataLoss_one": "{{count}} data warning · Some data may have changed · View details",
+    "compactDataLoss_other": "{{count}} data warnings · Some data may have changed · View details",
+    "compactArchiveFailure_one": "{{count}} import warning · Original file unavailable · View details",
+    "compactArchiveFailure_other": "{{count}} import warnings · Original file unavailable · View details"
   },
   "complete": {
     "heroTitle_one": "{{count}} dataset added to the catalog",
     "heroTitle_many": "{{count}} datasets added to the catalog",
     "heroTitle_other": "{{count}} datasets added to the catalog",
     "heroDesc": "All files ingested, tiled, and indexed. Ready to query, style, and map.",
+    "heroDescTilesets": "Ready to load in a 3D Tiles client. The tileset URL is on the dataset's Access tab.",
     "statDatasets": "Datasets",
     "statVector": "Vector",
     "statRaster": "Raster",
     "statTabular": "Tabular",
+    "statTilesets": "3D Tiles",
     "next": "Next:",
     "viewCatalog": "View in Catalog",
     "importMore": "Import more",
-    "aiMetadata": "Add AI metadata"
+    "aiMetadata": "Add AI metadata",
+    "statPointClouds": "Point clouds",
+    "heroDescPointClouds": "Ready to open in a COPC client. The file URL is on the dataset’s Access tab.",
+    "partialTitle": "{{completed}} datasets added · {{failed}} failed or cancelled",
+    "partialDesc": "Some imports did not finish. Review the failed jobs and open the datasets that are ready.",
+    "heroDescTables": "Rows and schema are ready to query and reuse. Nonspatial tables have no map preview.",
+    "heroDescMixed": "Datasets are ready in the catalog. Open each dataset for its available data and access options.",
+    "failedJobs": "Failed or cancelled jobs"
   },
   "dropzone": {
     "ariaLabel": "Upload files",
@@ -128,10 +153,18 @@
     "subtext": "GeoLens will detect geometry, CRS, and schema before committing to the catalog. Batches up to {{max}} files.",
     "dropHere": "Drop files here",
     "unsupportedType": "This file type is not supported",
+    "rejectionReason": {
+      "fileInvalidType": "File type must be one of: {{types}}",
+      "fileTooLarge": "File is larger than the {{size}} MB limit",
+      "fileTooSmall": "File is smaller than the minimum size",
+      "tooManyFiles": "Up to {{max}} files per batch",
+      "kindOnly": "{{ext}} files are not imported in this mode. Choose \"{{mode}}\" instead"
+    },
     "sizeLimit": "Max 500 MB per file",
     "sizeLimitDynamic": "Max {{size}} MB per file",
     "batchLimit": "Up to {{max}} files per batch",
-    "fileRejected": "{{filename}}: {{reason}}"
+    "fileRejected": "{{filename}}: {{reason}}",
+    "tilesetSubtext": "GeoLens checks each archive and reads its tileset.json before anything is stored."
   },
   "stac": {
     "label": "STAC API URL; paste the catalog root endpoint",
@@ -175,6 +208,10 @@
     "assetCount_one": "{{count}} asset",
     "assetCount_other": "{{count}} assets",
     "noCogAsset": "No COG asset",
+    "unsupportedAssetScheme": "Published at an {{scheme}}:// address GeoLens can't read",
+    "assetUrlInvalid": "Its address isn't a valid http or https URL",
+    "assetHasCredentials": "Uses a signed or credential-bearing URL, which GeoLens doesn't store",
+    "assetHrefTooLong": "Its address is too long for GeoLens to store",
     "catalogHelp": "Browse and import raster datasets from public STAC catalogs like",
     "matchedTotal": "({{count}} total)",
     "confirm": {
@@ -184,9 +221,10 @@
       "itemsLabel": "Items",
       "totalSizeLabel": "Estimated total size",
       "sizeUnavailable": "Size unavailable",
+      "sizeChecking": "Checking sizes...",
       "partialSizeNote_one": "{{count}} item is missing size info; total is a lower bound.",
       "partialSizeNote_other": "{{count}} items are missing size info; total is a lower bound.",
-      "estimateSource": "Estimate sourced from the STAC manifest (file:size). Actual download may differ.",
+      "estimateSource": "Estimate from the STAC manifest (file:size) or, when the catalog omits it, from the asset server. Actual download may differ.",
       "backToSelection": "Back to selection",
       "confirmImport_one": "Confirm and import {{count}} item",
       "confirmImport_other": "Confirm and import {{count}} items"
@@ -206,20 +244,35 @@
     "credentialHeaderNamePlaceholder": "e.g. Ocp-Apim-Subscription-Key",
     "credentialHeaderValueLabel": "Header value",
     "credentialHeaderValuePlaceholder": "Your API key",
-    "credentialHelpText": "Choose the method your catalog documents. A bearer token is sent as an Authorization header; a username and password are sent as HTTP Basic auth; an API key can go under whatever header name the provider specifies — for example X-API-Key, Ocp-Apim-Subscription-Key, or key. It authenticates the catalog, its collections and its items; tiles are rendered from the asset URL and carry no credential."
+    "credentialHelpText": "Choose the method your catalog documents. A bearer token is sent as an Authorization header; a username and password are sent as HTTP Basic auth; an API key can go under whatever header name the provider specifies — for example X-API-Key, Ocp-Apim-Subscription-Key, or key. It authenticates the catalog, its collections and its items; tiles are rendered from the asset URL and carry no credential.",
+    "filterStart": "From",
+    "filterEnd": "To",
+    "filterBbox": "Area (west, south, east, north)",
+    "filterBboxPlaceholder": "-74.3, 40.5, -73.7, 40.9",
+    "filterApply": "Apply filters",
+    "filterDateOrder": "The start date must not be after the end date.",
+    "filterBboxInvalid": "Enter four numbers as west, south, east, north (longitude -180 to 180, latitude -90 to 90, south not above north).",
+    "loadMore": "Load more",
+    "filterCloud": "Max cloud cover (%)",
+    "filterCloudInvalid": "Enter a cloud cover between 0 and 100.",
+    "selectionLimit": "You can import up to {{count}} items at a time."
   },
   "serviceUrl": {
     "label": "Service URL",
     "placeholder": "https://example.com/wfs, ArcGIS FeatureServer, or OGC API endpoint",
     "helpText": "Paste a WFS, ArcGIS Feature Service, or OGC API Features URL",
+    "arcgisPortalUrlHint": "This looks like an ArcGIS organization or portal page, not a layer. Open the layer's item page, copy its REST URL (it ends in /FeatureServer/0 or /MapServer/0) and paste that here. Protected layers ask for sign-in after you paste the layer URL.",
     "detectedLabel": "Service URL; detected",
     "clear": "Clear",
-    "layersAvailable": "{{count}} layers available",
+    "layersAvailable_one": "{{count}} layer available",
+    "layersAvailable_other": "{{count}} layers available",
     "noLayers": "No layers were found in this service.",
+    "unsupportedLayerType": "{{type}} holds no features. Import one of its feature layers instead.",
     "probe": "Probe →",
     "supported": "Supported:",
     "tokenPlaceholder": "ArcGIS token, API key, or WFS access token",
     "credentialMethodLabel": "Authentication",
+    "credentialsReset": "Authentication was reset because the service address changed.",
     "credentialMethodNone": "No authentication",
     "credentialMethodBearer": "Bearer token",
     "credentialMethodBasic": "Username and password",
@@ -294,7 +347,7 @@
     "reviewTitle": "Review detection",
     "reviewDesc": "Confirm geometry type, CRS, schema, and preview for each file.",
     "importTitle": "Import & catalog",
-    "importDesc": "Tile, index, publish; datasets appear in the Catalog immediately.",
+    "importDesc": "Prepare each dataset for its data type and add it to the catalog.",
     "workflow": "Workflow",
     "whatImported": "What gets imported",
     "vectorLabel": "Vector",
@@ -322,7 +375,17 @@
     "urlHint": "Importing from a file URL",
     "urlDesc": "GeoLens downloads the file server-side into staging, then runs the same detection and import pipeline as an upload.",
     "urlNote": "The URL is validated and size-capped before download · data is copied into GeoLens",
-    "compareUrl": "Upload sends a file from your machine. File URL fetches it from the web; same review, same result, no local download needed."
+    "compareUrl": "Upload sends a file from your machine. File URL fetches it from the web; same review, same result, no local download needed.",
+    "tiles3dLabel": "3D Tiles",
+    "tiles3dDesc": "unpacked and served as is to 3D Tiles clients.",
+    "partialDesc": "Some imports failed or were cancelled. Review their job details.",
+    "partialStatus": "Needs attention",
+    "completeTableDesc": "Rows and schema are ready to query and reuse; no map preview.",
+    "completeTilesetDesc": "Open the dataset Access tab for the 3D Tiles client URL.",
+    "completePointCloudDesc": "Open the dataset Access tab for the COPC file URL.",
+    "completeDesc": "The finished datasets are available in the catalog.",
+    "pointcloudLabel": "COPC point cloud",
+    "pointcloudDesc": "served to external COPC clients; no built-in map preview."
   },
   "register": {
     "helpText": "Catalog existing PostGIS tables from your database as datasets in GeoLens. Use this when you have geographic data already in the database that wasn't imported through GeoLens. Selected tables will be added to the dataset catalog with automatic metadata detection.",
@@ -351,6 +414,11 @@
     "successToast_one": "{{count}} table registered successfully",
     "successToast_other": "{{count}} tables registered successfully",
     "registerFailed": "Failed to register tables",
+    "internalFailure": "Registration failed for a reason the server could not report safely. Ask an operator to check the server log.",
+    "refusal": {
+      "source_srid_undeclared": "Its geom column declares no SRID, so GeoLens cannot tell where its coordinates are. Set the SRID, for example with UpdateGeometrySRID, then register the table.",
+      "source_gid_unusable": "GeoLens identifies features by a column named gid: an integer that is NOT NULL and unique, such as a primary key, in a table no other table inherits from. This table does not meet that. Add or fix the gid column, or rename one GeoLens can't use so it can add its own, then register the table."
+    },
     "unknownError": "Unknown error",
     "searchPlaceholder": "Search tables…",
     "selectHint": "Select a table from the list to see its schema and register it.",
@@ -383,7 +451,8 @@
     "estimatedRows": "~{{count}} rows"
   },
   "preview": {
-    "title": "File Preview",
+    "title": "File preview",
+    "serviceTitle": "Service preview",
     "raster": "Raster",
     "crs": "CRS:",
     "bands": "Bands:",
@@ -515,7 +584,15 @@
     "rasterCount_one": "{{value}} raster",
     "rasterCount_other": "{{value}} rasters",
     "tableCount_one": "{{value}} tabular dataset",
-    "tableCount_other": "{{value}} tabular datasets"
+    "tableCount_other": "{{value}} tabular datasets",
+    "tilesetSummary": "3D Tiles {{version}} · {{size}} · {{volume}}",
+    "tilesetCount_one": "{{value}} tileset",
+    "tilesetCount_other": "{{value}} tilesets",
+    "tilesetActionSummary": "{{files}} · {{tilesets}}",
+    "pointcloudSummary": "{{points}} points · {{crs}} · {{size}}",
+    "pointcloudCount_one": "{{value}} point cloud",
+    "pointcloudCount_other": "{{value}} point clouds",
+    "singleActionHint": "Review the settings above, then import this dataset."
   },
   "detect": {
     "rasterInfo": "Raster info",
@@ -535,12 +612,20 @@
       "cog": "COG",
       "type": "type",
       "features": "features",
-      "layer": "layer"
+      "layer": "layer",
+      "version": "version",
+      "geometricError": "geometric error",
+      "volume": "volume",
+      "extent": "extent",
+      "unpacked": "unpacked",
+      "entries": "entries"
     },
     "table": {
       "column": "Column",
       "type": "Type"
-    }
+    },
+    "tilesetInfo": "Tileset",
+    "noExtent": "none; the volume is not georeferenced"
   },
   "eyebrow": "Import",
   "pageDescription": "Upload files, register tables from your Postgres, or connect a remote service. GeoLens detects geometry, schema, and CRS, then makes it queryable, styleable, and embeddable.",
@@ -581,7 +666,13 @@
     "createVrtMosaic": "Create VRT Mosaic",
     "importAsVrt": "Import as VRT Mosaic",
     "ingestAllLayers": "Ingest all {{count}} layers as separate datasets",
-    "uploadProgressLabel": "Upload progress for {{name}}"
+    "uploadProgressLabel": "Upload progress for {{name}}",
+    "toggleDetails": "Show or hide details for {{name}}",
+    "removeNamedFile": "Remove {{name}}",
+    "defaultsConfirmTitle": "Import batch with defaults?",
+    "defaultsConfirmDescription": "This uses filenames as dataset names and private visibility. All edits in the review forms, including names, descriptions, visibility, geometry, CRS, and raster settings, will be discarded. Each multi-layer file imports only its selected layer.",
+    "confirmDefaults": "Import with defaults",
+    "progressDetailWithFailures": "{{done}} complete · {{failed}} failed or cancelled · {{active}} in progress · {{queued}} queued"
   },
   "status": {
     "uploading": "Uploading",
@@ -590,5 +681,11 @@
     "importing": "Importing",
     "ready": "Ready",
     "failed": "Failed"
+  },
+  "pointcloud": {
+    "points": "Points",
+    "crs": "CRS",
+    "pointFormat": "Point format",
+    "size": "Size"
   }
 }

@@ -1,9 +1,11 @@
 """ArcGIS REST API probing, URL normalization, and service type detection."""
 
 import asyncio
+from dataclasses import dataclass
+import hashlib
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from urllib.parse import quote, urlencode, urlparse
 
 import httpx
@@ -19,6 +21,11 @@ from app.core.service_tokens import (
     register_credential_secret,
 )
 from app.core.url_redaction import redact_exception_text
+from app.modules.catalog.sources.field_labels import arcgis_field_labels
+from app.modules.catalog.sources.layer_types import (
+    arcgis_probe_layers,
+    reject_unsupported_arcgis_type,
+)
 from app.platform.probe_bounds import bounded_probe_read
 from app.platform.security import SSRFError, same_origin
 from app.platform.service_endpoints import (
@@ -34,11 +41,15 @@ logger = structlog.stdlib.get_logger(__name__)
 __all__ = [
     "ARCGIS_SERVICE_FORMAT",
     "ArcGISTokenError",
+    "ArcGISIDPlan",
+    "ArcGISIDPlanError",
     "arcgis_accepts_header_token",
     "arcgis_request_auth",
     "build_arcgis_count_query_url",
+    "build_arcgis_id_query_url",
     "enrich_arcgis_feature_counts",
     "fetch_arcgis_feature_count",
+    "fetch_arcgis_id_plan",
     "fetch_arcgis_layer_preview",
     "fetch_arcgis_pagination_info",
     "normalize_arcgis_url",
@@ -55,6 +66,39 @@ ARCGIS_HEADER_TOKEN_MIN_VERSION = (10, 5, 1)
 # means the token WAS read and rejected, so retrying would just resend it.
 _ARCGIS_TOKEN_REQUIRED_CODE = 499
 _ARCGIS_TOKEN_ERROR_CODES = frozenset({498, _ARCGIS_TOKEN_REQUIRED_CODE})
+
+# These limits deliberately make the stronger policy a bounded capability.  A
+# returnIdsOnly response is one ArcGIS response rather than a cursor protocol;
+# accepting a partial or oversized response would turn a transport limit into a
+# false completeness claim.  ID chunks stay below the service import page size
+# and keep generated query URLs well below ordinary proxy limits.
+ARCGIS_ID_PLAN_POLICY = "arcgis_id_set_v1"
+ARCGIS_ID_PLAN_MAX_IDS = 100_000
+ARCGIS_ID_FETCH_CHUNK_SIZE = 1_000
+_ARCGIS_OID_MAX = (1 << 63) - 1
+
+
+class ArcGISIDPlanError(ValueError):
+    """The source cannot support a bounded, exact ArcGIS OID plan."""
+
+
+@dataclass(frozen=True)
+class ArcGISIDPlan:
+    """A compact, deterministic ArcGIS source-membership plan.
+
+    ``ids`` is intentionally transient: callers persist only ``digest`` and
+    counters in refresh evidence.  Matching this plan proves membership
+    coverage, never an atomic attribute or geometry snapshot.
+    """
+
+    oid_field: str
+    ids: tuple[int, ...]
+    digest: str
+    source_marker: str | int | None
+
+    @property
+    def count(self) -> int:
+        return len(self.ids)
 
 
 class ArcGISTokenError(Exception):
@@ -488,34 +532,9 @@ async def _probe_arcgis_service_within_deadline(
     else:
         service_type = "ArcGIS FeatureServer"
 
-    layers = []
-
-    service_oid = data.get("objectIdField")
-
-    for layer in data.get("layers", []):
-        layers.append(
-            {
-                "id": layer["id"],
-                "name": layer["name"],
-                "title": layer.get("title"),
-                "geometry_type": _normalize_esri_geom_type(layer.get("geometryType")),
-                "type": "layer",
-                "object_id_field": layer.get("objectIdField")
-                or service_oid
-                or "OBJECTID",
-            }
-        )
-
-    for table in data.get("tables", []):
-        layers.append(
-            {
-                "id": table["id"],
-                "name": table["name"],
-                "title": table.get("title"),
-                "geometry_type": None,
-                "type": "table",
-            }
-        )
+    layers = arcgis_probe_layers(
+        data, data.get("objectIdField"), _normalize_esri_geom_type
+    )
 
     return {
         "service_type": service_type,
@@ -624,6 +643,125 @@ def build_arcgis_count_query_url(layer_url: str, query_token: str | None = None)
     return f"{clean}/query?{urlencode(params)}"
 
 
+def build_arcgis_id_query_url(layer_url: str, query_token: str | None = None) -> str:
+    """Build the native ArcGIS membership query for a complete OID plan.
+
+    ArcGIS returns all object IDs in one response for ``returnIdsOnly``.  It
+    has no trustworthy pagination contract for that shape, so callers reject
+    transfer-limit markers and cardinalities above ``ARCGIS_ID_PLAN_MAX_IDS``.
+    The caller must use a ``make_safe_client``; this function only produces a
+    query for the already validated, stored service binding.
+    """
+    clean = urlparse(layer_url)._replace(query="", fragment="").geturl().rstrip("/")
+    if clean.lower().endswith("/query"):
+        clean = clean[: -len("/query")].rstrip("/")
+    params: dict[str, str] = {
+        "where": "1=1",
+        "returnIdsOnly": "true",
+        "returnGeometry": "false",
+        "f": "json",
+    }
+    if query_token:
+        params["token"] = query_token
+    return f"{clean}/query?{urlencode(params)}"
+
+
+def _arcgis_oid_plan_digest(oid_field: str, ids: Sequence[int]) -> str:
+    """Return the canonical digest without retaining source IDs in evidence."""
+    payload = json.dumps(
+        {"oid_field": oid_field, "ids": list(ids)},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
+def _parse_arcgis_id_plan(
+    data: object, *, expected_oid_field: str | None
+) -> ArcGISIDPlan:
+    """Validate a complete integer OID response without coercing identities."""
+    if not isinstance(data, dict):
+        raise ArcGISIDPlanError("ArcGIS object-ID response is not an object")
+    error = data.get("error")
+    if isinstance(error, dict):
+        code = error.get("code")
+        message = error.get("message", "Unknown ArcGIS error")
+        if code in _ARCGIS_TOKEN_ERROR_CODES:
+            raise ArcGISTokenError(code, str(message))
+        raise ArcGISIDPlanError("ArcGIS object-ID query was rejected")
+    if data.get("exceededTransferLimit") is True:
+        raise ArcGISIDPlanError("ArcGIS object-ID response was truncated")
+
+    oid_field = data.get("objectIdFieldName")
+    if not isinstance(oid_field, str) or not oid_field.strip():
+        raise ArcGISIDPlanError("ArcGIS object-ID response omitted its OID field")
+    oid_field = oid_field.strip()
+    if (
+        expected_oid_field is not None
+        and oid_field.casefold() != expected_oid_field.casefold()
+    ):
+        raise ArcGISIDPlanError("ArcGIS object-ID field changed during planning")
+
+    raw_ids = data.get("objectIds")
+    if not isinstance(raw_ids, list):
+        raise ArcGISIDPlanError("ArcGIS object-ID response omitted objectIds")
+    if len(raw_ids) > ARCGIS_ID_PLAN_MAX_IDS:
+        raise ArcGISIDPlanError("ArcGIS object-ID response exceeded the plan limit")
+
+    ids: list[int] = []
+    for value in raw_ids:
+        # bool is an int subclass in Python; it is never a source identity.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ArcGISIDPlanError("ArcGIS object-ID response contains a non-integer")
+        if value < 0 or value > _ARCGIS_OID_MAX:
+            raise ArcGISIDPlanError(
+                "ArcGIS object-ID response contains an invalid integer"
+            )
+        ids.append(value)
+    ids.sort()
+    if len(set(ids)) != len(ids):
+        raise ArcGISIDPlanError("ArcGIS object-ID response contains duplicate IDs")
+
+    marker = data.get("editMoment")
+    if isinstance(marker, bool) or not isinstance(marker, (str, int)):
+        marker = None
+    return ArcGISIDPlan(
+        oid_field=oid_field,
+        ids=tuple(ids),
+        digest=_arcgis_oid_plan_digest(oid_field, ids),
+        source_marker=marker,
+    )
+
+
+async def fetch_arcgis_id_plan(
+    base_url: str,
+    layer_id: int | str,
+    client: httpx.AsyncClient,
+    token: str | None = None,
+    *,
+    expected_oid_field: str | None = None,
+    current_version: object = None,
+) -> ArcGISIDPlan:
+    """Return a bounded exact OID plan for one stored ArcGIS layer.
+
+    This is deliberately a native, safe-client request.  GDAL subsequently
+    transports only the already planned IDs in deterministic chunks; it does
+    not decide membership or make a second caller-controlled network path.
+    """
+    base = base_url.rstrip("/")
+    safe_layer_id = str(layer_id).strip("/")
+    layer_url = f"{base}/{safe_layer_id}"
+    async with asyncio.timeout(DEFAULT_CHECK_TIMEOUT):
+        data = await read_arcgis_json(
+            client,
+            lambda query_token: build_arcgis_id_query_url(layer_url, query_token),
+            token,
+            current_version=current_version,
+        )
+    return _parse_arcgis_id_plan(data, expected_oid_field=expected_oid_field)
+
+
 async def fetch_arcgis_feature_count(
     base_url: str,
     layer_id: int | str,
@@ -678,8 +816,13 @@ async def fetch_arcgis_pagination_info(
     token: str | None = None,
     *,
     current_version: object = None,
+    fallback_order_field: str | None = None,
 ) -> tuple[int | None, bool, str | None]:
     """Fetch ArcGIS pagination support, page size, and stable order field.
+
+    The order field is the layer's own OID when the layer can order by it,
+    ``None`` when it can't, and *fallback_order_field* when the layer's
+    metadata can't be read.
 
     fix(#1770): bounded like `enrich_arcgis_feature_counts` above, for the
     same reason. This is also where ``currentVersion`` lives — a caller that
@@ -709,13 +852,13 @@ async def fetch_arcgis_pagination_info(
         # fix(#1858): degrades here for the reason given at `_fetch_count`
         # above — the optional fact is pagination support, and the worker's
         # own handler degrades identically either way.
-        return None, False, None
+        return None, False, fallback_order_field
 
     # fix(#1770): same as `_fetch_count`/`fetch_arcgis_feature_count` above
     # — a non-dict response makes the checks below raise uncaught, instead
     # of the ordinary "no pagination info" degrade.
     if not isinstance(data, dict):
-        return None, False, None
+        return None, False, fallback_order_field
 
     if "error" in data:
         error_info = data["error"]
@@ -723,15 +866,21 @@ async def fetch_arcgis_pagination_info(
         message = error_info.get("message", "Unknown ArcGIS error")
         if code in _ARCGIS_TOKEN_ERROR_CODES:
             raise ArcGISTokenError(code, message)
-        return None, False, None
+        return None, False, fallback_order_field
 
     value = data.get("maxRecordCount")
     max_record_count = value if isinstance(value, int) and value > 0 else None
     advanced = data.get("advancedQueryCapabilities") or {}
-    supports_pagination = (
-        isinstance(advanced, dict) and advanced.get("supportsPagination") is True
+    if not isinstance(advanced, dict):
+        advanced = {}
+    supports_pagination = advanced.get("supportsPagination") is True
+    # A server that can't order rejects a query carrying orderByFields.
+    supports_order_by = (
+        data.get("supportsAdvancedQueries") is True
+        or advanced.get("supportsOrderBy") is True
     )
-    return max_record_count, supports_pagination, _extract_arcgis_object_id_field(data)
+    order_field = _extract_arcgis_object_id_field(data) if supports_order_by else None
+    return max_record_count, supports_pagination, order_field
 
 
 async def fetch_arcgis_layer_preview(
@@ -787,6 +936,8 @@ async def fetch_arcgis_layer_preview(
         if code in _ARCGIS_TOKEN_ERROR_CODES:
             raise ArcGISTokenError(code, message)
         raise ValueError(f"ArcGIS layer metadata error ({code}): {message}")
+
+    reject_unsupported_arcgis_type(meta)
 
     columns = [
         {
@@ -884,4 +1035,5 @@ async def fetch_arcgis_layer_preview(
         "feature_count": feature_count,
         "columns": columns,
         "sample_rows": sample_rows,
+        "field_labels": arcgis_field_labels(meta),
     }

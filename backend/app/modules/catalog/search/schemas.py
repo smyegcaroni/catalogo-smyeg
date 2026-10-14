@@ -176,6 +176,14 @@ class OGCRecordProperties(BaseModel):
     distributions: list[dict] | None = None
     record_status: str | None = None
     has_quicklook: bool = False
+    quicklook_version: str | None = Field(
+        default=None,
+        description=(
+            "Changes whenever the quicklook image is replaced. Pass it as the "
+            "`v` query parameter of the quicklook request so caches fetch the "
+            "new image."
+        ),
+    )
     gsd: float | None = None
     # fix(#1805): gsd is a lossy min(abs(res_x), abs(res_y)) — two sources
     # with different per-axis resolution can share one gsd, so the client
@@ -218,9 +226,22 @@ class OGCAsset(BaseModel):
     """STAC-style asset entry for an OGC Record."""
 
     href: str
-    type: str
+    # STAC asset `type` is optional, and _build_stac_assets omits the key
+    # entirely (rather than passing type=None) when the stored asset row has
+    # no media type. FastAPI response serialization otherwise fills the
+    # declared default regardless of the raw dict's shape, so the presence
+    # check below (mirroring OGCRasterBand's nodata handling above) is what
+    # keeps "unknown" genuinely absent from the wire instead of a null.
+    type: str | None = None
     title: str | None = None
     roles: list[str] | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize_type_presence(self, handler):  # noqa: ANN001
+        data = handler(self)
+        if "type" not in self.model_fields_set:
+            data.pop("type", None)
+        return data
 
 
 class OGCRecordResponse(BaseModel):
@@ -243,6 +264,13 @@ class OGCFeatureCollectionResponse(BaseModel):
     type: str = "FeatureCollection"
     timeStamp: str | None = None
     numberMatched: int = Field(description="Total records matching the query")
+    numberMatchedAllTypes: int | None = Field(
+        default=None,
+        description=(
+            "Total records matching the query with record_type removed and every "
+            "other filter kept; present only when record_type is set"
+        ),
+    )
     numberReturned: int = Field(description="Number of records in this response page")
     features: list[OGCRecordResponse]
     links: list[OGCRecordLink] | None = Field(

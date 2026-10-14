@@ -170,6 +170,7 @@ class _GatedDownload:
         self,
         prepared,
         *,
+        job_id: uuid.UUID,
         max_size_bytes: int,
         quota_byte_limit: int | None = None,
     ) -> str:
@@ -1060,7 +1061,9 @@ class TestReservationFailureReleasesTheKey:
 
         downloads = 0
 
-        async def _download(prepared, *, max_size_bytes, quota_byte_limit=None) -> str:
+        async def _download(
+            prepared, *, job_id, max_size_bytes, quota_byte_limit=None
+        ) -> str:
             nonlocal downloads
             downloads += 1
             return str(_staged_bytes(f"manifest_1814_ledger_{downloads}.geojson"))
@@ -1242,8 +1245,11 @@ class TestStaleReservations:
         reaped = await test_db_session.get(
             IngestJob, abandoned_id, populate_existing=True
         )
-        assert reaped.status == "failed"
-        assert MANIFEST_STAGE_METADATA_KEY not in reaped.user_metadata
+        # Settled by the stale-job pass, so it reads as the running sweep's.
+        assert (reaped.status, reaped.error_message) == (
+            "failed",
+            f"Stale: running for over {JOB_TIMEOUT_SECONDS // 60} minutes",
+        )
 
     async def test_a_reservation_inside_the_lease_still_holds_the_key(
         self, test_db_session, clean_tables

@@ -18,6 +18,7 @@ import { SourceQualityTab, type SourceQualityDraftField, type SourceQualityDraft
 import { useAIAvailability } from '@/hooks/use-ai-availability';
 import { useKeywordSuggestions } from '@/hooks/use-ai-metadata';
 import { useCreateKeyword, useKeywords } from '@/components/dataset/hooks/use-records';
+import type { DatasetRefreshWatch } from '@/components/dataset/hooks/use-dataset';
 import type { DatasetEditCapabilities } from '@/components/dataset/hooks/use-dataset-edit-capabilities';
 
 interface MetadataTabProps {
@@ -28,6 +29,7 @@ interface MetadataTabProps {
   onDraftSave: (field: SourceQualityDraftField, value: string) => void;
   onDraftDirtyChange: (field: SourceQualityDraftField, isDirty: boolean) => void;
   onNavigateToValidationField?: (field: string) => void;
+  refreshWatch?: DatasetRefreshWatch;
 }
 
 export function MetadataTab({
@@ -38,6 +40,7 @@ export function MetadataTab({
   onDraftSave,
   onDraftDirtyChange,
   onNavigateToValidationField,
+  refreshWatch,
 }: MetadataTabProps) {
   const { t } = useTranslation('dataset');
   const [historyExpanded, setHistoryExpanded] = useState(false);
@@ -78,24 +81,28 @@ export function MetadataTab({
     <>
       {/* Compact Health / QA Block */}
       {hasIssues ? (
-        <div className="flex items-center gap-2 p-3 rounded-lg border bg-muted/30 text-sm">
+        <div className="flex flex-wrap items-center gap-2 p-3 rounded-lg border bg-muted/30 text-sm">
           <AlertCircle className="h-4 w-4 text-destructive shrink-0" />
           <span>
             {requiredCount > 0 && <span className="font-medium">{t('overview.requiredCount', { count: requiredCount, defaultValue: '{{count}} required' })}</span>}
             {requiredCount > 0 && recommendedCount > 0 && ' · '}
             {recommendedCount > 0 && <span>{t('overview.recommendedCount', { count: recommendedCount, defaultValue: '{{count}} recommended' })}</span>}
             {' · '}
-            <span>{t('overview.percentComplete', { percent: completionPercent, defaultValue: '{{percent}}% complete' })}</span>
+            <span>{t('overview.validationProgress', { percent: completionPercent })}</span>
             {nextField && (
               <>
                 {' · '}
-                <button
-                  type="button"
-                  className="text-primary underline underline-offset-2 hover:text-primary/80"
-                  onClick={() => onNavigateToValidationField?.(nextField)}
-                >
-                  {t('overview.nextFillIn', { field: fieldLabels[nextField] ?? nextField.replace(/_/g, ' '), defaultValue: 'Next: fill in {{field}}' })}
-                </button>
+                {canEdit ? (
+                  <button
+                    type="button"
+                    className="text-primary underline underline-offset-2 hover:text-primary/80"
+                    onClick={() => onNavigateToValidationField?.(nextField)}
+                  >
+                    {t('overview.nextFillIn', { field: fieldLabels[nextField] ?? nextField.replace(/_/g, ' ') })}
+                  </button>
+                ) : (
+                  <span>{t('overview.askMaintainer', { field: fieldLabels[nextField] ?? nextField.replace(/_/g, ' ') })}</span>
+                )}
               </>
             )}
           </span>
@@ -107,6 +114,7 @@ export function MetadataTab({
           >
             {t('overview.reviewIssues', { defaultValue: 'Review issues' })}
           </Button>
+          <p className="basis-full text-xs text-muted-foreground">{t('overview.validationProgressHelp')}</p>
         </div>
       ) : validationData ? (
         <div className="flex items-center gap-2 p-3 rounded-lg border bg-muted/30 text-sm text-success">
@@ -158,7 +166,9 @@ export function MetadataTab({
           )}
         </CardHeader>
         <CardContent className="space-y-3">
-          <KeywordsEditor recordId={dataset.record_id} canEdit={canEdit} />
+          <div data-field-anchor="keywords">
+            <KeywordsEditor recordId={dataset.record_id} canEdit={canEdit} />
+          </div>
           {suggestedKeywords !== null && (
             <AiKeywordSuggestions
               keywords={suggestedKeywords}
@@ -207,6 +217,7 @@ export function MetadataTab({
         <CardContent>
           <ValidationStatus
             datasetId={dataset.id}
+            canEdit={canEdit}
             onNavigateToField={onNavigateToValidationField}
           />
         </CardContent>
@@ -230,7 +241,7 @@ export function MetadataTab({
         </CardHeader>
         {historyExpanded && (
           <CardContent className="space-y-6">
-            <VersionHistory datasetId={dataset.id} dataset={dataset} />
+            <VersionHistory datasetId={dataset.id} dataset={dataset} canEdit={canEdit} watch={refreshWatch} />
             {canEdit && <ChangeHistory datasetId={dataset.id} />}
           </CardContent>
         )}

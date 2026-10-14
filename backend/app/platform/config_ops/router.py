@@ -12,6 +12,8 @@ from app.core.dependencies import get_client_ip, get_db
 from app.core.identity import Identity
 from app.modules.auth.dependencies import require_mode_permission
 from app.platform.config_ops.exceptions import (
+    ConfigApplyError,
+    ConfigBusyError,
     ConfigLockedError,
     ConfigPreviewError,
     ConfigValidationError,
@@ -30,7 +32,11 @@ from app.platform.config_ops.service import (
     validate_connectivity,
 )
 from app.processing.export.service import safe_content_disposition
-from app.standards.ogc.errors import CONFLICT_RESPONSE, ERROR_RESPONSES_AUTH
+from app.standards.ogc.errors import (
+    CONFIG_APPLY_UNAVAILABLE_RESPONSE,
+    CONFLICT_RESPONSE,
+    ERROR_RESPONSES_AUTH,
+)
 
 logger = structlog.stdlib.get_logger(__name__)
 
@@ -100,7 +106,9 @@ async def export_configuration(
 
 
 @router.post(
-    "/import/", response_model=ImportResult, responses={409: CONFLICT_RESPONSE}
+    "/import/",
+    response_model=ImportResult,
+    responses={409: CONFLICT_RESPONSE, 503: CONFIG_APPLY_UNAVAILABLE_RESPONSE},
 )
 async def import_configuration(
     data: ConfigImportRequest,
@@ -110,7 +118,8 @@ async def import_configuration(
         default=None,
         alias="X-Config-Preview-Token",
         description=(
-            "Signed token returned by the matching dry-run. Required for overwrite mode."
+            "Signed token returned by the matching dry-run. Required for overwrite mode "
+            "and for a merge that would delete the stored embeddings."
         ),
     ),
     user: Identity = Depends(require_config_operator),
@@ -149,10 +158,20 @@ async def import_configuration(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(e),
         )
+    except ConfigBusyError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e),
+        )
     except IntegrityError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Configuration import conflict — duplicate entry",
+        )
+    except ConfigApplyError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(e),
         )
     return result
 

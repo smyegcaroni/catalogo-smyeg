@@ -20,9 +20,12 @@ from app.modules.catalog.search.service_filters import (
     SearchFilters,
     _apply_common_filters,
     _build_text_filter,
+    utc_midnight,
 )
 from app.modules.catalog.search.service_semantic import (
     SemanticArm,
+    UNRESOLVED,
+    QueryEmbedding,
     resolve_semantic_arm,
 )
 
@@ -52,9 +55,9 @@ def _apply_search_only_filters(stmt: Select, filters: SearchFilters) -> Select:
             )
         )
     if filters.date_from:
-        stmt = stmt.where(Record.created_at >= filters.date_from)
+        stmt = stmt.where(Record.created_at >= utc_midnight(filters.date_from))
     if filters.date_to:
-        stmt = stmt.where(Record.created_at <= filters.date_to)
+        stmt = stmt.where(Record.created_at < utc_midnight(filters.date_to, 1))
     if filters.vintage_start:
         stmt = stmt.where(Record.temporal_start >= filters.vintage_start)
     if filters.vintage_end:
@@ -113,6 +116,7 @@ async def select_candidates(
     *,
     search_only: bool,
     depth: int,
+    embedding: QueryEmbedding | None = UNRESOLVED,
 ) -> Candidates:
     """Apply the shared candidate selection to ``base``.
 
@@ -135,6 +139,8 @@ async def select_candidates(
         filters,
         search_only=search_only,
     )
-    semantic = await resolve_semantic_arm(session, filters, vet_stmt, depth=depth)
+    semantic = await resolve_semantic_arm(
+        session, filters, vet_stmt, depth=depth, embedding=embedding
+    )
     match = text_clause if semantic is None else or_(text_clause, semantic.clause())
     return Candidates(stmt.where(match), text_clause, text_parts, semantic)

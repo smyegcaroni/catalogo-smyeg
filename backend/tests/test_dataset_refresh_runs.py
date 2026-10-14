@@ -37,6 +37,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.platform.jobs.models import IngestJob
+from app.platform.jobs.defer_guard import make_ingest_job_failed_rollback
 from app.platform.refresh.models import DatasetRefreshRun
 from app.platform.refresh.service import (
     ABANDONED_ERROR_CODE,
@@ -50,7 +51,6 @@ from app.platform.refresh.service import (
     create_pending_run,
     drift_status_from_diff,
     list_runs_for_dataset,
-    make_refresh_run_failed_rollback,
     project_refresh_success,
     record_refresh_failure,
     record_refresh_success,
@@ -165,7 +165,7 @@ class TestProjectRefreshSuccess:
     def test_last_refreshed_at_and_health_are_not_this_function_s_business(
         self,
     ) -> None:
-        """`_apply_reupload_swap` owns the first; #1222 owns the other two."""
+        """`_write_reupload_catalog` owns the first; #1222 owns the other two."""
         dataset = self._dataset()
         project_refresh_success(dataset, schema_diff=_diff(), contacted_origin=True)
         assert dataset.last_refreshed_at == datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -223,10 +223,35 @@ class TestVocabularyMatchesTheConstraints:
             RUN_ORIGIN_KINDS
         )
 
-    def test_scheduled_is_not_a_trigger(self) -> None:
-        """Gate 4. Invariant 8 rides on this exclusion: whoever adds
-        `scheduled` must add `scheduled_for` and its unique index with it."""
-        assert "scheduled" not in RUN_TRIGGERS
+    def test_scheduled_trigger_has_durable_identity_fences(self) -> None:
+        """Scheduled occurrences must remain idempotent across redelivery."""
+        assert "scheduled" in RUN_TRIGGERS
+
+        constraints = {
+            constraint.name: str(constraint.sqltext)
+            for constraint in DatasetRefreshRun.__table__.constraints
+            if getattr(constraint, "name", None)
+            == "chk_refresh_runs_scheduled_identity"
+        }
+        assert constraints == {
+            "chk_refresh_runs_scheduled_identity": (
+                "(trigger = 'scheduled' AND scheduled_for IS NOT NULL "
+                "AND occurrence_key IS NOT NULL AND claim_deadline IS NOT NULL "
+                "AND execution_key IS NOT NULL) "
+                "OR (trigger <> 'scheduled' AND scheduled_for IS NULL)"
+            )
+        }
+
+        indexes = {
+            index.name: tuple(column.name for column in index.columns)
+            for index in DatasetRefreshRun.__table__.indexes
+            if index.unique
+        }
+        assert indexes["uq_refresh_runs_scheduled_occurrence"] == (
+            "dataset_id",
+            "scheduled_for",
+        )
+        assert indexes["uq_refresh_runs_execution_key"] == ("execution_key",)
 
     def test_blocked_is_terminal(self) -> None:
         assert "blocked" in RUN_STATUSES
@@ -246,8 +271,10 @@ class TestCreatePendingRunRefusesBadVocabulary:
                 feature_count_before=None,
             )
 
-    async def test_scheduled_trigger_raises(self) -> None:
-        with pytest.raises(ValueError, match="trigger"):
+    async def test_scheduled_trigger_requires_immutable_identity(self) -> None:
+        with pytest.raises(
+            ValueError, match="immutable occurrence and source identity"
+        ):
             await create_pending_run(
                 None,  # type: ignore[arg-type]
                 dataset_id=uuid.uuid4(),
@@ -317,6 +344,9 @@ def test_only_the_commit_handler_creates_a_run() -> None:
     # `refresh_dataset`, after the one Rule 1 gate — which is what makes the
     # partial unique index the referee for every origin kind rather than for
     # the two that happened to be written first.
+    #
+    # `dispatch_upload_acceptance` is the upload strategy behind the same
+    # door, for accepting a blocked file replacement, on the same terms.
     assert callers == {
         "router_reupload.py": {"reupload_commit"},
         "router_refresh.py": {
@@ -324,6 +354,7 @@ def test_only_the_commit_handler_creates_a_run() -> None:
             "_dispatch_postgis_refresh",
             "_dispatch_stac_refresh",
         },
+        "refresh_acceptance.py": {"dispatch_upload_acceptance"},
     }, f"A refresh run row may only be created by a dispatch handler. Found: {callers}"
 
 
@@ -518,14 +549,6 @@ class TestRunLifecycle:
             ingest_job_id=job.id,
             error_code="service_refresh_failed",
             error_message="GDAL: https://svc.example/wfs?token=hunter2 returned 500",
-            contacted_origin=True,
-            # feat(#1220): the contact stamp is a guarded write now, and the
-            # binding this attempt read is what guards it.
-            origin_binding=(
-                dataset.origin_uri,
-                dataset.origin_ref,
-                dataset.source_format,
-            ),
         )
         await test_db_session.commit()
         await test_db_session.refresh(run)
@@ -537,7 +560,7 @@ class TestRunLifecycle:
         assert "hunter2" not in run.error_message
         assert run.dataset_version_id is None
         assert dataset.last_refreshed_at == datetime(2026, 1, 1, tzinfo=timezone.utc)
-        assert dataset.last_checked_at is not None
+        assert dataset.last_checked_at is None
 
     async def test_local_failure_does_not_stamp_last_checked_at(
         self, test_db_session
@@ -558,7 +581,6 @@ class TestRunLifecycle:
             ingest_job_id=job.id,
             error_code="validation_failed",
             error_message="Unsupported file",
-            contacted_origin=False,
         )
         await test_db_session.commit()
         await test_db_session.refresh(dataset)
@@ -582,7 +604,6 @@ class TestRunLifecycle:
             ingest_job_id=job.id,
             error_code="file_refresh_failed",
             error_message="boom",
-            contacted_origin=False,
         )
         await test_db_session.commit()
 
@@ -605,6 +626,7 @@ class TestRunLifecycle:
     async def test_defer_failure_finalizes_the_run(self, test_db_session) -> None:
         """The orphan guard's rollback must not leave a ghost `pending` row."""
         dataset, job = await _seed(test_db_session)
+        job.status = "pending"
         run = await create_pending_run(
             test_db_session,
             dataset_id=dataset.id,
@@ -616,21 +638,37 @@ class TestRunLifecycle:
         )
         await test_db_session.commit()
 
-        inner_calls: list[BaseException] = []
-
-        async def _inner(exc: BaseException) -> None:
-            inner_calls.append(exc)
-
-        rollback = make_refresh_run_failed_rollback(
-            _inner, db=test_db_session, ingest_job_id=job.id
+        rollback = make_ingest_job_failed_rollback(
+            job, message_prefix="Failed to queue refresh task"
         )
-        await rollback(RuntimeError("queue unreachable"))
+        assert await rollback(RuntimeError("queue unreachable"))
         await test_db_session.commit()
         await test_db_session.refresh(run)
 
-        assert len(inner_calls) == 1
         assert run.status == "failed"
         assert run.error_code == "dispatch_failed"
+
+
+class TestScheduledIdentityConstraint:
+    @pytest.mark.parametrize("trigger", ["manual", "api", "cli"])
+    async def test_an_unscheduled_run_cannot_carry_an_occurrence_time(
+        self, test_db_session, trigger
+    ) -> None:
+        """The database refuses `scheduled_for` on a run whose trigger is not `scheduled`."""
+        dataset, job = await _seed(test_db_session)
+        test_db_session.add(
+            DatasetRefreshRun(
+                dataset_id=dataset.id,
+                ingest_job_id=job.id,
+                origin_kind="upload",
+                trigger=trigger,
+                status="pending",
+                scheduled_for=datetime.now(timezone.utc),
+            )
+        )
+        with pytest.raises(IntegrityError, match="chk_refresh_runs_scheduled_identity"):
+            await test_db_session.flush()
+        await test_db_session.rollback()
 
 
 class TestAdmissionControl:
@@ -720,7 +758,6 @@ class TestAdmissionControl:
             ingest_job_id=job.id,
             error_code="file_refresh_failed",
             error_message="boom",
-            contacted_origin=False,
         )
         await test_db_session.commit()
 
@@ -943,7 +980,6 @@ class TestCompareAndSetTransitions:
                 ingest_job_id=job.id,
                 error_code="file_refresh_failed",
                 error_message="late arrival",
-                contacted_origin=False,
             )
             is None
         )
@@ -965,7 +1001,6 @@ class TestCompareAndSetTransitions:
                 ingest_job_id=job.id,
                 error_code="service_refresh_failed",
                 error_message="ssrf refusal",
-                contacted_origin=False,
             )
             == run.id
         )
@@ -1368,8 +1403,6 @@ async def _seed_history(session, *, visibility: str = "public"):
         ingest_job_id=job.id,
         error_code="service_refresh_failed",
         error_message="Layer 'parcels' vanished from the service",
-        contacted_origin=True,
-        origin_binding=(dataset.origin_uri, dataset.origin_ref, dataset.source_format),
         schema_diff={
             "columns_added": [],
             "columns_removed": [{"name": "private_column", "type": "text"}],
@@ -1429,6 +1462,32 @@ class TestRefreshRunListEndpoint:
         assert row["error_code"] == "service_refresh_failed"
         assert "parcels" in row["error_message"]
         assert row["verification"]["source_binding"]["url"].startswith("https://")
+
+    async def test_scheduled_history_exposes_only_safe_timing_metadata(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ) -> None:
+        dataset, run = await _seed_history(test_db_session)
+        scheduled_for = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        claim_deadline = scheduled_for + timedelta(minutes=30)
+        run.trigger = "scheduled"
+        run.scheduled_for = scheduled_for
+        run.occurrence_key = f"history:{uuid.uuid4()}"
+        run.claim_deadline = claim_deadline
+        run.execution_key = uuid.uuid4()
+        await test_db_session.commit()
+
+        resp = await client.get(
+            f"/datasets/{dataset.id}/refresh-runs", headers=admin_auth_header
+        )
+
+        assert resp.status_code == 200, resp.text
+        row = resp.json()["runs"][0]
+        assert row["trigger"] == "scheduled"
+        assert row["scheduled_for"].startswith("2030-01-02T03:04:05")
+        assert row["claim_deadline"].startswith("2030-01-02T03:34:05")
+        assert "execution_key" not in row
+        assert "credential_reference" not in row
+        assert "credential_version" not in row
 
     @pytest.mark.parametrize("reader", ["viewer", "editor"])
     async def test_a_named_third_party_gets_the_timeline_without_the_people(
@@ -1734,51 +1793,144 @@ class TestCommitTimeRecompute:
         assert run.schema_diff["row_count_new"] == 31
         assert run.feature_count_after == 31
 
-    def test_the_recompute_runs_before_the_swap_overwrites_its_inputs(self) -> None:
-        """Order is the whole correctness argument, so pin it.
+    async def test_a_file_reupload_run_stores_the_staged_table_against_the_stored_one(
+        self, client, test_db_session, tmp_path
+    ) -> None:
+        """A file re-upload's run stores the staged columns and count against the stored ones."""
+        from unittest.mock import AsyncMock, patch
 
-        `_apply_reupload_swap` assigns dataset.column_info and feature_count
-        from the staging metadata. Compute the diff after that call and both
-        sides of the comparison are the NEW data, so every diff comes back
-        empty and every dataset reports schema_drift_status='none'. That
-        failure is silent — a permissive default with no symptom — which is
-        exactly why it gets a structural test rather than trust.
-        """
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "app/processing/ingest/tasks_reupload.py"
-        ).read_text(encoding="utf-8")
-        tree = ast.parse(source)
+        import app.core.db as db_module
+        from app.platform.refresh.verification import (
+            geometry_contract,
+            review_fingerprint,
+            review_subject,
+        )
+        from app.processing.ingest.tasks import reupload_file
 
-        checked = 0
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            diff_lines = [
-                call.lineno
-                for call in ast.walk(node)
-                if isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Attribute)
-                and call.func.attr == "compute_schema_diff"
-            ]
-            swap_lines = [
-                call.lineno
-                for call in ast.walk(node)
-                if isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Name)
-                and call.func.id == "_apply_reupload_swap"
-            ]
-            if not diff_lines or not swap_lines:
-                continue
-            checked += 1
-            assert max(diff_lines) < min(swap_lines), (
-                f"{node.name}: compute_schema_diff must run BEFORE "
-                "_apply_reupload_swap overwrites dataset.column_info"
+        user_id = await get_user_id(test_db_session, "admin")
+        table = f"rundiff_{uuid.uuid4().hex[:10]}"
+        dataset = await _create_dataset(
+            test_db_session,
+            created_by=user_id,
+            table_name=table,
+            visibility="private",
+            record_type="vector_dataset",
+            geometry_type="POINT",
+            feature_count=5,
+            column_info=[{"name": "retired", "type": "text"}],
+        )
+        await test_db_session.execute(
+            sa.text(
+                f'CREATE TABLE data."{table}" '
+                "(gid serial PRIMARY KEY, geom geometry(Point, 4326), retired text)"
+            )
+        )
+        source = tmp_path / "update.geojson"
+        source.write_text('{"type":"FeatureCollection","features":[]}')
+        unknown = geometry_contract(
+            geometry_types=None, srid=None, is_3d=None, n_dims=None
+        )
+        # The removal needs review; this is the fingerprint a preview gives it.
+        reviewed = review_fingerprint(
+            review_subject(
+                ["destructive_schema_change"],
+                {"columns_removed": [{"name": "retired"}], "type_changes": []},
+                unknown,
+                unknown,
+            )
+        )
+        job = IngestJob(
+            dataset_id=dataset.id,
+            status="pending",
+            attempt_id=uuid.uuid4(),
+            source_filename="update.geojson",
+            file_path=str(source),
+            created_by=user_id,
+            user_metadata={
+                "reupload": True,
+                "dataset_id": str(dataset.id),
+                "review_fingerprint": reviewed,
+            },
+        )
+        test_db_session.add(job)
+        await test_db_session.flush()
+        await create_pending_run(
+            test_db_session,
+            dataset_id=dataset.id,
+            origin_kind="upload",
+            trigger="manual",
+            triggered_by=user_id,
+            ingest_job_id=job.id,
+            feature_count_before=5,
+        )
+        await test_db_session.commit()
+        await test_db_session.refresh(job)
+
+        async def _stage(file_path, staging_tn, db_conn_str, **kwargs):
+            async with db_module.async_session() as session:
+                await session.execute(
+                    sa.text(
+                        f'CREATE TABLE data."{staging_tn}" (gid serial PRIMARY KEY, '
+                        "geom geometry(Point, 4326), name text, population integer)"
+                    )
+                )
+                await session.execute(
+                    sa.text(
+                        f'INSERT INTO data."{staging_tn}" (geom, name) VALUES '
+                        "(ST_SetSRID(ST_MakePoint(1, 1), 4326), 'a'), "
+                        "(ST_SetSRID(ST_MakePoint(2, 2), 4326), 'b')"
+                    )
+                )
+                await session.commit()
+
+        ogrinfo = {
+            "srid": 4326,
+            "geometry_type": "Point",
+            "layer_name": "update",
+            "feature_count": 2,
+            "columns": [{"name": "name", "type": "String"}],
+        }
+        with (
+            patch(
+                "app.processing.ingest.service.resolve_file_path",
+                new=AsyncMock(side_effect=lambda path, job_id: path),
+            ),
+            patch(
+                "app.processing.ingest.tasks_reupload._validate_upload_file_safety",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.processing.ingest.ogr.run_ogrinfo",
+                new=AsyncMock(return_value=ogrinfo),
+            ),
+            patch(
+                "app.processing.ingest.ogr.run_ogr2ogr",
+                new=AsyncMock(side_effect=_stage),
+            ),
+            # A real grant would put this module in the tenancy test group.
+            patch(
+                "app.processing.ingest.metadata.grant_reader_access", new=AsyncMock()
+            ),
+            patch("app.processing.ingest.tasks_staging.get_storage", AsyncMock),
+        ):
+            await reupload_file(
+                job_id=str(job.id),
+                dataset_id=str(dataset.id),
+                file_path=str(source),
+                user_id=str(user_id),
+                attempt_id=str(job.attempt_id),
             )
 
-        assert checked == 2, (
-            f"expected both reupload tasks to recompute the diff; found {checked}"
+        run = await test_db_session.scalar(
+            select(DatasetRefreshRun)
+            .where(DatasetRefreshRun.ingest_job_id == job.id)
+            .execution_options(populate_existing=True)
         )
+        assert run.status == "succeeded"
+        diff = run.schema_diff
+        assert [c["name"] for c in diff["columns_added"]] == ["name", "population"]
+        assert [c["name"] for c in diff["columns_removed"]] == ["retired"]
+        assert (diff["row_count_old"], diff["row_count_new"]) == (5, 2)
 
 
 class TestHistoryPaging:

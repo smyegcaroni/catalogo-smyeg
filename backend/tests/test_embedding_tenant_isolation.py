@@ -20,6 +20,9 @@ from app.processing.embeddings import helpers
 from app.processing.embeddings import service as service_module
 from tests.fixtures.dummy_overlay.tenant_isolation import TenantIsolationSurface
 
+# An admin reads every record, so these reads see only the tenant boundary.
+_ADMIN_SCOPE = {"user": SimpleNamespace(id=uuid.uuid4()), "user_roles": {"admin"}}
+
 
 def _result(*, rows=(), scalar=None, first=None):
     result = MagicMock()
@@ -41,8 +44,8 @@ async def test_processing_vocabulary_queries_join_rls_visible_records():
     session.execute.return_value = _result()
     port = DefaultProcessingPort()
 
-    await port.get_catalog_vocabulary(session)
-    await port.get_keywords_for_records(session, [uuid.uuid4()])
+    await port.get_catalog_vocabulary(session, **_ADMIN_SCOPE)
+    await port.get_keywords_for_records(session, [uuid.uuid4()], **_ADMIN_SCOPE)
 
     statements = [str(call.args[0]) for call in session.execute.await_args_list]
     assert len(statements) == 2
@@ -143,6 +146,7 @@ async def test_admin_stats_and_force_delete_are_record_scoped(monkeypatch):
     # scoping has to hold.
     record = SimpleNamespace(
         id=uuid.uuid4(),
+        record_type="vector_dataset",
         title="Tenant Scoped Record",
         summary=None,
         keywords=[],
@@ -154,6 +158,13 @@ async def test_admin_stats_and_force_delete_are_record_scoped(monkeypatch):
         get_records_without_embeddings=AsyncMock(return_value=[record]),
     )
     monkeypatch.setattr(backfill_module, "get_processing_port", lambda: port)
+    # A mocked session cannot answer the re-read that checks the record is
+    # unchanged, and this test is about the delete's record scope.
+    monkeypatch.setattr(
+        backfill_module,
+        "records_still_current",
+        AsyncMock(side_effect=lambda _session, observed: set(observed)),
+    )
     # fix(#1511 review r3): the force path proves it can embed before it
     # deletes. This test is about the DELETE's record scoping, so give it a
     # working provider rather than letting the pre-flight abort the run.
@@ -334,9 +345,11 @@ async def test_embedding_reads_and_stats_are_tenant_local(
             record_b = uuid.UUID(surface.rec_b_id)
 
             async with ctx.tenant_session(ctx.tenant_a) as session:
-                assert await port.get_catalog_vocabulary(session) == ["tenant-a-only"]
+                assert await port.get_catalog_vocabulary(session, **_ADMIN_SCOPE) == [
+                    "tenant-a-only"
+                ]
                 assert await port.get_keywords_for_records(
-                    session, [record_a, record_b]
+                    session, [record_a, record_b], **_ADMIN_SCOPE
                 ) == ["tenant-a-only"]
                 assert await helpers.has_embeddings(session) is True
                 assert await helpers.get_nearest_record_ids(session, record_a) == []
@@ -345,9 +358,11 @@ async def test_embedding_reads_and_stats_are_tenant_local(
                 assert (stats_a.total_records, stats_a.embedded_records) == (1, 1)
 
             async with ctx.tenant_session(ctx.tenant_b) as session:
-                assert await port.get_catalog_vocabulary(session) == ["tenant-b-only"]
+                assert await port.get_catalog_vocabulary(session, **_ADMIN_SCOPE) == [
+                    "tenant-b-only"
+                ]
                 assert await port.get_keywords_for_records(
-                    session, [record_a, record_b]
+                    session, [record_a, record_b], **_ADMIN_SCOPE
                 ) == ["tenant-b-only"]
                 assert await helpers.get_nearest_record_ids(session, record_b) == []
                 stats_b = await AdminService(session).get_embedding_stats()
@@ -387,6 +402,7 @@ async def test_force_backfill_deletes_only_active_tenant_embeddings(
         # untouched, which is the fleet-wide-delete hazard this test exists for.
         record_a = SimpleNamespace(
             id=uuid.UUID(surface.rec_a_id),
+            record_type="vector_dataset",
             title="Tenant A Record",
             summary=None,
             keywords=[],
@@ -398,6 +414,14 @@ async def test_force_backfill_deletes_only_active_tenant_embeddings(
             get_records_without_embeddings=AsyncMock(return_value=[record_a]),
         )
         monkeypatch.setattr(backfill_module, "get_processing_port", lambda: port)
+        # The stub above is not what the database holds, and the re-read that
+        # checks a record is unchanged share-locks it, which needs UPDATE on
+        # records. This test is about the delete's tenant scope.
+        monkeypatch.setattr(
+            backfill_module,
+            "records_still_current",
+            AsyncMock(side_effect=lambda _session, observed: set(observed)),
+        )
         # fix(#1511): the force path snapshots the active model and dimensions
         # before it deletes, and this session runs as geolens_reader, which
         # cannot read app_settings. Unpinned, the resolver returns the unknown

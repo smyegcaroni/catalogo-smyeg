@@ -1,6 +1,6 @@
 """Structural guard for the CodeQL alert-suppression pack.
 
-AGENTS.md ("Standing CodeQL policy", decided 2026-08-03) says that if the
+AGENTS.md ("Security > CodeQL") says that if the
 validated-identifier ``py/sql-injection`` class fires again on an
 ingest-adjacent PR, the repo adopts the alert-suppression query pack instead
 of dismissing the alerts by hand a second time. It fired again on
@@ -136,7 +136,7 @@ def test_every_dynamic_text_site_carries_a_suppression_marker(rel_path: str) -> 
         "Dynamic text() sites without a `# codeql[py/sql-injection]` marker on "
         "their own line directly above:\n  " + "\n  ".join(unmarked) + "\n"
         "Add the marker with its justification, or make the SQL static. See "
-        "AGENTS.md > Standing CodeQL policy."
+        "AGENTS.md > Security > CodeQL."
     )
 
 
@@ -176,7 +176,7 @@ def test_every_codeql_marker_in_backend_app_binds_to_the_line_it_covers() -> Non
         "CodeQL markers that do not bind to the line they are meant to "
         "suppress:\n  " + "\n  ".join(misplaced) + "\n"
         "A marker must sit alone on the line directly above its call. See "
-        "AGENTS.md > Standing CodeQL policy."
+        "AGENTS.md > Security > CodeQL."
     )
 
 
@@ -209,7 +209,8 @@ SSRF_SINK_MODULES = (
 )
 
 SINK_CALL_RE = re.compile(
-    r"\bclient\.(get|post|put|patch|delete|head|options|request|stream|send)\("
+    r"\bclient\.(get|post|put|patch|delete|head|options|request|stream|send"
+    r"|build_request)\("
 )
 
 
@@ -420,12 +421,24 @@ def _dynamic_sql_lines(source: str) -> set[int]:
     return set(_dynamic_text_sites(source))
 
 
+def _print_call_lines(source: str) -> set[int]:
+    """1-based start line of every call to the builtin ``print``."""
+    return {
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "print"
+    }
+
+
 # The construct each rule reports at. `py/full-ssrf` is absent because the two
 # tests above already pin its markers in both directions, against one shared
 # definition of an SSRF sink.
 MARKER_CONSTRUCTS = {
     "py/sql-injection": _dynamic_sql_lines,
     "py/path-injection": _path_sink_lines,
+    "py/clear-text-logging-sensitive-data": _print_call_lines,
 }
 RULES_CHECKED_ELSEWHERE = frozenset({"py/full-ssrf"})
 
@@ -482,7 +495,7 @@ def test_every_marker_sits_above_a_construct_its_own_rule_reports_at() -> None:
         "rule reports at, so they suppress nothing:\n  "
         + "\n  ".join(misplaced)
         + "\nMove the marker onto the line directly above the flagged call. See "
-        "AGENTS.md > Standing CodeQL policy."
+        "AGENTS.md > Security > CodeQL."
     )
 
     unexercised = (set(MARKER_CONSTRUCTS) | RULES_CHECKED_ELSEWHERE) - exercised
@@ -566,6 +579,19 @@ def test_codeql_workflow_runs_and_acts_on_the_suppression_query() -> None:
     )
     assert f"steps.{analyze['id']}.outputs.sarif-output" in consumed, (
         "the dismissal step must consume the analyze step's SARIF output path"
+    )
+
+    check = next(
+        (s for s in steps if "check_suppressed_alerts.py" in str(s.get("run", ""))),
+        None,
+    )
+    assert check is not None, (
+        "a step must run scripts/check_suppressed_alerts.py after the dismissal "
+        "step; the action exits 0 even when it leaves a suppressed alert open"
+    )
+    assert steps.index(check) > steps.index(dismiss)
+    assert "pull_request" in str(check.get("if", "")), (
+        "the check must stay off pull_request, like the dismissal step"
     )
 
 

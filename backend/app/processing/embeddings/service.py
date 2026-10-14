@@ -2,16 +2,27 @@
 
 import hashlib
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any
 
 import structlog
 from sqlalchemy import func, select
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload, selectinload
 
 from app.core.config import settings
-from app.platform.extensions import get_embedding_provider
+from app.platform.extensions import get_embedding_provider, get_processing_port
 from app.processing.embeddings.helpers import resolve_live_embedding_config
 from app.processing.embeddings.models import RecordEmbedding
-from app.core.persistent_config import AI_ENABLED, EMBEDDING_DIMS, EMBEDDING_MODEL
+from app.core.persistent_config import (
+    AI_ENABLED,
+    EMBEDDING_DIMS,
+    EMBEDDING_MODEL,
+    apply_side_effects_batch,
+)
 
 logger = structlog.stdlib.get_logger(__name__)
 
@@ -209,6 +220,24 @@ async def probe_embedding_dimensions(session: AsyncSession) -> int:
     return len(embedding)
 
 
+async def live_embedding_column_width(session: AsyncSession) -> int | None:
+    """Read the declared width of the embedding column, straight from storage.
+
+    pgvector stores the dimension in `atttypmod` with no offset; -1 means an
+    unconstrained `vector`. Storage rather than `EMBEDDING_DIMS`, because the
+    two can disagree and that is the point of asking.
+    """
+    return (
+        await session.execute(
+            sa_text(
+                "SELECT atttypmod FROM pg_attribute "
+                "WHERE attrelid = 'catalog.record_embeddings'::regclass "
+                "AND attname = 'embedding' AND NOT attisdropped"
+            )
+        )
+    ).scalar_one_or_none()
+
+
 async def rebuild_embedding_column(db: AsyncSession, new_dims: int) -> bool:
     """Resize the embedding column to new_dims if it currently differs.
 
@@ -289,6 +318,175 @@ async def rebuild_embedding_column(db: AsyncSession, new_dims: int) -> bool:
     return True
 
 
+class EmbeddingColumnRebuildError(RuntimeError):
+    """The column rebuild failed and the embedding settings were put back."""
+
+
+class EmbeddingChangeBusyError(RuntimeError):
+    """Another embedding model or width change still holds the lock."""
+
+
+_CHANGE_LOCK_SQL = (
+    "SELECT pg_try_advisory_xact_lock(hashtextextended('geolens:embedding_change', 0))"
+)
+
+
+@asynccontextmanager
+async def embedding_change_lock(
+    needed: bool = True, *, db: AsyncSession | None = None
+) -> AsyncIterator[None]:
+    """Run one embedding model or width change at a time, from reading the old
+    pair to the rebuild or restore. Does nothing unless ``needed``.
+
+    The lock holds a connection of its own, outside the request pool: the
+    change commits between those steps, and a burst of requests as large as
+    the pool would otherwise each wait at checkout for a connection the others
+    hold. ``db``, the request's session, has its read-only transaction ended
+    first, so under transaction pooling a request trying the lock holds no
+    other server connection. A second change is refused with
+    EmbeddingChangeBusyError rather than queued.
+    """
+    if not needed:
+        yield
+        return
+    if db is not None:
+        await db.commit()
+    from sqlalchemy import text as sa_text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from app.core.db import engine  # late-bound so a test engine applies
+
+    lock_engine = create_async_engine(
+        engine.url, poolclass=NullPool, connect_args=settings.database_connect_args
+    )
+    try:
+        async with lock_engine.connect() as lock_connection:
+            locked = await lock_connection.execute(sa_text(_CHANGE_LOCK_SQL))
+            if not locked.scalar():
+                raise EmbeddingChangeBusyError(
+                    "Another embedding configuration change is in progress. "
+                    "Retry once it finishes."
+                )
+            yield
+    finally:
+        await lock_engine.dispose()
+
+
+@dataclass(frozen=True)
+class CommittedEmbeddingPair:
+    """The embedding settings a failed column rebuild puts back.
+
+    ``model`` is None when the settings batch leaves the model alone. The
+    ``*_overridden`` flags record whether the key had a stored override, so a
+    restore deletes one the batch created instead of pinning the default.
+    """
+
+    dims: int
+    model: str | None
+    dims_overridden: bool
+    model_overridden: bool
+
+
+async def read_committed_embedding_pair(
+    db: AsyncSession, *, with_model: bool
+) -> CommittedEmbeddingPair:
+    """Read before a settings batch writes. Uncached, so a rollback restores
+    what is committed rather than a cache entry that may already be stale."""
+    from app.core.db.models import AppSetting
+
+    dims = await EMBEDDING_DIMS.get_uncached(db)
+    model = await EMBEDDING_MODEL.get_uncached(db) if with_model else None
+    overridden = set(
+        (
+            await db.execute(
+                select(AppSetting.key).where(
+                    AppSetting.key.in_((EMBEDDING_DIMS.key, EMBEDDING_MODEL.key))
+                )
+            )
+        ).scalars()
+    )
+    return CommittedEmbeddingPair(
+        dims=dims,
+        model=model,
+        dims_overridden=EMBEDDING_DIMS.key in overridden,
+        model_overridden=EMBEDDING_MODEL.key in overridden,
+    )
+
+
+async def _restore_setting(
+    db: AsyncSession,
+    cfg: Any,
+    value: Any,
+    overridden: bool,
+    *,
+    user_id: uuid.UUID,
+    ip_address: str | None,
+) -> None:
+    if overridden:
+        await cfg.set(db, value, user_id=user_id, ip_address=ip_address, commit=False)
+    else:
+        await cfg.reset(db, user_id=user_id, ip_address=ip_address, commit=False)
+
+
+async def rebuild_column_or_restore(
+    db: AsyncSession,
+    new_dims: int,
+    previous: CommittedEmbeddingPair,
+    *,
+    user_id: uuid.UUID,
+    ip_address: str | None,
+) -> None:
+    """Rebuild the column to the width a settings batch just committed.
+
+    Callers hold ``embedding_change_lock`` from before they read
+    ``previous``. On failure, restores ``previous`` and raises
+    EmbeddingColumnRebuildError, so published settings never name a width the
+    column does not have.
+    """
+    try:
+        await rebuild_embedding_column(db, new_dims)
+    except Exception as exc:  # broad: DDL rebuild can fail for schema/lock reasons; roll setting back atomically
+        # A failure before the rebuild's own rollback leaves the transaction
+        # aborted, and the restore below would fail on it.
+        await db.rollback()
+        # One transaction, then one side-effect step, so no reader sees the
+        # new model beside the old width. Evicting before the commit would let
+        # a concurrent reader re-cache the value being rolled back.
+        await _restore_setting(
+            db,
+            EMBEDDING_DIMS,
+            previous.dims,
+            previous.dims_overridden,
+            user_id=user_id,
+            ip_address=ip_address,
+        )
+        rolled_back: list[tuple] = [(EMBEDDING_DIMS, previous.dims)]
+        if previous.model is not None:
+            await _restore_setting(
+                db,
+                EMBEDDING_MODEL,
+                previous.model,
+                previous.model_overridden,
+                user_id=user_id,
+                ip_address=ip_address,
+            )
+            rolled_back.append((EMBEDDING_MODEL, previous.model))
+        await db.commit()
+        await apply_side_effects_batch(rolled_back)
+        logger.exception(
+            "Embedding column rebuild failed, rolling back the embedding pair",
+            old_dims=previous.dims,
+            new_dims=new_dims,
+            old_model=previous.model,
+            rolled_back_model=previous.model is not None,
+        )
+        raise EmbeddingColumnRebuildError(
+            "Embedding column rebuild failed. The embedding settings have "
+            "been reverted to their previous values."
+        ) from exc
+
+
 def build_content_text(
     *,
     title: str | None,
@@ -320,6 +518,112 @@ def compute_content_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def content_fields(record) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+    """The fields ``build_content_text`` reads, pulled off a record eagerly.
+
+    Eager, because a rollback expires every ORM instance and a later attribute
+    access raises ``MissingGreenlet``. One function for every reader so "is
+    this record empty" and "is this record unchanged" are asked the same way.
+    """
+    return {
+        "title": record.title,
+        "summary": record.summary,
+        "keywords": [kw.keyword for kw in record.keywords] if record.keywords else [],
+        "lineage": record.lineage_summary,
+        "localized_texts": [
+            "\n".join(
+                part
+                for part in (
+                    f"{translation.language}: {translation.title}",
+                    translation.summary,
+                )
+                if part
+            )
+            for translation in record.translations
+        ],
+    }
+
+
+async def raster_summary_of(session: AsyncSession, record) -> str | None:  # type: ignore[no-untyped-def]
+    """The raster facts a raster dataset's embedded text carries, if any."""
+    from app.processing.raster.models import RasterAsset
+
+    if record.record_type != "raster_dataset":
+        return None
+    dataset_orm = get_processing_port().get_dataset_orm_class()
+    ra = (
+        await session.execute(
+            select(
+                RasterAsset.size_bytes,
+                RasterAsset.res_x,
+                RasterAsset.band_count,
+                RasterAsset.dtype,
+                RasterAsset.epsg,
+                RasterAsset.compression,
+            )
+            .join(dataset_orm, RasterAsset.dataset_id == dataset_orm.id)
+            .where(dataset_orm.record_id == record.id)
+        )
+    ).first()
+    if ra is None:
+        return None
+    size_str = (
+        f"{ra.size_bytes / (1024 * 1024):.1f}MB" if ra.size_bytes else "unknown size"
+    )
+    # res_x may be NULL, which the float format would raise on.
+    res_str = f"{ra.res_x:.6f} resolution, " if ra.res_x is not None else ""
+    return (
+        f"GeoTIFF, {ra.band_count} band(s), {ra.dtype}, "
+        f"{res_str}EPSG:{ra.epsg}, "
+        f"{ra.compression} compression, {size_str}"
+    )
+
+
+def _comparable(fields: dict[str, Any]) -> dict[str, Any]:
+    # Keywords have no load order, so two reads of the same set may differ.
+    return {**fields, "keywords": sorted(fields["keywords"])}
+
+
+async def records_still_current(
+    session: AsyncSession, observed: dict[Any, dict[str, Any]]
+) -> set[Any]:
+    """The observed records whose ``content_fields`` are unchanged.
+
+    An observed ``raster_summary`` is compared as well. The records stay
+    share-locked until the caller commits, so an edit waits for the embedding
+    write and then queues its own re-embed; raster publishes lock the record
+    row too. A deleted record is not current.
+    """
+    record_orm = get_processing_port().get_record_orm_class()
+    ids = list(observed)
+    # Lock, then read in a later statement: a locking statement that waited on
+    # an edit returns joined rows from the snapshot it started with.
+    await session.execute(
+        select(record_orm.id)
+        .where(record_orm.id.in_(ids))
+        .order_by(record_orm.id)
+        .with_for_update(read=True)
+    )
+    result = await session.execute(
+        select(record_orm)
+        .options(joinedload(record_orm.keywords), selectinload(record_orm.translations))
+        .where(record_orm.id.in_(ids))
+        # The caller's identity map may still hold these records as first read.
+        .execution_options(populate_existing=True)
+    )
+    current = {}
+    for record in result.unique().scalars().all():
+        fields = content_fields(record)
+        if "raster_summary" in observed.get(record.id, {}):
+            fields["raster_summary"] = await raster_summary_of(session, record)
+        current[record.id] = _comparable(fields)
+    return {
+        record_id
+        for record_id, fields in observed.items()
+        if current.get(record_id) == _comparable(fields)
+    }
+
+
 async def generate_and_store_embedding(
     *,
     session: AsyncSession,
@@ -330,11 +634,15 @@ async def generate_and_store_embedding(
     lineage: str | None,
     raster_summary: str | None = None,
     localized_texts: list[str] | None = None,
+    observed: dict[str, Any] | None = None,
 ) -> bool:
     """Orchestrate embedding generation and storage.
 
     Non-fatal: catches all errors and logs warnings instead of raising.
     Skips silently when AI is disabled, content is empty, or hash is unchanged.
+    ``observed`` is what the text was built from: the record's
+    ``content_fields``, plus its ``raster_summary`` when that was included.
+    When given, the vector is stored only if the record still holds them.
 
     Returns:
         True if an embedding was created/updated, False otherwise.
@@ -445,6 +753,14 @@ async def generate_and_store_embedding(
             "Embedding generation failed",
             record_id=str(record_id),
             exc_info=True,
+        )
+        return False
+
+    if observed is not None and record_id not in await records_still_current(
+        session, {record_id: observed}
+    ):
+        logger.info(
+            "Record changed while embedding, skipping", record_id=str(record_id)
         )
         return False
 

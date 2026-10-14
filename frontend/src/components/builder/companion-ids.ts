@@ -15,8 +15,8 @@ import { mixedLinesLayerId, mixedPointsLayerId } from './layer-adapters/mixed-ad
  * Suffix for the DEM hypsometric color-relief companion layer. Unlike the other
  * companions, the color-relief layer reuses the raster-dem source rather than
  * owning its own source, so it is keyed off the LAYER id (`layer-${id}`), not the
- * raw layer id. Exported so the standalone derivations in map-sync and
- * color-relief-sync share one literal.
+ * raw layer id. Exported so the standalone derivations in map-sync and the
+ * hillshade adapter share one literal.
  */
 export const COLOR_RELIEF_SUFFIX = '-colorrelief';
 
@@ -69,4 +69,21 @@ export function getCompanionLayerIds(rawLayerId: string, prefix?: string): Compa
     mixedLines: mixedLinesLayerId(layer),
     mixedPoints: mixedPointsLayerId(layer),
   };
+}
+
+/** All prospective map layers of a saved layer, including disabled companions; sources are excluded. */
+export function getDrawingLayerIds(rawLayerId: string, prefix?: string): string[] {
+  const ids = getCompanionLayerIds(rawLayerId, prefix);
+  return [
+    ids.colorRelief,
+    ids.label,
+    ids.arrow,
+    ids.extrusion,
+    ids.outline,
+    ids.clusterCount,
+    ids.cluster,
+    ids.mixedLines,
+    ids.mixedPoints,
+    ids.layer,
+  ];
 }

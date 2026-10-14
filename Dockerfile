@@ -176,8 +176,8 @@ LABEL org.opencontainers.image.source="https://github.com/geolens-io/geolens"
 # falls back to an in-memory cache by design, so a Valkey outage the API can
 # serve straight through used to mark this container unhealthy -- and the
 # frontend's `depends_on: api: service_healthy` then refused to start the UI at
-# all. /health is still the readiness view; point orchestrator readiness probes
-# and dashboards at it.
+# all. Orchestrator readiness probes belong on /health/ready, which checks only
+# the database; /health stays the full dependency report for dashboards.
 HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"
 
@@ -260,7 +260,7 @@ RUN chmod +x /scripts/backup-entrypoint.sh /scripts/restore.sh
 
 ENTRYPOINT ["/scripts/backup-entrypoint.sh"]
 
-FROM node:26.8.2-alpine AS frontend-build
+FROM node:26.10.0-alpine AS frontend-build
 
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./

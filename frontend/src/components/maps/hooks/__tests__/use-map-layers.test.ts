@@ -1,6 +1,8 @@
 import { renderHook } from '@testing-library/react';
+import { DEFAULT_HILLSHADE_PAINT } from '@/components/builder/layer-adapters/builder-defaults';
 import { describe, expect, it, vi } from 'vitest';
-import { useMapLayers } from '../use-map-layers';
+import type { VectorTileToken } from '@/api/tiles';
+import { previewSourceId, useMapLayers } from '../use-map-layers';
 import type { Map as MaplibreMap } from 'maplibre-gl';
 
 vi.mock('@/lib/env', () => ({
@@ -23,7 +25,7 @@ function addedLayers(map: MaplibreMap) {
   );
 }
 
-function runHook(geometryType: string) {
+function runHook(geometryType: string, elevationColumn?: string) {
   const mapRef = { current: null };
   const { result } = renderHook(() =>
     useMapLayers({
@@ -31,6 +33,7 @@ function runHook(geometryType: string) {
       geometryType,
       tileToken: null,
       mapRef,
+      elevationColumn,
     }),
   );
   const map = fakeMap();
@@ -43,10 +46,10 @@ describe('useMapLayers generic-geometry rendering (fix #430 codex r21)', () => {
     const map = runHook('GEOMETRY');
     const layers = addedLayers(map);
     expect(layers.map((l) => l.id)).toEqual([
-      'vector-fill',
-      'vector-outline',
-      'vector-lines',
-      'vector-points',
+      'preview-layer-dataset',
+      'preview-layer-dataset-outline',
+      'preview-layer-dataset-lines',
+      'preview-layer-dataset-points',
     ]);
     // Every generic layer filters by geometry family so no feature renders
     // through the wrong adapter.
@@ -57,24 +60,27 @@ describe('useMapLayers generic-geometry rendering (fix #430 codex r21)', () => {
 
   it('does the same for GEOMETRYCOLLECTION display types', () => {
     const map = runHook('GEOMETRYCOLLECTION');
-    expect(addedLayers(map).map((l) => l.id)).toContain('vector-points');
-    expect(addedLayers(map).map((l) => l.id)).toContain('vector-lines');
-    expect(addedLayers(map).map((l) => l.id)).toContain('vector-fill');
+    expect(addedLayers(map).map((l) => l.id)).toContain('preview-layer-dataset-points');
+    expect(addedLayers(map).map((l) => l.id)).toContain('preview-layer-dataset-lines');
+    expect(addedLayers(map).map((l) => l.id)).toContain('preview-layer-dataset');
   });
 
   it('keeps the single-renderer behavior for concrete types', () => {
     const point = runHook('MULTIPOINT');
-    expect(addedLayers(point).map((l) => l.id)).toEqual(['vector-points']);
+    expect(addedLayers(point).map((l) => l.id)).toEqual(['preview-layer-dataset']);
     expect(addedLayers(point)[0].filter).toBeUndefined();
 
     const line = runHook('LINESTRING');
-    expect(addedLayers(line).map((l) => l.id)).toEqual(['vector-lines']);
+    expect(addedLayers(line).map((l) => l.id)).toEqual(['preview-layer-dataset']);
 
     const polygon = runHook('POLYGON');
     expect(addedLayers(polygon).map((l) => l.id)).toEqual([
-      'vector-fill',
-      'vector-outline',
+      'preview-layer-dataset',
+      'preview-layer-dataset-outline',
     ]);
+
+    const extruded = runHook('POLYGON', 'height_m');
+    expect(addedLayers(extruded).map((l) => l.id)).toEqual(['preview-layer-dataset-extrusion']);
   });
 
   it('waits for an async tenant prefix before installing immutable source-layer names', () => {
@@ -107,19 +113,56 @@ describe('useMapLayers generic-geometry rendering (fix #430 codex r21)', () => {
   });
 });
 
+describe('useMapLayers vector source', () => {
+  function vectorToken(sig: string): VectorTileToken {
+    return { kind: 'vector', sig, exp: 2000000000, scope: 'scope-1', expires_in: 900 };
+  }
+
+  it('requests tiles from z0 and overzooms z14 tiles past z14', () => {
+    const map = runHook('POLYGON');
+    expect(map.addSource).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ type: 'vector', minzoom: 0, maxzoom: 14 }),
+    );
+  });
+
+  it('re-signs the source in place when the token changes', () => {
+    const setTiles = vi.fn();
+    const map = {
+      ...fakeMap(),
+      getSource: vi.fn((id: string) => (id === previewSourceId('roads') ? { setTiles } : undefined)),
+    } as unknown as MaplibreMap;
+    const mapRef = { current: map };
+    const { rerender } = renderHook(
+      ({ tileToken }: { tileToken: VectorTileToken }) =>
+        useMapLayers({ tableName: 'roads', geometryType: 'LINESTRING', tileToken, mapRef }),
+      { initialProps: { tileToken: vectorToken('first') } },
+    );
+    setTiles.mockClear();
+
+    rerender({ tileToken: vectorToken('second') });
+
+    expect(setTiles).toHaveBeenCalledExactlyOnceWith([
+      'http://tiles.test/tiles/data.roads/{z}/{x}/{y}.pbf?sig=second&exp=2000000000&scope=scope-1',
+    ]);
+  });
+});
+
 // #1362 codex r2: the raster tile route is a fixed per-dataset path, and a
 // public dataset's tile response carries `Cache-Control: public,
 // max-age=3600` — so the browser's own HTTP cache can keep serving
 // pre-replace bytes for an identical URL. tileVersion busts that the same
 // way the vector source already does via buildSignedTileUrl.
 describe('useMapLayers raster tile source cache-busting', () => {
-  function runRasterHook(rasterTileUrl: string | null, tileVersion?: string | null) {
+  function runRasterHook(rasterTileUrl: string | null, tileVersion?: string | null, isDem = false, bounds?: number[]) {
     const mapRef = { current: null };
     const { result } = renderHook(() =>
       useMapLayers({
         tableName: null,
         geometryType: null,
         rasterTileUrl,
+        isDem,
+        bounds,
         tileVersion,
         tileToken: null,
         mapRef,
@@ -143,6 +186,29 @@ describe('useMapLayers raster tile source cache-busting', () => {
     const source = addedSourceConfig(map);
     expect(source?.tiles[0]).toContain('/raster-tiles/dataset-1/tiles/{z}/{x}/{y}.png?v=');
     expect(source?.tiles[0]).toContain(encodeURIComponent('2026-08-10T00:00:00Z'));
+  });
+
+  it('draws a non-DEM raster as a plain raster layer', () => {
+    const map = runRasterHook('/raster-tiles/dataset-1/tiles/{z}/{x}/{y}.png');
+    expect((map.addSource as ReturnType<typeof vi.fn>).mock.calls[0][1].type).toBe('raster');
+    expect((map.addLayer as ReturnType<typeof vi.fn>).mock.calls[0][0].type).toBe('raster');
+  });
+
+  it('decodes a DEM as raster-dem and draws it as hillshade', () => {
+    const map = runRasterHook('/raster-tiles/dataset-1/tiles/{z}/{x}/{y}.png', null, true, [7.6, 45.9, 7.7, 46.0]);
+    const [id, source] = (map.addSource as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(id).toBe('raster-tile-source');
+    expect(source).toMatchObject({
+      type: 'raster-dem', encoding: 'mapbox',
+      tileSize: 256,
+      maxzoom: 22,
+      bounds: [7.6, 45.9, 7.7, 46.0],
+    });
+    expect((map.addLayer as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+      type: 'hillshade',
+      source: 'raster-tile-source',
+      paint: DEFAULT_HILLSHADE_PAINT,
+    });
   });
 
   it('omits the query param when tileVersion is absent', () => {

@@ -1,7 +1,9 @@
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import { LayerLegend, viewerSwatchStyle } from '../LayerLegend';
-import type { MapTerrainConfig, SharedLayerResponse } from '@/types/api';
+import { LayerLegend } from '../LayerLegend';
+import type { DrawnLayer } from '@/components/map/legend-facts';
+import { SAVED_LAYERS, toSharedLayer } from '@/test/fixtures/saved-layers';
+import type { MapLayerResponse, MapTerrainConfig, SharedLayerResponse } from '@/types/api';
 
 function layer(overrides: Partial<SharedLayerResponse> = {}): SharedLayerResponse {
   return {
@@ -67,60 +69,6 @@ function layer(overrides: Partial<SharedLayerResponse> = {}): SharedLayerRespons
 }
 
 describe('LayerLegend', () => {
-  it('separates graduated radius and color semantics for point layers', () => {
-    render(
-      <LayerLegend
-        layers={[layer()]}
-        visibleLayers={new Set(['layer-1'])}
-        onToggleVisibility={vi.fn()}
-        isOpen
-        onToggle={vi.fn()}
-      />,
-    );
-
-    expect(screen.getByText('Size: Magnitude')).toBeInTheDocument();
-    expect(screen.getByText('Color: Depth (km)')).toBeInTheDocument();
-    expect(screen.getByText('< 6')).toBeInTheDocument();
-    expect(screen.getByText(/50.*200/)).toBeInTheDocument();
-  });
-
-  it('colors graduated-size swatches with a constant fill, not the gray fallback', () => {
-    // Regression: a constant (string) circle-color is not an expression, so
-    // parsePaintColors returns null — the radius legend must still use the real
-    // color instead of falling back to gray (#cccccc).
-    const constColorLayer = layer({
-      id: 'layer-const',
-      display_name: 'Magnitude (graduated)',
-      paint: {
-        'circle-radius': ['step', ['get', 'mag'], 4, 5, 7, 6, 11, 7, 16],
-        'circle-color': '#ef4444',
-      },
-      style_config: {
-        mode: 'graduated',
-        column: 'mag',
-        target: 'radius',
-        ramp: 'YlOrRd',
-        breaks: [5, 6, 7],
-        sizes: [4, 7, 11, 16],
-        sizeLabel: 'Magnitude',
-      },
-    });
-
-    const { container } = render(
-      <LayerLegend
-        layers={[constColorLayer]}
-        visibleLayers={new Set(['layer-const'])}
-        onToggleVisibility={vi.fn()}
-        isOpen
-        onToggle={vi.fn()}
-      />,
-    );
-
-    expect(screen.getByText('Size: Magnitude')).toBeInTheDocument();
-    expect(container.querySelectorAll('circle[fill="#ef4444"]').length).toBeGreaterThanOrEqual(1);
-    expect(container.querySelector('circle[fill="#cccccc"]')).toBeNull();
-  });
-
   it('shows a raster icon, not a colored point swatch, for raster layers', () => {
     // Regression: raster layers (no vector fill) were given the #6366f1 default
     // color + a point swatch. They should render a raster icon like the builder.
@@ -168,6 +116,63 @@ describe('LayerLegend', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Hide Second copy' }));
 
     expect(onToggleVisibility).toHaveBeenCalledWith('layer-b');
+  });
+});
+
+describe('LayerLegend notes under an entry', () => {
+  function renderLegend(saved: MapLayerResponse[], drawn?: ReadonlyMap<string, DrawnLayer>) {
+    render(
+      <LayerLegend
+        layers={saved.map(toSharedLayer)}
+        visibleLayers={new Set(saved.map((layer) => layer.id))}
+        onToggleVisibility={vi.fn()}
+        isOpen
+        onToggle={vi.fn()}
+        drawn={drawn}
+      />,
+    );
+  }
+  const clusters = [SAVED_LAYERS.boundedCluster, SAVED_LAYERS.serverCluster, SAVED_LAYERS.fallbackCluster];
+  const entry = (name: string) => within(screen.getByText(name).closest('li')!);
+
+  it('names each cluster by its saved strategy when the map has reported nothing', () => {
+    renderLegend(clusters);
+
+    expect(entry('Bike racks').getByText('Bounded cluster')).toBeInTheDocument();
+    expect(entry('Street trees').getByText('Server cluster')).toBeInTheDocument();
+    expect(entry('Survey points').getByText('Point fallback')).toBeInTheDocument();
+  });
+
+  it('names a bounded cluster the map drew as single points a point fallback', () => {
+    renderLegend(clusters, new Map([
+      [SAVED_LAYERS.boundedCluster.id, { drawsAs: 'circle' }],
+      [SAVED_LAYERS.serverCluster.id, { drawsAs: 'cluster' }],
+    ]));
+
+    expect(entry('Bike racks').getByText('Point fallback')).toBeInTheDocument();
+    expect(entry('Street trees').getByText('Server cluster')).toBeInTheDocument();
+  });
+
+  it('names the column a heatmap is weighted by', () => {
+    renderLegend([SAVED_LAYERS.heatmapByRamp]);
+
+    expect(screen.getByText('Weighted by: severity')).toBeInTheDocument();
+  });
+
+  it('names the column a rising weight ramp scales, and says it is scaled', () => {
+    const { heatmapByRamp } = SAVED_LAYERS;
+    const weight = ['interpolate', ['linear'], ['to-number', ['get', 'mag'], 0], 2.5, 0.05, 8, 1];
+    renderLegend([{ ...heatmapByRamp, paint: { ...heatmapByRamp.paint, 'heatmap-weight': weight } }]);
+
+    expect(screen.getByText('Weighted by: mag (scaled)')).toBeInTheDocument();
+  });
+
+  it('names no weight column for a heatmap with a constant weight', () => {
+    const { heatmapByRamp } = SAVED_LAYERS;
+    renderLegend([{ ...heatmapByRamp, paint: { ...heatmapByRamp.paint, 'heatmap-weight': 1 } }]);
+
+    expect(screen.getByText('Low')).toBeInTheDocument();
+    expect(screen.queryByText(/Weighted by/)).not.toBeInTheDocument();
   });
 });
 
@@ -439,40 +444,5 @@ describe('LayerLegend terrain consistency (Fix 1)', () => {
     const synthetic = screen.getByTestId('legend-terrain-synthetic');
     expect(within(synthetic).getByText('◬')).toBeInTheDocument();
     expect(screen.getByText('⛰')).toBeInTheDocument();
-  });
-});
-
-// fix(#1288 codex): a stroke the user turned off through the builder can leave
-// paint's _stroke-disabled/_outline-width unchanged — the viewer legend swatch
-// must prefer builder state, same as extractStyleHints/getSwatchStyleFromPaint.
-describe('viewerSwatchStyle — builder stroke precedence (fix #1288)', () => {
-  it('prefers builder.strokeDisabled over a stale paint mirror', () => {
-    const style = viewerSwatchStyle(layer({
-      geometry_type: 'POLYGON',
-      paint: { 'fill-opacity': 0, '_outline-color': '#ec4b7f' },
-      style_config: { mode: 'categorical', builder: { strokeDisabled: true, outlineColor: '#ec4b7f' } } as SharedLayerResponse['style_config'],
-    }));
-    expect(style.strokeDisabled).toBe(true);
-  });
-
-  it('treats an explicit builder.outlineWidth of 0 as a disabled stroke', () => {
-    const style = viewerSwatchStyle(layer({
-      geometry_type: 'POLYGON',
-      paint: { 'fill-opacity': 0, '_outline-color': '#ec4b7f', '_outline-width': 2 },
-      style_config: { mode: 'categorical', builder: { outlineWidth: 0, outlineColor: '#ec4b7f' } } as SharedLayerResponse['style_config'],
-    }));
-    expect(style.strokeDisabled).toBe(true);
-    expect(style.strokeWidth).toBe(0);
-  });
-
-  it('leaves a normal visible outline unchanged', () => {
-    const style = viewerSwatchStyle(layer({
-      geometry_type: 'POLYGON',
-      paint: { 'fill-opacity': 0.5, '_outline-color': '#ec4b7f', '_outline-width': 2 },
-      style_config: { mode: 'categorical' } as SharedLayerResponse['style_config'],
-    }));
-    expect(style.strokeDisabled).toBe(false);
-    expect(style.outlineColor).toBe('#ec4b7f');
-    expect(style.strokeWidth).toBe(2);
   });
 });

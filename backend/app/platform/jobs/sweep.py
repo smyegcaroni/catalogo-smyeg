@@ -16,32 +16,54 @@ from typing import Literal, overload
 import structlog
 from sqlalchemy import (
     DateTime,
+    Select,
     and_,
-    case,
     delete,
     func,
+    literal,
     not_,
     or_,
     select,
     text,
     update,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import MAX_PRESIGNED_URL_LIFETIME_SECONDS, settings
+from app.core.failure_reason import FixedReason
+from app.core.pointcloud import is_pointcloud_attempt_key
+from app.core.tiles3d import (
+    UNPUBLISHED_TILESET_ATTEMPTS_FIELD,
+    is_tileset_attempt_prefix,
+    tileset_attempt_dataset,
+)
 from app.observability.metrics.refresh import refresh_sweep_reconciled_total
+from app.platform.jobs import attempt_tables
+from app.platform.jobs.heartbeat import ANALYSIS_MATERIALIZE_LEASE_SECONDS
 from app.platform.jobs.models import (
+    ACTIVE_STATUSES,
+    ANALYSIS_OUTPUT_TABLE_FIELD,
     COMMIT_ATTEMPTED_METADATA_KEY,
     EMBEDDING_BACKFILL_METADATA_KEY,
     FAN_OUT_INTERRUPTED_METADATA_KEY,
+    PUBLISH_FOLLOWUPS_FIELD,
     STAGING_REAPED_FINAL_MARKER,
-    STATUSES_NEEDING_STAGED_INPUT,
+    STAGING_REAPED_MARKER,
+    SUPERSEDED_COG_ITEM,
+    UNPUBLISHED_STORAGE_KEYS_FIELD,
+    UNREAPED_ARTIFACT_FIELDS,
     IngestJob,
+    carries_unreaped,
+    holds_unarchived_original,
+    needs_staged_input,
     owned_presigned_staging_key,
 )
+from app.platform.jobs.ledger import Outcome, end_stale, run_stale_passes
+from app.platform.jobs.originals_reconcile import reconcile_orphaned_originals
+from app.platform.jobs.quicklook_reconcile import reconcile_orphaned_quicklooks
 from app.platform.jobs.staging_reconcile import reconcile_orphaned_staging_objects
-from app.platform.refresh.service import sweep_abandoned_refresh_runs
 from app.platform.storage.titiler_url import resolve_current_storage_key
 
 log = structlog.get_logger()
@@ -56,9 +78,10 @@ FAN_OUT_CHILDLESS_GRACE_SECONDS = 300
 
 # fix(#1709): never advertise retry here. Generic retry re-queues the parent
 # as ONE default-layer import and is refused on the marker; re-upload is the path.
-FAN_OUT_DISPATCH_INTERRUPTED_MESSAGE = (
+FAN_OUT_DISPATCH_INTERRUPTED_MESSAGE = FixedReason(
     "Fan-out dispatch was interrupted before any layer was queued. "
-    "Re-upload the file to import its layers."
+    "Re-upload the file to import its layers.",
+    code="dispatch_interrupted",
 )
 
 
@@ -82,8 +105,12 @@ def stale_pending_cutoff_seconds(*, completion_bound: bool) -> int:
 
 
 # fix(#1235): no hour in the message; the timeout is configurable.
-STALE_PENDING_UNBOUND_MESSAGE = "Stale: pending too long (never queued)"
-STALE_PENDING_BOUND_MESSAGE = "Stale: upload completed but never committed"
+STALE_PENDING_UNBOUND_MESSAGE = FixedReason(
+    "Stale: pending too long (never queued)", code="stale_never_queued"
+)
+STALE_PENDING_BOUND_MESSAGE = FixedReason(
+    "Stale: upload completed but never committed", code="stale_never_committed"
+)
 
 
 def stale_pending_clauses(now: datetime, *, completion_bound: bool) -> tuple:
@@ -120,17 +147,9 @@ def stale_pending_clauses(now: datetime, *, completion_bound: bool) -> tuple:
 
 # fix(#1556): an upload nobody ever committed settles `cancelled`, not `failed`.
 # `cancelled` is already in the status CHECK, the admin literal and openapi.json.
-ABANDONED_UPLOAD_MESSAGE = "Abandoned: upload was never completed"
-
-
-def is_abandoned_upload(user_metadata: dict | None) -> bool:
-    """Python twin of ``abandoned_upload``, over one loaded row.
-
-    Used only by worker startup recovery, which mirrors the UPDATE onto its
-    ORM instances — a plain ``job.status = "failed"`` there would overwrite
-    the status the database just computed.
-    """
-    return not (user_metadata or {}).get(COMMIT_ATTEMPTED_METADATA_KEY)
+ABANDONED_UPLOAD_MESSAGE = FixedReason(
+    "Abandoned: upload was never completed", code="upload_abandoned"
+)
 
 
 def abandoned_upload():
@@ -149,21 +168,6 @@ def abandoned_upload():
         func.coalesce(IngestJob.user_metadata[COMMIT_ATTEMPTED_METADATA_KEY].astext, "")
         == ""
     )
-
-
-def stale_pending_unbound_values(now: datetime, *, message: str) -> dict:
-    """Every column the unbound half of the pending sweep writes.
-
-    Companion to ``stale_pending_clauses``: bundles the cancelled/failed
-    split with the caller's own ``message``, so a caller cannot take one
-    without the other.
-    """
-    abandoned = abandoned_upload()
-    return {
-        "status": case((abandoned, "cancelled"), else_="failed"),
-        "error_message": case((abandoned, ABANDONED_UPLOAD_MESSAGE), else_=message),
-        "completed_at": now,
-    }
 
 
 def no_unclaimed_queue_entry():
@@ -240,6 +244,18 @@ class StaleCleanupOutcome:
     _unadopted_analysis_tables: tuple[tuple[uuid.UUID, str], ...] = field(
         default=(), repr=False, compare=False
     )
+    # The unpack prefixes tileset attempts named before their first put, reaped
+    # after the commit like the raster keys.
+    _unpublished_tileset_attempts: tuple[str, ...] = field(
+        default=(), repr=False, compare=False
+    )
+    # The job rows this pass settled, for a caller that logs each one.
+    _settled_running_ids: tuple[uuid.UUID, ...] = field(
+        default=(), repr=False, compare=False
+    )
+    _settled_pending: tuple[tuple[uuid.UUID, str], ...] = field(
+        default=(), repr=False, compare=False
+    )
 
     @property
     def total_cleaned(self) -> int:
@@ -304,7 +320,7 @@ def post_expiry_sweep_after_seconds() -> int:
 
 
 # Set on the post-expiry sweep's first pass; not permanent on its own (#1236).
-_STAGING_REAPED_MARKER = "s3_key_reaped"
+_STAGING_REAPED_MARKER = STAGING_REAPED_MARKER
 
 # fix(#1236): set once the RE-CHECK pass has run past
 # MAX_PRESIGNED_URL_LIFETIME_SECONDS + the transfer margin; only rows
@@ -351,9 +367,16 @@ async def _sweep_expired_presigned_staging(
                 IngestJob.user_metadata,
                 IngestJob.created_at,
             ).where(
-                IngestJob.status.not_in(("pending", "running")),
+                IngestJob.status.not_in(ACTIVE_STATUSES),
                 IngestJob.user_metadata["s3_key"].astext.is_not(None),
                 IngestJob.user_metadata[_STAGING_REAPED_FINAL_MARKER].astext.is_(None),
+                # With no file_path the key may hold the job's original alone.
+                not_(
+                    and_(
+                        func.coalesce(IngestJob.file_path, "") == "",
+                        holds_unarchived_original(),
+                    )
+                ),
                 or_(
                     and_(not_yet_reaped, IngestJob.created_at < first_pass_cutoff),
                     and_(
@@ -386,15 +409,19 @@ async def _sweep_expired_presigned_staging(
                 recheck_pass=is_recheck_pass,
             )
             continue
-        # Fresh dict, not an in-place mutation — JSONB doesn't track
-        # mutation, so an in-place edit would never flush.
-        new_metadata = {**(metadata or {}), _STAGING_REAPED_MARKER: True}
+        # Merged into the stored metadata, so a key another writer changed
+        # since the select above is not written back over.
+        markers = {_STAGING_REAPED_MARKER: True}
         if is_recheck_pass and created_at < recheck_final_cutoff:
-            new_metadata[_STAGING_REAPED_FINAL_MARKER] = True
+            markers[_STAGING_REAPED_FINAL_MARKER] = True
         await db.execute(
             update(IngestJob)
             .where(IngestJob.id == job_row_id)
-            .values(user_metadata=new_metadata)
+            .values(
+                user_metadata=func.coalesce(
+                    IngestJob.user_metadata, text("'{}'::jsonb")
+                ).op("||")(literal(markers, JSONB))
+            )
         )
         reaped += 1
 
@@ -498,9 +525,16 @@ async def _reap_committed_staged_paths(
     staged_paths_skipped += skipped
     staged_cleanup_failures += failures
 
-    # fix(#1778): the analysis peer of the loop above. Same rule, same reason:
-    # the table is dropped only once the row that stopped owning it is durable.
+    reaped, skipped, failures = await reap_unpublished_tileset_attempts(
+        outcome._unpublished_tileset_attempts
+    )
+    storage_objects_reaped += reaped
+    staged_paths_skipped += skipped
+    staged_cleanup_failures += failures
+
+    # Tables go only once the row that stopped owning them is durable.
     await _reap_unadopted_analysis_outputs(outcome._unadopted_analysis_tables)
+    await attempt_tables.reap_settled_attempt_tables()
 
     return replace(
         outcome,
@@ -514,17 +548,13 @@ async def _reap_committed_staged_paths(
 def unpublished_storage_keys_from_metadata(
     user_metadata: object,
 ) -> tuple[str, ...]:
-    """Read the object keys a killed raster tail named on its own job row.
+    """Read the object keys a killed raster or point cloud tail named on its job row.
 
-    fix(#1778): tails write their keys to ``user_metadata`` before the puts,
-    so a SIGKILL between the puts and the terminal ``finally`` still leaves
-    an owner. The prefix check is the only guard against a hand-edited row
-    licensing an arbitrary delete.
+    Tails write their keys to ``user_metadata`` before the puts, so a SIGKILL
+    between the puts and the terminal ``finally`` still leaves an owner. The
+    key shape check is the only guard against a hand-edited row licensing an
+    arbitrary delete.
     """
-    from app.processing.ingest.tasks_raster_common import (
-        UNPUBLISHED_STORAGE_KEYS_FIELD,
-    )
-
     if not isinstance(user_metadata, dict):
         return ()
     raw = user_metadata.get(UNPUBLISHED_STORAGE_KEYS_FIELD)
@@ -534,9 +564,27 @@ def unpublished_storage_keys_from_metadata(
         key
         for key in raw
         if isinstance(key, str)
-        and key.startswith(("rasters/", "originals/"))
-        and ".." not in key
+        and (
+            (key.startswith(("rasters/", "originals/")) and ".." not in key)
+            or is_pointcloud_attempt_key(key)
+        )
     )
+
+
+def unpublished_tileset_attempts_from_metadata(
+    user_metadata: object,
+) -> tuple[str, ...]:
+    """Read the unpack prefixes tileset attempts named on their job row.
+
+    Only the exact shape of one attempt's prefix is read back: the value comes
+    from a schemaless JSONB blob and licenses deleting everything under it.
+    """
+    if not isinstance(user_metadata, dict):
+        return ()
+    raw = user_metadata.get(UNPUBLISHED_TILESET_ATTEMPTS_FIELD)
+    if not isinstance(raw, list):
+        return ()
+    return tuple(prefix for prefix in raw if is_tileset_attempt_prefix(prefix))
 
 
 def unadopted_analysis_tables_from_metadata(user_metadata: object) -> tuple[str, ...]:
@@ -551,12 +599,16 @@ def unadopted_analysis_tables_from_metadata(user_metadata: object) -> tuple[str,
     return recorded_analysis_output_tables(user_metadata)
 
 
-async def _live_referenced_storage_keys(keys: tuple[str, ...]) -> set[str]:
+async def _live_referenced_storage_keys(
+    keys: tuple[str, ...], *, owed_cogs: bool = False
+) -> set[str]:
     """Which of ``keys`` a live catalog row still points at.
 
     Catalog rows hold LOGICAL keys, same form as the job row, so this is a
     plain match across the four schema columns naming an object under
-    `rasters/` or `originals/`.
+    `rasters/`, `originals/` or `pointclouds/`. With ``owed_cogs`` it also
+    counts a superseded COG a landed replacement's follow-ups still owe,
+    which a VRT may be reading.
     """
     from sqlalchemy import Text, any_, bindparam, union_all
     from sqlalchemy.dialects.postgresql import ARRAY
@@ -566,25 +618,33 @@ async def _live_referenced_storage_keys(keys: tuple[str, ...]) -> set[str]:
     from app.processing.raster.models import RasterAsset
 
     DatasetAsset = get_catalog_port().dataset_asset_orm_class()
-    # fix(#1778): ONE array param for all four arms — four IN clauses
-    # crossed asyncpg's 32767-arg ceiling at ~8192 keys, and a failed query
-    # skipped every delete, leaking the objects for good.
+    # One array param for every arm: an IN clause per arm crossed asyncpg's
+    # 32767-arg ceiling at ~8192 keys, and a failed query skipped every
+    # delete, leaking the objects for good.
     keys_param = bindparam("reap_keys", value=list(keys), type_=ARRAY(Text))
-    async with async_session() as session:
-        stmt = union_all(
-            select(RasterAsset.asset_uri.label("key")).where(
-                RasterAsset.asset_uri == any_(keys_param)
-            ),
-            select(RasterAsset.quicklook_256_uri.label("key")).where(
-                RasterAsset.quicklook_256_uri == any_(keys_param)
-            ),
-            select(RasterAsset.quicklook_512_uri.label("key")).where(
-                RasterAsset.quicklook_512_uri == any_(keys_param)
-            ),
-            select(DatasetAsset.href.label("key")).where(
-                DatasetAsset.href == any_(keys_param)
-            ),
+    arms = [
+        select(RasterAsset.asset_uri.label("key")).where(
+            RasterAsset.asset_uri == any_(keys_param)
+        ),
+        select(RasterAsset.quicklook_256_uri.label("key")).where(
+            RasterAsset.quicklook_256_uri == any_(keys_param)
+        ),
+        select(RasterAsset.quicklook_512_uri.label("key")).where(
+            RasterAsset.quicklook_512_uri == any_(keys_param)
+        ),
+        select(DatasetAsset.href.label("key")).where(
+            DatasetAsset.href == any_(keys_param)
+        ),
+    ]
+    if owed_cogs:
+        owed = IngestJob.user_metadata[PUBLISH_FOLLOWUPS_FIELD][SUPERSEDED_COG_ITEM]
+        arms.append(
+            select(owed["key"].astext.label("key")).where(
+                owed["key"].astext == any_(keys_param)
+            )
         )
+    async with async_session() as session:
+        stmt = union_all(*arms)
         return {row[0] for row in (await session.execute(stmt)).all() if row[0]}
 
 
@@ -637,6 +697,7 @@ async def _clear_settled_artifact_records(
     *,
     storage_keys: set[str] = frozenset(),  # type: ignore[assignment]
     analysis_tables: set[str] = frozenset(),  # type: ignore[assignment]
+    tileset_attempts: set[str] = frozenset(),  # type: ignore[assignment]
 ) -> None:
     """Drop the job-row record of artifacts that are now accounted for.
 
@@ -649,12 +710,8 @@ async def _clear_settled_artifact_records(
     from sqlalchemy.dialects.postgresql import ARRAY
 
     from app.core.db import async_session
-    from app.processing.analysis.tasks import ANALYSIS_OUTPUT_TABLE_FIELD
-    from app.processing.ingest.tasks_raster_common import (
-        UNPUBLISHED_STORAGE_KEYS_FIELD,
-    )
 
-    if not storage_keys and not analysis_tables:
+    if not storage_keys and not analysis_tables and not tileset_attempts:
         return
     try:
         async with async_session() as session:
@@ -680,12 +737,22 @@ async def _clear_settled_artifact_records(
                         ),
                     )
                 )
+            if tileset_attempts:
+                await session.execute(
+                    text(_CLEAR_SETTLED_LIST_SQL).bindparams(
+                        bindparam("field", value=UNPUBLISHED_TILESET_ATTEMPTS_FIELD),
+                        bindparam(
+                            "settled", value=sorted(tileset_attempts), type_=ARRAY(Text)
+                        ),
+                    )
+                )
             await session.commit()
     except Exception:  # broad: costs one more sweep, never correctness
         log.warning(
             "Failed to clear settled artifact records",
             key_count=len(storage_keys),
             table_count=len(analysis_tables),
+            prefix_count=len(tileset_attempts),
         )
 
 
@@ -706,7 +773,9 @@ async def reap_unpublished_storage_keys(
         return (0, 0, 0)
 
     try:
-        live = await _live_referenced_storage_keys(keys)
+        # A replacement's follow-ups decide its superseded COG, which a VRT
+        # may still read.
+        live = await _live_referenced_storage_keys(keys, owed_cogs=True)
     except Exception:  # broad: an unreadable catalog must not license a delete
         log.warning(
             "Skipped unpublished raster reap, survivor query failed",
@@ -747,6 +816,70 @@ async def reap_unpublished_storage_keys(
             settled.add(key)
     await _clear_settled_artifact_records(storage_keys=settled)
     return (reaped, skipped, failures)
+
+
+async def reap_unpublished_tileset_attempts(
+    prefixes: tuple[str, ...],
+) -> tuple[int, int, int]:
+    """Delete what killed tileset attempts unpacked, but never a live attempt.
+
+    Returns ``(objects reaped, prefixes refused, prefixes failed)``. A prefix
+    a live pointer names is refused, and a failed survivor query deletes
+    nothing. A refused or emptied prefix comes off the job-row record; a
+    failed one stays on it for the next pass.
+    """
+    from app.core.db import async_session
+    from app.core.db.tenant_session import current_tenant_var
+    from app.core.tenancy import is_multi_tenant
+    from app.modules.catalog.datasets.domain.service import get_tileset_href
+    from app.platform.storage.reap import delete_prefix
+
+    prefixes = tuple(dict.fromkeys(prefixes))
+    if not prefixes:
+        return (0, 0, 0)
+    live: set[str] = set()
+    try:
+        async with async_session() as session:
+            for prefix in prefixes:
+                # Only its dataset's pointer is served from under a prefix, and
+                # that pointer names its own attempt's tileset.json.
+                href = await get_tileset_href(session, tileset_attempt_dataset(prefix))
+                if href is not None and href.startswith(prefix):
+                    live.add(prefix)
+    except Exception:  # broad: an unreadable catalog must not license a delete
+        log.warning(
+            "Skipped tileset attempt reap, survivor query failed",
+            prefix_count=len(prefixes),
+        )
+        return (0, len(prefixes), 0)
+
+    tenant_id = current_tenant_var.get() if is_multi_tenant() else None
+    reaped = refused = failed = 0
+    settled: set[str] = set()
+    for prefix in prefixes:
+        if prefix in live:
+            refused += 1
+            outcome = "refused"
+            log.warning(
+                "Refused to reap a tileset attempt a live pointer names",
+                storage_prefix=prefix,
+            )
+        else:
+            try:
+                reaped += await delete_prefix(prefix, tenant_id=tenant_id)
+            except Exception:  # broad: the record stays for the next pass
+                failed += 1
+                outcome = "failed"
+                log.warning(
+                    "Failed to reap an unpublished tileset attempt",
+                    storage_prefix=prefix,
+                )
+            else:
+                outcome = "deleted"
+        if outcome in STORAGE_KEY_FINAL_OUTCOMES:
+            settled.add(prefix)
+    await _clear_settled_artifact_records(tileset_attempts=settled)
+    return (reaped, refused, failed)
 
 
 async def _reap_unadopted_analysis_outputs(
@@ -825,24 +958,6 @@ def _stale_generation_storage_keys(
     )
 
 
-async def _reap_stale_generation_storage(keys: tuple[str, ...]) -> None:
-    """Best-effort delete of already-resolved, already-committed keys.
-
-    fix(#1322): must run strictly after the caller's commit — a "dead"
-    worker is declared by heartbeat, not proof, and a rolled-back
-    reconciliation could still publish a generation whose objects this
-    already deleted. Deleting a never-written key is a documented no-op.
-    """
-    if not keys:
-        return
-
-    # Function-local: platform may not import processing eagerly
-    # (test_platform_processing_imports_stay_deferred).
-    from app.processing.ingest.tasks_raster import _cleanup_orphaned_storage_keys
-
-    await _cleanup_orphaned_storage_keys(list(keys), job_id="vrt-stale-sweep")
-
-
 # fix(#1322): does the PUBLISHED member set (built_from) still
 # match the CATALOG's (vrt_source_links)? Count-match + subset proves it.
 # `jsonb_typeof = 'object'`, not IS NOT NULL — a JSON `null` scalar raises.
@@ -906,6 +1021,8 @@ _NO_LIVE_GENERATION_JOB_SQL = """
 async def sweep_stale_vrt_assets(
     db: AsyncSession,
     stale_cutoff: datetime,
+    *,
+    dataset_ids=None,
 ) -> tuple[int, int, tuple[str, ...]]:
     """Reconcile RasterAsset rows stuck in status='regenerating' past ``stale_cutoff``.
 
@@ -926,6 +1043,8 @@ async def sweep_stale_vrt_assets(
     Args:
         db: Active async session; must NOT be committed before returning.
         stale_cutoff: Generations started before this are stale.
+        dataset_ids: When given (ids, or a select of them), only these VRT
+            datasets' generations are considered.
 
     Returns:
         ``(assets_recovered, gens_failed, storage_keys)``; assets_recovered
@@ -946,6 +1065,8 @@ async def sweep_stale_vrt_assets(
 
         generation_scope.append(VrtGeneration.vrt_dataset_id.in_(select(Dataset.id)))
         asset_scope.append(RasterAsset.dataset_id.in_(select(Dataset.id)))
+    if dataset_ids is not None:
+        generation_scope.append(VrtGeneration.vrt_dataset_id.in_(dataset_ids))
 
     # fix(#1322): 'running' trusts its own stale heartbeat (procrastinate
     # may still read 'doing'); 'pending' also needs proof of no live queue row.
@@ -1034,8 +1155,8 @@ async def sweep_stale_vrt_assets(
 def publish_refresh_reconciliation(outcome: StaleCleanupOutcome) -> None:
     """Publish the sweep's reconciliation counter, AFTER its commit landed.
 
-    fix(#1277): a counter incremented inside the transaction survives a
-    rollback, and the overcount is permanent. Both commit sites call this.
+    A counter incremented inside the transaction survives a rollback, and the
+    overcount is permanent. Every commit site calls this.
     """
     if outcome._refresh_runs_reconciled:
         refresh_sweep_reconciled_total.inc(outcome._refresh_runs_reconciled)
@@ -1103,6 +1224,283 @@ async def purge_terminal_job_tokens(db: AsyncSession) -> None:
     await db.commit()
 
 
+def _stale_running_message(lease_seconds: float) -> FixedReason:
+    return FixedReason(
+        f"Stale: running for over {int(lease_seconds) // 60} minutes",
+        code="worker_lost",
+    )
+
+
+def _childless_fan_out_parent():
+    """Predicate: no job names this row as its fan-out parent."""
+    return text(
+        "NOT EXISTS (SELECT 1 FROM catalog.ingest_jobs c"
+        " WHERE c.user_metadata->>'fan_out_parent_id' = ingest_jobs.id::text)"
+    )
+
+
+def _pending_age_basis(job: IngestJob) -> datetime | None:
+    """What the pass ages a pending job from: ``staged_at``, else ``created_at``.
+
+    An unreadable or naive stamp falls back to ``created_at``, which is never
+    later, so the fallback can only make a job look older.
+    """
+    try:
+        staged_at = datetime.fromisoformat((job.user_metadata or {})["staged_at"])
+    except (KeyError, TypeError, ValueError):
+        return job.created_at
+    return staged_at if staged_at.tzinfo is not None else job.created_at
+
+
+def may_be_stale(job: IngestJob, now: datetime) -> bool:
+    """Whether ``settle_stale_jobs`` could settle this loaded job at ``now``.
+
+    A free precheck for a caller that settles one job: a job it rejects is one
+    the pass would leave alone, and the pass re-checks everything it accepts.
+    ``is_held_back`` covers the queue and child rows this cannot see.
+    """
+    if job.status == "running":
+        liveness = job.heartbeat_at or job.started_at
+        lease = (
+            ANALYSIS_MATERIALIZE_LEASE_SECONDS
+            if "analysis" in (job.user_metadata or {})
+            else JOB_TIMEOUT_SECONDS
+        )
+        return liveness is not None and (now - liveness).total_seconds() > lease
+    if job.status == "pending":
+        basis = _pending_age_basis(job)
+        cutoff = stale_pending_cutoff_seconds(
+            completion_bound=(job.file_path or "").startswith("staging/")
+        )
+        return basis is not None and (now - basis).total_seconds() > cutoff
+    if job.status == "fanned_out":
+        return (
+            job.completed_at is not None
+            and (now - job.completed_at).total_seconds()
+            > FAN_OUT_CHILDLESS_GRACE_SECONDS
+        )
+    return False
+
+
+async def is_held_back(db: AsyncSession, job: IngestJob) -> bool:
+    """Whether the row that makes the pass leave this job alone still exists.
+
+    One read of the pass's own predicate for the job's status: a live queue
+    row for a pending job, an unclaimed one for a running job, and a child for
+    a fan-out parent. Meant for a job ``may_be_stale`` accepted.
+    """
+    if job.status == "pending":
+        free = no_live_procrastinate_job()
+    elif job.status == "running":
+        free = no_unclaimed_queue_entry()
+    else:
+        free = _childless_fan_out_parent()
+    return not await db.scalar(select(free).where(IngestJob.id == job.id))
+
+
+async def settle_stale_jobs(
+    db: AsyncSession, now: datetime, *, job_ids: Sequence[uuid.UUID] | None = None
+) -> StaleCleanupOutcome:
+    """Settle stale jobs, VRT regenerations and refresh runs, without committing.
+
+    The one settlement pass the lifespan sweep, worker startup recovery, the
+    job status poll and manifest reservation expiry share. Stale rules:
+      - pending: older than ``stale_pending_cutoff_seconds`` AND no live
+        Procrastinate job (a true orphan, never queued)
+      - running: heartbeat_at/started_at older than the job's lease:
+        ANALYSIS_MATERIALIZE_LEASE_SECONDS for an analysis job, else
+        JOB_TIMEOUT_SECONDS
+      - fanned_out: still childless past ``FAN_OUT_CHILDLESS_GRACE_SECONDS``
+
+    Each stale job ends through the job ledger in its own SAVEPOINT, fenced on
+    the status and attempt read here, with its class's rule checked again
+    under the row lock. Running candidates are locked when read and skip rows
+    a task holds; the others are taken in creation order, so two concurrent
+    passes wait on each other rather than deadlock, and each row ends once. A
+    hook that raises rolls back its row's end and stops the pass. Each
+    owner's stale pass then runs once: VRT RasterAsset rows stuck
+    'regenerating' use JOB_TIMEOUT_SECONDS. ``job_ids`` limits all of it to
+    those jobs. The outcome carries no purge or reap counts.
+    """
+    scope = () if job_ids is None else (IngestJob.id.in_(job_ids),)
+    pending: list[tuple[uuid.UUID, str]] = []
+
+    # fix(#1234): the 1h policy applies only to rows that never bound bytes.
+    # The guard is FALSY, not IS NULL — every creator writes "" for file_path.
+    unbound = stale_pending_clauses(now, completion_bound=False)
+    never_dispatched = abandoned_upload()
+    for job_id, attempt_id, abandoned in await _stale_candidates(
+        db, select(IngestJob.id, IngestJob.attempt_id, never_dispatched), unbound, scope
+    ):
+        # fix(#1556): an upload nobody ever committed is cancelled, not failed.
+        status = "cancelled" if abandoned else "failed"
+        ended = await end_stale(
+            db,
+            job_id,
+            attempt_id,
+            expect="pending",
+            still_stale=(
+                *unbound,
+                never_dispatched if abandoned else not_(never_dispatched),
+            ),
+            status=status,
+            code="never_started",
+            reason=ABANDONED_UPLOAD_MESSAGE
+            if abandoned
+            else STALE_PENDING_UNBOUND_MESSAGE,
+        )
+        if ended.outcome is Outcome.LANDED:
+            pending.append((job_id, status))
+
+    # fix(#1234): the bound half — exempt from the 1h clause, and the purge
+    # only takes terminal rows, so it is immortal without this backstop.
+    bound = stale_pending_clauses(now, completion_bound=True)
+    for job_id, attempt_id in await _stale_candidates(
+        db, select(IngestJob.id, IngestJob.attempt_id), bound, scope
+    ):
+        ended = await end_stale(
+            db,
+            job_id,
+            attempt_id,
+            expect="pending",
+            still_stale=bound,
+            status="failed",
+            code="never_started",
+            reason=STALE_PENDING_BOUND_MESSAGE,
+        )
+        if ended.outcome is Outcome.LANDED:
+            pending.append((job_id, "failed"))
+
+    is_analysis = IngestJob.user_metadata.has_key("analysis")
+    liveness = func.coalesce(IngestJob.heartbeat_at, IngestJob.started_at)
+    expired = (
+        IngestJob.status == "running",
+        or_(
+            liveness < now - timedelta(seconds=JOB_TIMEOUT_SECONDS),
+            and_(
+                is_analysis,
+                liveness < now - timedelta(seconds=ANALYSIS_MATERIALIZE_LEASE_SECONDS),
+            ),
+        ),
+        no_unclaimed_queue_entry(),
+    )
+    running: list[uuid.UUID] = []
+    # fix(#1778): candidates are locked `FOR UPDATE SKIP LOCKED` as they are
+    # read — a phase-2 write holds `FOR NO KEY UPDATE`, and waiting on it
+    # would stall the whole pass behind one task's swap.
+    for job_id, attempt_id, analysis in await _stale_candidates(
+        db,
+        select(IngestJob.id, IngestJob.attempt_id, is_analysis),
+        expired,
+        scope,
+        skip_locked=True,
+    ):
+        lease = ANALYSIS_MATERIALIZE_LEASE_SECONDS if analysis else JOB_TIMEOUT_SECONDS
+        ended = await end_stale(
+            db,
+            job_id,
+            attempt_id,
+            expect="running",
+            still_stale=expired,
+            status="failed",
+            code="worker_lost",
+            reason=_stale_running_message(lease),
+        )
+        if ended.outcome is Outcome.LANDED:
+            running.append(job_id)
+
+    # fix(#1709): a childless `fanned_out` parent past the grace, inside the
+    # retention horizon, is the signature of a dispatch interrupted pre-commit.
+    # fix(#2016): a dispatch still looping reclaims this row on its way out.
+    childless = [
+        IngestJob.status == "fanned_out",
+        IngestJob.completed_at.is_not(None),
+        IngestJob.completed_at
+        < now - timedelta(seconds=FAN_OUT_CHILDLESS_GRACE_SECONDS),
+        _childless_fan_out_parent(),
+    ]
+    if settings.ingest_jobs_retention_days > 0:
+        childless.append(
+            IngestJob.completed_at
+            >= now - timedelta(days=settings.ingest_jobs_retention_days)
+        )
+    childless_fanout_ids: list[uuid.UUID] = []
+    for job_id, attempt_id in await _stale_candidates(
+        db, select(IngestJob.id, IngestJob.attempt_id), childless, scope
+    ):
+        ended = await end_stale(
+            db,
+            job_id,
+            attempt_id,
+            expect="fanned_out",
+            still_stale=childless,
+            status="failed",
+            code="dispatch_interrupted",
+            reason=FAN_OUT_DISPATCH_INTERRUPTED_MESSAGE,
+            # fix(#1709): the marker _retry_capability refuses on; a generic
+            # retry would import ONE default layer of a multi-layer file.
+            values={
+                "user_metadata": func.coalesce(
+                    IngestJob.user_metadata, text("'{}'::jsonb")
+                ).op("||")(
+                    text(f"'{{\"{FAN_OUT_INTERRUPTED_METADATA_KEY}\": true}}'::jsonb")
+                )
+            },
+        )
+        if ended.outcome is Outcome.LANDED:
+            childless_fanout_ids.append(job_id)
+    if childless_fanout_ids:
+        log.warning(
+            "childless_fanned_out_parents_failed",
+            job_ids=[str(job_id_) for job_id_ in childless_fanout_ids],
+        )
+
+    # After the job ends, which supply one of the facts the run pass requires.
+    # GAP-002: the VRT pass resolves a dead generation's keys, and the caller
+    # reaps them only after its commit (fix(#1322)), like _staged_paths.
+    linked = await run_stale_passes(db, now, job_ids=job_ids)
+    if linked.refresh_runs_cancelled:
+        log.info(
+            "abandoned_refresh_runs_cancelled", count=linked.refresh_runs_cancelled
+        )
+
+    pending_cancelled = sum(1 for _job_id, status in pending if status == "cancelled")
+    return StaleCleanupOutcome(
+        pending_failed=len(pending) - pending_cancelled,
+        pending_cancelled=pending_cancelled,
+        running_failed=len(running),
+        vrt_assets_recovered=linked.vrt_assets_recovered,
+        vrt_generations_failed=linked.vrt_generations_failed,
+        terminal_jobs_purged=0,
+        staged_paths_considered=0,
+        local_files_reaped=0,
+        storage_objects_reaped=0,
+        staged_paths_skipped=0,
+        staged_cleanup_failures=0,
+        _refresh_runs_reconciled=linked.refresh_runs_cancelled,
+        _stale_generation_storage_keys=linked.storage_keys,
+        _settled_running_ids=tuple(running),
+        _settled_pending=tuple(pending),
+    )
+
+
+async def _stale_candidates(
+    db: AsyncSession,
+    columns: Select,
+    rule: Sequence,
+    scope: Sequence,
+    *,
+    skip_locked: bool = False,
+) -> list:
+    """The rows one stale class's rule matches, oldest first."""
+    statement = columns.where(*rule, *scope).order_by(
+        IngestJob.created_at, IngestJob.id
+    )
+    if skip_locked:
+        statement = statement.with_for_update(skip_locked=True)
+    return list((await db.execute(statement)).all())
+
+
 @overload
 async def fail_stale_jobs(
     db: AsyncSession,
@@ -1127,189 +1525,20 @@ async def fail_stale_jobs(
     commit: bool = True,
     detailed: bool = False,
 ) -> tuple[int, int] | StaleCleanupOutcome:
-    """Mark stale jobs failed and reap retained staging artifacts.
+    """Settle stale jobs, purge terminal jobs past retention, and reap artifacts.
 
     The default two-item tuple preserves the background-sweeper contract.
     ``detailed=True`` returns the complete operational outcome for the admin
-    endpoint and its audit event.
-
-    Stale rules:
-      - pending: older than ``stale_pending_cutoff_seconds`` AND no live
-        Procrastinate job (a true orphan, never queued)
-      - running: heartbeat_at/started_at older than JOB_TIMEOUT_SECONDS
-        (worker lease expired)
-
-    Also sweeps VRT RasterAsset rows stuck 'regenerating' past
-    JOB_TIMEOUT_SECONDS (GAP-002) via ``sweep_stale_vrt_assets``, using the
-    same stale_cutoff.
+    endpoint and its audit event. ``settle_stale_jobs`` holds the stale rules.
     """
+    from app.processing.ingest.publish_followups import run_owed_publish_followups
+    from app.processing.raster.vrt_members import reclaim_retained_cogs
+
     now = datetime.now(timezone.utc)
-
-    # fix(#1234): the 1h policy applies only to rows that never bound bytes.
-    # The guard is FALSY, not IS NULL — every creator writes "" for file_path.
-    unbound_result = await db.execute(
-        update(IngestJob)
-        .where(*stale_pending_clauses(now, completion_bound=False))
-        .values(
-            **stale_pending_unbound_values(now, message=STALE_PENDING_UNBOUND_MESSAGE)
-        )
-        # fix(#1556): RETURNING carries the status the CASE actually chose.
-        .returning(
-            IngestJob.id,
-            IngestJob.user_metadata,
-            IngestJob.created_by,
-            IngestJob.status,
-        )
-    )
-    unbound_rows = list(unbound_result.all())
-    # Positional access, like every row read here: a mocked session hands
-    # back plain tuples, and attribute access would pass against the DB but
-    # raise in the unit suites that drive this with doubles.
-    pending_cancelled = sum(1 for row in unbound_rows if row[3] == "cancelled")
-    # fix(#1744): cancelled rows still get their audit trail closed; a backfill
-    # in the cancelled class is exactly the `never_started` the loop records.
-    pending_rows = [(row[0], row[1], row[2]) for row in unbound_rows]
-    pending_job_ids = [row[0] for row in unbound_rows]
-
-    # fix(#1234): the bound half — exempt from the 1h clause, and the purge
-    # only takes terminal rows, so it is immortal without this backstop.
-    bound_pending_result = await db.execute(
-        update(IngestJob)
-        .where(*stale_pending_clauses(now, completion_bound=True))
-        .values(
-            status="failed",
-            error_message=STALE_PENDING_BOUND_MESSAGE,
-            completed_at=now,
-        )
-        .returning(IngestJob.id, IngestJob.user_metadata, IngestJob.created_by)
-    )
-    bound_pending_rows = list(bound_pending_result.all())
-    pending_rows += bound_pending_rows
-    pending_job_ids += [row[0] for row in bound_pending_rows]
-
-    # fix(#1778): "still names an unreaped artifact" — the purge
-    # refuses these rows too. A string test on the JSONB blob, never a
-    # throwing cast.
-    from app.processing.analysis.tasks import ANALYSIS_OUTPUT_TABLE_FIELD
-    from app.processing.ingest.tasks_raster_common import (
-        UNPUBLISHED_STORAGE_KEYS_FIELD,
-    )
-
-    carries_unreaped_artifacts = or_(
-        IngestJob.user_metadata[UNPUBLISHED_STORAGE_KEYS_FIELD].is_not(None),
-        IngestJob.user_metadata[ANALYSIS_OUTPUT_TABLE_FIELD].is_not(None),
-    )
-
-    running_cutoff = now - timedelta(seconds=JOB_TIMEOUT_SECONDS)
-    # fix(#1778): candidates come through their own `FOR UPDATE
-    # SKIP LOCKED` subquery — a phase-2 write holds `FOR NO KEY UPDATE`, and
-    # a lock_timeout on a set-based UPDATE would cancel the WHOLE statement.
-    running_candidates = (
-        select(IngestJob.id)
-        .where(
-            IngestJob.status == "running",
-            func.coalesce(IngestJob.heartbeat_at, IngestJob.started_at)
-            < running_cutoff,
-            no_unclaimed_queue_entry(),
-        )
-        .with_for_update(skip_locked=True)
-    )
-    running_result = await db.execute(
-        update(IngestJob)
-        .where(IngestJob.id.in_(running_candidates))
-        .values(
-            status="failed",
-            error_message=(
-                f"Stale: running for over {JOB_TIMEOUT_SECONDS // 60} minutes"
-            ),
-            completed_at=now,
-        )
-        .returning(IngestJob.id, IngestJob.user_metadata, IngestJob.created_by)
-    )
-    running_rows = list(running_result.all())
-    running_job_ids = [row[0] for row in running_rows]
-
-    # fix(#1550): the row and its audit trail are settled by the same actor in
-    # the same transaction; after a hard kill this sweep is the only actor left.
-    for job_id_, user_metadata_, created_by_ in running_rows:
-        await audit_settled_embedding_backfill(
-            db,
-            job_id=job_id_,
-            user_metadata=user_metadata_,
-            created_by=created_by_,
-            error_code="worker_lost",
-        )
-    for job_id_, user_metadata_, created_by_ in pending_rows:
-        await audit_settled_embedding_backfill(
-            db,
-            job_id=job_id_,
-            user_metadata=user_metadata_,
-            created_by=created_by_,
-            error_code="never_started",
-        )
-
-    # fix(#1709): a childless `fanned_out` parent past the grace, inside the
-    # retention horizon, is the signature of a dispatch interrupted pre-commit.
-    # fix(#2016): a dispatch still looping reclaims this row on its way out.
-    childless_fanout_clauses = [
-        IngestJob.status == "fanned_out",
-        IngestJob.completed_at.is_not(None),
-        IngestJob.completed_at
-        < now - timedelta(seconds=FAN_OUT_CHILDLESS_GRACE_SECONDS),
-        text(
-            "NOT EXISTS (SELECT 1 FROM catalog.ingest_jobs c"
-            " WHERE c.user_metadata->>'fan_out_parent_id' = ingest_jobs.id::text)"
-        ),
-    ]
-    if settings.ingest_jobs_retention_days > 0:
-        childless_fanout_clauses.append(
-            IngestJob.completed_at
-            >= now - timedelta(days=settings.ingest_jobs_retention_days)
-        )
-    childless_fanout_result = await db.execute(
-        update(IngestJob)
-        .where(*childless_fanout_clauses)
-        .values(
-            status="failed",
-            error_message=FAN_OUT_DISPATCH_INTERRUPTED_MESSAGE,
-            completed_at=now,
-            # fix(#1709): the marker _retry_capability refuses on; a generic
-            # retry would import ONE default layer of a multi-layer file.
-            user_metadata=func.coalesce(
-                IngestJob.user_metadata, text("'{}'::jsonb")
-            ).op("||")(
-                text(f"'{{\"{FAN_OUT_INTERRUPTED_METADATA_KEY}\": true}}'::jsonb")
-            ),
-        )
-        .returning(IngestJob.id)
-    )
-    childless_fanout_ids = list(childless_fanout_result.scalars())
-    if childless_fanout_ids:
-        log.warning(
-            "childless_fanned_out_parents_failed",
-            job_ids=[str(job_id_) for job_id_ in childless_fanout_ids],
-        )
-
-    # GAP-002: stale VRT assets, same cutoff. fix(#1322): the generation keys
-    # are resolved here and reaped only after the commit, like _staged_paths.
-    (
-        vrt_assets_recovered,
-        vrt_generations_failed,
-        stale_generation_storage_keys,
-    ) = await sweep_stale_vrt_assets(db, running_cutoff)
-
-    # feat(#1219): AFTER the two job sweeps, which supply one of the facts the
-    # run sweep requires. Not folded into StaleCleanupOutcome (published shape).
-    cancelled_runs = await sweep_abandoned_refresh_runs(db, now)
-    if cancelled_runs:
-        log.info("abandoned_refresh_runs_cancelled", count=cancelled_runs)
+    settled = await settle_stale_jobs(db, now)
 
     terminal_jobs_purged = 0
     staged_paths_considered = 0
-    local_files_reaped = 0
-    storage_objects_reaped = 0
-    staged_paths_skipped = 0
-    staged_cleanup_failures = 0
     deleted_paths: set[str] = set()
     deleted_presigned_keys: set[str] = set()
 
@@ -1362,19 +1591,27 @@ async def fail_stale_jobs(
             ),
         )
         purge_clauses = [
-            IngestJob.status.not_in(("pending", "running")),
+            IngestJob.status.not_in(ACTIVE_STATUSES),
             func.coalesce(IngestJob.completed_at, IngestJob.created_at)
             < retention_cutoff,
             IngestJob.id.not_in(latest_complete_ids),
             IngestJob.id.not_in(latest_manifest_ids),
             not_(presigned_url_may_still_be_live),
+            not_(holds_unarchived_original()),
+            attempt_tables.owns_no_staging_table(),
         ]
-        # fix(#1778): a row still naming an unreaped artifact is not
-        # purged; it IS the pending-reap record. One DELETE .. RETURNING
-        # (#434) so retry can't flip a candidate mid-way.
+        # A row still naming an unreaped artifact is the pending-reap record,
+        # so it stays. One statement, so a retry can't flip a candidate
+        # mid-way; a row someone holds, such as a blocked job whose upload an
+        # acceptance is reusing, is skipped until a later pass.
+        purgeable = (
+            select(IngestJob.id)
+            .where(*purge_clauses, not_(_carries_unreaped_artifacts()))
+            .with_for_update(skip_locked=True)
+        )
         deleted = await db.execute(
             delete(IngestJob)
-            .where(*purge_clauses, not_(carries_unreaped_artifacts))
+            .where(IngestJob.id.in_(purgeable))
             .returning(IngestJob.id, IngestJob.file_path, IngestJob.user_metadata)
         )
         deleted_rows = deleted.all()
@@ -1394,61 +1631,26 @@ async def fail_stale_jobs(
                 retention_days=settings.ingest_jobs_retention_days,
             )
 
-        # #434 r3-r5: this purge is the retention policy for staged files.
-        # Reap only paths no surviving row NEEDS (pending/running reads it,
-        # failed keeps it for retry); complete rows keep the row, not the file.
+        # This purge is the retention policy for staged files: a path goes
+        # only once no surviving row still needs it.
         if deleted_paths:
             survivors = await db.execute(
                 select(IngestJob.file_path).where(
-                    IngestJob.file_path.in_(deleted_paths),
-                    IngestJob.status.in_(STATUSES_NEEDING_STAGED_INPUT),
+                    IngestJob.file_path.in_(deleted_paths), needs_staged_input()
                 )
             )
             deleted_paths -= set(survivors.scalars())
         staged_paths_considered = len(deleted_paths)
 
-    # fix(#1778): ONE collection — terminal, still carrying a record,
-    # regardless of age or exemption; bounded so a pass can't hold its
-    # session open.
-    artifact_rows = await db.execute(
-        select(IngestJob.id, IngestJob.user_metadata)
-        .where(
-            IngestJob.status.not_in(("pending", "running")),
-            carries_unreaped_artifacts,
-        )
-        .limit(_ARTIFACT_REAP_BATCH)
-    )
-    unpublished_storage_keys: list[str] = []
-    # The row id rides along so the drop can refuse a name that isn't this
-    # job's, without a second read to re-derive ownership.
-    unadopted_analysis_tables: list[tuple[uuid.UUID, str]] = []
-    for artifact_id, artifact_metadata in artifact_rows.all():
-        unpublished_storage_keys.extend(
-            unpublished_storage_keys_from_metadata(artifact_metadata)
-        )
-        unadopted_analysis_tables.extend(
-            (artifact_id, name)
-            for name in unadopted_analysis_tables_from_metadata(artifact_metadata)
-        )
-
-    outcome = StaleCleanupOutcome(
-        pending_failed=len(pending_job_ids) - pending_cancelled,
-        pending_cancelled=pending_cancelled,
-        running_failed=len(running_job_ids),
-        vrt_assets_recovered=vrt_assets_recovered,
-        vrt_generations_failed=vrt_generations_failed,
-        terminal_jobs_purged=terminal_jobs_purged,
-        staged_paths_considered=staged_paths_considered,
-        local_files_reaped=local_files_reaped,
-        storage_objects_reaped=storage_objects_reaped,
-        staged_paths_skipped=staged_paths_skipped,
-        staged_cleanup_failures=staged_cleanup_failures,
-        _staged_paths=tuple(sorted(deleted_paths)),
-        _staged_presigned_keys=tuple(sorted(deleted_presigned_keys)),
-        _refresh_runs_reconciled=cancelled_runs,
-        _stale_generation_storage_keys=stale_generation_storage_keys,
-        _unpublished_storage_keys=tuple(sorted(set(unpublished_storage_keys))),
-        _unadopted_analysis_tables=tuple(sorted(set(unadopted_analysis_tables))),
+    outcome = await collect_unreaped_artifacts(
+        db,
+        replace(
+            settled,
+            terminal_jobs_purged=terminal_jobs_purged,
+            staged_paths_considered=staged_paths_considered,
+            _staged_paths=tuple(sorted(deleted_paths)),
+            _staged_presigned_keys=tuple(sorted(deleted_presigned_keys)),
+        ),
     )
     if commit:
         # Never remove an external artifact before a DELETE that may still
@@ -1458,12 +1660,73 @@ async def fail_stale_jobs(
         publish_refresh_reconciliation(outcome)
         outcome = await _reap_committed_staged_paths(outcome)
         outcome = await _sweep_expired_presigned_staging(db, outcome, now=now)
-        # fix(#1249): starts from the OBJECTS and asks whether any row owns
-        # them — the only direction that finds one nothing references.
+        # Starting from the objects is the only way to find one no row references.
         await reconcile_orphaned_staging_objects(db, now=now)
+        await reconcile_orphaned_originals(db, now=now)
+        await reconcile_orphaned_quicklooks(db, now=now)
+        await run_owed_publish_followups()
+        await reclaim_retained_cogs()
     if detailed:
         return outcome
     return outcome.pending_failed, outcome.running_failed
+
+
+_REAPED_ARTIFACT_FIELDS = (
+    UNPUBLISHED_STORAGE_KEYS_FIELD,
+    ANALYSIS_OUTPUT_TABLE_FIELD,
+    UNPUBLISHED_TILESET_ATTEMPTS_FIELD,
+)
+
+
+def _carries_unreaped_artifacts(fields=UNREAPED_ARTIFACT_FIELDS):
+    """Predicate: the row still names one of ``fields`` nothing has settled.
+
+    By default that is any artifact or follow-ups, which makes the row the
+    pending record the retention purge keeps. A string test on the JSONB blob,
+    never a throwing cast.
+    """
+    return or_(*(carries_unreaped(field) for field in fields))
+
+
+async def collect_unreaped_artifacts(
+    db: AsyncSession, outcome: StaleCleanupOutcome
+) -> StaleCleanupOutcome:
+    """Add the artifacts terminal job rows still name, for the post-commit reap.
+
+    Every terminal row naming an artifact counts, whatever its age or
+    exemption; bounded so a pass can't hold its session open. Rows that owe
+    only follow-ups are left out, so they can't fill the batch.
+    """
+    artifact_rows = await db.execute(
+        select(IngestJob.id, IngestJob.user_metadata)
+        .where(
+            IngestJob.status.not_in(ACTIVE_STATUSES),
+            _carries_unreaped_artifacts(_REAPED_ARTIFACT_FIELDS),
+        )
+        .limit(_ARTIFACT_REAP_BATCH)
+    )
+    unpublished_storage_keys: list[str] = []
+    # The row id rides along so the drop can refuse a name that isn't this
+    # job's, without a second read to re-derive ownership.
+    unadopted_analysis_tables: list[tuple[uuid.UUID, str]] = []
+    unpublished_tileset_attempts: list[str] = []
+    for artifact_id, artifact_metadata in artifact_rows.all():
+        unpublished_storage_keys.extend(
+            unpublished_storage_keys_from_metadata(artifact_metadata)
+        )
+        unadopted_analysis_tables.extend(
+            (artifact_id, name)
+            for name in unadopted_analysis_tables_from_metadata(artifact_metadata)
+        )
+        unpublished_tileset_attempts.extend(
+            unpublished_tileset_attempts_from_metadata(artifact_metadata)
+        )
+    return replace(
+        outcome,
+        _unpublished_storage_keys=tuple(sorted(set(unpublished_storage_keys))),
+        _unadopted_analysis_tables=tuple(sorted(set(unadopted_analysis_tables))),
+        _unpublished_tileset_attempts=tuple(sorted(set(unpublished_tileset_attempts))),
+    )
 
 
 async def audit_settled_embedding_backfill(
@@ -1474,13 +1737,15 @@ async def audit_settled_embedding_backfill(
     created_by: uuid.UUID | None,
     error_code: str,
     settled_by: uuid.UUID | None = None,
+    ip_address: str | None = None,
 ) -> None:
     """Close an embedding backfill's audit trail when a sweeper settles its row.
 
     fix(#1550): the job row and audit trail are written together by
     whichever actor settles the job — after a hard kill, that's the sweeper.
     Emitted on the caller's session so both commit or roll back as one. A
-    no-op for any other kind of job.
+    no-op for any other kind of job. ``ip_address`` is the request behind the
+    settlement; a sweep has none.
     """
     marker = (user_metadata or {}).get(EMBEDDING_BACKFILL_METADATA_KEY)
     if not marker:
@@ -1492,7 +1757,7 @@ async def audit_settled_embedding_backfill(
     try:
         async with session.begin_nested():
             await _emit_terminal_backfill_event(
-                session, marker, job_id, actor, error_code
+                session, marker, job_id, actor, error_code, ip_address
             )
     except IntegrityError:
         log.info(
@@ -1508,6 +1773,7 @@ async def _emit_terminal_backfill_event(
     job_id: uuid.UUID,
     actor: uuid.UUID | None,
     error_code: str,
+    ip_address: str | None,
 ) -> None:
     """Write the one terminal entry; ``actor`` is whoever settled the run."""
     # Deferred by design to preserve the platform -> modules layer boundary,
@@ -1530,8 +1796,8 @@ async def _emit_terminal_backfill_event(
                 "outcome": "failed",
                 "error_code": error_code,
             },
-            # No request behind a sweep, and inventing one would be a fiction
-            # in a record whose purpose is attribution.
-            ip_address=None,
+            # None for a sweep: no request is behind it, and inventing one
+            # would be a fiction in a record whose purpose is attribution.
+            ip_address=ip_address,
         ),
     )

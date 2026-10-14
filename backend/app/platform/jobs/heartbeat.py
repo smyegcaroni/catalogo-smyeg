@@ -11,6 +11,8 @@ from sqlalchemy import text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db.sqlstate import sqlstate
+from app.platform.jobs import ledger
+from app.platform.jobs.ledger import StaleIngestAttempt
 from app.platform.jobs.models import IngestJob
 
 HEARTBEAT_INTERVAL_SECONDS = 30.0
@@ -19,10 +21,6 @@ HEARTBEAT_INTERVAL_SECONDS = 30.0
 # job-status auto-fail (platform/jobs/router.py), so API and poller agree. 10x
 # the renewal interval so one missed renewal can't admit a second concurrent CTAS.
 ANALYSIS_MATERIALIZE_LEASE_SECONDS = 300.0
-
-
-class StaleIngestAttempt(RuntimeError):
-    """Raised when a worker no longer owns the job attempt it received."""
 
 
 # fix(#1858): shared by the code that MAKES these names and the code that
@@ -42,12 +40,37 @@ def attempt_scoped_staging_table(base_table: str, attempt_id: uuid.UUID) -> str:
 def is_attempt_scoped_staging_table(table_name: str) -> bool:
     """Whether *table_name* is a physical staging table owned by an attempt.
 
-    fix(#1858): a survivor of a SIGKILLed/OOM-killed worker (created in an
-    import, dropped in its ``finally``; nothing else reaps it). Left
+    A killed worker's table outlives it until the stale sweep drops it. Left
     unrecognised, table discovery would let bulk registration bind a
     permanent dataset to a table the next attempt can rename away.
     """
     return _ATTEMPT_STAGING_NAME_RE.search(table_name) is not None
+
+
+# POSIX syntax, like the staging pattern, so discovery's `~` and Python agree.
+PREVIOUS_VERSION_NAME_PATTERN = r"_previous_[0-9a-f]{32}$"
+
+_PREVIOUS_VERSION_NAME_RE = re.compile(PREVIOUS_VERSION_NAME_PATTERN)
+
+
+def previous_version_table(base_table: str, dataset_id: uuid.UUID) -> str:
+    """Return the name of the table holding a dataset's previous data."""
+    suffix = f"_previous_{dataset_id.hex}"
+    return f"{base_table[: 63 - len(suffix)]}{suffix}"
+
+
+def is_previous_version_table(table_name: str) -> bool:
+    """Whether *table_name* is a dataset's retained previous-version table."""
+    return _PREVIOUS_VERSION_NAME_RE.search(table_name) is not None
+
+
+async def previous_version_name_claimed(session: AsyncSession, name: str) -> bool:
+    """Whether a catalog dataset uses *name* as its own table, so it is no previous version."""
+    claimed = await session.scalar(
+        text("SELECT 1 FROM catalog.datasets WHERE table_name = :name LIMIT 1"),
+        {"name": name},
+    )
+    return claimed is not None
 
 
 async def resolve_ingest_job_attempt(
@@ -84,25 +107,6 @@ async def resolve_ingest_job_attempt(
         if result.rowcount:  # type: ignore[attr-defined]
             return adopted_attempt
     return None
-
-
-async def claim_ingest_job_attempt(
-    session: AsyncSession,
-    job_id: uuid.UUID,
-    attempt_id: uuid.UUID,
-) -> bool:
-    """Atomically move the matching pending attempt to running."""
-    now = datetime.now(timezone.utc)
-    result = await session.execute(
-        update(IngestJob)
-        .where(
-            IngestJob.id == job_id,
-            IngestJob.attempt_id == attempt_id,
-            IngestJob.status == "pending",
-        )
-        .values(status="running", started_at=now, heartbeat_at=now)
-    )
-    return bool(result.rowcount)  # type: ignore[attr-defined]
 
 
 # fix(#1950): the budget an attempt-fenced failure write spends on its own
@@ -170,7 +174,13 @@ async def update_ingest_job_for_attempt(
     values: dict[str, object],
     expected_status: str = "running",
 ) -> bool:
-    """Apply a job mutation only while the caller owns the active attempt."""
+    """Apply a job mutation only while the caller owns the active attempt.
+
+    Refuses, before any statement, ``values`` that name a column the ledger
+    owns: a job's status, reason, completion time and fence change only there.
+    """
+    if owned := ledger.OWNED_COLUMNS & values.keys():
+        raise ValueError(f"the ledger writes {sorted(owned)} itself")
     result = await session.execute(
         update(IngestJob)
         .where(
@@ -188,16 +198,20 @@ async def write_job_failure_for_attempt(
     job_id: uuid.UUID,
     attempt_id: uuid.UUID,
     *,
-    values: dict[str, object],
     task_name: str,
+    reason: str | BaseException,
     budget_ms: int | None = None,
 ) -> bool | None:
-    """Commit a fenced terminal job write under the error-write budget.
+    """Fail the running job through the ledger and commit, under the error-write budget.
+
+    ``reason`` is stored redacted; a missing or ``None`` reason raises TypeError
+    before the session is touched.
 
     Returns whether the fence matched, or ``None`` when the write did not
     happen at all and the transaction was ended: the budget expired or the
-    connection went. Never raises, because every caller reaches it from a
-    failure path where a raise would replace the cause with a lock timeout.
+    connection went. A write error never raises, because every caller reaches
+    it from a failure path where a raise would replace the cause with a lock
+    timeout.
 
     fix(#1957): ``None`` is not a fence miss. A caller that treats it as one
     drops cleanup that belongs to an attempt still owning the job row. On
@@ -211,6 +225,8 @@ async def write_job_failure_for_attempt(
     """
     from sqlalchemy.exc import SQLAlchemyError
 
+    if reason is None:
+        raise TypeError("a failure write needs a reason")
     budget_ms = JOB_ERROR_WRITE_TIMEOUT_MS if budget_ms is None else budget_ms
     try:
         # The connection first, on its own deadline: `SET LOCAL` cannot bound a
@@ -219,9 +235,7 @@ async def write_job_failure_for_attempt(
         # the one point in the write that is safe to cancel.
         await asyncio.wait_for(session.connection(), timeout=budget_ms / 1000)
         await arm_job_error_write_budget(session, budget_ms=budget_ms)
-        fenced = await update_ingest_job_for_attempt(
-            session, job_id, attempt_id, values=values
-        )
+        fenced = await ledger.fail(session, job_id, attempt_id, reason=reason)
         await session.commit()
         return fenced
     except (SQLAlchemyError, TimeoutError) as write_failure:
@@ -294,7 +308,7 @@ async def claim_job_attempt_and_start_heartbeat(
     progress step in the same commit so polling sees a fresh signal on its
     first poll after pickup (REMED-02 / ingest-audit P2-07).
     """
-    if not await claim_ingest_job_attempt(session, job_uuid, attempt_uuid):
+    if not await ledger.claim(session, job_uuid, attempt_uuid):
         await session.rollback()
         return None
     if job is not None and current_step is not None:

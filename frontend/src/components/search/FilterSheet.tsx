@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useState } from 'react';
+import { lazy, Suspense, useCallback, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Loader2, MapPin, SlidersHorizontal } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -27,6 +27,7 @@ import { useResetOnEpoch } from '@/hooks/use-reset-on-epoch';
 import { useAuthStore } from '@/stores/auth-store';
 import { useCatalogSummary, useFacets } from '@/components/search/hooks/use-search';
 import { getGeometryTypeLabel, getSearchSortLabel } from '@/i18n/labels';
+import { recordTypeCapabilities } from '@/lib/record-types';
 
 const GEOMETRY_TYPES = [
   'POINT',
@@ -72,6 +73,7 @@ function parseTemporalInterval(datetime: string): [string, string] {
 
 interface FilterSheetProps {
   totalResults: number | undefined;
+  allTypesTotal?: number;
 }
 
 /**
@@ -83,8 +85,9 @@ interface FilterSheetProps {
  *
  * State source: All filter state is read from `useSearchStore` (zustand).
  */
-export function FilterSheet({ totalResults }: FilterSheetProps) {
+export function FilterSheet({ totalResults, allTypesTotal }: FilterSheetProps) {
   const { t } = useTranslation('search');
+  const filterTriggerRef = useRef<HTMLButtonElement>(null);
   const geometryType = useSearchStore((s) => s.geometry_type);
   const bbox = useSearchStore((s) => s.bbox);
   const dateFrom = useSearchStore((s) => s.date_from);
@@ -104,10 +107,13 @@ export function FilterSheet({ totalResults }: FilterSheetProps) {
   const { data: facets } = useFacets();
   const counts = facets?.record_type ?? {};
   const allTypeCount =
-    (counts.vector_dataset ?? 0) +
+    allTypesTotal ??
+    ((counts.vector_dataset ?? 0) +
     (counts.raster_dataset ?? 0) +
     (counts.vrt_dataset ?? 0) +
-    (counts.table ?? 0);
+    (counts.table ?? 0) +
+    (counts.tiles3d_dataset ?? 0) +
+    (counts.pointcloud_dataset ?? 0));
 
   const { data: summaries } = useCatalogSummary();
 
@@ -130,7 +136,10 @@ export function FilterSheet({ totalResults }: FilterSheetProps) {
   const activeFilterCount = [geometryType, bbox, dateFrom || dateTo, recordType, collectionId, sourceOrganization, srid, datetime, selectedKeywords.length > 0 ? 'kw' : ''].filter(Boolean).length;
   const activeGeomLabel = geometryType ? getGeometryTypeLabel(t, geometryType) : null;
   const showsTableToggle = counts.table !== undefined;
-  const showGeometryFilter = recordType !== 'raster_dataset' && recordType !== 'vrt_dataset' && recordType !== 'table';
+  const showsTiles3dToggle = counts.tiles3d_dataset !== undefined;
+  const showsPointcloudToggle = counts.pointcloud_dataset !== undefined;
+  const showGeometryFilter =
+    !recordType || (recordTypeCapabilities(recordType).tileToken === 'vector' && recordType !== 'table');
   const showSridFilter = srids.length > 0 && recordType !== 'table';
   const getRecordTypeLabel = (value: string) => {
     switch (value) {
@@ -142,6 +151,10 @@ export function FilterSheet({ totalResults }: FilterSheetProps) {
         return t('filters.vrt', { defaultValue: 'Virtual Raster' });
       case 'table':
         return t('card.table', { defaultValue: 'Table' });
+      case 'tiles3d_dataset':
+        return t('card.tiles3d', { defaultValue: '3D Tiles' });
+      case 'pointcloud_dataset':
+        return t('card.pointcloud', { defaultValue: 'Point cloud' });
       default:
         return value;
     }
@@ -183,6 +196,7 @@ export function FilterSheet({ totalResults }: FilterSheetProps) {
     if (dateTo) return dateTo;
     return '';
   })();
+  const dataCoverageDateChipLabel = `${t('filters.dataCoverageDate', { defaultValue: 'Dates covered by the data' })}: ${temporalStart || '..'} - ${temporalEnd || '..'}`;
 
   const clearFilters = () => {
     useSearchStore.getState().resetFilters();
@@ -211,13 +225,14 @@ export function FilterSheet({ totalResults }: FilterSheetProps) {
   return (
     <>
       {/* ---- Mobile bar + chip row ---- */}
-      <div className="space-y-4 md:hidden">
+      <div className="space-y-4 lg:hidden">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="text-sm text-muted-foreground">
             {totalResultsLabel ? <span>{totalResultsLabel}</span> : null}
           </div>
           <div className="flex items-center gap-2">
             <Button
+              ref={filterTriggerRef}
               type="button"
               variant={activeFilterCount > 0 ? 'default' : 'outline'}
               size="sm"
@@ -295,11 +310,7 @@ export function FilterSheet({ totalResults }: FilterSheetProps) {
             )}
             {datetime && (
               <FilterChip
-                label={t('filters.temporalExtentRange', {
-                  start: temporalStart || '..',
-                  end: temporalEnd || '..',
-                  defaultValue: 'Temporal Extent: {{start}} - {{end}}',
-                })}
+                label={dataCoverageDateChipLabel}
                 onRemove={() => useSearchStore.getState().setFilter('datetime', '')}
               />
             )}
@@ -327,6 +338,12 @@ export function FilterSheet({ totalResults }: FilterSheetProps) {
         }}
       >
         <SheetContent
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            const trigger = filterTriggerRef.current;
+            if (trigger && trigger.getClientRects().length > 0) trigger.focus();
+            else document.querySelector<HTMLElement>('main')?.focus();
+          }}
           side="bottom"
           className="max-h-[85vh] rounded-t-3xl border-x-0 border-b-0 px-0"
         >
@@ -352,11 +369,11 @@ export function FilterSheet({ totalResults }: FilterSheetProps) {
               onValueChange={(val) =>
                 useSearchStore.getState().setFilter('record_type', val === 'all' ? '' : val)
               }
-              className="w-full"
+              className="w-full flex-wrap"
             >
               <ToggleGroupItem value="all" className="flex-1 text-xs">
                 {t('filters.allTypes', { defaultValue: 'All' })}
-                {Object.keys(counts).length > 0 && ` (${allTypeCount})`}
+                {(allTypesTotal !== undefined || Object.keys(counts).length > 0) && ` (${allTypeCount})`}
               </ToggleGroupItem>
               <ToggleGroupItem value="vector_dataset" className="flex-1 text-xs" disabled={counts.vector_dataset === 0}>
                 {t('filters.vector', { defaultValue: 'Vector' })}
@@ -374,6 +391,18 @@ export function FilterSheet({ totalResults }: FilterSheetProps) {
                 <ToggleGroupItem value="table" className="flex-1 text-xs" disabled={counts.table === 0}>
                   {t('card.table', { defaultValue: 'Table' })}
                   {counts.table !== undefined && ` (${counts.table})`}
+                </ToggleGroupItem>
+              )}
+              {showsTiles3dToggle && (
+                <ToggleGroupItem value="tiles3d_dataset" className="flex-1 text-xs" disabled={counts.tiles3d_dataset === 0}>
+                  {t('card.tiles3d', { defaultValue: '3D Tiles' })}
+                  {` (${counts.tiles3d_dataset})`}
+                </ToggleGroupItem>
+              )}
+              {showsPointcloudToggle && (
+                <ToggleGroupItem value="pointcloud_dataset" className="flex-1 text-xs" disabled={counts.pointcloud_dataset === 0}>
+                  {t('card.pointcloud', { defaultValue: 'Point cloud' })}
+                  {` (${counts.pointcloud_dataset})`}
                 </ToggleGroupItem>
               )}
             </ToggleGroup>
@@ -571,10 +600,9 @@ export function FilterSheet({ totalResults }: FilterSheetProps) {
             </Button>
           </div>
 
-          {/* Temporal Extent (mobile) */}
           <div className="space-y-2">
             <label className="text-sm font-medium text-foreground">
-              {t('filters.temporalExtent', { defaultValue: 'Temporal Extent' })}
+              {t('filters.dataCoverageDate', { defaultValue: 'Dates covered by the data' })}
             </label>
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-1">

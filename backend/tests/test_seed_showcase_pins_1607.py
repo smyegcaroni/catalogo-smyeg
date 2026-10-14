@@ -27,6 +27,7 @@ import importlib.util
 import subprocess
 import sys
 
+import httpx
 import pytest
 
 from tests.repo_paths import repo_root
@@ -61,6 +62,11 @@ def test_pinned_dataset_titles_name_every_externally_referenced_dataset():
         "swissALTI3D Matterhorn DEM (2m mosaic)",
         # geolens-examples ci/fixtures.json -> fixtures.meteorites
         "Meteorite Landings (Meteoritical Society)",
+        # geolens-examples' sentinelNYHarbor fixture; the title embeds the
+        # pinned scene id (build_sentinel2).
+        f"Sentinel-2 TCI {seeder.PINNED_HARBOR_SCENE_ID}",
+        seeder.COPC_TITLE,
+        seeder.TILES3D_TITLE,
     )
 
 
@@ -78,10 +84,7 @@ def test_pinned_map_names_are_the_four_the_examples_address_by_id():
 def test_a_pinned_name_is_never_also_a_retired_one():
     """--prune deletes RETIRED_* by exact name; the two sets must not overlap."""
     assert set(seeder.PINNED_MAP_NAMES).isdisjoint(seeder.RETIRED_MAPS)
-    pinned_titles = set(seeder.PINNED_DATASET_TITLES) | set(
-        seeder.PINNED_FOREIGN_DATASET_TITLES
-    )
-    assert pinned_titles.isdisjoint(seeder.RETIRED_DATASETS)
+    assert set(seeder.PINNED_DATASET_TITLES).isdisjoint(seeder.RETIRED_DATASETS)
 
 
 def test_a_pinned_map_is_never_reported_as_a_stray():
@@ -192,12 +195,21 @@ def test_every_builder_checks_existence_through_the_pin_helper():
 
 
 def test_the_guard_is_not_vacuous():
-    """An empty list above must mean 'all routed', not 'no call sites left'.
-
-    One per builder that owns a map: restless, manhattan, hurricanes,
-    hurricane-exposure, meteorites, matterhorn, sentinel2, embed.
-    """
-    assert _guarded_map_exists_count(SOURCE) >= 8
+    """Every map builder must route its existing-map decision through the pin helper."""
+    tree = ast.parse(SOURCE)
+    guarded_builders = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name.startswith("build_")
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "_keep_existing_map"
+            for call in ast.walk(node)
+        )
+    }
+    assert len(guarded_builders) >= 8
 
 
 def test_the_guard_catches_the_old_bare_shape():
@@ -681,3 +693,357 @@ def test_a_map_id_reports_nothing_and_counts_as_built():
     # as built, exactly as they did before the marker was added.
     assert seeder._builder_outcome_line("catalog", "(catalog)") is None
     assert seeder._builder_outcome_line("collections", "(none)") is None
+
+
+# --- the pinned-ids summary -----------------------------------------------------
+
+
+class _SummaryApi:
+    """Just the surface _print_pinned_summary reads."""
+
+    def __init__(self, maps, datasets, share_tokens):
+        self._maps = maps
+        self._datasets = datasets
+        self._share_tokens = share_tokens
+
+    def list_maps(self):
+        return self._maps
+
+    def datasets_by_title(self):
+        return self._datasets
+
+    def map_share_token(self, map_id):
+        return self._share_tokens.get(map_id)
+
+
+def test_the_token_embedded_map_is_one_of_the_pinned_names():
+    assert seeder.PINNED_MAP_EMBEDDED_BY_TOKEN in seeder.PINNED_MAP_NAMES
+
+
+def test_pinned_summary_flags_only_the_token_embedded_map(capsys, monkeypatch):
+    """The other pinned maps are deep-linked by id and normally have no link."""
+    monkeypatch.setattr(
+        seeder,
+        "PINNED_MAP_NAMES",
+        ("Restless Earth", "Manhattan - A Century of Skyline"),
+    )
+    monkeypatch.setattr(seeder, "PINNED_MAP_EMBEDDED_BY_TOKEN", "Restless Earth")
+    monkeypatch.setattr(
+        seeder, "PINNED_DATASET_TITLES", ("Meteorite Landings (Meteoritical Society)",)
+    )
+    api = _SummaryApi(
+        maps={
+            "Restless Earth": "m-restless",
+            "Manhattan - A Century of Skyline": "m-manhattan",
+        },
+        datasets={},  # the pinned dataset is missing this run
+        share_tokens={},  # neither map has an active link
+    )
+    monkeypatch.setattr(seeder.Api, "login", lambda *a, **k: api)
+
+    seeder._print_pinned_summary("http://x", "admin", "pw")
+
+    out = capsys.readouterr().out
+    assert "m-restless" in out
+    assert "'Restless Earth' has no active share link" in out
+    assert "m-manhattan" in out
+    assert out.count("no active share link") == 1
+    assert "! dataset 'Meteorite Landings (Meteoritical Society)' not found" in out
+    assert "gh api repos/geolens-io/geolens-examples/dispatches" in out
+
+
+def test_pinned_summary_never_prints_the_share_token_itself(capsys, monkeypatch):
+    """Keep this even though the real endpoint returns only a token hint."""
+    monkeypatch.setattr(seeder, "PINNED_MAP_NAMES", ("Restless Earth",))
+    monkeypatch.setattr(seeder, "PINNED_MAP_EMBEDDED_BY_TOKEN", "Restless Earth")
+    monkeypatch.setattr(seeder, "PINNED_DATASET_TITLES", ())
+    api = _SummaryApi(
+        maps={"Restless Earth": "m-restless"},
+        datasets={},
+        share_tokens={
+            "m-restless": {"token": "SECRET-DO-NOT-PRINT", "is_active": True}
+        },
+    )
+    monkeypatch.setattr(seeder.Api, "login", lambda *a, **k: api)
+
+    seeder._print_pinned_summary("http://x", "admin", "pw")
+
+    out = capsys.readouterr().out
+    assert "no active share link" not in out
+    assert "SECRET-DO-NOT-PRINT" not in out
+
+
+class _ExpiredLoginApi:
+    """list_maps() 401s, as it would on a token that expired mid-seed."""
+
+    def list_maps(self):
+        request = httpx.Request("GET", "http://x/api/maps")
+        raise httpx.HTTPStatusError(
+            "401", request=request, response=httpx.Response(401, request=request)
+        )
+
+
+def test_pinned_summary_is_best_effort_on_an_http_failure(capsys, monkeypatch):
+    """A stale token or network hiccup here must not fail an otherwise-good seed."""
+    monkeypatch.setattr(seeder.Api, "login", lambda *a, **k: _ExpiredLoginApi())
+
+    seeder._print_pinned_summary("http://x", "admin", "pw")
+
+    assert "skipped" in capsys.readouterr().out.lower()
+
+
+# --- the pinned Sentinel-2 harbor scene ---------------------------------------
+
+
+class _FakeStacResponse:
+    def __init__(self, features: list[dict]):
+        self._features = features
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"features": self._features}
+
+
+def _fake_sentinel_feature(item_id: str, *, datetime: str) -> dict:
+    return {
+        "id": item_id,
+        "collection": "sentinel-2-c1-l2a",
+        "properties": {"datetime": datetime, "proj:code": "EPSG:32618"},
+        "assets": {"visual": {"href": f"https://example.test/{item_id}.tif"}},
+        "links": [{"rel": "self", "href": f"https://example.test/items/{item_id}"}],
+        "bbox": [-74.0, 40.7, -73.9, 40.8],
+    }
+
+
+def test_sentinel2_pins_t18twl_even_when_a_newer_scene_comes_first(monkeypatch):
+    """The newest-per-tile search never displaces the pinned harbor scene."""
+    newer = _fake_sentinel_feature(
+        "S2A_T18TWL_20260915T155705_L2A", datetime="2026-09-15T15:57:05Z"
+    )
+    pinned = _fake_sentinel_feature(
+        seeder.PINNED_HARBOR_SCENE_ID, datetime="2026-08-29T15:57:05Z"
+    )
+
+    def fake_post(url, *, json, timeout):
+        if "ids" in json:
+            matched = json["ids"] == [seeder.PINNED_HARBOR_SCENE_ID]
+            return _FakeStacResponse([pinned] if matched else [])
+        return _FakeStacResponse([newer])
+
+    monkeypatch.setattr(seeder.httpx, "post", fake_post)
+
+    items = seeder._sentinel2_items()
+
+    ids = [it["id"] for it in items]
+    assert seeder.PINNED_HARBOR_SCENE_ID in ids
+    assert "S2A_T18TWL_20260915T155705_L2A" not in ids
+
+
+def test_sentinel2_raises_when_the_pinned_scene_is_missing(monkeypatch):
+    """A search that cannot find the pinned item fails loudly, not silently."""
+    other = _fake_sentinel_feature(
+        "S2A_T19TCH_20260829T155705_L2A", datetime="2026-08-29T15:57:05Z"
+    )
+
+    def fake_post(url, *, json, timeout):
+        if "ids" in json:
+            return _FakeStacResponse([])
+        return _FakeStacResponse([other])
+
+    monkeypatch.setattr(seeder.httpx, "post", fake_post)
+
+    with pytest.raises(RuntimeError, match="pinned Sentinel-2 scene"):
+        seeder._sentinel2_items()
+
+
+def test_sentinel2_raises_on_an_empty_aoi_search_even_with_a_pinned_hit(monkeypatch):
+    """A dead AOI search fails loudly even though the pinned lookup succeeds.
+
+    Otherwise every OTHER MGRS tile silently drops out and --force rebinds
+    the map to the one pinned tile alone.
+    """
+    pinned = _fake_sentinel_feature(
+        seeder.PINNED_HARBOR_SCENE_ID, datetime="2026-08-29T15:57:05Z"
+    )
+
+    def fake_post(url, *, json, timeout):
+        if "ids" in json:
+            return _FakeStacResponse([pinned])
+        return _FakeStacResponse([])
+
+    monkeypatch.setattr(seeder.httpx, "post", fake_post)
+
+    with pytest.raises(RuntimeError, match="no low-cloud Sentinel-2 TCI items"):
+        seeder._sentinel2_items()
+
+
+class _SentinelImportApi:
+    """Just the surface build_sentinel2 reads for a fresh, non-repair build."""
+
+    def list_maps(self) -> dict[str, str]:
+        return {}
+
+    def stac_import(self, url, items, visibility="public"):
+        return [
+            {
+                "item_id": "S2A_T19TCH_20260829T155705_L2A",
+                "dataset_id": "other-ds-id",
+                "status": "created",
+            },
+            {"item_id": seeder.PINNED_HARBOR_SCENE_ID, "status": "skipped"},
+        ]
+
+    def datasets_by_title(self) -> dict[str, str]:
+        return {}
+
+
+def test_sentinel2_raises_when_the_pinned_scene_does_not_resolve(monkeypatch):
+    """A pinned scene the import skips and cannot resolve by href or title fails loudly.
+
+    Every other scene resolving is not enough: without this check the map
+    still builds, silently missing the one scene geolens-examples pins.
+    """
+    other = _fake_sentinel_feature(
+        "S2A_T19TCH_20260829T155705_L2A", datetime="2026-08-29T15:57:05Z"
+    )
+    pinned = _fake_sentinel_feature(
+        seeder.PINNED_HARBOR_SCENE_ID, datetime="2026-08-29T15:57:05Z"
+    )
+
+    def fake_post(url, *, json, timeout):
+        if "ids" in json:
+            return _FakeStacResponse([pinned])
+        return _FakeStacResponse([other])
+
+    monkeypatch.setattr(seeder.httpx, "post", fake_post)
+
+    with pytest.raises(RuntimeError, match=seeder.PINNED_HARBOR_SCENE_ID):
+        seeder.build_sentinel2(_SentinelImportApi())
+
+
+class _SentinelTitleMismatchApi(_SentinelImportApi):
+    """A same-titled dataset resolves, but its origin names another scene."""
+
+    def datasets_by_title(self) -> dict[str, str]:
+        return {f"Sentinel-2 TCI {seeder.PINNED_HARBOR_SCENE_ID}": "wrong-ds-id"}
+
+    def get_dataset(self, dataset_id: str) -> dict:
+        return {
+            "origin_ref": {
+                "item_id": "S2A_T99XYZ_20260101T000000_L2A",
+                "asset_href": "https://example.test/unrelated.tif",
+            }
+        }
+
+
+def test_sentinel2_raises_when_a_title_match_answers_for_another_scene(monkeypatch):
+    """A same-titled row whose origin names a different scene is rejected.
+
+    A title alone is not proof of origin; accepting it would layer the
+    wrong imagery onto the pinned tile.
+    """
+    other = _fake_sentinel_feature(
+        "S2A_T19TCH_20260829T155705_L2A", datetime="2026-08-29T15:57:05Z"
+    )
+    pinned = _fake_sentinel_feature(
+        seeder.PINNED_HARBOR_SCENE_ID, datetime="2026-08-29T15:57:05Z"
+    )
+
+    def fake_post(url, *, json, timeout):
+        if "ids" in json:
+            return _FakeStacResponse([pinned])
+        return _FakeStacResponse([other])
+
+    monkeypatch.setattr(seeder.httpx, "post", fake_post)
+
+    with pytest.raises(RuntimeError, match=seeder.PINNED_HARBOR_SCENE_ID):
+        seeder.build_sentinel2(_SentinelTitleMismatchApi())
+
+
+class _SentinelResolvedImportApi:
+    """A fresh build where the pinned scene resolves via a matching title
+    fallback: enough of the surface to run build_sentinel2 to completion."""
+
+    def __init__(self, origin_ref: dict):
+        self._origin_ref = origin_ref
+        self.added_layers: list[dict] = []
+
+    def list_maps(self) -> dict[str, str]:
+        return {}
+
+    def stac_import(self, url, items, visibility="public"):
+        return [
+            {
+                "item_id": "S2A_T19TCH_20260829T155705_L2A",
+                "dataset_id": "other-ds-id",
+                "status": "created",
+            },
+            {"item_id": seeder.PINNED_HARBOR_SCENE_ID, "status": "skipped"},
+        ]
+
+    def datasets_by_title(self) -> dict[str, str]:
+        return {f"Sentinel-2 TCI {seeder.PINNED_HARBOR_SCENE_ID}": "pinned-ds-id"}
+
+    def get_dataset(self, dataset_id: str) -> dict:
+        return {"origin_ref": self._origin_ref}
+
+    def create_map(self, name: str, description: str) -> str:
+        return "new-map-id"
+
+    def get_map(self, map_id: str) -> dict:
+        return {"layers": []}
+
+    def delete_layer(self, map_id: str, layer_id: str) -> None:
+        pass
+
+    def add_layer(self, map_id: str, body: dict) -> dict:
+        self.added_layers.append(body)
+        return body
+
+    def set_view(self, map_id: str, **fields) -> None:
+        pass
+
+    def visibility_check(self, map_id: str) -> dict:
+        return {}
+
+
+@pytest.mark.parametrize(
+    "origin_ref",
+    [
+        {"item_id": seeder.PINNED_HARBOR_SCENE_ID},
+        {"asset_href": f"https://example.test/{seeder.PINNED_HARBOR_SCENE_ID}.tif"},
+    ],
+    ids=["item_id", "asset_href"],
+)
+def test_sentinel2_accepts_a_title_match_whose_origin_names_the_pinned_scene(
+    monkeypatch, origin_ref
+):
+    """A same-titled row is accepted once its origin actually names the pin.
+
+    Matching on either origin_ref.item_id or the asset href is enough; the
+    build then carries on to create the map with both scenes layered.
+    """
+    other = _fake_sentinel_feature(
+        "S2A_T19TCH_20260829T155705_L2A", datetime="2026-08-29T15:57:05Z"
+    )
+    pinned = _fake_sentinel_feature(
+        seeder.PINNED_HARBOR_SCENE_ID, datetime="2026-08-29T15:57:05Z"
+    )
+
+    def fake_post(url, *, json, timeout):
+        if "ids" in json:
+            return _FakeStacResponse([pinned])
+        return _FakeStacResponse([other])
+
+    monkeypatch.setattr(seeder.httpx, "post", fake_post)
+    api = _SentinelResolvedImportApi(origin_ref)
+
+    map_id = seeder.build_sentinel2(api)
+
+    assert map_id == "new-map-id"
+    assert {layer["dataset_id"] for layer in api.added_layers} == {
+        "other-ds-id",
+        "pinned-ds-id",
+    }

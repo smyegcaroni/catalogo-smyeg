@@ -12,13 +12,16 @@ import os
 import uuid
 from datetime import datetime, timezone
 from collections.abc import Iterable
+from enum import StrEnum
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, text
 
+from app.core.geo import crs_columns
 from app.platform.dataset_origin import set_dataset_origin
-from app.processing.raster.cog import check_cog_compliance, extract_raster_metadata
+from app.platform.jobs.models import UNPUBLISHED_STORAGE_KEYS_FIELD
+from app.processing.raster.probe import RasterProbeError, inspect_raster
 from app.platform.storage.titiler_url import resolve_current_storage_key
 
 
@@ -54,44 +57,31 @@ def _friendly_raster_open_failure_message(original_filename: "str | None") -> st
     )
 
 
-def extract_source_raster_metadata(
-    file_path: str, *, original_filename: "str | None" = None
+def inspect_source_raster(
+    file_path: str,
+    *,
+    original_filename: "str | None" = None,
+    expected_compression: str | None = None,
 ) -> dict:
-    """``extract_raster_metadata``, translating an open-time rasterio failure.
+    """``inspect_raster`` on a staged upload, refusing with a message of ours.
 
-    fix(#1661): both raster ingest tails call this on the freshly-staged
-    SOURCE upload. ``extract_raster_metadata`` opens the file with a single
-    ``rasterio.open`` call and reads everything else off the resulting
-    dataset, so ANY ``RasterioIOError`` it raises means "rasterio could not
-    open this file" — unrecognized format, corrupt/truncated IFD, missing
-    file, or permission error alike. (A narrower pattern match on just the
-    "not recognized" text missed the corrupt-IFD shape, which also quotes
-    the staging path and is equally reachable: a .tif with a valid magic
-    header but a corrupt IFD passes upload-time content-sniffing same as
-    any other .tif.)
-
-    This used to land the raw rasterio message, staging path included, in
-    ``IngestJob.error_message`` verbatim. The full message still reaches
-    structured logs here, the one place that sees it; a failure from
-    anything OTHER than the open call itself (e.g. EXIF/tag parsing further
-    into ``extract_raster_metadata``) is not a ``RasterioIOError`` and keeps
-    its real message. Callers reading their own just-produced COG (no
-    upload filename to leak) don't need this wrapper.
+    The refusal lands in ``IngestJob.error_message``, so it names the upload
+    by ``original_filename`` alone: never the staging path, and nothing the
+    probe read.
     """
-    import rasterio
-
     try:
-        return extract_raster_metadata(file_path)
-    except rasterio.errors.RasterioIOError as exc:
-        message = str(exc)
-        structlog.get_logger().error(
-            "rasterio could not open raster source",
-            error=message,
+        return inspect_raster(file_path, expected_compression=expected_compression)
+    except RasterProbeError as exc:
+        structlog.get_logger().warning(
+            "raster source probe failed",
+            kind=exc.kind,
             original_filename=original_filename,
         )
-        raise ValueError(
-            _friendly_raster_open_failure_message(original_filename)
-        ) from exc
+        if exc.kind == "open":
+            raise ValueError(
+                _friendly_raster_open_failure_message(original_filename)
+            ) from None
+        raise ValueError(str(exc)) from None
 
 
 def _is_manifest_vrt_job(job: Any) -> bool:
@@ -112,34 +102,29 @@ def _reject_raw_vrt_job(source_filename: str | None) -> None:
         )
 
 
-async def _enforce_strict_cog(
-    file_path: str,
+def _enforce_strict_cog(
+    inspection: dict,
     *,
-    expected_compression: str | None,
     is_manifest_vrt: bool,
     strict_cog: bool,
 ) -> None:
-    """Strict-mode COG gate for ING-07 / P2-09.
+    """Strict-mode COG gate.
 
     When the user opted in via ``RasterCommitRequest.strict_cog=True``,
     rejects non-COG TIFFs here instead of silently converting via
     ``check_and_prepare_cog``. Manifest-VRT jobs are excluded (VRTs are
     XML, not TIFFs — the compliance check would fail for unrelated
-    reasons). Raises ``ValueError`` with the compliance reason;
+    reasons). ``inspection`` was checked against the requested compression.
+    Raises ``ValueError`` with the compliance reason;
     ``ingest_raster``'s outer ``except Exception`` handler writes it to the
     job via ``_job_phase_session("error_write")``.
     """
-    import asyncio
-
     if not strict_cog or is_manifest_vrt:
         return
 
-    compliant, reason = await asyncio.to_thread(
-        check_cog_compliance, file_path, expected_compression=expected_compression
-    )
-    if not compliant:
+    if not inspection["compliant"]:
         raise ValueError(
-            f"Strict-COG mode rejected upload: {reason}. "
+            f"Strict-COG mode rejected upload: {inspection['compliance_reason']}. "
             "Disable strict_cog or upload a COG-compliant TIFF."
         )
 
@@ -260,7 +245,7 @@ async def create_raster_dataset(
         driver=meta.get("driver"),
         storage_backend="local",
         ingested_at=datetime.now(timezone.utc),
-        crs_wkt=meta.get("crs_wkt"),
+        **crs_columns(meta),
         epsg=meta.get("epsg"),
         band_count=meta.get("band_count"),
         dtype=meta.get("dtype"),
@@ -365,106 +350,161 @@ def _resolve_managed_raster_storage_keys(
     )
 
 
-async def _cleanup_orphaned_storage_keys(keys: list[str], *, job_id: str) -> None:
+async def _cleanup_orphaned_storage_keys(keys: list[str], *, job_id: str) -> list[str]:
     """Best-effort delete storage keys written before a failed/rolled-back commit.
 
     GAP-017: raster ingest puts COG/quicklook bytes to storage BEFORE the
     terminal DB commit. If the commit (or a later step) fails, the dataset
     row rolls back and ``delete_dataset`` never runs, orphaning the bytes —
     this reaps exactly the keys that were written. Failures here are
-    swallowed; cleanup must never mask the original ingest error.
+    swallowed; cleanup must never mask the original ingest error. Returns the
+    keys it could not delete.
     """
     from app.platform.storage import get_storage
 
     try:
         storage = get_storage()
     except Exception:  # broad: storage may be unavailable; nothing to clean then
-        return
+        return list(keys)
+    failed: list[str] = []
     for key in keys:
         try:
             await storage.delete(key)
         except Exception:  # broad: best-effort per-key cleanup, keep going
+            failed.append(key)
             structlog.get_logger().warning(
                 "Failed to clean up orphaned raster asset",
                 job_id=job_id,
                 storage_key=key,
             )
+    return failed
 
 
 async def publish_commit_landed(
     job_uuid: uuid.UUID,
     attempt_uuid: uuid.UUID,
     *,
+    xid: str | None,
+    error: BaseException,
     job_id: str,
     task: str,
 ) -> bool:
-    """Did the publishing commit durably land, despite the raise?
+    """Whether a publishing commit that raised ``error`` may have landed.
 
-    fix(#1778): applies #1708's reasoning to the raster and VRT publish
-    tails. A commit whose acknowledgement is lost — a dropped connection, or
-    the ``asyncio.CancelledError`` a cancel delivers (a BaseException the
-    tails' ``except Exception`` never sees but their ``finally`` still runs
-    through) — may still have been applied by PostgreSQL. Each tail sets its
-    "published" flag on the line after that await, so a lost ack left the
-    flag false and the terminal cleanup deleted the exact object keys the
-    committed row had just been pointed at: the objects survive in the
-    bucket but nothing points at them, and every tile request, download and
-    STAC asset 404s until an operator lists the prefix by hand.
+    A commit whose acknowledgement is lost, to a dropped connection or a
+    cancellation, may still have been applied, and reaping the objects it
+    published would leave the dataset naming bytes that no longer exist. So
+    only a probe that reads the transaction aborted returns False. A commit it
+    reads as landed or still in progress, or cannot read at all, returns True:
+    an object kept by mistake can still be removed, a deleted one can't be
+    restored.
 
-    So decide by OBSERVATION, not the await's outcome: read the job row back
-    on a FRESH session (the publishing session is mid-failure) and ask
-    whether this attempt's terminal write is there. ``status == 'complete'``
-    for this exact ``attempt_id`` is the shared signal, because every tail
-    stamps it in the SAME transaction as the pointer swap — seeing it means
-    the swap is durable, and no other attempt could have produced it since
-    the attempt token is fresh per attempt and each task is ``retry=0``.
+    A caller that gets True stands down, returning instead of re-raising into a
+    failure handler that would write about a job that may have succeeded. It
+    must not read True as success for anything that deletes, such as the
+    uploader's staged original.
+    """
+    observation = await observe_publish_commit(
+        job_uuid, attempt_uuid, xid=xid, error=error, job_id=job_id, task=task
+    )
+    return observation is not PublishObservation.NOT_LANDED
 
-    A probe that itself fails returns True — standing down. The asymmetry is
-    #1708's: standing down on a false positive leaves objects an operator or
-    sweep can still remove, while proceeding on a false negative deletes the
-    live raster.
 
-    A caller that gets True stands DOWN, returning normally rather than
-    re-raising into its failure handler — gating only the orphaned-key
-    cleanup was not enough, because the handler still entered writes about a
-    job that succeeded (``regenerate_vrt`` reloaded the now ``completed``
-    ``VrtGeneration`` and stamped it ``failed``, which both ``get_vrt_status``
-    and the stale-generation sweep then read as an unhealthy asset). Nothing
-    is lost by returning: the terminal write is durable, and the only work
-    skipped is the post-commit best-effort block those tails already treat
-    as unfailable.
+class PublishObservation(StrEnum):
+    """What the probe says about a commit whose acknowledgement was lost."""
 
-    The caller must NOT set ``final_status`` from this: that string also
-    decides whether the uploader's staged original may be deleted, and
-    standing down there would turn a probe failure into a second, worse
-    deletion.
+    LANDED = "landed"
+    NOT_LANDED = "not_landed"
+    # Still committing, not known, or the probe failed: the commit may land yet.
+    UNKNOWN = "unknown"
+
+
+# A publishing transaction's id, noted with the transaction it belongs to.
+_PUBLISHING_XID = "publishing_xid"
+
+_XACT_STATUS = text("SELECT pg_xact_status(CAST(:xid AS text)::xid8)")
+
+# How long the probe waits out a transaction that reads in progress. A commit
+# still flushing its WAL or waiting on a standby usually settles well inside it.
+PUBLISH_PROBE_RETRIES = 20
+PUBLISH_PROBE_RETRY_INTERVAL = 0.05
+
+
+async def note_publishing_xid(session) -> None:
+    """Note the id of ``session``'s transaction for the probe after its commit.
+
+    Costs a round trip, so callers run it before the transaction's first row lock.
+    """
+    xid = await session.scalar(text("SELECT pg_current_xact_id()::text"))
+    session.info[_PUBLISHING_XID] = (session.sync_session.get_transaction(), xid)
+
+
+def publishing_xid(session) -> str | None:
+    """The id noted for ``session``'s current transaction, or None."""
+    noted = session.info.get(_PUBLISHING_XID)
+    if noted is None or noted[0] is not session.sync_session.get_transaction():
+        return None
+    return noted[1]
+
+
+async def observe_publish_commit(
+    job_uuid: uuid.UUID,
+    attempt_uuid: uuid.UUID,
+    *,
+    xid: str | None,
+    error: BaseException,
+    job_id: str,
+    task: str,
+    ended: str = "complete",
+) -> PublishObservation:
+    """Ask PostgreSQL, on a fresh session, whether transaction ``xid`` committed.
+
+    ``pg_xact_status`` reads a transaction that is still committing, while its
+    WAL flushes or it waits on a synchronous standby, as in progress, where a
+    snapshot of the job row would read it as not landed. The probe asks again
+    while it reads in progress, up to ``PUBLISH_PROBE_RETRIES`` times. Aborted
+    is ``NOT_LANDED``. Committed is ``LANDED`` only while this attempt's job
+    reads ``ended``: a failover can lose a commit and reissue its id, so a
+    committed id whose job disagrees is not this commit's. Anything else, and a
+    probe that fails, is ``UNKNOWN``. ``error`` is what the commit raised.
     """
     # fix(#909)-style late bind so tests' engine patching is honored.
     import app.core.db as db_module
 
     from app.platform.jobs.models import IngestJob
 
+    log = structlog.get_logger().bind(
+        job_id=job_id, task=task, error=type(error).__name__
+    )
+    if xid is None:
+        log.warning("publish_commit_probe_without_xid")
+        return PublishObservation.UNKNOWN
+    status = None
     try:
         async with db_module.async_session() as probe:
-            status = (
-                await probe.execute(
+            outcome = await probe.scalar(_XACT_STATUS, {"xid": xid})
+            for _ in range(PUBLISH_PROBE_RETRIES):
+                if outcome != "in progress":
+                    break
+                await asyncio.sleep(PUBLISH_PROBE_RETRY_INTERVAL)
+                outcome = await probe.scalar(_XACT_STATUS, {"xid": xid})
+            if outcome == "committed":
+                status = await probe.scalar(
                     select(IngestJob.status).where(
                         IngestJob.id == job_uuid,
                         IngestJob.attempt_id == attempt_uuid,
                     )
                 )
-            ).scalar_one_or_none()
     except BaseException:
-        structlog.get_logger().warning(
-            "publish_commit_probe_failed", job_id=job_id, task=task
-        )
-        return True
-    landed = status == "complete"
-    if landed:
-        structlog.get_logger().warning(
-            "publish_commit_ack_lost_but_landed", job_id=job_id, task=task
-        )
-    return landed
+        log.warning("publish_commit_probe_failed")
+        return PublishObservation.UNKNOWN
+    if outcome == "aborted":
+        return PublishObservation.NOT_LANDED
+    if outcome == "committed" and status == ended:
+        log.warning("publish_commit_ack_lost_but_landed")
+        return PublishObservation.LANDED
+    log.warning("publish_commit_outcome_unknown", outcome=outcome)
+    return PublishObservation.UNKNOWN
 
 
 def absorb_cancellation(exc: BaseException) -> None:
@@ -528,9 +568,6 @@ def attempt_scoped_raster_base_key(
     return f"rasters/{dataset_id}/attempts/{attempt_id}/{asset_sha256}"
 
 
-UNPUBLISHED_STORAGE_KEYS_FIELD = "unpublished_storage_keys"
-
-
 async def record_unpublished_storage_keys(
     job_uuid: uuid.UUID,
     attempt_uuid: uuid.UUID,
@@ -540,6 +577,7 @@ async def record_unpublished_storage_keys(
     attempt_scope: str,
     job_id: str,
     task: str,
+    field: str = UNPUBLISHED_STORAGE_KEYS_FIELD,
 ) -> bool:
     """Persist the object keys this attempt is ABOUT to write, best effort.
 
@@ -598,10 +636,12 @@ async def record_unpublished_storage_keys(
 
     A JSONB merge rather than assignment, so it can't clobber a field a
     later write adds, fenced on ``attempt_id`` so a retry's keys never land
-    on another attempt's row. A transient failure is swallowed: this buys
-    reclaimability for a crash that may not happen, and refusing the ingest
-    over an error that says nothing about the fence would trade a possible
-    leak for a certain failure.
+    on another attempt's row. ``field`` names the job-row list the keys
+    join; the tileset task keeps its attempt prefixes in a list of its own.
+    A transient failure is swallowed: this buys reclaimability for a crash
+    that may not happen, and refusing the ingest over an error that says
+    nothing about the fence would trade a possible leak for a certain
+    failure.
     """
     from sqlalchemy import bindparam, case, func, text, update
     from sqlalchemy.dialects.postgresql import JSONB
@@ -635,7 +675,7 @@ async def record_unpublished_storage_keys(
     # would fold an array into a non-array, so anything that isn't an array
     # is replaced rather than appended to.
     _existing_keys = func.coalesce(
-        IngestJob.user_metadata[UNPUBLISHED_STORAGE_KEYS_FIELD],
+        IngestJob.user_metadata[field],
         text("'[]'::jsonb"),
     )
     _new_keys = bindparam("unpublished_patch", value=unpublished, type_=JSONB)
@@ -657,11 +697,7 @@ async def record_unpublished_storage_keys(
                 .values(
                     user_metadata=func.coalesce(
                         IngestJob.user_metadata, text("'{}'::jsonb")
-                    ).op("||")(
-                        func.jsonb_build_object(
-                            UNPUBLISHED_STORAGE_KEYS_FIELD, _accumulated_keys
-                        )
-                    )
+                    ).op("||")(func.jsonb_build_object(field, _accumulated_keys))
                 )
             )
             await session.commit()

@@ -1,16 +1,20 @@
 import { Fragment, useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { useTranslation } from 'react-i18next';
+import { getIngestSourceLabel } from '@/i18n/labels';
+import type { TFunction } from 'i18next';
 import { describeFailureReason } from '@/lib/failure-reason';
-import { useLocation, useSearchParams } from 'react-router';
+import { Link, useLocation, useSearchParams } from 'react-router';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useAdminJobs, useCancelAdminJob, useRetryAdminJob, useUserNames } from '@/hooks/use-admin';
 import { formatDate } from '@/lib/format';
 import { paginationRange } from '@/lib/pagination';
-import { jobStatusColors } from '@/lib/status-colors';
+import { jobStatusColors, semanticBadgeColors } from '@/lib/status-colors';
+import type { AdminJobResponse } from '@/types/api';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
+import { startAgainPath } from '@/components/import/start-again';
 import { DataTablePagination } from './DataTablePagination';
 import { SortableColumnHeader, type SortDirection } from './SortableColumnHeader';
 import { DataTableSearch } from './DataTableSearch';
@@ -49,7 +53,43 @@ const STATUS_OPTIONS = [
   { value: 'running', labelKey: 'jobs.filters.running' },
   { value: 'complete', labelKey: 'jobs.filters.complete' },
   { value: 'failed', labelKey: 'jobs.filters.failed' },
+  { value: 'awaiting_review', labelKey: 'jobs.filters.awaitingReview' },
+  { value: 'cancelled', labelKey: 'jobs.filters.cancelled' },
+  { value: 'fanned_out', labelKey: 'jobs.filters.fannedOut' },
 ];
+
+// Reuses the import panel's status labels rather than adding a second copy:
+// `import` is one of the namespaces every locale bundle loads eagerly
+// (src/i18n/resources.ts), so it is available here without a dedicated fetch.
+function jobStatusLabel(t: TFunction<'admin'>, status: string): string {
+  switch (status) {
+    case 'pending': return t('import:jobProgress.status.pending');
+    case 'running': return t('import:jobProgress.status.running');
+    case 'complete': return t('import:jobProgress.status.complete');
+    case 'failed': return t('import:jobProgress.status.failed');
+    case 'cancelled': return t('import:jobProgress.status.cancelled');
+    case 'fanned_out': return t('import:jobProgress.status.fannedOut');
+    default: return t('import:jobProgress.status.unknown', { status });
+  }
+}
+
+// A replacement held for review keeps the stored status 'failed'; the list shows
+// what it is waiting on instead.
+function jobBadge(
+  t: TFunction<'admin'>,
+  job: Pick<AdminJobResponse, 'status' | 'review_state'>,
+): { label: string; className: string } {
+  if (job.review_state === 'awaiting') {
+    return { label: t('jobs.reviewState.awaiting'), className: semanticBadgeColors.warning };
+  }
+  if (job.review_state === 'resolved') {
+    return { label: t('jobs.reviewState.resolved'), className: 'bg-muted text-muted-foreground border-border' };
+  }
+  return {
+    label: jobStatusLabel(t, job.status),
+    className: jobStatusColors[job.status] ?? 'bg-muted text-muted-foreground border-border',
+  };
+}
 
 function formatDuration(startedAt: string | null, completedAt: string | null): string {
   if (!startedAt || !completedAt) return '-';
@@ -363,7 +403,9 @@ export function JobList() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {(data?.jobs ?? []).map((job) => (
+                  {(data?.jobs ?? []).map((job) => {
+                    const badge = jobBadge(t, job);
+                    return (
                     <Fragment key={job.id}>
                       <TableRow
                         data-state={expandedId === job.id ? 'selected' : undefined}
@@ -414,15 +456,20 @@ export function JobList() {
                           className="max-w-[36vw] truncate sm:max-w-none"
                           title={job.source_filename ?? undefined}
                         >
-                          {job.source_filename ?? '-'}
+                          {job.source_filename ? getIngestSourceLabel(t, job.source_filename) : '-'}
                         </TableCell>
                         <TableCell>
                           <Badge
                             variant="outline"
-                            className={`text-xs ${jobStatusColors[job.status] ?? 'bg-muted text-muted-foreground border-border'}`}
+                            className={`text-xs ${badge.className}`}
                           >
-                            {job.status}
+                            {badge.label}
                           </Badge>
+                          {job.status === 'failed' && job.can_retry && (
+                            <p className="mt-1 text-xs text-muted-foreground">
+                              {t('jobs.retryAvailable')}
+                            </p>
+                          )}
                         </TableCell>
                         <TableCell>
                           {formatDuration(job.started_at, job.completed_at)}
@@ -441,14 +488,22 @@ export function JobList() {
                                     {describeFailureReason(
                                       job.error_message,
                                       t('common:errors.internalFailureReason'),
+                                      job.error_code,
                                     )}
                                   </pre>
                                 </div>
                               )}
-                              {job.status === 'failed' && job.retry_reason && (
+                              {job.status === 'failed' && job.retry_reason && job.error_code !== 'review_required' && (
                                 <p className="mb-2 text-xs text-muted-foreground">
                                   {job.retry_reason}
                                 </p>
+                              )}
+                              {job.status === 'failed' && !job.can_retry && job.restart_source && (
+                                <Button asChild variant="outline" size="sm" className="mb-2">
+                                  <Link to={startAgainPath(job.restart_source, job.source_url)}>
+                                    {t('jobs.startAgain')}
+                                  </Link>
+                                </Button>
                               )}
                               {job.user_metadata && (
                                 <div className="mb-2">
@@ -495,7 +550,8 @@ export function JobList() {
                         </TableRow>
                       )}
                     </Fragment>
-                  ))}
+                    );
+                  })}
                 </TableBody>
                 </Table>
               </>

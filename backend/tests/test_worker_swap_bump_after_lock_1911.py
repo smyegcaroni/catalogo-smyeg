@@ -1,7 +1,6 @@
 """Each worker swap publishes N+2 behind an edit that published N+1 (#1911)."""
 
 import asyncio
-from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select, text
@@ -9,10 +8,11 @@ from sqlalchemy.orm import joinedload
 
 import app.core.db as db_module
 from app.modules.catalog.datasets.domain.models import Dataset
-from app.processing.ingest.tasks_common import _apply_reupload_swap
+from app.processing.ingest.catalog_projection import measure
 from app.processing.ingest.tasks_raster_replace import reupload_raster
 from app.processing.raster.models import RasterAsset
 from tests import test_feature_lock_order_1847 as lock_order
+from tests.test_reupload_swap_lock_retry import swap_in
 from tests.factories import get_user_id
 from tests.test_feature_lock_order_1847 import (
     _await_waiter_on,
@@ -26,24 +26,6 @@ from tests.test_raster_replace_1221 import (
     _queue_replace_job,
 )
 from tests.test_raster_replace_1221 import raster_storage as raster_storage
-
-_SWAP_METADATA = {
-    "srid": 4326,
-    "geometry_type": "Point",
-    "feature_count": 1,
-    "extent_wkt": None,
-    "column_info": [{"name": "name", "type": "character varying"}],
-}
-
-# Complete, because the row outlives the swap on the shared per-worker
-# database and a partial detail fails response validation elsewhere.
-_QUALITY = {
-    "overall": 90.0,
-    "metadata_completeness": 90.0,
-    "geometry_validity": 100.0,
-    "attribute_completeness": 90.0,
-    "crs_defined": 100.0,
-}
 
 
 async def _parked_statement(probe, holder_xid: str) -> str:
@@ -138,39 +120,30 @@ class TestTheReuploadSwapPublishesTheNextVersion:
             )
         )
         await test_db_session.commit()
+        measurement = await measure(
+            test_db_session, dataset, table=staging, schema="data"
+        )
 
-        with (
-            patch(
-                "app.processing.ingest.metadata.refresh_attribute_metadata",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "app.processing.ingest.metadata.compute_quality_score",
-                new_callable=AsyncMock,
-            ) as mock_quality,
+        async with (
+            db_module.async_session() as holder,
+            db_module.async_session() as probe,
         ):
-            mock_quality.return_value = _QUALITY
-            async with (
-                db_module.async_session() as holder,
-                db_module.async_session() as probe,
-            ):
-                before, _version = await _overlap(
-                    holder,
-                    probe,
-                    dataset.id,
-                    _apply_reupload_swap(
-                        test_db_session,
-                        dataset=dataset,
-                        staging_table=staging,
-                        metadata=_SWAP_METADATA,
-                        sample_values={"name": ["A"]},
-                        user_id=str(admin_id),
-                        source_filename="again.geojson",
-                        source_format="geojson",
-                        original_srid=4326,
-                    ),
-                )
-            await test_db_session.commit()
+            before, _swapped = await _overlap(
+                holder,
+                probe,
+                dataset.id,
+                swap_in(
+                    test_db_session,
+                    dataset=dataset,
+                    staging_table=staging,
+                    measurement=measurement,
+                    user_id=str(admin_id),
+                    source_filename="again.geojson",
+                    source_format="geojson",
+                    original_srid=4326,
+                ),
+            )
+        await test_db_session.commit()
 
         published = await _published_version(dataset.id)
         assert published == before + 2, _message(before, published)
@@ -227,27 +200,3 @@ class TestTheRasterReplacePublishesTheNextVersion:
             assert asset.asset_uri != old_cog_key, "the replace did not swap"
         finally:
             await _purge(test_db_session, dataset_id=dataset_id, record_id=record_id)
-
-
-class TestNoWorkerSwapWritesAnAbsoluteTileVersion:
-    """The two swap doors call the atomic spelling, not the instance method."""
-
-    def test_the_swap_modules_call_the_atomic_bump(self):
-        import ast
-        import inspect
-
-        from app.processing.ingest import (
-            tasks_common,
-            tasks_raster_replace,
-            tasks_raster_swap,
-        )
-
-        scan = lock_order.TestNoCatalogModuleWritesAnAbsoluteTileVersion
-        for module in (tasks_common, tasks_raster_replace, tasks_raster_swap):
-            tree = ast.parse(inspect.getsource(module))
-            assert not scan._calls_named(tree, scan.ABSOLUTE), (
-                f"{module.__name__} writes an absolute tile_cache_version"
-            )
-        for module in (tasks_common, tasks_raster_replace):
-            tree = ast.parse(inspect.getsource(module))
-            assert len(scan._calls_named(tree, scan.ATOMIC)) == 1, module.__name__

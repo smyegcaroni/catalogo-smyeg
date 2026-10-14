@@ -87,6 +87,8 @@ export interface CanonicalFilterCondition {
   rawValue?: unknown;
   /** Parsed literal values for in_list / not_in_list (used for chip preview). */
   listValues?: unknown[];
+  /** Read through `to-number`, which turns a missing value into 0. */
+  toNumber?: true;
 }
 
 export type CanonicalFilter =
@@ -156,7 +158,13 @@ function parseSingleCondition(e: unknown): CanonicalFilterCondition | null {
     Array.isArray(e[1][1]) &&
     e[1][1][0] === 'get'
   ) {
-    return { field: e[1][1][1] as string, operator: e[0] as string, value: String(e[2] ?? ''), rawValue: e[2] };
+    return {
+      field: e[1][1][1] as string,
+      operator: e[0] as string,
+      value: String(e[2] ?? ''),
+      rawValue: e[2],
+      toNumber: true,
+    };
   }
 
   return null;
@@ -350,4 +358,244 @@ export function sanitizeNullableNumericFilter(
   // fix(#392): preserve input reference when structurally unchanged so the filter editor re-emit guard holds (audit FL-01)
   if (JSON.stringify(sanitized) === JSON.stringify(filter)) return filter;
   return sanitized as FilterSpecification;
+}
+
+// ---------------------------------------------------------------------------
+// Layer filter -> CQL2-JSON, for analysis requests
+// ---------------------------------------------------------------------------
+
+/** A CQL2-JSON expression, as the analysis endpoints and OGC items accept it. */
+export type Cql2Expression = {
+  op: string;
+  args: unknown[];
+};
+
+const CQL2_COMPARISON: Record<string, string> = {
+  '==': '=',
+  '!=': '<>',
+  '<': '<',
+  '>': '>',
+  '<=': '<=',
+  '>=': '>=',
+};
+
+/** A dataset column as the catalog lists it, typed by its information_schema name. */
+export interface FilterColumn {
+  name: string;
+  type?: string | null;
+}
+
+// Mirrors _FEATURE_QUERYABLE_NAME_RE and _PG_TYPE_TO_SCHEMA in
+// backend/app/standards/ogc/filtering.py: the columns a CQL2 filter can read.
+const CQL2_COLUMN_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,62}$/;
+const CQL2_STRING_TYPES = new Set(['text', 'character varying', 'character']);
+const CQL2_QUERYABLE_TYPES = new Set([
+  ...CQL2_STRING_TYPES,
+  'smallint',
+  'integer',
+  'bigint',
+  'real',
+  'double precision',
+  'numeric',
+  'boolean',
+  'date',
+  'timestamp without time zone',
+  'timestamp with time zone',
+  'uuid',
+]);
+// The map compares a date or timestamp as the text PostgreSQL wrote into the
+// tile, so only a value in that exact form compares the same way in SQL.
+const DATE_TEXT_RE = /^\d{4}-\d{2}-\d{2}$/;
+// No trailing zeros in the fraction: PostgreSQL drops them.
+const TIMESTAMP_TEXT_RE = /^(\d{4}-\d{2}-\d{2}) ((?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{0,5}[1-9])?)$/;
+// Mirrors _utc_timestamptz_text in backend/app/processing/tiles/service.py.
+const UTC_TIMESTAMP_TEXT_RE =
+  /^(\d{4}-\d{2}-\d{2})T((?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{0,5}[1-9])?)\+00:00$/;
+const TYPED_TIMESTAMP_RE =
+  /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?\s*(Z|[+-](?:0\d|1[0-5])(?::?[0-5]\d)?)?$/i;
+// PostgreSQL writes a uuid in lowercase, and the map compares case-sensitively.
+const UUID_TEXT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function isCalendarDate(day: string): boolean {
+  const parsed = new Date(`${day}T00:00:00Z`);
+  return (
+    !Number.isNaN(parsed.getTime()) &&
+    parsed.getUTCFullYear() >= 1 &&
+    parsed.toISOString().slice(0, 10) === day
+  );
+}
+
+const pad = (n: number, width = 2) => String(n).padStart(width, '0');
+
+/**
+ * A typed timestamp as the UTC text vector tiles carry for a timestamp with
+ * time zone, e.g. `2024-03-01T17:00:00+00:00`, or null when `value` is not a
+ * date and time. A value without an offset is read as UTC, the zone the map
+ * shows these values in.
+ */
+export function utcTimestampText(value: string): string | null {
+  const m = TYPED_TIMESTAMP_RE.exec(value.trim());
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s = '00', fraction = '', zone = 'Z'] = m;
+  const at = new Date(0);
+  at.setUTCFullYear(Number(y), Number(mo) - 1, Number(d));
+  at.setUTCHours(Number(h), Number(mi), Number(s));
+  if (
+    at.getUTCFullYear() !== Number(y) ||
+    at.getUTCMonth() !== Number(mo) - 1 ||
+    at.getUTCDate() !== Number(d) ||
+    at.getUTCHours() !== Number(h) ||
+    at.getUTCMinutes() !== Number(mi) ||
+    at.getUTCSeconds() !== Number(s)
+  ) {
+    return null;
+  }
+  if (zone.toUpperCase() !== 'Z') {
+    const digits = zone.slice(1).replace(':', '');
+    const minutes = Number(digits.slice(0, 2)) * 60 + Number(digits.slice(2) || 0);
+    at.setTime(at.getTime() - (zone[0] === '-' ? -minutes : minutes) * 60_000);
+  }
+  const year = at.getUTCFullYear();
+  if (year < 1 || year > 9999) return null;
+  const trimmed = fraction.replace(/0+$/, '');
+  return (
+    `${pad(year, 4)}-${pad(at.getUTCMonth() + 1)}-${pad(at.getUTCDate())}` +
+    `T${pad(at.getUTCHours())}:${pad(at.getUTCMinutes())}:${pad(at.getUTCSeconds())}` +
+    `${trimmed ? `.${trimmed}` : ''}+00:00`
+  );
+}
+
+/**
+ * The CQL2 literal for a value compared with a column of `pgType`, or null when
+ * SQL can't compare it the way the map does.
+ */
+function cql2Literal(value: string | number | boolean, pgType: string | undefined): unknown {
+  if (pgType === 'date') {
+    return typeof value === 'string' && DATE_TEXT_RE.test(value) && isCalendarDate(value)
+      ? { date: value }
+      : null;
+  }
+  if (pgType === 'timestamp without time zone') {
+    const m = typeof value === 'string' ? TIMESTAMP_TEXT_RE.exec(value) : null;
+    return m && isCalendarDate(m[1]) ? { timestamp: `${m[1]}T${m[2]}Z` } : null;
+  }
+  if (pgType === 'timestamp with time zone') {
+    const m = typeof value === 'string' ? UTC_TIMESTAMP_TEXT_RE.exec(value) : null;
+    return m && isCalendarDate(m[1]) ? { timestamp: `${m[1]}T${m[2]}Z` } : null;
+  }
+  if (pgType === 'uuid') {
+    return typeof value === 'string' && UUID_TEXT_RE.test(value) ? value : null;
+  }
+  return value;
+}
+
+function isCql2Scalar(value: unknown): value is string | number | boolean {
+  return (
+    typeof value === 'string' ||
+    typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isFinite(value))
+  );
+}
+
+const cql2Property = (field: string) => ({ property: field });
+const cql2IsNull = (field: string): Cql2Expression => ({
+  op: 'isNull',
+  args: [cql2Property(field)],
+});
+const cql2Not = (expr: Cql2Expression): Cql2Expression => ({ op: 'not', args: [expr] });
+// Tiles omit null properties, so MapLibre's negative tests (`!=`, not-in) keep
+// features with no value where SQL's three-valued logic would drop them.
+const cql2OrNull = (field: string, expr: Cql2Expression): Cql2Expression => ({
+  op: 'or',
+  args: [cql2IsNull(field), expr],
+});
+
+function compareNumbers(a: number, operator: string, b: number): boolean {
+  switch (operator) {
+    case '==':
+      return a === b;
+    case '!=':
+      return a !== b;
+    case '<':
+      return a < b;
+    case '>':
+      return a > b;
+    case '<=':
+      return a <= b;
+    default:
+      return a >= b;
+  }
+}
+
+function conditionToCql2(
+  c: CanonicalFilterCondition,
+  pgType: string | undefined,
+): Cql2Expression | null {
+  if (!CQL2_COLUMN_NAME_RE.test(c.field)) return null;
+  // An unlisted column is left to the server, which reads the live table.
+  if (pgType !== undefined && !CQL2_QUERYABLE_TYPES.has(pgType)) return null;
+  if (c.operator === 'is_null') return cql2IsNull(c.field);
+  if (c.operator === 'has') return cql2Not(cql2IsNull(c.field));
+  if (c.operator === 'in_list' || c.operator === 'not_in_list') {
+    const values = c.listValues ?? [];
+    if (values.length === 0 || !values.every(isCql2Scalar)) return null;
+    const literals = values.map((v) => cql2Literal(v, pgType));
+    if (literals.includes(null)) return null;
+    const inList: Cql2Expression = { op: 'in', args: [cql2Property(c.field), literals] };
+    return c.operator === 'in_list' ? inList : cql2OrNull(c.field, cql2Not(inList));
+  }
+  if (c.operator === 'contains') {
+    if (typeof c.rawValue !== 'string') return null;
+    if (pgType !== undefined && !CQL2_STRING_TYPES.has(pgType)) return null;
+    // MapLibre's `in` is a literal, case-sensitive substring test.
+    const literal = c.rawValue.replace(/[\\%_]/g, '\\$&');
+    return { op: 'like', args: [cql2Property(c.field), `%${literal}%`] };
+  }
+  const op = CQL2_COMPARISON[c.operator];
+  if (!op) return null;
+  if (c.toNumber) {
+    if (typeof c.rawValue !== 'number' || !Number.isFinite(c.rawValue)) return null;
+    const comparison: Cql2Expression = { op, args: [cql2Property(c.field), c.rawValue] };
+    return compareNumbers(0, c.operator, c.rawValue)
+      ? cql2OrNull(c.field, comparison)
+      : comparison;
+  }
+  if (c.rawValue === null) {
+    if (c.operator === '==') return cql2IsNull(c.field);
+    if (c.operator === '!=') return cql2Not(cql2IsNull(c.field));
+    return null;
+  }
+  if (!isCql2Scalar(c.rawValue)) return null;
+  const literal = cql2Literal(c.rawValue, pgType);
+  if (literal === null) return null;
+  const comparison: Cql2Expression = { op, args: [cql2Property(c.field), literal] };
+  return c.operator === '!=' ? cql2OrNull(c.field, comparison) : comparison;
+}
+
+/**
+ * Translate a layer's MapLibre filter into CQL2-JSON that keeps the same
+ * features. Returns null when the layer has no filter, and 'unsupported' when
+ * the filter uses a form outside the structured editor's subset or reads a
+ * column CQL2 cannot filter. `columns` types the literals; a filter on a
+ * column it does not list is sent untyped.
+ */
+export function maplibreFilterToCql2(
+  filter: FilterSpecification | null | undefined,
+  columns?: readonly FilterColumn[] | null,
+): Cql2Expression | null | 'unsupported' {
+  const canonical = parseCanonicalFilter(filter);
+  if (canonical.kind === 'opaque') return 'unsupported';
+  const types = new Map(
+    (columns ?? []).filter((col) => col.type).map((col) => [col.name, String(col.type).toLowerCase()]),
+  );
+  const parts: Cql2Expression[] = [];
+  for (const condition of canonical.conditions) {
+    const part = conditionToCql2(condition, types.get(condition.field));
+    if (part === null) return 'unsupported';
+    parts.push(part);
+  }
+  // An empty `any` matches nothing on the map, and CQL2 here has no false literal.
+  if (parts.length === 0) return canonical.combinator === 'any' ? 'unsupported' : null;
+  if (parts.length === 1) return parts[0];
+  return { op: canonical.combinator === 'all' ? 'and' : 'or', args: parts };
 }

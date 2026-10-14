@@ -1,4 +1,15 @@
 {
+  "mapsMatchingQuery": "Mapas que coinciden con \"{{query}}\"",
+  "loadingMaps": "Cargando mapas coincidentes...",
+  "mapsError": "No se pudieron cargar los mapas coincidentes.",
+  "retryMaps": "Reintentar búsqueda de mapas",
+  "mapsScopeHint": "Los mapas coinciden solo con el texto de búsqueda; los filtros del catálogo no se aplican.",
+  "catalogResults_one": "{{count}} resultado del catálogo",
+  "catalogResults_other": "{{count}} resultados del catálogo",
+  "catalogResults_many": "{{count}} resultados del catálogo",
+  "mapMatchCount_one": "{{count}} mapa coincidente",
+  "mapMatchCount_other": "{{count}} mapas coincidentes",
+  "mapMatchCount_many": "{{count}} mapas coincidentes",
   "title": "Buscar datos geoespaciales",
   "subtitle": "Busque, previsualice y exporte datos geoespaciales del catálogo",
   "placeholder": "Buscar en el catálogo...",
@@ -8,17 +19,27 @@
   "resultCount_other": "{{count}} resultados",
   "mapsSectionTitle": "Mapas",
   "empty": {
+    "catalogResultsTitle": "No se encontraron resultados en el catálogo",
+    "catalogResultsDescription": "Prueba a cambiar la búsqueda o los filtros.",
     "title": "No se encontraron conjuntos de datos",
     "description": "Intente ajustar su consulta de búsqueda o los filtros",
     "cta": "Importe su primer conjunto de datos",
     "catalogTitle": "Tu catálogo está vacío",
     "catalogDescription": "Importa un conjunto de datos para empezar a crear tu catálogo geoespacial.",
+    "catalogTitleViewer": "No hay conjuntos de datos que mostrar",
+    "catalogDescriptionViewer": "Aún no hay conjuntos de datos visibles para ti. Aparecerán aquí cuando alguien añada uno o comparta uno contigo.",
+    "catalogDescriptionAnonymous": "Aún no hay conjuntos de datos públicos. Inicia sesión para ver los que se han compartido contigo.",
+    "signIn": "Iniciar sesión",
     "clear": "Borrar búsqueda y filtros"
   },
   "error": {
     "message": "Error al cargar resultados: {{message}}"
   },
   "filters": {
+    "datasetFilters": "Filtros de conjuntos de datos",
+    "activeRefinements": "Filtros activos",
+    "advancedFilters": "Filtros avanzados",
+    "dataCoverageDate": "Fechas cubiertas por los datos",
     "geometry": "Geometría",
     "anyGeometry": "Cualquier geometría",
     "point": "Punto",
@@ -50,8 +71,8 @@
     "raster": "Ráster",
     "vrt": "VRT",
     "type": "Tipo",
-    "organization": "Organizacion",
-    "anyOrganization": "Cualquier organizacion",
+    "organization": "Organización",
+    "anyOrganization": "Cualquier organización",
     "crs": "CRS",
     "anyCrs": "Cualquier CRS",
     "collection": "Colección",
@@ -98,6 +119,8 @@
     "vrt": "Ráster virtual",
     "collection": "Colección",
     "table": "Tabla",
+    "tiles3d": "3D Tiles",
+    "pointcloud": "Nube de puntos",
     "sourceCount_one": "{{count}} fuente",
     "sourceCount_other": "{{count}} fuentes",
     "autoDesc": {
@@ -109,7 +132,8 @@
       "vrt_other": "Ráster virtual {{vrtType}} con {{count}} fuentes",
       "table_one": "Tabla con {{count}} fila",
       "table_other": "Tabla con {{count}} filas",
-      "fallback": "Conjunto de datos geoespacial"
+      "fallback": "Conjunto de datos geoespacial",
+      "tiles3d": "Tileset de 3D Tiles"
     },
     "moretags": "+{{count}} más",
     "updatedFallback": "Actualizado hace {{time}}",
@@ -144,7 +168,7 @@
   "bbox": {
     "mapAriaLabel": "Mapa del cuadro delimitador",
     "noExtent": "Sin extensión",
-    "instruction": "Haz clic y arrastra para dibujar un cuadro delimitador",
+    "instruction": "Haz clic para iniciar el cuadro y vuelve a hacer clic para terminarlo",
     "loading": "Cargando mapa..."
   },
   "typeahead": {
@@ -193,7 +217,7 @@
     "close": "Cerrar",
     "rectangle": "Rectángulo",
     "polygon": "Polígono",
-    "rectangleInstruction": "Haz clic y arrastra para dibujar un cuadro delimitador",
+    "rectangleInstruction": "Haz clic para iniciar el cuadro y vuelve a hacer clic para terminarlo",
     "polygonInstruction": "Haz clic para añadir puntos, doble clic para finalizar",
     "predicate": "Modo:",
     "intersects": "Interseca",

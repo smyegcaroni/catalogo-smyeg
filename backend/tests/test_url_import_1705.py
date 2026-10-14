@@ -254,7 +254,7 @@ class TestUrlImportFilename:
             headers=admin_auth_header,
         )
         assert resp.status_code == 422
-        assert "filename" in resp.json()["detail"]
+        assert "filename" in resp.json()["detail"]["message"]
 
     async def test_extensionless_path_needs_override(
         self, client: AsyncClient, admin_auth_header: dict
@@ -280,7 +280,7 @@ class TestUrlImportFilename:
             headers=admin_auth_header,
         )
         assert resp.status_code == 400
-        assert "not allowed" in resp.json()["detail"]
+        assert "not allowed" in resp.json()["detail"]["message"]
 
     async def test_ssrf_gate_runs_before_any_handler_db_work(
         self, client: AsyncClient, admin_auth_header: dict, monkeypatch
@@ -298,7 +298,8 @@ class TestUrlImportFilename:
         monkeypatch.setattr("app.platform.security.validate_url_for_ssrf", gate)
         spy = AsyncMock(return_value=[".geojson"])
         monkeypatch.setattr(
-            "app.processing.ingest.router._get_allowed_extensions_safely", spy
+            "app.processing.ingest.router_url_import._get_allowed_extensions_safely",
+            spy,
         )
         resp = await client.post(
             "/ingest/upload/url",
@@ -318,7 +319,7 @@ class TestUrlImportFilename:
             headers=admin_auth_header,
         )
         assert resp.status_code == 422
-        assert "VRT" in resp.json()["detail"]
+        assert "VRT" in resp.json()["detail"]["message"]
 
     def test_filename_from_url_shapes(self):
         assert filename_from_url("https://h/x/roads.geojson") == "roads.geojson"
@@ -394,9 +395,12 @@ class TestUrlImportFetch:
         assert deferred["url"] == "https://files.example.test/deferred.geojson"
         assert deferred["attempt_id"] == str(job.attempt_id)
         assert deferred["filename"] == "deferred.geojson"
-        # fix(#1710): a URL can carry userinfo credentials and user_metadata
-        # is served by GET /jobs/{id}, so the URL must not reach the row.
-        assert "deferred.geojson" not in str(job.user_metadata or {})
+        # The row keeps only the credential-free marker, and GET /jobs/{id}
+        # serves none of it.
+        assert job.user_metadata["url_import"] == deferred["url"]
+        status_resp = await client.get(f"/jobs/{job.id}", headers=admin_auth_header)
+        assert status_resp.status_code == 200, status_resp.text
+        assert "files.example.test" not in status_resp.text
 
     async def test_success_stages_file_and_creates_job(
         self,
@@ -758,7 +762,7 @@ class TestUrlImportMalformedUrl:
             headers=admin_auth_header,
         )
         assert resp.status_code == 400
-        assert "Invalid" in resp.json()["detail"]
+        assert "Invalid" in resp.json()["detail"]["message"]
 
     async def test_malformed_authority_with_override_is_400(
         self, client: AsyncClient, admin_auth_header: dict
@@ -1003,7 +1007,7 @@ class TestUrlImportControlCharacters:
             headers=admin_auth_header,
         )
         assert resp.status_code == 422
-        assert "control characters" in resp.json()["detail"]
+        assert "control characters" in resp.json()["detail"]["message"]
         result = await test_db_session.execute(
             select(IngestJob).where(IngestJob.source_filename.like("nulname%"))
         )
@@ -1029,7 +1033,7 @@ class TestUrlImportControlCharacters:
             headers=admin_auth_header,
         )
         assert resp.status_code == 422
-        assert "control characters" in resp.json()["detail"]
+        assert "control characters" in resp.json()["detail"]["message"]
 
 
 class TestUrlImportWallClock:
@@ -1208,7 +1212,9 @@ class TestUrlImportPreflightDnsBound:
         its own. A validator that never returns must fail cleanly at the
         (patched) preflight bound, name DNS as the cause, and leave no job
         row — the gate runs before any job exists."""
-        monkeypatch.setattr("app.processing.ingest.router.PREFLIGHT_DNS_MAX_SECONDS", 1)
+        monkeypatch.setattr(
+            "app.processing.ingest.router_url_import.PREFLIGHT_DNS_MAX_SECONDS", 1
+        )
 
         async def stalled_resolve(url: str) -> None:
             await asyncio.sleep(30)  # cancelled by wait_for at the bound

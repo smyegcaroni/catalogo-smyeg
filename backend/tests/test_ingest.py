@@ -8,17 +8,19 @@ Requirements:
   - Alembic migrations must be applied
 """
 
+import shutil
 import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.modules.auth.models import User
 from app.platform.jobs.models import IngestJob, commit_attempted_marker
 from tests.conftest import get_auth_header
+from tests.test_service_refresh_1220 import credential_backend  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +116,9 @@ class TestUpload:
             headers=admin_auth_header,
         )
         assert resp.status_code == 400
-        assert "not allowed" in resp.json()["detail"].lower()
+        detail = resp.json()["detail"]
+        assert detail["code"] == "disallowed_extension"
+        assert "not allowed" in detail["message"].lower()
 
     async def test_upload_rejects_standalone_vrt_even_when_configured(
         self, client: AsyncClient, admin_auth_header: dict
@@ -125,7 +129,9 @@ class TestUpload:
             headers=admin_auth_header,
         )
         assert resp.status_code == 422
-        assert "standalone vrt" in resp.json()["detail"].lower()
+        detail = resp.json()["detail"]
+        assert detail["code"] == "standalone_vrt_not_supported"
+        assert "standalone vrt" in detail["message"].lower()
 
     async def test_s3_validation_download_failure_deletes_the_staged_source(
         self,
@@ -711,11 +717,6 @@ class TestCsvNonSpatialPipeline:
             await test_db_session.commit()
 
 
-# ---------------------------------------------------------------------------
-# ArcGIS column_info fallback test (260408-iny)
-# ---------------------------------------------------------------------------
-
-
 async def _get_admin_id_for_ingest(session):
     """Helper to get admin user id for Task 3 tests."""
     from tests.factories import get_user_id
@@ -723,126 +724,60 @@ async def _get_admin_id_for_ingest(session):
     return await get_user_id(session, "admin")
 
 
-@pytest.mark.anyio
-async def test_arcgis_table_ingest_populates_column_info(test_db_session):
-    """When ogr2ogr creates a table with no attribute columns (only gid),
-    the ArcGIS fields fallback in _finalize_ingest should populate column_info
-    from source_columns stored in user_metadata.
+# ---------------------------------------------------------------------------
+# A non-spatial ArcGIS service load keeps its attribute columns
+# ---------------------------------------------------------------------------
 
-    Verifies _arcgis_type_to_column_type helper and the fallback branch.
-    """
-    import uuid as _uuid
+# An ArcGIS Table layer's query response: attributes, with no geometry.
+_NONSPATIAL_ESRIJSON = """{
+  "objectIdFieldName": "OBJECTID",
+  "fields": [
+    {"name": "OBJECTID", "type": "esriFieldTypeOID", "alias": "OBJECTID"},
+    {"name": "NAME", "type": "esriFieldTypeString", "alias": "NAME", "length": 255},
+    {"name": "SCORE", "type": "esriFieldTypeDouble", "alias": "SCORE"}
+  ],
+  "features": [
+    {"attributes": {"OBJECTID": 1, "NAME": "Alpha", "SCORE": 1.5}},
+    {"attributes": {"OBJECTID": 2, "NAME": "Bravo", "SCORE": 2.5}}
+  ]
+}"""
 
-    from sqlalchemy import text
 
-    from app.modules.catalog.datasets.domain.models import Dataset
-    from app.processing.ingest.tasks import (
-        IngestContext,
-        _arcgis_type_to_column_type,
-        _finalize_ingest,
-    )
-    from app.platform.jobs.models import IngestJob
+@pytest.mark.skipif(
+    shutil.which("ogr2ogr") is None,
+    reason="ogr2ogr binary not available on host (runs in backend Docker image / CI)",
+)
+@pytest.mark.requires_ogr2ogr
+async def test_nonspatial_arcgis_service_load_keeps_attribute_columns(
+    test_db_session, tmp_path
+):
+    """A non-spatial ArcGIS table keeps its attribute columns, not only gid."""
+    from app.processing.ingest.metadata import get_column_info
+    from app.processing.ingest.ogr import build_pg_conn_str, run_ogr2ogr_service
 
-    admin_id = await _get_admin_id_for_ingest(test_db_session)
-
-    source_columns = [
-        {"name": "Opportunity_Number", "type": "esriFieldTypeString"},
-        {"name": "Federal_Agency", "type": "esriFieldTypeString"},
-        {"name": "Category", "type": "esriFieldTypeString"},
-        {"name": "Opening_Date", "type": "esriFieldTypeDate"},
-        {"name": "FID2", "type": "esriFieldTypeOID"},
-    ]
-    user_metadata = {
-        "service_type": "ArcGIS:FeatureServer",
-        "layer_id": 0,
-        "geometry_type": None,
-        "source_columns": source_columns,
-        "title": "ArcGIS Column Info Test",
-        "visibility": "private",
-    }
-
-    job = IngestJob(
-        source_filename="TestTable",
-        source_url="https://example.arcgis.com/FeatureServer/0",
-        source_layer="0",
-        created_by=admin_id,
-        status="running",
-        user_metadata=user_metadata,
-    )
-    test_db_session.add(job)
-    await test_db_session.flush()
-
-    # Simulate Case 2: ogr2ogr created only the gid column (no attribute columns)
-    table_name = f"tbl_arcgis_{_uuid.uuid4().hex[:10]}"
-    await test_db_session.execute(
-        text(f"CREATE TABLE IF NOT EXISTS data.{table_name} (gid serial PRIMARY KEY)")
-    )
-    await test_db_session.commit()
+    fixture = tmp_path / "nonspatial.json"
+    fixture.write_text(_NONSPATIAL_ESRIJSON)
+    table_name = f"tbl_arcgis_ns_{uuid.uuid4().hex[:10]}"
 
     try:
-        await _finalize_ingest(
-            IngestContext(
-                session=test_db_session,
-                job=job,
-                table_name=table_name,
-                user_id=str(admin_id),
-                has_geometry=False,
-                effective_srid=None,
-                source_format="arcgis_featureserver",
-                source_filename="TestTable",
-                original_srid=None,
-                user_metadata=user_metadata,
-            )
+        await run_ogr2ogr_service(
+            gdal_source=f"ESRIJSON:{fixture}",
+            layer_name="",
+            table_name=table_name,
+            db_conn_str=build_pg_conn_str(),
+            service_type="arcgis_featureserver",
+            is_non_spatial=True,
+            schema="data",
         )
 
-        from sqlalchemy import select
-
-        result = await test_db_session.execute(
-            select(Dataset).where(Dataset.table_name == table_name)
-        )
-        dataset = result.scalar_one()
-
-        assert dataset.column_info is not None
-        assert len(dataset.column_info) == 5
-
-        names = [c["name"] for c in dataset.column_info]
-        assert "Opportunity_Number" in names
-        assert "Federal_Agency" in names
-        assert "Opening_Date" in names
-
-        # Verify type mapping
-        by_name = {c["name"]: c for c in dataset.column_info}
-        assert by_name["Opportunity_Number"]["type"] == "text"
-        assert by_name["Opening_Date"]["type"] == "timestamp without time zone"
-        assert by_name["FID2"]["type"] == "integer"
-
-        # Verify ordinal_position is sequential from 1
-        assert by_name["Opportunity_Number"]["ordinal_position"] == 1
-        assert by_name["FID2"]["ordinal_position"] == 5
-
-        # fix(#1271 review): a first service ingest fetched from the origin
-        # moments ago, so the import IS a contact and stamps last_checked_at.
-        # The health verdict itself stays with the probe's classifier.
-        assert dataset.last_checked_at is not None
-        assert dataset.source_health is None
-
-        # Verify _arcgis_type_to_column_type helper directly
-        assert _arcgis_type_to_column_type("esriFieldTypeString") == "text"
-        assert _arcgis_type_to_column_type("esriFieldTypeInteger") == "integer"
-        assert _arcgis_type_to_column_type("esriFieldTypeDouble") == "double precision"
-        assert (
-            _arcgis_type_to_column_type("esriFieldTypeDate")
-            == "timestamp without time zone"
-        )
-        assert _arcgis_type_to_column_type("esriFieldTypeOID") == "integer"
-        assert _arcgis_type_to_column_type("esriFieldTypeUnknown") == "text"  # fallback
-
+        columns = await get_column_info(test_db_session, table_name, schema="data")
+        names = {c["name"] for c in columns}
+        assert names == {"objectid", "name", "score"}
     finally:
-        await test_db_session.rollback()
-        async with test_db_session.begin_nested():
-            await test_db_session.execute(
-                text(f"DROP TABLE IF EXISTS data.{table_name} CASCADE")
-            )
+        await test_db_session.execute(
+            text(f"DROP TABLE IF EXISTS data.{table_name} CASCADE")
+        )
+        await test_db_session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -1012,6 +947,47 @@ async def test_detect_and_override_geometry_x_y_constructs_point(test_db_session
 
 
 @pytest.mark.anyio
+async def test_detect_and_override_geometry_x_y_non_numeric_x_raises(test_db_session):
+    """A CSV whose X column ogr2ogr typed as text (mixed content) raises
+    'not numbers' rather than letting a bad cast reach the database driver."""
+    import uuid as _uuid
+
+    from sqlalchemy import text
+
+    from app.processing.ingest.tasks import _detect_and_override_geometry
+
+    table_name = f"tst_xytext_{_uuid.uuid4().hex[:8]}"
+    await test_db_session.execute(
+        text(
+            f"CREATE TABLE data.{table_name} ("
+            "  gid SERIAL PRIMARY KEY,"
+            "  lon text,"
+            "  lat text"
+            ")"
+        )
+    )
+    await test_db_session.execute(
+        text(f"INSERT INTO data.{table_name} (lon, lat) VALUES ('west', '40.7')")
+    )
+    await test_db_session.commit()
+
+    try:
+        with pytest.raises(ValueError, match="not numbers"):
+            await _detect_and_override_geometry(
+                test_db_session,
+                table_name=table_name,
+                user_metadata={"x_column": "lon", "y_column": "lat"},
+                effective_srid=4326,
+            )
+    finally:
+        await test_db_session.rollback()
+        await test_db_session.execute(
+            text(f"DROP TABLE IF EXISTS data.{table_name} CASCADE")
+        )
+        await test_db_session.commit()
+
+
+@pytest.mark.anyio
 async def test_detect_and_override_geometry_uppercase_column_names_lowered(
     test_db_session,
 ):
@@ -1164,44 +1140,105 @@ async def test_archive_original_file_success_leaves_user_metadata_untouched(
     assert "archive_failed" not in job.user_metadata
 
 
-@pytest.mark.anyio
-async def test_archive_original_file_failure_marks_user_metadata(tmp_path, monkeypatch):
-    """Storage failure → job.user_metadata['archive_failed']=True + error recorded."""
-    import uuid as _uuid
-    from unittest.mock import AsyncMock, MagicMock
+async def _fail_an_archive(
+    test_db_session, tmp_path, monkeypatch, *, error, metadata, attempt_moves=False
+):
+    """Archive a job's upload into a store whose put raises ``error``.
 
+    With ``attempt_moves`` another attempt takes the job during the put.
+    Returns the job's stored metadata and what its loaded instance shows.
+    """
+    from unittest.mock import AsyncMock
+
+    from sqlalchemy import delete
+
+    import app.core.db as db_module
     from app.processing.ingest.tasks import _archive_original_file
 
     upload_file = tmp_path / "cities.csv"
     upload_file.write_text("name,lat,lng\nParis,48.85,2.35\n")
 
-    mock_storage = AsyncMock()
-    mock_storage.put = AsyncMock(side_effect=RuntimeError("S3 unreachable"))
+    async def _put(key, fobj):
+        if attempt_moves:
+            async with db_module.async_session() as other:
+                await other.execute(
+                    text(
+                        "UPDATE catalog.ingest_jobs SET attempt_id = gen_random_uuid() "
+                        "WHERE id = :id"
+                    ),
+                    {"id": job_id},
+                )
+                await other.commit()
+        raise RuntimeError(error)
 
+    mock_storage = AsyncMock()
+    mock_storage.put = _put
     monkeypatch.setattr(
         "app.processing.ingest.tasks_staging.get_storage", lambda: mock_storage
     )
+    job = IngestJob(
+        status="complete",
+        created_by=await _get_admin_id_for_ingest(test_db_session),
+        user_metadata=metadata,
+    )
+    test_db_session.add(job)
+    await test_db_session.flush()
+    job_id = job.id
+    await test_db_session.commit()
+    try:
+        async with db_module.async_session() as session:
+            loaded = await session.get(IngestJob, job_id)
+            archived = await _archive_original_file(
+                session,
+                job=loaded,
+                dataset_id=uuid.uuid4(),
+                file_path=str(upload_file),
+            )
+            assert archived is False
+            shown = loaded.user_metadata
+        async with db_module.async_session() as session:
+            stored = await session.scalar(
+                select(IngestJob.user_metadata).where(IngestJob.id == job_id)
+            )
+        return stored, shown
+    finally:
+        await test_db_session.execute(delete(IngestJob).where(IngestJob.id == job_id))
+        await test_db_session.commit()
 
-    mock_session = AsyncMock()
-    mock_session.commit = AsyncMock()
 
-    job = MagicMock()
-    job.user_metadata = {"title": "Cities"}
-
-    dataset_id = _uuid.uuid4()
-
-    # Must NOT raise — archive is best-effort.
-    await _archive_original_file(
-        mock_session,
-        job=job,
-        dataset_id=dataset_id,
-        file_path=str(upload_file),
+@pytest.mark.anyio
+async def test_archive_original_file_failure_merges_its_flag_into_the_stored_metadata(
+    test_db_session, tmp_path, monkeypatch
+):
+    """A failed put adds ``archive_failed`` and ``archive_error`` and keeps the rest."""
+    stored, shown = await _fail_an_archive(
+        test_db_session,
+        tmp_path,
+        monkeypatch,
+        error="S3 unreachable",
+        metadata={"title": "Cities"},
     )
 
-    assert job.user_metadata["archive_failed"] is True
-    assert "S3 unreachable" in job.user_metadata["archive_error"]
-    assert job.user_metadata["title"] == "Cities"  # preserved
-    mock_session.commit.assert_awaited_once()
+    assert stored["archive_failed"] is True
+    assert "S3 unreachable" in stored["archive_error"]
+    assert stored["title"] == "Cities"
+    assert shown == stored
+
+
+@pytest.mark.anyio
+async def test_archive_original_file_failure_lands_nothing_once_another_attempt_owns_the_job(
+    test_db_session, tmp_path, monkeypatch
+):
+    stored, shown = await _fail_an_archive(
+        test_db_session,
+        tmp_path,
+        monkeypatch,
+        error="S3 unreachable",
+        metadata={"title": "Cities"},
+        attempt_moves=True,
+    )
+
+    assert stored == shown == {"title": "Cities"}
 
 
 @pytest.mark.anyio
@@ -1239,6 +1276,7 @@ async def test_archive_original_file_commit_failure_does_not_raise(
     mock_session.rollback = AsyncMock()
 
     job = MagicMock()
+    job.id, job.attempt_id = _uuid.uuid4(), _uuid.uuid4()
     job.user_metadata = {"title": "Fragile"}
     dataset_id = _uuid.uuid4()
 
@@ -1250,51 +1288,23 @@ async def test_archive_original_file_commit_failure_does_not_raise(
         file_path=str(upload_file),
     )
 
-    # user_metadata was updated in memory even though the commit didn't persist.
-    assert job.user_metadata["archive_failed"] is True
-    assert "S3 unreachable" in job.user_metadata["archive_error"]
+    # Nothing in memory claims a flag that never persisted.
+    assert job.user_metadata == {"title": "Fragile"}
     # Rollback was called so the session is clean for the caller.
     mock_session.rollback.assert_awaited_once()
 
 
 @pytest.mark.anyio
 async def test_archive_original_file_failure_truncates_long_error(
-    tmp_path, monkeypatch
+    test_db_session, tmp_path, monkeypatch
 ):
     """Very long error messages are truncated to 500 chars to avoid JSONB bloat."""
-    import uuid as _uuid
-    from unittest.mock import AsyncMock, MagicMock
-
-    from app.processing.ingest.tasks import _archive_original_file
-
-    upload_file = tmp_path / "big.shp.zip"
-    upload_file.write_bytes(b"PK\x03\x04")  # fake zip header
-
-    long_error = "X" * 2000  # way over 500 char limit
-
-    mock_storage = AsyncMock()
-    mock_storage.put = AsyncMock(side_effect=RuntimeError(long_error))
-
-    monkeypatch.setattr(
-        "app.processing.ingest.tasks_staging.get_storage", lambda: mock_storage
+    stored, _ = await _fail_an_archive(
+        test_db_session, tmp_path, monkeypatch, error="X" * 2000, metadata=None
     )
 
-    mock_session = AsyncMock()
-    mock_session.commit = AsyncMock()
-
-    job = MagicMock()
-    job.user_metadata = None  # test the None branch too
-
-    await _archive_original_file(
-        mock_session,
-        job=job,
-        dataset_id=_uuid.uuid4(),
-        file_path=str(upload_file),
-    )
-
-    assert job.user_metadata is not None
-    assert job.user_metadata["archive_failed"] is True
-    assert len(job.user_metadata["archive_error"]) == 500
+    assert stored["archive_failed"] is True
+    assert len(stored["archive_error"]) == 500
 
 
 # ---------------------------------------------------------------------------
@@ -1303,131 +1313,53 @@ async def test_archive_original_file_failure_truncates_long_error(
 
 
 @pytest.mark.anyio
-async def test_queue_ingest_job_file_defer_failure_marks_job_failed(tmp_path):
-    """Procrastinate outage during file ingest defer → job marked failed + 503."""
-    import uuid as _uuid
+@pytest.mark.parametrize("kind", ["file", "service", "raster"])
+async def test_queue_ingest_job_defer_failure_marks_job_failed(
+    test_db_session, tmp_path, kind
+):
+    """A queue outage at each ingest task fails the committed job and answers 503."""
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from fastapi import HTTPException
 
+    from app.platform.jobs.models import IngestJob
     from app.processing.ingest.service import queue_ingest_job
 
-    # Real file on disk so queue_ingest_job's size probe runs.
-    upload_file = tmp_path / "cities.geojson"
-    upload_file.write_text('{"type":"FeatureCollection","features":[]}')
+    upload = tmp_path / ("dem.tif" if kind == "raster" else "cities.geojson")
+    upload.write_text('{"type":"FeatureCollection","features":[]}')
+    job = IngestJob(
+        source_filename=upload.name,
+        status="pending",
+        file_path=None if kind == "service" else str(upload),
+        source_url=(
+            "https://example.com/services/arcgis/0" if kind == "service" else None
+        ),
+        source_layer="parcels" if kind == "service" else None,
+        user_metadata={"file_type": "raster"} if kind == "raster" else None,
+    )
+    test_db_session.add(job)
+    await test_db_session.commit()
+    job_id = job.id
 
-    mock_db = AsyncMock()
-    mock_db.commit = AsyncMock()
+    task = MagicMock()
+    task.defer_async = AsyncMock(side_effect=RuntimeError("procrastinate unreachable"))
+    # A small vector file goes to the priority queue through `configure`.
+    task.configure = MagicMock(return_value=task)
+    target = {
+        "file": "ingest_file",
+        "service": "ingest_service",
+        "raster": "ingest_raster",
+    }
 
-    job = MagicMock()
-    job.id = _uuid.uuid4()
-    job.source_url = None
-    job.file_path = str(upload_file)
-    job.user_metadata = None
-    job.status = "pending"
-    job.error_message = None
-    job.completed_at = None
-
-    failing_defer = AsyncMock(side_effect=RuntimeError("procrastinate unreachable"))
-
-    with patch("app.processing.ingest.tasks.ingest_file") as mock_task:
-        # Small file path routes to configure("priority").defer_async
-        priority_task = MagicMock()
-        priority_task.defer_async = failing_defer
-        mock_task.configure.return_value = priority_task
-        mock_task.defer_async = failing_defer
-
+    with patch(f"app.processing.ingest.tasks.{target[kind]}", task):
         with pytest.raises(HTTPException) as exc_info:
-            await queue_ingest_job(job, "user-id", db=mock_db)
+            await queue_ingest_job(job, "user-id", db=test_db_session)
 
     assert exc_info.value.status_code == 503
-    assert job.status == "failed"
-    assert job.error_message is not None
-    # fix(#1953): the type, never the message ADR-002 Decision 3 excludes.
-    assert "(RuntimeError)" in job.error_message
-    assert "procrastinate unreachable" not in job.error_message
-    assert job.completed_at is not None
-    mock_db.commit.assert_awaited()
-
-
-@pytest.mark.anyio
-async def test_queue_ingest_job_service_defer_failure_marks_job_failed():
-    """Procrastinate outage during service ingest defer → job marked failed + 503."""
-    import uuid as _uuid
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    from fastapi import HTTPException
-
-    from app.processing.ingest.service import queue_ingest_job
-
-    mock_db = AsyncMock()
-    mock_db.commit = AsyncMock()
-
-    job = MagicMock()
-    job.id = _uuid.uuid4()
-    job.source_url = "https://example.com/services/arcgis/0"
-    job.source_layer = "parcels"
-    job.file_path = None
-    job.user_metadata = None
-    job.status = "pending"
-    job.error_message = None
-    job.completed_at = None
-
-    failing_defer = AsyncMock(side_effect=RuntimeError("queue down"))
-
-    with patch(
-        "app.processing.ingest.tasks.ingest_service",
-        defer_async=failing_defer,
-    ):
-        with pytest.raises(HTTPException) as exc_info:
-            await queue_ingest_job(job, "user-id", db=mock_db)
-
-    assert exc_info.value.status_code == 503
-    assert job.status == "failed"
-    # fix(#1953): the type, never the message ADR-002 Decision 3 excludes.
-    assert "(RuntimeError)" in job.error_message
-    assert "queue down" not in job.error_message
-
-
-@pytest.mark.anyio
-async def test_queue_ingest_job_raster_defer_failure_marks_job_failed(tmp_path):
-    """Procrastinate outage during raster ingest defer → job marked failed + 503."""
-    import uuid as _uuid
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    from fastapi import HTTPException
-
-    from app.processing.ingest.service import queue_ingest_job
-
-    raster_file = tmp_path / "dem.tif"
-    raster_file.write_bytes(b"fake-raster")
-
-    mock_db = AsyncMock()
-    mock_db.commit = AsyncMock()
-
-    job = MagicMock()
-    job.id = _uuid.uuid4()
-    job.source_url = None
-    job.file_path = str(raster_file)
-    job.user_metadata = {"file_type": "raster"}
-    job.status = "pending"
-    job.error_message = None
-    job.completed_at = None
-
-    failing_defer = AsyncMock(side_effect=RuntimeError("raster queue dead"))
-
-    with patch(
-        "app.processing.ingest.tasks.ingest_raster",
-        defer_async=failing_defer,
-    ):
-        with pytest.raises(HTTPException) as exc_info:
-            await queue_ingest_job(job, "user-id", db=mock_db)
-
-    assert exc_info.value.status_code == 503
-    assert job.status == "failed"
-    # fix(#1953): the type, never the message ADR-002 Decision 3 excludes.
-    assert "(RuntimeError)" in job.error_message
-    assert "raster queue dead" not in job.error_message
+    row = await test_db_session.get(IngestJob, job_id, populate_existing=True)
+    assert row.status == "failed"
+    assert row.error_message == "Failed to queue ingest task (RuntimeError)"
+    assert row.completed_at is not None
 
 
 class TestCommitImportDispatch:
@@ -1610,7 +1542,12 @@ class TestCommitImportDispatch:
         assert "strict_cog" not in job.user_metadata
 
     async def test_service_job_commits_with_service_body(
-        self, client, admin_auth_header, test_db_session, mock_ingest_task
+        self,
+        client,
+        admin_auth_header,
+        test_db_session,
+        mock_ingest_task,
+        credential_backend,  # noqa: F811
     ) -> None:
         """Service job + service body -> 202 + queue_ingest_job called with token kwarg."""
         result = await test_db_session.execute(
@@ -1860,7 +1797,9 @@ class TestServiceImportAuthRequiredMarker:
         monkeypatch.setattr(
             tasks_vector, "_run_service_import_with_wfs_fallback", _fake_import
         )
-        monkeypatch.setattr(tasks_vector, "_emit_billing_event", _noop)
+        monkeypatch.setattr(
+            "app.processing.ingest.publish_followups._emit_billing_event", _noop
+        )
 
         with (
             patch(
@@ -1938,6 +1877,16 @@ class TestServiceImportAuthRequiredMarker:
                 assert "service-token" not in str(dataset.origin_uri)
             finally:
                 async with db_module.async_session() as session:
+                    # The committed dataset carries the mocked quality score,
+                    # which no dataset listing on this database can serialize.
+                    await session.execute(
+                        text(
+                            "DELETE FROM catalog.records WHERE id IN "
+                            "(SELECT record_id FROM catalog.datasets "
+                            "WHERE table_name = :table_name)"
+                        ),
+                        {"table_name": table_name},
+                    )
                     await session.execute(
                         text(f'DROP TABLE IF EXISTS data."{table_name}" CASCADE')
                     )

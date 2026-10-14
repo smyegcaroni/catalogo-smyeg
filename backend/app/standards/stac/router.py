@@ -7,12 +7,11 @@ see public + their owned private + any restricted records granted to their roles
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 import uuid
 from collections.abc import Sequence
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 from urllib.parse import urlencode
@@ -29,13 +28,14 @@ from app.modules.catalog.collections.models import Collection, CollectionDataset
 from app.core.config import settings
 from app.core.identity import Identity
 from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
-import app.core.db as _db_module
 from app.modules.auth.dependencies import (
     get_optional_user,
     get_optional_user_no_security_schema,
 )
 from app.modules.catalog.authorization import (
     apply_visibility_filter,
+    can_download_raster_cog,
+    can_export,
     get_user_roles,
     visible_lineage_summaries,
     visible_lineage_summary,
@@ -56,7 +56,14 @@ from app.standards.ogc.utils import (
     link_header_value,
     parse_accept_languages,
 )
-from app.core.geo import make_bbox_filter, rollup_bbox, rollup_bbox_columns
+from app.core.geo import (
+    check_wrap_turns,
+    make_bbox_filter,
+    rollup_bbox,
+    rollup_bbox_columns,
+    wrap_geometry_longitudes,
+    wrapped_spatial_filter,
+)
 from app.modules.catalog.search.service import build_assets, dataset_to_ogc_record
 from app.standards.stac.schemas import (
     StacCatalog,
@@ -265,6 +272,7 @@ async def _dataset_to_stac_item(
     user: Identity | None = None,
     user_roles: set[str] | None = None,
     lineage_summary: Any = _LINEAGE_UNRESOLVED,
+    may_export: bool | None = None,
 ) -> dict:
     """Convert a Dataset ORM object to a STAC Item dict with presigned URLs.
 
@@ -312,6 +320,9 @@ async def _dataset_to_stac_item(
         storage_backend=settings.storage_provider,
         storage_provider=storage,
         public_app_url=public_app_url,
+        cog_download=await can_download_raster_cog(
+            db, dataset, user, user_roles, may_export=may_export
+        ),
     )
 
     # Look up collection membership if not provided
@@ -337,6 +348,10 @@ async def _dataset_to_stac_item(
         collection_id=collection_id,
         stac_api_url=stac_api_url,
         derived_from_id=await _visible_derived_from_id(db, record, user, user_roles),
+        crs_metres_per_unit=(raster_meta or {}).get("crs_metres_per_unit"),
+        band_info=(raster_meta or {}).get("band_info"),
+        dtype=(raster_meta or {}).get("dtype"),
+        nodata=(raster_meta or {}).get("nodata"),
     )
 
 
@@ -871,7 +886,9 @@ async def get_collection(
                 detail="Collection not found",
             )
 
-    # Three independent metadata queries -- run concurrently with separate sessions.
+    # Run the three metadata queries one after another on the caller's session
+    # (see get_collections): a session of their own each would hold extra pool
+    # connections on top of the one this request already holds.
 
     async def _fetch_extent() -> tuple | None:
         extent_stmt = (
@@ -894,8 +911,7 @@ async def get_collection(
         extent_stmt = apply_visibility_filter(
             extent_stmt, user, user_roles, Record, DatasetGrant
         )
-        async with _db_module.async_session() as s:
-            return (await s.execute(extent_stmt)).one_or_none()
+        return (await db.execute(extent_stmt)).one_or_none()
 
     async def _fetch_kw() -> list[str] | None:
         kw_stmt = (
@@ -914,10 +930,9 @@ async def get_collection(
         kw_stmt = apply_visibility_filter(
             kw_stmt, user, user_roles, Record, DatasetGrant
         )
-        async with _db_module.async_session() as s:
-            rows = await s.execute(kw_stmt)
-            result = sorted([r[0] for r in rows.all() if r[0]])
-            return result or None
+        rows = await db.execute(kw_stmt)
+        result = sorted([r[0] for r in rows.all() if r[0]])
+        return result or None
 
     async def _fetch_projection() -> dict | None:
         RasterAsset = get_catalog_port().raster_asset_orm_class()
@@ -939,14 +954,13 @@ async def get_collection(
         projection_stmt = apply_visibility_filter(
             projection_stmt, user, user_roles, Record, DatasetGrant
         )
-        async with _db_module.async_session() as s:
-            rows = await s.execute(projection_stmt)
-            codes = sorted([r[0] for r in rows.all() if r[0]])
-            return {"proj:code": [f"EPSG:{code}" for code in codes]} if codes else None
+        rows = await db.execute(projection_stmt)
+        codes = sorted([r[0] for r in rows.all() if r[0]])
+        return {"proj:code": [f"EPSG:{code}" for code in codes]} if codes else None
 
-    ext_row, coll_keywords, summaries = await asyncio.gather(
-        _fetch_extent(), _fetch_kw(), _fetch_projection()
-    )
+    ext_row = await _fetch_extent()
+    coll_keywords = await _fetch_kw()
+    summaries = await _fetch_projection()
     spatial_extent, temporal_extent, license = _parse_extent_row(ext_row)
 
     return ogc_collection_to_stac_collection(
@@ -1040,42 +1054,37 @@ async def get_collection_items(
     result = await db.execute(stmt)
     datasets = result.unique().scalars().all()
 
-    # Bulk-fetch assets, raster metadata, and spatial-extent GeoJSON concurrently.
+    # Bulk-fetch assets, raster metadata, and spatial-extent GeoJSON on the
+    # caller's session, one after another (see get_collections).
     # Bulk ST_AsGeoJSON in PostGIS is faster than per-dataset Python-side
     # to_shape() WKB deserialization in dataset_to_ogc_record.
     ds_ids = [d.id for d in datasets]
 
-    async def _assets():
-        async with _db_module.async_session() as s:
-            return await _fetch_dataset_asset_rows(s, ds_ids)
-
-    async def _raster():
-        async with _db_module.async_session() as s:
-            return await _fetch_raster_meta(s, ds_ids)
-
     async def _extents() -> dict[str, str | None]:
         if not ds_ids:
             return {}
-        async with _db_module.async_session() as s:
-            stmt = (
-                select(
-                    Dataset.id,
-                    func.ST_AsGeoJSON(Record.spatial_extent, 6).label("geojson"),
-                )
-                .join(Record, Dataset.record_id == Record.id)
-                .where(Dataset.id.in_(ds_ids))
+        stmt = (
+            select(
+                Dataset.id,
+                func.ST_AsGeoJSON(Record.spatial_extent, 6).label("geojson"),
             )
-            return {str(row.id): row.geojson for row in (await s.execute(stmt)).all()}
+            .join(Record, Dataset.record_id == Record.id)
+            .where(Dataset.id.in_(ds_ids))
+        )
+        return {str(row.id): row.geojson for row in (await db.execute(stmt)).all()}
 
-    asset_rows_map, raster_meta_map, extent_geojson_map = await asyncio.gather(
-        _assets(), _raster(), _extents()
-    )
+    asset_rows_map = await _fetch_dataset_asset_rows(db, ds_ids)
+    raster_meta_map = await _fetch_raster_meta(db, ds_ids)
+    extent_geojson_map = await _extents()
 
     # Lineage visibility for the whole page in one query
     # instead of one visible_lineage_summary round trip per item.
     lineage_map = await visible_lineage_summaries(
         db, [d.record for d in datasets], user, user_roles or set()
     )
+    may_export = any(
+        d.record.record_type == "raster_dataset" for d in datasets
+    ) and await can_export(db, user, user_roles)
 
     features = []
     coll_id_str = str(collection_id)
@@ -1094,6 +1103,7 @@ async def get_collection_items(
             user=user,
             user_roles=user_roles,
             lineage_summary=lineage_map[dataset.record.id],
+            may_export=may_export,
         )
         features.append(item)
 
@@ -1160,15 +1170,8 @@ async def _build_item_response(
 ) -> JSONResponse:
     """Fetch assets/raster metadata, convert to STAC Item, return as geo+json."""
 
-    async def _assets():
-        async with _db_module.async_session() as s:
-            return await _fetch_dataset_asset_rows(s, [dataset.id])
-
-    async def _raster():
-        async with _db_module.async_session() as s:
-            return await _fetch_raster_meta(s, [dataset.id])
-
-    asset_rows, raster_meta = await asyncio.gather(_assets(), _raster())
+    asset_rows = await _fetch_dataset_asset_rows(db, [dataset.id])
+    raster_meta = await _fetch_raster_meta(db, [dataset.id])
 
     # Intentional validation boundary: serializer output must satisfy the
     # published STAC response contract before it reaches the wire.
@@ -1352,20 +1355,20 @@ def _build_search_filters(
 
     # Filter by intersects (GeoJSON geometry) — accept string or dict
     if intersects:
-        if isinstance(intersects, dict):
-            intersects_str = json.dumps(intersects)
-        else:
-            intersects_str = intersects
-            try:
-                json.loads(intersects_str)  # validate JSON before sending to DB
-            except (ValueError, TypeError) as e:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid intersects geometry: {e}",
-                )
-        _geom = func.ST_SetSRID(func.ST_GeomFromGeoJSON(intersects_str), 4326)
-        filters.append(Record.spatial_extent.op("&&")(func.ST_Envelope(_geom)))
-        filters.append(func.ST_Intersects(Record.spatial_extent, _geom))
+        intersects_str = (
+            intersects if isinstance(intersects, str) else json.dumps(intersects)
+        )
+        try:
+            check_wrap_turns(json.loads(intersects_str))
+        except (ValueError, TypeError) as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid intersects geometry: {e}",
+            )
+        _geom = wrap_geometry_longitudes(
+            func.ST_SetSRID(func.ST_GeomFromGeoJSON(intersects_str), 4326)
+        )
+        filters.append(wrapped_spatial_filter(Record, _geom))
     elif bbox:
         # Filter by bbox (only if intersects not provided). parse_bbox takes the
         # GET string and the POST list, so both spellings validate identically.
@@ -1512,14 +1515,6 @@ async def _execute_search(
 
     ds_ids = [d.id for d in datasets]
 
-    async def _assets():
-        async with _db_module.async_session() as s:
-            return await _fetch_dataset_asset_rows(s, ds_ids)
-
-    async def _raster():
-        async with _db_module.async_session() as s:
-            return await _fetch_raster_meta(s, ds_ids)
-
     async def _coll_membership() -> dict[str, str]:
         if not ds_ids:
             return {}
@@ -1552,22 +1547,24 @@ async def _execute_search(
             CollectionDataset.added_at.asc(),
             CollectionDataset.collection_id.asc(),
         )
-        async with _db_module.async_session() as s:
-            cd_result = await s.execute(cd_stmt)
-            memberships: dict[str, str] = {}
-            for row in cd_result.all():
-                memberships.setdefault(str(row.dataset_id), str(row.collection_id))
-            return memberships
+        cd_result = await db.execute(cd_stmt)
+        memberships: dict[str, str] = {}
+        for row in cd_result.all():
+            memberships.setdefault(str(row.dataset_id), str(row.collection_id))
+        return memberships
 
-    asset_rows_map, raster_meta_map, collection_id_map = await asyncio.gather(
-        _assets(), _raster(), _coll_membership()
-    )
+    asset_rows_map = await _fetch_dataset_asset_rows(db, ds_ids)
+    raster_meta_map = await _fetch_raster_meta(db, ds_ids)
+    collection_id_map = await _coll_membership()
 
     # Lineage visibility for the whole page in one query
     # instead of one visible_lineage_summary round trip per item.
     lineage_map = await visible_lineage_summaries(
         db, [d.record for d in datasets], user, user_roles or set()
     )
+    may_export = any(
+        d.record.record_type == "raster_dataset" for d in datasets
+    ) and await can_export(db, user, user_roles)
 
     features = []
     for dataset in datasets:
@@ -1586,6 +1583,7 @@ async def _execute_search(
             user=user,
             user_roles=user_roles,
             lineage_summary=lineage_map[dataset.record.id],
+            may_export=may_export,
         )
         features.append(item)
 
@@ -1782,7 +1780,7 @@ def _apply_datetime_filter(stmt, datetime_str: str):
     Malformed inputs raise HTTP 400 (was silently ignored before — that
     masked client mistakes).
     """
-    from app.modules.catalog.search.service import parse_ogc_datetime
+    from app.modules.catalog.search.service import parse_ogc_datetime, utc_midnight
 
     datetime_str = _validate_stac_datetime(datetime_str.strip())
     start, end = parse_ogc_datetime(datetime_str)
@@ -1799,7 +1797,7 @@ def _apply_datetime_filter(stmt, datetime_str: str):
                 # missing temporal_start so interval and instant queries agree.
                 | (Record.temporal_end.is_(None) & Record.temporal_start.isnot(None))
                 | (Record.temporal_start >= start)
-                | (null_temporal & (Record.created_at >= start))
+                | (null_temporal & (Record.created_at >= utc_midnight(start)))
             )
         if end is not None:
             stmt = stmt.where(
@@ -1808,7 +1806,7 @@ def _apply_datetime_filter(stmt, datetime_str: str):
                 # always within any end bound. Null-null uses created_at,
                 # day-inclusive on the end bound.
                 | (Record.temporal_start.is_(None) & Record.temporal_end.isnot(None))
-                | (null_temporal & (Record.created_at < end + timedelta(days=1)))
+                | (null_temporal & (Record.created_at < utc_midnight(end, 1)))
             )
     elif start is not None:
         # Single instant (day-granular) — match records whose temporal range
@@ -1821,8 +1819,8 @@ def _apply_datetime_filter(stmt, datetime_str: str):
             (range_contains & ~null_temporal)
             | (
                 null_temporal
-                & (Record.created_at >= start)
-                & (Record.created_at < start + timedelta(days=1))
+                & (Record.created_at >= utc_midnight(start))
+                & (Record.created_at < utc_midnight(start, 1))
             )
         )
     return stmt

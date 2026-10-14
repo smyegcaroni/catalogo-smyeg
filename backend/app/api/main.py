@@ -9,6 +9,7 @@ import structlog
 # Must run before FastAPI/Starlette imports (gh #101); shared with worker for
 # the /tmp tmpfs issue during COG conversion.
 from app.core.config import settings
+from app.core.pointcloud import POINTCLOUD_MEDIA_TYPE
 from app.core.runtime.gdal_env import configure_gdal_s3_env
 from app.core.runtime.staging import redirect_tempfile_to_staging
 
@@ -36,7 +37,7 @@ from app.core.async_io import run_in_thread_draining
 from app.core.db.tenant_session import tenant_job_context
 from app.core.logging_config import setup_logging
 from app.core.tenancy import is_multi_tenant
-from app.api.no_compress_export import NoCompressionForExportMiddleware
+from app.api.no_compress_paths import NoCompressionByPathMiddleware
 from app.core.runtime.staging import (
     EXPORTS_PERIODIC_SWEEP_AGE_SECONDS,
     ensure_staging_ready,
@@ -49,7 +50,7 @@ from app.platform.extensions.bootstrap import (
     bootstrap,
 )
 from app.modules.auth.models import Role, User, UserRole
-from app.modules.auth.providers.local import hash_password
+from app.modules.auth.providers.local import hash_password_async
 from app.platform.ratelimit import emit_startup_notices, limiter
 from app.processing.ingest.tasks import task_app
 from app.api.middleware.body_limit import RequestBodyLimitMiddleware
@@ -152,7 +153,7 @@ async def seed_initial_admin() -> None:
         if user_count == 0:
             admin_user = User(
                 username=settings.geolens_admin_username,
-                password_hash=hash_password(
+                password_hash=await hash_password_async(
                     settings.geolens_admin_password.get_secret_value()
                 ),
                 is_active=True,
@@ -589,10 +590,10 @@ without credentials; private/restricted datasets require one of:
 Priority: header API key > query param API key > JWT > anonymous.
 
 **The `?api_key=` query parameter is deprecated, and it authenticates reads
-only.** A key sent in the URL is recorded by server access logs and any proxy
-in between, so it authenticates `GET`, `HEAD` and `OPTIONS` and nothing else.
-On any other method the key is ignored and the request is answered as if no
-credential had been sent. Prefer the `X-Api-Key` header, which carries reads
+only.** A key sent in the URL is recorded by server access logs and by any
+proxy or CDN that terminates TLS in front of GeoLens, so it authenticates
+`GET`, `HEAD` and `OPTIONS` and nothing else. On any other method the key is
+ignored and the request is answered as if no credential had been sent. Prefer the `X-Api-Key` header, which carries reads
 and writes alike; keep the query parameter only for clients that cannot send
 headers (e.g. XYZ tile URLs in desktop GIS tools).
 
@@ -752,7 +753,7 @@ _is_production = settings.is_production
 # Fallback below covers running from a source checkout with no `uv pip
 # install -e .` (no metadata to read); keep it in lockstep with
 # pyproject.toml — `make bump` rewrites it.
-_FALLBACK_APP_VERSION = "1.20.0"
+_FALLBACK_APP_VERSION = "1.24.0"
 
 
 def _resolve_app_version() -> str:
@@ -798,6 +799,8 @@ from app.standards.ogc.errors import (  # noqa: E402
     ProblemDetail,
     RATE_LIMIT_RESPONSE,
     UNRESOLVABLE_CREDENTIAL_RESPONSE,
+    UNRESOLVABLE_CREDENTIAL_RESPONSE_WITH_CAPABILITY,
+    UNRESOLVABLE_CREDENTIAL_RESPONSE_WITH_EMBED_TOKEN,
     register_error_handlers,
 )
 
@@ -1030,31 +1033,24 @@ app.add_middleware(
 # runs first on response) 2) GZipMiddleware (added second, outer, runs
 # second). Pinned by tests/test_phase_273_middleware_order.py.
 app.add_middleware(SecurityHeadersMiddleware)
-# fix(#1540): image/tiff joins starlette's default exclusions (avif/gif/
-# jpeg/png/webp) — a CORRECTNESS fix, not just a CPU one. This middleware
-# compresses a 200 but skips a 206, so a COG's strong ETag would identify
-# gzip bytes on the full download but raw bytes on a range: a client
-# resuming the encoded representation could splice raw bytes at encoded
-# offsets and assemble a corrupt file. Excluding the type restores the
-# invariant without variant-specific validators.
+# The COG and COPC media types join starlette's default exclusions (avif/gif/
+# jpeg/png/webp), and each is produced only by its byte route. This middleware
+# compresses a 200 but skips a 206, so a strong ETag would identify gzip bytes
+# on the full download but raw bytes on a range: a client resuming the encoded
+# representation could splice raw bytes at encoded offsets and assemble a
+# corrupt file. Excluding the types keeps one representation per ETag.
 app.add_middleware(
     GZipMiddleware,
     minimum_size=256,
     compresslevel=4,
-    exclude_content_types=DEFAULT_EXCLUDED_CONTENT_TYPES + ("image/tiff",),
+    exclude_content_types=DEFAULT_EXCLUDED_CONTENT_TYPES
+    + ("image/tiff", POINTCLOUD_MEDIA_TYPE),
 )
-# fix(#1532): export route excluded by PATH, not media type — excluding
-# `application/geo+json`/`text/csv` app-wide also stopped compressing
-# feature GeoJSON and admin/audit CSV, a straight bandwidth regression for
-# endpoints that never serve a range. `image/tiff` stays a type exclusion
-# since the COG download is its only producer.
-#
-# Implemented by dropping gzip from Accept-Encoding before GZipMiddleware
-# reads it (the documented opt-out) rather than `Content-Encoding: identity`,
-# which RFC 9110 defines for Accept-Encoding, not Content-Encoding. Added
-# AFTER the middleware above so it wraps it (starlette runs the most
-# recently added outermost).
-app.add_middleware(NoCompressionForExportMiddleware)
+# The export download and the 3D Tiles files are excluded by path: their media
+# types also come from routes that serve one representation and gain from gzip.
+# Added after GZipMiddleware so it runs first and strips gzip from the
+# Accept-Encoding that GZipMiddleware reads.
+app.add_middleware(NoCompressionByPathMiddleware)
 app.add_middleware(DynamicCORSMiddleware)
 
 app.include_router(api_router)
@@ -1336,6 +1332,11 @@ def _document_unresolvable_credential_401(schema: dict) -> None:
     from the security-marker set (fix(#430)). Only writes ``responses``,
     never ``security``, so it can't stamp an auth requirement back on.
     Pinned by ``test_no_security_schema_ops_get_401_without_security``.
+
+    A handler ``CAPABILITY`` marks in ``FAIL_OPEN_ALLOWLIST``
+    (``tests/test_optional_auth_failure_mode_1518.py``) gets a response
+    naming only the capability it actually accepts; every other operation
+    gets the plain, capability-free description.
     """
 
     from app.modules.auth.dependencies import (
@@ -1343,11 +1344,32 @@ def _document_unresolvable_credential_401(schema: dict) -> None:
         get_optional_user_fail_open,
         get_optional_user_no_security_schema,
     )
+    from app.modules.catalog.features.router import get_features_geojson_z_endpoint
+    from app.modules.catalog.maps.router_sharing import get_shared_map_endpoint
+    from app.processing.tiles.router import (
+        cluster_tile_endpoint,
+        get_tile_tokens_batch,
+        raster_auth_check,
+        raster_tile_proxy,
+        tile_endpoint,
+    )
 
     credential_aware = {
         get_optional_user,
         get_optional_user_fail_open,
         get_optional_user_no_security_schema,
+    }
+    # Vector/raster tile serving verifies both X-Embed-Token and a signed
+    # template (sig, exp, scope); the batch token mint and the other two
+    # capability handlers check X-Embed-Token only.
+    capability_responses = {
+        get_features_geojson_z_endpoint: UNRESOLVABLE_CREDENTIAL_RESPONSE_WITH_EMBED_TOKEN,
+        get_shared_map_endpoint: UNRESOLVABLE_CREDENTIAL_RESPONSE_WITH_EMBED_TOKEN,
+        get_tile_tokens_batch: UNRESOLVABLE_CREDENTIAL_RESPONSE_WITH_EMBED_TOKEN,
+        tile_endpoint: UNRESOLVABLE_CREDENTIAL_RESPONSE_WITH_CAPABILITY,
+        cluster_tile_endpoint: UNRESOLVABLE_CREDENTIAL_RESPONSE_WITH_CAPABILITY,
+        raster_tile_proxy: UNRESOLVABLE_CREDENTIAL_RESPONSE_WITH_CAPABILITY,
+        raster_auth_check: UNRESOLVABLE_CREDENTIAL_RESPONSE_WITH_CAPABILITY,
     }
 
     for ctx in _iter_api_routes(app):
@@ -1356,15 +1378,23 @@ def _document_unresolvable_credential_401(schema: dict) -> None:
             continue
         if not _dependency_uses(route.dependant, credential_aware):
             continue
+        response = capability_responses.get(route.endpoint)
         for method in route.methods or ():
             operation = _route_operation(schema, ctx, method)
             if operation is None:
                 continue
-            # setdefault: a route that already documents its own 401 with a
-            # more specific description keeps it.
-            operation.setdefault("responses", {}).setdefault(
-                "401", UNRESOLVABLE_CREDENTIAL_RESPONSE
-            )
+            responses = operation.setdefault("responses", {})
+            if response is not None:
+                # A mapped route's shared generic 401 (spread from an
+                # ERROR_RESPONSES_* constant on the route or an ancestor
+                # router) would otherwise win by already occupying the key;
+                # the mapping names what this route actually accepts, so it
+                # overrides rather than defers to that generic text.
+                responses["401"] = response
+            else:
+                # setdefault: a route that already documents its own 401 with
+                # a more specific description keeps it.
+                responses.setdefault("401", UNRESOLVABLE_CREDENTIAL_RESPONSE)
 
 
 def _document_global_failures(schema: dict) -> None:

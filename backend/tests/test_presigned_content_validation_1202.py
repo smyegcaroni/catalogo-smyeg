@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import uuid
+import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -238,7 +240,7 @@ async def test_both_doors_reject_a_mislabeled_payload_identically(
     assert direct.status_code == 422, direct.text
     assert presigned.status_code == direct.status_code, presigned.text
     assert presigned.json()["detail"] == direct.json()["detail"]
-    assert "'.gif'" in direct.json()["detail"]
+    assert "'.gif'" in direct.json()["detail"]["message"]
 
 
 async def test_both_doors_accept_a_legitimate_payload(
@@ -254,6 +256,33 @@ async def test_both_doors_accept_a_legitimate_payload(
 
     assert direct.status_code == 201, direct.text
     assert presigned.status_code == 200, presigned.text
+
+
+async def test_both_doors_reject_a_disallowed_extension_identically(
+    client, admin_auth_header, both_doors
+) -> None:
+    """A disallowed extension answers 400 on both doors, with the same detail.
+
+    The presigned door's validate_file_extension call had no handler for the
+    ValueError it raises, so this request used to 500 instead.
+    """
+    direct = await _direct_upload(
+        client, admin_auth_header, "malware.exe", b"MZ" + b"\x00" * 64
+    )
+    presigned_resp = await client.post(
+        "/ingest/upload/presigned",
+        json={
+            "filename": "malware.exe",
+            "file_size": 66,
+            "content_type": "application/octet-stream",
+        },
+        headers=admin_auth_header,
+    )
+
+    assert direct.status_code == 400, direct.text
+    assert presigned_resp.status_code == direct.status_code, presigned_resp.text
+    assert presigned_resp.json()["detail"] == direct.json()["detail"]
+    assert "'.exe'" in direct.json()["detail"]["message"]
 
 
 async def test_both_doors_reject_a_truncated_parquet_identically(
@@ -274,7 +303,7 @@ async def test_both_doors_reject_a_truncated_parquet_identically(
     assert direct.status_code == 422, direct.text
     assert presigned.status_code == direct.status_code, presigned.text
     assert presigned.json()["detail"] == direct.json()["detail"]
-    assert "PAR1" in direct.json()["detail"]
+    assert "PAR1" in direct.json()["detail"]["message"]
 
     # The footer can only have come from a read anchored to the end.
     size = len(_TRUNCATED_PARQUET)
@@ -296,6 +325,102 @@ async def test_both_doors_accept_a_valid_parquet_larger_than_the_header_window(
 
     assert direct.status_code == 201, direct.text
     assert presigned.status_code == 200, presigned.text
+
+
+_POINTS_GEOJSON = (
+    b'{"type":"FeatureCollection","features":[{"type":"Feature",'
+    b'"properties":{"name":"a"},"geometry":{"type":"Point","coordinates":[1,2]}}]}'
+)
+
+
+def _points_zip(method: int) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", method) as archive:
+        archive.writestr("points.geojson", _POINTS_GEOJSON)
+    return buffer.getvalue()
+
+
+async def _preview_from_both_doors(client, headers, storage, payload: bytes) -> list:
+    """Upload ``payload`` as a .zip through each door, then preview each job."""
+    from app.processing.ingest import router
+
+    with patch.object(
+        router, "_get_allowed_extensions_safely", AsyncMock(return_value=[".zip"])
+    ):
+        direct = await _direct_upload(client, headers, "points.zip", payload)
+        presigned, presigned_job, _ = await _presigned_upload(
+            client, headers, storage, "points.zip", payload
+        )
+    assert direct.status_code == 201, direct.text
+    assert presigned.status_code == 200, presigned.text
+    return [
+        await client.post(f"/ingest/preview/{job_id}", headers=headers)
+        for job_id in (direct.json()["job_id"], presigned_job)
+    ]
+
+
+@pytest.mark.parametrize(
+    "method", [zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA], ids=["bzip2", "lzma"]
+)
+async def test_both_doors_refuse_an_archive_member_by_its_method_unread(
+    client, admin_auth_header, both_doors, zip_member_reads, method
+) -> None:
+    """Preview refuses a bzip2 or LZMA member from either door without reading it."""
+    previews = await _preview_from_both_doors(
+        client, admin_auth_header, both_doors, _points_zip(method)
+    )
+
+    assert [p.status_code for p in previews] == [422, 422], [p.text for p in previews]
+    assert previews[0].json()["detail"] == previews[1].json()["detail"]
+    assert (
+        f"compressed with {zipfile.compressor_names[method]}"
+        in previews[0].json()["detail"]["message"]
+    )
+    assert zip_member_reads == []
+
+
+@pytest.mark.parametrize(
+    "method", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED], ids=["stored", "deflated"]
+)
+async def test_both_doors_preview_a_stored_or_deflated_archive_member(
+    client, admin_auth_header, both_doors, zip_member_reads, method
+) -> None:
+    """A stored or deflated member is read and previewed from either door."""
+    previews = await _preview_from_both_doors(
+        client, admin_auth_header, both_doors, _points_zip(method)
+    )
+
+    assert [p.status_code for p in previews] == [200, 200], [p.text for p in previews]
+    assert zip_member_reads.count("points.geojson") >= 2
+
+
+async def test_the_direct_door_sniffs_only_the_uploaded_bytes(
+    client, admin_auth_header, monkeypatch, tmp_path, zip_member_reads
+) -> None:
+    """A display name naming a file on the server changes nothing and opens nothing."""
+    from app.processing.ingest import router
+
+    monkeypatch.setattr(settings, "storage_provider", "local")
+    monkeypatch.setattr(settings, "upload_staging_dir", str(tmp_path / "staging"))
+    monkeypatch.setattr(
+        router, "_get_allowed_extensions_safely", AsyncMock(return_value=[".zip"])
+    )
+    elsewhere = tmp_path / "elsewhere.zip"
+    with zipfile.ZipFile(elsewhere, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<Types><Override ContentType="application/vnd.openxmlformats-'
+            'officedocument.spreadsheetml.sheet.main+xml"/></Types>',
+        )
+    payload = _points_zip(zipfile.ZIP_DEFLATED)
+
+    responses = [
+        await _direct_upload(client, admin_auth_header, name, payload)
+        for name in ("points.zip", str(elsewhere))
+    ]
+
+    assert [r.status_code for r in responses] == [201, 201], [r.text for r in responses]
+    assert zip_member_reads == []
 
 
 async def test_rejected_presigned_upload_removes_both_objects(
@@ -502,9 +627,35 @@ async def test_an_oversize_object_is_refused_without_being_copied(
         )
 
     assert completion.status_code == 422, completion.text
-    assert "exceeds the maximum allowed" in completion.json()["detail"]
+    assert "exceeds the maximum allowed" in completion.json()["detail"]["message"]
     assert both_doors.copies == [], both_doors.copies
     assert both_doors.objects == {}, both_doors.objects
+
+
+async def test_a_declared_oversize_request_is_refused_with_a_coded_detail(
+    client, admin_auth_header, both_doors
+) -> None:
+    """The request-time check: a declared file_size over the cap is a coded 422
+    before any URL is signed, matching the completion-time check's shape."""
+    from app.processing.ingest import router
+
+    with patch.object(router.UPLOAD_MAX_SIZE_MB, "get", AsyncMock(return_value=0)):
+        resp = await client.post(
+            "/ingest/upload/presigned",
+            json={
+                "filename": "roads.geojson",
+                "file_size": 1024 * 1024,
+                "content_type": "application/octet-stream",
+            },
+            headers=admin_auth_header,
+        )
+
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "file_size_exceeded"
+    assert "exceeds the maximum allowed" in detail["message"]
+    assert detail["size_mb"] == 1.0
+    assert detail["limit_mb"] == 0
 
 
 # Big enough to cross the multipart threshold the fixture lowers to 1 MB, and
@@ -870,7 +1021,8 @@ class TestFinalizeCleanupContract:
                 )
 
         assert exc.value.status_code == 422
-        assert "exceeds the maximum allowed" in str(exc.value.detail)
+        assert exc.value.detail["code"] == "file_size_exceeded"
+        assert "exceeds the maximum allowed" in exc.value.detail["message"]
         assert staging_key not in storage.objects
         assert frozen_key not in storage.objects, (
             "the frozen copy from the earlier attempt survived a pre-copy "

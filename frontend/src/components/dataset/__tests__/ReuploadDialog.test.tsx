@@ -10,11 +10,13 @@ import {
 } from '@/components/dataset/hooks/use-dataset';
 import { useJobStatus, useUploadConfig } from '@/components/import/hooks/use-ingest';
 import { probeService } from '@/api/ingest';
+import { useRefreshSearchWhenQuicklookLands } from '@/components/dataset/hooks/use-quicklook-settled';
 import { getDataset } from '@/api/datasets';
 import { ApiError } from '@/api/client';
 import { queryKeys } from '@/lib/query-keys';
+import { changeTestLanguage } from '@/test/i18n';
 import { ReuploadDialog } from '../ReuploadDialog';
-import type { DatasetResponse, ProbeResponse, ReuploadPreviewResponse } from '@/types/api';
+import type { DatasetResponse, ProbeResponse, RecordType, ReuploadPreviewResponse } from '@/types/api';
 
 let dropHandler: ((acceptedFiles: File[]) => void) | null = null;
 
@@ -40,6 +42,10 @@ vi.mock('@/components/dataset/hooks/use-dataset', () => ({
 vi.mock('@/components/import/hooks/use-ingest', () => ({
   useUploadConfig: vi.fn(),
   useJobStatus: vi.fn(),
+}));
+
+vi.mock('@/components/dataset/hooks/use-quicklook-settled', () => ({
+  useRefreshSearchWhenQuicklookLands: vi.fn(),
 }));
 
 vi.mock('@/api/ingest', () => ({
@@ -311,6 +317,64 @@ describe('ReuploadDialog', () => {
     expect(screen.getByTestId('reupload-file-dropzone')).toBeInTheDocument();
   });
 
+  it('skips a layer without features when preselecting and refuses to select it', async () => {
+    const user = userEvent.setup();
+    const probe = makeProbeResponse();
+    probe.layers = [
+      {
+        ...probe.layers[0],
+        name: 'detailed',
+        title: 'Detailed',
+        source_layer_type: 'Group Layer',
+        importable: false,
+      },
+      probe.layers[1],
+    ];
+    mockProbeService.mockResolvedValue(probe);
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: 'Service URL' }));
+    await user.type(screen.getByLabelText('Service URL'), 'https://example.com/wfs');
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
+    await screen.findByText('Select a layer');
+
+    expect(screen.getByText('Group Layer holds no features and cannot be re-uploaded from.')).toBeInTheDocument();
+    await user.click(screen.getByText('Detailed'));
+    expect(screen.getByRole('button', { name: 'Preview Layer' })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: 'Preview Layer' }));
+    await waitFor(() =>
+      expect(servicePreviewMutateAsync).toHaveBeenCalledWith(
+        expect.objectContaining({
+          request: expect.objectContaining({ layer_name: 'roads' }),
+        }),
+      ),
+    );
+  });
+
+  it('renders nothing for an unknown record type', () => {
+    render(
+      <ReuploadDialog
+        dataset={{ ...makeDataset(), record_type: 'hologram_dataset' as RecordType }}
+        open
+        onOpenChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it.each(['tiles3d_dataset', 'pointcloud_dataset'] as const)('renders nothing for a %s', (recordType) => {
+    render(
+      <ReuploadDialog
+        dataset={{ ...makeDataset(), record_type: recordType }}
+        open
+        onOpenChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
   // fix(#1746): this is a request-only service token, not a login credential,
   // so it must opt every password manager out explicitly.
   it('opts every password manager out of the service token field', async () => {
@@ -337,6 +401,25 @@ describe('ReuploadDialog', () => {
     expect(screen.queryByText('.tif')).not.toBeInTheDocument();
     expect(screen.queryByText('.tiff')).not.toBeInTheDocument();
     expect(screen.queryByText('.vrt')).not.toBeInTheDocument();
+  });
+
+  it('does not offer a .3tz tileset archive or a .laz point cloud', async () => {
+    mockUseUploadConfig.mockReturnValue({
+      data: {
+        presigned_uploads: false,
+        presigned_threshold_bytes: 10485760,
+        max_file_size_bytes: 524288000,
+        allowed_extensions: '.zip,.geojson,.3tz,.laz',
+      },
+    } as unknown as ReturnType<typeof useUploadConfig>);
+    const user = userEvent.setup();
+    renderDialog();
+
+    await openFileSource(user);
+
+    expect(screen.getByText('.geojson')).toBeInTheDocument();
+    expect(screen.queryByText('.3tz')).not.toBeInTheDocument();
+    expect(screen.queryByText('.laz')).not.toBeInTheDocument();
   });
 
   it('moves through service probe and layer selection into schema diff preview', async () => {
@@ -426,6 +509,46 @@ describe('ReuploadDialog', () => {
     await screen.findByText(
       'Warning: This re-upload includes schema changes that may affect existing queries.',
     );
+  });
+
+  it('lists the review reasons and sends the fingerprint of what it showed', async () => {
+    const user = userEvent.setup();
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({
+        job_id: 'file-job',
+        review_reasons: ['destructive_schema_change', 'geometry_type_changed'],
+        review_fingerprint: 'a'.repeat(64),
+      }),
+    );
+    renderDialog();
+
+    await openFileSource(user);
+    await dropFile();
+    const reasons = await screen.findByRole('list', { name: 'Changes that need review' });
+    expect(reasons).toHaveTextContent('The new data removes columns or changes their types.');
+    expect(reasons).toHaveTextContent('The new data changes the geometry type.');
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(commitMutateAsync).toHaveBeenCalled();
+    });
+    expect(commitMutateAsync.mock.calls[0][0].reviewFingerprint).toBe('a'.repeat(64));
+  });
+
+  it('sends the review fingerprint with a service-source commit', async () => {
+    const user = userEvent.setup();
+    servicePreviewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({ job_id: 'service-job', review_fingerprint: 'b'.repeat(64) }),
+    );
+    renderDialog();
+
+    await openServicePreview(user);
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(commitMutateAsync).toHaveBeenCalled();
+    });
+    expect(commitMutateAsync.mock.calls[0][0].reviewFingerprint).toBe('b'.repeat(64));
   });
 
   it('pre-fills service URL from dataset source_url', async () => {
@@ -1425,6 +1548,48 @@ describe('ReuploadDialog raster reupload', () => {
     });
   });
 
+  it('keeps watching for the new thumbnail when the job completes before its quicklook lands', async () => {
+    const user = userEvent.setup();
+    mockUseJobStatus.mockReturnValue({
+      data: { status: 'complete', quicklook_pending: true },
+    } as unknown as ReturnType<typeof useJobStatus>);
+
+    render(
+      <ReuploadDialog dataset={makeRasterDataset()} open onOpenChange={vi.fn()} />,
+    );
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(useRefreshSearchWhenQuicklookLands).toHaveBeenLastCalledWith('raster-job');
+    });
+  });
+
+  it.each([
+    ['a replacement held for review', 'review_required', 'This replacement was held for review.'],
+    ['a failed job', 'worker_lost', 'Something went wrong during the re-upload.'],
+  ])('titles %s as %s', async (_label, errorCode, heading) => {
+    const user = userEvent.setup();
+    mockUseJobStatus.mockReturnValue({
+      data: { status: 'failed', error_code: errorCode, error_message: 'reason text' },
+    } as unknown as ReturnType<typeof useJobStatus>);
+
+    render(<ReuploadDialog dataset={makeRasterDataset()} open onOpenChange={vi.fn()} />);
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    expect(await screen.findByText(heading)).toBeInTheDocument();
+    const tryAgain = screen.queryByTestId('reupload-try-again');
+    if (errorCode === 'review_required') expect(tryAgain).not.toBeInTheDocument();
+    else expect(tryAgain).toBeInTheDocument();
+  });
+
   it('does not call onReplaceComplete while the job is still pending', async () => {
     const user = userEvent.setup();
     const onReplaceComplete = vi.fn();
@@ -1565,6 +1730,34 @@ describe('ReuploadDialog raster reupload', () => {
   // fix(#1953): ADR-002 Decision 3 stores `internal_error` in place of a
   // failure the server did not compose, so the dialog is the surface that
   // has to turn that code into something a reader understands.
+  it('refetches the run history when a replacement is held for review', async () => {
+    const user = userEvent.setup();
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+    });
+    mockUseJobStatus.mockReturnValue({
+      data: {
+        status: 'failed',
+        error_code: 'review_required',
+        error_message: 'Review the detected changes before publication.',
+      },
+    } as unknown as ReturnType<typeof useJobStatus>);
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ReuploadDialog dataset={makeDataset()} open onOpenChange={vi.fn()} />
+      </QueryClientProvider>,
+    );
+
+    await openFileSource(user);
+    await dropFile();
+    await user.click(await screen.findByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({
+      queryKey: queryKeys.datasets.refreshRunsPrefix('dataset-1'),
+    }));
+  });
+
   it('renders the localized line for the coded internal failure', async () => {
     const user = userEvent.setup();
     mockUseJobStatus.mockReturnValue({
@@ -1579,6 +1772,43 @@ describe('ReuploadDialog raster reupload', () => {
 
     expect(await screen.findByText('Re-upload job failed.')).toBeInTheDocument();
     expect(screen.queryByText('internal_error')).not.toBeInTheDocument();
+  });
+
+  // check_missing_crs's text ends with the SRID-override remedy, which the
+  // vector import gate's missing_crs sentence does not carry --
+  // missing_crs_reupload is its own code so that remedy survives
+  // translation instead of being replaced by the vector gate's shorter one.
+  it('renders the SRID-override remedy for a re-upload missing-CRS failure, in de', async () => {
+    // Switched before the interaction, not after: the dialog computes and
+    // stores the localized error once, when the job status effect fires --
+    // a later language change would not re-render stale stored text. So the
+    // UI is driven in German throughout, not through openFileSource/the
+    // English "Confirm Re-Upload" label the other tests here use.
+    await changeTestLanguage('de');
+    const user = userEvent.setup();
+    mockUseJobStatus.mockReturnValue({
+      data: {
+        status: 'failed',
+        error_code: 'missing_crs_reupload',
+        error_message:
+          'Missing CRS: no coordinate system detected. Ensure the file includes CRS information (e.g., .prj file for Shapefiles) or provide an SRID override.',
+      },
+    } as unknown as ReturnType<typeof useJobStatus>);
+    renderRasterDialog();
+
+    await user.click(screen.getByRole('button', { name: 'Datei' }));
+    expect(screen.getByTestId('reupload-file-dropzone')).toBeInTheDocument();
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Erneutes Hochladen bestätigen' });
+    await user.click(screen.getByRole('button', { name: 'Erneutes Hochladen bestätigen' }));
+
+    expect(
+      await screen.findByText(
+        'CRS fehlt: Es wurde kein Koordinatensystem erkannt. Stellen Sie sicher, dass die Datei CRS-Informationen enthält (z. B. eine .prj-Datei bei Shapefiles), oder geben Sie eine SRID-Überschreibung an.',
+      ),
+    ).toBeInTheDocument();
+
+    await changeTestLanguage('en');
   });
 
   it('still shows a composed failure message verbatim', async () => {

@@ -21,10 +21,16 @@ from app.processing.ai.metadata_schemas import (
 )
 from app.core.config import settings
 from app.core.geo import extent_to_bbox
-from app.platform.cache import tenant_cache_context_available, tenant_cache_key
+from app.core.identity import Identity
+from app.platform.cache import tenant_cache_key
 from app.platform.extensions import get_ai_provider
 from app.processing.embeddings.helpers import get_nearest_record_ids
-from app.core.persistent_config import LLM_MODEL_LIGHT, LLM_PROVIDER
+from app.core.persistent_config import (
+    LLM_MODEL_LIGHT,
+    LLM_PROVIDER,
+    llm_model_default,
+)
+from app.processing.ai.service import _should_send_sample_values
 from app.processing.ai.token_usage import record_token_usage
 
 if TYPE_CHECKING:
@@ -35,12 +41,23 @@ logger = structlog.stdlib.get_logger(__name__)
 # In-memory TTL caches for metadata AI (avoids redundant DB queries when
 # a user clicks Summary, Keywords, Lineage in quick succession).
 _CACHE_TTL = 60.0  # seconds
-_NEIGHBOR_KW_TTL = 300.0  # 5 min — vector NN is heavier, embeddings change rarely
-_NEIGHBOR_KW_MAX = 100
 _dataset_context_cache: dict[str, tuple[float, str]] = {}
-_vocabulary_cache: dict[str, tuple[float, list[str]]] = {}
-_VOCABULARY_CACHE_MAX = 32
-_neighbor_kw_cache: dict[str, tuple[float, list[str]]] = {}
+
+
+def _describe_extent(bounds: tuple[float, float, float, float]) -> str:
+    """Describe a west, south, east, north bbox as signed longitude and latitude ranges.
+
+    Bare W/S/E/N labels beside positive numbers read as hemisphere letters to some
+    models. A seam-crossing extent keeps west > east instead of a global footprint,
+    and says so, because west > east alone reads as a typo.
+    """
+    west, south, east, north = bounds
+    crossing = " (crosses the antimeridian)" if west > east else ""
+    return (
+        "Extent in signed decimal degrees (negative longitude is west, negative "
+        f"latitude is south): longitude {west:.4f} to {east:.4f}{crossing}, "
+        f"latitude {south:.4f} to {north:.4f}"
+    )
 
 
 async def _build_dataset_context(
@@ -52,9 +69,10 @@ async def _build_dataset_context(
     """Load dataset with relationships and build a context string for prompts."""
     import uuid as _uuid
 
+    send_samples = await _should_send_sample_values(session)
     # Check TTL cache
     now = time.monotonic()
-    cache_key = tenant_cache_key(dataset_id)
+    cache_key = tenant_cache_key(f"{dataset_id}:samples={send_samples}")
     cached = _dataset_context_cache.get(cache_key)
     if cached and (now - cached[0]) < _CACHE_TTL:
         return cached[1]
@@ -100,19 +118,11 @@ async def _build_dataset_context(
         parts.append(f"Source organization: {record.source_organization}")
 
     if record.spatial_extent is not None:
-        # fix(#892): the label below is literally "W, S, E, N", so the RFC 7946
-        # §5.2 spec bbox is the honest value -- a seam-crossing extent reads
-        # W > E rather than claiming a global -180..180 footprint. Spell the
-        # crossing out, because W > E alone reads as a typo to a summarizer.
         bounds = extent_to_bbox(record.spatial_extent)
         if bounds is None:
             logger.debug("Failed to parse spatial bounds for AI context")
         else:
-            crossing = " (crosses the antimeridian)" if bounds[0] > bounds[2] else ""
-            parts.append(
-                f"Bounding box (W, S, E, N): {bounds[0]:.4f}, {bounds[1]:.4f}, "
-                f"{bounds[2]:.4f}, {bounds[3]:.4f}{crossing}"
-            )
+            parts.append(_describe_extent(bounds))
 
     if record.access_constraints:
         parts.append(f"Access constraints: {record.access_constraints}")
@@ -159,7 +169,7 @@ async def _build_dataset_context(
                 parts.append("Column statistics:\n" + "\n".join(lines))
 
     # Sample values (truncated at value level to avoid mid-JSON cuts)
-    if dataset.sample_values:
+    if send_samples and dataset.sample_values:
         truncated_samples = {}
         for col, vals in list(dataset.sample_values.items())[:10]:
             truncated_samples[col] = vals[:5] if isinstance(vals, list) else vals
@@ -211,37 +221,20 @@ async def _build_dataset_context(
     return result
 
 
-async def _get_catalog_vocabulary(
-    session: AsyncSession,
-    *,
-    port: "ProcessingPort",
-) -> list[str]:
-    """Return up to 200 distinct keywords from the catalog (cached 60s)."""
-    now = time.monotonic()
-    cache_key = tenant_cache_key("catalog-vocabulary")
-    cached = _vocabulary_cache.get(cache_key)
-    if cached and (now - cached[0]) < _CACHE_TTL:
-        return cached[1]
-
-    vocab = await port.get_catalog_vocabulary(session)
-    if len(_vocabulary_cache) >= _VOCABULARY_CACHE_MAX:
-        oldest_key = min(_vocabulary_cache, key=lambda key: _vocabulary_cache[key][0])
-        del _vocabulary_cache[oldest_key]
-    _vocabulary_cache[cache_key] = (now, vocab)
-    return vocab
-
-
 async def _get_related_keywords_from_embeddings(
     session: AsyncSession,
     dataset_id: str,
     limit: int = 5,
     *,
     port: "ProcessingPort",
+    user: Identity,
+    user_roles: set[str],
 ) -> list[str]:
     """Return keywords from the top-N nearest datasets by embedding similarity.
 
-    Falls back to empty list on no embedding or any error. Cached 5min by
-    dataset_id (vector NN is heavier than the dataset-context query).
+    Only neighbors ``user`` may read contribute keywords. Falls back to an
+    empty list on no embedding or any error. Not cached, because the result
+    depends on the caller's visibility.
 
     Both the dataset lookup and keyword aggregation route through the Port
     surface so processing/* carries no ``app.modules.catalog`` ORM import;
@@ -249,39 +242,32 @@ async def _get_related_keywords_from_embeddings(
     """
     import uuid as _uuid
 
-    if not tenant_cache_context_available():
-        return []
-
-    # Check cache first (keyed on dataset_id; embedding model rebinds are
-    # rare and a 5min staleness window is acceptable for context enrichment).
-    now = time.monotonic()
-    cache_key = tenant_cache_key(dataset_id)
-    cached = _neighbor_kw_cache.get(cache_key)
-    if cached and (now - cached[0]) < _NEIGHBOR_KW_TTL:
-        return cached[1]
-
     try:
         dataset = await port.get_dataset(session, _uuid.UUID(dataset_id))
         if dataset is None or dataset.record_id is None:
             return []
 
         neighbor_ids = await get_nearest_record_ids(
-            session, dataset.record_id, limit=limit
+            session,
+            dataset.record_id,
+            limit=limit,
+            restrict=lambda stmt: port.apply_visibility_filter(
+                stmt,
+                user,
+                user_roles,
+                port.get_record_orm_class(),
+                port.get_grant_orm_class(),
+            ),
         )
         if not neighbor_ids:
             return []
 
-        result = await port.get_keywords_for_records(session, neighbor_ids)
+        return await port.get_keywords_for_records(
+            session, neighbor_ids, user=user, user_roles=user_roles
+        )
     except Exception:  # broad: embedding neighbor lookup is non-fatal context-builder; degrade to empty list
         logger.debug("Embedding neighbor keyword lookup failed", exc_info=True)
         return []
-
-    # Cache (LRU-style eviction)
-    if len(_neighbor_kw_cache) >= _NEIGHBOR_KW_MAX:
-        oldest_key = min(_neighbor_kw_cache, key=lambda k: _neighbor_kw_cache[k][0])
-        del _neighbor_kw_cache[oldest_key]
-    _neighbor_kw_cache[cache_key] = (now, result)
-    return result
 
 
 async def _generate_structured(
@@ -304,16 +290,14 @@ async def _generate_structured(
         if db is not None
         else ("anthropic" if settings.anthropic_api_key else "openai_compatible")
     )
-    model = (
-        await LLM_MODEL_LIGHT.get(db)
-        if db is not None
-        else (
-            settings.llm_model if settings.anthropic_api_key else settings.openai_model
-        )
-    )
     provider_ext = get_ai_provider(provider)
     runtime_config = (
         await provider_ext.resolve_runtime_config(db) if db is not None else {}
+    )
+    model = (
+        await LLM_MODEL_LIGHT.for_provider(db, provider, runtime_config)
+        if db is not None
+        else llm_model_default(provider, light=True)
     )
     result, input_tokens, output_tokens = await provider_ext.structured_complete(
         model=model,
@@ -449,15 +433,20 @@ async def generate_keyword_suggestions(
     *,
     language: str | None = None,
     port: "ProcessingPort",
-    user_id: uuid.UUID | None = None,
+    user: Identity,
+    user_roles: set[str],
 ) -> KeywordSuggestionsResponse:
-    """Generate AI-suggested keywords for a dataset."""
+    """Generate AI-suggested keywords for a dataset.
+
+    The vocabulary and similar-dataset keywords added to the prompt come only
+    from records ``user`` may read.
+    """
     from app.processing.ai.chat_service import lang_name
 
     context = await _build_dataset_context(session, dataset_id, port=port)
-    vocab = await _get_catalog_vocabulary(session, port=port)
+    vocab = await port.get_catalog_vocabulary(session, user=user, user_roles=user_roles)
     related_kws = await _get_related_keywords_from_embeddings(
-        session, dataset_id, port=port
+        session, dataset_id, port=port, user=user, user_roles=user_roles
     )
 
     prompt = context
@@ -473,7 +462,7 @@ async def generate_keyword_suggestions(
     if language:
         system += f"\n\nRespond in {lang_name(language)}."
     return await _generate_structured(
-        system, prompt, KeywordSuggestionsResponse, db=session, user_id=user_id
+        system, prompt, KeywordSuggestionsResponse, db=session, user_id=user.id
     )
 
 

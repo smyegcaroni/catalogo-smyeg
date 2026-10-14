@@ -1,17 +1,20 @@
 import type { ReactNode } from 'react';
-import { Route, Routes } from 'react-router';
-import { render, screen } from '@/test/test-utils';
+import { Link, Route, Routes } from 'react-router';
+import { act, fireEvent, render, screen, within } from '@/test/test-utils';
 import { PublicViewerPage } from '../PublicViewerPage';
 import { useSharedMap } from '@/hooks/use-maps';
 import { useViewerLayers } from '@/components/viewer/hooks/use-viewer-layers';
-import { useEdition } from '@/hooks/use-edition';
-import { useBranding } from '@/hooks/use-settings';
+import { useDocumentTitle } from '@/hooks/use-document-title';
 import { ApiError } from '@/api/client';
 import type { ViewerMap } from '@/components/viewer/ViewerMap';
+import type { LayerLegend } from '@/components/viewer/LayerLegend';
 import type { SharedMapResponse } from '@/types/api';
 
 const viewerMapMock = vi.hoisted(() => ({
   props: null as React.ComponentProps<typeof ViewerMap> | null,
+}));
+const legendMock = vi.hoisted(() => ({
+  props: null as React.ComponentProps<typeof LayerLegend> | null,
 }));
 
 vi.mock('@/hooks/use-maps', () => ({
@@ -26,14 +29,6 @@ vi.mock('@/hooks/use-document-title', () => ({
   useDocumentTitle: vi.fn(),
 }));
 
-vi.mock('@/hooks/use-edition', () => ({
-  useEdition: vi.fn(),
-}));
-
-vi.mock('@/hooks/use-settings', () => ({
-  useBranding: vi.fn(),
-}));
-
 vi.mock('@/components/viewer/ViewerMap', () => ({
   ViewerMap: (props: React.ComponentProps<typeof ViewerMap>) => {
     viewerMapMock.props = props;
@@ -42,7 +37,10 @@ vi.mock('@/components/viewer/ViewerMap', () => ({
 }));
 
 vi.mock('@/components/viewer/LayerLegend', () => ({
-  LayerLegend: () => <div data-testid="layer-legend">legend</div>,
+  LayerLegend: (props: React.ComponentProps<typeof LayerLegend>) => {
+    legendMock.props = props;
+    return <div data-testid="layer-legend">legend</div>;
+  },
 }));
 
 vi.mock('@/components/map/MapTitlePill', () => ({
@@ -50,7 +48,11 @@ vi.mock('@/components/map/MapTitlePill', () => ({
 }));
 
 vi.mock('@/components/map/BasemapToggle', () => ({
-  BasemapToggle: () => <div data-testid="basemap-toggle">basemap</div>,
+  BasemapToggle: ({ value, onChange }: { value: string; onChange: (id: string) => void }) => (
+    <button type="button" data-testid="basemap-toggle" onClick={() => onChange('chosen-basemap')}>
+      {value}
+    </button>
+  ),
 }));
 
 vi.mock('@/components/error', () => ({
@@ -59,8 +61,6 @@ vi.mock('@/components/error', () => ({
 
 const mockedUseSharedMap = vi.mocked(useSharedMap);
 const mockedUseViewerLayers = vi.mocked(useViewerLayers);
-const mockedUseEdition = vi.mocked(useEdition);
-const mockedUseBranding = vi.mocked(useBranding);
 
 const SHARED_MAP: SharedMapResponse = {
   name: 'Shared map',
@@ -124,6 +124,7 @@ function renderPage(route = '/m/share-token') {
 describe('PublicViewerPage', () => {
   beforeEach(() => {
     viewerMapMock.props = null;
+    legendMock.props = null;
 
     mockedUseSharedMap.mockReturnValue({
       data: SHARED_MAP,
@@ -138,37 +139,68 @@ describe('PublicViewerPage', () => {
       isLegendOpen: true,
       setIsLegendOpen: vi.fn(),
     } as ReturnType<typeof useViewerLayers>);
-
-    mockedUseEdition.mockReturnValue({
-      edition: 'enterprise',
-      features: ['branding'],
-      isEnterprise: true,
-      isMultiTenant: false,
-      isLoading: false,
-      isResolved: true,
-    });
-
-    mockedUseBranding.mockReturnValue({
-      data: { show_badge: false, privacy_url: null },
-    } as ReturnType<typeof useBranding>);
   });
 
-  it('renders footer links on shared-map pages even when enterprise branding is disabled', () => {
+  it('titles the document with the shared map name', () => {
+    renderPage();
+    expect(vi.mocked(useDocumentTitle)).toHaveBeenLastCalledWith('Shared map');
+  });
+
+  it('falls back to the generic title while the map is unresolved', () => {
+    mockedUseSharedMap.mockReturnValue({
+      data: undefined,
+      isLoading: true,
+      isError: false,
+      error: null,
+    } as ReturnType<typeof useSharedMap>);
+    renderPage();
+    expect(vi.mocked(useDocumentTitle)).toHaveBeenLastCalledWith('Shared Map');
+  });
+
+  it('wraps the loading branch in a main landmark', () => {
+    mockedUseSharedMap.mockReturnValue({
+      data: undefined,
+      isLoading: true,
+      isError: false,
+      error: null,
+    } as ReturnType<typeof useSharedMap>);
+    renderPage();
+    expect(screen.getByRole('main')).toBeInTheDocument();
+  });
+
+  it('wraps the error branch in a main landmark and announces it as an alert', () => {
+    mockedUseSharedMap.mockReturnValue({
+      data: null,
+      isLoading: false,
+      isError: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSharedMap>);
+    renderPage();
+    const main = screen.getByRole('main');
+    expect(within(main).getByRole('alert')).toHaveTextContent(/map not found/i);
+  });
+
+  it('renders no app footer on shared-map pages', () => {
     renderPage();
 
-    const footer = screen.getByRole('contentinfo');
-    expect(footer).toBeInTheDocument();
-    expect(footer).not.toHaveTextContent('Powered by GeoLens');
-    expect(screen.getByRole('link', { name: /^github$/i })).toHaveAttribute(
-      'href',
-      'https://github.com/geolens-io/geolens',
-    );
+    expect(screen.queryByRole('contentinfo')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /^github$/i })).not.toBeInTheDocument();
   });
 
-  it('omits the footer on embedded shared-map pages', () => {
+  it('renders no app footer on embedded shared-map pages', () => {
     renderPage('/m/share-token?embed=true');
 
     expect(screen.queryByRole('contentinfo')).not.toBeInTheDocument();
+  });
+
+  it('hands the legend what the viewer map reports drawing', async () => {
+    renderPage();
+    await screen.findByTestId('viewer-map');
+    const drawn = new Map([['shared-layer-1', { drawsAs: 'circle' as const }]]);
+
+    act(() => viewerMapMock.props?.onDrawnChange?.(drawn));
+
+    expect(legendMock.props?.drawn).toBe(drawn);
   });
 
   it('forwards persisted basemap appearance into the viewer map', async () => {
@@ -180,21 +212,6 @@ describe('PublicViewerPage', () => {
       basemapConfig: SHARED_MAP.basemap_config,
       terrainConfig: SHARED_MAP.terrain_config,
       showBasemapLabels: true,
-    });
-  });
-
-  describe('SHARE-07 branding overlay routing', () => {
-    it('embed mode passes showInlineBranding=true to ViewerMap', async () => {
-      renderPage('/m/share-token?embed=true');
-      await screen.findByTestId('viewer-map');
-      expect(viewerMapMock.props?.showInlineBranding).toBe(true);
-    });
-
-    it('non-embed mode passes showInlineBranding=false to ViewerMap AND AppFooter renders', async () => {
-      renderPage('/m/share-token');
-      await screen.findByTestId('viewer-map');
-      expect(viewerMapMock.props?.showInlineBranding).toBe(false);
-      expect(screen.getByRole('contentinfo')).toBeInTheDocument();
     });
   });
 
@@ -254,6 +271,47 @@ describe('PublicViewerPage', () => {
       expect(screen.queryByRole('heading', { name: /map not found/i })).not.toBeInTheDocument();
 
       consoleErrorSpy.mockRestore();
+    });
+  });
+  describe('when the viewed map changes', () => {
+    function renderWithNav() {
+      return render(
+        <>
+          <Link to="/m/token-b">other map</Link>
+          <Link to="/m/token-a">first map</Link>
+          <Routes>
+            <Route path="/m/:token" element={<PublicViewerPage />} />
+          </Routes>
+        </>,
+        { route: '/m/token-a' },
+      );
+    }
+
+    it('resets the chosen basemap and drawn layers on another map', async () => {
+      renderWithNav();
+      await screen.findByTestId('viewer-map');
+      fireEvent.click(screen.getByTestId('basemap-toggle'));
+      act(() => viewerMapMock.props?.onDrawnChange?.(new Map([['l', { drawsAs: 'circle' as const }]])));
+      expect(screen.getByTestId('basemap-toggle')).toHaveTextContent('chosen-basemap');
+      expect(legendMock.props?.drawn).toBeDefined();
+
+      fireEvent.click(screen.getByRole('link', { name: 'other map' }));
+
+      expect(screen.getByTestId('basemap-toggle')).toHaveTextContent('carto-light');
+      expect(legendMock.props?.drawn).toBeUndefined();
+    });
+
+    it('keeps them across a rerender of the same map', async () => {
+      renderWithNav();
+      await screen.findByTestId('viewer-map');
+      fireEvent.click(screen.getByTestId('basemap-toggle'));
+      const drawn = new Map([['l', { drawsAs: 'circle' as const }]]);
+      act(() => viewerMapMock.props?.onDrawnChange?.(drawn));
+
+      fireEvent.click(screen.getByRole('link', { name: 'first map' }));
+
+      expect(screen.getByTestId('basemap-toggle')).toHaveTextContent('chosen-basemap');
+      expect(legendMock.props?.drawn).toBe(drawn);
     });
   });
 });

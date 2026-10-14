@@ -5,17 +5,26 @@ from urllib.parse import quote
 import httpx
 
 from ...client import AuthenticatedClient, Client
-from ...types import Response
+from ...types import Response, UNSET
 from ... import errors
 
 from ...models.problem_detail import ProblemDetail
+from ...types import Unset
 from uuid import UUID
 
 
 def _get_kwargs(
     dataset_id: UUID,
     gid: int,
+    *,
+    table_id: str | Unset = UNSET,
 ) -> dict[str, Any]:
+
+    params: dict[str, Any] = {}
+
+    params["table_id"] = table_id
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
     _kwargs: dict[str, Any] = {
         "method": "delete",
@@ -23,6 +32,7 @@ def _get_kwargs(
             dataset_id=quote(str(dataset_id), safe=""),
             gid=quote(str(gid), safe=""),
         ),
+        "params": params,
     }
 
     return _kwargs
@@ -102,14 +112,23 @@ def sync_detailed(
     gid: int,
     *,
     client: AuthenticatedClient,
+    table_id: str | Unset = UNSET,
 ) -> Response[Any | ProblemDetail]:
     """Delete Single Feature
 
      Delete a feature by gid (hard delete).
 
+    The X-GeoLens-Tile-Cache-Version response header carries the dataset's
+    tile_cache_version after the delete committed; a 204 response has no
+    body to carry it in, unlike the create, replace and patch endpoints,
+    which return it as a field of the written feature.
+
     Args:
         dataset_id (UUID):
         gid (int):
+        table_id (str | Unset): The `table_id` the feature was read with. If the dataset's data
+            has been replaced since, the request is refused with 409 and code `dataset_replaced`, and
+            nothing is written.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -122,6 +141,7 @@ def sync_detailed(
     kwargs = _get_kwargs(
         dataset_id=dataset_id,
         gid=gid,
+        table_id=table_id,
     )
 
     response = client.get_httpx_client().request(
@@ -136,14 +156,23 @@ def sync(
     gid: int,
     *,
     client: AuthenticatedClient,
+    table_id: str | Unset = UNSET,
 ) -> Any | ProblemDetail | None:
     """Delete Single Feature
 
      Delete a feature by gid (hard delete).
 
+    The X-GeoLens-Tile-Cache-Version response header carries the dataset's
+    tile_cache_version after the delete committed; a 204 response has no
+    body to carry it in, unlike the create, replace and patch endpoints,
+    which return it as a field of the written feature.
+
     Args:
         dataset_id (UUID):
         gid (int):
+        table_id (str | Unset): The `table_id` the feature was read with. If the dataset's data
+            has been replaced since, the request is refused with 409 and code `dataset_replaced`, and
+            nothing is written.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -157,6 +186,7 @@ def sync(
         dataset_id=dataset_id,
         gid=gid,
         client=client,
+        table_id=table_id,
     ).parsed
 
 
@@ -165,14 +195,23 @@ async def asyncio_detailed(
     gid: int,
     *,
     client: AuthenticatedClient,
+    table_id: str | Unset = UNSET,
 ) -> Response[Any | ProblemDetail]:
     """Delete Single Feature
 
      Delete a feature by gid (hard delete).
 
+    The X-GeoLens-Tile-Cache-Version response header carries the dataset's
+    tile_cache_version after the delete committed; a 204 response has no
+    body to carry it in, unlike the create, replace and patch endpoints,
+    which return it as a field of the written feature.
+
     Args:
         dataset_id (UUID):
         gid (int):
+        table_id (str | Unset): The `table_id` the feature was read with. If the dataset's data
+            has been replaced since, the request is refused with 409 and code `dataset_replaced`, and
+            nothing is written.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -185,6 +224,7 @@ async def asyncio_detailed(
     kwargs = _get_kwargs(
         dataset_id=dataset_id,
         gid=gid,
+        table_id=table_id,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -197,14 +237,23 @@ async def asyncio(
     gid: int,
     *,
     client: AuthenticatedClient,
+    table_id: str | Unset = UNSET,
 ) -> Any | ProblemDetail | None:
     """Delete Single Feature
 
      Delete a feature by gid (hard delete).
 
+    The X-GeoLens-Tile-Cache-Version response header carries the dataset's
+    tile_cache_version after the delete committed; a 204 response has no
+    body to carry it in, unlike the create, replace and patch endpoints,
+    which return it as a field of the written feature.
+
     Args:
         dataset_id (UUID):
         gid (int):
+        table_id (str | Unset): The `table_id` the feature was read with. If the dataset's data
+            has been replaced since, the request is refused with 409 and code `dataset_replaced`, and
+            nothing is written.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -219,5 +268,6 @@ async def asyncio(
             dataset_id=dataset_id,
             gid=gid,
             client=client,
+            table_id=table_id,
         )
     ).parsed

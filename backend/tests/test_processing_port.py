@@ -179,10 +179,10 @@ class FakeProcessingPort:
             )
         ]
 
-    async def get_catalog_vocabulary(self, session):
+    async def get_catalog_vocabulary(self, session, *, user, user_roles):
         return ["test", "vocabulary", "keyword"]
 
-    async def get_keywords_for_records(self, session, record_ids):
+    async def get_keywords_for_records(self, session, record_ids, *, user, user_roles):
         if not record_ids:
             return []
         return ["related", "keywords"]
@@ -220,6 +220,9 @@ class FakeProcessingPort:
     async def update_map(self, session, map_id, **kwargs):
         return (self._map, [], None, None)
 
+    async def update_dataset_metadata(self, session, dataset_id, fields, *, actor_id):
+        return None
+
     def create_ingestion_result(self, **kwargs):
         result = MagicMock()
         for k, v in kwargs.items():
@@ -247,8 +250,23 @@ class FakeProcessingPort:
         token=None,
         order_field=None,
         result_limit=None,
+        result_offset=None,
+        object_ids=None,
+        force_arcgis_geojson=False,
     ):
         return (f"{service_type}:{base_url}", layer_name)
+
+    async def fetch_arcgis_id_plan(
+        self,
+        base_url,
+        layer_id,
+        client,
+        token=None,
+        *,
+        expected_oid_field=None,
+        current_version=None,
+    ):
+        return MagicMock()
 
     # -------------------------------------------------------------------------
     # ORM class helpers (Plans 02 + 03a/03b)

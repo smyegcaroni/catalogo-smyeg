@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import json
 import uuid
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -203,7 +204,7 @@ def test_hosted_cache_override_never_publicizes_private_tiles(empty: bool):
     public_headers = _serving_tile_headers("public", 60, override, empty=empty)
 
     assert private_headers["Cache-Control"] == "private, max-age=60"
-    assert public_headers["Cache-Control"] == override
+    assert public_headers["Cache-Control"] == f"{override}, s-maxage=60"
     assert ("Content-Encoding" in private_headers) is (not empty)
 
 
@@ -231,23 +232,27 @@ async def test_rejected_tile_limiter_never_queries_or_releases(
         }
     )
     with pytest.raises(HTTPException) as exc_info:
-        await tile_router._acquire_and_serve_tile(
-            request=request,
-            table_name="roads",
-            z=0,
-            x=0,
-            y=0,
-            tid="tenant-1",
-            schema="data_t_tenant_1",
-            query_callable=query,
-            tile_cache=None,
-            cache_key="roads",
-            cache_ttl=60,
-            base_headers={},
-            tenant_sem=limiter,
-        )
+        async with tile_router.tile_render_slot(limiter):
+            await tile_router._acquire_and_serve_tile(
+                request=request,
+                table_name="roads",
+                z=0,
+                x=0,
+                y=0,
+                tid="tenant-1",
+                schema="data_t_tenant_1",
+                query_callable=query,
+                tile_cache=None,
+                cache_key="roads",
+                cache_ttl=60,
+                base_headers={},
+            )
 
     assert exc_info.value.status_code == 429
+    assert exc_info.value.headers["Retry-After"] == "2"
+    assert exc_info.value.headers["Access-Control-Allow-Origin"] == "*"
+    assert exc_info.value.headers["Access-Control-Expose-Headers"] == "Retry-After"
+    assert exc_info.value.headers["Cache-Control"] == "no-store"
     assert limiter.acquired == 1
     assert limiter.released == 0
     assert pool.acquire_count == 0
@@ -294,6 +299,8 @@ async def test_hosted_tile_endpoints_share_cache_policy_and_limit_only_db_misses
         tile_cache_ttl=cache_ttl,
         tile_columns=None,
         publication_version=0,
+        tile_cache_version=1,
+        updated_at=datetime.now(timezone.utc),
     )
     cache = SimpleNamespace(
         get=AsyncMock(return_value=gzip.compress(b"cached-mvt") if cache_hit else None),
@@ -336,7 +343,9 @@ async def test_hosted_tile_endpoints_share_cache_policy_and_limit_only_db_misses
 
     assert response.status_code == 200
     expected_cache_control = (
-        cache_override if cache_scope == "public" else f"private, max-age={cache_ttl}"
+        f"{cache_override}, s-maxage=60"
+        if cache_scope == "public"
+        else f"private, max-age={cache_ttl}"
     )
     assert response.headers["Cache-Control"] == expected_cache_control
     assert serving.limiter_requests == [str(tenant_id)]

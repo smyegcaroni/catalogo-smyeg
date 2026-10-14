@@ -1,11 +1,12 @@
 import asyncio
 import logging
 import os
+import sys
 import time
 import uuid
 import tempfile
-import warnings
-from contextlib import asynccontextmanager, contextmanager
+import zipfile
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from unittest.mock import patch
 
 import asyncpg.exceptions
@@ -21,7 +22,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.modules.auth.models import Role, User, UserRole
 from app.modules.auth.providers.local import hash_password
 from app.platform.cache import init_cache
-from app.core.config import settings
+from app.core.config import Settings, settings
 
 from tests.factories import create_user
 
@@ -95,61 +96,6 @@ def _make_test_async_engine(test_database_url: str):
     )
 
 
-# Per-worker setup stagger — spreads the startup connection spike across time.
-#
-# Root-cause: when N workers run _test_db_lifecycle simultaneously, each opens
-# a sync SQLAlchemy connection to the main DB (dev_engine) PLUS connections to
-# their test DB (test_engine_sync, alembic, _saml_bridge_engine). With
-# N=16 workers and max_connections=30 (db/postgresql.conf:11), and the running
-# API/worker services already holding 8 persistent idle connections, the
-# concurrent setup fan-out saturates Postgres before any test runs.
-#
-# Fix: stagger each worker's startup by SETUP_STAGGER_SECONDS × worker_num.
-# Alembic migration (22 steps) takes ≈ 3-5s per worker. With a 5.0s stagger:
-#   - Worker 0 starts immediately (no delay)
-#   - Worker 1 starts after 5.0s (worker 0 is already past migration)
-#   - Worker k starts after k × 5.0s
-# Peak concurrent main-DB connections during stagger window: ~1-2.
-# Safe under max_connections=30.
-#
-# This approach is O(STAGGER_SECONDS × worker_num) total overhead vs. O(N × setup_time)
-# for a hard serialiser — wall-clock impact is bounded by the LAST worker's stagger
-# (15 × 5.0s = 75s), not the sum.
-#
-# See .planning/audits/PYTEST-XDIST-SPIKE-v1019.md for measured numbers + rationale.
-# Combined with NullPool for async engines (no idle connections post-setup),
-# the fix addresses both the setup-phase spike and the test-phase connection budget.
-# Setup phase per worker: dev_engine + test_engine_sync + alembic (22 steps) +
-# _saml_bridge_engine ≈ 3-5 seconds total. Stagger must be ≥ setup time so at
-# most 1 worker is in the migration phase at any time. Use 5s with some headroom.
-# Impact: last worker (gw15) delays 15 × 5 = 75s. Total parallel wall clock:
-#   75s (stagger overhead) + ~80s (test execution) ≈ 155s vs sequential 539s.
-_SETUP_STAGGER_SECONDS = 5.0
-
-
-def _get_setup_stagger_delay() -> float:
-    """Return the number of seconds this worker should sleep before running setup.
-
-    Sequential mode (master) or unrecognised worker ID returns 0.0 — no stagger needed.
-    xdist worker gw0 returns 0.0, gw1 returns 5.0, gw15 returns 75.0.
-
-    Note: if xdist changes its worker ID format (currently 'gwN'), unrecognised
-    IDs silently return 0.0, defeating the stagger for those workers.
-    """
-    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "master")
-    if not worker_id.startswith("gw"):
-        return 0.0
-    try:
-        worker_num = int(worker_id[2:])
-    except ValueError:
-        warnings.warn(
-            f"Unexpected PYTEST_XDIST_WORKER format: {worker_id!r}; stagger disabled",
-            stacklevel=2,
-        )
-        return 0.0
-    return worker_num * _SETUP_STAGGER_SECONDS
-
-
 def pytest_configure(config):
     """Re-capture the pytest-xdist worker id under config-time hooks.
 
@@ -220,7 +166,11 @@ _TENANCY_GLOBAL_STATE_MODULES = {
     "test_analysis_materialize",  # register_existing_table → grant_reader_access
     "test_registered_delete_detach_1452",  # same: registers real tables
     "test_register_geom_column_name_1737",  # same: its accept-case registers
+    "test_register_without_gid",  # same: registers real tables
     "test_registered_geom_4326_rederive_1738",  # same: registers, and REVOKEs
+    "test_replacement_post_commit",  # staging and the PostGIS repair grant the reader
+    "test_replacement_preamble",  # same: it drives the same replacements
+    "test_publication_settlement",  # service staging grants the reader
     "test_embed_tokens",
     "test_features_crud",
     "test_features_geojson_z",
@@ -228,6 +178,8 @@ _TENANCY_GLOBAL_STATE_MODULES = {
     "test_rls_drift_gate",
     "test_rls_leak_lint",
     "test_vrt_stale_sweep_gap002",
+    "test_retained_cog_reclaim_hosted",  # same harness and reader grants
+    "test_staging_pipeline_tables",  # stages real tables, which grants the reader
 }
 
 
@@ -347,53 +299,51 @@ def _dispose_shared_app_engine_after_test(request):
         _dispose()
 
 
+def _repoint_stale_settings(original, skip_modules=None) -> None:
+    """Point every app-module attribute holding another ``Settings`` at ``original``.
+
+    Modules named in ``skip_modules`` are not checked.
+    """
+    # A test that reloads app.core.config leaves a new Settings class behind it.
+    settings_classes = (Settings, sys.modules["app.core.config"].Settings)
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("app.") or (skip_modules and name in skip_modules):
+            continue
+        for attr, value in list(getattr(module, "__dict__", {}).items()):
+            if isinstance(value, settings_classes) and value is not original:
+                setattr(module, attr, original)
+
+
 @pytest.fixture(autouse=True)
 def _restore_process_global_config():
-    """Snapshot/restore the process-global config singleton + tenancy-mode env per test.
+    """Put the config singleton and the tenancy-mode env var back after each test.
 
-    ROOT cause of the v1042 ``pytest -n 4`` cross-test cascade. Many tenancy tests
-    rebind ``app.core.config.settings`` to a fresh ``Settings()`` (via the local
-    ``_reload_settings()`` helpers) and/or set ``os.environ["GEOLENS_TENANCY_MODE"]``
-    to exercise the multi_tenant paths. Both are PROCESS-GLOBAL per pytest-xdist
-    worker, not per-test:
+    Tenancy tests rebind ``app.core.config.settings`` to a fresh ``Settings()`` and
+    set ``GEOLENS_TENANCY_MODE`` to reach the multi_tenant paths, and both are global
+    to the xdist worker. A fresh ``Settings()`` lacks the per-worker
+    ``postgres_db_test`` name set on the original at session setup, and a leaked
+    multi_tenant mode changes RLS, schema and migration behaviour for later tests.
+    App modules bind the singleton when imported, under ``settings`` or another
+    name, so a module that bound a test's object keeps it; those bindings are
+    pointed back too.
 
-      * The fresh ``Settings()`` loses the conftest-injected per-worker
-        ``postgres_db_test`` suffix (``conftest.py`` sets it as an attribute on the
-        ORIGINAL singleton at session setup — line ~1133), reverting to the bare
-        ``geolens_test`` default. Any later test on the SAME worker then connects to
-        a non-existent DB -> ``InvalidCatalogNameError`` / ``ogr2ogr PQconnectdb
-        failed`` / 500s.
-      * A leaked ``GEOLENS_TENANCY_MODE=multi_tenant`` makes downstream
-        alembic-autogenerate (cloud columns -> "drift detected"), RLS enforcement
-        ("permission denied for table users"), and per-tenant-schema code
-        ("schema data_t_... does not exist") behave wrongly on tests that assume the
-        single_tenant default.
-
-    Only ONE module (test_tenancy_mode.py, b269f24d) restored this, so 9+ other
-    tenancy modules leaked. Restoring the original singleton OBJECT (suffix
-    preserved) + the original env value after EVERY test makes the suite leak-proof
-    regardless of which xdist worker a test lands on — the deterministic ROOT fix the
-    per-module xdist grouping could not provide (loadgroup may co-locate distinct
-    groups on one worker; ungrouped tests can land on the tenancy worker too).
-
-    Safe for tests that legitimately mutate settings WITHIN a test body:
-      * ``monkeypatch.setattr(settings, ...)`` mutates attributes on the existing
-        singleton (does not rebind ``cfg_mod.settings``), so the ``is not`` guard
-        below is a no-op for them and monkeypatch still auto-reverts the attrs.
-      * Tests that rebind via ``_reload_settings()`` observe their fresh object for
-        the duration of the test; only the teardown restore (after ``yield``) runs.
+    ``monkeypatch.setattr(settings, ...)`` changes attributes on the singleton itself
+    and monkeypatch undoes it; nothing here interferes with that.
     """
     import app.core.config as cfg_mod
 
     original_settings = cfg_mod.settings
+    modules_before = set(sys.modules)
     _MODE_KEY = "GEOLENS_TENANCY_MODE"
     _mode_was_set = _MODE_KEY in os.environ
     _original_mode = os.environ.get(_MODE_KEY)
     try:
         yield
     finally:
-        if cfg_mod.settings is not original_settings:
-            cfg_mod.settings = original_settings
+        rebound = cfg_mod.settings is not original_settings
+        cfg_mod.settings = original_settings
+        # A test that put the singleton back itself leaves only its new imports to check.
+        _repoint_stale_settings(original_settings, None if rebound else modules_before)
         if _mode_was_set:
             os.environ[_MODE_KEY] = _original_mode  # type: ignore[assignment]
         else:
@@ -657,6 +607,19 @@ def _restore_global_logging_config():
 
 
 @pytest.fixture(autouse=True)
+def _reset_credential_registry():
+    """Start and end every test with an empty credential-secret registry.
+
+    A sync test registers in the main thread's context, which every later test copies.
+    """
+    from app.core.service_tokens import reset_registered_credential_secrets
+
+    reset_registered_credential_secrets()
+    yield
+    reset_registered_credential_secrets()
+
+
+@pytest.fixture(autouse=True)
 def _enable_dataset_editing(monkeypatch):
     """Turn on the `enable_dataset_editing` flag for the whole suite.
 
@@ -718,6 +681,20 @@ def enterprise_edition(monkeypatch):
     init_edition(["enterprise"])
     yield
     init_edition([])
+
+
+@pytest.fixture
+def zip_member_reads(monkeypatch) -> list[str]:
+    """The names of the archive members ``zipfile`` decompresses from, in order."""
+    reads: list[str] = []
+    read = zipfile.ZipExtFile._read1
+
+    def spy(self, n):
+        reads.append(self.name)
+        return read(self, n)
+
+    monkeypatch.setattr(zipfile.ZipExtFile, "_read1", spy)
+    return reads
 
 
 def _quote_database_identifier(db_name: str) -> str:
@@ -796,16 +773,17 @@ def _create_test_db_with_retry(
             the regression pin patches this to a no-op so retries do not
             actually wait.
         backoffs: Tuple of per-attempt sleep durations (seconds) between
-            failed attempts. Length determines retry budget. Total wait
-            budget under contention with the default ``(1.0, 2.0, 4.0)`` is
-            7s, bounded below the staggered-startup window's 75s ceiling.
+            failed attempts. Length determines retry budget. The default
+            ``(1.0, 2.0, 4.0)`` waits up to 7s: every worker creates its
+            database as the session starts, so connections refused in that
+            burst get time to free up, and a server that stays saturated
+            still fails setup within seconds.
 
     Raises:
         OperationalError: If every attempt raises an OperationalError whose
             message contains ``"too many clients already"``. Re-raised so
-            the caller surfaces the contention loudly as a fixture error
-            (NOT swallowed silently — that was the v1019 defect at audit
-            Section 4.1, 407/648 failures, 62.8% of total).
+            setup fails with it instead of running the worker's tests
+            without a database.
         OperationalError: Re-raised immediately for any other OperationalError
             (DNS failure, refused connection, authentication, etc.) — the
             caller decides whether to translate that into a `pytest.skip` or
@@ -843,11 +821,9 @@ def _create_test_db_with_retry(
         raise last_exc
 
 
-# Retry budget for transient "too many clients already" contention during
-# per-fixture async-session setup (e.g., `_ensure_roles_and_admin`). Same
-# shape as `_CREATE_DB_RETRY_BACKOFFS` above — bounded below the staggered-
-# startup window's 75s ceiling. See Plan 1088-03 and audit Section 4.2
-# (`.planning/audits/PYTEST-XDIST-FIXTURE-AUDIT-v1020.md`).
+# Retry budget for "too many clients already" when a fixture opens a
+# connection: the init lock, `_ensure_roles_and_admin`, the tile pool and the
+# test engine. Same 7s ceiling and reason as `_CREATE_DB_RETRY_BACKOFFS`.
 _SETUP_PHASE_RETRY_BACKOFFS = (1.0, 2.0, 4.0)
 
 
@@ -881,39 +857,14 @@ async def _run_with_too_many_clients_retry(
 ):
     """Run an async fixture-setup callable with retry on transient contention.
 
-    Plan 1088-03 / audit Section 4.2: After Plan 1088-01's silent-swallow
-    fix closed the dominant per-worker DB lifecycle race (category 4.1,
-    407/648 failures), the residual setup-phase contention category 4.2
-    remained at 188 failures (re-measure at
-    `.planning/audits/PYTEST-XDIST-REMEASURE-AFTER-1088-01.md`). The failure
-    shape is identical across all 188 occurrences:
-
-        "failed on setup with 'asyncpg.exceptions.TooManyConnectionsError:
-         sorry, too many clients already'"
-
-    Root cause: the `client` fixture's first async-session connection
-    acquisition (inside `_ensure_roles_and_admin` at conftest.py:644-691)
-    races the connection ceiling. With max_connections=30 and 16 xdist
-    workers staggered at 5.0s intervals, the cascade window briefly opens
-    when several workers complete the staggered-startup gate simultaneously
-    and concurrently request session-factory connections.
-
-    This helper mirrors the shape of `_create_test_db_with_retry` (Plan
-    1088-01) but for async callables: it invokes ``coro_fn`` (a zero-arg
-    async callable that performs the DB operation), retries on the
-    transient contention exception family (`OperationalError`,
-    `asyncpg.TooManyConnectionsError`, `asyncpg.CannotConnectNowError`),
-    and re-raises after the budget is exhausted — NOT silently swallowed.
-
-    IMPORTANT — exception-family scope (see ``_TRANSIENT_CONTENTION_EXCEPTIONS``
-    above the helper): the helper must catch BOTH the SQLAlchemy-wrapped
-    OperationalError shape AND the raw asyncpg exception classes. During
-    initial Plan 1088-03 measurement, catching only ``OperationalError``
-    yielded a retry-coverage rate of ~42% (188 → 109) because the
-    majority of contention errors surface as raw
-    ``asyncpg.exceptions.TooManyConnectionsError`` through the
-    ``bind.connect()`` → ``greenlet_spawn`` path. Widening the catch to
-    include the asyncpg classes is what actually closes the 4.2 cascade.
+    The async twin of `_create_test_db_with_retry`: a fixture's first
+    connection, such as the one `_ensure_roles_and_admin` opens for every
+    `client`, can be refused with "too many clients already" while other
+    workers hold connections. ``coro_fn`` is retried on
+    ``_TRANSIENT_CONTENTION_EXCEPTIONS`` and the last error is re-raised
+    once the budget is spent. The asyncpg classes are in that tuple because
+    most refusals escape through ``greenlet_spawn`` before SQLAlchemy wraps
+    them in ``OperationalError``.
 
     Args:
         coro_fn: Zero-arg async callable that performs the DB-touching
@@ -925,31 +876,18 @@ async def _run_with_too_many_clients_retry(
             ``asyncio.sleep``; the regression pin patches this to a no-op
             so retries do not actually wait.
         backoffs: Tuple of per-attempt sleep durations (seconds) between
-            failed attempts. Length determines retry budget. Total wait
-            budget under contention with the default ``(1.0, 2.0, 4.0)``
-            is 7s, bounded below the staggered-startup window's 75s
-            ceiling.
+            failed attempts. Length determines retry budget. The default
+            is ``_SETUP_PHASE_RETRY_BACKOFFS``, up to 7s.
 
     Raises:
         Exception: If every attempt raises one of
             ``_TRANSIENT_CONTENTION_EXCEPTIONS`` whose message contains
             ``"too many clients already"``, the last exception is re-raised
-            so the caller surfaces the contention loudly as a fixture
-            error (NOT swallowed silently).
-        Exception: Re-raised immediately for any
-            ``OperationalError`` whose message does NOT contain
-            ``"too many clients already"`` (DNS failure, refused
-            connection, authentication, etc.) — non-contention shapes
-            propagate so the caller can route them appropriately.
-        Exception: Any other exception (non-contention, non-OperationalError)
-            propagates immediately on the first attempt.
-
-    The helper is async-native (awaits ``coro_fn()`` and ``sleep_fn(...)``)
-    so it integrates cleanly with the existing async `client` fixture
-    body. The signature mirrors `_create_test_db_with_retry` so future
-    callers (or test pins) have a consistent retry-wrapper API for both
-    sync setup work (DDL CREATE/DROP) and async setup work (session
-    factories / asyncpg).
+            so the fixture fails with it.
+        Exception: Re-raised immediately for any ``OperationalError`` whose
+            message does NOT contain ``"too many clients already"`` (DNS
+            failure, refused connection, authentication, etc.).
+        Exception: Any other exception propagates on the first attempt.
     """
     last_exc: BaseException | None = None
     attempt_budget = 1 + len(backoffs)
@@ -1024,23 +962,10 @@ async def _init_tile_pool_for_tests(request):
     pool_module._tile_pool = None
 
 
-# Retry budget for transient "too many clients already" contention during
-# in-test session-factory acquisition (per-request `override_get_db` ->
-# `test_session_factory()`). Distinct from `_SETUP_PHASE_RETRY_BACKOFFS`:
-#
-# - Setup phase budget (1.0 + 2.0 + 4.0 = 7s): fires ONCE per worker at the
-#   `_ensure_roles_and_admin` call; bounded below the 75s staggered-startup
-#   window's ceiling.
-# - In-test phase budget (0.5 + 1.0 = 1.5s): fires per-request inside a
-#   test body; a single test may issue several sequential `TestClient.post`
-#   calls, each opening a new connection. The budget MUST be tight or
-#   stalls compound across requests within one test. 1.5s is the smallest
-#   window that empirically clears the connection-saturation peak (see
-#   Plan 1088-04 and audit Section 4.3).
-#
-# See Plan 1088-04 and audit Section 4.3
-# (`.planning/audits/PYTEST-XDIST-FIXTURE-AUDIT-v1020.md:1109-1135` +
-# Section 5 suggestion at lines 1296-1299).
+# Retry budget for "too many clients already" when a test's request opens a
+# session (`override_get_db` -> `test_session_factory()`). One test can make
+# several requests, each with its own connection, so waits here add up; it is
+# kept to 1.5s, where the setup-phase budget allows 7s.
 _IN_TEST_RETRY_BACKOFFS = (0.5, 1.0)
 
 
@@ -1325,54 +1250,18 @@ def _install_dbapi_connect_retry(sync_engine, sleep_fn, backoffs):
 
 
 class _RetryingAsyncEngine:
-    """Composition wrapper around ``AsyncEngine`` that retries
-    ``engine.connect()`` and ``engine.dispose()`` on transient connection
-    contention.
+    """``AsyncEngine`` wrapper that retries connections refused as too many clients.
 
-    Plan 1093-02 / TEST-01: After Plan 1088-04's session-factory wrapper
-    (`_acquire_test_session_with_retry`) closed the in-test warm-up surface
-    (137 → 48 failures, partial close), 48 deterministic + ~173
-    non-deterministic failures remained on `bind.connect()` calls firing
-    AFTER `await session.commit()` releases the warm-up's connection —
-    OUTSIDE any session-factory-level retry envelope. The session-factory
-    helper cannot wrap these because they happen inside test bodies on
-    fresh connection acquisitions after `__aenter__` has yielded.
+    Tests open connections after a session commits, outside the session
+    factory's retry, and under xdist the server can refuse them with "too
+    many clients already". ``connect()``, ``dispose()`` and the DBAPI connect
+    behind session binds retry on ``_TRANSIENT_CONTENTION_EXCEPTIONS`` with
+    ``backoffs``, which defaults to the setup budget because fixtures use
+    this engine too, and re-raise the last error once it is spent.
 
-    This wrapper intercepts at the LOWEST async-engine layer: every direct
-    call to ``engine.connect()`` and ``engine.dispose()`` flows through
-    retry-on-`_TRANSIENT_CONTENTION_EXCEPTIONS` with the
-    ``_SETUP_PHASE_RETRY_BACKOFFS = (1.0, 2.0, 4.0)`` budget (7s total).
-    Setup-phase budget (vs. the in-test 1.5s budget) chosen because the
-    engine wrapper subsumes setup-phase retries IN ADDITION to closing
-    the post-commit residual — tighter budgets risk false-positive
-    loud-fails under combined contention.
-
-    Composition (NOT inheritance) was chosen per
-    `.planning/audits/ENGINE-RETRY-ENVELOPE-v1021.md` Section 3 — the
-    alternative shapes (event.listen, NullPool subclass, async_creator=)
-    each failed one or more of the 4 criteria: covers both surfaces /
-    preserves NullPool+QueuePool branches / preserves
-    `test_conftest_pool_sizing.py` pins (specifically
-    `type(engine.pool).__name__`) / testable via MagicMock-only.
-
-    The wrapper:
-    - REUSES `_TRANSIENT_CONTENTION_EXCEPTIONS` verbatim — no new catch.
-    - REUSES `_SETUP_PHASE_RETRY_BACKOFFS = (1.0, 2.0, 4.0)` verbatim.
-    - Preserves the underlying engine's `.pool` accessor via `@property`
-      delegation (required for `test_xdist_engine_uses_nullpool` at
-      `test_conftest_pool_sizing.py:261` and
-      `test_sequential_engine_uses_queuepool` at `:281`).
-    - Preserves the `sync_engine` accessor used by `async_sessionmaker`
-      via `engine._get_sync_engine_or_connection` (module-level function
-      in `sqlalchemy.ext.asyncio.engine`).
-    - Delegates everything else via `__getattr__` so call sites using
-      other AsyncEngine surfaces (e.g., `await engine.begin()`,
-      `engine.raw_connection`) work unchanged.
-    - Provides a `sleep_fn` parameter (defaults to `asyncio.sleep`)
-      mirroring v1020 helper conventions for testability.
-    - Loud-fail-on-exhaust: re-raises the last exception after budget
-      exhaustion, mirroring `_run_with_too_many_clients_retry` and
-      `_acquire_test_session_with_retry` conventions.
+    ``pool`` and ``sync_engine`` return the wrapped engine's, so the pool
+    class tests and ``async_sessionmaker`` see the real engine. Everything
+    else is delegated through ``__getattr__``.
     """
 
     def __init__(
@@ -1566,10 +1455,7 @@ class _RetryingAsyncEngine:
 
     @property
     def pool(self):
-        """Pass-through accessor preserving the underlying engine's
-        pool class. CRITICAL for `test_conftest_pool_sizing.py:261` /
-        `:281` pins which check `type(engine.pool).__name__`.
-        """
+        """The underlying engine's pool, whose class the pool sizing tests check."""
         return self._underlying.pool
 
     @property
@@ -1632,6 +1518,70 @@ def _skip_if_db_unavailable(request):
     pytest.skip(f"Postgres unreachable: {_db_unavailable_reason}")
 
 
+def _reraise_if_saturated(error: SQLAlchemyError) -> None:
+    """Re-raise ``error`` when the server refused a connection as "too many clients already"."""
+    if "too many clients already" in str(error).lower():
+        raise error
+
+
+_CLUSTER_INIT_LOCK_KEY = 861501
+_CLUSTER_INIT_LOCK_POLL_SECONDS = 0.2
+# Well above sixteen workers' inits run one after another, at about 5 s each.
+_CLUSTER_INIT_LOCK_WAIT_SECONDS = 300.0
+
+
+@contextmanager
+def _cluster_init_lock(
+    sleep_fn=time.sleep,
+    backoffs=_SETUP_PHASE_RETRY_BACKOFFS,
+    wait_seconds=_CLUSTER_INIT_LOCK_WAIT_SECONDS,
+    key=_CLUSTER_INIT_LOCK_KEY,
+):
+    """Hold the lock that lets one worker at a time create server-wide roles.
+
+    Each worker's init and migrations create and grant roles that belong to
+    the whole server, and two workers doing that at once on a fresh server
+    collide on pg_authid. Advisory locks are scoped to one database, so the
+    lock is taken in the database every worker connects to for CREATE
+    DATABASE. Held in the worker's own database, it would also stall the
+    CREATE INDEX CONCURRENTLY its migrations run.
+
+    A waiting worker holds no connection: it polls with a fresh one and raises
+    ``TimeoutError`` after ``wait_seconds``. A connection refused for "too many
+    clients already" is retried on the ``backoffs`` budget, then re-raised.
+    """
+    engine = sqlalchemy.create_engine(settings.database_url_sync, poolclass=NullPool)
+    deadline = time.monotonic() + wait_seconds
+    try:
+        while True:
+            for attempt in range(1 + len(backoffs)):
+                try:
+                    conn = engine.connect()
+                    break
+                except OperationalError as e:
+                    if "too many clients already" not in str(e).lower():
+                        raise
+                    if attempt == len(backoffs):
+                        raise
+                    sleep_fn(backoffs[attempt])
+            with conn, conn.begin():
+                taken = conn.execute(
+                    text("SELECT pg_try_advisory_xact_lock(:key)"),
+                    {"key": key},
+                ).scalar()
+                if taken:
+                    yield
+                    return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"waited {wait_seconds:.0f}s for the database init lock "
+                    f"({key}) another worker holds"
+                )
+            sleep_fn(_CLUSTER_INIT_LOCK_POLL_SECONDS)
+    finally:
+        engine.dispose()
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _test_db_lifecycle():
     """Create, migrate, and tear down the test database once per session.
@@ -1672,36 +1622,11 @@ def _test_db_lifecycle():
     os.environ["POSTGRES_DB_TEST"] = db_name
     should_drop_db = False
 
-    # Stagger startup to prevent simultaneous connection spikes.
-    # See _get_setup_stagger_delay() and _SETUP_STAGGER_SECONDS for rationale.
-    _stagger_delay = _get_setup_stagger_delay()
-    if _stagger_delay > 0:
-        time.sleep(_stagger_delay)
-
+    init_lock = ExitStack()
     try:
         # --- Setup: create test database ---
-        #
-        # Audit Section 4.1 / Phase 1088-01 / FI-02: the original block here was a
-        # broad `except Exception: yield; return` that silently swallowed any
-        # failure from `dev_engine.connect()`. Under `pytest -n auto` against
-        # max_connections=30, the staggered-startup window placed the highest-
-        # numbered worker (gw15, 75s stagger) into the connection-saturation
-        # window, where `dev_engine.connect()` raised OperationalError("too many
-        # clients already"). The silent-swallow yielded with should_drop_db=False
-        # and returned, leaving the per-worker test DB uncreated. The 407
-        # downstream `InvalidCatalogNameError` failures (62.8% of all -n auto
-        # failures in the v1020 audit) all traced back to this single defect.
-        #
-        # The replacement structure below distinguishes:
-        #   - transient connection contention (`too many clients already`):
-        #     retry-with-backoff via `_create_test_db_with_retry`, fail loudly
-        #     on exhaustion so the issue surfaces as a fixture error (NOT as
-        #     downstream InvalidCatalogNameError).
-        #   - genuinely unreachable host (DNS failure, refused connection):
-        #     preserve the existing pytest.skip semantics so pure unit-test
-        #     runs outside Docker still work.
-        # See `.planning/audits/PYTEST-XDIST-FIXTURE-AUDIT-v1020.md` §4.1 and
-        # `.planning/phases/1088-fixture-isolation-fixes-regression-pins/1088-01-PLAN.md`.
+        # Saturation is retried and then fails setup, so a worker never runs
+        # without its database; an unreachable host skips only DB-backed tests.
         quoted_db_name = _quote_database_identifier(db_name)
 
         def _open_dev_engine():
@@ -1728,24 +1653,11 @@ def _test_db_lifecycle():
             return
 
         # --- Init: extensions, schemas, roles ---
+        # Held until the migrations finish, since they create server-wide roles too.
+        init_lock.enter_context(_cluster_init_lock())
         test_engine_sync = sqlalchemy.create_engine(settings.test_database_url_sync)
         try:
             with test_engine_sync.connect() as conn:
-                # Serialize this entire per-worker DB-init across xdist workers with a
-                # CLUSTER-WIDE advisory lock. The block below creates cluster-global
-                # roles (geolens_reader + per-tenant geolens_reader_t_*) and GRANTs to
-                # them, which write the shared pg_shdepend catalog. Under -n 4 on a
-                # FRESH database, the 4 workers racing here hit "role already exists" /
-                # "tuple concurrently updated", aborting the init transaction so the
-                # per-tenant data_t_* schemas + USAGE grants never commit — later
-                # tenancy tests then fail with "schema does not exist" / "permission
-                # denied for schema". (Locally this is masked: the roles/schemas already
-                # exist from a prior run, so CREATE IF NOT EXISTS short-circuits with no
-                # contention — which is why the failure only reproduces on a fresh CI
-                # DB.) pg_advisory_xact_lock is cluster-global (one lock space across all
-                # DBs) and auto-releases at commit() below, so the workers queue rather
-                # than race.
-                conn.execute(text("SELECT pg_advisory_xact_lock(861501)"))
                 conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
                 conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
                 conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
@@ -1804,10 +1716,12 @@ def _test_db_lifecycle():
                         )
                     )
                 conn.commit()
-        except SQLAlchemyError:
+        except SQLAlchemyError as e:
+            test_engine_sync.dispose()
+            _reraise_if_saturated(e)
             # DB is reachable but missing required extensions (for example pgvector).
             # Let DB-light tests run; DB-backed tests will fail when they request DB fixtures.
-            test_engine_sync.dispose()
+            init_lock.close()
             _drop_test_database_if_exists(db_name)
             should_drop_db = False
             yield
@@ -1854,6 +1768,7 @@ def _test_db_lifecycle():
         # behaves identically to "head" because there is only one head; with
         # enterprise installed, this picks up the enterprise branch.
         command.upgrade(alembic_cfg, "heads")
+        init_lock.close()
 
         # The four SAML columns on catalog.oauth_providers are now created by core
         # migration 0008_oauth_saml_columns (ADD COLUMN IF NOT EXISTS), so the
@@ -1869,6 +1784,7 @@ def _test_db_lifecycle():
         yield
 
     finally:
+        init_lock.close()
         if should_drop_db:
             # --- Teardown: drop the test database ---
             #
@@ -1917,6 +1833,17 @@ def _test_db_lifecycle():
             os.environ["POSTGRES_DB_TEST"] = _original_pg_db_test_env
 
 
+# FastAPI caches each dependency callable it resolves (a process-wide LRU of
+# 4096). A closure per test would keep thousands of test engines alive in a
+# worker and lengthen every later full GC pass, so tests share this override.
+_client_session_factory: async_sessionmaker | None = None
+
+
+async def _override_get_db():
+    async with _acquire_test_session_with_retry(_client_session_factory) as session:
+        yield session
+
+
 @pytest.fixture
 async def client(tmp_path):
     """Create an async test client with a dedicated database engine.
@@ -1925,110 +1852,112 @@ async def client(tmp_path):
     so that the lifespan seed functions and request handlers all use the same
     test engine. This prevents asyncpg pool state conflicts.
     """
-    original_upload_staging_dir = settings.upload_staging_dir
-    settings.upload_staging_dir = str(tmp_path / "staging")
-    staging_dir = tmp_path / "staging"
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    original_tempdir = tempfile.tempdir
+    import app.core.db as db_module
+    import app.platform.storage.provider as storage_provider_module
+    from app.api.main import app
     from app.core.runtime.staging import redirect_tempfile_to_staging
 
-    redirect_tempfile_to_staging(staging_dir)
-
-    # Pool sizing is derived per pytest-xdist worker via _derive_test_pool_sizing().
-    # The baseline connection budget is tight:
-    #   max_connections=30 (db/postgresql.conf:11, PERF-05 / Phase 274)
-    #   API+worker services: 8 persistent idle connections to the main DB
-    #   Postgres background: 5 connections
-    #   Available for test workers: 30 − 13 = 17 connections
-    # Under -n auto (16 workers), any pool that holds idle connections will
-    # consume the entire budget, leaving no room for setup-phase engines.
-    # NullPool (xdist mode) avoids idle-connection overhead — connections are
-    # opened only during active DB operations and closed immediately when released.
-    # Sequential mode (worker_id=master) keeps the historical (5, 2) QueuePool
-    # for request handlers that need concurrent DB conns within a single test.
-    # See .planning/audits/PYTEST-XDIST-SPIKE-v1019.md for measured numbers + rationale.
-    # Engine-creation logic is extracted to _make_test_async_engine() so the
-    # NullPool-vs-QueuePool branch is directly testable (see test_conftest_pool_sizing.py).
-    test_engine = _make_test_async_engine(settings.test_database_url)
-    test_session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
-
-    # Patch the database module so lifespan seed functions use our engine
-    import app.core.db as db_module
-
+    global _client_session_factory
+    original_upload_staging_dir = settings.upload_staging_dir
+    original_tempdir = tempfile.tempdir
     original_engine = db_module.engine
     original_session = db_module.async_session
-    db_module.engine = test_engine
-    db_module.async_session = test_session_factory
-
-    # fix(#909): the health service late-binds engine from app.core.db, so
-    # the db_module patch above covers it — no per-module re-point needed.
-
-    # Override the get_db dependency
-    from app.core.dependencies import get_db
-    from app.api.main import app
-
-    # Plan 1088-04 / audit Section 4.3: wrap the per-request session-factory
-    # acquisition with `_acquire_test_session_with_retry` so transient
-    # `asyncpg.TooManyConnectionsError` / `OperationalError("too many clients
-    # already")` raised inside `__aenter__` is retried with bounded backoff
-    # (0.5 + 1.0 = 1.5s budget) before failing loudly. Distinct from
-    # Plan 1088-03's setup-phase wrap of `_ensure_roles_and_admin`: this one
-    # fires per-request inside the test body (e.g., when a test issues
-    # multiple sequential `TestClient.post(...)` calls), so the budget is
-    # intentionally tighter than the setup-phase 7s window. See
-    # `.planning/audits/PYTEST-XDIST-FIXTURE-AUDIT-v1020.md` Section 4.3 +
-    # Section 5 suggestion (lines 1289-1299).
-    async def override_get_db():
-        async with _acquire_test_session_with_retry(test_session_factory) as session:
-            yield session
-
-    app.dependency_overrides[get_db] = override_get_db
-
-    # Initialize singleton cache provider for settings reads/writes in request paths.
-    # Lifespan is not guaranteed in this ASGITransport test setup.
-    init_cache()
-    import app.platform.storage.provider as storage_provider_module
-    from app.platform.storage.local import LocalStorageProvider
-
     original_storage = storage_provider_module._storage
-    storage_provider_module._storage = LocalStorageProvider(base_dir=str(staging_dir))
-    structlog.contextvars.bind_contextvars(service="api")
+    test_engine = None
+    try:
+        settings.upload_staging_dir = str(tmp_path / "staging")
+        staging_dir = tmp_path / "staging"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        redirect_tempfile_to_staging(staging_dir)
 
-    # Disable rate limiter during tests
-    from app.platform.ratelimit import limiter
+        # Pool sizing is derived per pytest-xdist worker via _derive_test_pool_sizing().
+        # The baseline connection budget is tight:
+        #   max_connections=30 (db/postgresql.conf:11, PERF-05 / Phase 274)
+        #   API+worker services: 8 persistent idle connections to the main DB
+        #   Postgres background: 5 connections
+        #   Available for test workers: 30 − 13 = 17 connections
+        # Under -n auto (16 workers), any pool that holds idle connections will
+        # consume the entire budget, leaving no room for setup-phase engines.
+        # NullPool (xdist mode) avoids idle-connection overhead — connections are
+        # opened only during active DB operations and closed immediately when released.
+        # Sequential mode (worker_id=master) keeps the historical (5, 2) QueuePool
+        # for request handlers that need concurrent DB conns within a single test.
+        # See .planning/audits/PYTEST-XDIST-SPIKE-v1019.md for measured numbers + rationale.
+        # Engine-creation logic is extracted to _make_test_async_engine() so the
+        # NullPool-vs-QueuePool branch is directly testable (see test_conftest_pool_sizing.py).
+        test_engine = _make_test_async_engine(settings.test_database_url)
+        test_session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
 
-    limiter.enabled = False
+        # Patch the database module so lifespan seed functions use our engine
+        db_module.engine = test_engine
+        db_module.async_session = test_session_factory
 
-    # Ensure roles and admin user exist before tests.
-    #
-    # Plan 1088-03 / audit Section 4.2: this is the FIRST async-session
-    # connection acquisition under the test_engine, and under -n auto
-    # it surfaced 188 of 365 residual failures as
-    # `asyncpg.TooManyConnectionsError: sorry, too many clients already`
-    # during fixture setup (see
-    # `.planning/audits/PYTEST-XDIST-REMEASURE-AFTER-1088-01.md`).
-    # Wrap with `_run_with_too_many_clients_retry` so transient
-    # connection-contention is retried with bounded backoff
-    # (1.0 + 2.0 + 4.0 = 7s) before failing loudly. The retry budget is
-    # the SAME shape as `_create_test_db_with_retry` from Plan 1088-01
-    # (audit Section 4.1) so both setup-phase contention sites use a
-    # consistent retry contract.
-    await _run_with_too_many_clients_retry(
-        lambda: _ensure_roles_and_admin(test_session_factory)
-    )
+        # fix(#909): the health service late-binds engine from app.core.db, so
+        # the db_module patch above covers it — no per-module re-point needed.
 
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        yield ac
+        # Override the get_db dependency
+        from app.core.dependencies import get_db
 
-    # Cleanup
-    app.dependency_overrides.clear()
-    db_module.engine = original_engine
-    db_module.async_session = original_session
-    storage_provider_module._storage = original_storage
-    settings.upload_staging_dir = original_upload_staging_dir
-    tempfile.tempdir = original_tempdir
-    await test_engine.dispose()
+        # Plan 1088-04 / audit Section 4.3: wrap the per-request session-factory
+        # acquisition with `_acquire_test_session_with_retry` so transient
+        # `asyncpg.TooManyConnectionsError` / `OperationalError("too many clients
+        # already")` raised inside `__aenter__` is retried with bounded backoff
+        # (0.5 + 1.0 = 1.5s budget) before failing loudly. Distinct from
+        # Plan 1088-03's setup-phase wrap of `_ensure_roles_and_admin`: this one
+        # fires per-request inside the test body (e.g., when a test issues
+        # multiple sequential `TestClient.post(...)` calls), so the budget is
+        # intentionally tighter than the setup-phase 7s window. See
+        # `.planning/audits/PYTEST-XDIST-FIXTURE-AUDIT-v1020.md` Section 4.3 +
+        # Section 5 suggestion (lines 1289-1299).
+        _client_session_factory = test_session_factory
+        app.dependency_overrides[get_db] = _override_get_db
+
+        # Initialize singleton cache provider for settings reads/writes in request paths.
+        # Lifespan is not guaranteed in this ASGITransport test setup.
+        init_cache()
+        from app.platform.storage.local import LocalStorageProvider
+
+        storage_provider_module._storage = LocalStorageProvider(
+            base_dir=str(staging_dir)
+        )
+        structlog.contextvars.bind_contextvars(service="api")
+
+        # Disable rate limiter during tests
+        from app.platform.ratelimit import limiter
+
+        limiter.enabled = False
+
+        # Ensure roles and admin user exist before tests.
+        #
+        # Plan 1088-03 / audit Section 4.2: this is the FIRST async-session
+        # connection acquisition under the test_engine, and under -n auto
+        # it surfaced 188 of 365 residual failures as
+        # `asyncpg.TooManyConnectionsError: sorry, too many clients already`
+        # during fixture setup (see
+        # `.planning/audits/PYTEST-XDIST-REMEASURE-AFTER-1088-01.md`).
+        # Wrap with `_run_with_too_many_clients_retry` so transient
+        # connection-contention is retried with bounded backoff
+        # (1.0 + 2.0 + 4.0 = 7s) before failing loudly. The retry budget is
+        # the SAME shape as `_create_test_db_with_retry` from Plan 1088-01
+        # (audit Section 4.1) so both setup-phase contention sites use a
+        # consistent retry contract.
+        await _run_with_too_many_clients_retry(
+            lambda: _ensure_roles_and_admin(test_session_factory)
+        )
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac
+    finally:
+        app.dependency_overrides.clear()
+        _client_session_factory = None
+        db_module.engine = original_engine
+        db_module.async_session = original_session
+        storage_provider_module._storage = original_storage
+        settings.upload_staging_dir = original_upload_staging_dir
+        tempfile.tempdir = original_tempdir
+        if test_engine is not None:
+            await test_engine.dispose()
 
 
 async def _ensure_roles_and_admin(session_factory: async_sessionmaker) -> None:

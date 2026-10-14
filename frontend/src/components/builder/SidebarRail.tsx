@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { LayoutGrid, Plus, Settings } from 'lucide-react';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { ColorizedGeometryIcon, extractStyleHints, getLayerColors, isDiscreteColorStyle } from '@/components/map/layer-icons';
+import { legendFacts } from '@/components/map/legend-facts';
 import { getLayerCapabilities } from '@/lib/layer-capabilities';
 import { cn } from '@/lib/utils';
 import type { MapLayerResponse } from '@/types/api';
@@ -19,7 +20,8 @@ interface SidebarRailProps {
 
 function RailLayerIcon({ layer }: { layer: MapLayerResponse }) {
   const caps = getLayerCapabilities(layer);
-  const layerColors = getLayerColors(layer);
+  const facts = legendFacts(layer);
+  const layerColors = getLayerColors(facts);
   const styleHints = extractStyleHints(
     layer.paint ?? {},
     layer.layout ?? {},
@@ -41,7 +43,9 @@ function RailLayerIcon({ layer }: { layer: MapLayerResponse }) {
       layerId={layer.id}
       layerType={caps.kind}
       styleHints={styleHints}
-      discrete={isDiscreteColorStyle(layer.style_config)}
+      swatch={facts?.swatch ?? null}
+      ramp={facts?.ramp ?? null}
+      discrete={isDiscreteColorStyle(facts)}
     />
   );
 }

@@ -23,8 +23,11 @@ if TYPE_CHECKING:
         DatasetResponseStacAssetsType0,
     )
     from ..models.derived_from_response import DerivedFromResponse
+    from ..models.point_cloud_metadata import PointCloudMetadata
+    from ..models.previous_version_response import PreviousVersionResponse
     from ..models.quality_detail import QualityDetail
     from ..models.raster_metadata import RasterMetadata
+    from ..models.tileset_metadata import TilesetMetadata
 
 
 T = TypeVar("T", bound="DatasetResponse")
@@ -118,14 +121,22 @@ class DatasetResponse:
         updated_by (None | Unset | UUID):
         record_type (str | Unset): Record type: 'vector_dataset' (spatial features), 'raster_dataset' (single COG),
             'vrt_dataset' (VRT mosaic), 'table' (non-spatial tabular), 'map' (saved map), 'service' (catalogued remote
-            service), 'collection' (flat dataset group). Default: 'vector_dataset'.
+            service), 'collection' (flat dataset group), 'tiles3d_dataset' (3D Tiles tileset), 'pointcloud_dataset' (COPC
+            point cloud). Default: 'vector_dataset'.
         raster (None | RasterMetadata | Unset): Raster-specific metadata (null for vectors)
+        tileset (None | TilesetMetadata | Unset): 3D Tiles metadata on the dataset detail response; null for other
+            record types and before a tileset is published
+        pointcloud (None | PointCloudMetadata | Unset): COPC point cloud metadata on the dataset detail response; null
+            for other record types and before a point cloud is published
         stac_assets (DatasetResponseStacAssetsType0 | None | Unset): STAC-style asset dictionary
         stac_extensions (list[str] | None | Unset):
         language (None | str | Unset): ISO 639-1 language code, e.g. en, fr
         metadata_warnings (list[str] | None | Unset): Advisory warnings produced by a metadata update — e.g. a
             visibility or status change exposing keywords inherited from an analysis source the new audience cannot open.
             Only ever set on the PATCH response; the change has already applied.
+        previous_version (None | PreviousVersionResponse | Unset): The data the last replacement or restore replaced,
+            which POST /previous-version/restore publishes again. Set on the detail endpoint only; null elsewhere and when
+            there is none.
     """
 
     id: UUID
@@ -186,10 +197,13 @@ class DatasetResponse:
     updated_by: None | Unset | UUID = UNSET
     record_type: str | Unset = "vector_dataset"
     raster: None | RasterMetadata | Unset = UNSET
+    tileset: None | TilesetMetadata | Unset = UNSET
+    pointcloud: None | PointCloudMetadata | Unset = UNSET
     stac_assets: DatasetResponseStacAssetsType0 | None | Unset = UNSET
     stac_extensions: list[str] | None | Unset = UNSET
     language: None | str | Unset = UNSET
     metadata_warnings: list[str] | None | Unset = UNSET
+    previous_version: None | PreviousVersionResponse | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -200,8 +214,11 @@ class DatasetResponse:
             DatasetResponseStacAssetsType0,
         )
         from ..models.derived_from_response import DerivedFromResponse
+        from ..models.point_cloud_metadata import PointCloudMetadata
+        from ..models.previous_version_response import PreviousVersionResponse
         from ..models.quality_detail import QualityDetail
         from ..models.raster_metadata import RasterMetadata
+        from ..models.tileset_metadata import TilesetMetadata
 
         id = str(self.id)
 
@@ -525,6 +542,22 @@ class DatasetResponse:
         else:
             raster = self.raster
 
+        tileset: dict[str, Any] | None | Unset
+        if isinstance(self.tileset, Unset):
+            tileset = UNSET
+        elif isinstance(self.tileset, TilesetMetadata):
+            tileset = self.tileset.to_dict()
+        else:
+            tileset = self.tileset
+
+        pointcloud: dict[str, Any] | None | Unset
+        if isinstance(self.pointcloud, Unset):
+            pointcloud = UNSET
+        elif isinstance(self.pointcloud, PointCloudMetadata):
+            pointcloud = self.pointcloud.to_dict()
+        else:
+            pointcloud = self.pointcloud
+
         stac_assets: dict[str, Any] | None | Unset
         if isinstance(self.stac_assets, Unset):
             stac_assets = UNSET
@@ -556,6 +589,14 @@ class DatasetResponse:
 
         else:
             metadata_warnings = self.metadata_warnings
+
+        previous_version: dict[str, Any] | None | Unset
+        if isinstance(self.previous_version, Unset):
+            previous_version = UNSET
+        elif isinstance(self.previous_version, PreviousVersionResponse):
+            previous_version = self.previous_version.to_dict()
+        else:
+            previous_version = self.previous_version
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -667,6 +708,10 @@ class DatasetResponse:
             field_dict["record_type"] = record_type
         if raster is not UNSET:
             field_dict["raster"] = raster
+        if tileset is not UNSET:
+            field_dict["tileset"] = tileset
+        if pointcloud is not UNSET:
+            field_dict["pointcloud"] = pointcloud
         if stac_assets is not UNSET:
             field_dict["stac_assets"] = stac_assets
         if stac_extensions is not UNSET:
@@ -675,6 +720,8 @@ class DatasetResponse:
             field_dict["language"] = language
         if metadata_warnings is not UNSET:
             field_dict["metadata_warnings"] = metadata_warnings
+        if previous_version is not UNSET:
+            field_dict["previous_version"] = previous_version
 
         return field_dict
 
@@ -689,8 +736,11 @@ class DatasetResponse:
             DatasetResponseStacAssetsType0,
         )
         from ..models.derived_from_response import DerivedFromResponse
+        from ..models.point_cloud_metadata import PointCloudMetadata
+        from ..models.previous_version_response import PreviousVersionResponse
         from ..models.quality_detail import QualityDetail
         from ..models.raster_metadata import RasterMetadata
+        from ..models.tileset_metadata import TilesetMetadata
 
         d = dict(src_dict)
         id = UUID(d.pop("id"))
@@ -1266,6 +1316,40 @@ class DatasetResponse:
 
         raster = _parse_raster(d.pop("raster", UNSET))
 
+        def _parse_tileset(data: object) -> None | TilesetMetadata | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                tileset_type_0 = TilesetMetadata.from_dict(data)
+
+                return tileset_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | TilesetMetadata | Unset, data)
+
+        tileset = _parse_tileset(d.pop("tileset", UNSET))
+
+        def _parse_pointcloud(data: object) -> None | PointCloudMetadata | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                pointcloud_type_0 = PointCloudMetadata.from_dict(data)
+
+                return pointcloud_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | PointCloudMetadata | Unset, data)
+
+        pointcloud = _parse_pointcloud(d.pop("pointcloud", UNSET))
+
         def _parse_stac_assets(
             data: object,
         ) -> DatasetResponseStacAssetsType0 | None | Unset:
@@ -1328,6 +1412,25 @@ class DatasetResponse:
 
         metadata_warnings = _parse_metadata_warnings(d.pop("metadata_warnings", UNSET))
 
+        def _parse_previous_version(
+            data: object,
+        ) -> None | PreviousVersionResponse | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                previous_version_type_0 = PreviousVersionResponse.from_dict(data)
+
+                return previous_version_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | PreviousVersionResponse | Unset, data)
+
+        previous_version = _parse_previous_version(d.pop("previous_version", UNSET))
+
         dataset_response = cls(
             id=id,
             record_id=record_id,
@@ -1387,10 +1490,13 @@ class DatasetResponse:
             updated_by=updated_by,
             record_type=record_type,
             raster=raster,
+            tileset=tileset,
+            pointcloud=pointcloud,
             stac_assets=stac_assets,
             stac_extensions=stac_extensions,
             language=language,
             metadata_warnings=metadata_warnings,
+            previous_version=previous_version,
         )
 
         dataset_response.additional_properties = d

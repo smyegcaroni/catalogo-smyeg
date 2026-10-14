@@ -2,13 +2,14 @@ import { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { Map as MaplibreMap } from 'maplibre-gl';
 import type { MapLayerResponse } from '@/types/api';
-import { applyLayerVisibilityToMap } from '@/components/builder/hooks/use-layer-map-sync';
+import { writeBuilderLayer } from '@/components/builder/hooks/use-layer-map-sync';
 import { removePerLayerCompanions } from '@/components/builder/hooks/builder-layer-mutations';
 import {
   type GroupedLayer,
   clearPersistedFolderGroup,
   pruneEmptyFolderGroups,
 } from '@/components/builder/folder-groups';
+import { randomId } from '@/lib/random-id';
 
 // STATE-02: folder-group handlers, relocated verbatim out of the useBuilderLayers
 // god-hook. PURE RELOCATION — handler bodies are unchanged; the shared layers
@@ -34,10 +35,10 @@ export function useFolderGroupLayers({
   const { t } = useTranslation('builder');
   const handleCreateGroupWithLayer = useCallback((layerId: string) => {
     // Generate id OUTSIDE the updater so both setters share the same value.
-    // Phase 1051 WR-01: crypto.randomUUID is collision-safe across bulk +
+    // randomId() is collision-safe across bulk +
     // single create paths firing in the same millisecond. The prior
     // `group-${Date.now()}` form collided under rapid bulk operations.
-    const groupId = `group-${crypto.randomUUID()}`;
+    const groupId = `group-${randomId()}`;
 
     setLocalLayers((prev) => {
       const idx = prev.findIndex((l) => l.id === layerId);
@@ -107,12 +108,8 @@ export function useFolderGroupLayers({
     setHasUnsavedChanges(true);
   }, [setLocalLayers, setHasUnsavedChanges]);
 
-  // P1-09: toggle the visibility of a folder group AND every child layer in ONE
-  // atomic setLocalLayers write, routing each child's live-map side effect
-  // through the shared companion visibility helper so a folder eye hides/shows
-  // every child sublayer + its outline/label/extrusion/arrow/cluster/color-relief
-  // companions. The synthetic group row is not a real map layer, so the old
-  // `set_visibility` on the group id updated nothing but the row.
+  // Toggle a folder group and every child in one setLocalLayers write, and write
+  // each child to the map as the single toggle does. The group row draws nothing.
   const handleToggleGroupVisibility = useCallback((groupId: string) => {
     const current = layersRef.current;
     const group = current.find((l) => l.id === groupId);
@@ -137,7 +134,7 @@ export function useFolderGroupLayers({
     const map = mapInstanceRef.current;
     if (map && map.isStyleLoaded()) {
       for (const child of children) {
-        applyLayerVisibilityToMap(map, child, nextVisible);
+        writeBuilderLayer(map, { ...child, visible: nextVisible });
       }
     }
   }, [layersRef, setLocalLayers, setHasUnsavedChanges, mapInstanceRef]);

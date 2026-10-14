@@ -9,8 +9,6 @@ workflow-specific sub-modules so that existing imports continue to work:
 from app.processing.ingest.tasks_common import (  # noqa: F401
     IngestContext,
     _append_job_warning,
-    _apply_reupload_swap,
-    _arcgis_type_to_column_type,
     _bind_task_log_context,
     _detect_and_override_geometry,
     _finalize_ingest,
@@ -41,6 +39,12 @@ from app.processing.ingest.tasks_raster import (  # noqa: F401
     create_raster_dataset,
     ingest_raster,
 )
+from app.processing.ingest.tasks_tileset import (  # noqa: F401
+    ingest_tileset,
+)
+from app.processing.ingest.tasks_pointcloud import (  # noqa: F401
+    ingest_pointcloud,
+)
 from app.processing.ingest.tasks_vrt import (  # noqa: F401
     create_vrt_dataset,
     ingest_vrt,
@@ -50,6 +54,7 @@ from app.processing.ingest.tasks_vrt import (  # noqa: F401
 from app.processing.ingest.tasks_reupload import (  # noqa: F401
     reupload_file,
     reupload_service,
+    reupload_verified_file,
     reupload_verified_refresh,
 )
 from app.processing.ingest.tasks_url_fetch import (  # noqa: F401
@@ -60,6 +65,9 @@ from app.processing.ingest.tasks_raster_replace import (  # noqa: F401
 )
 from app.processing.ingest.tasks_postgis_refresh import (  # noqa: F401
     refresh_postgis,
+)
+from app.processing.ingest.tasks_restore import (  # noqa: F401
+    restore_previous_version,
 )
 from app.processing.ingest.tasks_stac_refresh import (  # noqa: F401
     refresh_stac,

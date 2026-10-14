@@ -76,7 +76,17 @@
     "quotaShort": "Übersprungen – Datensatzlimit erreicht",
     "quotaBannerTitle": "Datensatzlimit erreicht",
     "quotaBannerHint": "Löschen Sie vorhandene Datensätze, um Platz zu schaffen, oder bitten Sie einen Administrator, das Limit zu erhöhen.",
-    "reportProblem": "Dieses Problem melden"
+    "reportProblem": "Dieses Problem melden",
+    "kindLegend": "Was laden Sie hoch?",
+    "kindFiles": "Geodaten-Dateien",
+    "kindFilesHint": "Vektor-, Raster- oder Tabellendaten",
+    "kindTileset": "3D-Tiles-Tileset",
+    "kindTilesetHint": "Ein .zip- oder .3tz-Archiv mit tileset.json im Stammverzeichnis oder in einem Ordner",
+    "kindTilesetUnavailable": "Nicht verfügbar, bis ein Administrator .zip- oder .3tz-Uploads erlaubt",
+    "kindLocked": "Gesperrt, während die abgelegten Dateien auf die Upload-Einstellungen warten",
+    "kindPointCloud": "COPC-Punktwolke",
+    "kindPointCloudHint": "Eine .laz-Datei im COPC-Format; andere LAS/LAZ-Dateien müssen zuerst konvertiert werden",
+    "kindPointCloudUnavailable": "Nicht verfügbar, bis ein Administrator .laz-Uploads erlaubt"
   },
   "warnings": {
     "bannerTitle": "Import mit Warnungen abgeschlossen",
@@ -104,20 +114,34 @@
     "temporalParseErrors": {
       "title": "Zeitfelder verworfen",
       "description": "Die folgenden Zeitwerte konnten nicht als ISO-8601-Daten geparst und wurden verworfen. Geben Sie sie im Datensatz-Metadaten-Editor erneut ein, um sie wiederherzustellen."
-    }
+    },
+    "compactSummary_one": "{{count}} Importwarnung · Details anzeigen",
+    "compactSummary_other": "{{count}} Importwarnungen · Details anzeigen",
+    "compactDataLoss_one": "{{count}} Datenwarnung · Einige Daten könnten verändert sein · Details anzeigen",
+    "compactDataLoss_other": "{{count}} Datenwarnungen · Einige Daten könnten verändert sein · Details anzeigen",
+    "compactArchiveFailure_one": "{{count}} Importwarnung · Originaldatei nicht verfügbar · Details anzeigen",
+    "compactArchiveFailure_other": "{{count}} Importwarnungen · Originaldatei nicht verfügbar · Details anzeigen"
   },
   "dropzone": {
     "ariaLabel": "Dateien hochladen",
     "instructions": "Dateien hierher ziehen oder",
     "dropHere": "Dateien hier ablegen",
     "unsupportedType": "Dieser Dateityp wird nicht unterstützt",
+    "rejectionReason": {
+      "fileInvalidType": "Der Dateityp muss einer der folgenden sein: {{types}}",
+      "fileTooLarge": "Die Datei überschreitet das Limit von {{size}} MB",
+      "fileTooSmall": "Die Datei ist kleiner als die Mindestgröße",
+      "tooManyFiles": "Bis zu {{max}} Dateien pro Stapel",
+      "kindOnly": "{{ext}}-Dateien werden in diesem Modus nicht importiert. Wählen Sie stattdessen „{{mode}}“"
+    },
     "sizeLimit": "Maximal 500 MB pro Datei",
     "sizeLimitDynamic": "Maximal {{size}} MB pro Datei",
     "batchLimit": "Bis zu {{max}} Dateien pro Stapel",
     "fileRejected": "{{filename}}: {{reason}}",
     "browse": "Durchsuchen",
     "toUpload": "zum Hochladen",
-    "subtext": "GeoLens erkennt Geometrie, KRS und Schema, bevor es in den Katalog übernommen wird. Stapel bis zu {{max}} Dateien."
+    "subtext": "GeoLens erkennt Geometrie, KRS und Schema, bevor es in den Katalog übernommen wird. Stapel bis zu {{max}} Dateien.",
+    "tilesetSubtext": "GeoLens prüft jedes Archiv und liest dessen tileset.json, bevor etwas gespeichert wird."
   },
   "stac": {
     "label": "STAC-API-URL; Katalog-Stammendpunkt einfügen",
@@ -161,6 +185,10 @@
     "assetCount_one": "{{count}} Asset",
     "assetCount_other": "{{count}} Assets",
     "noCogAsset": "Kein COG-Asset",
+    "unsupportedAssetScheme": "Veröffentlicht unter einer {{scheme}}://-Adresse, die GeoLens nicht lesen kann",
+    "assetUrlInvalid": "Die Adresse ist keine gültige http- oder https-URL",
+    "assetHasCredentials": "Verwendet eine signierte oder anmeldedatenbehaftete URL, die GeoLens nicht speichert",
+    "assetHrefTooLong": "Die Adresse ist zu lang, um von GeoLens gespeichert zu werden",
     "catalogHelp": "Durchsuchen und importieren Sie Rasterdatensätze aus öffentlichen STAC-Katalogen wie",
     "matchedTotal": "({{count}} insgesamt)",
     "confirm": {
@@ -170,9 +198,10 @@
       "itemsLabel": "Objekte",
       "totalSizeLabel": "Geschätzte Gesamtgröße",
       "sizeUnavailable": "Größe nicht verfügbar",
+      "sizeChecking": "Größen werden geprüft ...",
       "partialSizeNote_one": "Bei {{count}} Objekt fehlt die Größenangabe; die Gesamtgröße ist eine Untergrenze.",
       "partialSizeNote_other": "Bei {{count}} Objekten fehlt die Größenangabe; die Gesamtgröße ist eine Untergrenze.",
-      "estimateSource": "Schätzung basiert auf dem STAC-Manifest (file:size). Tatsächlicher Download kann abweichen.",
+      "estimateSource": "Schätzung basiert auf dem STAC-Manifest (file:size) oder, falls der Katalog es auslässt, auf dem Asset-Server. Tatsächlicher Download kann abweichen.",
       "backToSelection": "Zurück zur Auswahl",
       "confirmImport_one": "{{count}} Objekt bestätigen und importieren",
       "confirmImport_other": "{{count}} Objekte bestätigen und importieren"
@@ -192,14 +221,27 @@
     "credentialHeaderNamePlaceholder": "z. B. Ocp-Apim-Subscription-Key",
     "credentialHeaderValueLabel": "Header-Wert",
     "credentialHeaderValuePlaceholder": "Ihr API-Schlüssel",
-    "credentialHelpText": "Wählen Sie die Methode, die Ihr Katalog dokumentiert. Ein Bearer-Token wird als Authorization-Header gesendet; Benutzername und Passwort werden als HTTP-Basic-Authentifizierung gesendet; ein API-Schlüssel kann unter dem vom Anbieter angegebenen Header-Namen gesendet werden, zum Beispiel X-API-Key, Ocp-Apim-Subscription-Key oder key. Sie authentifiziert den Katalog, seine Collections und seine Items; Kacheln werden aus der Asset-URL gerendert und tragen keine Zugangsdaten."
+    "credentialHelpText": "Wählen Sie die Methode, die Ihr Katalog dokumentiert. Ein Bearer-Token wird als Authorization-Header gesendet; Benutzername und Passwort werden als HTTP-Basic-Authentifizierung gesendet; ein API-Schlüssel kann unter dem vom Anbieter angegebenen Header-Namen gesendet werden, zum Beispiel X-API-Key, Ocp-Apim-Subscription-Key oder key. Sie authentifiziert den Katalog, seine Collections und seine Items; Kacheln werden aus der Asset-URL gerendert und tragen keine Zugangsdaten.",
+    "filterStart": "Von",
+    "filterEnd": "Bis",
+    "filterBbox": "Bereich (West, Süd, Ost, Nord)",
+    "filterBboxPlaceholder": "-74.3, 40.5, -73.7, 40.9",
+    "filterApply": "Filter anwenden",
+    "filterDateOrder": "Das Startdatum darf nicht nach dem Enddatum liegen.",
+    "filterBboxInvalid": "Geben Sie vier Zahlen ein: West, Süd, Ost, Nord (Längengrad -180 bis 180, Breitengrad -90 bis 90, Süd nicht nördlich von Nord).",
+    "loadMore": "Mehr laden",
+    "filterCloud": "Max. Wolkenbedeckung (%)",
+    "filterCloudInvalid": "Geben Sie eine Wolkenbedeckung zwischen 0 und 100 ein.",
+    "selectionLimit": "Sie können höchstens {{count}} Elemente auf einmal importieren."
   },
   "serviceUrl": {
     "label": "Service-URL",
     "placeholder": "https://example.com/wfs, ArcGIS FeatureServer oder OGC-API-Endpunkt",
     "helpText": "WFS-, ArcGIS-Feature-Service- oder OGC-API-Features-URL einfügen",
+    "arcgisPortalUrlHint": "Das sieht nach einer ArcGIS-Organisations- oder Portalseite aus, nicht nach einem Layer. Öffnen Sie die Elementseite des Layers, kopieren Sie dessen REST-URL (sie endet auf /FeatureServer/0 oder /MapServer/0) und fügen Sie sie hier ein. Geschützte Layer verlangen die Anmeldung, nachdem Sie die Layer-URL eingefügt haben.",
     "tokenPlaceholder": "ArcGIS-Token, API-Schlüssel oder WFS-Zugriffstoken",
     "credentialMethodLabel": "Authentifizierung",
+    "credentialsReset": "Die Authentifizierung wurde zurückgesetzt, weil sich die Dienstadresse geändert hat.",
     "credentialMethodNone": "Keine Authentifizierung",
     "credentialMethodBearer": "Bearer-Token",
     "credentialMethodBasic": "Benutzername und Passwort",
@@ -221,8 +263,10 @@
     "commitFailed": "Import konnte nicht gestartet werden",
     "detectedLabel": "Service-URL; erkannt",
     "clear": "Löschen",
-    "layersAvailable": "{{count}} Ebenen verfügbar",
+    "layersAvailable_one": "{{count}} Ebene verfügbar",
+    "layersAvailable_other": "{{count}} Ebenen verfügbar",
     "noLayers": "In diesem Service wurden keine Ebenen gefunden.",
+    "unsupportedLayerType": "{{type}} enthält keine Features. Importieren Sie stattdessen eine seiner Feature-Ebenen.",
     "probe": "Prüfen →",
     "supported": "Unterstützt:",
     "unknownDataset": "Unbekannter Datensatz",
@@ -301,6 +345,11 @@
     "successToast_one": "{{count}} Tabelle erfolgreich registriert",
     "successToast_other": "{{count}} Tabellen erfolgreich registriert",
     "registerFailed": "Tabellen konnten nicht registriert werden",
+    "internalFailure": "Die Registrierung ist aus einem Grund fehlgeschlagen, den der Server nicht sicher melden konnte. Bitten Sie einen Betreiber, das Server-Protokoll zu prüfen.",
+    "refusal": {
+      "source_srid_undeclared": "Die geom-Spalte deklariert keine SRID, daher kann GeoLens nicht erkennen, wo ihre Koordinaten liegen. Legen Sie die SRID fest, zum Beispiel mit UpdateGeometrySRID, und registrieren Sie die Tabelle dann.",
+      "source_gid_unusable": "GeoLens identifiziert Features über eine Spalte namens gid: eine eindeutige Ganzzahl mit NOT NULL, etwa ein Primärschlüssel, in einer Tabelle, von der keine andere Tabelle erbt. Diese Tabelle erfüllt das nicht. Fügen Sie die Spalte gid hinzu oder korrigieren Sie sie, oder benennen Sie eine unbrauchbare um, damit GeoLens eine eigene hinzufügen kann, und registrieren Sie die Tabelle dann."
+    },
     "unknownError": "Unbekannter Fehler",
     "searchPlaceholder": "Tabellen suchen…",
     "selectHint": "Eine Tabelle aus der Liste auswählen, um ihr Schema zu sehen und sie zu registrieren.",
@@ -334,6 +383,7 @@
   },
   "preview": {
     "title": "Dateivorschau",
+    "serviceTitle": "Dienstvorschau",
     "raster": "Raster",
     "crs": "CRS:",
     "bands": "Bänder:",
@@ -465,7 +515,15 @@
     "rasterCount_one": "{{value}} Raster",
     "rasterCount_other": "{{value}} Raster",
     "tableCount_one": "{{value}} tabellarischer Datensatz",
-    "tableCount_other": "{{value}} tabellarische Datensätze"
+    "tableCount_other": "{{value}} tabellarische Datensätze",
+    "tilesetSummary": "3D Tiles {{version}} · {{size}} · {{volume}}",
+    "tilesetCount_one": "{{value}} Tileset",
+    "tilesetCount_other": "{{value}} Tilesets",
+    "tilesetActionSummary": "{{files}} · {{tilesets}}",
+    "pointcloudSummary": "{{points}} Punkte · {{crs}} · {{size}}",
+    "pointcloudCount_one": "{{value}} Punktwolke",
+    "pointcloudCount_other": "{{value}} Punktwolken",
+    "singleActionHint": "Prüfen Sie die Einstellungen oben und importieren Sie dann diesen Datensatz."
   },
   "detect": {
     "rasterInfo": "Raster-Info",
@@ -485,12 +543,20 @@
       "cog": "COG",
       "type": "type",
       "features": "features",
-      "layer": "layer"
+      "layer": "layer",
+      "version": "version",
+      "geometricError": "geometrischer Fehler",
+      "volume": "volume",
+      "extent": "extent",
+      "unpacked": "unpacked",
+      "entries": "entries"
     },
     "table": {
       "column": "Spalte",
       "type": "Typ"
-    }
+    },
+    "tilesetInfo": "Tileset",
+    "noExtent": "keine; das Volumen ist nicht georeferenziert"
   },
   "bulk": {
     "uploading_one": "{{count}} Datei wird hochgeladen...",
@@ -529,7 +595,13 @@
     "detectingHint": "Hochladen & Erkennen…",
     "importingFiles": "{{count}} Dateien werden importiert",
     "progressDetail": "{{done}} abgeschlossen · {{active}} in Bearbeitung · {{queued}} in Warteschlange",
-    "uploadProgressLabel": "Upload-Fortschritt für {{name}}"
+    "uploadProgressLabel": "Upload-Fortschritt für {{name}}",
+    "toggleDetails": "Details für {{name}} ein- oder ausblenden",
+    "removeNamedFile": "{{name}} entfernen",
+    "defaultsConfirmTitle": "Stapel mit Standardwerten importieren?",
+    "defaultsConfirmDescription": "Dateinamen werden als Datensatznamen verwendet; die Sichtbarkeit ist privat. Alle Änderungen in den Prüfformularen, einschließlich Namen, Beschreibungen, Sichtbarkeit, Geometrie, CRS und Rastereinstellungen, werden verworfen. Bei mehrschichtigen Dateien wird nur die ausgewählte Ebene importiert.",
+    "confirmDefaults": "Mit Standardwerten importieren",
+    "progressDetailWithFailures": "{{done}} abgeschlossen · {{failed}} fehlgeschlagen oder abgebrochen · {{active}} in Bearbeitung · {{queued}} in Warteschlange"
   },
   "eyebrow": "Importieren",
   "pageDescription": "Dateien hochladen, Tabellen aus Ihrem Postgres registrieren oder einen Remote-Service verbinden. GeoLens erkennt Geometrie, Schema und KRS und macht die Daten abfragbar, stilisierbar und einbettbar.",
@@ -538,14 +610,23 @@
     "heroTitle_many": "{{count}} Datensätze zum Katalog hinzugefügt",
     "heroTitle_other": "{{count}} Datensätze zum Katalog hinzugefügt",
     "heroDesc": "Alle Dateien aufgenommen, gekachelt und indiziert. Bereit zum Abfragen, Gestalten und Kartografieren.",
+    "heroDescTilesets": "Bereit zum Laden in einem 3D-Tiles-Client. Die Tileset-URL steht im Tab „Zugriff“ des Datensatzes.",
     "statDatasets": "Datensätze",
     "statVector": "Vektor",
     "statRaster": "Raster",
     "statTabular": "Tabellarisch",
+    "statTilesets": "3D Tiles",
     "next": "Weiter:",
     "viewCatalog": "Im Katalog anzeigen",
     "importMore": "Mehr importieren",
-    "aiMetadata": "KI-Metadaten hinzufügen"
+    "aiMetadata": "KI-Metadaten hinzufügen",
+    "statPointClouds": "Punktwolken",
+    "heroDescPointClouds": "Bereit für einen COPC-Client. Die Datei-URL steht auf der Registerkarte Zugriff des Datensatzes.",
+    "partialTitle": "{{completed}} Datensätze hinzugefügt · {{failed}} fehlgeschlagen oder abgebrochen",
+    "partialDesc": "Einige Importe wurden nicht abgeschlossen. Prüfen Sie die fehlgeschlagenen Aufträge und öffnen Sie die verfügbaren Datensätze.",
+    "heroDescTables": "Zeilen und Schema können abgefragt und wiederverwendet werden. Nicht räumliche Tabellen haben keine Kartenvorschau.",
+    "heroDescMixed": "Die Datensätze sind im Katalog verfügbar. Öffnen Sie jeden Datensatz für Daten und Zugriffsoptionen.",
+    "failedJobs": "Fehlgeschlagene oder abgebrochene Aufträge"
   },
   "rail": {
     "stageTitle": "Dateien bereitstellen",
@@ -553,7 +634,7 @@
     "reviewTitle": "Erkennung prüfen",
     "reviewDesc": "Geometrietyp, KRS, Schema und Vorschau für jede Datei bestätigen.",
     "importTitle": "Importieren & katalogisieren",
-    "importDesc": "Kacheln, indizieren, veröffentlichen; Datensätze erscheinen sofort im Katalog.",
+    "importDesc": "Bereitet jeden Datensatz passend zu seinem Datentyp vor und fügt ihn dem Katalog hinzu.",
     "workflow": "Arbeitsablauf",
     "whatImported": "Was importiert wird",
     "vectorLabel": "Vektor",
@@ -581,7 +662,17 @@
     "urlHint": "Import von einer Datei-URL",
     "urlDesc": "GeoLens lädt die Datei serverseitig in den Staging-Bereich und führt dann dieselbe Erkennungs- und Importpipeline wie bei einem Upload aus.",
     "urlNote": "Die URL wird vor dem Download validiert und größenbeschränkt · die Daten werden in GeoLens kopiert",
-    "compareUrl": "Upload sendet eine Datei von Ihrem Rechner. Datei-URL ruft sie aus dem Web ab; gleiche Prüfung, gleiches Ergebnis, ohne lokalen Download."
+    "compareUrl": "Upload sendet eine Datei von Ihrem Rechner. Datei-URL ruft sie aus dem Web ab; gleiche Prüfung, gleiches Ergebnis, ohne lokalen Download.",
+    "tiles3dLabel": "3D Tiles",
+    "tiles3dDesc": "entpackt und unverändert an 3D-Tiles-Clients ausgeliefert.",
+    "partialDesc": "Einige Importe sind fehlgeschlagen oder wurden abgebrochen. Prüfen Sie die Auftragsdetails.",
+    "partialStatus": "Prüfung nötig",
+    "completeTableDesc": "Zeilen und Schema sind abfragbar und wiederverwendbar; keine Kartenvorschau.",
+    "completeTilesetDesc": "Die URL für 3D-Tiles-Clients steht im Tab Zugriff.",
+    "completePointCloudDesc": "Die COPC-Datei-URL steht im Tab Zugriff.",
+    "completeDesc": "Die fertigen Datensätze sind im Katalog verfügbar.",
+    "pointcloudLabel": "COPC-Punktwolke",
+    "pointcloudDesc": "für externe COPC-Clients verfügbar; keine integrierte Kartenvorschau."
   },
   "status": {
     "uploading": "Hochladen",
@@ -590,5 +681,11 @@
     "importing": "Import",
     "ready": "Bereit",
     "failed": "Fehlgeschlagen"
+  },
+  "pointcloud": {
+    "points": "Punkte",
+    "crs": "KBS",
+    "pointFormat": "Punktformat",
+    "size": "Größe"
   }
 }

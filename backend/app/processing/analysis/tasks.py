@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import re
 import uuid
-from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Literal
 
@@ -30,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db.tenant_schema import tenant_data_schema
 from app.core.db.tenant_session import current_tenant_var, tenant_task
 from app.core.tenancy import is_multi_tenant
+from app.platform.jobs.models import ANALYSIS_OUTPUT_TABLE_FIELD
 from app.platform.analysis_sql import (
     INTERNAL_ALIAS_PREFIX,
     INTERSECT_OUTPUT_COLUMNS,
@@ -38,6 +38,7 @@ from app.platform.analysis_sql import (
     MEASURE_OUTPUT_COLUMNS,
     NON_GROUPABLE_COLUMN_TYPES,
     NOT_EMPTY_PREDICATE,
+    binds_referenced_by,
     render_clip_layer_join,
     render_geometry_expr,
     render_intersect_pairs,
@@ -46,13 +47,15 @@ from app.platform.analysis_sql import (
     render_spatial_join,
     spatial_join_output_columns,
 )
+from app.processing.analysis.layer_filter import narrow_analysis_inputs
 from app.processing.analysis.provenance import apply_analysis_provenance
+from app.core.failure_reason import FixedReason
+from app.platform.jobs import ledger
 from app.platform.jobs.heartbeat import (
-    claim_ingest_job_attempt,
+    StaleIngestAttempt,
     maintain_ingest_job_heartbeat,
     resolve_ingest_job_attempt,
     stop_ingest_job_heartbeat,
-    update_ingest_job_for_attempt,
     write_job_failure_for_attempt,
 )
 from app.processing.ingest.metadata import _sql_quote_ident
@@ -159,13 +162,15 @@ CANCEL_WRITE_BUDGET_MS = int(
 )
 
 
-def _user_error_message(exc: Exception, *, registered: bool = False) -> str:
-    """Map a failure onto text safe to return from ``GET /jobs/{job_id}``.
+def _user_error_message(exc: Exception, *, registered: bool = False) -> str | Exception:
+    """The reason to store for a failure: a sentence for a database error, else the error.
 
     SQLAlchemy stringifies DB errors with the full statement appended
     (``[SQL: CREATE TABLE "data"."…" AS …]``), which would hand internal schema
     and table names to the client. Mirrors the sandbox's
-    ``_handle_execution_error`` categories; raw text stays in server logs.
+    ``_handle_execution_error`` categories; raw text stays in server logs. Any
+    other failure is returned as it is, for the ledger's redaction to judge by
+    where it came from.
     """
     if isinstance(exc, SQLAlchemyError):
         exc_text = str(exc).lower()
@@ -191,7 +196,7 @@ def _user_error_message(exc: Exception, *, registered: bool = False) -> str:
                 "operation. Try a different column."
             )
         return "The analysis failed due to a database error"
-    return str(exc)[:2000]
+    return exc
 
 
 async def _fail_cancelled_job(
@@ -231,15 +236,10 @@ async def _fail_cancelled_job(
             session,
             uuid.UUID(job_id),
             attempt_id,
-            values={
-                "status": "failed",
-                "error_message": (
-                    "The worker shut down before this analysis finished. Run it again."
-                ),
-                # fix(#813): terminal writes stamp completed_at — without it
-                # the jobs UI renders '-' and retention ages on queue time.
-                "completed_at": datetime.now(timezone.utc),
-            },
+            reason=FixedReason(
+                "The worker shut down before this analysis finished. Run it again.",
+                code="analysis_worker_shutdown",
+            ),
             task_name="analysis_cancelled",
             budget_ms=CANCEL_WRITE_BUDGET_MS,
         )
@@ -271,13 +271,12 @@ async def _fail_cancelled_job(
 
 
 async def _count_features_bounded(
-    session: AsyncSession, table_ref: str, cap: int
+    session: AsyncSession, table_ref: str, cap: int, binds: list[Any]
 ) -> int:
     """Live row count, stopping at ``cap + 1`` so the probe stays bounded."""
+    sql = f"SELECT count(*) FROM (SELECT 1 FROM {table_ref} AS _t LIMIT :lim) AS _n"  # noqa: S608
     result = await session.execute(
-        text(
-            f"SELECT count(*) FROM (SELECT 1 FROM {table_ref} LIMIT :lim) AS _n"  # noqa: S608
-        ).bindparams(lim=cap + 1)
+        text(sql).bindparams(*binds_referenced_by(sql, binds), lim=cap + 1)
     )
     return int(result.scalar_one())
 
@@ -509,16 +508,21 @@ async def _recheck_size_caps(
     operation: str,
     src_ref: str,
     mask_table_ref: str | None,
+    binds: list[Any],
 ) -> None:
     """Re-validate the enqueue-time size gates against the live tables.
 
     The queue wait can be long enough for a source or mask dataset to be
     re-uploaded past its cap, and the post-CTAS output check is too late to
     protect the dissolve/mask union itself from OOM — so the bounded counts run
-    again here, immediately before the SQL is built.
+    again here, immediately before the SQL is built. Both refs carry their
+    layer filters, so only the features those keep are counted.
     """
     cap = MAX_SOURCE_FEATURES.get(operation)
-    if cap is not None and await _count_features_bounded(session, src_ref, cap) > cap:
+    if (
+        cap is not None
+        and await _count_features_bounded(session, src_ref, cap, binds) > cap
+    ):
         raise ValueError(
             f"This dataset is too large for {operation} (the limit is "
             f"{cap:,} features). Filter it to a smaller dataset first."
@@ -526,7 +530,7 @@ async def _recheck_size_caps(
     if (
         mask_table_ref is not None
         and await _count_features_bounded(
-            session, mask_table_ref, MAX_MASK_LAYER_FEATURES
+            session, mask_table_ref, MAX_MASK_LAYER_FEATURES, binds
         )
         > MAX_MASK_LAYER_FEATURES
     ):
@@ -590,21 +594,16 @@ async def _complete_job_for_attempt(
     job they were told failed. The fence shares the registration transaction,
     so a miss rolls the Dataset row back with it.
     """
-    if await update_ingest_job_for_attempt(
-        session,
-        uuid.UUID(job_id),
-        attempt_id,
-        values={
-            "status": "complete",
-            "dataset_id": dataset_id,
-            # fix(#813): stamp completion time like ingest does.
-            "completed_at": datetime.now(timezone.utc),
-        },
-    ):
+    try:
+        await ledger.complete(
+            session, uuid.UUID(job_id), attempt_id, values={"dataset_id": dataset_id}
+        )
+    except StaleIngestAttempt:
+        await session.rollback()
+    else:
         await session.commit()
         ANALYSIS_JOBS.labels(operation=operation, status="complete").inc()
         return
-    await session.rollback()
     logger.warning("analysis.complete_write_superseded", job_id=job_id)
     # fix(#814): the output table is durable from the build commit and this
     # attempt's registration is rolled back, so gate the drop on the adoption
@@ -648,12 +647,6 @@ async def _output_table_adopted(session: AsyncSession, out_table: str) -> bool:
             "SELECT 1 FROM catalog.datasets WHERE table_name = :out"
         ).bindparams(out=out_table)
     return (await session.execute(stmt)).first() is not None
-
-
-# fix(#1778): the `user_metadata` field an analysis job names its output table
-# under, written in the SAME transaction that creates the table, so a row that
-# has one has the other and no orphan is left with nothing able to name it.
-ANALYSIS_OUTPUT_TABLE_FIELD = "analysis_out_table"
 
 
 def recorded_analysis_output_tables(user_metadata: object) -> tuple[str, ...]:
@@ -899,13 +892,8 @@ async def _mark_job_failed(
         session,
         uuid.UUID(job_id),
         attempt_id,
-        values={
-            "status": "failed",
-            # Sanitized (fix(#692)): raw DB errors embed the generated SQL.
-            "error_message": _user_error_message(exc, registered=registered),
-            # fix(#813): stamp completion time like ingest does.
-            "completed_at": datetime.now(timezone.utc),
-        },
+        # Raw DB errors embed the generated SQL.
+        reason=_user_error_message(exc, registered=registered),
         task_name="analysis_materialize",
     )
     # fix(#1957): an expiry proves nothing about who owns the row, so the
@@ -1033,11 +1021,11 @@ def _build_materialize_select(
                 f"SELECT (row_number() OVER ())::integer AS gid, {col}, "
                 f"COUNT(*)::integer AS source_count, "
                 f"{union_expr} AS geom "
-                f"FROM {src_ref} GROUP BY {col}"
+                f"FROM {src_ref} AS _src GROUP BY {col}"
             )
         return _wrap_not_empty(
             f"SELECT 1 AS gid, COUNT(*)::integer AS source_count, "
-            f"{union_expr} AS geom FROM {src_ref}"
+            f"{union_expr} AS geom FROM {src_ref} AS _src"
         )
     if operation == "select_by_location" and mask_table_ref is not None:
         # fix(#955): whole source rows, filtered. No lateral and no CTE, so
@@ -1067,7 +1055,9 @@ def _build_materialize_select(
         mask=mask,
     )
     cols = "".join(f"{_sql_quote_ident(c)}, " for c in carry_cols)
-    return _wrap_not_empty(f"SELECT gid, {cols}{expr} AS geom FROM {src_ref}{where}")
+    return _wrap_not_empty(
+        f"SELECT gid, {cols}{expr} AS geom FROM {src_ref} AS _src{where}"
+    )
 
 
 async def _materialize(
@@ -1083,6 +1073,9 @@ async def _materialize(
     by_field: str | None = None,
     join_dataset_id: str | None = None,
     join_fields: list[str] | None = None,
+    source_filter: dict[str, Any] | None = None,
+    mask_filter: dict[str, Any] | None = None,
+    join_filter: dict[str, Any] | None = None,
 ) -> None:
     """Core materialize logic; separated from the task wrapper for tests."""
     from app.core.db import async_session
@@ -1104,9 +1097,7 @@ async def _materialize(
         # token, stamping the liveness signals the sweep and the lease need.
         # Without it a row another actor already made terminal is resurrected.
         attempt_id = job.attempt_id or await resolve_ingest_job_attempt(job.id, None)
-        if attempt_id is None or not await claim_ingest_job_attempt(
-            session, job.id, attempt_id
-        ):
+        if attempt_id is None or not await ledger.claim(session, job.id, attempt_id):
             await session.rollback()
             logger.warning("analysis.attempt_not_claimed", job_id=job_id)
             return
@@ -1180,12 +1171,26 @@ async def _materialize(
                     label="join",
                     require_geometry="any",
                 )
+            (
+                src_ref,
+                mask_table_ref,
+                join_table_ref,
+                filter_binds,
+            ) = await narrow_analysis_inputs(
+                session,
+                _schema,
+                source=(src_ref, src.table_name, bool(src.geometry_type)),
+                mask=(mask_table_ref, mask_table_name),
+                join=(join_table_ref, join_table_name),
+                filters=(source_filter, mask_filter, join_filter),
+            )
 
             await _recheck_size_caps(
                 session,
                 operation=operation,
                 src_ref=src_ref,
                 mask_table_ref=mask_table_ref,
+                binds=filter_binds,
             )
 
             _base_table, collision_warning = await generate_table_name(title, session)
@@ -1248,7 +1253,11 @@ async def _materialize(
                 # in memory at once and can OOM-kill the shared db container;
                 # sorted aggregation bounds it to one group at a time.
                 await session.execute(text("SET LOCAL enable_hashagg = off"))
-            await session.execute(text(f"CREATE TABLE {out_ref} AS {select_sql}"))
+            await session.execute(
+                text(f"CREATE TABLE {out_ref} AS {select_sql}").bindparams(
+                    *binds_referenced_by(select_sql, filter_binds)
+                )
+            )
             out_table_created = True
             # Early exit only — a table already over the ceiling must not hold
             # the single worker slot through the rewrite phases. The
@@ -1316,6 +1325,7 @@ async def _materialize(
                 source_dataset_id=dataset_id,
                 user_id=user_id,
                 operation=operation,
+                source_filter=source_filter,
                 params={
                     "distance_meters": distance_meters,
                     "by_field": by_field,
@@ -1330,6 +1340,8 @@ async def _materialize(
                     "mask_dataset_id": mask_dataset_id,
                     "join_dataset_id": join_dataset_id,
                     "join_fields": join_fields or None,
+                    "mask_filter": mask_filter,
+                    "join_filter": join_filter,
                 },
             )
             await _complete_job_for_attempt(
@@ -1404,6 +1416,9 @@ async def materialize_analysis(
     by_field: str | None = None,
     join_dataset_id: str | None = None,
     join_fields: list[str] | None = None,
+    source_filter: dict[str, Any] | None = None,
+    mask_filter: dict[str, Any] | None = None,
+    join_filter: dict[str, Any] | None = None,
 ) -> None:
     """Procrastinate entry point for async analysis materialization."""
     await _materialize(
@@ -1418,4 +1433,7 @@ async def materialize_analysis(
         by_field=by_field,
         join_dataset_id=join_dataset_id,
         join_fields=join_fields,
+        source_filter=source_filter,
+        mask_filter=mask_filter,
+        join_filter=join_filter,
     )

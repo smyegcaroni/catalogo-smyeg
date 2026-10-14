@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import {
@@ -15,6 +16,7 @@ import { formatBytes, formatNumber } from '@/lib/format';
 import { ApiError } from '@/api/client';
 import {
   connectStac,
+  fetchStacAssetSizes,
   fetchStacCollections,
   searchStacItems,
 } from '@/api/stac';
@@ -31,6 +33,8 @@ import type {
   StacItemSummary,
   StacImportItem,
   StacImportResult,
+  StacNextPage,
+  StacSearchRequest,
 } from '@/types/api';
 import { originOf } from './utils';
 import { Button } from '@/components/ui/button';
@@ -49,6 +53,27 @@ import {
 // own note that converging the two is a follow-up.
 type StacCredentialMethod = 'none' | 'bearer' | 'basic' | 'header';
 
+type SearchFilters = Pick<
+  StacSearchRequest,
+  'bbox' | 'datetime_range' | 'max_cloud_cover' | 'cloud_cover_mode'
+>;
+
+// Which STAC extension the catalog advertises for filtering on cloud cover:
+// Query is the simpler one, CQL2 JSON the fallback. None means no filter.
+function cloudCoverMode(conformsTo: string[]): 'query' | 'filter' | null {
+  if (conformsTo.some((c) => c.includes('item-search#query'))) return 'query';
+  if (
+    conformsTo.some((c) => c.includes('item-search#filter')) &&
+    conformsTo.some((c) => c.includes('cql2-json'))
+  ) {
+    return 'filter';
+  }
+  return null;
+}
+
+// StacImportRequest.items allows at most this many per call.
+const MAX_IMPORT_ITEMS = 50;
+
 type Step =
   | 'idle'
   | 'connecting'
@@ -58,6 +83,67 @@ type Step =
   | 'confirm' // EW-05: size-estimate confirmation before committing to fetch
   | 'importing'
   | 'done';
+
+interface AssetAvailability {
+  importable: boolean;
+  /** Unset when importable. 'no_asset' has no href at all; the other three
+   * mirror the search endpoint's own `data_asset_import_refusal` — the
+   * server's prediction of what `/import`'s `StacImportItem` validator
+   * (stac_router.py) would refuse, so the client screens out exactly what
+   * the door would reject rather than a separate, driftable guess. */
+  reason?: 'no_asset' | 'not_http' | 'credentials' | 'too_long';
+  /** The href's scheme, lowercase and without the trailing colon — display
+   * only, for the 'not_http' reason's message. Parsing it here decides
+   * nothing: `data_asset_import_refusal` already did. */
+  scheme?: string;
+}
+
+function assetAvailability(
+  item: Pick<StacItemSummary, 'data_asset_href' | 'data_asset_import_refusal'>,
+): AssetAvailability {
+  if (!item.data_asset_href) return { importable: false, reason: 'no_asset' };
+  // Absent (the field's own type allows undefined) is treated the same as
+  // null — importable — rather than as an unknown, disable-it default. The
+  // only way this app's own API omits the field is a server too old to
+  // have it yet, and disabling every item against that server would break
+  // imports that work today for a check it hasn't heard of.
+  if (!item.data_asset_import_refusal) return { importable: true };
+  const availability: AssetAvailability = {
+    importable: false,
+    reason: item.data_asset_import_refusal,
+  };
+  if (item.data_asset_import_refusal === 'not_http') {
+    try {
+      availability.scheme = new URL(item.data_asset_href).protocol.replace(/:$/, '');
+    } catch {
+      // Unparsable is display-only fallout; data_asset_import_refusal already decided.
+    }
+  }
+  return availability;
+}
+
+/** The reason text for a disabled item's row, one per `AssetAvailability.reason`. */
+function assetUnavailableReasonText(
+  t: (key: string, opts?: Record<string, unknown>) => string,
+  availability: AssetAvailability,
+): string {
+  switch (availability.reason) {
+    case 'not_http':
+      // A scheme names the address's actual problem; without one (the
+      // href didn't parse even client-side, e.g. a malformed authority)
+      // there is nothing to name, so fall back to a generic reason rather
+      // than an empty "://" fragment.
+      return availability.scheme
+        ? t('stac.unsupportedAssetScheme', { scheme: availability.scheme })
+        : t('stac.assetUrlInvalid');
+    case 'credentials':
+      return t('stac.assetHasCredentials');
+    case 'too_long':
+      return t('stac.assetHrefTooLong');
+    default:
+      return t('stac.noCogAsset');
+  }
+}
 
 export function StacImportForm() {
   const { t } = useTranslation('import');
@@ -74,6 +160,26 @@ export function StacImportForm() {
   const [selectedCollection, setSelectedCollection] = useState<StacCollectionSummary | null>(null);
   const [searchResult, setSearchResult] = useState<{ items: StacItemSummary[]; matched: number | null }>({ items: [], matched: null });
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  const [bboxText, setBboxText] = useState('');
+  const [maxCloud, setMaxCloud] = useState('');
+  // Latched once an item of this collection reports cloud cover, so a limit
+  // that empties the list does not take the control away.
+  const [cloudCoverSeen, setCloudCoverSeen] = useState(false);
+  const [filtering, setFiltering] = useState(false);
+  const [nextPage, setNextPage] = useState<StacNextPage | null>(null);
+  const [appliedFilters, setAppliedFilters] = useState<SearchFilters>({});
+  const [loadingMore, setLoadingMore] = useState(false);
+  // Sizes looked up on the review step for assets the catalog gave none for,
+  // keyed by asset URL since item ids repeat across collections; null means
+  // the asset's server did not say.
+  const [probedSizes, setProbedSizes] = useState<Record<string, number | null>>({});
+  const [probingSizes, setProbingSizes] = useState(false);
+  // Bumped whenever the result set is replaced or abandoned, so a response
+  // for an earlier search cannot append to, or overwrite, a newer one.
+  const searchGenRef = useRef(0);
+  const [filterError, setFilterError] = useState<string | null>(null);
   const [importResult, setImportResult] = useState<{
     created: number;
     skipped: number;
@@ -81,6 +187,7 @@ export function StacImportForm() {
     results: StacImportResult[];
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const importErrorId = useId();
   // fix(#1712): a mount that STARTED the import must not act on its own
   // settlement after it unmounts — `handleImport`'s function body keeps
   // running past an unmount (unlike the request itself, nothing cancels
@@ -95,9 +202,16 @@ export function StacImportForm() {
     };
   }, []);
 
+  const cloudMode = catalogInfo ? cloudCoverMode(catalogInfo.conforms_to ?? []) : null;
   const items = searchResult.items;
   const matchedCount = searchResult.matched;
-  const selectableItems = useMemo(() => items.filter((i) => i.data_asset_href), [items]);
+  useEffect(() => {
+    if (items.some((i) => i.cloud_cover != null)) setCloudCoverSeen(true);
+  }, [items]);
+  const selectableItems = useMemo(
+    () => items.filter((i) => assetAvailability(i).importable),
+    [items],
+  );
 
   // fix(#1764): a failed Connect returns here with the credential intact, so
   // editing the URL to another catalog would send the first catalog's key to
@@ -142,6 +256,7 @@ export function StacImportForm() {
   }
 
   const reset = () => {
+    searchGenRef.current += 1;
     setStep('idle');
     setUrl('');
     clearCredential('none');
@@ -150,6 +265,15 @@ export function StacImportForm() {
     setSelectedCollection(null);
     setSearchResult({ items: [], matched: null });
     setSelectedItems(new Set());
+    setStartDate('');
+    setEndDate('');
+    setBboxText('');
+    setMaxCloud('');
+    setCloudCoverSeen(false);
+    setFilterError(null);
+    setNextPage(null);
+    setAppliedFilters({});
+    setProbedSizes({});
     setImportResult(null);
     setError(null);
     // fix(#1712): defensive symmetry with the success/failure settlement
@@ -175,6 +299,7 @@ export function StacImportForm() {
 
     setStep('connecting');
     setError(null);
+    setProbedSizes({});
 
     try {
       const auth = buildStacAuth();
@@ -195,7 +320,17 @@ export function StacImportForm() {
 
   // ── Step 2: Select collection and search items ──
   const handleCollectionSelect = async (collection: StacCollectionSummary) => {
+    const gen = ++searchGenRef.current;
+    setFiltering(false);
+    setLoadingMore(false);
     setSelectedCollection(collection);
+    setStartDate('');
+    setEndDate('');
+    setBboxText('');
+    setMaxCloud('');
+    setCloudCoverSeen(false);
+    setFilterError(null);
+    setAppliedFilters({});
     setStep('loading-items');
     setError(null);
 
@@ -209,14 +344,127 @@ export function StacImportForm() {
         limit: 50,
         ...(auth ? { auth } : {}),
       });
+      if (gen !== searchGenRef.current) return;
       setSearchResult({ items: result.items, matched: result.matched });
+      setNextPage(result.next_page ?? null);
       setSelectedItems(new Set());
       setStep('items');
     } catch (err) {
+      if (gen !== searchGenRef.current) return;
       const msg = err instanceof ApiError ? err.message : t('stac.searchItemsFailed');
       setError(msg);
       setStep('collections');
       toast.error(msg);
+    }
+  };
+
+  // The `bbox` and `datetime_range` the filter fields describe, or an error
+  // message when a field is unusable. Blank fields mean no filter.
+  function buildSearchFilters(): { filters: SearchFilters } | { error: string } {
+    const filters: SearchFilters = {};
+    if (startDate && endDate && startDate > endDate) {
+      return { error: t('stac.filterDateOrder') };
+    }
+    if (startDate || endDate) {
+      const from = startDate ? `${startDate}T00:00:00Z` : '..';
+      const to = endDate ? `${endDate}T23:59:59.999999Z` : '..';
+      filters.datetime_range = `${from}/${to}`;
+    }
+    if (bboxText.trim()) {
+      const parts = bboxText.split(',').map((p) => p.trim());
+      const nums = parts.map(Number);
+      const [west, south, east, north] = nums;
+      const valid =
+        parts.length === 4 &&
+        parts.every((p) => p !== '') &&
+        nums.every(Number.isFinite) &&
+        [west, east].every((lon) => lon >= -180 && lon <= 180) &&
+        [south, north].every((lat) => lat >= -90 && lat <= 90) &&
+        south <= north;
+      if (!valid) return { error: t('stac.filterBboxInvalid') };
+      filters.bbox = nums;
+    }
+    if (cloudMode && maxCloud.trim()) {
+      const value = Number(maxCloud);
+      if (!Number.isFinite(value) || value < 0 || value > 100) {
+        return { error: t('stac.filterCloudInvalid') };
+      }
+      filters.max_cloud_cover = value;
+      filters.cloud_cover_mode = cloudMode;
+    }
+    return { filters };
+  }
+
+  const handleApplyFilters = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedCollection || !catalogInfo) return;
+    const built = buildSearchFilters();
+    if ('error' in built) {
+      setFilterError(built.error);
+      return;
+    }
+    const gen = ++searchGenRef.current;
+    setFilterError(null);
+    setFiltering(true);
+    setLoadingMore(false);
+    setError(null);
+    try {
+      const auth = buildStacAuth();
+      const result = await searchStacItems({
+        url: catalogInfo.url,
+        collections: [selectedCollection.id],
+        limit: 50,
+        ...built.filters,
+        ...(auth ? { auth } : {}),
+      });
+      if (!mountedRef.current || gen !== searchGenRef.current) return;
+      setSearchResult({ items: result.items, matched: result.matched });
+      setNextPage(result.next_page ?? null);
+      setAppliedFilters(built.filters);
+      setSelectedItems(new Set());
+    } catch (err) {
+      if (!mountedRef.current || gen !== searchGenRef.current) return;
+      const msg = err instanceof ApiError ? err.message : t('stac.searchItemsFailed');
+      setFilterError(msg);
+      toast.error(msg);
+    } finally {
+      if (mountedRef.current && gen === searchGenRef.current) setFiltering(false);
+    }
+  };
+
+  // Filters come from the last applied search, not the fields, which may
+  // have been edited since: the next page belongs to that search.
+  const handleLoadMore = async () => {
+    if (!selectedCollection || !catalogInfo || !nextPage || filtering) return;
+    const gen = searchGenRef.current;
+    setLoadingMore(true);
+    setError(null);
+    try {
+      const auth = buildStacAuth();
+      const result = await searchStacItems({
+        url: catalogInfo.url,
+        collections: [selectedCollection.id],
+        limit: 50,
+        ...appliedFilters,
+        next_page: nextPage,
+        ...(auth ? { auth } : {}),
+      });
+      if (!mountedRef.current || gen !== searchGenRef.current) return;
+      setSearchResult((prev) => {
+        const seen = new Set(prev.items.map((i) => i.id));
+        return {
+          items: [...prev.items, ...result.items.filter((i) => !seen.has(i.id))],
+          matched: result.matched ?? prev.matched,
+        };
+      });
+      setNextPage(result.next_page ?? null);
+    } catch (err) {
+      if (!mountedRef.current || gen !== searchGenRef.current) return;
+      const msg = err instanceof ApiError ? err.message : t('stac.searchItemsFailed');
+      setError(msg);
+      toast.error(msg);
+    } finally {
+      if (mountedRef.current && gen === searchGenRef.current) setLoadingMore(false);
     }
   };
 
@@ -225,16 +473,26 @@ export function StacImportForm() {
     setSelectedItems((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
-      else next.add(id);
+      else if (next.size < MAX_IMPORT_ITEMS) next.add(id);
       return next;
     });
   };
 
+  const atSelectionCap = selectedItems.size >= MAX_IMPORT_ITEMS;
+  const allSelectableSelected =
+    selectedItems.size > 0 &&
+    selectedItems.size >= Math.min(MAX_IMPORT_ITEMS, selectableItems.length);
+
   const toggleAll = () => {
-    if (selectedItems.size === selectableItems.length) {
+    if (allSelectableSelected) {
       setSelectedItems(new Set());
     } else {
-      setSelectedItems(new Set(selectableItems.map((i) => i.id)));
+      const next = new Set(selectedItems);
+      for (const item of selectableItems) {
+        if (next.size >= MAX_IMPORT_ITEMS) break;
+        next.add(item.id);
+      }
+      setSelectedItems(next);
     }
   };
 
@@ -287,6 +545,15 @@ export function StacImportForm() {
       selectedCollection: selectedCollection!,
       searchResult,
       selectedItemIds: Array.from(selectedItems),
+      credential: {
+        method: credentialMethod,
+        token,
+        basicUsername,
+        basicPassword,
+        headerName,
+        headerValue,
+      },
+      search: { startDate, endDate, bboxText, maxCloud, cloudCoverSeen, appliedFilters, nextPage },
     };
     // feat(#1764): a boolean, never the credential. `/import` contacts no
     // catalog, so this is the only way the dataset can learn that browsing
@@ -351,6 +618,22 @@ export function StacImportForm() {
     setSelectedCollection(session.context.selectedCollection);
     setSearchResult(session.context.searchResult);
     setSelectedItems(new Set(session.context.selectedItemIds));
+    const { search, credential } = session.context;
+    setCredentialMethod(credential.method);
+    setToken(credential.token);
+    setBasicUsername(credential.basicUsername);
+    setBasicPassword(credential.basicPassword);
+    setHeaderName(credential.headerName);
+    setHeaderValue(credential.headerValue);
+    setStartDate(search.startDate);
+    setEndDate(search.endDate);
+    setBboxText(search.bboxText);
+    setMaxCloud(search.maxCloud);
+    setCloudCoverSeen(search.cloudCoverSeen);
+    setAppliedFilters(search.appliedFilters);
+    setNextPage(search.nextPage);
+    // A search started before the unmount must not land on the restored list.
+    searchGenRef.current += 1;
     setStep('importing');
 
     // fix(codex #1763 r3): the app renders under React.StrictMode
@@ -403,14 +686,67 @@ export function StacImportForm() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // The review step asks for the sizes the catalog left out, for the
+  // selected items only.
+  useEffect(() => {
+    if (step !== 'confirm' || !catalogInfo) return;
+    const missing = selectableItems.filter(
+      (i) =>
+        selectedItems.has(i.id) &&
+        typeof i.data_asset_size_bytes !== 'number' &&
+        !(i.data_asset_href! in probedSizes),
+    );
+    if (missing.length === 0) return;
+    let cancelled = false;
+    setProbingSizes(true);
+    const auth = buildStacAuth();
+    fetchStacAssetSizes(
+      catalogInfo.url,
+      missing.map((i) => ({ id: i.id, href: i.data_asset_href! })),
+      auth,
+    )
+      .then((res) => {
+        if (cancelled) return;
+        setProbedSizes((prev) => ({
+          ...prev,
+          ...Object.fromEntries(missing.map((i) => [i.data_asset_href!, null])),
+          ...Object.fromEntries(
+            // Entries come back in request order; ids can repeat.
+            res.sizes.flatMap((s, n) =>
+              missing[n] ? [[missing[n].data_asset_href!, s.size_bytes]] : [],
+            ),
+          ),
+        }));
+      })
+      .catch(() => {
+        // The size is a convenience; leave it unknown rather than block the import.
+        if (cancelled) return;
+        setProbedSizes((prev) => ({
+          ...prev,
+          ...Object.fromEntries(missing.map((i) => [i.data_asset_href!, null])),
+        }));
+      })
+      .finally(() => {
+        if (!cancelled) setProbingSizes(false);
+      });
+    return () => {
+      cancelled = true;
+      setProbingSizes(false);
+    };
+    // Only entering the review step should probe; the inputs it reads are
+    // settled by then.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step]);
+
   // ── Confirm step (EW-05) ──
   if (step === 'confirm' && selectedCollection && catalogInfo) {
     const itemsToImport = selectableItems.filter((i) => selectedItems.has(i.id));
-    const itemsWithSize = itemsToImport.filter((i) => typeof i.data_asset_size_bytes === 'number');
-    const totalBytes = itemsWithSize.reduce(
-      (acc, i) => acc + (i.data_asset_size_bytes ?? 0),
-      0,
-    );
+    const sizeOf = (i: StacItemSummary) =>
+      typeof i.data_asset_size_bytes === 'number'
+        ? i.data_asset_size_bytes
+        : (probedSizes[i.data_asset_href!] ?? null);
+    const itemsWithSize = itemsToImport.filter((i) => sizeOf(i) !== null);
+    const totalBytes = itemsWithSize.reduce((acc, i) => acc + (sizeOf(i) ?? 0), 0);
     const unavailableCount = itemsToImport.length - itemsWithSize.length;
 
     return (
@@ -433,14 +769,16 @@ export function StacImportForm() {
                 {t('stac.confirm.totalSizeLabel')}
               </dt>
               <dd className="text-lg font-medium tracking-tight">
-                {itemsWithSize.length > 0
-                  ? formatBytes(totalBytes)
-                  : t('stac.confirm.sizeUnavailable')}
+                {probingSizes
+                  ? t('stac.confirm.sizeChecking')
+                  : itemsWithSize.length > 0
+                    ? formatBytes(totalBytes)
+                    : t('stac.confirm.sizeUnavailable')}
               </dd>
             </div>
           </div>
 
-          {unavailableCount > 0 && itemsWithSize.length > 0 && (
+          {!probingSizes && unavailableCount > 0 && itemsWithSize.length > 0 && (
             <p className="text-xs text-muted-foreground mt-3">
               {t('stac.confirm.partialSizeNote', { count: unavailableCount })}
             </p>
@@ -455,7 +793,7 @@ export function StacImportForm() {
           <Button variant="outline" onClick={() => setStep('items')}>
             {t('stac.confirm.backToSelection')}
           </Button>
-          <Button onClick={handleImport}>
+          <Button onClick={handleImport} disabled={probingSizes}>
             {t('stac.confirm.confirmImport', { count: itemsToImport.length })}
           </Button>
         </div>
@@ -492,6 +830,10 @@ export function StacImportForm() {
       }, new Map<string, { message: string; itemIds: string[] }>()).values(),
     );
 
+    const createdDatasets = (importResult.results ?? []).filter(
+      (r) => r.status === 'created' && r.dataset_id,
+    );
+
     return (
       <div className="space-y-4">
         <div className="rounded-xl border border-success/30 bg-success/5 p-5">
@@ -510,6 +852,20 @@ export function StacImportForm() {
               <span className="text-destructive">{t('stac.failedCount', { count: importResult.errors })}</span>
             )}
           </div>
+          {createdDatasets.length > 0 && (
+            <ul className="mt-3 divide-y divide-success/15 border-t border-success/20">
+              {createdDatasets.map((r) => (
+                <li key={r.dataset_id} className="flex items-center justify-between gap-3 py-2">
+                  <span className="truncate font-mono text-2xs text-muted-foreground" title={r.item_id}>
+                    {r.item_id}
+                  </span>
+                  <Link to={`/datasets/${r.dataset_id}`} className="shrink-0 text-xs font-medium underline">
+                    {t('bulk.openDataset')}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
 
         {groupedFailures.length > 0 && (
@@ -642,14 +998,14 @@ export function StacImportForm() {
 
   // ── Items list with selection ──
   if (step === 'items' && selectedCollection && catalogInfo) {
-    const allSelected = selectableItems.length > 0 && selectedItems.size === selectableItems.length;
+    const allSelected = allSelectableSelected;
 
     return (
       <div className="space-y-4">
         {/* Breadcrumb */}
         <div className="flex items-center gap-2 text-sm">
           <button
-            onClick={() => { setStep('collections'); setSelectedCollection(null); }}
+            onClick={() => { searchGenRef.current += 1; setStep('collections'); setSelectedCollection(null); }}
             className="flex items-center gap-1 text-muted-foreground hover:text-foreground"
           >
             <ArrowLeft className="size-3.5 rtl-mirror" />
@@ -664,52 +1020,135 @@ export function StacImportForm() {
           )}
         </div>
 
-        {/* Action bar */}
-        <div className="flex items-center justify-between rounded-lg border border-border bg-surface-1 px-4 py-2.5">
-          <label className="flex items-center gap-2 text-xs text-muted-foreground">
-            <input
-              type="checkbox"
-              checked={allSelected}
-              onChange={toggleAll}
-              className="rounded-sm border-border"
+        <form
+          data-testid="stac-search-filters"
+          onSubmit={handleApplyFilters}
+          className="flex flex-wrap items-end gap-3 rounded-lg border border-border bg-surface-1 px-4 py-3"
+        >
+          <div className="space-y-1">
+            <Label htmlFor="stac-filter-start" className="text-xs">{t('stac.filterStart')}</Label>
+            <Input
+              id="stac-filter-start"
+              type="date"
+              value={startDate}
+              max={endDate || undefined}
+              onChange={(e) => setStartDate(e.target.value)}
             />
-            {selectedItems.size > 0
-              ? t('stac.selectedCount', { selected: selectedItems.size, total: items.length })
-              : t('stac.itemCount', { count: items.length })}
-          </label>
-          <Button
-            size="sm"
-            disabled={selectedItems.size === 0}
-            onClick={() => setStep('confirm')}
-          >
-            {selectedItems.size > 0 ? t('stac.importItems', { count: selectedItems.size }) : t('stac.importLabel')}
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="stac-filter-end" className="text-xs">{t('stac.filterEnd')}</Label>
+            <Input
+              id="stac-filter-end"
+              type="date"
+              value={endDate}
+              min={startDate || undefined}
+              onChange={(e) => setEndDate(e.target.value)}
+            />
+          </div>
+          <div className="min-w-56 flex-1 space-y-1">
+            <Label htmlFor="stac-filter-bbox" className="text-xs">{t('stac.filterBbox')}</Label>
+            <Input
+              id="stac-filter-bbox"
+              value={bboxText}
+              placeholder={t('stac.filterBboxPlaceholder')}
+              onChange={(e) => setBboxText(e.target.value)}
+              aria-invalid={filterError ? true : undefined}
+            />
+          </div>
+          {cloudMode && cloudCoverSeen && (
+            <div className="w-32 space-y-1">
+              <Label htmlFor="stac-filter-cloud" className="text-xs">{t('stac.filterCloud')}</Label>
+              <Input
+                id="stac-filter-cloud"
+                type="number"
+                min={0}
+                max={100}
+                step="any"
+                inputMode="decimal"
+                value={maxCloud}
+                onChange={(e) => setMaxCloud(e.target.value)}
+              />
+            </div>
+          )}
+          <Button type="submit" size="sm" disabled={filtering}>
+            {t('stac.filterApply')}
           </Button>
+          {filterError && (
+            <p role="alert" data-testid="stac-filter-error" className="basis-full text-sm text-destructive">
+              {filterError}
+            </p>
+          )}
+        </form>
+
+        {/* Action bar */}
+        <div
+          data-testid="stac-items-action-bar"
+          className="rounded-lg border border-border bg-surface-1 px-4 py-2.5"
+        >
+          <div className="flex items-center justify-between">
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                onChange={toggleAll}
+                className="rounded-sm border-border"
+              />
+              {selectedItems.size > 0
+                ? t('stac.selectedCount', { selected: selectedItems.size, total: selectableItems.length })
+                : t('stac.itemCount', { count: items.length })}
+            </label>
+            <Button
+              size="sm"
+              disabled={selectedItems.size === 0 || filtering}
+              onClick={() => setStep('confirm')}
+            >
+              {selectedItems.size > 0 ? t('stac.importItems', { count: selectedItems.size }) : t('stac.importLabel')}
+            </Button>
+          </div>
+          {atSelectionCap && selectableItems.length > MAX_IMPORT_ITEMS && (
+            <p data-testid="stac-selection-limit" className="mt-2 text-xs text-muted-foreground">
+              {t('stac.selectionLimit', { count: MAX_IMPORT_ITEMS })}
+            </p>
+          )}
+          {/* A refused import lands back on this step (see handleImport's catch);
+              shown here, beside the action that triggered it, rather than below
+              a list that can run to 50 rows and push it out of view. */}
+          {error && (
+            <p id={importErrorId} data-testid="stac-import-error" className="mt-2 text-sm text-destructive">
+              {error}
+            </p>
+          )}
         </div>
 
         {/* Item rows */}
-        <div className="overflow-hidden rounded-xl border border-border bg-card divide-y divide-border">
+        <div
+          data-testid="stac-items-list"
+          className="overflow-hidden rounded-xl border border-border bg-card divide-y divide-border"
+        >
           {items.length === 0 && (
             <p className="px-5 py-8 text-center text-sm text-muted-foreground">
               {t('stac.noItems')}
             </p>
           )}
           {items.map((item) => {
-            const hasAsset = !!item.data_asset_href;
+            const availability = assetAvailability(item);
             const isSelected = selectedItems.has(item.id);
+            const reasonId = `stac-asset-reason-${item.id}`;
 
             return (
               <label
                 key={item.id}
                 className={cn(
                   'flex items-center gap-3 px-4 py-3 transition-colors',
-                  hasAsset ? 'cursor-pointer hover:bg-surface-2' : 'opacity-50 cursor-not-allowed',
+                  availability.importable ? 'cursor-pointer hover:bg-surface-2' : 'opacity-50 cursor-not-allowed',
                   isSelected && 'bg-primary/5',
                 )}
               >
                 <input
                   type="checkbox"
                   checked={isSelected}
-                  disabled={!hasAsset}
+                  disabled={!availability.importable || (atSelectionCap && !isSelected)}
+                  aria-describedby={availability.importable ? undefined : reasonId}
                   onChange={() => toggleItem(item.id)}
                   className="rounded-sm border-border shrink-0"
                 />
@@ -747,9 +1186,12 @@ export function StacImportForm() {
                   </div>
                 </div>
 
-                {!hasAsset && (
-                  <span className="shrink-0 font-mono text-2xs text-muted-foreground">
-                    {t('stac.noCogAsset')}
+                {!availability.importable && (
+                  <span
+                    id={reasonId}
+                    className="max-w-[10rem] shrink-0 text-right font-mono text-2xs text-muted-foreground"
+                  >
+                    {assetUnavailableReasonText(t, availability)}
                   </span>
                 )}
               </label>
@@ -757,7 +1199,19 @@ export function StacImportForm() {
           })}
         </div>
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {nextPage && (
+          <div className="flex justify-center">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={loadingMore || filtering}
+              onClick={handleLoadMore}
+            >
+              {t('stac.loadMore')}
+            </Button>
+          </div>
+        )}
       </div>
     );
   }

@@ -13,6 +13,7 @@ from app.modules.catalog.datasets.domain._sql_safety import (
 from app.modules.catalog.datasets.domain.service_analysis import (
     PREVIEW_FEATURE_CAP,
     build_preview_sql,
+    compile_layer_filter,
     resolve_source_feature_count,
     run_analysis_preview,
 )
@@ -30,6 +31,7 @@ from app.modules.catalog.datasets.domain.service_lifecycle import (
 )
 from app.modules.catalog.datasets.domain.service_metadata import (
     compute_schema_diff,
+    defer_metadata_embedding,
     get_attribute,
     list_attributes,
     reset_attribute,
@@ -37,11 +39,18 @@ from app.modules.catalog.datasets.domain.service_metadata import (
     update_attribute,
     update_user_metadata,
 )
+from app.modules.catalog.datasets.domain.service_previous_version import (
+    PreviousVersionRefused,
+    admit_restore,
+    drop_previous_version,
+)
 from app.modules.catalog.datasets.domain.service_query import (
     get_dataset,
     get_dataset_detail,
     get_dataset_rows,
     get_datasets_list,
+    get_pointcloud_pointer,
+    get_tileset_href,
     list_datasets,
 )
 from app.modules.catalog.datasets.domain.service_relationships import (
@@ -53,6 +62,7 @@ from app.modules.catalog.datasets.domain.service_relationships import (
     get_relationship_datasets,
     list_relationships,
     list_relationships_with_total,
+    validate_relationship_columns,
 )
 
 __all__ = [
@@ -61,20 +71,27 @@ __all__ = [
     "DatasetTitleMismatchError",
     "DependentVrtError",
     "PREVIEW_FEATURE_CAP",
+    "PreviousVersionRefused",
+    "admit_restore",
     "auto_detect_relationships",
     "build_preview_sql",
+    "compile_layer_filter",
     "compute_schema_diff",
     "create_dataset",
     "create_empty_dataset",
     "create_relationship",
+    "defer_metadata_embedding",
     "delete_dataset",
     "delete_relationship",
+    "drop_previous_version",
     "get_attribute",
     "get_dataset",
     "get_dataset_detail",
     "get_dataset_rows",
     "get_dataset_versions",
     "get_datasets_list",
+    "get_pointcloud_pointer",
+    "get_tileset_href",
     "get_related_datasets",
     "get_related_records",
     "get_relationship_datasets",
@@ -82,6 +99,7 @@ __all__ = [
     "list_datasets",
     "list_relationships",
     "list_relationships_with_total",
+    "validate_relationship_columns",
     "reset_attribute",
     "sample_example_values",
     "resolve_source_feature_count",

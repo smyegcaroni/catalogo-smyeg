@@ -6,23 +6,22 @@ import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { useQueryClient } from '@tanstack/react-query';
 import type { Map as MaplibreMap } from 'maplibre-gl';
-import { getSourceIdForLayer } from '@/components/builder/map-sync';
+import { getSourceIdForLayer, TERRAIN_SOURCE_ID } from '@/components/builder/map-sync';
 import { readMapCamera, sameMapCamera, type BuilderCamera } from '@/components/builder/builder-camera';
 import { hasGlobeSpaceBackdrop } from '@/components/builder/map-composition-sync';
 import { ApiError } from '@/api/client';
 import { useUpdateMap, useDuplicateMap, usePatchMapLayers } from '@/hooks/use-maps';
 import { useEnabledPlugins } from '@/hooks/use-settings';
 import { useEdition } from '@/hooks/use-edition';
-import { getLayerColors, extractStyleHints } from '@/components/map/layer-icons';
+import { demChipGlyph, getLayerColors } from '@/components/map/layer-icons';
 import { getMap, uploadThumbnail, uploadOgImage } from '@/api/maps';
 import { extractPlaceholders, validatePlaceholders } from '@/lib/popup-template';
 import type { MapBasemapConfig, MapLayerDiffRequest, MapLayerInput, MapLayerPatch, MapLayerResponse, MapResponse, MapTerrainConfig, MapUpdateRequest } from '@/types/api';
 import { usePluginStore } from '@/stores/map-plugin-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { getDefaultPluginIds, resolveAvailablePluginIds, samePluginIds } from '@/components/map-plugins';
-// D5: the PNG export legend must render the same effective entry names as the
-// on-screen legend (per-entry legendLabel override > display name > dataset name).
-import { legendEntryName } from '@/components/map-plugins/builtin/LegendPlugin';
+import { legendFacts, rampGradient } from '@/components/map/legend-facts';
+import { syntheticTerrainEntry } from '@/components/builder/terrain-legend';
 import { getPersistedFolderGroup, prepareLayersForPersistence, stampPersistedFolderGroupExpanded, type FolderGroupMeta } from '@/components/builder/folder-groups';
 import { normalizeDemStyleConfig } from '@/lib/dem-render-mode';
 import { MAP_COLORS } from '@/lib/map-colors';
@@ -39,7 +38,7 @@ import {
 } from '@/lib/map-image-attribution';
 // fix(#430 V-01): capability gate used to detect fields the builder has no editor
 // for on a given layer type (see unmanagedNullableFields below).
-import { getLayerCapabilities, isFolderGroupLayer } from '@/lib/layer-capabilities';
+import { getLayerCapabilities } from '@/lib/layer-capabilities';
 
 /** Center-crop `srcCanvas` to the given target dimensions and return the
  *  resulting offscreen canvas. Crops from the center without distortion
@@ -257,8 +256,15 @@ function doCapture(
   mapId: string,
   queryClient: ReturnType<typeof useQueryClient>,
   trigger: CaptureTrigger,
+  captureIsStale?: (mapId: string) => boolean,
 ) {
   const onRender = () => {
+    // An edit made after the save, or another map now in the builder, must not
+    // reach this map's stored images.
+    if (captureIsStale?.(mapId)) {
+      rearmAutoCapture(mapId);
+      return;
+    }
     try {
       const srcCanvas = map.getCanvas();
       // fix(#1479 Codex P2 round 1): both crops carry the space backdrop when
@@ -329,17 +335,72 @@ function doCapture(
 }
 
 /** Run `fn` immediately if the map is loaded, otherwise wait for the idle event
- *  with a 3-second safety timeout to prevent silent drops. */
-function whenMapIdle(map: MaplibreMap, fn: () => void) {
+ *  with a 3-second safety timeout to prevent silent drops. When `stillLoading`
+ *  is true at that timeout, call `onDefer` and leave `fn` to the idle event,
+ *  which fires once the slow raster tiles have settled. */
+function whenMapIdle(
+  map: MaplibreMap,
+  fn: () => void,
+  stillLoading?: () => boolean,
+  onDefer?: () => void,
+) {
   if (map.loaded()) { fn(); return; }
   let done = false;
   const onIdle = () => { if (done) return; done = true; clearTimeout(timer); fn(); };
   map.once('idle', onIdle);
-  const timer = setTimeout(() => { if (!done) { done = true; map.off('idle', onIdle); fn(); } }, 3000);
+  const timer = setTimeout(() => {
+    if (done) return;
+    if (stillLoading?.()) { onDefer?.(); return; }
+    done = true;
+    map.off('idle', onIdle);
+    fn();
+  }, 3000);
+}
+
+const HELD_SOURCE_TYPES = new Set(['raster', 'raster-dem']);
+
+/** Whether a raster or hillshade source on the map is still loading. Other
+ *  source types and ids with no source (folder rows, terrain DEMs) don't hold
+ *  a capture. */
+function anySourceStillLoading(map: MaplibreMap, sourceIds: string[]): boolean {
+  return sourceIds.some((sourceId) => {
+    const type = map.getSource(sourceId)?.type;
+    return type !== undefined && HELD_SOURCE_TYPES.has(type) && !map.isSourceLoaded(sourceId);
+  });
+}
+
+/** Sources drawn by style layers that aren't hidden. */
+function visibleStyleSourceIds(map: MaplibreMap): string[] {
+  return (map.getStyle()?.layers ?? []).flatMap((layer) =>
+    'source' in layer && typeof layer.source === 'string' && layer.layout?.visibility !== 'none'
+      ? [layer.source]
+      : [],
+  );
+}
+
+/** whenMapIdle, holding the capture while a raster or hillshade source loads.
+ *  Every source a visible style layer draws counts, not only the map layers':
+ *  a raster basemap and the shared terrain source load outside them. A deferred capture re-arms
+ *  auto-capture at once, as the blank-frame guard does, so a reopen during the
+ *  wait, or after a capture that never runs, can schedule its own. */
+function whenMapIdleAndRasterLoaded(
+  map: MaplibreMap,
+  mapId: string,
+  sourceIds: string[],
+  fn: () => void,
+) {
+  const stillLoading = () =>
+    anySourceStillLoading(map, [
+      ...sourceIds,
+      TERRAIN_SOURCE_ID,
+      ...visibleStyleSourceIds(map),
+    ]);
+  whenMapIdle(map, fn, stillLoading, () => rearmAutoCapture(mapId));
 }
 
 function waitForVisibleLayerSources(
   map: MaplibreMap,
+  mapId: string,
   layers: MapLayerResponse[],
   fn: () => void,
   signal?: { cancelled: boolean },
@@ -349,7 +410,7 @@ function waitForVisibleLayerSources(
     .map((layer) => getSourceIdForLayer(layer));
 
   if (visibleSourceIds.length === 0) {
-    whenMapIdle(map, fn);
+    whenMapIdleAndRasterLoaded(map, mapId, [], fn);
     return;
   }
 
@@ -359,7 +420,9 @@ function waitForVisibleLayerSources(
     if (signal?.cancelled) return;
     const sourcesReady = visibleSourceIds.every((sourceId) => !!map.getSource(sourceId));
     if (sourcesReady || Date.now() >= deadline) {
-      if (!signal?.cancelled) whenMapIdle(map, fn);
+      if (!signal?.cancelled) {
+        whenMapIdleAndRasterLoaded(map, mapId, visibleSourceIds, () => { if (!signal?.cancelled) fn(); });
+      }
       return;
     }
     setTimeout(poll, 100);
@@ -381,13 +444,15 @@ function waitForVisibleLayerSources(
  *  waitForVisibleLayerSources normally. This fixes the new-map + ?add_dataset race
  *  where the 500ms debounce fires before the layer-add effect has run.
  *
- *  Invariants preserved:
- *  - SF-05: a genuinely-empty map (layers stay [] until deadline) falls through
- *    to the existing whenMapIdle path, so we never busy-loop forever.
- *  - SF-07: shouldAutoCapture fires before captureThumbnail; this function does
- *    not touch autoCapturedKeys.
- *  - SP-16: the 500ms debounce is upstream in captureThumbnail; unaffected.
- *  - T-1233-01: the 5000ms bounded deadline + cancellation signal prevent DoS. */
+ *  Invariants:
+ *  - A genuinely empty map (layers stay [] until the deadline) falls through to
+ *    whenMapIdle, so this never polls forever.
+ *  - shouldAutoCapture runs before captureThumbnail. This function changes
+ *    autoCapturedKeys only to re-arm a capture deferred while a source loads.
+ *  - The 500ms debounce is upstream in captureThumbnail.
+ *  - The 5000ms deadline and the cancellation signal bound the polling. A
+ *    capture left waiting on a loading raster runs on the next idle event,
+ *    where a newer capture, an edit or another map drops it. */
 function runCaptureNow(
   map: MaplibreMap,
   mapId: string,
@@ -396,7 +461,18 @@ function runCaptureNow(
   signal?: { cancelled: boolean },
   layersRef?: React.RefObject<MapLayerResponse[]>,
   trigger: CaptureTrigger = 'save',
+  captureIsStale?: (mapId: string) => boolean,
 ) {
+  // The canvas is read when the capture runs, which can be well after the save.
+  // An edit made meanwhile, or a switch to another map, skips it and re-arms
+  // auto-capture for a later open.
+  const capture = () => {
+    if (captureIsStale?.(mapId)) {
+      rearmAutoCapture(mapId);
+      return;
+    }
+    doCapture(map, mapId, queryClient, trigger, captureIsStale);
+  };
   // POLISH-01: defer the first capture when a layer-add is pending (layersRef
   // provided) but no layers have synced yet. Poll the live ref so we pick up
   // the layer that ?add_dataset adds after initializedRef resolves.
@@ -407,7 +483,7 @@ function runCaptureNow(
       const live = layersRef.current ?? [];
       if (live.length > 0) {
         // Layers have arrived — proceed through normal source-readiness path.
-        waitForVisibleLayerSources(map, live, () => doCapture(map, mapId, queryClient, trigger), signal);
+        waitForVisibleLayerSources(map, mapId, live, capture, signal);
         return;
       }
       if (Date.now() >= deadline) {
@@ -415,8 +491,8 @@ function runCaptureNow(
         // we never leave an open poll. Re-check cancellation INSIDE the idle
         // callback (WR-02): whenMapIdle can fire up to ~3s later, possibly after
         // an unmount, so the guard must be at capture time, not registration time.
-        whenMapIdle(map, () => {
-          if (!signal?.cancelled) doCapture(map, mapId, queryClient, trigger);
+        whenMapIdleAndRasterLoaded(map, mapId, [], () => {
+          if (!signal?.cancelled) capture();
         });
         return;
       }
@@ -425,7 +501,7 @@ function runCaptureNow(
     pollForLayers();
     return;
   }
-  waitForVisibleLayerSources(map, layers, () => doCapture(map, mapId, queryClient, trigger), signal);
+  waitForVisibleLayerSources(map, mapId, layers, capture, signal);
 }
 
 /** SP-16: 500ms trailing-edge debounce around captureThumbnail.
@@ -467,6 +543,9 @@ const pendingCaptures = new Map<string, ReturnType<typeof setTimeout>>();
  *  the same browser logged in as a different user with access to the same map. */
 const AUTO_CAPTURE_LRU_LIMIT = 64;
 const autoCapturedKeys = new Map<string, true>();
+// Only the newest capture for a map may run; an older one can still be waiting
+// on sources a later save removed.
+const captureGenerations = new Map<string, number>();
 
 function captureThumbnail(
   map: MaplibreMap,
@@ -476,18 +555,24 @@ function captureThumbnail(
   signal?: { cancelled: boolean },
   layersRef?: React.RefObject<MapLayerResponse[]>,
   trigger: CaptureTrigger = 'save',
+  captureIsStale?: (mapId: string) => boolean,
 ) {
   // SP-16: clear any prior pending capture for this mapId; the latest call
   // wins (trailing edge), reflecting the final state once the window settles.
   const existing = pendingCaptures.get(mapId);
   if (existing) clearTimeout(existing);
 
+  const generation = (captureGenerations.get(mapId) ?? 0) + 1;
+  captureGenerations.set(mapId, generation);
+  const superseded = (id: string) =>
+    captureGenerations.get(id) !== generation || !!captureIsStale?.(id);
+
   const timer = setTimeout(() => {
     pendingCaptures.delete(mapId);
     // POLISH-01: pass layersRef through so runCaptureNow can defer on the
     // new-map + ?add_dataset path. Save-path callers do not pass layersRef,
     // so they remain on the existing waitForVisibleLayerSources path.
-    runCaptureNow(map, mapId, queryClient, layers, signal, layersRef, trigger);
+    runCaptureNow(map, mapId, queryClient, layers, signal, layersRef, trigger, superseded);
   }, THUMBNAIL_DEBOUNCE_MS);
 
   pendingCaptures.set(mapId, timer);
@@ -540,6 +625,7 @@ export function __resetThumbnailDebounceForTests(): void {
   for (const timer of pendingCaptures.values()) clearTimeout(timer);
   pendingCaptures.clear();
   autoCapturedKeys.clear();
+  captureGenerations.clear();
 }
 
 function resolvePluginsPayload(
@@ -999,6 +1085,11 @@ export function useBuilderSave(state: SaveState) {
   // commits could read the stale ref and clear the dirty flag anyway.
   const latestStateRef = useRef(state);
   latestStateRef.current = state;
+  const captureIsStale = useCallback(
+    (mapId: string) =>
+      latestStateRef.current.hasUnsavedChanges || latestStateRef.current.mapId !== mapId,
+    [],
+  );
 
   function editedDuringSave(
     sent: SaveState,
@@ -1171,7 +1262,7 @@ export function useBuilderSave(state: SaveState) {
               if (!editedDuringSave(state, sentPluginSet, camera)) {
                 state.setHasUnsavedChanges(false);
               }
-              if (map && id) captureThumbnail(map, id, queryClient, localLayers);
+              if (map && id) captureThumbnail(map, id, queryClient, localLayers, undefined, undefined, 'save', captureIsStale);
               return;
             }
             if (!isUnsupportedLayerPatchError(error)) throw error;
@@ -1196,7 +1287,7 @@ export function useBuilderSave(state: SaveState) {
             if (!editedDuringSave(state, sentPluginSet, camera)) {
               state.setHasUnsavedChanges(false);
             }
-            if (map && id) captureThumbnail(map, id, queryClient, localLayers);
+            if (map && id) captureThumbnail(map, id, queryClient, localLayers, undefined, undefined, 'save', captureIsStale);
             return;
           }
         }
@@ -1220,7 +1311,7 @@ export function useBuilderSave(state: SaveState) {
       // Use `map` captured before mutate — mapInstanceRef.current may be
       // transiently null during re-render (callback ref identity change).
       if (map && id) {
-        captureThumbnail(map, id, queryClient, localLayers);
+        captureThumbnail(map, id, queryClient, localLayers, undefined, undefined, 'save', captureIsStale);
       }
     } catch (err) {
       setLastSaveFailed(true);
@@ -1278,17 +1369,23 @@ export function useBuilderSave(state: SaveState) {
           const descFontPx = 14 * dpr;
           const titleBlockH = title ? (description ? 84 * dpr : 56 * dpr) : 0;
 
-          // fix(#769): synthetic group:folder rows inherit visible/show_in_legend
-          // from their first child — exclude them or the exported PNG ships a
-          // phantom legend row per folder group (mirrors LegendPlugin's filter).
-          const legendLayers = state.localLayers.filter(
-            (l) => l.visible && l.show_in_legend !== false && !isFolderGroupLayer(l),
+          const legendRows = state.localLayers.flatMap((layer) => {
+            if (!layer.visible || layer.show_in_legend === false) return [];
+            const facts = legendFacts(layer);
+            return facts ? [{ layer, facts }] : [];
+          });
+          const terrainEntry = syntheticTerrainEntry(
+            state.terrainConfig,
+            state.localLayers,
+            legendRows.map(({ layer }) => layer),
+            { labelKey: 'plugins.legend.terrain3d' },
           );
-          const legendHeaderH = legendLayers.length > 0 ? 32 * dpr : 0;
+          const legendRowCount = legendRows.length + (terrainEntry ? 1 : 0);
+          const legendHeaderH = legendRowCount > 0 ? 32 * dpr : 0;
           const legendRowH = 22 * dpr;
           const legendBlockH =
-            legendLayers.length > 0
-              ? 12 * dpr + legendHeaderH + legendLayers.length * legendRowH + 12 * dpr
+            legendRowCount > 0
+              ? 12 * dpr + legendHeaderH + legendRowCount * legendRowH + 12 * dpr
               : 0;
 
           const showBranding = !isEnterprise;
@@ -1364,7 +1461,7 @@ export function useBuilderSave(state: SaveState) {
           ctx.drawImage(srcCanvas, 0, cursorY);
           cursorY += mapHeight;
 
-          if (legendLayers.length > 0) {
+          if (legendRowCount > 0) {
             cursorY += 12 * dpr;
             ctx.fillStyle = MAP_COLORS.exportImage.text;
             ctx.font = `600 ${14 * dpr}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
@@ -1375,37 +1472,49 @@ export function useBuilderSave(state: SaveState) {
               : t('export.legendHeader', { defaultValue: 'Legend' });
             ctx.fillText(legendHeaderText, pad, cursorY);
             cursorY += legendHeaderH;
-            ctx.font = `400 ${13 * dpr}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+            const rowFont = `400 ${13 * dpr}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+            ctx.font = rowFont;
             const swatchSize = 14 * dpr;
-            for (const layer of legendLayers) {
-              // fix(#424): mirror the on-screen legend swatch — draw a gradient for
-              // multi-stop ramps (graduated/categorical/heatmap) and use the real
-              // stroke color as the border so hollow-circle styles (light fill +
-              // colored ring, e.g. #fff7ed fill / #ea580c stroke) don't export blank.
-              const colors = getLayerColors(layer);
-              const hints = extractStyleHints(
-                layer.paint ?? {},
-                layer.layout ?? {},
-                layer.dataset_geometry_type,
-                undefined,
-                layer.style_config,
+            if (terrainEntry) {
+              // The builder legend pins this row first and draws its icon as the
+              // raster glyph chip.
+              const rowY = cursorY + (legendRowH - swatchSize) / 2;
+              const glyph = demChipGlyph('terrain');
+              const glyphPx = 11 * dpr;
+              ctx.fillStyle = MAP_COLORS.exportImage.rasterChip.background;
+              ctx.fillRect(pad, rowY, swatchSize, swatchSize);
+              ctx.font = `600 ${glyphPx}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+              ctx.fillStyle = MAP_COLORS.exportImage.rasterChip.glyph;
+              ctx.fillText(
+                glyph,
+                pad + (swatchSize - ctx.measureText(glyph).width) / 2,
+                rowY + (swatchSize - glyphPx) / 2,
               );
-              // A stroke the user turned off lives in builder.strokeDisabled (which
-              // leaves a stale circle-stroke-color in paint) or a zeroed width, but
-              // extractStyleHints only honors paint['_stroke-disabled']. Resolve it the
-              // way the map adapters do so the export doesn't reintroduce a hidden ring.
-              const builder = layer.style_config?.builder;
-              const strokeHidden =
-                (builder?.strokeDisabled ?? !!layer.paint?.['_stroke-disabled']) ||
-                layer.paint?.['circle-stroke-width'] === 0 ||
-                layer.paint?.['_outline-width'] === 0;
+              ctx.font = rowFont;
+              ctx.fillStyle = MAP_COLORS.exportImage.text;
+              ctx.fillText(
+                terrainEntry.sourceName ?? t(terrainEntry.labelKey),
+                pad + swatchSize + 10 * dpr,
+                cursorY + (legendRowH - 13 * dpr) / 2,
+              );
+              cursorY += legendRowH;
+            }
+            for (const { facts } of legendRows) {
+              // Mirror the on-screen swatch: a gradient for multi-stop ramps, and the
+              // stroke the map draws as the border, so a hollow circle (light fill,
+              // coloured ring) doesn't export blank.
+              const { swatch } = facts;
+              const colors = getLayerColors(facts);
               const rowY = cursorY + (legendRowH - swatchSize) / 2;
               const solidFill = colors.find((c) => !!c) || MAP_COLORS.icon.fallback;
               let filled = false;
               if (colors.length > 1) {
                 try {
                   const grad = ctx.createLinearGradient(pad, 0, pad + swatchSize, 0);
-                  colors.forEach((c, i) => grad.addColorStop(i / (colors.length - 1), c));
+                  const stops = facts.ramp
+                    ? rampGradient(facts.ramp)
+                    : colors.map((color, i) => ({ color, offset: i / (colors.length - 1) }));
+                  stops.forEach(({ color, offset }) => grad.addColorStop(offset, color));
                   ctx.fillStyle = grad;
                   filled = true;
                 } catch {
@@ -1414,15 +1523,17 @@ export function useBuilderSave(state: SaveState) {
                 }
               }
               if (!filled) ctx.fillStyle = solidFill;
+              const layerAlpha = swatch?.opacity ?? 1;
+              ctx.globalAlpha = layerAlpha * (swatch?.fillOpacity ?? 1);
               ctx.fillRect(pad, rowY, swatchSize, swatchSize);
-              ctx.strokeStyle = (!strokeHidden && hints.strokeColor) || MAP_COLORS.previewOutline;
+              ctx.globalAlpha = layerAlpha;
+              ctx.strokeStyle = swatch?.stroke?.color ?? MAP_COLORS.previewOutline;
               ctx.lineWidth = Math.max(1, dpr);
               ctx.strokeRect(pad, rowY, swatchSize, swatchSize);
+              ctx.globalAlpha = 1;
               ctx.fillStyle = MAP_COLORS.exportImage.text;
-              // D5: was `display_name || dataset_name`, which dropped the
-              // per-entry legendLabel override the on-screen legend renders.
               ctx.fillText(
-                legendEntryName(layer),
+                facts.name,
                 pad + swatchSize + 10 * dpr,
                 cursorY + (legendRowH - 13 * dpr) / 2,
               );
@@ -1528,8 +1639,8 @@ export function useBuilderSave(state: SaveState) {
     // the live localLayersRef so runCaptureNow can defer the capture until layers
     // arrive. For all other paths, layersRef is undefined → existing behavior.
     const layersRef = state.pendingLayerAdd ? localLayersRef : undefined;
-    captureThumbnail(map, state.mapId, queryClient, localLayersRef.current, captureSignalRef.current, layersRef, 'auto');
-  }, [state.hasThumbnail, state.mapId, state.pendingLayerAdd, queryClient]);
+    captureThumbnail(map, state.mapId, queryClient, localLayersRef.current, captureSignalRef.current, layersRef, 'auto', captureIsStale);
+  }, [state.hasThumbnail, state.mapId, state.pendingLayerAdd, queryClient, captureIsStale]);
 
   // P-08: Cancel in-flight polling on unmount
   useEffect(() => {

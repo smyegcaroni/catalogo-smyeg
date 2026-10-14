@@ -8,9 +8,8 @@ import {
   QueryClient,
   QueryClientProvider,
 } from '@tanstack/react-query';
-import { Toaster } from 'sonner';
 import { ThemeProvider } from '@/components/theme-provider';
-import { useTheme } from '@/components/theme-provider';
+import { ThemedToaster } from '@/components/ThemedToaster';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { initializeI18n } from '@/i18n';
 import { AppErrorBoundary } from '@/components/error';
@@ -18,6 +17,7 @@ import { ApiError } from '@/api/client';
 import { initReportCapture, pushReportEntry, redact, reportNetworkError } from '@/lib/report';
 import { installStaleAssetReload } from '@/lib/stale-asset-reload';
 import { wireAuthCacheReset } from '@/lib/auth-cache-reset';
+import { restoreSessionBeforeRender, wireSessionSync } from '@/lib/session-sync';
 import { ReportProblemHost } from '@/components/report/ReportProblemHost';
 import { appRoutes } from './App';
 import './index.css';
@@ -73,14 +73,7 @@ const queryClient = new QueryClient({
 // fix(#430 codex r6): evict every cached query when the signed-in identity
 // changes so one user's cached rows never render for the next (see module doc).
 wireAuthCacheReset(queryClient);
-
-function ThemedToaster() {
-  const { resolvedTheme } = useTheme();
-  // #305: richColors differentiates success/error/warning/info by
-  // hue (was a single neutral surface for all 183 call sites); closeButton
-  // makes every toast dismissable.
-  return <Toaster theme={resolvedTheme} richColors closeButton />;
-}
+wireSessionSync();
 
 const router = createBrowserRouter(createRoutesFromElements(appRoutes));
 
@@ -95,7 +88,9 @@ interface RootContainer extends HTMLElement { __glRoot?: Root }
 // bundle resolves would flash raw keys. Upgrade path: render en immediately and
 // background-swap the locale, or ship a static skeleton in index.html.
 async function bootstrap() {
-  await initializeI18n();
+  // The access token lives in memory, so a reload recovers it before the first
+  // render; otherwise every signed-in route would redirect to /login first.
+  await Promise.all([initializeI18n(), restoreSessionBeforeRender()]);
 
   const container = document.getElementById('root')! as RootContainer;
   const root = container.__glRoot ?? ReactDOM.createRoot(container);

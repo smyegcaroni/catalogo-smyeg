@@ -11,8 +11,48 @@ vi.mock('@/api/auth', () => ({
   awaitPendingLogout: () => mockAwaitPendingLogout(),
 }));
 
+let mockIsEnterprise = false;
+let mockEditionResolved = true;
+let mockEditionLoading = false;
+vi.mock('@/hooks/use-edition', () => ({
+  useEdition: () => ({
+    isEnterprise: mockIsEnterprise,
+    isResolved: mockEditionResolved,
+    isLoading: mockEditionLoading,
+  }),
+}));
+
+async function clickAndCaptureHref(button: HTMLElement): Promise<string[]> {
+  const hrefs: string[] = [];
+  const original = Object.getOwnPropertyDescriptor(window, 'location');
+  Object.defineProperty(window, 'location', {
+    configurable: true,
+    value: { ...window.location, set href(v: string) { hrefs.push(v); } },
+  });
+  try {
+    await userEvent.click(button);
+    await waitFor(() => expect(hrefs).toHaveLength(1));
+  } finally {
+    if (original) Object.defineProperty(window, 'location', original);
+  }
+  return hrefs;
+}
+
+/** The sign-in URLs without the per-tab nonce, which is random. */
+function withoutNonce(hrefs: string[]): string[] {
+  return hrefs.map((href) => {
+    const [path, query] = href.split('?');
+    expect(query).toMatch(/^nonce=[A-Za-z0-9_-]{43}$/);
+    expect(sessionStorage.getItem('geolens-sso-nonce')).toBe(query.slice('nonce='.length));
+    return path;
+  });
+}
+
 describe('OAuthButtons', () => {
   beforeEach(() => {
+    mockIsEnterprise = false;
+    mockEditionResolved = true;
+    mockEditionLoading = false;
     mockAwaitPendingLogout.mockReset();
     mockAwaitPendingLogout.mockResolvedValue(undefined);
   });
@@ -44,7 +84,7 @@ describe('OAuthButtons', () => {
       expect(hrefs).toEqual([]);
 
       releaseLogout();
-      await waitFor(() => expect(hrefs).toEqual(['/api/auth/oauth/github/login']));
+      await waitFor(() => expect(withoutNonce(hrefs)).toEqual(['/api/auth/oauth/github/login']));
     } finally {
       if (original) Object.defineProperty(window, 'location', original);
     }
@@ -102,5 +142,46 @@ describe('OAuthButtons', () => {
       expect(button).toHaveAttribute('aria-label');
       expect(button.querySelector('span')).not.toBeInTheDocument();
     }
+  });
+
+  it('sends SAML providers to the SAML login route and OIDC providers to the OAuth route', async () => {
+    mockIsEnterprise = true;
+    const { getOAuthProviders } = await import('@/api/auth');
+    (getOAuthProviders as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { slug: 'corp-saml', display_name: 'Corp SSO', provider_type: 'saml' },
+      { slug: 'corp-oidc', display_name: 'Corp OIDC', provider_type: 'oidc' },
+    ]);
+
+    render(<OAuthButtons />);
+
+    const saml = await screen.findByRole('button', { name: /corp sso/i });
+    const oidc = await screen.findByRole('button', { name: /corp oidc/i });
+    expect(withoutNonce(await clickAndCaptureHref(saml))).toEqual(['/api/auth/saml/corp-saml/login']);
+    expect(withoutNonce(await clickAndCaptureHref(oidc))).toEqual(['/api/auth/oauth/corp-oidc/login']);
+  });
+
+  it('hides SAML providers when the runtime is not Enterprise', async () => {
+    const { getOAuthProviders } = await import('@/api/auth');
+    (getOAuthProviders as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { slug: 'corp-saml', display_name: 'Corp SSO', provider_type: 'saml' },
+      { slug: 'corp-oidc', display_name: 'Corp OIDC', provider_type: 'oidc' },
+    ]);
+
+    render(<OAuthButtons />);
+
+    await screen.findByRole('button', { name: /corp oidc/i });
+    expect(screen.queryByRole('button', { name: /corp sso/i })).not.toBeInTheDocument();
+  });
+
+  it('keeps SAML providers when the edition lookup failed', async () => {
+    mockEditionResolved = false;
+    const { getOAuthProviders } = await import('@/api/auth');
+    (getOAuthProviders as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { slug: 'corp-saml', display_name: 'Corp SSO', provider_type: 'saml' },
+    ]);
+
+    render(<OAuthButtons />);
+
+    expect(await screen.findByRole('button', { name: /corp sso/i })).toBeInTheDocument();
   });
 });

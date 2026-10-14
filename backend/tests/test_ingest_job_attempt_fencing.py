@@ -7,13 +7,14 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy import text, update
 
+from app.platform.jobs import ledger
 from app.platform.jobs.heartbeat import (
     StaleIngestAttempt,
     attempt_scoped_staging_table,
-    claim_ingest_job_attempt,
     renew_ingest_job_heartbeat,
     resolve_ingest_job_attempt,
     update_ingest_job_for_attempt,
+    write_job_failure_for_attempt,
 )
 from app.platform.jobs.models import IngestJob
 from app.platform.jobs.router import fail_stale_jobs
@@ -50,18 +51,17 @@ async def test_expired_attempt_cannot_renew_or_finalize_retried_job(test_db_sess
         )
     )
     await test_db_session.commit()
-    assert await claim_ingest_job_attempt(test_db_session, job.id, attempt_b)
+    assert await ledger.claim(test_db_session, job.id, attempt_b)
     await test_db_session.commit()
 
     # The resumed delivery for A cannot adopt B's token.
     assert not await renew_ingest_job_heartbeat(job.id, attempt_a)
     assert not await update_ingest_job_for_attempt(
-        test_db_session,
-        job.id,
-        attempt_a,
-        values={"status": "complete", "completed_at": datetime.now(timezone.utc)},
+        test_db_session, job.id, attempt_a, values={"progress": 0.5}
     )
-    assert not await claim_ingest_job_attempt(test_db_session, job.id, attempt_a)
+    with pytest.raises(StaleIngestAttempt):
+        await ledger.complete(test_db_session, job.id, attempt_a)
+    assert not await ledger.claim(test_db_session, job.id, attempt_a)
     await test_db_session.rollback()
 
     await test_db_session.refresh(job)
@@ -70,14 +70,26 @@ async def test_expired_attempt_cannot_renew_or_finalize_retried_job(test_db_sess
 
     assert await renew_ingest_job_heartbeat(job.id, attempt_b)
     assert await update_ingest_job_for_attempt(
-        test_db_session,
-        job.id,
-        attempt_b,
-        values={"status": "complete", "completed_at": datetime.now(timezone.utc)},
+        test_db_session, job.id, attempt_b, values={"progress": 0.5}
     )
+    await ledger.complete(test_db_session, job.id, attempt_b)
     await test_db_session.commit()
     await test_db_session.refresh(job)
     assert job.status == "complete"
+
+
+@pytest.mark.parametrize(
+    "column",
+    ["status", "error_message", "error_code", "completed_at", "attempt_id", "id"],
+)
+async def test_the_fenced_update_refuses_a_column_the_ledger_owns(column):
+    """A fenced update naming a status, reason, completion time or fence column raises before any statement."""
+    untouched = object()
+
+    with pytest.raises(ValueError, match="the ledger writes"):
+        await update_ingest_job_for_attempt(
+            untouched, uuid.uuid4(), uuid.uuid4(), values={column: None}
+        )
 
 
 async def test_vrt_generation_heartbeat_fences_stale_recovery(test_db_session):
@@ -224,6 +236,17 @@ async def test_attempt_owned_publish_rejects_stale_external_writer(test_db_sessi
     await _drop_attempt_staging_table(staging_a)
     await test_db_session.execute(text(f'DROP TABLE data."{live_table}"'))
     await test_db_session.commit()
+
+
+@pytest.mark.parametrize("given", [{}, {"reason": None}], ids=["omitted", "none"])
+async def test_a_failure_write_without_a_reason_is_refused(given):
+    """A failure write given no reason, or None, raises before it touches the session."""
+    untouched = object()
+
+    with pytest.raises(TypeError):
+        await write_job_failure_for_attempt(
+            untouched, uuid.uuid4(), uuid.uuid4(), task_name="ingest_file", **given
+        )
 
 
 def test_attempt_scoped_staging_tables_include_full_token():

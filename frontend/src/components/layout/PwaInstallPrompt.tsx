@@ -53,7 +53,7 @@ export function PwaInstallPrompt() {
   useEffect(() => {
     if (window.location.hostname !== 'catalogo.caroni.org.ve') return;
     if ('serviceWorker' in navigator && window.isSecureContext) {
-      void navigator.serviceWorker.register('/service-worker.js?v=20261003pwaicon3', {
+      void navigator.serviceWorker.register('/service-worker.js?v=20261014pwaicon1', {
         updateViaCache: 'none',
       })
         .catch((error: unknown) => console.warn('PWA registration failed', error));
@@ -125,7 +125,7 @@ export function PwaInstallPrompt() {
       <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-md">
         <DialogHeader>
           <img
-            src="/app-icon-192.png?v=20261003pwaicon3"
+            src="/app-icon-192.png?v=20261014pwaicon1"
             alt=""
             width={64}
             height={64}

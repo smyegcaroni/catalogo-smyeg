@@ -1,5 +1,6 @@
 import {
   classifyApiError,
+  describeUploadRefusal,
   translateApiErrorDetail,
   translateError,
 } from '@/lib/error-map';
@@ -28,6 +29,40 @@ describe('API error localization boundary', () => {
         403,
       ),
     ).toBe('This service requires authentication. Provide an access token and try again.');
+  });
+
+  const denial = (current: string, requested: string, allowed: string[]) => ({
+    code: 'workflow_transition_denied',
+    message: `Cannot transition from '${current}' to '${requested}'.`,
+    current_stage: current,
+    requested_stage: requested,
+    allowed_stages: allowed,
+  });
+
+  it('names the refused workflow edge and the steps still open to the caller', () => {
+    const detail = denial('pending_review', 'published', ['approved', 'draft']);
+    expect(classifyApiError(detail, 422)).toEqual({
+      key: 'errors.workflowTransitionDenied',
+      values: { from: 'pending_review', to: 'published', allowed: 'approved, draft' },
+    });
+    expect(translateApiErrorDetail(detail, 422)).toContain('“pending_review” to “published”');
+    expect(translateApiErrorDetail(detail, 422)).toContain('approved, draft');
+  });
+
+  it("reads stage names holding quotes, the edge delimiter or a line break", () => {
+    expect(
+      classifyApiError(denial("a' to 'b", 'pub\nlished', ['reviewer\'s "ok"']), 422),
+    ).toEqual({
+      key: 'errors.workflowTransitionDenied',
+      values: { from: "a' to 'b", to: 'pub\nlished', allowed: 'reviewer\'s "ok"' },
+    });
+  });
+
+  it('says so when no workflow step is open to the caller', () => {
+    expect(classifyApiError(denial('draft', 'published', []), 422)).toEqual({
+      key: 'errors.workflowTransitionDeniedNoneAllowed',
+      values: { from: 'draft', to: 'published' },
+    });
   });
 
   it('does not render unknown backend prose', () => {
@@ -108,6 +143,16 @@ describe('API error localization boundary', () => {
         409,
       ),
     ).toEqual({ key: 'errors.refreshDatasetBusy' });
+
+    expect(
+      classifyApiError(
+        {
+          code: 'review_superseded',
+          message: 'The dataset changed after this replacement was held. Upload the file again.',
+        },
+        409,
+      ),
+    ).toEqual({ key: 'errors.refreshReviewSuperseded' });
   });
 
   // fix(#1768): the re-upload commit door returns the SAME `origin_changed`
@@ -362,15 +407,16 @@ describe('API error localization boundary', () => {
     );
   });
 
-  // fix(#1390): the VRT source-compatibility 422 (`validate_sources` in
+  // The VRT source-compatibility 422 (`validate_sources` in
   // backend/app/processing/raster/validation.py) returns an array of
   // SourceValidationError objects (source_id/code/message/field/severity),
-  // not the Pydantic loc/type/ctx shape below. All 8 VAL codes must map to a
+  // not the Pydantic loc/type/ctx shape below. Every VAL code must map to a
   // per-code string that carries the offending source_id as context.
   it('maps every SourceValidationError code from a VRT validation 422', () => {
     const sourceId = '11111111-1111-1111-1111-111111111111';
     const cases: Array<[string, string]> = [
       ['crs_mismatch', 'errors.sourceValidationCrsMismatch'],
+      ['crs_unverified', 'errors.sourceValidationCrsUnverified'],
       ['band_count_mismatch', 'errors.sourceValidationBandCountMismatch'],
       ['single_band_required', 'errors.sourceValidationSingleBandRequired'],
       ['dtype_mismatch', 'errors.sourceValidationDtypeMismatch'],
@@ -450,6 +496,32 @@ describe('API error localization boundary', () => {
     ];
 
     expect(translateApiErrorDetail(detail, 422)).toBe('display_name is required.');
+  });
+
+  // The STAC import door reuses pydantic's own HttpUrl parsing inside a
+  // field validator (`_validate_stac_http_url` in stac_router.py) to reject
+  // an item whose data asset is an `s3://` (or other non-http) URL. That
+  // raises pydantic-core's own `url_scheme` error type rather than the
+  // generic `value_error` a raised ValueError would produce; unmapped it
+  // fell through to the field-name-only "has an invalid value" message and
+  // hid that the concrete, fixable problem is the scheme.
+  it('names the scheme problem for a pydantic url_scheme validation error, not the generic field message', () => {
+    const detail = [
+      {
+        type: 'url_scheme',
+        loc: ['body', 'items', 0, 'data_asset_href'],
+        msg: "URL scheme should be 'http' or 'https'",
+        ctx: { expected_schemes: "'http' or 'https'" },
+      },
+    ];
+
+    expect(classifyApiError(detail, 422)).toEqual({
+      key: 'errors.validationUrlSchemeInvalid',
+      values: { field: 'items.0.data_asset_href' },
+    });
+    const rendered = translateApiErrorDetail(detail, 422);
+    expect(rendered).toBe('items.0.data_asset_href must be an http or https address.');
+    expect(rendered).not.toBe('The submitted values are invalid.');
   });
 
   it('localizes validation constraints with their numeric limit', () => {
@@ -647,5 +719,78 @@ describe('API error localization boundary', () => {
     expect(rendered).toContain('https://maps.example.com');
     // The guard the mapping exists for.
     expect(rendered).not.toBe('The submitted values are invalid.');
+  });
+});
+
+describe('describeUploadRefusal', () => {
+  it('shows an unmapped 422 string detail verbatim, the way a stored job failure reason already does', () => {
+    const detail = 'Archive contains a path outside the tileset root: ../secrets.txt';
+
+    expect(describeUploadRefusal(detail, 422)).toBe(detail);
+  });
+
+  it('shows an unmapped 400 string detail verbatim, such as the extension refusal', () => {
+    const detail = "File extension '.exe' not allowed. Allowed: ['.zip', '.geojson']";
+
+    expect(describeUploadRefusal(detail, 400)).toBe(detail);
+  });
+
+  it('still translates a 422 string this table already recognizes', () => {
+    expect(
+      describeUploadRefusal('Dataset quota exceeded: 5 of 5 datasets used', 422),
+    ).toBe('Dataset quota exceeded: 5 of 5 datasets used.');
+  });
+
+  it('translates a Pydantic validation array rather than rendering it', () => {
+    const detail = [{ loc: ['body', 'name'], type: 'missing' }];
+
+    const rendered = describeUploadRefusal(detail, 422);
+
+    expect(rendered).not.toBe(detail);
+    expect(typeof rendered).toBe('string');
+    expect(rendered).toContain('name');
+  });
+
+  it('translates a structured {code, message} refusal rather than rendering the message', () => {
+    const detail = { code: 'geometry_loss', message: 'Replacing this file would drop its geometry column.' };
+
+    expect(describeUploadRefusal(detail, 422)).not.toBe(detail.message);
+  });
+
+  it('does not render an unmapped string outside 400 and 422', () => {
+    expect(describeUploadRefusal('Some unmapped 409 detail', 409)).toBe(
+      "The request conflicts with the resource's current state.",
+    );
+  });
+
+  it('interpolates both values for a size refusal that knows the actual size', () => {
+    const detail = {
+      code: 'file_size_exceeded',
+      message: 'File size (2.0 MB) exceeds the maximum allowed (1 MB).',
+      size_mb: 2.0,
+      limit_mb: 1,
+    };
+
+    expect(translateApiErrorDetail(detail, 422)).not.toContain('{{');
+  });
+
+  it('interpolates the kind for a .laz sent without the point cloud kind', () => {
+    const detail = {
+      code: 'pointcloud_kind_required',
+      message: 'A .laz file holds a point cloud. Upload it as a new dataset with kind=pointcloud.',
+      file_type: 'pointcloud',
+    };
+
+    expect(translateApiErrorDetail(detail, 422)).toBe(detail.message);
+  });
+
+  it('interpolates the limit for a size refusal aborted mid-stream, with no actual size', () => {
+    const detail = {
+      code: 'file_size_limit_exceeded',
+      message: 'File size exceeds maximum allowed (1 MB).',
+      limit_mb: 1,
+    };
+
+    expect(translateApiErrorDetail(detail, 413)).not.toContain('{{');
   });
 });

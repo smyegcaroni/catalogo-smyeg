@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -13,9 +15,15 @@ if TYPE_CHECKING:
 import structlog
 
 from app.core.config import settings
+from app.core.pointcloud import POINTCLOUD_MEDIA_TYPE, pointcloud_path
 from app.core.raster_bands import band_display_name, stac_band_nodata
-from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
-from app.core.tile_scope import republished_tile_url, tile_template_query
+from app.core.record_types import RASTER_FAMILY_RECORD_TYPES, capabilities
+from app.core.tile_scope import (
+    republished_tile_url,
+    tile_template_params,
+    tile_template_query,
+)
+from app.core.tiles3d import TILESET_MEDIA_TYPE, tileset_path
 from app.modules.catalog.datasets.domain.models import Dataset
 from app.modules.catalog.datasets.domain.source_freshness import (
     compute_source_freshness,
@@ -30,7 +38,7 @@ from app.modules.catalog.search.record_metadata import (
 )
 from app.modules.catalog.sources.provenance import derive_last_edited
 from app.platform.dataset_origin import classify_origin, project_unknown
-from app.standards.distributions import is_publishable_url
+from app.standards.distributions import cog_download_path, is_publishable_url
 from app.standards.ogc.utils import build_url
 
 logger = structlog.stdlib.get_logger(__name__)
@@ -58,6 +66,29 @@ _TABLE_FORMAT_MEDIA = {
 }
 
 
+def _quicklook_version(uri: str | None) -> str | None:
+    """A token that changes whenever the dataset's quicklook points at a new image."""
+    if uri is None:
+        return None
+    return hashlib.sha256(uri.encode()).hexdigest()[:12]
+
+
+def _record_formats(record_type: str) -> list[str]:
+    """Media types a record advertises; the vector exports need a feature table."""
+    if record_type in RASTER_FAMILY_RECORD_TYPES:
+        return list(_RASTER_FORMAT_MEDIA.values())
+    if record_type == "table":
+        return list(_TABLE_FORMAT_MEDIA.values())
+    if record_type == "tiles3d_dataset":
+        # Tile content types vary by tileset; its tileset.json is always JSON.
+        return [TILESET_MEDIA_TYPE]
+    if record_type == "pointcloud_dataset":
+        return [POINTCLOUD_MEDIA_TYPE]
+    if capabilities(record_type).feature_table:
+        return list(_FORMAT_MEDIA.values())
+    return []
+
+
 def build_assets(
     dataset: Dataset,
     public_api_url: str,
@@ -67,10 +98,15 @@ def build_assets(
     storage_backend: str = "local",
     storage_provider: "StorageProvider | None" = None,
     public_app_url: str | None = None,
+    cog_download: bool = False,
 ) -> dict:
     """Build a modality-aware unified assets dict for a dataset.
 
-    fix(#315): the raster/VRT ``raster_tiles`` asset uses ``public_app_url``
+    ``cog_download``: the caller may use the COG download route, so a
+    raster's stored data-role assets are advertised: a signed URL on S3,
+    the route on any other store.
+
+    The raster/VRT ``raster_tiles`` asset uses ``public_app_url``
     (nginx-rewritten to the tile proxy), not ``/api``; every other
     asset/link stays on ``public_api_url``.
     """
@@ -141,6 +177,23 @@ def build_assets(
             "roles": ["visual"],
         }
 
+    elif record_type == "tiles3d_dataset":
+        assets["tileset"] = {
+            "href": build_url(tileset_path(dataset.id), base_url=public_api_url),
+            "type": TILESET_MEDIA_TYPE,
+            "title": "3D Tiles tileset",
+            "roles": ["data"],
+        }
+
+    elif record_type == "pointcloud_dataset" and dataset.pointcloud_attempt_id:
+        copc_path = pointcloud_path(dataset.id, dataset.pointcloud_attempt_id)
+        assets["pointcloud"] = {
+            "href": build_url(copc_path, base_url=public_api_url),
+            "type": POINTCLOUD_MEDIA_TYPE,
+            "title": "COPC point cloud",
+            "roles": ["data"],
+        }
+
     # Merge DatasetAsset rows -- takes precedence on key conflict
     stac_built = _build_stac_assets(
         stac_asset_rows,
@@ -148,10 +201,39 @@ def build_assets(
         storage_backend=storage_backend,
         public_api_url=public_api_url,
         storage_provider=storage_provider,
+        proxy_routes=_proxied_raster_asset_routes(dataset, record_type, record_status),
+        cog_download=cog_download,
     )
     assets.update(stac_built)
 
     return assets
+
+
+def _proxied_raster_asset_routes(
+    dataset: Dataset,
+    record_type: str,
+    record_status: str,
+) -> dict[str, str] | None:
+    """API routes serving a published raster's stored files behind its access checks.
+
+    They stand in for an asset that has no URL of its own: any key on local
+    or Azure storage, and an S3 key where the caller passed no provider to
+    sign it. VRTs have no single COG. The quicklook URLs carry the tile
+    cache-key params: that route is cached publicly, and a replaced raster
+    must not show the old images.
+    """
+    if not (record_status == "published" and record_type == "raster_dataset"):
+        return None
+    version = tile_template_params(
+        getattr(dataset, "tile_cache_version", None),
+        getattr(dataset, "publication_version", None),
+    )
+    quicklook = f"/datasets/{dataset.id}/quicklook?"
+    return {
+        "data": cog_download_path(dataset.id),
+        "thumbnail": quicklook + urlencode({"size": 256, **version}),
+        "overview": quicklook + urlencode({"size": 512, **version}),
+    }
 
 
 def _build_stac_assets(
@@ -161,11 +243,13 @@ def _build_stac_assets(
     storage_backend: str = "local",
     public_api_url: str = "",
     storage_provider: "StorageProvider | None" = None,
+    proxy_routes: dict[str, str] | None = None,
+    cog_download: bool = False,
 ) -> dict:
     if not asset_rows:
         return {}
 
-    from app.platform.assets.urls import resolve_asset_url
+    from app.platform.assets.urls import is_remote_href, resolve_asset_url
 
     from app.platform.assets.keys import is_public_asset_key
 
@@ -175,6 +259,15 @@ def _build_stac_assets(
         # why it is an allowlist.
         if not is_public_asset_key(row["key"]):
             continue
+        # Stored data files go only to callers the COG download route serves,
+        # which excludes every VRT; a remote URL is public at its origin.
+        # The primary keys count too, since roles is nullable.
+        if (
+            ("data" in (row.get("roles") or ()) or row["key"] in ("data", "vrt"))
+            and not cog_download
+            and not is_remote_href(row["href"])
+        ):
+            continue
         resolved_href = resolve_asset_url(
             row["href"],
             storage_backend=storage_backend,
@@ -183,9 +276,10 @@ def _build_stac_assets(
             public_api_url=public_api_url,
             storage_provider=storage_provider,
         )
-        # GAP-031: resolve_asset_url returns None when no safe authorized URL
-        # exists (e.g. local-storage proxy path that has no backend route).
-        # Skip the asset entry rather than publishing a dead/colliding href.
+        if resolved_href is None and proxy_routes and row["key"] in proxy_routes:
+            resolved_href = build_url(proxy_routes[row["key"]], base_url=public_api_url)
+        # No safe authorized URL (e.g. a local key with no serving route):
+        # skip the entry rather than publish a dead /assets/{key} href.
         if resolved_href is None:
             continue
         entry: dict = {"href": resolved_href}
@@ -295,8 +389,14 @@ def dataset_to_ogc_record(
         keywords = list(record.theme_category or [])
     license_value = record.license or "proprietary"
 
-    # Used both for has_quicklook dispatch below and the STAC raster block.
+    # Used for has_quicklook and formats below and for the STAC raster block.
     record_type = getattr(record, "record_type", "vector_dataset") or "vector_dataset"
+
+    quicklook_uri = (
+        (raster_meta.get("quicklook_256_uri") if raster_meta is not None else None)
+        if record_type in RASTER_FAMILY_RECORD_TYPES
+        else dataset.quicklook_256_uri
+    )
 
     ogc_record: dict = {
         "type": "Feature",
@@ -336,22 +436,9 @@ def dataset_to_ogc_record(
             "record_status": record.record_status,
             # vector_dataset/table reads Dataset.quicklook_256_uri; raster
             # types read it off raster_meta (RasterAsset.quicklook_256_uri).
-            "has_quicklook": (
-                raster_meta is not None
-                and raster_meta.get("quicklook_256_uri") is not None
-            )
-            if record_type in RASTER_FAMILY_RECORD_TYPES
-            else (dataset.quicklook_256_uri is not None),
-            "formats": (
-                list(_RASTER_FORMAT_MEDIA.values())
-                if (
-                    getattr(record, "record_type", "vector_dataset") or "vector_dataset"
-                )
-                in RASTER_FAMILY_RECORD_TYPES
-                else list(_TABLE_FORMAT_MEDIA.values())
-                if getattr(record, "record_type", None) == "table"
-                else list(_FORMAT_MEDIA.values())
-            ),
+            "has_quicklook": quicklook_uri is not None,
+            "quicklook_version": _quicklook_version(quicklook_uri),
+            "formats": _record_formats(record_type),
             "language": localized.language,
             "externalIds": build_external_ids(dataset),
             "themes": build_themes(record.theme_category, record.keywords),
@@ -449,6 +536,7 @@ def dataset_to_ogc_record(
                 "type": "application/json",
             },
         ],
+        # Unsigned: a signed URL outlives a revocation, and search pages are cached.
         "assets": build_assets(
             dataset,
             public_api_url,

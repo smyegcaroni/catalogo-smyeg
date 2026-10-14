@@ -1,6 +1,8 @@
 import i18n from '@/i18n/i18n';
 import { formatProvenanceTime } from '@/lib/provenance-attribution';
 
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
 export function formatDate(dateString: string | null): string {
   if (!dateString) return i18n.t('common:notAvailable');
   try {
@@ -8,6 +10,9 @@ export function formatDate(dateString: string | null): string {
       year: 'numeric',
       month: 'short',
       day: 'numeric',
+      // A bare date parses as UTC midnight; formatting it in local time would
+      // show the previous day west of UTC.
+      ...(DATE_ONLY.test(dateString) && { timeZone: 'UTC' }),
     });
   } catch {
     return i18n.t('common:notAvailable');
@@ -46,9 +51,35 @@ export function formatDateTimeSmart(dateString: string | null): string {
   }
 }
 
+/** Scheduled automation is defined in UTC, so its due times must never imply local time. */
+export function formatDateTimeUtc(dateString: string | null): string {
+  if (!dateString) return i18n.t('common:notAvailable');
+  try {
+    const date = new Date(dateString);
+    if (isNaN(date.getTime())) return i18n.t('common:notAvailable');
+    const formatted = new Intl.DateTimeFormat(i18n.language, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      timeZone: 'UTC',
+    }).format(date);
+    return `${formatted} UTC`;
+  } catch {
+    return i18n.t('common:notAvailable');
+  }
+}
+
 export function formatNumber(n: number | null | undefined, options?: Intl.NumberFormatOptions): string {
   if (n === null || n === undefined) return i18n.t('common:notAvailable');
   return new Intl.NumberFormat(i18n.language, options).format(n);
+}
+
+/** A `[west, south, east, north]` box as `(w, s) to (e, n)`, or `fallback` without one. */
+export function formatBbox(bbox: number[] | null | undefined, fallback: string): string {
+  if (!bbox || bbox.length < 4) return fallback;
+  return `(${bbox[0].toFixed(4)}, ${bbox[1].toFixed(4)}) to (${bbox[2].toFixed(4)}, ${bbox[3].toFixed(4)})`;
 }
 
 export function formatBytes(bytes: number | null): string {

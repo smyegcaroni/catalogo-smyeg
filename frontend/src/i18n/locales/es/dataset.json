@@ -4,6 +4,8 @@
   "rowCount_one": "{{count}} fila",
   "rowCount_other": "{{count}} filas",
   "page": {
+    "showMapPreview": "Mostrar vista previa del mapa",
+    "hideMapPreview": "Ocultar vista previa del mapa",
     "loading": "Cargando conjunto de datos...",
     "errorTitle": "Conjunto de datos no encontrado",
     "errorMessage": "No se pudo cargar el conjunto de datos solicitado.",
@@ -63,13 +65,17 @@
     "notOwner": "Solo el propietario del conjunto de datos o un administrador puede editar este registro."
   },
   "connect": {
+    "openInstructions": "Abrir instrucciones de conexión",
+    "instructionsTools": "QGIS, Python y curl",
     "copyCogUrl": "Copiar URL de COG",
     "copyXyzTileUrl": "Copiar URL de mosaico XYZ",
     "copyS3Uri": "Copiar URI de S3",
     "copyCsvExportUrl": "Copiar URL de exportación CSV",
     "copyOgcFeaturesUrl": "Copiar URL de OGC Features",
     "copyVectorTilesUrl": "Copiar URL de mosaicos vectoriales",
-    "copied": "Copiado: {{preview}}"
+    "copied": "Copiado: {{preview}}",
+    "copyTilesetUrl": "Copiar URL del tileset",
+    "instructionsTileset": "CesiumJS"
   },
   "addToMap": {
     "button": "Agregar al mapa",
@@ -229,7 +235,8 @@
     "actions": {
       "metadataEdit": "Metadatos actualizados",
       "datasetDelete": "Conjunto de datos eliminado",
-      "datasetCreate": "Conjunto de datos creado"
+      "datasetCreate": "Conjunto de datos creado",
+      "datasetTransferOwner": "Propietario cambiado"
     }
   },
   "versionHistory": {
@@ -239,8 +246,29 @@
     "version": "Versión {{number}}",
     "current": "Actual",
     "unknownFile": "Archivo desconocido",
+    "detailsUnrecorded": "No se registraron los detalles de esta versión.",
     "features": "{{count}} entidades",
-    "srid": "SRID {{value}}"
+    "srid": "SRID {{value}}",
+    "restore": "Restaurar",
+    "restoreBusyHint": "Ya hay una actualización, un reemplazo o una restauración en curso. Consulte el historial de actualizaciones.",
+    "restoreSelectionHint": "Anule la selección de la entidad en el mapa para restaurar."
+  },
+  "restoreDialog": {
+    "title": "¿Restaurar la versión {{number}}?",
+    "description": "La versión {{number}} vuelve a ser los datos actuales. Los datos que reemplaza se conservan, por lo que la restauración se puede deshacer hasta el siguiente reemplazo.",
+    "consequenceEdits": "Se descartan las ediciones de entidades hechas desde la versión {{number}}.",
+    "consequenceMosaics": "Los mosaicos que usan este conjunto de datos siguen leyendo el miembro actual hasta que se reconstruyan.",
+    "confirmPrompt": "Escriba el nombre del conjunto de datos para confirmar:",
+    "restoring": "Restaurando...",
+    "restore": "Restaurar versión",
+    "failed": "No se pudo restaurar la versión",
+    "queued": "Restauración de la versión {{number}} en cola. Aparece en el historial de actualizaciones.",
+    "refusal": {
+      "dataset_busy": "Se está ejecutando otra actualización, reemplazo o restauración de este conjunto de datos. Espere a que termine e inténtelo de nuevo.",
+      "previous_version_changed": "La versión anterior conservada cambió mientras el diálogo estaba abierto. Ciérrelo y revise de nuevo el historial.",
+      "no_previous_version": "Este conjunto de datos ya no tiene una versión anterior que restaurar.",
+      "restore_not_applicable": "Este conjunto de datos no tiene tabla de entidades, por lo que no hay nada que restaurar."
+    }
   },
   "vrt": {
     "mosaic": "Mosaico VRT",
@@ -315,6 +343,7 @@
       "committing": "Confirmando la nueva subida...",
       "tracking": "El conjunto de datos se está actualizando en segundo plano.",
       "complete": "El conjunto de datos se ha actualizado correctamente.",
+      "held": "Esta sustitución quedó retenida para su revisión.",
       "error": "Algo salió mal durante la nueva subida."
     },
     "sourceSelector": {
@@ -332,6 +361,7 @@
       "connecting": "Conectando al servicio...",
       "layerStep": "Seleccione una capa",
       "emptyState": "No se encontraron capas para este servicio.",
+      "unsupportedLayerType": "{{type}} no contiene entidades y no se puede usar para volver a cargar.",
       "previewLayer": "Vista previa de la capa",
       "previewing": "Preparando vista previa de nueva subida...",
       "layerLabel": "Capa:",
@@ -363,6 +393,7 @@
     "uploadingMessage": "Subiendo y analizando archivo...",
     "file": "Archivo:",
     "schemaChangeAdvisory": "El esquema difiere de la versión anterior: {{added}} columnas añadidas, {{removed}} eliminadas.",
+    "reviewReasonsLabel": "Cambios que requieren revisión",
     "warningSchemaChanges": "Advertencia: Esta nueva subida incluye cambios de esquema que pueden afectar consultas existentes.",
     "confirmReupload": "Confirmar nueva subida",
     "committingMessage": "Confirmando nueva subida...",
@@ -382,6 +413,10 @@
   },
   "quality": {
     "title": "Puntuación de calidad",
+    "assessedAt": "Calidad evaluada el {{date}} ({{age}})",
+    "assessmentVsSource": "Esta fecha corresponde a la evaluación de calidad. Consulte Origen para saber cuándo se actualizaron los datos y conocer su vigencia.",
+    "scoreExplanation": "La puntuación total combina las dimensiones de calidad disponibles. Los porcentajes indican el peso de cada dimensión.",
+    "metadataExplanation": "La completitud de metadatos de calidad cuenta los campos opcionales del registro con valor (10 en total). El progreso de validación de Metadatos se calcula aparte.",
     "metadataCompleteness": "Completitud de metadatos",
     "geometryValidity": "Validez de geometría",
     "attributeCompleteness": "Completitud de atributos",
@@ -391,28 +426,30 @@
       "absolute": "Última verificación {{date}}",
       "relative": "Verificado {{relative}}",
       "cadence": "Cadencia esperada de actualización: {{cadence}}.",
-      "cadenceDaily": "Se espera una actualización diaria.",
-      "cadenceWeekly": "Se espera una actualización semanal.",
-      "cadenceMonthly": "Se espera una actualización mensual.",
-      "cadenceQuarterly": "Se espera una actualización trimestral.",
-      "cadenceAnnually": "Se espera una actualización anual.",
-      "cadenceUnknown": "La cadencia es desconocida; confirme el calendario de actualización.",
+      "cadenceDaily": "La vigencia de la evaluación se compara con la frecuencia diaria indicada.",
+      "cadenceWeekly": "La vigencia de la evaluación se compara con la frecuencia semanal indicada.",
+      "cadenceMonthly": "La vigencia de la evaluación se compara con la frecuencia mensual indicada.",
+      "cadenceQuarterly": "La vigencia de la evaluación se compara con la frecuencia trimestral indicada.",
+      "cadenceAnnually": "La vigencia de la evaluación se compara con la frecuencia anual indicada.",
+      "cadenceUnknown": "Sin una frecuencia periódica, la vigencia de la evaluación usa una referencia de 45 días.",
       "state": {
-        "fresh": "Reciente",
-        "stale": "Desactualizado",
-        "missing": "Falta la información de vigencia"
+        "fresh": "Evaluación reciente",
+        "stale": "Evaluación pendiente",
+        "missing": "Sin fecha de evaluación"
       },
       "remediation": {
-        "fresh": "No se requiere una actualización inmediata.",
-        "stale": "Recalcule las métricas de calidad y verifique que se hayan ingerido las actualizaciones recientes de la fuente.",
-        "missing": "Ejecute la validación de calidad para generar una marca de tiempo de vigencia."
+        "fresh": "No es necesario actualizar la evaluación.",
+        "stale": "Vuelva a calcular la evaluación de calidad para comprobar los datos actuales.",
+        "missing": "Ejecute la validación de calidad para crear una fecha de evaluación."
       },
       "notAvailable": "No disponible",
-      "unknownAge": "Antigüedad desconocida"
+      "unknownAge": "Antigüedad desconocida",
+      "readOnlyGuidance": "Pida al propietario del conjunto de datos o a un contacto indicado arriba que actualice la evaluación de calidad."
     }
   },
   "serviceUrls": {
-    "authHelpSimple": "Estos endpoints aceptan un encabezado X-Api-Key o Authorization: Bearer.",
+    "authHelpSimple": "Las descargas y los endpoints de OGC Features y de teselas vectoriales aceptan un encabezado X-Api-Key o Authorization: Bearer.",
+    "vectorTilesKeyHint": "Las teselas vectoriales de un conjunto de datos no público necesitan una clave de API. En QGIS, añade una conexión de teselas vectoriales con la URL de teselas sin el parámetro api_key y, en Autenticación, elige el método API Header con el encabezado X-Api-Key. Los clientes que no pueden enviar encabezados pueden conservar ?api_key=. Usa una clave de solo lectura.",
     "manageApiKeys": "Gestionar claves API"
   },
   "schema": {
@@ -452,6 +489,10 @@
     "ariaLabel": "Mapa del conjunto de datos",
     "featureSaved": "Entidad guardada",
     "featureSaveFailed": "Error al guardar la entidad",
+    "featureSavedThenChanged": "Esta entidad ya estaba guardada y otra persona la ha modificado desde entonces, por lo que tus últimos cambios no se aplicaron. Guarda de nuevo para reemplazar sus cambios con los tuyos o descarta para conservar los suyos.",
+    "featureSavedThenRemoved": "El guardado anterior se eliminó. Guardar creará la entidad de nuevo.",
+    "featureSavedThenReplaced": "Los datos de este conjunto de datos se reemplazaron después de tu guardado anterior, por lo que tus cambios no se aplicaron. Guardar creará la entidad de nuevo.",
+    "featureDatasetReplaced": "Los datos de este conjunto de datos se reemplazaron después de que empezaras a editar, por lo que tu cambio no se guardó.",
     "featureUpdated": "Entidad actualizada",
     "featureUpdateFailed": "Error al actualizar la entidad",
     "featureDeleted": "Entidad eliminada",
@@ -461,9 +502,13 @@
     "attributesUpdated": "Atributos actualizados",
     "attributesUpdateFailed": "Error al actualizar los atributos",
     "unsavedDiscarded": "Cambios no guardados descartados",
+    "sketchStillSaving": "La entidad anterior aún se está guardando. Intente de nuevo cuando se haya guardado.",
     "discardChangesTitle": "¿Descartar ediciones del mapa sin guardar?",
     "discardChangesDescription": "Los cambios de geometría no se han guardado. Puede continuar editando o descartarlos.",
+    "discardChangesAccessLostDescription": "Ya no puede editar este conjunto de datos, así que al descartar se quitarán del mapa estos cambios de geometría sin guardar.",
     "discardChangesAction": "Descartar cambios",
+    "editAccessLostNotice": "Ya no puede editar este conjunto de datos, por lo que estos cambios del mapa no se pueden guardar.",
+    "editLostOnReloadNotice": "El mapa se recargó y se perdió el cambio sin guardar de esta entidad.",
     "deleteFeatureTitle": "Eliminar entidad",
     "deleteFeatureDescription": "¿Eliminar esta entidad? Esta acción no se puede deshacer.",
     "zoomToExtent": "Zoom a la extensión del conjunto de datos",
@@ -486,6 +531,7 @@
     "helperWarnings": "Se encontraron {{warningCount}} advertencia(s). Revise las causas probables antes de publicar.",
     "likelyCompact": "Probable:",
     "troubleshootAction": "Solucionar problemas",
+    "readOnlyGuidance": "Pida al propietario del conjunto de datos o a un contacto indicado arriba que resuelva estos problemas de validación.",
     "health": {
       "title": "Estado del conjunto de datos",
       "required": "Obligatorio {{count}}",
@@ -532,6 +578,24 @@
       "invalid": "{{field}} inválido",
       "conflicting": "{{field}} en conflicto",
       "needsReview": "{{field}} necesita revisión"
+    },
+    "fields": {
+      "title": "Título",
+      "summary": "Resumen",
+      "license": "Licencia",
+      "spatialExtent": "Extensión espacial",
+      "lineageSummary": "Resumen del linaje",
+      "srid": "Sistema de referencia de coordenadas",
+      "contacts": "Contactos",
+      "keywords": "Palabras clave",
+      "geometry": "Geometría",
+      "attributeDescriptions": "Descripciones de atributos",
+      "sourceUrl": "URL de origen",
+      "sourceOrganization": "Organización de origen",
+      "qualityStatement": "Declaración de calidad",
+      "updateFrequency": "Frecuencia de actualización",
+      "temporalExtent": "Extensión temporal",
+      "attribution": "Atribución"
     }
   },
   "contacts": {
@@ -554,7 +618,8 @@
       "publisher": "Editor",
       "distributor": "Distribuidor",
       "custodian": "Custodio"
-    }
+    },
+    "remove": "Eliminar contacto {{name}}"
   },
   "keywords": {
     "title": "Palabras clave",
@@ -573,7 +638,8 @@
     "inheritedConfirmTitle": "¿Compartir las palabras clave heredadas?",
     "inheritedConfirmBody": "Estas palabras clave se copiaron de un conjunto de datos de origen que la nueva audiencia no puede abrir. Continúe para compartirlas, o cancele y elimínelas primero.",
     "inheritedConfirmContinue": "Cambiar visibilidad",
-    "inheritedGeneric": "Este conjunto de datos contiene palabras clave heredadas de su origen. Revise la lista completa de palabras clave antes de compartir."
+    "inheritedGeneric": "Este conjunto de datos contiene palabras clave heredadas de su origen. Revise la lista completa de palabras clave antes de compartir.",
+    "remove": "Eliminar palabra clave {{keyword}}"
   },
   "attributeMetadata": {
     "title": "Metadatos de atributos",
@@ -589,12 +655,15 @@
     "editingDisabled": "La edición de atributos está deshabilitada en esta instalación."
   },
   "distributions": {
-    "title": "Puntos de acceso",
+    "title": "Descargas y conexiones",
     "download": "Descargas",
     "api": "Endpoints API",
     "tiles": "Servicios de teselas",
     "other": "Acceso adicional",
-    "noDistributions": "No hay distribuciones disponibles.",
+    "noDistributions": "No se muestran aquí otras descargas ni servicios.",
+    "connectWithClient": "Conectar con QGIS, Python o curl",
+    "otherFormats": "Descargar en otro formato",
+    "accessPermissions": "Quién puede acceder a este conjunto de datos",
     "auto": "auto",
     "primary": "Primario",
     "copyUrl": "Copiar URL",
@@ -690,7 +759,9 @@
     "noRecords": "Sin registros relacionados",
     "showingCount": "Mostrando {{shown}} de {{total}} registros",
     "error": "Error al cargar relaciones",
-    "loadError": "Error al cargar registros relacionados"
+    "loadError": "Error al cargar registros relacionados",
+    "broken": "Rota",
+    "brokenMessage": "Una columna de unión ya no existe en su conjunto de datos. Elimine o vuelva a crear esta relación."
   },
   "overview": {
     "allChecksPassed": "Todas las comprobaciones superadas",
@@ -723,6 +794,9 @@
     "nodata": "Nodata",
     "ogcApiFeatures": "OGC API Features",
     "percentComplete": "{{percent}}% completo",
+    "validationProgress": "Comprobaciones de validación superadas: {{percent}}%",
+    "validationProgressHelp": "Estimación basada en 12 comprobaciones iniciales menos los errores y avisos registrados. La puntuación de metadatos de calidad cuenta otros campos opcionales.",
+    "askMaintainer": "Pida al propietario del conjunto de datos o a un contacto indicado abajo que complete {{field}}",
     "rasterProperties": "Propiedades del ráster",
     "recommendedCount_one": "{{count}} recomendado",
     "recommendedCount_other": "{{count}} recomendados",
@@ -780,7 +854,7 @@
       "table": "Tabla registrada",
       "serviceType": "Tipo de servicio",
       "layer": "Identificador de capa",
-      "endpoint": "Puntero seguro a la fuente",
+      "endpoint": "URL de la fuente (credenciales eliminadas)",
       "collection": "Colección STAC",
       "asset": "Recurso STAC",
       "item": "Elemento STAC"
@@ -804,6 +878,7 @@
         "unknown": "Sin comparar"
       }
     },
+    "healthUnknownHint": "Se comprueba al actualizar la fuente.",
     "healthDetail": {
       "not_found": "No se encontró el recurso de origen.",
       "item_withdrawn": "El elemento STAC fue retirado.",
@@ -834,6 +909,10 @@
       "dialogDescription": "Vuelve a extraer los datos de este conjunto desde donde se importaron originalmente. El conjunto de datos sigue sirviendo sus datos actuales hasta que los nuevos estén listos.",
       "reviewDialogTitle": "Revisar y reintentar la actualización",
       "reviewDialogDescription": "Vuelve a consultar la fuente y publica solo si coincide con la ejecución revisada.",
+      "uploadReviewDialogTitle": "Publicar el reemplazo revisado",
+      "uploadReviewDialogDescription": "Publique el archivo que esta ejecución retuvo, a partir de la carga que conservó. Solo se publica si sus cambios siguen coincidiendo con los indicados para esta ejecución.",
+      "uploadConfirm": "Publicar reemplazo",
+      "uploadToastAccepted": "Reemplazo iniciado (ejecución {{runId}}).",
       "tokenLabel": "Token de acceso (opcional)",
       "tokenPlaceholder": "Solo necesario para una fuente protegida",
       "tokenHint": "Se usa solo para esta actualización; no se almacena con el conjunto de datos.",
@@ -893,6 +972,7 @@
         "empty": "Todavía no hay actualizaciones.",
         "featureDelta": "{{before}} → {{after}} entidades",
         "triggeredBy": "Iniciado por {{username}}",
+        "scheduledFor": "Programada para {{time}}",
         "mechanismLabel": "Método: {{mechanism}}",
         "mechanismTooltip": "Cómo se ejecutó esta actualización, no el origen del conjunto de datos",
         "status": {
@@ -901,7 +981,8 @@
           "succeeded": "Correcta",
           "failed": "Fallida",
           "cancelled": "Cancelada",
-          "blocked": "Requiere revisión"
+          "blocked": "Requiere revisión",
+          "accepted": "Aceptado"
         },
         "sourceCountUnavailable": "Recuento de la fuente no disponible.",
         "identityUnavailable": "No se compararon las identidades de los registros.",
@@ -912,12 +993,145 @@
         "permalink": "Enlace",
         "reason": {
           "source_count_unavailable": "GeoLens no pudo comparar las filas obtenidas con la fuente, por lo que la publicación requiere revisión.",
-          "empty_result": "La actualización sustituiría un conjunto con datos por un resultado vacío.",
-          "destructive_schema_change": "La actualización elimina columnas o cambia sus tipos."
+          "empty_result": "Los nuevos datos sustituirían un conjunto con datos por uno vacío.",
+          "destructive_schema_change": "Los nuevos datos eliminan columnas o cambian sus tipos.",
+          "geometry_type_changed": "Los nuevos datos cambian el tipo de geometría.",
+          "srid_changed": "Los nuevos datos cambian el sistema de coordenadas.",
+          "coordinate_dimension_reduced": "Los nuevos datos eliminan dimensiones de coordenadas, como la elevación.",
+          "arcgis_id_coverage_unavailable": "GeoLens no pudo verificar la cobertura de identificadores de objeto de ArcGIS.",
+          "arcgis_source_membership_changed": "La fuente de ArcGIS cambió mientras se ejecutaba esta actualización.",
+          "live_data_changed": "Se editaron entidades mientras se ejecutaba este reemplazo. Publicarlo descartaría esas ediciones."
         },
         "reviewAndRetry": "Revisar y reintentar",
+        "acceptedReasonsLabel": "Motivos de revisión que se aceptaron:",
         "loadMore": "Cargar ejecuciones anteriores"
       }
+    },
+    "sync": {
+      "title": "Sincronización programada",
+      "description": "Mantén esta fuente ArcGIS actualizada con una programación UTC.",
+      "loading": "Cargando sincronización programada",
+      "unavailable": "La sincronización programada está disponible cuando la capacidad de programación Enterprise está activa.",
+      "unsupportedSource": "Esta fuente no se puede programar. Se admiten capas ArcGIS FeatureServer con identificador entero.",
+      "reader": "Puedes ver la fuente de este conjunto de datos. Un propietario o administrador puede configurar la sincronización programada.",
+      "notConfigured": "No hay una programación configurada. Crea un borrador, ejecuta la verificación y actívala explícitamente.",
+      "setup": "Configurar programación",
+      "setupTitle": "Configurar sincronización programada",
+      "editTitle": "Editar sincronización programada",
+      "dialogDescription": "La vinculación de la fuente permanece fija. Las horas usan UTC.",
+      "replacementWarningTitle": "La actualización programada reemplaza los datos locales",
+      "replacementWarning": "Cada actualización programada reemplaza la copia local del conjunto de datos. Los cambios locales pueden sobrescribirse.",
+      "createDraft": "Crear borrador",
+      "save": "Guardar programación",
+      "edit": "Editar",
+      "runNow": "Ejecutar verificación",
+      "pause": "Pausar",
+      "enable": "Activar programación",
+      "detach": "Desvincular",
+      "detachTitle": "¿Desvincular sincronización programada?",
+      "detachDescription": "Se cancelará el trabajo futuro no reclamado. Las ejecuciones ya reclamadas continúan y permanecen en el historial.",
+      "enableTitle": "¿Activar la sincronización programada?",
+      "enableDescription": "Cada actualización programada reemplaza la copia local del conjunto de datos. Los cambios locales pueden sobrescribirse. Actívela solo si esto es lo esperado.",
+      "runAccepted": "Ejecución de verificación en cola.",
+      "paused": "Sincronización programada pausada.",
+      "enabled": "Sincronización programada activada.",
+      "detached": "Sincronización programada desvinculada.",
+      "cadenceLabel": "Programación",
+      "nextDue": "Próxima ejecución",
+      "credential": "Credencial",
+      "publicSource": "Fuente pública",
+      "lastRun": "Última ejecución de sincronización",
+      "noRuns": "Aún no hay ejecuciones programadas",
+      "verificationRun": "Ejecución de verificación",
+      "occurrenceState": {
+        "planned": "En cola",
+        "admitted": "Admitida",
+        "delivered": "Entregada",
+        "claimed": "En ejecución",
+        "completed": "Completada",
+        "failed": "Fallida",
+        "cancelled": "Cancelada",
+        "expired": "Expirada"
+      },
+      "status": {
+        "draft": "Borrador",
+        "enabled": "Activa",
+        "paused": "Pausada"
+      },
+      "cadence": {
+        "hourly": "Cada hora",
+        "daily": "Diaria",
+        "weekly": "Semanal",
+        "hourlyAt": "Cada hora a las {{time}}",
+        "dailyAt": "Diariamente a las {{time}}",
+        "weeklyAt": "{{weekday}} a las {{time}}"
+      },
+      "weekday": {
+        "0": "Lunes",
+        "1": "Martes",
+        "2": "Miércoles",
+        "3": "Jueves",
+        "4": "Viernes",
+        "5": "Sábado",
+        "6": "Domingo"
+      },
+      "form": {
+        "cadence": "Frecuencia",
+        "weekday": "Día de la semana",
+        "hour": "Hora",
+        "minute": "Minuto",
+        "utc": "Todas las horas usan UTC.",
+        "credential": "Credencial",
+        "publicSource": "Sin credencial (fuente pública)",
+        "newCredential": "Guardar una credencial nueva",
+        "credentialName": "Nombre de la credencial",
+        "token": "Token de ArcGIS",
+        "tokenHint": "El token se envía una vez y nunca se muestra ni se guarda en este navegador.",
+        "replaceToken": "Reemplazar token guardado",
+        "cancelReplace": "Conservar token actual",
+        "credentialRequired": "Introduce un nombre de credencial y un token.",
+        "tokenRequired": "Introduce un token.",
+        "invalidTime": "Introduce una hora UTC válida."
+      },
+      "eligibility": {
+        "qualifying_run_required": "Ejecuta correctamente la verificación antes de activar esta programación.",
+        "verification_policy_changed": "La política de verificación cambió. Ejecuta la verificación de nuevo antes de activar esta programación.",
+        "source_or_credential_changed": "La fuente o la credencial cambió. Ejecuta la verificación de nuevo antes de activar esta programación."
+      },
+      "pauseReason": {
+        "qualification_required": "Se requiere una ejecución de verificación válida.",
+        "review_required": "Revisa la actualización más reciente antes de activar esta programación.",
+        "transient_failures": "La programación se pausó tras fallos transitorios repetidos.",
+        "credential_invalid": "La credencial guardada ya no es válida.",
+        "authorization_changed": "La autorización de la fuente cambió.",
+        "source_changed": "La vinculación de la fuente cambió y requiere verificación.",
+        "source_or_credential_changed": "La fuente o la credencial cambió y requiere verificación.",
+        "database_restored": "La programación se pausó después de restaurar la base de datos.",
+        "restored": "La programación se restauró en pausa.",
+        "manual": "La programación se pausó manualmente."
+      },
+      "errors": {
+        "loadFailed": "No se pudo cargar la sincronización programada.",
+        "credentialsUnavailable": "No se pudieron cargar las credenciales almacenadas. Aún puede programar una fuente pública o guardar una credencial nueva.",
+        "saveFailed": "No se pudo guardar la sincronización programada.",
+        "revisionConflict": "Esta programación cambió en el servidor. Revisa los detalles actuales e inténtalo de nuevo.",
+        "notEligible": "Esta fuente no es apta para una ejecución de verificación.",
+        "runFailed": "No se pudo iniciar la verificación.",
+        "qualificationRequired": "Ejecuta correctamente la verificación antes de activar esta programación.",
+        "statusFailed": "No se pudo cambiar el estado de la programación.",
+        "detachFailed": "No se pudo desvincular la sincronización programada.",
+        "occurrenceError": {
+          "admissionMetadataError": "No se pudo admitir la programación porque cambió la metadata de la fuente. Revise la fuente e inténtelo de nuevo.",
+          "admissionInvalid": "No se pudo admitir la programación. Revise la fuente y la configuración, e inténtelo de nuevo.",
+          "admissionFailed": "No se pudo admitir la programación. Inténtelo de nuevo o revise la configuración de la fuente.",
+          "sourceChanged": "La fuente cambió. Revísela y ejecute la verificación antes de activar la programación.",
+          "localEditsChanged": "Las ediciones locales cambiaron el conjunto de datos. Revise y resuelva los cambios locales antes de la próxima ejecución.",
+          "credentialExpired": "La credencial almacenada caducó. Actualícela y ejecute la verificación de nuevo.",
+          "failed": "Esta ejecución programada no se completó. Revise la programación e inténtelo de nuevo.",
+          "expired": "Esta ejecución programada venció antes de poder iniciarse. Se volverá a intentar en el próximo horario programado."
+        }
+      },
+      "verificationHelp": "La verificación comprueba que se hayan obtenido todos los ID de la fuente y que el conjunto de ID no haya cambiado. Los atributos de la fuente aún pueden cambiar durante la actualización."
     },
     "vrt": {
       "title": "Miembros VRT",
@@ -1025,5 +1239,41 @@
     "description": "Tienes cambios sin guardar. ¿Seguro que quieres salir? Se perderán tus cambios.",
     "stay": "Permanecer",
     "leave": "Salir"
+  },
+  "pointcloud": {
+    "title": "Nube de puntos COPC",
+    "pointCount": "Puntos",
+    "crs": "SRC horizontal",
+    "size": "Tamaño del archivo",
+    "pointFormat": "Formato de puntos",
+    "bounds": "Límites geográficos",
+    "elevationRange": "Rango de elevación",
+    "verticalCrs": "SRC vertical",
+    "accessTitle": "Abrir en un cliente de nubes de puntos",
+    "urlLabel": "URL de COPC",
+    "copyUrl": "Copiar URL de COPC",
+    "privateHint": "Esta nube de puntos requiere una clave API de solo lectura. Use X-Api-Key en clientes que admitan encabezados. Los ejemplos contienen un marcador, nunca su clave.",
+    "clientLabel": "Cliente de nubes de puntos",
+    "potreeHint": "Potree no puede enviar el encabezado X-Api-Key para COPC. Sustituya el marcador de la URL por su clave de solo lectura y trate la URL resultante como secreta.",
+    "copySnippet": "Copiar ejemplo del cliente",
+    "qgisSteps": "QGIS {{version}} → Capa > Añadir capa > Añadir capa de nube de puntos\nTipo de fuente: Protocolo: HTTP(S), nube, etc.\nURL: {{url}}",
+    "qgisAuthentication": "Autenticación: API Header → X-Api-Key: YOUR_API_KEY",
+    "qgisPrivateVersionHint": "Se necesita QGIS 4.0 o posterior para usar la autenticación API Header con una capa de nube de puntos.",
+    "instructions": "QGIS, Potree y copc.js"
+  },
+  "tileset": {
+    "title": "Tileset de 3D Tiles",
+    "version": "Versión",
+    "geometricError": "Error geométrico",
+    "boundingVolume": "Volumen envolvente",
+    "size": "Tamaño descomprimido",
+    "extent": "Extensión",
+    "noExtent": "No hay extensión registrada para este tileset.",
+    "contentTypes": "Tipos de contenido",
+    "extensionsRequired": "Extensiones requeridas",
+    "accessTitle": "Cargar en un cliente de 3D Tiles",
+    "urlLabel": "URL del tileset",
+    "headerHint": "Los tilesets internos, restringidos y privados necesitan una clave de API en el encabezado X-Api-Key. Usa una clave de solo lectura, ya que CesiumJS la envía con cada solicitud que hace al cargar el tileset.",
+    "copySnippet": "Copiar fragmento de CesiumJS"
   }
 }

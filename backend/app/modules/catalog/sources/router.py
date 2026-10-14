@@ -28,6 +28,7 @@ from app.core.identity import Identity
 from app.modules.auth.dependencies import require_permission
 from app.modules.catalog.datasets.domain.models import Dataset, Record
 from app.core.dependencies import get_db
+from app.platform.jobs import ledger
 from app.platform.jobs.models import IngestJob
 from app.platform.extensions import get_catalog_port, get_connector_extension
 from app.core.service_tokens import (
@@ -784,8 +785,8 @@ async def _create_preview_job(
 ) -> IngestJob:
     """Create the pending IngestJob for a successful preview, audit, and commit.
 
-    Stores source_columns/geometry_type so ingest_service can skip geometry
-    flags for non-spatial tables and fall back to column_info when needed.
+    Stores geometry_type so ingest_service can skip geometry flags for
+    non-spatial tables.
 
     ``source_url``/``layer_id`` override the request values so commit ingests
     the exact previewed resource — matters for ArcGIS, where preview
@@ -796,21 +797,19 @@ async def _create_preview_job(
     effective_url = source_url if source_url is not None else request.url
     effective_layer_id = layer_id if layer_id is not None else request.layer_id
     safe_request_url = redact_url_credentials(request.url)
-    job = IngestJob(
+    job = ledger.create(
+        db,
+        created_by=user_id,
         source_filename=request.layer_title or request.layer_name,
         source_url=effective_url,
         source_layer=request.layer_name,
-        created_by=user_id,
-        status="pending",
         user_metadata={
             "service_type": request.service_type,
             "layer_id": effective_layer_id,
             "object_id_field": request.object_id_field,
-            "geometry_type": preview_data.get("geometry_type"),
-            "source_columns": preview_data.get("columns") or [],
+            **{k: preview_data.get(k) for k in ("geometry_type", "field_labels")},
         },
     )
-    db.add(job)
     await db.flush()
 
     logger.info(

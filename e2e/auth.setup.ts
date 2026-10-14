@@ -6,14 +6,18 @@ import {
   seedDataset,
   type SeededDataset,
 } from './helpers/catalog';
+import { countRateLimitedResponses, tokenFileFor } from './helpers/session';
 
-const authFile = path.join(__dirname, '../playwright/.auth/user.json');
+const authFile = process.env.E2E_AUTH_FILE
+  ? path.resolve(process.env.E2E_AUTH_FILE)
+  : path.join(__dirname, '../playwright/.auth/user.json');
 const catalogFixtureFile = path.join(__dirname, '../playwright/.auth/catalog-fixture.json');
 
 setup('authenticate as admin', async ({ page }) => {
   setup.slow();
   const adminUser = process.env.GEOLENS_ADMIN_USERNAME ?? 'admin';
   const adminPass = process.env.GEOLENS_ADMIN_PASSWORD ?? 'admin';
+  countRateLimitedResponses(page.context());
 
   await page.goto('/login');
 
@@ -23,6 +27,14 @@ setup('authenticate as admin', async ({ page }) => {
   // Fill credentials
   await page.getByLabel('Username').fill(adminUser);
   await page.locator('#password').fill(adminPass);
+
+  // The SPA keeps the access token in memory, so API calls made outside the
+  // browser take theirs from the sign-in response.
+  const loginResponse = page.waitForResponse(
+    (response) =>
+      response.request().method() === 'POST' &&
+      new URL(response.url()).pathname.endsWith('/auth/login'),
+  );
 
   // Submit the form
   await page.getByRole('button', { name: 'Sign In' }).click();
@@ -52,8 +64,11 @@ setup('authenticate as admin', async ({ page }) => {
     expect(page.url()).not.toContain('/login');
   });
 
-  // Save storage state (includes localStorage with auth token)
+  // The refresh cookie and the non-secret session marker; no token.
   await page.context().storageState({ path: authFile });
+  const { access_token: token } = (await (await loginResponse).json()) as { access_token?: string };
+  expect(token, 'sign-in response should carry an access token').toBeTruthy();
+  fs.writeFileSync(tokenFileFor(authFile), JSON.stringify({ token }), { mode: 0o600 });
 
   // fix(#547): host-backend stacks (uvicorn on the host + docker Postgres)
   // cannot run the real ingest that seedDataset needs, so E2E_SKIP_SEED=1

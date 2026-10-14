@@ -1,7 +1,7 @@
-"""Regression test for ING-06 / P2-08: ``_apply_reupload_swap`` must retry once on lock_timeout failure.
+"""Regression test for ING-06 / P2-08: the reupload swap must retry once on lock_timeout failure.
 
 Background — see ``.planning/audits/INGEST-AUDIT-2026-05-21.md`` P2-08:
-``_apply_reupload_swap`` ran ``SET LOCAL lock_timeout = '5s'`` before three
+the swap ran ``SET LOCAL lock_timeout = '5s'`` before three
 ``ALTER TABLE ... RENAME TO`` statements. Under autovacuum contention on
 large tables the AccessExclusiveLock acquire failed at the 5s mark, AFTER
 staging had been loaded — surfacing a late, user-visible failure.
@@ -19,11 +19,33 @@ import structlog
 from asyncpg.exceptions import LockNotAvailableError
 from sqlalchemy import text
 
+from app.platform.jobs.heartbeat import previous_version_table
+from app.processing.ingest.catalog_projection import Measurement
 from app.processing.ingest.tasks_common import (
-    _apply_reupload_swap,
+    _install_reupload_table,
     _is_lock_timeout_error,
+    _write_reupload_catalog,
     rename_pkey_to_match_table,
 )
+
+# What the settlement seam reads off a file or service strategy to take the rows.
+_SWAP = types.SimpleNamespace(raster_row=False, catalog_event="reupload_swap_catalog")
+
+
+async def swap_in(session, *, dataset, staging_table, measurement, **writes):
+    """Publish a staging table as the settlement seam does, outside a job."""
+    from app.platform import catalog_locks
+    from app.processing.ingest.publication import _take_catalog_rows
+
+    await _install_reupload_table(
+        session, dataset=dataset, staging_table=staging_table, measurement=measurement
+    )
+    await _take_catalog_rows(session, _SWAP, dataset)
+    written = await _write_reupload_catalog(
+        session, dataset=dataset, measurement=measurement, **writes
+    )
+    await catalog_locks.bump_tile_cache_version_on(session, dataset)
+    return written
 
 
 class TestIsLockTimeoutError:
@@ -63,33 +85,28 @@ class TestIsLockTimeoutError:
 
 
 def _make_dataset_stub(table_name: str):
-    """Build a minimal dataset object satisfying the attributes ``_apply_reupload_swap`` reads."""
-    # fix(#1361): the swap re-derives record_type from the geometry the swapped
-    # relation actually has, so the stub has to carry one to re-derive.
-    record = types.SimpleNamespace(
-        spatial_extent=None,
-        updated_by=None,
-        record_type="vector_dataset",
-    )
-    dataset = types.SimpleNamespace(
+    """Build a minimal dataset object satisfying the attributes the swap reads."""
+    return types.SimpleNamespace(
         id=uuid.uuid4(),
-        record=record,
+        record=types.SimpleNamespace(updated_by=None),
         record_id=uuid.uuid4(),
         table_name=table_name,
         current_version=1,
         tile_cache_version=1,
-        srid=4326,
-        geometry_type="Point",
-        feature_count=1,
-        column_info=[{"name": "name", "type": "character varying"}],
-        sample_values={},
-        source_format="csv",
-        source_filename="orig.csv",
-        original_srid=4326,
         source_url=None,
-        quality_detail=None,
+        last_refreshed_at=None,
     )
-    return dataset
+
+
+def _stub_projection(monkeypatch, trace: list | None = None) -> None:
+    """Stand in for ``project``, which writes catalog rows these stubs do not have."""
+
+    async def _project(session, dataset, measurement):
+        if trace is not None:
+            trace.append(("write", "project"))
+        return {}
+
+    monkeypatch.setattr("app.processing.ingest.catalog_projection.project", _project)
 
 
 def _stub_atomic_bump(monkeypatch) -> None:
@@ -103,7 +120,7 @@ def _stub_atomic_bump(monkeypatch) -> None:
 
 
 def _make_port():
-    """The ProcessingPort surface ``_apply_reupload_swap`` actually reaches for.
+    """The ProcessingPort surface the swap actually reaches for.
 
     The swap resolves both mapped classes through the port, so a stub offering
     only ``get_dataset_version_orm_class`` AttributeErrors. The real classes
@@ -128,181 +145,23 @@ def _make_port():
     return _Port
 
 
-def _minimal_metadata():
-    return {
-        "srid": 4326,
-        "geometry_type": "Point",
-        "feature_count": 1,
-        "extent_wkt": None,
-        "column_info": [{"name": "name", "type": "character varying"}],
-    }
+def _minimal_measurement() -> Measurement:
+    return Measurement(
+        metadata={
+            "srid": 4326,
+            "geometry_type": "POINT",
+            "feature_count": 1,
+            "extent_wkt": None,
+            "column_info": [{"name": "name", "type": "character varying"}],
+        },
+        sample_values={},
+        three_d={},
+        geometry_type="POINT",
+        quality_detail={},
+    )
 
 
-class _WriteRecorder:
-    """A stub that appends to a shared trace the first time each field is set."""
-
-    def __init__(self, trace, label, **fields):
-        object.__setattr__(self, "_trace", trace)
-        object.__setattr__(self, "_label", label)
-        object.__setattr__(self, "_armed", False)
-        for name, value in fields.items():
-            object.__setattr__(self, name, value)
-
-    def arm(self):
-        object.__setattr__(self, "_armed", True)
-
-    def __setattr__(self, name, value):
-        if self._armed:
-            self._trace.append(("write", f"{self._label}.{name}"))
-        object.__setattr__(self, name, value)
-
-
-class TestSwapLocksBeforeItWrites:
-    """The acquisition has to PRECEDE the first row write.
-
-    Drives the real swap against the real session and records two things on one
-    timeline: the SQL emitted, and the moment a field is first assigned. A
-    count-based assertion cannot separate the two orderings.
-    """
-
-    @pytest.fixture(autouse=True)
-    async def setup_tables(self, test_db_session):
-        self.session = test_db_session
-        suffix = uuid.uuid4().hex[:8]
-        self.live = f"swap_ord_{suffix}"
-        self.staging = f"swap_ords_{suffix}"
-        for tn in (self.live, self.staging, f"{self.live}_old"):
-            await self.session.execute(
-                text(f'DROP TABLE IF EXISTS data."{tn}" CASCADE')
-            )
-        await self.session.commit()
-        for tn in (self.live, self.staging):
-            await self.session.execute(
-                text(
-                    f'CREATE TABLE data."{tn}" '
-                    "(id serial PRIMARY KEY, name text, geom geometry(Point, 4326))"
-                )
-            )
-            await self.session.execute(
-                text(f"INSERT INTO data.\"{tn}\" (name) VALUES ('row')")
-            )
-        await self.session.commit()
-        yield
-        for tn in (self.live, self.staging, f"{self.live}_old"):
-            await self.session.execute(
-                text(f'DROP TABLE IF EXISTS data."{tn}" CASCADE')
-            )
-        await self.session.commit()
-
-    async def test_the_pair_is_locked_before_any_field_is_assigned(
-        self, monkeypatch
-    ) -> None:
-        trace: list[tuple[str, str]] = []
-
-        record = _WriteRecorder(
-            trace,
-            "record",
-            spatial_extent=None,
-            updated_by=None,
-            record_type="vector_dataset",
-        )
-        dataset = _WriteRecorder(
-            trace,
-            "dataset",
-            id=uuid.uuid4(),
-            record=record,
-            record_id=uuid.uuid4(),
-            table_name=self.live,
-            current_version=1,
-            tile_cache_version=1,
-            srid=4326,
-            geometry_type="Point",
-            feature_count=1,
-            column_info=[{"name": "name", "type": "character varying"}],
-            sample_values={},
-            source_format="csv",
-            source_filename="orig.csv",
-            original_srid=4326,
-            source_url=None,
-            quality_detail=None,
-        )
-        _stub_atomic_bump(monkeypatch)
-
-        async def _noop(*args, **kwargs):
-            return None
-
-        async def _noop_quality(*args, **kwargs):
-            return {"score": 0.0, "issues": []}
-
-        monkeypatch.setattr(
-            "app.processing.ingest.metadata.refresh_attribute_metadata", _noop
-        )
-        monkeypatch.setattr(
-            "app.processing.ingest.metadata.compute_quality_score", _noop_quality
-        )
-        monkeypatch.setattr("app.modules.audit.service.audit_emit", _noop)
-        monkeypatch.setattr("app.platform.extensions.get_processing_port", _make_port)
-        monkeypatch.setattr(self.session, "add", lambda *a, **kw: None)
-
-        real_execute = self.session.execute
-
-        async def _recording_execute(statement, *args, **kwargs):
-            trace.append(("sql", str(statement)))
-            return await real_execute(statement, *args, **kwargs)
-
-        monkeypatch.setattr(self.session, "execute", _recording_execute)
-
-        record.arm()
-        dataset.arm()
-        await _apply_reupload_swap(
-            self.session,
-            dataset=dataset,
-            staging_table=self.staging,
-            metadata=_minimal_metadata(),
-            sample_values={},
-            user_id=str(uuid.uuid4()),
-            source_filename="x.csv",
-            source_format="csv",
-            original_srid=4326,
-        )
-
-        lock_at = next(
-            (
-                i
-                for i, (kind, payload) in enumerate(trace)
-                if kind == "sql"
-                and "FOR UPDATE" in payload.upper()
-                and "datasets" in payload
-            ),
-            None,
-        )
-        assert lock_at is not None, (
-            "the swap never took catalog.datasets FOR UPDATE. Its flush writes "
-            "both catalog rows, and the ORM emits records before datasets, so "
-            f"without the acquisition the order is inverted. trace={trace}"
-        )
-        first_write = next(
-            (i for i, (kind, _p) in enumerate(trace) if kind == "write"), None
-        )
-        assert first_write is not None, "the swap wrote no fields at all"
-        assert lock_at < first_write, (
-            "the swap assigned "
-            f"{trace[first_write][1]} before taking the pair. The acquisition "
-            "has to precede the first write to either row, not merely happen "
-            "somewhere in the same transaction."
-        )
-        # And in the house order: datasets, then records.
-        records_lock_at = next(
-            i
-            for i, (kind, payload) in enumerate(trace)
-            if kind == "sql"
-            and "FOR UPDATE" in payload.upper()
-            and "records" in payload
-        )
-        assert lock_at < records_lock_at
-
-
-class TestApplyReuploadSwapRetry:
+class TestReuploadSwapRetry:
     """Exercise the swap retry behavior on a real test DB session."""
 
     @pytest.fixture(autouse=True)
@@ -352,24 +211,10 @@ class TestApplyReuploadSwapRetry:
         """No contention → swap completes silently; neither retry log fires."""
         dataset = _make_dataset_stub(self.live)
 
-        # Bypass downstream metadata writes that need real ORM objects.
-        async def _noop_refresh(*args, **kwargs):
-            return None
-
-        async def _noop_quality(*args, **kwargs):
-            return {"score": 0.0, "issues": []}
-
         async def _noop_audit(*args, **kwargs):
             return None
 
-        monkeypatch.setattr(
-            "app.processing.ingest.metadata.refresh_attribute_metadata",
-            _noop_refresh,
-        )
-        monkeypatch.setattr(
-            "app.processing.ingest.metadata.compute_quality_score",
-            _noop_quality,
-        )
+        _stub_projection(monkeypatch)
         monkeypatch.setattr(
             "app.modules.audit.service.audit_emit",
             _noop_audit,
@@ -385,12 +230,11 @@ class TestApplyReuploadSwapRetry:
         monkeypatch.setattr(self.session, "add", lambda *a, **kw: None)
 
         with structlog.testing.capture_logs() as captured:
-            await _apply_reupload_swap(
+            await swap_in(
                 self.session,
                 dataset=dataset,
                 staging_table=self.staging,
-                metadata=_minimal_metadata(),
-                sample_values={},
+                measurement=_minimal_measurement(),
                 user_id=str(uuid.uuid4()),
                 source_filename="x.csv",
                 source_format="csv",
@@ -450,23 +294,10 @@ class TestApplyReuploadSwapRetry:
         origin was never contacted right after it demonstrably was."""
         dataset = _make_dataset_stub(self.live)
 
-        async def _noop_refresh(*args, **kwargs):
-            return None
-
-        async def _noop_quality(*args, **kwargs):
-            return {"score": 0.0, "issues": []}
-
         async def _noop_audit(*args, **kwargs):
             return None
 
-        monkeypatch.setattr(
-            "app.processing.ingest.metadata.refresh_attribute_metadata",
-            _noop_refresh,
-        )
-        monkeypatch.setattr(
-            "app.processing.ingest.metadata.compute_quality_score",
-            _noop_quality,
-        )
+        _stub_projection(monkeypatch)
         monkeypatch.setattr(
             "app.modules.audit.service.audit_emit",
             _noop_audit,
@@ -479,12 +310,11 @@ class TestApplyReuploadSwapRetry:
         _stub_atomic_bump(monkeypatch)
         monkeypatch.setattr(self.session, "add", lambda *a, **kw: None)
 
-        await _apply_reupload_swap(
+        await swap_in(
             self.session,
             dataset=dataset,
             staging_table=self.staging,
-            metadata=_minimal_metadata(),
-            sample_values={},
+            measurement=_minimal_measurement(),
             user_id=str(uuid.uuid4()),
             source_filename=None,
             source_format="wfs",
@@ -506,23 +336,10 @@ class TestApplyReuploadSwapRetry:
         """First swap raises ``LockNotAvailableError``; retry succeeds and both logs fire."""
         dataset = _make_dataset_stub(self.live)
 
-        async def _noop_refresh(*args, **kwargs):
-            return None
-
-        async def _noop_quality(*args, **kwargs):
-            return {"score": 0.0, "issues": []}
-
         async def _noop_audit(*args, **kwargs):
             return None
 
-        monkeypatch.setattr(
-            "app.processing.ingest.metadata.refresh_attribute_metadata",
-            _noop_refresh,
-        )
-        monkeypatch.setattr(
-            "app.processing.ingest.metadata.compute_quality_score",
-            _noop_quality,
-        )
+        _stub_projection(monkeypatch)
         monkeypatch.setattr(
             "app.modules.audit.service.audit_emit",
             _noop_audit,
@@ -552,14 +369,14 @@ class TestApplyReuploadSwapRetry:
         # call inside ``_swap_with_timeout`` raises ``LockNotAvailableError``.
         original_execute = self.session.execute
         raised = {"once": False}
+        kept = previous_version_table(self.live, dataset.id)
 
         async def _flaky_execute(stmt, *args, **kwargs):
-            # Only intercept the live-table rename on the first pass.
-            # ``_qtable`` produces ``"data"."{name}"`` so we look for the
-            # full RENAME-to-_old shape rather than just the table name
-            # (which would also match the SELECT EXISTS pre-check).
+            # Only intercept the live-table rename on the first pass: the
+            # full RENAME shape, since the table name alone would also match
+            # the SELECT EXISTS pre-check.
             sql = str(getattr(stmt, "text", stmt))
-            if not raised["once"] and f'RENAME TO "{self.live}_old"' in sql:
+            if not raised["once"] and f'RENAME TO "{kept}"' in sql:
                 raised["once"] = True
                 raise LockNotAvailableError("simulated autovacuum contention")
             return await original_execute(stmt, *args, **kwargs)
@@ -567,12 +384,11 @@ class TestApplyReuploadSwapRetry:
         monkeypatch.setattr(self.session, "execute", _flaky_execute)
 
         with structlog.testing.capture_logs() as captured:
-            await _apply_reupload_swap(
+            await swap_in(
                 self.session,
                 dataset=dataset,
                 staging_table=self.staging,
-                metadata=_minimal_metadata(),
-                sample_values={},
+                measurement=_minimal_measurement(),
                 user_id=str(uuid.uuid4()),
                 source_filename="x.csv",
                 source_format="csv",

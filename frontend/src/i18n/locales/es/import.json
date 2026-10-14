@@ -76,7 +76,17 @@
     "quotaShort": "Omitido: límite de conjuntos de datos alcanzado",
     "quotaBannerTitle": "Límite de conjuntos de datos alcanzado",
     "quotaBannerHint": "Elimina conjuntos de datos existentes para liberar espacio o pide a un administrador que aumente el límite.",
-    "reportProblem": "Informar de este problema"
+    "reportProblem": "Informar de este problema",
+    "kindLegend": "¿Qué vas a subir?",
+    "kindFiles": "Archivos geoespaciales",
+    "kindFilesHint": "Datos vectoriales, ráster o tabulares",
+    "kindTileset": "Tileset de 3D Tiles",
+    "kindTilesetHint": "Un archivo .zip o .3tz con tileset.json en la raíz o en una carpeta",
+    "kindTilesetUnavailable": "No disponible hasta que un administrador permita subir archivos .zip o .3tz",
+    "kindLocked": "Bloqueado mientras los archivos soltados esperan a que se cargue la configuración de subida",
+    "kindPointCloud": "Nube de puntos COPC",
+    "kindPointCloudHint": "Un archivo .laz en formato COPC; otros archivos LAS/LAZ requieren conversión previa",
+    "kindPointCloudUnavailable": "No disponible hasta que un administrador permita subir archivos .laz"
   },
   "warnings": {
     "bannerTitle": "Importación completada con advertencias",
@@ -104,20 +114,34 @@
     "temporalParseErrors": {
       "title": "Campos temporales descartados",
       "description": "Los siguientes valores temporales no se pudieron analizar como fechas ISO-8601 y se descartaron. Vuelva a introducirlos en el editor de metadatos del conjunto de datos para restaurarlos."
-    }
+    },
+    "compactSummary_one": "{{count}} aviso de importación · Ver detalles",
+    "compactSummary_other": "{{count}} avisos de importación · Ver detalles",
+    "compactDataLoss_one": "{{count}} aviso de datos · Algunos datos pueden haber cambiado · Ver detalles",
+    "compactDataLoss_other": "{{count}} avisos de datos · Algunos datos pueden haber cambiado · Ver detalles",
+    "compactArchiveFailure_one": "{{count}} aviso de importación · Archivo original no disponible · Ver detalles",
+    "compactArchiveFailure_other": "{{count}} avisos de importación · Archivo original no disponible · Ver detalles"
   },
   "dropzone": {
     "ariaLabel": "Subir archivos",
     "instructions": "Arrastre y suelte archivos aquí, o",
     "dropHere": "Suelte los archivos aquí",
     "unsupportedType": "Este tipo de archivo no es compatible",
+    "rejectionReason": {
+      "fileInvalidType": "El tipo de archivo debe ser uno de: {{types}}",
+      "fileTooLarge": "El archivo supera el límite de {{size}} MB",
+      "fileTooSmall": "El archivo es menor que el tamaño mínimo",
+      "tooManyFiles": "Hasta {{max}} archivos por lote",
+      "kindOnly": "Los archivos {{ext}} no se importan en este modo. Elija «{{mode}}»"
+    },
     "sizeLimit": "Máximo 500 MB por archivo",
     "sizeLimitDynamic": "Máximo {{size}} MB por archivo",
     "batchLimit": "Hasta {{max}} archivos por lote",
     "fileRejected": "{{filename}}: {{reason}}",
     "browse": "Examinar",
     "toUpload": "para cargar",
-    "subtext": "GeoLens detectará geometría, CRS y esquema antes de enviarlo al catálogo. Lotes de hasta {{max}} archivos."
+    "subtext": "GeoLens detectará geometría, CRS y esquema antes de enviarlo al catálogo. Lotes de hasta {{max}} archivos.",
+    "tilesetSubtext": "GeoLens comprueba cada archivo y lee su tileset.json antes de almacenar nada."
   },
   "stac": {
     "label": "URL de API STAC; pegue el endpoint raíz del catálogo",
@@ -161,6 +185,10 @@
     "assetCount_one": "{{count}} recurso",
     "assetCount_other": "{{count}} recursos",
     "noCogAsset": "Sin recurso COG",
+    "unsupportedAssetScheme": "Publicado en una dirección {{scheme}}:// que GeoLens no puede leer",
+    "assetUrlInvalid": "Su dirección no es una URL http o https válida",
+    "assetHasCredentials": "Usa una URL firmada o con credenciales, que GeoLens no almacena",
+    "assetHrefTooLong": "Su dirección es demasiado larga para que GeoLens la almacene",
     "catalogHelp": "Explore e importe conjuntos de datos ráster desde catálogos STAC públicos como",
     "matchedTotal": "({{count}} en total)",
     "confirm": {
@@ -170,9 +198,10 @@
       "itemsLabel": "Elementos",
       "totalSizeLabel": "Tamaño total estimado",
       "sizeUnavailable": "Tamaño no disponible",
+      "sizeChecking": "Comprobando tamaños...",
       "partialSizeNote_one": "{{count}} elemento no tiene información de tamaño; el total es un límite inferior.",
       "partialSizeNote_other": "{{count}} elementos no tienen información de tamaño; el total es un límite inferior.",
-      "estimateSource": "Estimación basada en el manifiesto STAC (file:size). La descarga real puede diferir.",
+      "estimateSource": "Estimación basada en el manifiesto STAC (file:size) o, si el catálogo no lo incluye, en el servidor del recurso. La descarga real puede diferir.",
       "backToSelection": "Volver a la selección",
       "confirmImport_one": "Confirmar e importar {{count}} elemento",
       "confirmImport_other": "Confirmar e importar {{count}} elementos"
@@ -192,14 +221,27 @@
     "credentialHeaderNamePlaceholder": "p. ej. Ocp-Apim-Subscription-Key",
     "credentialHeaderValueLabel": "Valor del encabezado",
     "credentialHeaderValuePlaceholder": "Su clave API",
-    "credentialHelpText": "Elija el método que documenta su catálogo. Un token bearer se envía como encabezado Authorization; un usuario y contraseña se envían como autenticación HTTP Basic; una clave API puede enviarse bajo el nombre de encabezado que especifique el proveedor, por ejemplo X-API-Key, Ocp-Apim-Subscription-Key o key. Autentica el catálogo, sus colecciones y sus elementos; los teselados se generan desde la URL del recurso y no llevan credencial."
+    "credentialHelpText": "Elija el método que documenta su catálogo. Un token bearer se envía como encabezado Authorization; un usuario y contraseña se envían como autenticación HTTP Basic; una clave API puede enviarse bajo el nombre de encabezado que especifique el proveedor, por ejemplo X-API-Key, Ocp-Apim-Subscription-Key o key. Autentica el catálogo, sus colecciones y sus elementos; los teselados se generan desde la URL del recurso y no llevan credencial.",
+    "filterStart": "Desde",
+    "filterEnd": "Hasta",
+    "filterBbox": "Área (oeste, sur, este, norte)",
+    "filterBboxPlaceholder": "-74.3, 40.5, -73.7, 40.9",
+    "filterApply": "Aplicar filtros",
+    "filterDateOrder": "La fecha de inicio no puede ser posterior a la fecha de fin.",
+    "filterBboxInvalid": "Introduzca cuatro números: oeste, sur, este, norte (longitud de -180 a 180, latitud de -90 a 90, sur no mayor que norte).",
+    "loadMore": "Cargar más",
+    "filterCloud": "Nubosidad máx. (%)",
+    "filterCloudInvalid": "Introduzca una nubosidad entre 0 y 100.",
+    "selectionLimit": "Puede importar hasta {{count}} elementos a la vez."
   },
   "serviceUrl": {
     "label": "URL de servicio",
     "placeholder": "https://example.com/wfs, ArcGIS FeatureServer o endpoint OGC API",
     "helpText": "Pegue una URL de servicio WFS, ArcGIS Feature Service u OGC API Features",
+    "arcgisPortalUrlHint": "Esto parece una página de organización o portal de ArcGIS, no una capa. Abre la página del elemento de la capa, copia su URL REST (termina en /FeatureServer/0 o /MapServer/0) y pégala aquí. Las capas protegidas piden iniciar sesión después de pegar la URL de la capa.",
     "tokenPlaceholder": "Token de ArcGIS, clave API o token de acceso WFS",
     "credentialMethodLabel": "Autenticación",
+    "credentialsReset": "La autenticación se restableció porque cambió la dirección del servicio.",
     "credentialMethodNone": "Sin autenticación",
     "credentialMethodBearer": "Token bearer",
     "credentialMethodBasic": "Usuario y contraseña",
@@ -221,8 +263,10 @@
     "commitFailed": "Error al iniciar la importación",
     "detectedLabel": "URL de servicio; detectada",
     "clear": "Borrar",
-    "layersAvailable": "{{count}} capas disponibles",
+    "layersAvailable_one": "{{count}} capa disponible",
+    "layersAvailable_other": "{{count}} capas disponibles",
     "noLayers": "No se encontraron capas en este servicio.",
+    "unsupportedLayerType": "{{type}} no contiene entidades. Importe una de sus capas de entidades en su lugar.",
     "probe": "Comprobar →",
     "supported": "Compatible:",
     "unknownDataset": "Conjunto de datos desconocido",
@@ -301,6 +345,11 @@
     "successToast_one": "{{count}} tabla registrada correctamente",
     "successToast_other": "{{count}} tablas registradas correctamente",
     "registerFailed": "Error al registrar las tablas",
+    "internalFailure": "No se pudo registrar la tabla por un motivo que el servidor no pudo comunicar de forma segura. Pide a un operador que revise el registro del servidor.",
+    "refusal": {
+      "source_srid_undeclared": "Su columna geom no declara ningún SRID, así que GeoLens no puede saber dónde están sus coordenadas. Define el SRID, por ejemplo con UpdateGeometrySRID, y luego registra la tabla.",
+      "source_gid_unusable": "GeoLens identifica las entidades por una columna llamada gid: un entero NOT NULL y único, como una clave primaria, en una tabla de la que no hereda ninguna otra. Esta tabla no lo cumple. Añade o corrige la columna gid, o cambia el nombre de una que GeoLens no pueda usar para que añada la suya, y luego registra la tabla."
+    },
     "unknownError": "Error desconocido",
     "searchPlaceholder": "Buscar tablas…",
     "selectHint": "Selecciona una tabla de la lista para ver su esquema y registrarla.",
@@ -334,6 +383,7 @@
   },
   "preview": {
     "title": "Vista previa del archivo",
+    "serviceTitle": "Vista previa del servicio",
     "raster": "Ráster",
     "crs": "CRS:",
     "bands": "Bandas:",
@@ -353,7 +403,7 @@
     "moreColumns_one": "+{{count}} columna más",
     "moreColumns_other": "+{{count}} columnas más",
     "noSampleData": "No hay datos de muestra disponibles",
-    "geometryDetected": "Columnas de geometria detectadas",
+    "geometryDetected": "Columnas de geometría detectadas",
     "nonSpatial": "Tabla no espacial"
   },
   "metadata": {
@@ -381,10 +431,10 @@
     "resamplingHelp": "Método para generación de vistas generales. Auto selecciona según el tipo de datos.",
     "nodataLabel": "Valor NoData",
     "nodataHelp": "Sobrescribir o asignar un valor NoData para este ráster.",
-    "geometryColumns": "Columnas de geometria",
+    "geometryColumns": "Columnas de geometría",
     "geometryMode": "Modo",
-    "autoDetected": "Deteccion automatica",
-    "manualOverride": "Anulacion manual",
+    "autoDetected": "Detección automática",
+    "manualOverride": "Anulación manual",
     "nonSpatial": "Importar como no espacial",
     "embeddedGeometry": "Usando geometría integrada",
     "embeddedGeometryHelp": "Esta fuente ya incluye geometría nativa, por lo que GeoLens la conservará durante la importación.",
@@ -465,7 +515,15 @@
     "rasterCount_one": "{{value}} ráster",
     "rasterCount_other": "{{value}} rásters",
     "tableCount_one": "{{value}} conjunto de datos tabular",
-    "tableCount_other": "{{value}} conjuntos de datos tabulares"
+    "tableCount_other": "{{value}} conjuntos de datos tabulares",
+    "tilesetSummary": "3D Tiles {{version}} · {{size}} · {{volume}}",
+    "tilesetCount_one": "{{value}} tileset",
+    "tilesetCount_other": "{{value}} tilesets",
+    "tilesetActionSummary": "{{files}} · {{tilesets}}",
+    "pointcloudSummary": "{{points}} puntos · {{crs}} · {{size}}",
+    "pointcloudCount_one": "{{value}} nube de puntos",
+    "pointcloudCount_other": "{{value}} nubes de puntos",
+    "singleActionHint": "Revisa los ajustes anteriores y después importa este conjunto de datos."
   },
   "detect": {
     "rasterInfo": "Info del ráster",
@@ -485,12 +543,20 @@
       "cog": "COG",
       "type": "tipo",
       "features": "entidades",
-      "layer": "capa"
+      "layer": "capa",
+      "version": "versión",
+      "geometricError": "error geométrico",
+      "volume": "volumen",
+      "extent": "extensión",
+      "unpacked": "descomprimido",
+      "entries": "entradas"
     },
     "table": {
       "column": "Columna",
       "type": "Tipo"
-    }
+    },
+    "tilesetInfo": "Tileset",
+    "noExtent": "ninguna; el volumen no está georreferenciado"
   },
   "bulk": {
     "uploading_one": "Subiendo {{count}} archivo...",
@@ -529,7 +595,13 @@
     "detectingHint": "Cargando y detectando…",
     "importingFiles": "Importando {{count}} archivos",
     "progressDetail": "{{done}} completo · {{active}} en progreso · {{queued}} en cola",
-    "uploadProgressLabel": "Progreso de carga de {{name}}"
+    "uploadProgressLabel": "Progreso de carga de {{name}}",
+    "toggleDetails": "Mostrar u ocultar detalles de {{name}}",
+    "removeNamedFile": "Eliminar {{name}}",
+    "defaultsConfirmTitle": "¿Importar el lote con valores predeterminados?",
+    "defaultsConfirmDescription": "Se usarán los nombres de archivo y la visibilidad privada. Se descartarán todos los cambios en los formularios de revisión, incluidos nombre, descripción, visibilidad, geometría, CRS y ajustes ráster. Cada archivo con varias capas importa solo la capa seleccionada.",
+    "confirmDefaults": "Importar con valores predeterminados",
+    "progressDetailWithFailures": "{{done}} completos · {{failed}} fallidos o cancelados · {{active}} en curso · {{queued}} en cola"
   },
   "eyebrow": "Importar",
   "pageDescription": "Sube archivos, registra tablas de tu Postgres o conecta un servicio remoto. GeoLens detecta geometría, esquema y CRS, luego hace los datos consultables, estilizables e integrables.",
@@ -538,14 +610,23 @@
     "heroTitle_many": "{{count}} de conjuntos de datos añadidos al catálogo",
     "heroTitle_other": "{{count}} conjuntos de datos añadidos al catálogo",
     "heroDesc": "Todos los archivos ingestados, teselados e indexados. Listos para consultar, estilizar y mapear.",
+    "heroDescTilesets": "Listos para cargarse en un cliente de 3D Tiles. La URL del tileset está en la pestaña Acceso del conjunto de datos.",
     "statDatasets": "Conjuntos de datos",
     "statVector": "Vector",
     "statRaster": "Ráster",
     "statTabular": "Tabular",
+    "statTilesets": "3D Tiles",
     "next": "Siguiente:",
     "viewCatalog": "Ver en el catálogo",
     "importMore": "Importar más",
-    "aiMetadata": "Añadir metadatos con IA"
+    "aiMetadata": "Añadir metadatos con IA",
+    "statPointClouds": "Nubes de puntos",
+    "heroDescPointClouds": "Lista para abrir en un cliente COPC. La URL del archivo está en la pestaña Acceso del conjunto de datos.",
+    "partialTitle": "{{completed}} conjuntos de datos añadidos · {{failed}} fallidos o cancelados",
+    "partialDesc": "Algunas importaciones no terminaron. Revisa los trabajos fallidos y abre los conjuntos de datos disponibles.",
+    "heroDescTables": "Las filas y el esquema están listos para consultas y reutilización. Las tablas no espaciales no tienen vista previa en el mapa.",
+    "heroDescMixed": "Los conjuntos de datos están en el catálogo. Abre cada uno para ver sus datos y opciones de acceso.",
+    "failedJobs": "Trabajos fallidos o cancelados"
   },
   "rail": {
     "stageTitle": "Preparar archivos",
@@ -553,7 +634,7 @@
     "reviewTitle": "Revisar detección",
     "reviewDesc": "Confirma el tipo de geometría, CRS, esquema y vista previa de cada archivo.",
     "importTitle": "Importar y catalogar",
-    "importDesc": "Teselar, indexar, publicar; los conjuntos de datos aparecen en el catálogo de inmediato.",
+    "importDesc": "Prepara cada conjunto de datos según su tipo y lo añade al catálogo.",
     "workflow": "Flujo de trabajo",
     "whatImported": "Qué se importa",
     "vectorLabel": "Vector",
@@ -581,7 +662,17 @@
     "urlHint": "Importando desde una URL de archivo",
     "urlDesc": "GeoLens descarga el archivo en el servidor al área de preparación y luego ejecuta el mismo proceso de detección e importación que una carga.",
     "urlNote": "La URL se valida y se limita en tamaño antes de la descarga · los datos se copian en GeoLens",
-    "compareUrl": "La carga envía un archivo desde tu equipo. URL de archivo lo obtiene de la web: misma revisión, mismo resultado, sin descarga local."
+    "compareUrl": "La carga envía un archivo desde tu equipo. URL de archivo lo obtiene de la web: misma revisión, mismo resultado, sin descarga local.",
+    "tiles3dLabel": "3D Tiles",
+    "tiles3dDesc": "se descomprime y se sirve tal cual a los clientes de 3D Tiles.",
+    "partialDesc": "Algunas importaciones fallaron o se cancelaron. Revisa los detalles de los trabajos.",
+    "partialStatus": "Requiere atención",
+    "completeTableDesc": "Filas y esquema listos para consultas y reutilización; sin vista previa en el mapa.",
+    "completeTilesetDesc": "Abre la pestaña Acceso para obtener la URL del cliente de 3D Tiles.",
+    "completePointCloudDesc": "Abre la pestaña Acceso para obtener la URL del archivo COPC.",
+    "completeDesc": "Los conjuntos de datos terminados están en el catálogo.",
+    "pointcloudLabel": "Nube de puntos COPC",
+    "pointcloudDesc": "disponible para clientes COPC externos; sin vista previa en el mapa."
   },
   "status": {
     "uploading": "Subiendo",
@@ -590,5 +681,11 @@
     "importing": "Importando",
     "ready": "Listo",
     "failed": "Error"
+  },
+  "pointcloud": {
+    "points": "Puntos",
+    "crs": "SRC",
+    "pointFormat": "Formato de puntos",
+    "size": "Tamaño"
   }
 }

@@ -19,6 +19,7 @@ above it runs anywhere.
 
 import ast
 import codecs
+import importlib.util
 import shutil
 import uuid
 import zipfile
@@ -31,7 +32,7 @@ from app.core.config import settings
 from app.processing.ingest.ogr import _resolve_source_path
 from app.processing.ingest.source_format import (
     derive_source_format,
-    zip_contains_filegdb,
+    zip_data_format,
 )
 from app.processing.ingest.validation import (
     EXTENSION_CONTENT_MAP,
@@ -231,31 +232,72 @@ class TestDeriveSourceFormat:
         assert derive_source_format("/staging/1_a.csv") == "csv"
 
 
-class TestZipContainsFilegdb:
+class TestZipDataFormat:
     def test_real_gdb_zip_detected(self):
-        assert zip_contains_filegdb(str(GDB_ZIP)) is True
+        assert zip_data_format(str(GDB_ZIP)) == "fgdb"
 
     def test_shapefile_zip_not_detected(self):
-        assert zip_contains_filegdb(str(SHAPEFILE_ZIP)) is False
+        assert zip_data_format(str(SHAPEFILE_ZIP)) != "fgdb"
 
     def test_windows_separators_detected(self, tmp_path: Path):
         f = tmp_path / "win.zip"
         with zipfile.ZipFile(f, "w") as zf:
             zf.writestr("data\\parcels.gdb\\a00000001.gdbtable", b"x")
-        assert zip_contains_filegdb(str(f)) is True
+        assert zip_data_format(str(f)) == "fgdb"
 
     def test_bare_directory_entry_detected(self, tmp_path: Path):
         """A writer that stores directory entries names the .gdb with no members."""
         f = tmp_path / "dironly.zip"
         with zipfile.ZipFile(f, "w") as zf:
             zf.writestr("parcels.gdb/", b"")
-        assert zip_contains_filegdb(str(f)) is True
+        assert zip_data_format(str(f)) == "fgdb"
 
     def test_gdb_in_a_filename_is_not_a_directory(self, tmp_path: Path):
         f = tmp_path / "notgdb.zip"
         with zipfile.ZipFile(f, "w") as zf:
             zf.writestr("notes_about_gdb.txt", b"x")
-        assert zip_contains_filegdb(str(f)) is False
+        assert zip_data_format(str(f)) != "fgdb"
+
+    @pytest.mark.parametrize(
+        ("members", "expected"),
+        [
+            (["parcels.csv"], "csv"),
+            (["data/parcels.geojson"], "geojson"),
+            (["parcels.JSON"], "json"),
+            (["parcels.gpkg"], "gpkg"),
+            (["parcels.shp", "parcels.dbf", "parcels.shx"], "shapefile"),
+            (["parcels.shp", "meta.csv", "style.json"], "shapefile"),
+            (["points.csv", "metadata.json"], "csv"),
+            (["__MACOSX/._parcels.csv", "parcels.geojson"], "geojson"),
+            (["readme.txt"], "shapefile"),
+        ],
+    )
+    def test_classified_by_data_member(self, tmp_path: Path, members, expected):
+        f = tmp_path / "bundle.zip"
+        with zipfile.ZipFile(f, "w") as zf:
+            for name in members:
+                zf.writestr(name, b"x")
+        assert zip_data_format(str(f)) == expected
+        assert derive_source_format(str(f)) == expected
+
+    @pytest.mark.parametrize(
+        ("members", "layer", "expected"),
+        [
+            (["points.csv", "metadata.json"], "points", "csv"),
+            (["points.csv", "metadata.json"], "metadata", "json"),
+            (["parcels.shp", "parcels.dbf", "points.csv"], "points", "csv"),
+            (["parcels.shp", "parcels.dbf", "points.csv"], "parcels", "shapefile"),
+            (["parcels.shp", "points.csv"], "unknown_layer", "shapefile"),
+            (["Roads.shp", "roads.csv"], "roads", "csv"),
+            (["Roads.shp", "roads.csv"], "Roads", "shapefile"),
+        ],
+    )
+    def test_selected_layer_decides(self, tmp_path: Path, members, layer, expected):
+        f = tmp_path / "bundle.zip"
+        with zipfile.ZipFile(f, "w") as zf:
+            for name in members:
+                zf.writestr(name, b"x")
+        assert derive_source_format(str(f), layer) == expected
 
 
 class TestSourcePathResolution:
@@ -283,12 +325,12 @@ class TestSourceFormatConstraint:
             if getattr(c, "name", None) == "chk_datasets_source_format"
         )
         sql = str(constraint.sqltext)
-        for value in ("fgb", "kml", "fgdb", "shapefile"):
+        for value in ("fgb", "kml", "fgdb", "shapefile", "csv", "geojson", "gpkg"):
             assert f"'{value}'" in sql
 
     async def test_live_constraint_carries_the_tier1_values(self, test_db_session):
         """The migration ran, not just the model. The test DB is migrated to
-        head by the session fixture, so this reads what 0053 actually built."""
+        head by the session fixture, so this reads what the migrations built."""
         rows = await test_db_session.execute(
             text(
                 "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
@@ -305,19 +347,24 @@ class TestSourceFormatConstraint:
         """The migration is the source of truth; drift here is a silent 500."""
         from app.modules.catalog.datasets.domain.models import Dataset
 
-        migration = (
+        path = (
             Path(__file__).parents[1]
             / "alembic"
             / "versions"
-            / "0053_source_format_fgb.py"
-        ).read_text()
+            / "0070_pointcloud_record_type.py"
+        )
+        spec = importlib.util.spec_from_file_location("migration_0070", path)
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
         constraint = next(
             c
             for c in Dataset.__table__.constraints
             if getattr(c, "name", None) == "chk_datasets_source_format"
         )
         model_values = set(_quoted_values(str(constraint.sqltext)))
-        migration_values = set(_quoted_values(migration))
+        migration_values = set(
+            _quoted_values(f"{migration._BASE_FORMATS}, {migration._NEW_FORMATS}")
+        )
         assert model_values == migration_values
 
 

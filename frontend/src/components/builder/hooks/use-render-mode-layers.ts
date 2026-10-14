@@ -2,16 +2,13 @@ import { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import type { Map as MaplibreMap } from 'maplibre-gl';
-import { getLayerType, getSourceIdForLayer } from '@/components/builder/map-sync';
 import { getAdapter } from '@/components/builder/layer-adapters/registry';
-import type { AdapterLayerInput } from '@/components/builder/layer-adapters/types';
 import { DEFAULT_HEATMAP_PAINT } from '@/components/builder/layer-adapters/heatmap-adapter';
-import { buildSignedTileUrl, getMvtSourceLayerName } from '@/lib/tile-utils';
-import { buildLabelLayerSpec } from '@/components/builder/label-layer-utils';
-import { sanitizeNullableNumericFilter } from '@/lib/maplibre-filter-utils';
 import { normalizeDemStyleConfig } from '@/lib/dem-render-mode';
 import type { MapLayerResponse, StyleConfig, SymbolStyleConfig } from '@/types/api';
-import { getCompanionLayerIds } from '@/components/builder/companion-ids';
+import { builderAdapterInput } from '@/components/builder/hooks/use-layer-map-sync';
+import { getDrawingLayerIds } from '@/components/builder/companion-ids';
+import { removeDescribedLayers } from '@/components/builder/layer-writer';
 import { DEFAULT_CIRCLE_PAINT } from '@/components/builder/layer-adapters/builder-defaults';
 import { buildRenderAsPatch } from '@/components/builder/renderAs';
 import type { RenderAsId, RenderAsAdapterType } from '@/components/builder/renderAs';
@@ -62,14 +59,8 @@ export function useRenderModeLayers({
 }: UseRenderModeLayersParams) {
   const { t } = useTranslation('builder');
 
-  /** Swap the MapLibre layer for a given dataset between adapter types (e.g. circle <-> heatmap).
-   *
-   *  Phase 1050 SF-04: sourceId now routes through `getSourceIdForLayer` so
-   *  non-cluster vector layers correctly inherit the deduped
-   *  `source-data-${dataset_table_name}` source's tile URL. Cluster and
-   *  raster/hillshade layers keep their per-layer source id via the helper's
-   *  branching contract.
-   */
+  /** Swap the MapLibre layer for a given dataset between vector adapter types (e.g. circle <-> heatmap).
+   *  An image or hillshade switch is left to the sync pass. */
   // STATE-02: named function expression so the BUG-018 idle-retry recursion
   // targets the function's own (immutable) name binding `runSwapLayerOnMap`
   // instead of the reactive useCallback identity — the React Compiler rejects
@@ -80,6 +71,9 @@ export function useRenderModeLayers({
     adapterType: RenderAsAdapterType,
     updatedPaint: Record<string, unknown>,
   ): void {
+    // A raster source's URL comes from the dataset's tile token, which only the
+    // sync pass holds, so that pass replaces the layer and its source.
+    if (adapterType === 'raster' || adapterType === 'hillshade') return;
     const map = mapInstanceRef.current;
     if (!map) return;
     // BUG-018: mirror the idle-retry pattern from BuilderMap.tsx (~:923).
@@ -91,67 +85,10 @@ export function useRenderModeLayers({
       return;
     }
 
-    // SYNC-04: companion ids from the single source of truth.
-    const ids = getCompanionLayerIds(layer.id);
-    const mapLayerId = ids.layer;
-    const sourceId = getSourceIdForLayer(layer);
-    const labelId = ids.label;
-    const colorReliefId = ids.colorRelief;
+    removeDescribedLayers(map, getDrawingLayerIds(layer.id));
 
-    // Remove old layer
-    if (map.getLayer(colorReliefId)) {
-      map.removeLayer(colorReliefId);
-    }
-    if (map.getLayer(mapLayerId)) {
-      map.removeLayer(mapLayerId);
-    }
-    if (map.getLayer(ids.outline)) {
-      map.removeLayer(ids.outline);
-    }
-    if (map.getLayer(ids.extrusion)) {
-      map.removeLayer(ids.extrusion);
-    }
-    if (map.getLayer(ids.arrow)) {
-      map.removeLayer(ids.arrow);
-    }
-    if (map.getLayer(ids.mixedLines)) {
-      map.removeLayer(ids.mixedLines);
-    }
-    if (map.getLayer(ids.mixedPoints)) {
-      map.removeLayer(ids.mixedPoints);
-    }
-    // Per-layer raster/hillshade source removal — these layer types keep
-    // their per-layer source id via `getSourceIdForLayer`'s raster branch,
-    // so this is still safe (no sibling layer shares it).
-    if ((adapterType === 'raster' || adapterType === 'hillshade') && map.getSource(sourceId)) {
-      map.removeSource(sourceId);
-    }
-
-    // Get tile URL from existing source
-    const source = map.getSource(sourceId) as { tiles?: string[] } | undefined;
-    const tileUrl = source?.tiles?.[0] ?? buildSignedTileUrl(layer.dataset_table_name, null, undefined, layer.tile_version ?? undefined);
-    const sourceLayer = getMvtSourceLayerName(
-      layer.dataset_table_name,
-      mvtSourceLayerPrefix,
-    );
-
-    const adapterInput: AdapterLayerInput & { style_config?: StyleConfig | null } = {
-      id: layer.id,
-      dataset_table_name: layer.dataset_table_name,
-      dataset_geometry_type: layer.dataset_geometry_type,
-      opacity: layer.opacity ?? 1,
-      visible: layer.visible,
-      paint: updatedPaint,
-      layout: layer.layout ?? {},
-      filter: layer.filter,
-      label_config: layer.label_config ?? null,
-      sourceId,
-      layerId: mapLayerId,
-      sourceLayer,
-      tileUrl,
-      style_config: layer.style_config ?? null,
-      is_dem: layer.is_dem ?? null,
-    };
+    const adapterInput = builderAdapterInput(layer, mvtSourceLayerPrefix, { paint: updatedPaint });
+    if (!adapterInput) return;
 
     try {
       const adapter = getAdapter(adapterType);
@@ -159,7 +96,7 @@ export function useRenderModeLayers({
       // BUG-01: explicitly re-assert visibility after addLayers. The adapter
       // contract honors `input.visible` at initial add (defense-in-depth in
       // each adapter), and calling syncVisibility here also covers companion
-      // layers (e.g. fill outline / cluster count) so the freshly-swapped
+      // layers (e.g. fill outline / cluster count / label) so the freshly-swapped
       // layer cannot become a "ghost visible" layer when the user is on a
       // hidden render-mode source.
       adapter.syncVisibility(map, adapterInput);
@@ -167,34 +104,6 @@ export function useRenderModeLayers({
       toast.error(t('toasts.renderModeSwitchFailed'));
       if (import.meta.env.DEV) console.error('[builder] swapLayerOnMap failed:', e);
       return;
-    }
-
-    // Manage companion label layer: heatmap hides labels, symbol consolidates
-    // icon/text in the primary symbol layer, points restore companion labels.
-    if (adapterType === 'heatmap') {
-      if (map.getLayer(labelId)) {
-        map.setLayoutProperty(labelId, 'visibility', 'none');
-      }
-    } else if (adapterType === 'symbol') {
-      if (map.getLayer(labelId)) {
-        map.removeLayer(labelId);
-      }
-    } else if (layer.label_config?.column) {
-      const vis = layer.visible ? 'visible' : 'none';
-      if (!map.getLayer(labelId) && map.getSource(sourceId)) {
-        const geomType = getLayerType(layer.dataset_geometry_type);
-        map.addLayer(buildLabelLayerSpec({ labelId, sourceId, sourceLayer, lc: layer.label_config, geomType }));
-        // fix(#392): carry the parent layer's filter onto the re-added label so filtered-out features stay excluded (audit LB-02)
-        map.setFilter(labelId, sanitizeNullableNumericFilter(layer.filter));
-        map.setLayoutProperty(labelId, 'visibility', vis);
-      } else if (map.getLayer(labelId)) {
-        // fix(#394) LB-10: mirror the fresh-add branch's setFilter — restoring
-        // an EXISTING hidden companion label re-asserted visibility but not
-        // the filter, so filtered-out features flashed labels until the next
-        // reactive sync self-corrected.
-        map.setFilter(labelId, sanitizeNullableNumericFilter(layer.filter));
-        map.setLayoutProperty(labelId, 'visibility', vis);
-      }
     }
   }, [mapInstanceRef, mvtSourceLayerPrefix, t]);
 
@@ -213,10 +122,7 @@ export function useRenderModeLayers({
       map.once('idle', () => runRemove(layerId));
       return;
     }
-    const ids = getCompanionLayerIds(layerId);
-    for (const id of [ids.colorRelief, ids.label, ids.arrow, ids.extrusion, ids.outline, ids.clusterCount, ids.cluster, ids.mixedLines, ids.mixedPoints, ids.layer]) {
-      if (map.getLayer(id)) map.removeLayer(id);
-    }
+    removeDescribedLayers(map, getDrawingLayerIds(layerId));
   }, [mapInstanceRef]);
 
   const handleRenderAsChange = useCallback((layerId: string, renderAs: RenderAsId) => {

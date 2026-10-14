@@ -12,13 +12,25 @@ from collections.abc import Iterable, Sequence
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import Select, select
+from sqlalchemy import Select, Uuid, any_, bindparam, column, func, select, table
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.core.identity import Identity
+from app.core.permissions import EXPORT
+from app.modules.auth.permissions import get_effective_permissions
 from app.modules.auth.permissions import get_user_roles as _get_user_roles
 from app.platform.extensions import get_permission_extension
+
+
+# catalog.vrt_source_links, whose ORM class belongs to processing.
+_VRT_SOURCE_LINKS = table(
+    "vrt_source_links",
+    column("vrt_dataset_id", Uuid),
+    column("source_dataset_id", Uuid),
+    schema="catalog",
+)
 
 
 class DatasetVisibility(str, enum.Enum):
@@ -72,19 +84,25 @@ async def check_dataset_access_or_anonymous(
     Authenticated users follow the full RBAC rules via check_dataset_access().
     """
     if user is None:
-        allowed = await get_permission_extension().can_access_dataset(
-            db,
-            dataset,
-            dataset_id,
-            None,
-            user_roles=set(),
-        )
-        if not allowed:
+        if not await _anonymous_may_read(db, dataset, dataset_id):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
             )
         return set()
     return await check_dataset_access(db, dataset, dataset_id, user)
+
+
+async def _anonymous_may_read(
+    db: AsyncSession, dataset: Any, dataset_id: uuid.UUID
+) -> bool:
+    """Whether a caller with no identity may read *dataset*."""
+    return await get_permission_extension().can_access_dataset(
+        db,
+        dataset,
+        dataset_id,
+        None,
+        user_roles=set(),
+    )
 
 
 async def check_dataset_access(
@@ -192,8 +210,8 @@ async def _can_access_dataset_id(
 # what describes it and must drop with it. A new dataset-id param must
 # add a row here — test_every_dataset_id_param_is_redactable enforces it.
 _DATASET_ID_PARAMS: dict[str, tuple[str, ...]] = {
-    "mask_dataset_id": (),
-    "join_dataset_id": ("join_fields",),
+    "mask_dataset_id": ("mask_filter",),
+    "join_dataset_id": ("join_fields", "join_filter"),
 }
 
 
@@ -229,8 +247,8 @@ async def visible_derived_from(
         if await _can_access_dataset_id(db, dataset_id, user, user_roles):
             continue
         params.pop(id_param)
-        # Dropping join_dataset_id alone would still publish join_fields —
-        # the private layer's column names.
+        # Dropping join_dataset_id alone would still publish join_fields and
+        # the layer filters: the private layer's column names and values.
         for dependent in dependent_params:
             params.pop(dependent, None)
     return {**derived_from, "params": params}
@@ -363,6 +381,47 @@ async def visible_lineage_summary(
     return (await visible_lineage_summaries(db, [record], user, user_roles))[record.id]
 
 
+async def visible_vrt_source_counts(
+    db: AsyncSession,
+    vrt_dataset_ids: Iterable[uuid.UUID],
+    user: Identity | None,
+    user_roles: set[str],
+) -> dict[uuid.UUID, int]:
+    """How many of each VRT's member datasets this requester may read.
+
+    Member lists omit the members a requester cannot read, so a count of every
+    link would tell them how many are hidden. Each requested VRT gets an entry.
+    The count stays in SQL: one page can link more members than a statement
+    has bind parameters.
+    """
+    wanted = set(vrt_dataset_ids)
+    if not wanted:
+        return {}
+
+    from app.modules.catalog.datasets.domain.models import (
+        Dataset,
+        DatasetGrant,
+        Record,
+    )
+
+    links = _VRT_SOURCE_LINKS
+    stmt = (
+        select(links.c.vrt_dataset_id, func.count(links.c.source_dataset_id.distinct()))
+        .join(Dataset, Dataset.id == links.c.source_dataset_id)
+        .join(Record, Record.id == Dataset.record_id)
+        .where(
+            links.c.vrt_dataset_id
+            == any_(bindparam("vrt_ids", list(wanted), type_=ARRAY(Uuid)))
+        )
+        .group_by(links.c.vrt_dataset_id)
+    )
+    stmt = apply_visibility_filter(stmt, user, user_roles, Record, DatasetGrant)
+    counts = dict.fromkeys(wanted, 0)
+    for vrt_id, count in (await db.execute(stmt)).all():
+        counts[vrt_id] = count
+    return counts
+
+
 def can_view_dataset_provenance(
     record: Any, user: Identity | None, user_roles: set[str]
 ) -> bool:
@@ -470,4 +529,66 @@ async def check_public_visibility_allowed(
             "instance. Choose a narrower visibility or ask an admin to "
             "make this content public."
         ),
+    )
+
+
+async def can_download_raster_cog(
+    db: AsyncSession,
+    dataset: Any,
+    user: Identity | None,
+    user_roles: set[str] | None = None,
+    *,
+    may_export: bool | None = None,
+) -> bool:
+    """Whether the COG download route would serve *dataset* to a caller who
+    can already see it: :func:`can_export_dataset` for a raster.
+    """
+    if dataset.record.record_type != "raster_dataset":
+        return False
+    return await can_export_dataset(
+        db, dataset, dataset.id, user, user_roles, may_export=may_export
+    )
+
+
+async def can_export_dataset(
+    db: AsyncSession,
+    dataset: Any,
+    dataset_id: uuid.UUID,
+    user: Identity | None,
+    user_roles: set[str] | None = None,
+    *,
+    may_export: bool | None = None,
+) -> bool:
+    """Whether a caller who can already see *dataset* may download its data.
+
+    Every caller may download a public dataset an anonymous caller can read,
+    so signing in never takes away what signing out gives; anything beyond
+    that needs the export capability. ``may_export`` is that capability when
+    the caller already resolved it with :func:`can_export`.
+    """
+    if user is not None:
+        if may_export is None:
+            may_export = await can_export(db, user, user_roles)
+        if may_export:
+            return True
+    return dataset.record.visibility == DatasetVisibility.PUBLIC.value and (
+        await _anonymous_may_read(db, dataset, dataset_id)
+    )
+
+
+async def can_export(
+    db: AsyncSession, user: Identity | None, user_roles: set[str] | None = None
+) -> bool:
+    """Whether *user* holds the export capability. It depends on the caller
+    alone, so a page of items resolves it once."""
+    if user is None:
+        return False
+    if user_roles is None:
+        user_roles = await get_user_roles(db, user)
+    return await get_permission_extension().check_permission(
+        db,
+        user,
+        EXPORT,
+        user_roles=user_roles,
+        permission_matrix=await get_effective_permissions(db),
     )

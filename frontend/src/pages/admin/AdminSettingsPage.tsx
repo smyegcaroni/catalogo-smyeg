@@ -26,6 +26,7 @@ import { useAllSettings, useConfigMode, useUpdateSettings, useResetSettings } fr
 import { useUnsavedGuard } from '@/hooks/use-unsaved-guard';
 import { useEdition } from '@/hooks/use-edition';
 import type { SettingItem } from '@/api/settings';
+import type { ResetHandler } from '@/components/admin/settings/useSettingsForm';
 import { useDocumentTitle } from '@/hooks/use-document-title';
 
 // Exported for the App route-table guard (fix(#871)): a static
@@ -48,9 +49,10 @@ const TAB_LABELS: Record<TabKey, string> = {
 const TAB_COMPONENTS: Record<TabKey, React.ComponentType<{
   settings: SettingItem[];
   envOnly: boolean;
-  onSave: (changes: Record<string, unknown>) => void;
-  onReset: (key: string) => void;
+  onSave: (changes: Record<string, unknown>) => void | Promise<boolean>;
+  onReset: ResetHandler;
   isSaving: boolean;
+  settingsUpdatedAt?: number;
   saveFailed?: boolean;
   onDirtyChange?: (dirty: boolean) => void;
 }>> = {
@@ -68,7 +70,7 @@ export function AdminSettingsPage() {
   const { t } = useTranslation('admin');
   useDocumentTitle(t('common:pageTitle.adminSettings'));
   const { tab } = useParams<{ tab: string }>();
-  const { data: allSettings, isLoading, isError, error } = useAllSettings();
+  const { data: allSettings, dataUpdatedAt, isLoading, isError, error } = useAllSettings();
   const { data: configMode } = useConfigMode();
   const updateMutation = useUpdateSettings();
   const resetMutation = useResetSettings();
@@ -94,11 +96,17 @@ export function AdminSettingsPage() {
   const envOnly = configMode?.env_only ?? allSettings?.env_only ?? false;
 
   function handleSave(changes: Record<string, unknown>) {
-    updateMutation.mutate(changes);
+    return updateMutation.mutateAsync(changes).then(
+      () => true,
+      () => false,
+    );
   }
 
   function handleReset(key: string) {
-    resetMutation.mutate([key]);
+    return resetMutation.mutateAsync([key]).then(
+      () => true,
+      () => false,
+    );
   }
 
   if (isLoading) {
@@ -119,7 +127,9 @@ export function AdminSettingsPage() {
     );
   }
 
-  if (isError) {
+  // A failed background refetch keeps the cached settings; unmounting the tab
+  // would throw away the draft the user is still editing.
+  if (isError && !allSettings) {
     return (
       <>
         <PageHeader
@@ -158,6 +168,7 @@ export function AdminSettingsPage() {
           onSave={handleSave}
           onReset={handleReset}
           isSaving={updateMutation.isPending}
+          settingsUpdatedAt={dataUpdatedAt}
           saveFailed={updateMutation.isError}
           onDirtyChange={handleDirtyChange}
         />

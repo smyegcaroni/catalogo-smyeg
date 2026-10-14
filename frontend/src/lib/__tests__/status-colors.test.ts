@@ -71,7 +71,7 @@ describe('visibilityColors', () => {
   it('maps all expected levels', () => {
     expect(visibilityColors.public).toBe(semanticBadgeColors.success);
     expect(visibilityColors.restricted).toBe(semanticBadgeColors.warning);
-    expect(visibilityColors.private).toBe(semanticBadgeColors.destructive);
+    expect(visibilityColors.private).toBe('border-border bg-muted text-muted-foreground');
   });
 });
 
@@ -93,7 +93,16 @@ describe('activeDotColor', () => {
 describe('recordTypeColors', () => {
   it('maps all expected record types', () => {
     expect(Object.keys(recordTypeColors)).toEqual(
-      expect.arrayContaining(['collection', 'vector_dataset', 'raster_dataset', 'vrt_dataset', 'table', 'unknown'])
+      expect.arrayContaining([
+        'collection',
+        'vector_dataset',
+        'raster_dataset',
+        'vrt_dataset',
+        'table',
+        'tiles3d_dataset',
+        'pointcloud_dataset',
+        'unknown',
+      ])
     );
   });
 
@@ -103,6 +112,16 @@ describe('recordTypeColors', () => {
     expect(recordTypeColors.vrt_dataset).toContain('type-vrt');
     expect(recordTypeColors.table).toContain('type-table');
     expect(recordTypeColors.collection).toBe(semanticBadgeColors.warning);
+  });
+
+  it('uses its own token for tiles3d, not the unknown fallback', () => {
+    expect(recordTypeColors.tiles3d_dataset).toContain('type-tiles3d');
+    expect(recordTypeColors.tiles3d_dataset).not.toBe(recordTypeColors.unknown);
+  });
+
+  it('uses its own token for point clouds, not the unknown fallback', () => {
+    expect(recordTypeColors.pointcloud_dataset).toContain('type-pointcloud');
+    expect(recordTypeColors.pointcloud_dataset).not.toBe(recordTypeColors.unknown);
   });
 });
 

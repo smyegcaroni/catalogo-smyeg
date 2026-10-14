@@ -1,4 +1,5 @@
 import { API_BASE } from '@/lib/constants';
+import { signalWithTimeout } from '@/lib/abort';
 import { cookieAuthAvailable } from '@/lib/auth-transport';
 import { isEmbedViewer } from '@/lib/embed-context';
 import { translateApiErrorDetail } from '@/lib/error-map';
@@ -25,6 +26,8 @@ export class ApiError extends Error {
   /** fix(#2038): a 401 the client could NOT confirm — the refresh behind it
    * failed transiently, so nothing here says the credential was rejected. */
   unconfirmed?: boolean;
+  /** How long the server asked the caller to wait, from a 429's Retry-After. */
+  retryAfterMs?: number;
 
   constructor(message: string, status: number, body?: unknown) {
     super(message);
@@ -44,9 +47,19 @@ let inflightRefreshAbort: AbortController | null = null;
 // fix(#2038): how long to stop asking after a transient refresh failure. Without
 // it an auth outage — or a shared egress IP over the endpoint's per-IP limit —
 // turns every 401'd surface in every tab into an unbounded refresh loop.
-const TRANSIENT_COOLDOWN_MS = 30_000;
+export const TRANSIENT_COOLDOWN_MS = 30_000;
 let transientUntil = 0;
 let transientToken: string | null = null;
+
+/** Milliseconds until a refresh may be sent again after a transient failure. */
+export function refreshBackoffRemainingMs(): number {
+  return Math.max(0, transientUntil - Date.now());
+}
+
+/** Let the next refresh go out now, for a retry the user asked for. */
+export function clearRefreshBackoff(): void {
+  transientUntil = 0;
+}
 
 /**
  * fix(#1446): abandon any refresh still in flight, so its response — and the
@@ -57,6 +70,8 @@ let transientToken: string | null = null;
 export function abortInflightRefresh(): void {
   inflightRefreshAbort?.abort();
   inflightRefreshAbort = null;
+  // The next attempt starts its own request instead of joining the aborted one.
+  inflightRefresh = null;
   // fix(#2038): a deliberate session end must not leave the next session inside
   // the previous one's refresh back-off.
   transientUntil = 0;
@@ -108,15 +123,13 @@ export async function tryRefresh(): Promise<boolean> {
 
 /** As tryRefresh, but also reports WHY a failure happened. */
 export async function attemptRefresh(): Promise<RefreshOutcome> {
-  const { refreshToken, token } = useAuthStore.getState();
-  // fix(#1302): in cookie mode the credential is invisible to JS, so a stored
-  // refresh token is no longer proof a session exists — an access token is.
-  // `refreshToken` is still consulted because a pre-GH-1302 session carries one
-  // for exactly one migrating refresh, and because cross-origin deployments
-  // never leave cookie mode's starting gate.
+  const { refreshToken, token, sessionId } = useAuthStore.getState();
+  // The refresh cookie is invisible to JS, so a cookie session is known by its
+  // access token or, in a tab that has not recovered one yet, by its id. A
+  // body-token session, or a legacy one migrating, holds its refresh token.
   //
   // fix(#2038): nothing to refresh WITH, so this session cannot come back.
-  if (!refreshToken && !(token && cookieAuthAvailable())) return 'rejected';
+  if (!refreshToken && !((token || sessionId) && cookieAuthAvailable())) return 'rejected';
 
   if (Date.now() < transientUntil) {
     // fix(#2038): inside the back-off, so answer from it rather than issue
@@ -139,8 +152,8 @@ export async function attemptRefresh(): Promise<RefreshOutcome> {
   // fix(#1446): a logout can land while this request is in flight — most
   // easily when logout itself triggers the proactive refresh and then stops
   // waiting on it. Writing the rotated tokens afterwards would re-populate the
-  // store and localStorage, signing the browser back in while it sits on
-  // /login. Capture the epoch now and refuse the write if it moved.
+  // store, signing the browser back in while it sits on /login. Capture the
+  // epoch now and refuse the write if it moved.
   const epochAtStart = useAuthStore.getState().sessionEpoch;
 
   // fix(#1446): the epoch guard stops a late refresh writing to the store, but
@@ -150,6 +163,7 @@ export async function attemptRefresh(): Promise<RefreshOutcome> {
   // all, so the stale cookie never lands.
   const controller = new AbortController();
   inflightRefreshAbort = controller;
+  let retryAfterMs: number | undefined;
 
   // fix(#1849): report whether a NEW token actually got stored, not whether
   // some token — possibly the stale one this refresh was trying to replace —
@@ -157,13 +171,9 @@ export async function attemptRefresh(): Promise<RefreshOutcome> {
   // refresh too, so the caller retried the original request with a dead
   // token instead of going straight to the logout path.
   //
-  // fix(#1862 review P2): captured here, before the attempt, so a failure
-  // below can tell "nothing changed" from "a peer tab changed it". The
-  // access token also lives in localStorage (auth-store.ts's cross-tab
-  // `storage` listener), so a PEER tab's successful refresh can rehydrate a
-  // new token into this tab's store while this attempt is still in flight —
-  // most easily during the 429 backoff wait. `token` is that pre-attempt
-  // value from the destructure above.
+  // `token`, from the destructure above, is captured before the attempt so a
+  // failure below can tell "nothing changed" from "something else installed a
+  // token while this attempt waited", most easily during the 429 back-off.
   const promise = (async (): Promise<RefreshOutcome> => {
     try {
       const tokens = await refreshAccessToken(refreshToken, controller.signal);
@@ -173,25 +183,25 @@ export async function attemptRefresh(): Promise<RefreshOutcome> {
         void revokeCurrentSession(tokens.access_token).catch(() => {});
         return 'transient';
       }
-      // fix(#1302): null in cookie mode, which also clears the legacy
-      // localStorage token once the migrating refresh has spent it.
+      // Null in cookie mode, which also drops a legacy refresh token once the
+      // migrating refresh has spent it.
       useAuthStore.getState().setTokens(
         tokens.access_token,
         tokens.refresh_token ?? null,
         tokens.expires_in,
+        tokens.order,
       );
       return 'refreshed';
     } catch (err) {
       // If rate-limited, wait before giving up so the next attempt isn't also blocked
       if (err instanceof ApiError && err.status === 429) {
+        retryAfterMs = err.retryAfterMs;
         await new Promise((r) => setTimeout(r, 2000));
       }
-      // fix(#1862 review P2): our own attempt failed, but if a peer tab's
-      // refresh landed a different token while we waited, the session IS
-      // live — just not because of anything this attempt did. Reporting
-      // failure here would make the caller treat a peer's valid replacement
-      // as a terminal session death and log out (and revoke) the session
-      // that tab just refreshed.
+      // Our own attempt failed, but a different token installed while we
+      // waited means the session IS live. Reporting failure here would make
+      // the caller treat that valid replacement as a terminal session death
+      // and log out the session.
       const currentToken = useAuthStore.getState().token;
       if (currentToken && currentToken !== token) {
         return 'refreshed';
@@ -200,8 +210,11 @@ export async function attemptRefresh(): Promise<RefreshOutcome> {
       // an abort) left the credential alive.
       return isCredentialRejected(err) ? 'rejected' : 'transient';
     } finally {
-      inflightRefresh = null;
-      if (inflightRefreshAbort === controller) inflightRefreshAbort = null;
+      // An abort already handed both slots to the next attempt.
+      if (inflightRefreshAbort === controller) {
+        inflightRefresh = null;
+        inflightRefreshAbort = null;
+      }
     }
   })();
   inflightRefresh = promise;
@@ -209,7 +222,10 @@ export async function attemptRefresh(): Promise<RefreshOutcome> {
   const outcome = await promise;
   // fix(#2038): one place to arm the back-off and record the token it applies
   // to; it clears as soon as the endpoint answers either way again.
-  transientUntil = outcome === 'transient' ? Date.now() + TRANSIENT_COOLDOWN_MS : 0;
+  // A shorter Retry-After brings the next attempt forward; a longer one is
+  // capped so a stalled page load is not held past the usual back-off.
+  const backoffMs = Math.min(retryAfterMs ?? TRANSIENT_COOLDOWN_MS, TRANSIENT_COOLDOWN_MS);
+  transientUntil = outcome === 'transient' ? Date.now() + backoffMs : 0;
   transientToken = useAuthStore.getState().token;
   return outcome;
 }
@@ -241,16 +257,77 @@ export async function safeFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 }
 
+/** A response, and how its 401 was handled (null when nothing was refreshed). */
+export interface SessionResponse<R> {
+  response: R;
+  refresh: RefreshOutcome | null;
+}
+
+/**
+ * Send a request under the session current at the call: refresh a token about
+ * to expire first, and on a 401 refresh once and resend. A terminal 401 ends
+ * the session through notifySessionExpired.
+ *
+ * Once a logout or another sign-in replaces that session, the request stops
+ * acting on it: it is not dispatched, and a 401 comes back untouched (refresh
+ * null), so an older request can neither spend, resend under nor end the
+ * session that replaced it. `send` receives the token to authenticate with.
+ */
+export async function sendInSession<R extends { status: number }>(
+  send: (token: string | null) => Promise<R>,
+): Promise<SessionResponse<R>> {
+  const epochAtStart = useAuthStore.getState().sessionEpoch;
+  const isCurrent = () => useAuthStore.getState().sessionEpoch === epochAtStart;
+
+  // Proactively refresh if token expires within 30 seconds
+  const { token: currentToken, expiresAt } = useAuthStore.getState();
+  if (currentToken && expiresAt && Date.now() > expiresAt - 30_000) {
+    await tryRefresh();
+  }
+  if (!isCurrent()) {
+    const superseded = new ApiError(i18n.t('common:errors.unauthorized'), 401);
+    superseded.unconfirmed = true;
+    throw superseded;
+  }
+
+  const response = await send(useAuthStore.getState().token);
+  if (response.status !== 401 || !isCurrent()) return { response, refresh: null };
+
+  // Only a session that existed can expire; an anonymous 401 must not raise
+  // the signed-out prompt. Captured before refreshing so every concurrent
+  // failure holds the same dead value.
+  const deadSessionKey = useAuthStore.getState().token;
+  const outcome = await attemptRefresh();
+  if (!isCurrent()) return { response, refresh: null };
+
+  let final = response;
+  if (outcome === 'refreshed') {
+    const refreshedToken = useAuthStore.getState().token;
+    final = await send(refreshedToken);
+    // BUG-016: only a retry that is STILL 401 is an auth failure; anything
+    // else goes back to the caller to handle normally.
+    if (final.status !== 401) return { response: final, refresh: 'refreshed' };
+    if (refreshedToken) void revokeCurrentSession(refreshedToken).catch(() => {});
+    if (!isCurrent()) return { response: final, refresh: null };
+  }
+  // A transiently failed refresh leaves the session alive.
+  if (outcome === 'transient') return { response: final, refresh: 'transient' };
+  if (deadSessionKey) {
+    notifySessionExpired(deadSessionKey);
+  } else {
+    useAuthStore.getState().logout();
+  }
+  return { response: final, refresh: 'rejected' };
+}
+
 /**
  * BUG-035: Shared refresh-aware fetch core that returns the RAW Response.
  *
  * Streaming/download helpers (AI SSE streams, blob exports) can't go through
  * apiFetch because they need the live Response/ReadableStream/Blob rather than
- * a parsed JSON body. Previously they issued a bare `fetch()` with a possibly
- * stale JWT, so a stream/download issued as the FIRST request after a long idle
- * hit a hard 401 with no retry. This core applies the SAME proactive-refresh +
- * 401→tryRefresh→retry machinery as authenticatedFetch while leaving the
- * response body untouched, so callers keep their streaming semantics.
+ * a parsed JSON body. This core applies sendInSession's refresh and retry
+ * while leaving the response body untouched, so callers keep their streaming
+ * semantics.
  *
  * `target` is a fully-qualified URL or absolute path (already including
  * API_BASE) — unlike authenticatedFetch, the caller owns URL construction.
@@ -260,82 +337,35 @@ export async function authenticatedRawFetch(
   options: RequestInit = {},
   prepareHeaders?: (headers: Headers) => void,
 ): Promise<Response> {
-  // fix(#1515): the embedded viewer does not participate in the session. See
-  // isEmbedViewer's docstring — the share token is the capability, and once the
-  // frame is same-origin an embed on a third-party page would otherwise run as
-  // whoever is signed in, and could sign them out.
-  const embedded = isEmbedViewer();
-  const epochAtStart = useAuthStore.getState().sessionEpoch;
-
-  // Proactively refresh if token expires within 30 seconds
-  const { token: currentToken, expiresAt } = useAuthStore.getState();
-  if (!embedded && currentToken && expiresAt && Date.now() > expiresAt - 30_000) {
-    await tryRefresh();
-  }
-
-  function buildHeaders(): Headers {
+  function request(token: string | null): Promise<Response> {
     const headers = new Headers(options.headers);
-    const token = embedded ? null : useAuthStore.getState().token;
     if (token) {
       headers.set('Authorization', `Bearer ${token}`);
     }
     prepareHeaders?.(headers);
-    return headers;
+    return safeFetch(target, { ...options, headers });
   }
 
-  const response = await safeFetch(target, {
-    ...options,
-    headers: buildHeaders(),
-  });
+  // fix(#1515): the embedded viewer does not participate in the session. See
+  // isEmbedViewer's docstring — the share token is the capability, and once the
+  // frame is same-origin an embed on a third-party page would otherwise run as
+  // whoever is signed in, and could sign them out. A 401 here is the share or
+  // embed token failing to authorize, so it goes back to the viewer untouched.
+  if (isEmbedViewer()) return request(null);
 
-  if (response.status === 401) {
-    // fix(#1515): an embed never sent a session, so a 401 here is the share or
-    // embed token failing to authorize — not an expired login. Returning it
-    // keeps the viewer's own error handling and, more importantly, keeps a
-    // frame on someone else's page from refreshing or destroying the session
-    // of whoever is signed in.
-    if (embedded || useAuthStore.getState().sessionEpoch !== epochAtStart) return response;
-
-    // fix(#628): only a session that existed can expire; an anonymous 401 must
-    // not raise the signed-out prompt. Captured BEFORE tryRefresh so every
-    // concurrent failure holds the same dead value.
-    // fix(#1302): keyed on the access token now that the refresh token is a
-    // cookie. Every real session has one, and it is cleared on logout.
-    const deadSessionKey = useAuthStore.getState().token;
-    const outcome = await attemptRefresh();
-    if (useAuthStore.getState().sessionEpoch !== epochAtStart) return response;
-    if (outcome === 'refreshed') {
-      const refreshedToken = useAuthStore.getState().token;
-      const retry = await safeFetch(target, {
-        ...options,
-        headers: buildHeaders(),
-      });
-      // BUG-016: only treat a retry that is STILL 401 as an auth failure.
-      // Non-auth errors (403, 404, 422, 500, …) must be returned to the
-      // caller so they can be handled normally — not silently converted into
-      // a spurious logout.
-      if (retry.status !== 401) return retry;
-      if (refreshedToken) void revokeCurrentSession(refreshedToken).catch(() => {});
-      // A newer login must survive an older request's delayed failure.
-      if (useAuthStore.getState().sessionEpoch !== epochAtStart) return retry;
-    }
-    // fix(#2038): a transiently-failed refresh leaves the session alive, so keep
-    // it and hand the caller a 401 flagged as unconfirmed, which the sign-in
-    // catches must not read as a rejected credential.
-    if (outcome === 'transient') {
-      const unverified = new ApiError(i18n.t('common:errors.unauthorized'), 401);
-      unverified.unconfirmed = true;
-      throw unverified;
-    }
-    if (deadSessionKey) {
-      notifySessionExpired(deadSessionKey);
-    } else {
-      useAuthStore.getState().logout();
-    }
+  const { response, refresh } = await sendInSession(request);
+  // fix(#2038): a transiently-failed refresh leaves the session alive, so keep
+  // it and hand the caller a 401 flagged as unconfirmed, which the sign-in
+  // catches must not read as a rejected credential.
+  if (refresh === 'transient') {
+    const unverified = new ApiError(i18n.t('common:errors.unauthorized'), 401);
+    unverified.unconfirmed = true;
+    throw unverified;
+  }
+  if (refresh === 'rejected') {
     // fix(#438): UX-10 — was hardcoded English.
     throw new ApiError(i18n.t('common:errors.unauthorized'), 401);
   }
-
   return response;
 }
 
@@ -348,7 +378,10 @@ async function authenticatedFetch(
 }
 
 /**
- * Fetch wrapper that converts auth/network/HTTP errors into ApiError.
+ * Authenticate, retry on a stale 401, and throw ApiError on a non-ok
+ * response — everything apiFetch does except deciding what the body is.
+ * Shared with apiFetchHeader, which needs the raw Response (for a header)
+ * rather than a parsed JSON body.
  *
  * When `expected404` is set, a 404 response resolves to `null` instead
  * of throwing — for endpoints where 404 is a normal/handled outcome
@@ -360,20 +393,17 @@ async function authenticatedFetch(
  * returns a final response with status 404. Other error statuses (403, 410,
  * 500, …) still throw ApiError normally.
  */
-export async function apiFetch<T>(
+async function apiFetchResponse(
   path: string,
   options: RequestInit & { expected404?: boolean; timeoutMs?: number } = {},
-): Promise<T> {
+): Promise<Response | null> {
   const { expected404, timeoutMs, ...fetchOptions } = options;
 
   // fix(#438): DATA-04 — bound the request. Compose with any caller signal so
   // an explicit cancel still works; whichever fires first wins. `timeoutMs`
   // raises the deadline for endpoints whose legitimate worst case exceeds the
   // default (a caller signal alone can only shorten it, never extend it).
-  const timeoutSignal = AbortSignal.timeout(timeoutMs ?? REQUEST_TIMEOUT_MS);
-  fetchOptions.signal = fetchOptions.signal
-    ? AbortSignal.any([fetchOptions.signal, timeoutSignal])
-    : timeoutSignal;
+  fetchOptions.signal = signalWithTimeout(fetchOptions.signal, timeoutMs ?? REQUEST_TIMEOUT_MS);
 
   const response = await authenticatedFetch(path, fetchOptions, (headers) => {
     if (!headers.has('Content-Type') && !(fetchOptions.body instanceof URLSearchParams) && !(fetchOptions.body instanceof FormData)) {
@@ -382,7 +412,7 @@ export async function apiFetch<T>(
   });
 
   if (response.status === 404 && expected404) {
-    return null as T;
+    return null;
   }
 
   if (!response.ok) {
@@ -406,11 +436,52 @@ export async function apiFetch<T>(
     );
   }
 
+  return response;
+}
+
+/**
+ * Fetch wrapper that converts auth/network/HTTP errors into ApiError.
+ *
+ * When `expected404` is set, a 404 response resolves to `null` instead
+ * of throwing — for endpoints where 404 is a normal/handled outcome
+ * (e.g. share-token lookup with a possibly-invalid token). The caller's
+ * TypeScript signature should reflect the nullable shape.
+ *
+ * Important: `expected404` does NOT bypass the 401→refresh→retry flow in
+ * `authenticatedFetch`. The quiet path only fires AFTER `authenticatedFetch`
+ * returns a final response with status 404. Other error statuses (403, 410,
+ * 500, …) still throw ApiError normally.
+ */
+export async function apiFetch<T>(
+  path: string,
+  options: RequestInit & { expected404?: boolean; timeoutMs?: number } = {},
+): Promise<T> {
+  const response = await apiFetchResponse(path, options);
+
+  if (response === null) {
+    return null as T;
+  }
+
   if (response.status === 204) {
     return undefined as T;
   }
 
   return response.json() as Promise<T>;
+}
+
+/**
+ * As apiFetch, but reads one response header instead of a JSON body — for
+ * a route (a 204 with no body, most often) whose data rides on a header.
+ * Returns null when the response carries no value for that header, same as
+ * a missing/unparseable field would from a JSON body.
+ */
+export async function apiFetchHeader(
+  path: string,
+  headerName: string,
+  options: RequestInit & { expected404?: boolean; timeoutMs?: number } = {},
+): Promise<string | null> {
+  const response = await apiFetchResponse(path, options);
+  return response?.headers.get(headerName) ?? null;
 }
 
 export async function apiFetchBlob(

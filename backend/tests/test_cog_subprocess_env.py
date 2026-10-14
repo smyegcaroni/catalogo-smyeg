@@ -34,6 +34,11 @@ EXPECTED_CLAMPS = {
 }
 
 
+# What the probe reports for a source with no internal overviews whose
+# samples take a predictor: every conversion step below then runs.
+_NO_OVERVIEWS = {"has_internal_overviews": False, "predictor_supported": True}
+
+
 def _assert_clamps(env: dict) -> None:
     """The KNOWN-03 clamps must be set on the captured env."""
     assert env is not None, "subprocess.run was invoked without env="
@@ -82,26 +87,13 @@ class TestPrepareWithOverviewsSafeEnv:
         """``prepare_with_overviews`` invokes ``gdaladdo`` with the safety clamps."""
         from app.processing.raster import cog as cog_module
 
-        # Stub the source TIFF and the rasterio.open() probe that decides
-        # whether to skip gdaladdo (we want gdaladdo to run, so report
-        # "no internal overviews").
         src = tmp_path / "src.tif"
         src.write_bytes(b"\x00" * 8)
 
-        fake_dataset = mock.MagicMock()
-        fake_dataset.count = 1
-        fake_dataset.overviews.return_value = []  # no internal -> gdaladdo runs
-
-        fake_ctx = mock.MagicMock()
-        fake_ctx.__enter__.return_value = fake_dataset
-        fake_ctx.__exit__.return_value = False
-
-        import rasterio
-
-        monkeypatch.setattr(rasterio, "open", lambda *_a, **_k: fake_ctx)
-
         with _capture_subprocess_runs(monkeypatch) as captured:
-            cog_module.prepare_with_overviews(str(src), "uint8")
+            cog_module.prepare_with_overviews(
+                str(src), "uint8", has_internal_overviews=False
+            )
 
         # Find the gdaladdo invocation
         gdaladdo_calls = [
@@ -125,19 +117,10 @@ class TestPrepareWithOverviewsSafeEnv:
         src = tmp_path / "src.tif"
         src.write_bytes(b"\x00" * 8)
 
-        fake_dataset = mock.MagicMock()
-        fake_dataset.count = 1
-        fake_dataset.overviews.return_value = []
-        fake_ctx = mock.MagicMock()
-        fake_ctx.__enter__.return_value = fake_dataset
-        fake_ctx.__exit__.return_value = False
-
-        import rasterio
-
-        monkeypatch.setattr(rasterio, "open", lambda *_a, **_k: fake_ctx)
-
         with _capture_subprocess_runs(monkeypatch) as captured:
-            cog_module.prepare_with_overviews(str(src), "uint8", compression="ZSTD")
+            cog_module.prepare_with_overviews(
+                str(src), "uint8", has_internal_overviews=False, compression="ZSTD"
+            )
 
         gdaladdo_calls = [
             (cmd, env) for cmd, env in captured if cmd and cmd[0] == "gdaladdo"
@@ -164,18 +147,6 @@ class TestConvertToCogCrsAssignment:
     now carries the flag.
     """
 
-    def _stub_rasterio(self, monkeypatch):
-        fake_dataset = mock.MagicMock()
-        fake_dataset.count = 1
-        fake_dataset.overviews.return_value = []
-        fake_ctx = mock.MagicMock()
-        fake_ctx.__enter__.return_value = fake_dataset
-        fake_ctx.__exit__.return_value = False
-
-        import rasterio
-
-        monkeypatch.setattr(rasterio, "open", lambda *_a, **_k: fake_ctx)
-
     def test_assign_crs_lands_on_the_translate_and_spawns_no_warp(
         self, tmp_path, monkeypatch
     ):
@@ -192,10 +163,11 @@ class TestConvertToCogCrsAssignment:
         src = tmp_path / "src.tif"
         src.write_bytes(b"\x00" * 8)
         dst = tmp_path / "out.tif"
-        self._stub_rasterio(monkeypatch)
 
         with _capture_subprocess_runs(monkeypatch) as captured:
-            cog_module.convert_to_cog(str(src), str(dst), "uint8", assign_crs=3857)
+            cog_module.convert_to_cog(
+                str(src), str(dst), "uint8", assign_crs=3857, **_NO_OVERVIEWS
+            )
 
         tools = [cmd[0] for cmd, _ in captured if cmd]
         assert "gdalwarp" not in tools, (
@@ -226,10 +198,9 @@ class TestConvertToCogCrsAssignment:
         src = tmp_path / "src.tif"
         src.write_bytes(b"\x00" * 8)
         dst = tmp_path / "out.tif"
-        self._stub_rasterio(monkeypatch)
 
         with _capture_subprocess_runs(monkeypatch) as captured:
-            cog_module.convert_to_cog(str(src), str(dst), "uint8")
+            cog_module.convert_to_cog(str(src), str(dst), "uint8", **_NO_OVERVIEWS)
 
         for cmd, _ in captured:
             assert "-a_srs" not in cmd, f"unrequested CRS assignment in {cmd}"
@@ -243,11 +214,15 @@ class TestConvertToCogCrsAssignment:
         src = tmp_path / "src.tif"
         src.write_bytes(b"\x00" * 8)
         dst = tmp_path / "out.tif"
-        self._stub_rasterio(monkeypatch)
 
         with _capture_subprocess_runs(monkeypatch) as captured:
             cog_module.convert_to_cog(
-                str(src), str(dst), "uint8", assign_crs=3857, resampling="cubic"
+                str(src),
+                str(dst),
+                "uint8",
+                assign_crs=3857,
+                resampling="cubic",
+                **_NO_OVERVIEWS,
             )
 
         carriers = sorted({cmd[0] for cmd, _ in captured if "cubic" in cmd})
@@ -271,19 +246,8 @@ class TestConvertToCogGdalTranslateSafeEnv:
         src.write_bytes(b"\x00" * 8)
         dst = tmp_path / "out.tif"
 
-        fake_dataset = mock.MagicMock()
-        fake_dataset.count = 1
-        fake_dataset.overviews.return_value = []
-        fake_ctx = mock.MagicMock()
-        fake_ctx.__enter__.return_value = fake_dataset
-        fake_ctx.__exit__.return_value = False
-
-        import rasterio
-
-        monkeypatch.setattr(rasterio, "open", lambda *_a, **_k: fake_ctx)
-
         with _capture_subprocess_runs(monkeypatch) as captured:
-            cog_module.convert_to_cog(str(src), str(dst), "uint8")
+            cog_module.convert_to_cog(str(src), str(dst), "uint8", **_NO_OVERVIEWS)
 
         translate_calls = [
             (cmd, env) for cmd, env in captured if cmd and cmd[0] == "gdal_translate"
@@ -343,19 +307,6 @@ class TestGdalFailureTempCleanup:
     """run_gdal raises on timeout (BA-29); the returncode-only cleanup paths
     leaked the staged temp copies. Any raise must remove them."""
 
-    def _stub_rasterio_no_overviews(self, monkeypatch):
-        fake_dataset = mock.MagicMock()
-        fake_dataset.count = 1
-        fake_dataset.overviews.return_value = []
-
-        fake_ctx = mock.MagicMock()
-        fake_ctx.__enter__.return_value = fake_dataset
-        fake_ctx.__exit__.return_value = False
-
-        import rasterio
-
-        monkeypatch.setattr(rasterio, "open", lambda *_a, **_k: fake_ctx)
-
     def test_prepare_with_overviews_cleans_tmp_on_run_gdal_raise(
         self, tmp_path, monkeypatch
     ):
@@ -371,7 +322,6 @@ class TestGdalFailureTempCleanup:
         src = src_dir / "src.tif"
         src.write_bytes(b"\x00" * 8)
         monkeypatch.setattr(tempfile, "tempdir", str(work_dir))
-        self._stub_rasterio_no_overviews(monkeypatch)
 
         def _raise(*_a, **_k):
             raise RuntimeError("gdaladdo timed out after 900s")
@@ -379,7 +329,9 @@ class TestGdalFailureTempCleanup:
         monkeypatch.setattr(cog_module, "run_gdal", _raise)
 
         with pytest.raises(RuntimeError, match="timed out"):
-            cog_module.prepare_with_overviews(str(src), "uint8")
+            cog_module.prepare_with_overviews(
+                str(src), "uint8", has_internal_overviews=False
+            )
 
         assert list(work_dir.iterdir()) == [], (
             "temp raster copy leaked after run_gdal raised"
@@ -406,7 +358,6 @@ class TestGdalFailureTempCleanup:
         src = src_dir / "src.tif"
         src.write_bytes(b"\x00" * 8)
         monkeypatch.setattr(tempfile, "tempdir", str(work_dir))
-        self._stub_rasterio_no_overviews(monkeypatch)
 
         def _raise(*_a, **_k):
             raise RuntimeError("gdaladdo timed out after 900s")
@@ -419,11 +370,88 @@ class TestGdalFailureTempCleanup:
                 str(tmp_path / "out.tif"),
                 "uint8",
                 assign_crs=4326,
+                **_NO_OVERVIEWS,
             )
 
         assert list(work_dir.iterdir()) == [], (
             "a temp file leaked from the CRS-assignment path after run_gdal raised"
         )
+
+
+class TestOverviewSidecarCleanup:
+    """On a COG-layout input without internal overviews, GDAL 3.10 exits 0 and
+    writes ``<copy>.ovr`` beside the temp copy instead of rewriting it. Newer
+    GDAL refuses outright, so the stand-in below models the 3.10 behavior
+    rather than depending on whichever GDAL runs the suite.
+    """
+
+    @staticmethod
+    def _gdal_writing_ovr_sidecar(
+        work_dir, *, addo_raises=False, translate_returncode=0
+    ):
+        from pathlib import Path
+
+        def _run(cmd, **_kwargs):
+            if cmd[0] == "gdaladdo":
+                copy = next(a for a in cmd if Path(a).parent == work_dir)
+                Path(f"{copy}.ovr").write_bytes(b"\x00")
+                if addo_raises:
+                    raise RuntimeError("gdaladdo timed out after 900s")
+                return mock.Mock(returncode=0, stderr="")
+            # COPY_SRC_OVERVIEWS reads the sidecar, so it must still be there.
+            assert Path(f"{cmd[-2]}.ovr").exists()
+            if translate_returncode == 0:
+                Path(cmd[-1]).write_bytes(b"\x00")
+            return mock.Mock(returncode=translate_returncode, stderr="translate failed")
+
+        return _run
+
+    def _stage(self, tmp_path, monkeypatch, **fake_options):
+        from app.processing.raster import cog as cog_module
+
+        src = tmp_path / "src.tif"
+        src.write_bytes(b"\x00" * 8)
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        monkeypatch.setattr(cog_module, "_scratch_dir", lambda: str(work_dir))
+        monkeypatch.setattr(
+            cog_module,
+            "run_gdal",
+            self._gdal_writing_ovr_sidecar(work_dir, **fake_options),
+        )
+        return src, tmp_path / "out.tif", work_dir
+
+    def test_success_removes_the_sidecar_with_the_copy(self, tmp_path, monkeypatch):
+        from app.processing.raster import cog as cog_module
+
+        src, out, work_dir = self._stage(tmp_path, monkeypatch)
+
+        cog_module.convert_to_cog(str(src), str(out), "uint8", **_NO_OVERVIEWS)
+
+        assert out.exists()
+        assert list(work_dir.iterdir()) == []
+
+    def test_translate_failure_removes_the_sidecar(self, tmp_path, monkeypatch):
+        import pytest
+        from app.processing.raster import cog as cog_module
+
+        src, out, work_dir = self._stage(tmp_path, monkeypatch, translate_returncode=1)
+
+        with pytest.raises(RuntimeError, match="translate failed"):
+            cog_module.convert_to_cog(str(src), str(out), "uint8", **_NO_OVERVIEWS)
+
+        assert list(work_dir.iterdir()) == []
+
+    def test_gdaladdo_timeout_removes_a_partial_sidecar(self, tmp_path, monkeypatch):
+        import pytest
+        from app.processing.raster import cog as cog_module
+
+        src, out, work_dir = self._stage(tmp_path, monkeypatch, addo_raises=True)
+
+        with pytest.raises(RuntimeError, match="timed out"):
+            cog_module.convert_to_cog(str(src), str(out), "uint8", **_NO_OVERVIEWS)
+
+        assert list(work_dir.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
@@ -443,10 +471,10 @@ class TestGdalFailureTempCleanup:
 # which failed the whole COG conversion step (and the ingest job with it).
 # These tests write REAL on-disk GeoTIFFs via rasterio's `nbits` creation
 # option -- the GDAL CLI is not guaranteed on the test host, but rasterio's
-# own driver bindings always are -- and let ``convert_to_cog`` run its real
-# rasterio-based NBITS probe against them. Only the GDAL CLI subprocesses
-# are mocked (via ``_capture_subprocess_runs``), so the fixture and the
-# per-band tag detection are both genuine.
+# own driver bindings always are -- and hand ``convert_to_cog`` the verdict
+# the probe child reads from them. Only the GDAL CLI subprocesses are mocked
+# (via ``_capture_subprocess_runs``, entered after the probe has run), so the
+# fixture and the per-band tag detection are both genuine.
 
 
 def _write_nbits_fixture(
@@ -481,6 +509,22 @@ def _write_nbits_fixture(
         dst.write(np.zeros((height, width), dtype="uint8"), 1)
 
 
+def _convert_as_ingest_would(src: str, out: str, monkeypatch):
+    from app.processing.raster import cog as cog_module
+    from app.processing.raster.probe import inspect_raster
+
+    inspection = inspect_raster(src)
+    with _capture_subprocess_runs(monkeypatch) as captured:
+        cog_module.convert_to_cog(
+            src,
+            out,
+            "uint8",
+            has_internal_overviews=False,
+            predictor_supported=inspection["predictor_supported"],
+        )
+    return captured
+
+
 def _gdal_translate_argv(captured):
     calls = [(cmd, env) for cmd, env in captured if cmd and cmd[0] == "gdal_translate"]
     assert calls, f"gdal_translate was not invoked; ran {[c[0] for c in captured]}"
@@ -493,13 +537,12 @@ class TestPredictorLowBitDepth:
     def test_nbits4_source_drops_the_predictor(self, tmp_path, monkeypatch):
         """NBITS=4 (e.g. an LULC classification raster) is the exact shape that
         broke Peshawar_City_LULC_2050.tif in production."""
-        from app.processing.raster import cog as cog_module
-
         src = tmp_path / "src.tif"
         _write_nbits_fixture(str(src), nbits=4)
 
-        with _capture_subprocess_runs(monkeypatch) as captured:
-            cog_module.convert_to_cog(str(src), str(tmp_path / "out.tif"), "uint8")
+        captured = _convert_as_ingest_would(
+            str(src), str(tmp_path / "out.tif"), monkeypatch
+        )
 
         cmd = _gdal_translate_argv(captured)
         assert not any(arg.startswith("PREDICTOR=") for arg in cmd), (
@@ -510,13 +553,12 @@ class TestPredictorLowBitDepth:
     def test_nbits1_source_drops_the_predictor(self, tmp_path, monkeypatch):
         """NBITS=1 (a binary mask/palette raster) is the other end of the same
         failure class."""
-        from app.processing.raster import cog as cog_module
-
         src = tmp_path / "src.tif"
         _write_nbits_fixture(str(src), nbits=1)
 
-        with _capture_subprocess_runs(monkeypatch) as captured:
-            cog_module.convert_to_cog(str(src), str(tmp_path / "out.tif"), "uint8")
+        captured = _convert_as_ingest_would(
+            str(src), str(tmp_path / "out.tif"), monkeypatch
+        )
 
         cmd = _gdal_translate_argv(captured)
         assert not any(arg.startswith("PREDICTOR=") for arg in cmd), (
@@ -527,13 +569,12 @@ class TestPredictorLowBitDepth:
         """Counterpoint: a genuine 8-bit source (no NBITS tag at all) must keep
         PREDICTOR=2 -- the fix must not turn the predictor off across the
         board, only for the sources that actually can't take it."""
-        from app.processing.raster import cog as cog_module
-
         src = tmp_path / "src.tif"
         _write_nbits_fixture(str(src), nbits=None)
 
-        with _capture_subprocess_runs(monkeypatch) as captured:
-            cog_module.convert_to_cog(str(src), str(tmp_path / "out.tif"), "uint8")
+        captured = _convert_as_ingest_would(
+            str(src), str(tmp_path / "out.tif"), monkeypatch
+        )
 
         cmd = _gdal_translate_argv(captured)
         assert "PREDICTOR=2" in cmd, (

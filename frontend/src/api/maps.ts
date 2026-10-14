@@ -53,7 +53,9 @@ export async function listMaps(
     sort_by?: string;
     sort_dir?: string;
     visibility?: string;
+    owned_only?: boolean;
   } = {},
+  options?: RequestInit,
 ): Promise<MapListResponse> {
   const query = new URLSearchParams();
   if (params.skip !== undefined) query.set('skip', String(params.skip));
@@ -62,8 +64,9 @@ export async function listMaps(
   if (params.sort_by) query.set('sort_by', params.sort_by);
   if (params.sort_dir) query.set('sort_dir', params.sort_dir);
   if (params.visibility) query.set('visibility', params.visibility);
+  if (params.owned_only !== undefined) query.set('owned_only', String(params.owned_only));
   const qs = query.toString();
-  return apiFetch<MapListResponse>(`/maps/${qs ? `?${qs}` : ''}`);
+  return apiFetch<MapListResponse>(`/maps/${qs ? `?${qs}` : ''}`, options);
 }
 
 export async function getMap(id: string): Promise<MapResponse> {
@@ -511,9 +514,11 @@ export async function sendChatMessage(
   layers: MapLayerResponse[],
   language?: string,
   history?: ChatHistoryMessage[],
+  signal?: AbortSignal,
 ): Promise<ChatResponse> {
   return apiFetch<ChatResponse>('/ai/chat/', {
     method: 'POST',
+    signal,
     body: JSON.stringify({
       message,
       map_id: mapId,

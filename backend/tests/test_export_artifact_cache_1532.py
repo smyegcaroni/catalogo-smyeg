@@ -2330,17 +2330,14 @@ def test_the_gzip_exclusion_is_scoped_to_the_export_path():
     )
     excluded = set(gzip_layer.kwargs["exclude_content_types"])
 
-    assert "image/tiff" in excluded, (
-        "the COG exclusion fix(#1540) added must survive this change"
-    )
+    assert "image/tiff" in excluded, "the COG exclusion must survive this change"
     for media in ("application/geo+json", "text/csv"):
         assert media not in excluded, (
             f"{media} is excluded app-wide, which also silences compression on "
             f"the feature and CSV-stream endpoints that share the type"
         )
     assert any(
-        m.cls.__name__ == "NoCompressionForExportMiddleware"
-        for m in app.user_middleware
+        m.cls.__name__ == "NoCompressionByPathMiddleware" for m in app.user_middleware
     ), "the export route has no path-scoped opt-out, so it would be compressed"
 
 
@@ -3185,18 +3182,17 @@ def _build_export(
     stage.mkdir()
 
     if format_key == "parquet":
-        # The route's parquet writer is not ogr2ogr; it is this function, which
+        # The route's parquet writer is not ogr2ogr; it is this class, which
         # is deliberately DB-free so it can be driven directly.
-        from app.processing.export.parquet import _write_geoparquet
+        from app.processing.export.parquet import _GeoParquetWriter
 
         out = stage / "export.parquet"
-        _write_geoparquet(
-            geom=[b"\x01\x01\x00\x00\x00", None],
-            cols={"n": [1, 2], "s": ["alpha", "beta"]},
-            attr_names=["n", "s"],
-            geom_col="geometry",
-            output_path=str(out),
+        writer = _GeoParquetWriter(str(out), ["n", "s"], "geometry")
+        writer.write(
+            [b"\x01\x01\x00\x00\x00", None],
+            {"n": [1, 2], "s": ["alpha", "beta"]},
         )
+        writer.close()
         return out
 
     source = work_dir / "source.geojson"

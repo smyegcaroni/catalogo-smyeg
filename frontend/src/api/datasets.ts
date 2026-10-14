@@ -3,6 +3,8 @@ import { translateApiErrorDetail } from '@/lib/error-map';
 import i18n from '@/i18n/i18n';
 import { apiFetch, authenticatedRawFetch, ApiError } from './client';
 import { uploadChunks } from './_presignedUpload';
+import { rethrowAsUploadRefusal } from './ingest';
+import { triggerDownload } from '@/lib/download';
 import { pushReportEntry, reportNetworkError } from '@/lib/report';
 import type {
   CreateDatasetRequest,
@@ -20,6 +22,7 @@ import type {
   DatasetRefreshRequest,
   DatasetRefreshResponse,
   DatasetRefreshRunListResponse,
+  RestorePreviousVersionResponse,
   AttributeMetadataListResponse,
   AttributeMetadataResponse,
   AttributeMetadataUpdate,
@@ -78,10 +81,14 @@ export function getCogDownloadUrl(id: string): string {
 // downloaded through the same refresh-aware, bearer-authenticated flow —
 // a plain <a href> browser navigation carries no Authorization header, so a
 // private or unpublished dataset's export endpoint rejects it as anonymous.
-export async function authenticatedDownload(url: string, filename: string): Promise<void> {
+export async function authenticatedDownload(
+  url: string,
+  filename: string,
+  signal?: AbortSignal,
+): Promise<void> {
   // BUG-035: refresh-aware raw fetch so a download issued as the first request
   // after a long idle transparently refreshes the JWT instead of 401-ing.
-  const response = await authenticatedRawFetch(url);
+  const response = await authenticatedRawFetch(url, { signal });
 
   if (!response.ok) {
     let detail: unknown;
@@ -95,14 +102,7 @@ export async function authenticatedDownload(url: string, filename: string): Prom
   }
 
   const blob = await response.blob();
-  const objectUrl = URL.createObjectURL(blob);
-  const anchor = document.createElement('a');
-  anchor.href = objectUrl;
-  anchor.download = filename;
-  document.body.appendChild(anchor);
-  anchor.click();
-  document.body.removeChild(anchor);
-  URL.revokeObjectURL(objectUrl);
+  triggerDownload(blob, filename);
 }
 
 export async function downloadExport(
@@ -200,11 +200,15 @@ export async function reuploadDataset(
   const formData = new FormData();
   formData.append('file', file);
 
-  return apiFetch<ReuploadResponse>(`/datasets/${datasetId}/reupload`, {
-    method: 'POST',
-    body: formData,
-    timeoutMs: REUPLOAD_TIMEOUT_MS,
-  });
+  try {
+    return await apiFetch<ReuploadResponse>(`/datasets/${datasetId}/reupload`, {
+      method: 'POST',
+      body: formData,
+      timeoutMs: REUPLOAD_TIMEOUT_MS,
+    });
+  } catch (err) {
+    rethrowAsUploadRefusal(err);
+  }
 }
 
 export async function reuploadPreview(
@@ -214,20 +218,28 @@ export async function reuploadPreview(
   layerName?: string,
 ): Promise<ReuploadPreviewResponse> {
   const body = layerName !== undefined ? JSON.stringify({ layer_name: layerName }) : undefined;
-  return apiFetch<ReuploadPreviewResponse>(`/datasets/${datasetId}/reupload/${jobId}/preview`, {
-    method: 'POST',
-    ...(body ? { body } : {}),
-  });
+  try {
+    return await apiFetch<ReuploadPreviewResponse>(`/datasets/${datasetId}/reupload/${jobId}/preview`, {
+      method: 'POST',
+      ...(body ? { body } : {}),
+    });
+  } catch (err) {
+    rethrowAsUploadRefusal(err);
+  }
 }
 
 export async function reuploadServicePreview(
   datasetId: string,
   request: ReuploadServicePreviewRequest,
 ): Promise<ReuploadPreviewResponse> {
-  return apiFetch<ReuploadPreviewResponse>(`/datasets/${datasetId}/reupload/service/preview`, {
-    method: 'POST',
-    body: JSON.stringify(request),
-  });
+  try {
+    return await apiFetch<ReuploadPreviewResponse>(`/datasets/${datasetId}/reupload/service/preview`, {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  } catch (err) {
+    rethrowAsUploadRefusal(err);
+  }
 }
 
 export async function reuploadCommit(
@@ -243,18 +255,26 @@ export async function reuploadCommit(
   // the user was uploading and confirming. Optional server-side, so omitting
   // it is the pre-#1768 behaviour rather than an error.
   expectedOriginKind?: DatasetOrigin | null,
+  // The preview's fingerprint of the changes the person was shown. Without
+  // it a replacement that needs review ends blocked.
+  reviewFingerprint?: string | null,
 ): Promise<ReuploadCommitResponse> {
   const payload: ReuploadCommitRequest = {
     srid_override: sridOverride ?? null,
     ...(token ? { token } : {}),
     ...(layerName !== undefined ? { layer_name: layerName } : {}),
     ...(expectedOriginKind ? { expected_origin_kind: expectedOriginKind } : {}),
+    ...(reviewFingerprint ? { review_fingerprint: reviewFingerprint } : {}),
   };
 
-  return apiFetch<ReuploadCommitResponse>(`/datasets/${datasetId}/reupload/${jobId}/commit`, {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  });
+  try {
+    return await apiFetch<ReuploadCommitResponse>(`/datasets/${datasetId}/reupload/${jobId}/commit`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    rethrowAsUploadRefusal(err);
+  }
 }
 
 export async function addColumn(
@@ -307,6 +327,7 @@ export async function refreshDataset(
   token?: string,
   auth?: ServiceAuthRequest,
   acceptBlockedRunId?: string,
+  verificationPolicy?: DatasetRefreshRequest['verification_policy'],
 ): Promise<DatasetRefreshResponse> {
   // feat(#1746 B4): the door refuses a body naming both spellings
   // (reject_service_auth_conflict), so send at most one.
@@ -316,10 +337,21 @@ export async function refreshDataset(
   const payload = {
     ...credentialPayload,
     ...(acceptBlockedRunId ? { accept_blocked_run_id: acceptBlockedRunId } : {}),
+    ...(verificationPolicy ? { verification_policy: verificationPolicy } : {}),
   };
   return apiFetch<DatasetRefreshResponse>(`/datasets/${datasetId}/refresh`, {
     method: 'POST',
     body: JSON.stringify(payload),
+  });
+}
+
+export async function restorePreviousVersion(
+  datasetId: string,
+  expectedVersionNumber: number,
+): Promise<RestorePreviousVersionResponse> {
+  return apiFetch<RestorePreviousVersionResponse>(`/datasets/${datasetId}/previous-version/restore`, {
+    method: 'POST',
+    body: JSON.stringify({ expected_version_number: expectedVersionNumber }),
   });
 }
 
@@ -359,14 +391,18 @@ export async function requestPresignedReupload(
   fileSize: number,
   contentType?: string,
 ): Promise<PresignedUploadResponse> {
-  return apiFetch<PresignedUploadResponse>(`/datasets/${datasetId}/reupload/presigned`, {
-    method: 'POST',
-    body: JSON.stringify({
-      filename,
-      file_size: fileSize,
-      ...(contentType && { content_type: contentType }),
-    }),
-  });
+  try {
+    return await apiFetch<PresignedUploadResponse>(`/datasets/${datasetId}/reupload/presigned`, {
+      method: 'POST',
+      body: JSON.stringify({
+        filename,
+        file_size: fileSize,
+        ...(contentType && { content_type: contentType }),
+      }),
+    });
+  } catch (err) {
+    rethrowAsUploadRefusal(err);
+  }
 }
 
 export async function completePresignedReupload(
@@ -374,10 +410,14 @@ export async function completePresignedReupload(
   jobId: string,
   parts?: { etag: string; part_number: number }[],
 ): Promise<UploadResponse> {
-  return apiFetch<UploadResponse>(`/datasets/${datasetId}/reupload/presigned/${jobId}/complete`, {
-    method: 'POST',
-    body: JSON.stringify({ parts: parts ?? [] }),
-  });
+  try {
+    return await apiFetch<UploadResponse>(`/datasets/${datasetId}/reupload/presigned/${jobId}/complete`, {
+      method: 'POST',
+      body: JSON.stringify({ parts: parts ?? [] }),
+    });
+  } catch (err) {
+    rethrowAsUploadRefusal(err);
+  }
 }
 
 /**
@@ -411,15 +451,18 @@ export async function reuploadPresigned(
   datasetId: string,
   file: File,
 ): Promise<UploadResponse> {
+  // The presigned PUT URL is signed for this content type, and fetch sends no
+  // Content-Type for a Blob whose type is empty, so both sides name it.
+  const contentType = file.type || 'application/octet-stream';
   const { job_id, urls, upload_id, part_size } = await requestPresignedReupload(
     datasetId,
     file.name,
     file.size,
-    file.type || undefined,
+    contentType,
   );
 
   if (urls.length === 1 && !upload_id) {
-    const resp = await fetch(urls[0], { method: 'PUT', body: file });
+    const resp = await fetch(urls[0], { method: 'PUT', headers: { 'Content-Type': contentType }, body: file });
     if (!resp.ok) {
       throw new Error(
         i18n.t('common:errors.storageUploadFailed', { status: resp.status }),

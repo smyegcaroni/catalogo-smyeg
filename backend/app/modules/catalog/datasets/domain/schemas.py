@@ -113,7 +113,9 @@ class QualityDetail(BaseModel):
     overall: float = Field(ge=0.0, le=100.0)
     metadata_completeness: float = Field(ge=0.0, le=100.0)
     geometry_validity: float | None = Field(default=None, ge=0.0, le=100.0)
-    attribute_completeness: float = Field(ge=0.0, le=100.0)
+    # Null for a 3D Tiles dataset, which has no attributes. It stays required
+    # so the generated SDKs keep this field's position.
+    attribute_completeness: float | None = Field(ge=0.0, le=100.0)
     crs_defined: float | None = Field(default=None, ge=0.0, le=100.0)
     computed_at: datetime | None = None
 
@@ -140,6 +142,14 @@ class RasterBandInfo(BaseModel):
     color_interp: str | None = Field(
         default=None, description="Color interpretation, e.g. Red, Green, Gray"
     )
+
+    @field_validator("nodata", mode="before")
+    @classmethod
+    def _nodata_as_text(cls, v: object) -> str | None:
+        # band_info is schemaless JSONB; one stray value must not fail a whole list.
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return str(v)
+        return v if isinstance(v, str) else None
 
 
 class RasterConnect(BaseModel):
@@ -198,6 +208,76 @@ class RasterMetadata(BaseModel):
     )
 
 
+class PointCloudMetadata(BaseModel):
+    """A COPC point cloud's published file."""
+
+    url: str | None = Field(
+        default=None,
+        description="URL path of the COPC file on the app origin, e.g. "
+        "/api/datasets/{id}/copc/{attempt}/data.copc.laz. A replaced file gets a new URL",
+    )
+    size_bytes: int | None = Field(
+        default=None, description="Size of the COPC file in bytes"
+    )
+    point_count: int | None = Field(
+        default=None, description="Number of points, from the file's header"
+    )
+    point_format: int | None = Field(
+        default=None,
+        description=(
+            "LAS point data record format: 6 (no colour), 7 (RGB) or 8 (RGB and "
+            "near infrared)"
+        ),
+    )
+    vertical_crs: str | None = Field(
+        default=None,
+        description="Name of the file's vertical CRS, when its WKT gives one",
+    )
+
+
+class TilesetMetadata(BaseModel):
+    """A 3D Tiles dataset's published tileset."""
+
+    url: str = Field(
+        description="URL path of the tileset's tileset.json on the app origin, "
+        "e.g. /api/datasets/{id}/tiles3d/tileset.json"
+    )
+    size_bytes: int | None = Field(
+        default=None, description="Unpacked size of the tileset in bytes"
+    )
+    version: str | None = Field(
+        default=None, description="The tileset's asset.version: '1.0' or '1.1'"
+    )
+    geometric_error: float | None = Field(
+        default=None,
+        description="The root tile's geometricError, when tileset.json gives one",
+    )
+    bounding_volume: Literal["region", "box", "sphere"] | None = Field(
+        default=None,
+        description=(
+            "The kind of the root tile's bounding volume. A box or sphere not "
+            "in Earth-centred coordinates leaves the dataset's extent null."
+        ),
+    )
+    content_types: list[str] | None = Field(
+        default=None,
+        description=(
+            "The tile formats in the tileset, sorted: b3dm, i3dm, pnts, cmpt, "
+            "glb, gltf, subtree, vctr or geom, including the tiles inside a "
+            "cmpt. Null for a tileset published before GeoLens recorded them."
+        ),
+    )
+    extensions_required: list[str] | None = Field(
+        default=None,
+        description=(
+            "Every extension a client must support to load the tileset, sorted: "
+            "the extensionsRequired of its tileset JSON, external tilesets "
+            "included, and of its glTF content. Null for a tileset published "
+            "before GeoLens recorded them."
+        ),
+    )
+
+
 class StacAsset(BaseModel):
     href: str
     type: str | None = None
@@ -223,6 +303,13 @@ class DerivedFromResponse(BaseModel):
     """
 
     dataset_id: uuid.UUID = Field(description="The dataset this one was derived from")
+    source_filter: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "CQL2-JSON filter that selected the source features, or null when "
+            "the whole source dataset was used"
+        ),
+    )
     operation: str = Field(description="Analysis operation that produced it")
     params: dict[str, Any] = Field(
         description=(
@@ -231,6 +318,30 @@ class DerivedFromResponse(BaseModel):
         )
     )
     created_at: datetime
+
+
+class PreviousVersionResponse(BaseModel):
+    """The data a replacement or restore replaced, kept until the next one."""
+
+    version_number: int = Field(description="The version whose data is kept")
+    retained_at: datetime | None = None
+    size_bytes: int | None = Field(
+        default=None, description="Its table's size; not counted toward quota"
+    )
+    feature_count: int | None = Field(
+        default=None, description="As recorded on that version"
+    )
+
+
+class RestorePreviousVersionRequest(BaseModel):
+    expected_version_number: int = Field(
+        description="The previous version the caller confirmed restoring"
+    )
+
+
+class RestorePreviousVersionResponse(BaseModel):
+    job_id: uuid.UUID
+    run_id: uuid.UUID
 
 
 class DatasetResponse(BaseModel):
@@ -445,11 +556,27 @@ class DatasetResponse(BaseModel):
             "Record type: 'vector_dataset' (spatial features), "
             "'raster_dataset' (single COG), 'vrt_dataset' (VRT mosaic), "
             "'table' (non-spatial tabular), 'map' (saved map), "
-            "'service' (catalogued remote service), 'collection' (flat dataset group)."
+            "'service' (catalogued remote service), 'collection' (flat dataset group), "
+            "'tiles3d_dataset' (3D Tiles tileset), "
+            "'pointcloud_dataset' (COPC point cloud)."
         ),
     )
     raster: RasterMetadata | None = Field(
         default=None, description="Raster-specific metadata (null for vectors)"
+    )
+    tileset: TilesetMetadata | None = Field(
+        default=None,
+        description=(
+            "3D Tiles metadata on the dataset detail response; null for other "
+            "record types and before a tileset is published"
+        ),
+    )
+    pointcloud: PointCloudMetadata | None = Field(
+        default=None,
+        description=(
+            "COPC point cloud metadata on the dataset detail response; null for "
+            "other record types and before a point cloud is published"
+        ),
     )
     stac_assets: dict[str, StacAsset] | None = Field(
         default=None, description="STAC-style asset dictionary"
@@ -465,6 +592,14 @@ class DatasetResponse(BaseModel):
             "visibility or status change exposing keywords inherited from an "
             "analysis source the new audience cannot open. Only "
             "ever set on the PATCH response; the change has already applied."
+        ),
+    )
+    previous_version: PreviousVersionResponse | None = Field(
+        default=None,
+        description=(
+            "The data the last replacement or restore replaced, which "
+            "POST /previous-version/restore publishes again. Set on the "
+            "detail endpoint only; null elsewhere and when there is none."
         ),
     )
 
@@ -641,6 +776,10 @@ class DatasetMeta(BaseModel):
             "[] emits geometry-only tiles, list emits those properties at any zoom."
         ),
     )
+    owner_id: uuid.UUID | None = Field(
+        default=None,
+        description="Admin only: transfer the dataset to this active user.",
+    )
 
     @field_validator("language")
     @classmethod
@@ -731,6 +870,19 @@ class SchemaDiff(BaseModel):
     )
 
 
+ReviewReason = Literal[
+    "source_count_unavailable",
+    "empty_result",
+    "destructive_schema_change",
+    "geometry_type_changed",
+    "srid_changed",
+    "coordinate_dimension_reduced",
+    "arcgis_id_coverage_unavailable",
+    "arcgis_source_membership_changed",
+    "live_data_changed",
+]
+
+
 class ReuploadResponse(BaseModel):
     job_id: uuid.UUID
     status: str = "pending"
@@ -750,6 +902,21 @@ class ReuploadPreviewResponse(BaseModel):
     # GPKG-01 Phase 1058: multi-layer support fields
     all_layers: list[dict[str, Any]] | None = None
     previous_source_layer: str | None = None
+    review_reasons: list[ReviewReason] = Field(
+        default_factory=list,
+        description=(
+            "Changes in this file replacement or service re-upload that hold "
+            "it for review."
+        ),
+    )
+    review_fingerprint: str | None = Field(
+        default=None,
+        description=(
+            "Fingerprint of the reviewed changes. Send it as the commit's "
+            "`review_fingerprint` once a person has seen them; null when "
+            "nothing needs review."
+        ),
+    )
 
 
 class ReuploadServicePreviewRequest(BaseModel):
@@ -778,6 +945,15 @@ class ReuploadServicePreviewRequest(BaseModel):
 class ReuploadPreviewRequest(BaseModel):
     # GPKG-01 Phase 1058: optional layer_name for multi-layer file sources
     layer_name: str | None = Field(default=None, max_length=500)
+    srid_override: int | None = Field(
+        default=None,
+        ge=1,
+        le=998999,
+        description=(
+            "The SRID override the commit will send, so the preview judges "
+            "the coordinate system the replacement will be stored in."
+        ),
+    )
 
 
 class ReuploadCommitRequest(BaseModel):
@@ -801,6 +977,16 @@ class ReuploadCommitRequest(BaseModel):
     layer_name: str | None = Field(default=None, max_length=500)
     auth: ServiceAuthRequest | None = Field(
         default=None, description=SERVICE_AUTH_FIELD_DESCRIPTION
+    )
+    review_fingerprint: str | None = Field(
+        default=None,
+        pattern="^[0-9a-f]{64}$",
+        description=(
+            "The preview's `review_fingerprint`, sent once a person has seen "
+            "the changes it describes. A file replacement or service re-upload "
+            "with review reasons publishes only when the worker's own "
+            "fingerprint matches; otherwise its run ends `blocked`."
+        ),
     )
     _reject_auth_conflict = model_validator(mode="after")(reject_service_auth_conflict)
 
@@ -831,11 +1017,21 @@ class DatasetRefreshRequest(BaseModel):
         ),
     )
     _validate_token = field_validator("token")(_validate_safe_token)
+    verification_policy: Literal["standard", "arcgis_id_set_v1"] = Field(
+        default="standard",
+        description=(
+            "Verification policy for this refresh. arcgis_id_set_v1 performs "
+            "the stronger ArcGIS object-ID membership check."
+        ),
+    )
     accept_blocked_run_id: uuid.UUID | None = Field(
         default=None,
         description=(
             "A blocked run whose reviewed source and staged content may be "
-            "accepted once. A different result blocks again."
+            "accepted. The refresh that uses the acceptance holds it until it "
+            "ends, and a cancelled or failed refresh gives it back. A different "
+            "result blocks again. A blocked file replacement is accepted from "
+            "the upload its run kept."
         ),
     )
     auth: ServiceAuthRequest | None = Field(
@@ -880,6 +1076,9 @@ class DatasetVersionResponse(BaseModel):
     file_hash: str | None
     uploaded_by: uuid.UUID | None
     uploaded_at: datetime
+    restored_from_version: int | None = Field(
+        default=None, description="The version a restore published again as this one"
+    )
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -901,7 +1100,7 @@ class DatasetRowsResponse(BaseModel):
 
 
 class ColumnValuesResponse(BaseModel):
-    values: list[str | int | float | None]
+    values: list[bool | str | int | float | None]
     count: int
 
 
@@ -1097,6 +1296,14 @@ class DatasetRelationshipResponse(BaseModel):
     relationship_type: str
     label: str | None
     target_dataset_title: str | None = None
+    broken: bool = Field(
+        False,
+        description=(
+            "True when a join column no longer exists in its dataset. "
+            "Related-records reads for it fail until the relationship is deleted "
+            "or recreated."
+        ),
+    )
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -1158,7 +1365,26 @@ _ANALYSIS_PARAM_OWNERS = {
     "by_field": ("dissolve",),
     "join_dataset_id": ("spatial_join",),
     "join_fields": ("spatial_join",),
+    "mask_filter": ("clip", "select_by_location", "intersect"),
+    "join_filter": ("spatial_join",),
 }
+
+# Layer filters: CQL2-JSON, validated and compiled by the same code as the
+# OGC items `filter` parameter, so no SQL text comes from the client.
+_FILTER_DESCRIPTION = (
+    "CQL2-JSON filter on the source dataset, in the language "
+    "/collections/{dataset_id}/items accepts as filter-lang=cql2-json. Only "
+    "the features it keeps are analysed, counted, and checked against the "
+    "operation's size limit."
+)
+_MASK_FILTER_DESCRIPTION = (
+    "CQL2-JSON filter on the mask_dataset_id layer: only its matching "
+    "features form the mask or overlay. Requires mask_dataset_id."
+)
+_JOIN_FILTER_DESCRIPTION = (
+    "CQL2-JSON filter on the join layer: only its matching features are "
+    "joined (spatial_join only)."
+)
 
 # Operations whose geometry comes from a drawn mask or a mask layer, exactly
 # one of the two. fix(#956): intersect is deliberately NOT here -- it takes
@@ -1196,6 +1422,9 @@ def _require_analysis_params(request: Any) -> None:
     # this just insists on the layer that replaces it.
     if request.operation == "intersect" and request.mask_dataset_id is None:
         raise ValueError("intersect requires mask_dataset_id")
+    # A drawn mask has no attributes to filter.
+    if request.mask_filter is not None and request.mask_dataset_id is None:
+        raise ValueError("mask_filter requires mask_dataset_id")
     if request.operation == "spatial_join":
         if request.join_dataset_id is None:
             raise ValueError("spatial_join requires join_dataset_id")
@@ -1273,6 +1502,13 @@ class AnalysisPreviewRequest(BaseModel):
             "whole dataset, unchanged from before this field existed."
         ),
     )
+    filter: dict[str, Any] | None = Field(default=None, description=_FILTER_DESCRIPTION)
+    mask_filter: dict[str, Any] | None = Field(
+        default=None, description=_MASK_FILTER_DESCRIPTION
+    )
+    join_filter: dict[str, Any] | None = Field(
+        default=None, description=_JOIN_FILTER_DESCRIPTION
+    )
 
     @field_validator("bbox")
     @classmethod
@@ -1319,8 +1555,9 @@ class AnalysisPreviewResponse(BaseModel):
         description=(
             "Total feature count of the source dataset (1:1 operations only; "
             "null when the operation filters rows, e.g. clip). When the "
-            "request carried a bbox this is a live count of rows intersecting "
-            "it rather than the dataset's cached whole-table total. It is also "
+            "request carried a bbox or a filter this is a live count of the "
+            "rows intersecting the bbox and matching the filter rather than "
+            "the dataset's cached whole-table total. It is also "
             "null, like match_count, when that live count could not "
             "be computed within the query budget"
         ),
@@ -1330,7 +1567,8 @@ class AnalysisPreviewResponse(BaseModel):
         description=(
             "Exact total across the WHOLE source, not just the previewed "
             "features — WHOLE meaning the request's bbox when one was sent, "
-            "the same sense source_feature_count uses that word. What it "
+            "the same sense source_feature_count uses that word, and always "
+            "within the request's layer filters. What it "
             "counts is per-operation, so read it against the operation you "
             "sent rather than as one number: select_by_location gives the "
             "selected source features and intersect gives the output "
@@ -1407,6 +1645,13 @@ class AnalysisMaterializeRequest(BaseModel):
             "(spatial_join only)"
         ),
     )
+    filter: dict[str, Any] | None = Field(default=None, description=_FILTER_DESCRIPTION)
+    mask_filter: dict[str, Any] | None = Field(
+        default=None, description=_MASK_FILTER_DESCRIPTION
+    )
+    join_filter: dict[str, Any] | None = Field(
+        default=None, description=_JOIN_FILTER_DESCRIPTION
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -1429,22 +1674,38 @@ class AnalysisMaterializeResponse(BaseModel):
 class RefreshVerification(BaseModel):
     decision: Literal["allowed", "blocked", "rejected"]
     source_binding: dict[str, Any]
+    source_binding_fingerprint: str | None = None
     source_count: int | None
     fetched_count: int | None
     count_status: Literal["matched", "mismatched", "unavailable"]
-    identity_check: Literal["unavailable", "content_digest"]
+    identity_check: Literal["unavailable", "content_digest", "arcgis_id_set"]
     content_digest: str | None = None
+    arcgis_id_coverage: dict[str, Any] | None = None
     staged_geometry_type: str | None = None
     staged_srid: int | None = None
     staged_coordinate_dimension: int | None = None
-    review_reasons: list[
-        Literal[
-            "source_count_unavailable",
-            "empty_result",
-            "destructive_schema_change",
-        ]
-    ]
-    review_fingerprint: str | None
+    geometry_contract: dict[str, Any] | None = None
+    review_reasons: list[ReviewReason]
+    review_fingerprint: str | None = Field(
+        description=(
+            "Identifies what a blocked run asks a person to accept. A service "
+            "refresh fingerprints all of its evidence, so its acceptance must "
+            "fetch the same data again. A file replacement or service re-upload "
+            "fingerprints only its review reasons, removed columns, type "
+            "changes and, for a geometry reason, the geometry facts, which is "
+            "what its preview shows. A run held because features were edited "
+            "while it ran also names the edits it found, so accepting it does "
+            "not cover a later edit."
+        )
+    )
+    review_acknowledged_by: Literal["preview", "accepted_run"] | None = Field(
+        default=None,
+        description=(
+            "Why a replacement judged on its preview published: its commit "
+            "carried the preview's fingerprint, or a person accepted a blocked "
+            "run with the same changes."
+        ),
+    )
     accepted_blocked_run_id: uuid.UUID | None
     acceptance_consumed_by_run_id: uuid.UUID | None = None
 
@@ -1477,7 +1738,8 @@ class DatasetRefreshRunResponse(BaseModel):
     origin_kind: str = Field(
         description=(
             "The run's execution door, not the dataset's origin: upload, "
-            "postgis, service, stac, or raster. The two can visibly "
+            "postgis, service, stac, raster, or restore (the previous "
+            "version published again). The two can visibly "
             "diverge; for example a STAC-imported raster's pending or "
             "failed replace run is recorded 'upload' while the dataset's "
             "origin stays 'stac' until the replace succeeds. 'raster' "
@@ -1485,7 +1747,20 @@ class DatasetRefreshRunResponse(BaseModel):
             "label, with today's raster-replace runs recorded 'upload'."
         )
     )
-    trigger: str = Field(description="manual, api, or cli")
+    trigger: str = Field(description="manual, api, cli, or scheduled")
+    scheduled_for: datetime | None = Field(
+        default=None,
+        description=(
+            "The scheduled occurrence time. Null for manual, API, and CLI runs."
+        ),
+    )
+    claim_deadline: datetime | None = Field(
+        default=None,
+        description=(
+            "The immutable admission deadline for a scheduled or keyed run. "
+            "Null for legacy runs without an admission fence."
+        ),
+    )
     status: str = Field(
         description="pending, running, succeeded, failed, cancelled, or blocked"
     )

@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 
 from httpx import AsyncClient
 
+from app.api.main import app
 from app.modules.auth.router import REGISTRATION_ENABLED
 from app.core.config import settings
 from tests.conftest import get_auth_header
@@ -56,7 +57,7 @@ class TestRegistration:
         """Registration creates a pending user when REGISTRATION_ENABLED=true."""
         monkeypatch.setattr(
             REGISTRATION_ENABLED,
-            "get",
+            "get_uncached",
             AsyncMock(return_value=True),
         )
 
@@ -87,7 +88,7 @@ class TestRegistration:
         """
         monkeypatch.setattr(
             REGISTRATION_ENABLED,
-            "get",
+            "get_uncached",
             AsyncMock(return_value=True),
         )
 
@@ -127,6 +128,27 @@ class TestLogin:
         data = resp.json()
         assert "access_token" in data
         assert data["token_type"] == "bearer"
+
+    async def test_openapi_token_url_matches_the_proxied_login_path(
+        self, client: AsyncClient
+    ):
+        """The advertised tokenUrl is the login path behind the `/api` proxy.
+
+        The test client reaches the app under both paths, so the published value
+        is what guards deployments; the POST only shows that path works.
+        """
+        app.openapi_schema = None
+        spec = app.openapi()
+        flows = spec["components"]["securitySchemes"]["OAuth2PasswordBearer"]["flows"]
+        token_url = flows["password"]["tokenUrl"]
+        assert token_url == "/api/auth/login"
+
+        resp = await client.post(
+            token_url,
+            data={"username": ADMIN_USER, "password": ADMIN_PASS},
+        )
+        assert resp.status_code == 200
+        assert "access_token" in resp.json()
 
     async def test_login_sets_last_login_at(self, client: AsyncClient):
         """Successful login populates last_login_at on the user profile."""
@@ -318,7 +340,7 @@ class TestLoginAudit:
         """
         monkeypatch.setattr(
             REGISTRATION_ENABLED,
-            "get",
+            "get_uncached",
             AsyncMock(return_value=True),
         )
         unique = uuid.uuid4().hex[:8]
@@ -805,7 +827,7 @@ class TestAdminApproveReject:
 
         monkeypatch.setattr(
             REGISTRATION_ENABLED,
-            "get",
+            "get_uncached",
             AsyncMock(return_value=True),
         )
 
@@ -849,7 +871,7 @@ class TestAdminApproveReject:
 
         monkeypatch.setattr(
             REGISTRATION_ENABLED,
-            "get",
+            "get_uncached",
             AsyncMock(return_value=True),
         )
 

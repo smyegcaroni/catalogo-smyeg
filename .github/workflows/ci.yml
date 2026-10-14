@@ -54,7 +54,7 @@ jobs:
   # ---------- detect changed paths for conditional jobs ----------
   changes:
     name: Detect Changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Every job below now carries an explicit cap. Runner apt-get/npm-mirror
     # installs have blackholed nine times across geolens-io repos in the two
     # days before 2026-08-19 (e.g. runs 32158035509, 32172191527,
@@ -150,12 +150,25 @@ jobs:
               # test asserts audit-archives/ stays gitignored, so a
               # .gitignore-only PR must run Backend Tests too.
               - 'scripts/audit_retention.sh'
+              # test_check_suppressed_alerts.py imports this script.
+              - 'scripts/check_suppressed_alerts.py'
+              # test_frontend_dev_entrypoint.py runs this script against a stub npm.
+              - 'frontend/docker-dev-entrypoint.sh'
+              # Decides which test files each Backend Tests shard runs; a PR
+              # touching only it must exercise the sharded run.
+              - 'scripts/ci_backend_shards.py'
               # fix(#1277 review): test_sdks_round_trip.py asserts the generated
               # SDK carries no unguarded optional-body emission, which is what
               # this script produces during `make sdks`. A PR editing only the
               # script would otherwise skip Backend Tests and never run the
               # assertion that says whether it still works.
               - 'scripts/fix_sdk_optional_body.py'
+              # test_sdks_round_trip.py checks that every anonymous-capable
+              # operation accepts a plain Client, which this script produces.
+              - 'scripts/fix_sdk_anonymous_client.py'
+              # The SDK's hand-maintained modules (auth.py, cog_download.py) are
+              # tested only in test_sdks_round_trip.py and change without backend/**.
+              - 'sdks/python/geolens/*.py'
               # fix(#1607): test_seed_showcase_pins_1607.py imports this seeder
               # and walks its AST to prove every builder routes its map-exists
               # check through _keep_existing_map, so the maps geolens-examples
@@ -178,6 +191,7 @@ jobs:
               - 'frontend/src/types/api.ts'
               - 'frontend/src/lib/basemap-utils.ts'
               - 'frontend/src/lib/capabilities.ts'
+              - 'frontend/src/lib/__tests__/record-type-capabilities.cases.json'
               - 'frontend/src/components/builder/layer-adapters/shared.ts'
               # fix(#1778): more frontend files (plus one
               # e2e spec below) that backend tests reference by literal path
@@ -197,6 +211,10 @@ jobs:
               - 'frontend/src/components/admin/AuditLogViewer.tsx'
               - 'frontend/src/lib/__tests__/public-app-url-shape.cases.json'
               - 'frontend/src/lib/error-map.ts'
+              # test_job_failure_codes.py reads this by literal path (the
+              # fixed-failure-code to translation-key table); a
+              # frontend-only edit here must still run Backend Tests.
+              - 'frontend/src/lib/failure-reason.ts'
               - 'frontend/README.md'
               - 'frontend/src/components/admin/__tests__/AdminSidebar.test.tsx'
               - 'frontend/src/lib/__tests__/public-urls.test.ts'
@@ -262,8 +280,8 @@ jobs:
               # alert-suppression query, that a step still acts on the SARIF,
               # and that the query still refuses to honour ruff's noqa
               # comments. Without these entries a codeql.yml-only PR skips the
-              # only test that checks any of it. See AGENTS.md > Standing
-              # CodeQL policy.
+              # only test that checks any of it. See AGENTS.md > Security >
+              # CodeQL.
               - '.github/workflows/codeql.yml'
               - '.github/codeql/**'
               # fix(#1925): test_unscoped_finding_markers.py reads this config
@@ -448,7 +466,7 @@ jobs:
     name: Backend Lint
     needs: changes
     if: needs.changes.outputs.backend == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     defaults:
       run:
@@ -456,7 +474,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: "0.10.2"
           enable-cache: true
@@ -490,7 +508,7 @@ jobs:
 
   pre-commit:
     name: Pre-commit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -545,7 +563,7 @@ jobs:
     name: Installer Tag Resolution
     needs: changes
     if: needs.changes.outputs.installer == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -583,7 +601,7 @@ jobs:
       # .env interpolation/decoding checked against REAL `docker compose`
       # (not just our own understanding of its grammar) for the full corpus
       # of rounds 6-12 findings. `docker compose config` needs no daemon,
-      # image pull, or network — ubuntu-latest ships docker compose.
+      # image pull, or network — ubuntu-26.04 ships docker compose.
       - name: get_env_value vs real Docker Compose oracle test
         run: sh scripts/tests/test-env-file-compose-oracle.sh
 
@@ -622,7 +640,7 @@ jobs:
     name: Backup Restore Round-trip
     needs: changes
     if: needs.changes.outputs.backup == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       PGHOST: localhost
@@ -668,7 +686,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
 
       - name: Build backup image (Dockerfile --target backup, --load for docker run)
         run: |
@@ -713,7 +731,7 @@ jobs:
           # client (pg_dump/pg_restore/psql/createdb/dropdb).
           #
           # awscli is intentionally NOT installed from apt (dropped from noble).
-          # AWS CLI v2 is already preinstalled on ubuntu-latest runners and is
+          # AWS CLI v2 is already preinstalled on ubuntu-26.04 runners and is
           # used in the managed-mode step below to pull the staging archive from
           # MinIO after the backup image uploads it via its own SigV4 path.
           sudo install -d /usr/share/postgresql-common/pgdg
@@ -839,8 +857,8 @@ jobs:
           docker compose -f "$COMPOSE_FILE" up -d --build --wait db
 
           # The script validates the archive end-to-end, runs the pre-restore
-          # DDL, pg_restore --clean --if-exists --no-owner, classifies
-          # warnings vs errors, and re-applies the geolens_reader grants.
+          # DDL, pg_restore --clean --if-exists --no-owner (any nonzero exit
+          # fails), and re-applies the geolens_reader grants.
           # Its exit code is the gate (set -e).
           bash scripts/restore.sh "$DUMP_FILE"
 
@@ -940,7 +958,7 @@ jobs:
     name: OpenAPI Snapshot Drift
     needs: changes
     if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.sdks == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     defaults:
       run:
@@ -957,7 +975,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: "0.10.2"
           enable-cache: true
@@ -977,7 +995,7 @@ jobs:
     name: SDKs Drift Gate
     needs: changes
     if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.sdks == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     env:
       # Match the OpenAPI snapshot job's env so dump_openapi.py runs
@@ -989,7 +1007,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: "0.10.2"
           enable-cache: true
@@ -1032,7 +1050,7 @@ jobs:
   # + json + re); no DB, no Docker, runs on every push/PR.
   version-coherence:
     name: Version Coherence
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -1070,7 +1088,7 @@ jobs:
   # Pure stdlib; runs on every push/PR.
   docs-contract:
     name: Docs Contract
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -1104,7 +1122,7 @@ jobs:
   # file. Pure stdlib Node — no DB, browser, or network. Runs on every push/PR.
   readme-assets:
     name: README Assets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -1128,7 +1146,7 @@ jobs:
     name: Monitoring Rules
     needs: changes
     if: needs.changes.outputs.monitoring == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     env:
       # Same image RUNBOOK.md §4 tells operators to run Prometheus from, pinned
@@ -1184,7 +1202,7 @@ jobs:
     name: CLI Tests
     needs: changes
     if: needs.changes.outputs.cli == 'true' || needs.changes.outputs.backend == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     env:
       # CLI round-trip tests import the FastAPI app and exercise DB-backed
@@ -1240,7 +1258,7 @@ jobs:
             sleep 2
           done
 
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: "0.10.2"
           enable-cache: true
@@ -1324,13 +1342,13 @@ jobs:
     name: MCP Server Tests
     needs: changes
     if: needs.changes.outputs.mcp == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Compose boot + image build for the live tier need headroom on a shared
     # runner; the e2e-smoke job uses the same budget for a larger stack.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: "0.10.2"
           enable-cache: true
@@ -1388,17 +1406,24 @@ jobs:
         run: docker compose down
 
   backend-test:
-    name: Backend Tests
+    name: Backend Tests (${{ matrix.shard }}/4)
     needs: changes
     # Alembic-only changes must run the suite too — this condition absorbed the
     # deleted pytest-parallel-isolation job's trigger when that job folded in.
     if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.alembic == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # scripts/ci_backend_shards.py deals the test files across SHARD_COUNT
+        # shards; keep the matrix and SHARD_COUNT in step.
+        shard: [1, 2, 3, 4]
     defaults:
       run:
         working-directory: backend
     env:
+      SHARD_COUNT: 4
       POSTGRES_USER: geolens
       POSTGRES_PASSWORD: geolens_test
       POSTGRES_HOST: localhost
@@ -1412,6 +1437,9 @@ jobs:
       # PEP 669 sys.monitoring coverage core (Python 3.12+, coverage >= 7.4):
       # far cheaper than the default C-trace and combines correctly under xdist.
       COVERAGE_CORE: sysmon
+      # Visible (non-dot) name so upload-artifact ships it; pytest-cov combines
+      # the xdist workers' data into this file.
+      COVERAGE_FILE: coverage.shard-${{ matrix.shard }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -1454,7 +1482,7 @@ jobs:
             sleep 2
           done
 
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: "0.10.2"
           enable-cache: true
@@ -1546,6 +1574,9 @@ jobs:
         run: uv run alembic check
 
       - name: Manifest backend apply contract tests
+        # These also run inside whichever shard owns each file; one shard is
+        # enough for the standalone pass.
+        if: matrix.shard == 1
         run: |
           uv run pytest -v \
             tests/test_manifest_apply_api.py \
@@ -1554,26 +1585,33 @@ jobs:
             tests/test_manifest_apply_roundtrip.py \
             tests/test_layering.py
 
-      - name: Run tests with coverage
-        # --cov-fail-under=80 is the CI floor, aligned with pyproject's
-        # fail_under. The #561 -n4 run measured 85.49% actual, so 80 gates a real
-        # regression with a ~5.5 pt buffer (the old 58.5 caught nothing). Ratchet
-        # upward per the pyproject note; never lower without a CHANGELOG rationale.
+      - name: List this shard's tests
+        # Compared with the full collection by the coverage job, so a test file
+        # no shard picks up (or two shards both pick up) fails the build.
+        run: |
+          mapfile -t FILES < <(python3 ../scripts/ci_backend_shards.py "$SHARD_COUNT" "${{ matrix.shard }}")
+          echo "shard ${{ matrix.shard }}/$SHARD_COUNT: ${#FILES[@]} files"
+          uv run pytest --collect-only -q -m 'not perf' "${FILES[@]}" \
+            | grep -E '^tests/[^ ]+\.py::' | sort > "collected-shard-${{ matrix.shard }}.txt"
+          wc -l "collected-shard-${{ matrix.shard }}.txt"
+
+      - name: Run shard tests with coverage
+        # Each shard records coverage data only; the Backend Coverage job
+        # combines them and enforces the 80% floor (aligned with pyproject's
+        # fail_under; never lower it without a CHANGELOG rationale). The
+        # per-shard --cov-fail-under=0 overrides that pyproject value, which a
+        # single shard cannot meet alone.
         #
-        # This is the ONLY full-suite run. The former pytest-parallel-isolation
-        # job became a duplicate the day this job went xdist (#561): both ran the
-        # same suite `-n 4 --dist loadgroup`, differing only by coverage flags
-        # and the 4 `lifecycle` tests — folded in here via `-m 'not perf'`. Any
-        # fixture-isolation regression that job guarded against fails this run
-        # identically. pytest-cov auto-combines each worker's data, so
-        # --cov-fail-under still gates on the full total; --dist loadgroup
-        # (pyproject addopts) co-locates the global-state tenancy tests.
-        #
-        # -n 4 matches the runner's 4 vCPUs. -n 6 was benchmarked in #673 and
-        # measured slightly SLOWER (605s vs 585s pytest step): the suite keeps
-        # the cores saturated, so oversubscribing past core count buys nothing.
-        # --durations=25 keeps the slowest-test tail visible in every run.
-        run: uv run pytest -n 4 -v --tb=short --durations=25 -m 'not perf' --cov=app --cov-report=term-missing --cov-report=html:htmlcov --cov-report=xml:coverage.xml --cov-fail-under=80
+        # -n 4 matches the runner's 4 vCPUs; -n 6 measured slightly slower
+        # because the suite already saturates the cores. --dist loadgroup
+        # (pyproject addopts) co-locates the global-state tenancy tests on one
+        # worker. -m 'not perf' folds in the lifecycle tests. --durations=25
+        # keeps the slowest-test tail visible in every run.
+        run: |
+          mapfile -t FILES < <(python3 ../scripts/ci_backend_shards.py "$SHARD_COUNT" "${{ matrix.shard }}")
+          uv run pytest -n 4 -v --tb=short --durations=25 -m 'not perf' \
+            --junitxml="junit-shard-${{ matrix.shard }}.xml" \
+            --cov=app --cov-report= --cov-fail-under=0 "${FILES[@]}"
 
       - name: Verify SAML fixtures unchanged after pytest
         run: |
@@ -1590,12 +1628,26 @@ jobs:
             exit 1
           fi
 
-      - name: Upload backend coverage report
+      - name: Upload shard coverage data
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
-          name: backend-coverage
-          path: backend/htmlcov/
+          name: backend-coverage-shard-${{ matrix.shard }}
+          path: |
+            backend/coverage.shard-${{ matrix.shard }}
+            backend/collected-shard-${{ matrix.shard }}.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload shard test timings
+        # scripts/ci_backend_shards.py --timings reads these to refresh the
+        # per-file durations it balances the shards with.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: backend-junit-shard-${{ matrix.shard }}
+          path: backend/junit-shard-${{ matrix.shard }}.xml
+          if-no-files-found: warn
           retention-days: 14
 
       # fix(#1633): the gpkg byte-determinism gate
@@ -1614,9 +1666,95 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
-          name: determinism-evidence
+          name: determinism-evidence-${{ matrix.shard }}
           path: backend/test-artifacts/determinism/
           if-no-files-found: ignore
+          retention-days: 14
+
+  # Combines the shards' coverage data and gates the total. Skipped when
+  # Backend Tests skipped; blocked (not run) when any shard failed, which CI OK
+  # reports through backend-test itself.
+  backend-coverage:
+    name: Backend Coverage
+    needs: backend-test
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      POSTGRES_USER: geolens
+      POSTGRES_PASSWORD: geolens_test
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: postgres
+      JWT_SECRET_KEY: test-secret-key-for-ci-padding-32chars
+      GEOLENS_ADMIN_USERNAME: admin
+      GEOLENS_ADMIN_PASSWORD: geolens-ci-admin-password
+      PYTHONPATH: .
+      SHARD_COUNT: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          version: "0.10.2"
+          enable-cache: true
+          cache-dependency-glob: "backend/uv.lock"
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Install Python dependencies
+        run: uv sync --locked --dev
+
+      - name: Download shard coverage data
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7.0.0
+        with:
+          pattern: backend-coverage-shard-*
+          merge-multiple: true
+          path: backend
+
+      - name: Every test runs in exactly one shard
+        run: |
+          [ "$(ls collected-shard-*.txt | wc -l)" -eq "$SHARD_COUNT" ] \
+            || { echo "::error::expected $SHARD_COUNT shard collections"; ls; exit 1; }
+          [ "$(ls coverage.shard-* | wc -l)" -eq "$SHARD_COUNT" ] \
+            || { echo "::error::expected $SHARD_COUNT coverage data files"; ls; exit 1; }
+          uv run pytest --collect-only -q -m 'not perf' \
+            | grep -E '^tests/[^ ]+\.py::' | sort > collected-full.txt
+          cat collected-shard-*.txt | sort > collected-union.txt
+          DUPES=$(uniq -d collected-union.txt)
+          if [ -n "$DUPES" ]; then
+            echo "::error::tests collected by more than one shard"
+            echo "$DUPES" | head -20
+            exit 1
+          fi
+          if ! diff collected-full.txt collected-union.txt > collected.diff; then
+            echo "::error::the shards' tests differ from the full collection"
+            head -40 collected.diff
+            exit 1
+          fi
+          echo "$(wc -l < collected-full.txt) tests, each in exactly one shard"
+
+      - name: Combine coverage and report
+        run: |
+          uv run coverage combine coverage.shard-*
+          uv run coverage html -d htmlcov
+          uv run coverage xml -o coverage.xml
+          # fail_under comes from pyproject ([tool.coverage.report]); pass it
+          # explicitly so the floor is visible here too.
+          uv run coverage report --show-missing --fail-under=80
+
+      - name: Upload backend coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: backend-coverage
+          path: |
+            backend/htmlcov/
+            backend/coverage.xml
           retention-days: 14
 
   # ---------- alembic clean-DB upgrade smoke ----------
@@ -1631,12 +1769,12 @@ jobs:
     name: Alembic Clean-DB Upgrade
     needs: changes
     if: needs.changes.outputs.alembic == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: "0.10.2"
           enable-cache: true
@@ -1663,7 +1801,7 @@ jobs:
     name: Frontend Lint & Typecheck
     needs: changes
     if: needs.changes.outputs.frontend == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     defaults:
       run:
@@ -1673,7 +1811,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: "0.10.2"
 
@@ -1733,7 +1871,7 @@ jobs:
     name: Frontend Tests
     needs: changes
     if: needs.changes.outputs.frontend == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     defaults:
       run:
@@ -1775,7 +1913,7 @@ jobs:
   # against the current tree). The JSON report is still uploaded as an artifact.
   license-check:
     name: License Check (frontend)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     if: always()  # run even if other jobs fail
     timeout-minutes: 5
     # fix(#1816 round 2): job-scoped, not step-scoped. Codex round 1 on #1818
@@ -1850,7 +1988,7 @@ jobs:
     name: Security Scan
     needs: changes
     if: needs.changes.outputs.backend == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     defaults:
       run:
@@ -1858,7 +1996,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: "0.10.2"
           enable-cache: true
@@ -1909,6 +2047,7 @@ jobs:
       # step below counts skipped as pass.
       - backend-lint
       - backend-test
+      - backend-coverage
       - installer-test
       - backup-roundtrip
       - openapi-snapshot
@@ -1946,7 +2085,7 @@ jobs:
     # always() alone would rubber-stamp: it only guarantees this job RUNS.
     # The step below does the real gating on needs.*.result.
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - name: Fail if any needed job failed or was cancelled
@@ -1978,7 +2117,7 @@ jobs:
   runtime-extension-image-probe:
     name: "Runtime Extension Image Probe (${{ matrix.target }})"
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -2046,7 +2185,7 @@ jobs:
       && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
       && !contains(needs.*.result, 'failure')
       && !contains(needs.*.result, 'cancelled')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs: [backend-lint, backend-test, frontend-lint, frontend-test, security-scan]
     # A clean run includes fixture ingestion, 150+ checks, retries, and cleanup.
     # Keep enough headroom for the whole suite to finish on a shared runner.
@@ -2094,6 +2233,19 @@ jobs:
           NPM_CONFIG_LOGLEVEL: http
         run: npm ci
 
+      - name: Resolve Playwright version
+        id: playwright-version
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Playwright browsers and apt packages
+        id: playwright-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/playwright-apt-archives/*.deb
+          key: playwright-${{ runner.os }}-ubuntu-26.04-${{ steps.playwright-version.outputs.version }}
+
       - name: Install Playwright Browsers
         timeout-minutes: 13
         run: |
@@ -2132,6 +2284,11 @@ jobs:
           # (13-minute) step cap.
           echo 'Acquire::http::Timeout "30"; Acquire::https::Timeout "30"; Acquire::Retries "3";' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-fetch-timeouts >/dev/null
+          # Keep downloaded .debs in a cacheable directory: the slow part of
+          # this step is fetching them from the runner's apt mirror.
+          mkdir -p "$HOME/playwright-apt-archives"
+          echo "Dir::Cache::archives \"$HOME/playwright-apt-archives\";" \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-apt-archives >/dev/null
           for i in 1 2 3; do
             timeout -k 10 180 npx playwright install --with-deps chromium && break
             echo "playwright install attempt $i failed"
@@ -2148,6 +2305,15 @@ jobs:
             sudo timeout -k 10 30 dpkg --configure -a || true
             sleep 10
           done
+
+      - name: Save Playwright browsers and apt packages
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/playwright-apt-archives/*.deb
+          key: playwright-${{ runner.os }}-ubuntu-26.04-${{ steps.playwright-version.outputs.version }}
 
       - name: Run E2E tests
         run: npx playwright test
@@ -2237,7 +2403,7 @@ jobs:
     if: >-
       (github.event_name == 'pull_request' && needs.changes.outputs.e2e == 'true')
       || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       # The recipe below mirrors the nightly e2e-test job above — same .env
@@ -2279,6 +2445,19 @@ jobs:
           NPM_CONFIG_LOGLEVEL: http
         run: npm ci
 
+      - name: Resolve Playwright version
+        id: playwright-version
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Playwright browsers and apt packages
+        id: playwright-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/playwright-apt-archives/*.deb
+          key: playwright-${{ runner.os }}-ubuntu-26.04-${{ steps.playwright-version.outputs.version }}
+
       - name: Install Playwright Browsers
         timeout-minutes: 13
         run: |
@@ -2317,6 +2496,11 @@ jobs:
           # (13-minute) step cap.
           echo 'Acquire::http::Timeout "30"; Acquire::https::Timeout "30"; Acquire::Retries "3";' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-fetch-timeouts >/dev/null
+          # Keep downloaded .debs in a cacheable directory: the slow part of
+          # this step is fetching them from the runner's apt mirror.
+          mkdir -p "$HOME/playwright-apt-archives"
+          echo "Dir::Cache::archives \"$HOME/playwright-apt-archives\";" \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-apt-archives >/dev/null
           for i in 1 2 3; do
             timeout -k 10 180 npx playwright install --with-deps chromium && break
             echo "playwright install attempt $i failed"
@@ -2333,6 +2517,15 @@ jobs:
             sudo timeout -k 10 30 dpkg --configure -a || true
             sleep 10
           done
+
+      - name: Save Playwright browsers and apt packages
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/playwright-apt-archives/*.deb
+          key: playwright-${{ runner.os }}-ubuntu-26.04-${{ steps.playwright-version.outputs.version }}
 
       - name: Run core E2E smoke suite
         run: npm run e2e:smoke:core
@@ -2373,7 +2566,7 @@ jobs:
   ai-evals:
     name: AI Evals (live provider)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Live-API job: cap it so a hung provider call can't burn Actions minutes.
     timeout-minutes: 30
     defaults:
@@ -2436,7 +2629,7 @@ jobs:
             sleep 2
           done
 
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: "0.10.2"
           enable-cache: true
@@ -2518,19 +2711,19 @@ jobs:
     # preserves the push gate: don't run the expensive a11y suite if an upstream
     # lint/test failed.
     #
-    # fix(#1096): merge_group added, and this job joined ci-ok's needs. Before,
-    # axe ran ONLY on a push that had already happened, and gated nothing even
-    # then, because it was absent from the aggregator. An a11y regression landed
-    # on main and painted it red with no owner. In the queue it now runs against
-    # the candidate merge and a failure keeps it out. Costs ~4.7 min on the
-    # critical path, measured, and only after backend-test's 27.5.
+    # This job gates ci-ok, so in the queue it runs against the candidate merge
+    # and a failure keeps it out. It needs only the lints and the security scan
+    # (a few minutes), not the test suites: the browser suite does not depend
+    # on them, and waiting for the slowest backend shard put ~8 min of a11y on
+    # the critical path after ~18 min of pytest. Now it runs alongside the
+    # shards and finishes before they do.
     if: >-
       always()
       && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
       && !contains(needs.*.result, 'failure')
       && !contains(needs.*.result, 'cancelled')
-    runs-on: ubuntu-latest
-    needs: [backend-lint, backend-test, frontend-lint, frontend-test, security-scan]
+    runs-on: ubuntu-26.04
+    needs: [backend-lint, frontend-lint, security-scan]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -2567,6 +2760,19 @@ jobs:
           NPM_CONFIG_FETCH_RETRIES: "2"
           NPM_CONFIG_LOGLEVEL: http
         run: npm ci
+
+      - name: Resolve Playwright version
+        id: playwright-version
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Playwright browsers and apt packages
+        id: playwright-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/playwright-apt-archives/*.deb
+          key: playwright-${{ runner.os }}-ubuntu-26.04-${{ steps.playwright-version.outputs.version }}
 
       - name: Install Playwright Browsers
         timeout-minutes: 13
@@ -2606,6 +2812,11 @@ jobs:
           # (13-minute) step cap.
           echo 'Acquire::http::Timeout "30"; Acquire::https::Timeout "30"; Acquire::Retries "3";' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-fetch-timeouts >/dev/null
+          # Keep downloaded .debs in a cacheable directory: the slow part of
+          # this step is fetching them from the runner's apt mirror.
+          mkdir -p "$HOME/playwright-apt-archives"
+          echo "Dir::Cache::archives \"$HOME/playwright-apt-archives\";" \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-apt-archives >/dev/null
           for i in 1 2 3; do
             timeout -k 10 180 npx playwright install --with-deps chromium && break
             echo "playwright install attempt $i failed"
@@ -2650,6 +2861,15 @@ jobs:
       # run and leaves several minutes of this job's 15-minute cap for the
       # steps before and after (checkout/env/compose-up/npm-ci/browser-
       # install ran in 2m45s-4m29s across the two measured passing runs).
+      - name: Save Playwright browsers and apt packages
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/playwright-apt-archives/*.deb
+          key: playwright-${{ runner.os }}-ubuntu-26.04-${{ steps.playwright-version.outputs.version }}
+
       - name: Run accessibility tests
         run: >-
           npx playwright test e2e/accessibility.spec.ts e2e/keyboard-nav.spec.ts
@@ -2688,17 +2908,16 @@ jobs:
     # push(main), evaluate on schedule/dispatch despite skipped needs, and stay
     # off PRs (per-PR Actions budget = 0).
     #
-    # fix(#1096): merge_group added here too, same reasoning. STAC conformance
-    # is a public API contract, and it previously could not block the commit
-    # that broke it. ~2.7 min, in parallel with axe, so it adds nothing to the
-    # critical path beyond what axe already costs.
+    # STAC conformance is a public API contract, so it gates ci-ok in the queue
+    # like the accessibility job above, with the same needs: lints and the
+    # security scan only, so it runs alongside the test shards.
     if: >-
       always()
       && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
       && !contains(needs.*.result, 'failure')
       && !contains(needs.*.result, 'cancelled')
-    runs-on: ubuntu-latest
-    needs: [backend-lint, backend-test, frontend-lint, frontend-test, security-scan]
+    runs-on: ubuntu-26.04
+    needs: [backend-lint, frontend-lint, security-scan]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -2795,7 +3014,7 @@ jobs:
       always()
       && github.event_name == 'schedule'
       && (needs.e2e-test.result != 'success' || needs.accessibility.result != 'success')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       issues: write

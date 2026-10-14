@@ -127,6 +127,31 @@ async def _registered_dataset(
     return dataset
 
 
+async def _load_3d_points(session, table: str, *, geom_type: str) -> None:
+    """Retype the seed table's ``geom`` as ``geom_type`` and load two 3D points."""
+    await session.execute(
+        text(  # noqa: S608
+            f"ALTER TABLE data.{table} "
+            f"ALTER COLUMN geom TYPE {geom_type}, "
+            "ALTER COLUMN geom_4326 TYPE geometry(Point, 4326)"
+        )
+    )
+    await session.execute(
+        text(  # noqa: S608
+            f"INSERT INTO data.{table} (name, geom, geom_4326) VALUES "
+            "('a', ST_GeomFromText('POINT Z (1 1 5)', 4326), "
+            "ST_GeomFromText('POINT (1 1)', 4326)), "
+            "('b', ST_GeomFromText('POINT Z (2 2 40)', 4326), "
+            "ST_GeomFromText('POINT (2 2)', 4326))"
+        )
+    )
+    await session.commit()
+
+
+def _three_d(dataset: Dataset) -> tuple:
+    return dataset.is_3d, dataset.n_dims, dataset.z_min, dataset.z_max
+
+
 @asynccontextmanager
 async def _dispatch_harness():
     """Patch the deferred task and yield the mock the door should reach for."""
@@ -147,8 +172,13 @@ async def _run_for(session, dataset_id: uuid.UUID) -> DatasetRefreshRun | None:
 
 
 async def _job_for(session, job_id: uuid.UUID) -> IngestJob:
+    """Read the job back from the database, past the identity map."""
     return (
-        await session.execute(select(IngestJob).where(IngestJob.id == job_id))
+        await session.execute(
+            select(IngestJob)
+            .where(IngestJob.id == job_id)
+            .execution_options(populate_existing=True)
+        )
     ).scalar_one()
 
 
@@ -537,6 +567,20 @@ class TestPostgisRefreshDispatch:
 # ---------------------------------------------------------------------------
 
 
+# Two ways a registered table's geom stops reporting an SRID: the typmod drops
+# it, or a domain over geometry hides the column from geometry_columns.
+_SRID_LOSSES = {
+    "srid_zero": [
+        "ALTER TABLE data.{t} ALTER COLUMN geom "
+        "TYPE geometry(Polygon, 0) USING ST_SetSRID(geom, 0)",
+    ],
+    "domain": [
+        "CREATE DOMAIN data.{t}_geom AS geometry(Polygon, 3857)",
+        "ALTER TABLE data.{t} ALTER COLUMN geom TYPE data.{t}_geom USING geom",
+    ],
+}
+
+
 class TestPostgisRefreshExecution:
     async def test_a_refresh_re_measures_the_live_table(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
@@ -735,8 +779,9 @@ class TestPostgisRefreshExecution:
 
         payload = await _dispatch(client, admin_auth_header, dataset.id)
         purge = AsyncMock()
-        with patch.object(
-            tasks_postgis_refresh, "invalidate_tile_cache_for_table", purge
+        with patch(
+            "app.processing.ingest.publish_followups.invalidate_tile_cache_for_table",
+            purge,
         ):
             await _execute(test_db_session, payload)
 
@@ -941,15 +986,7 @@ class TestPostgisRefreshExecution:
     async def test_an_emptied_table_clears_the_stored_extent(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ) -> None:
-        """Where this parts from the swap path, deliberately.
-
-        ``_apply_reupload_swap`` only ever writes a non-NULL extent, so an
-        emptied source leaves the old footprint in place. That is tolerable
-        for a path installing bytes it fetched; it is not tolerable for the
-        one operation whose entire job is making the stored metadata agree
-        with the live table, because the footprint is what spatial search
-        matches on.
-        """
+        """An emptied table clears the stored extent that spatial search matches on."""
         admin_id = await get_user_id(test_db_session, "admin")
         dataset = await _registered_dataset(test_db_session, created_by=admin_id)
         await test_db_session.execute(
@@ -974,6 +1011,161 @@ class TestPostgisRefreshExecution:
             {"rid": refreshed.record_id},
         )
         assert extent is None
+
+    async def test_a_3d_point_table_records_its_z_range_without_an_elev_column(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ) -> None:
+        """A 3D point table records is_3d, n_dims and its z range, and gains no column."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _registered_dataset(
+            test_db_session, created_by=admin_id, rows=0
+        )
+        table = dataset.table_name
+        await _load_3d_points(
+            test_db_session, table, geom_type="geometry(PointZ, 4326)"
+        )
+
+        payload = await _dispatch(client, admin_auth_header, dataset.id)
+        await _execute(test_db_session, payload)
+
+        refreshed = await _reload(test_db_session, dataset.id)
+        assert _three_d(refreshed) == (True, 3, 5.0, 40.0)
+        columns = await test_db_session.scalars(
+            text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'data' AND table_name = :t"
+            ),
+            {"t": table},
+        )
+        assert "elev" not in set(columns)
+
+    @pytest.mark.parametrize(
+        "geom_type",
+        ["geometry(PointZ, 4326)", "geometry"],
+        ids=["declared_z", "unconstrained"],
+    )
+    async def test_an_emptied_3d_table_stays_3d_with_no_z_range(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        geom_type: str,
+    ) -> None:
+        """An emptied 3D table stays 3D, from its declaration or else as stored."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _registered_dataset(
+            test_db_session, created_by=admin_id, rows=0
+        )
+        table = dataset.table_name
+        await _load_3d_points(test_db_session, table, geom_type=geom_type)
+        # A legacy-style SRID check, since the catalog refuses SRID 0.
+        await test_db_session.execute(
+            text(  # noqa: S608
+                f"ALTER TABLE data.{table} ADD CHECK (ST_SRID(geom) = 4326)"
+            )
+        )
+        await test_db_session.commit()
+        await _execute(
+            test_db_session, await _dispatch(client, admin_auth_header, dataset.id)
+        )
+        assert _three_d(await _reload(test_db_session, dataset.id))[:2] == (True, 3)
+        await test_db_session.execute(text(f"DELETE FROM data.{table}"))  # noqa: S608
+        await test_db_session.commit()
+
+        await _execute(
+            test_db_session, await _dispatch(client, admin_auth_header, dataset.id)
+        )
+
+        refreshed = await _reload(test_db_session, dataset.id)
+        assert refreshed.feature_count == 0
+        assert _three_d(refreshed) == (True, 3, None, None)
+
+    async def test_a_populated_2d_table_records_two_dimensions(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ) -> None:
+        """A 2D table with rows records is_3d false, two dimensions and no z range."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _registered_dataset(test_db_session, created_by=admin_id)
+
+        await _execute(
+            test_db_session, await _dispatch(client, admin_auth_header, dataset.id)
+        )
+
+        assert _three_d(await _reload(test_db_session, dataset.id)) == (
+            False,
+            2,
+            None,
+            None,
+        )
+
+    @pytest.mark.parametrize("loss", list(_SRID_LOSSES), ids=list(_SRID_LOSSES))
+    async def test_a_table_that_loses_its_srid_is_refused_before_any_write(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session, loss: str
+    ) -> None:
+        """A table whose geom has no SRID PostGIS reports fails with a code and keeps its render column."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _registered_dataset(test_db_session, created_by=admin_id)
+        table = dataset.table_name
+        # Metres the repair would misread as degrees, with the SRID lost.
+        await test_db_session.execute(
+            text(  # noqa: S608
+                f"ALTER TABLE data.{table} ALTER COLUMN geom "
+                "TYPE geometry(Polygon, 3857) USING ST_Transform(geom, 3857)"
+            )
+        )
+        for statement in _SRID_LOSSES[loss]:
+            await test_db_session.execute(text(statement.format(t=table)))
+        await test_db_session.commit()
+        render_before = await test_db_session.scalar(
+            text(f"SELECT string_agg(ST_AsText(geom_4326), ';') FROM data.{table}")  # noqa: S608
+        )
+        version_before = (await _reload(test_db_session, dataset.id)).tile_cache_version
+
+        payload = await _dispatch(client, admin_auth_header, dataset.id)
+        with pytest.raises(tasks_postgis_refresh.PostgisRefreshError):
+            await _execute(test_db_session, payload)
+
+        run = await _run_for(test_db_session, dataset.id)
+        assert (run.status, run.error_code) == ("failed", "source_srid_undeclared")
+        job = await _job_for(test_db_session, uuid.UUID(payload["job_id"]))
+        assert "reports an SRID" in job.error_message
+        refreshed = await _reload(test_db_session, dataset.id)
+        assert (refreshed.srid, refreshed.tile_cache_version) == (4326, version_before)
+        render_after = await test_db_session.scalar(
+            text(f"SELECT string_agg(ST_AsText(geom_4326), ';') FROM data.{table}")  # noqa: S608
+        )
+        assert render_after == render_before
+
+    async def test_a_table_without_an_srid_gets_no_render_index_or_grant(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ) -> None:
+        """A refresh that refuses a table without an SRID indexes and grants nothing first."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _registered_dataset(test_db_session, created_by=admin_id)
+        table = dataset.table_name
+        for statement in _SRID_LOSSES["srid_zero"]:
+            await test_db_session.execute(text(statement.format(t=table)))
+        await test_db_session.commit()
+
+        payload = await _dispatch(client, admin_auth_header, dataset.id)
+        grant = AsyncMock()
+        with (
+            patch.object(tasks_postgis_refresh_metadata, "grant_reader_access", grant),
+            pytest.raises(tasks_postgis_refresh.PostgisRefreshError),
+        ):
+            await _execute(test_db_session, payload)
+
+        run = await _run_for(test_db_session, dataset.id)
+        assert (run.status, run.error_code) == ("failed", "source_srid_undeclared")
+        render_indexes = await test_db_session.scalar(
+            text(
+                "SELECT count(*) FROM pg_indexes WHERE schemaname = 'data' "
+                "AND tablename = :t AND indexdef LIKE '%USING gist (geom_4326)%'"
+            ),
+            {"t": table},
+        )
+        assert render_indexes == 0
+        grant.assert_not_awaited()
 
     async def test_an_emptied_table_keeps_its_geometry_type(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session

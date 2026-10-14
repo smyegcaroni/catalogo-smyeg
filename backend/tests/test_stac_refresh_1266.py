@@ -38,7 +38,7 @@ from sqlalchemy.orm import joinedload
 
 from app.modules.catalog.datasets.api import router_refresh
 from app.modules.catalog.datasets.domain.models import Dataset
-from app.modules.catalog.sources import stac_resolve
+from app.modules.catalog.sources import stac_resolve, stac_resolve_taxonomy
 from app.modules.catalog.sources.adapters.stac import pick_data_asset
 from app.modules.catalog.sources.origin_probe import DETAIL_CODES
 from app.platform.security import SSRFError, SSRFResolutionError
@@ -493,10 +493,14 @@ def test_the_health_words_are_the_ones_the_api_already_describes() -> None:
     assert tasks_stac_refresh._MISSING in SOURCE_HEALTH_VALUES
     assert tasks_stac_refresh._ITEM_WITHDRAWN in DETAIL_CODES
     assert tasks_stac_refresh._NOT_FOUND in DETAIL_CODES
+    assert tasks_stac_refresh._BLOCKED_BY_POLICY in DETAIL_CODES
     assert stac_resolve._WITHDRAWN.health in SOURCE_HEALTH_VALUES
     assert stac_resolve._WITHDRAWN.detail in DETAIL_CODES
     assert stac_resolve._ASSET_GONE.health in SOURCE_HEALTH_VALUES
     assert stac_resolve._ASSET_GONE.detail in DETAIL_CODES
+    assert (
+        tasks_stac_refresh._CRS_UNIDENTIFIED == stac_resolve_taxonomy.CRS_UNIDENTIFIED
+    )
 
 
 def test_stored_failure_text_is_composed_here_and_carries_no_origin_words() -> None:
@@ -2526,7 +2530,12 @@ class TestWorker:
         before_ingested = (await _raster_asset(dataset.id)).ingested_at
 
         payload = await _dispatch(client, admin_auth_header, dataset.id)
-        await _execute(test_db_session, payload)
+        embed = AsyncMock()
+        with patch("app.processing.embeddings.helpers.defer_embedding", new=embed):
+            await _execute(test_db_session, payload)
+
+        # The moved asset's bands and CRS are what the raster embedding reads.
+        embed.assert_awaited_once()
 
         refreshed = await _reload(dataset.id)
         assert refreshed.origin_ref["asset_href"] == _MOVED_ASSET
@@ -2660,13 +2669,7 @@ class TestWorker:
     async def test_a_refresh_prefers_the_probed_epsg_over_the_items_declared_one(
         self, client, admin_auth_header, test_db_session, stac_transport, monkeypatch
     ) -> None:
-        """fix(#1334 review): the moved item declares EPSG:32633
-        (``_item_doc``'s default ``proj:code``), while the probe that
-        actually opened the new bytes reports a different CRS — the raster
-        row and the dataset's srid follow the probe, not the item, so
-        ``RasterAsset.to_stac_properties()`` cannot publish a ``proj:code``
-        and a ``proj:wkt2`` that name different projections.
-        """
+        """A refresh stores the probe's CRS, not the moved item's declared EPSG."""
         install, _ = stac_transport
         install(
             {
@@ -2859,8 +2862,12 @@ class TestWorker:
         before_refreshed = dataset.last_refreshed_at
 
         payload = await _dispatch(client, admin_auth_header, dataset.id)
-        await _execute(test_db_session, payload)
+        embed = AsyncMock()
+        with patch("app.processing.embeddings.helpers.defer_embedding", new=embed):
+            await _execute(test_db_session, payload)
 
+        # Nothing the embedding reads moved, so none is queued.
+        embed.assert_not_awaited()
         refreshed = await _reload(dataset.id)
         assert refreshed.origin_ref["asset_href"] == _ASSET
         assert refreshed.origin_uri == _ASSET
@@ -3009,6 +3016,86 @@ class TestWorker:
         refreshed = await _reload(dataset.id)
         assert refreshed.last_checked_at is None
         assert refreshed.source_health is None
+
+    async def test_an_item_url_the_policy_refuses_stores_the_refusal_message(
+        self, client, admin_auth_header, test_db_session, stac_transport
+    ) -> None:
+        """The item URL is refused by this instance's outbound policy.
+
+        Retrying reaches the same refusal, so the stored message must not be
+        the generic unreachable one, which tells the reader to try again.
+        """
+        install, _ = stac_transport
+        install(_raising(lambda _req: SSRFError("private address")))
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _stac_dataset(
+            test_db_session, created_by=admin_id, source_health="healthy"
+        )
+
+        payload = await _dispatch(client, admin_auth_header, dataset.id)
+        with pytest.raises(Exception):
+            await _execute(test_db_session, payload)
+
+        refreshed = await _reload(dataset.id)
+        assert refreshed.source_health == "healthy"
+        assert refreshed.origin_uri == _ASSET
+        run = await _run_for(dataset.id)
+        assert run.status == "failed"
+        assert run.error_code == "source_blocked_by_policy"
+        assert "try again" not in run.error_message.lower()
+        assert "origin.test" not in run.error_message
+
+    async def test_a_moved_asset_the_policy_refuses_stores_the_refusal_message(
+        self, client, admin_auth_header, test_db_session, stac_transport
+    ) -> None:
+        """The item resolves fine; the asset it now names is refused instead."""
+        install, _ = stac_transport
+        blocked = "https://origin.test/internal/scene.tif"
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == blocked:
+                raise SSRFError("private address")
+            return httpx.Response(200, json=_item_doc(asset_href=blocked))
+
+        install(_handler)
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _stac_dataset(
+            test_db_session, created_by=admin_id, source_health="healthy"
+        )
+
+        payload = await _dispatch(client, admin_auth_header, dataset.id)
+        with pytest.raises(Exception):
+            await _execute(test_db_session, payload)
+
+        refreshed = await _reload(dataset.id)
+        assert refreshed.source_health == "healthy"
+        assert refreshed.origin_uri == _ASSET
+        run = await _run_for(dataset.id)
+        assert run.status == "failed"
+        assert run.error_code == "source_blocked_by_policy"
+        assert "try again" not in run.error_message.lower()
+        assert "origin.test" not in run.error_message
+
+    async def test_a_5xx_still_stores_the_generic_unreachable_message(
+        self, client, admin_auth_header, test_db_session, stac_transport
+    ) -> None:
+        """A 5xx is inconclusive, not a policy refusal, so the ordinary
+        unreachable code and message still apply."""
+        install, _ = stac_transport
+        install({_ITEM: (503, None)})
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _stac_dataset(
+            test_db_session, created_by=admin_id, source_health="healthy"
+        )
+
+        payload = await _dispatch(client, admin_auth_header, dataset.id)
+        with pytest.raises(Exception):
+            await _execute(test_db_session, payload)
+
+        run = await _run_for(dataset.id)
+        assert run.status == "failed"
+        assert run.error_code == "source_inaccessible"
+        assert run.error_message.endswith("Try again.")
 
     async def test_a_rebind_during_the_fetch_discards_the_answer(
         self, client, admin_auth_header, test_db_session, stac_transport
@@ -3322,6 +3409,143 @@ class TestOriginAssetRepair:
         assert await _origin_asset_rows(dataset.id) == []
 
 
+class TestNodataRepairOnRefresh:
+    """An unmoved asset gets no re-describe from fetch_cog_info, so a
+    dataset imported before nodata reading was fixed would keep a NULL
+    nodata forever without this: one /cog/info read on a refresh that
+    resolved but did not move, only while the stored value is still
+    missing.
+    """
+
+    async def test_a_nodata_reply_repairs_a_null_row(
+        self, client, admin_auth_header, test_db_session, stac_transport, monkeypatch
+    ) -> None:
+        from app.modules.catalog.sources.cog_info import fetch_cog_nodata
+        from tests.test_cog_info import _TITILER_INFO, _install
+
+        monkeypatch.setattr(
+            "app.modules.catalog.sources.stac_resolve_asset_gate.fetch_cog_nodata",
+            fetch_cog_nodata,
+        )
+        _install(
+            monkeypatch, {**_TITILER_INFO, "nodata_type": "Nodata", "nodata_value": 0.0}
+        )
+        install, _ = stac_transport
+        install({_ITEM: (200, _item_doc()), _ASSET: (206, None)})
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _stac_dataset(test_db_session, created_by=admin_id)
+        assert (await _raster_asset(dataset.id)).nodata is None
+
+        payload = await _dispatch(client, admin_auth_header, dataset.id)
+        await _execute(test_db_session, payload)
+
+        assert (await _raster_asset(dataset.id)).nodata == "0.0"
+
+    async def test_a_mask_reply_leaves_the_row_null(
+        self, client, admin_auth_header, test_db_session, stac_transport, monkeypatch
+    ) -> None:
+        from app.modules.catalog.sources.cog_info import fetch_cog_nodata
+        from tests.test_cog_info import _TITILER_INFO, _install
+
+        monkeypatch.setattr(
+            "app.modules.catalog.sources.stac_resolve_asset_gate.fetch_cog_nodata",
+            fetch_cog_nodata,
+        )
+        _install(monkeypatch, {**_TITILER_INFO, "nodata_type": "Mask"})
+        install, _ = stac_transport
+        install({_ITEM: (200, _item_doc()), _ASSET: (206, None)})
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _stac_dataset(test_db_session, created_by=admin_id)
+
+        payload = await _dispatch(client, admin_auth_header, dataset.id)
+        await _execute(test_db_session, payload)
+
+        assert (await _raster_asset(dataset.id)).nodata is None
+
+    async def test_a_row_with_nodata_already_set_makes_no_repair_call(
+        self, client, admin_auth_header, test_db_session, stac_transport, monkeypatch
+    ) -> None:
+        async def _unreachable(url: str):
+            raise AssertionError(
+                "fetch_cog_nodata called for a row that already had nodata"
+            )
+
+        monkeypatch.setattr(
+            "app.modules.catalog.sources.stac_resolve_asset_gate.fetch_cog_nodata",
+            _unreachable,
+        )
+        install, _ = stac_transport
+        install({_ITEM: (200, _item_doc()), _ASSET: (206, None)})
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _stac_dataset(test_db_session, created_by=admin_id)
+        await test_db_session.execute(
+            update(RasterAsset)
+            .where(RasterAsset.dataset_id == dataset.id)
+            .values(nodata="7")
+        )
+        await test_db_session.commit()
+
+        payload = await _dispatch(client, admin_auth_header, dataset.id)
+        await _execute(test_db_session, payload)
+
+        assert (await _raster_asset(dataset.id)).nodata == "7"
+
+    async def test_an_ssrf_refused_url_makes_no_repair_call(
+        self, client, admin_auth_header, test_db_session, stac_transport, monkeypatch
+    ) -> None:
+        async def _unreachable(url: str):
+            raise AssertionError("fetch_cog_nodata called for an SSRF-refused address")
+
+        monkeypatch.setattr(
+            "app.modules.catalog.sources.stac_resolve_asset_gate.fetch_cog_nodata",
+            _unreachable,
+        )
+        monkeypatch.setattr(
+            "app.modules.catalog.sources.stac_resolve_asset_gate.validate_url_for_ssrf",
+            AsyncMock(side_effect=SSRFError("refused")),
+        )
+        install, _ = stac_transport
+        install({_ITEM: (200, _item_doc()), _ASSET: (206, None)})
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _stac_dataset(test_db_session, created_by=admin_id)
+
+        payload = await _dispatch(client, admin_auth_header, dataset.id)
+        await _execute(test_db_session, payload)
+
+        assert (await _raster_asset(dataset.id)).nodata is None
+
+    async def test_a_relocated_items_unmoved_asset_gets_its_nodata_repaired(
+        self, client, admin_auth_header, test_db_session, stac_transport, monkeypatch
+    ) -> None:
+        from app.modules.catalog.sources.cog_info import fetch_cog_nodata
+        from tests.test_cog_info import _TITILER_INFO, _install
+
+        monkeypatch.setattr(
+            "app.modules.catalog.sources.stac_resolve_asset_gate.fetch_cog_nodata",
+            fetch_cog_nodata,
+        )
+        _install(
+            monkeypatch, {**_TITILER_INFO, "nodata_type": "Nodata", "nodata_value": 0.0}
+        )
+        install, _ = stac_transport
+        install(
+            {
+                _ITEM: (404, None),
+                _SEARCH: (200, {"features": [_item_doc(asset_href=_ASSET)]}),
+                _ASSET: (206, None),
+            }
+        )
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _stac_dataset(test_db_session, created_by=admin_id)
+        assert (await _raster_asset(dataset.id)).nodata is None
+
+        payload = await _dispatch(client, admin_auth_header, dataset.id)
+        await _execute(test_db_session, payload)
+
+        assert await _asset_uri(dataset.id) == _ASSET
+        assert (await _raster_asset(dataset.id)).nodata == "0.0"
+
+
 # ---------------------------------------------------------------------------
 # The probe is still a reporter
 # ---------------------------------------------------------------------------
@@ -3360,3 +3584,137 @@ async def test_the_probe_path_still_never_mutates_a_pointer(
     assert await _asset_uri(dataset.id) == _ASSET
     assert probed.last_refreshed_at == before_refreshed
     assert await _run_for(dataset.id) is None
+
+
+class TestProbedCrsOfAMovedAsset:
+    """What Titiler reads off a moved asset decides whether it is adopted.
+
+    Titiler's ``/cog/info`` JSON is mocked, so the real probe parses it; the
+    autouse ``cog_info`` stub is replaced with the real ``fetch_cog_info``.
+    """
+
+    async def _refresh(
+        self,
+        client,
+        headers,
+        session,
+        stac_transport,
+        monkeypatch,
+        crs,
+        *,
+        nodata_type: str | None = None,
+        nodata_value: float | None = None,
+    ):
+        from app.modules.catalog.sources.cog_info import fetch_cog_info
+        from tests.test_cog_info import _TITILER_INFO, _install
+
+        monkeypatch.setattr(
+            "app.modules.catalog.sources.stac_resolve_asset_gate.fetch_cog_info",
+            fetch_cog_info,
+        )
+        info = {**_TITILER_INFO, "crs": crs}
+        if nodata_type is not None:
+            info = {**info, "nodata_type": nodata_type, "nodata_value": nodata_value}
+        _install(monkeypatch, info)
+        install, _ = stac_transport
+        install(
+            {
+                _ITEM: (200, _item_doc(asset_href=_MOVED_ASSET)),
+                _MOVED_ASSET: (206, None),
+            }
+        )
+        admin_id = await get_user_id(session, "admin")
+        dataset = await _stac_dataset(session, created_by=admin_id)
+        payload = await _dispatch(client, headers, dataset.id)
+        return dataset, payload
+
+    async def test_a_crs_titiler_cannot_code_is_not_adopted(
+        self, client, admin_auth_header, test_db_session, stac_transport, monkeypatch
+    ) -> None:
+        """The item declares EPSG:32633; the asset's own CRS is unknown, so
+        neither it nor the declaration is stored."""
+        from tests.test_cog_info import _UTM_21N_WKT
+
+        dataset, payload = await self._refresh(
+            client,
+            admin_auth_header,
+            test_db_session,
+            stac_transport,
+            monkeypatch,
+            _UTM_21N_WKT,
+        )
+        with pytest.raises(Exception):
+            await _execute(test_db_session, payload)
+
+        refreshed = await _reload(dataset.id)
+        assert refreshed.origin_uri == _ASSET
+        assert await _asset_uri(dataset.id) == _ASSET
+        run = await _run_for(dataset.id)
+        assert run.status == "failed"
+        assert run.error_code == "stac_refresh_failed"
+        assert run.error_message == (
+            "The STAC item now names an asset whose CRS has no EPSG code and "
+            "isn't OGC CRS84, which GeoLens doesn't support for remote COGs. The "
+            "dataset keeps its previous asset until the source is reprojected to "
+            "an EPSG CRS (gdalwarp's -t_srs option does this) and refreshed again."
+        )
+
+    @pytest.mark.parametrize(
+        "crs",
+        [
+            "http://www.opengis.net/def/crs/OGC/0/CRS84",
+            "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+        ],
+    )
+    async def test_a_crs84_asset_is_adopted_as_crs84(
+        self,
+        client,
+        admin_auth_header,
+        test_db_session,
+        stac_transport,
+        monkeypatch,
+        crs,
+    ) -> None:
+        """Main's CRS84 WKT, longitude first, with no EPSG code borrowed from
+        the item's declared EPSG:32633."""
+        from tests.test_cog_info import _MAIN_CRS84_WKT
+
+        dataset, payload = await self._refresh(
+            client,
+            admin_auth_header,
+            test_db_session,
+            stac_transport,
+            monkeypatch,
+            crs,
+        )
+        await _execute(test_db_session, payload)
+
+        assert await _asset_uri(dataset.id) == _MOVED_ASSET
+        described = await _raster_asset(dataset.id)
+        assert described.crs_wkt == _MAIN_CRS84_WKT[crs]
+        assert (
+            described.crs_is_geographic,
+            described.crs_has_degree_unit,
+            described.crs_metres_per_unit,
+        ) == (True, True, None)
+        assert described.epsg is None
+        assert (await _reload(dataset.id)).srid is None
+
+    async def test_a_moved_assets_nodata_value_is_stored(
+        self, client, admin_auth_header, test_db_session, stac_transport, monkeypatch
+    ) -> None:
+        dataset, payload = await self._refresh(
+            client,
+            admin_auth_header,
+            test_db_session,
+            stac_transport,
+            monkeypatch,
+            "http://www.opengis.net/def/crs/EPSG/0/32621",
+            nodata_type="Nodata",
+            nodata_value=0.0,
+        )
+        await _execute(test_db_session, payload)
+
+        assert await _asset_uri(dataset.id) == _MOVED_ASSET
+        described = await _raster_asset(dataset.id)
+        assert described.nodata == "0.0"

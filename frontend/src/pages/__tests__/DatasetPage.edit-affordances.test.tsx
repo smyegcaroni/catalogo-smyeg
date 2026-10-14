@@ -10,6 +10,7 @@ import type { DatasetResponse, UserResponse } from '@/types/api';
 const drawingStoreState = vi.hoisted(() => ({
   isDrawing: false,
   isEditDirty: false,
+  hasUnsavedMapWork: false,
   setDrawing: vi.fn(),
   clearDrawing: vi.fn(),
 }));
@@ -65,6 +66,7 @@ vi.mock('@/stores/drawing-store', () => ({
   useDrawingStore: (selector: (state: {
     isDrawing: boolean;
     isEditDirty: boolean;
+    hasUnsavedMapWork: boolean;
     setDrawing: () => void;
     clearDrawing: () => void;
   }) => unknown) => selector(drawingStoreState),
@@ -77,6 +79,12 @@ vi.mock('@/components/dataset/DatasetMap', () => ({
 vi.mock('@/components/import/hooks/use-vrt', () => ({
   useVrtGenerations: () => ({ data: { generations: [] } }),
   useVrtStatus: () => ({ data: null }),
+}));
+
+vi.mock('@/components/dataset/DatasetChatPanel', () => ({
+  DatasetChatPanel: ({ abovePendingBar }: { abovePendingBar?: boolean }) => (
+    <div data-testid="dataset-chat-panel" data-above-pending-bar={String(Boolean(abovePendingBar))} />
+  ),
 }));
 
 vi.mock('@/components/dataset/DatasetDeleteDialog', () => ({
@@ -261,6 +269,7 @@ describe('DatasetPage editable affordance integration', () => {
     mutateAsync.mockResolvedValue({});
     drawingStoreState.isDrawing = false;
     drawingStoreState.isEditDirty = false;
+    drawingStoreState.hasUnsavedMapWork = false;
     drawingStoreState.setDrawing.mockReset();
     drawingStoreState.clearDrawing.mockReset();
     mockUseUnsavedGuard.mockReset();
@@ -296,8 +305,9 @@ describe('DatasetPage editable affordance integration', () => {
     expect(screen.queryByTestId('pending-edits-bar')).not.toBeInTheDocument();
 
     // DetailPanel is React.lazy (Phase 276 CODE-06) — wait for the chunk
-    // to resolve before querying its child fields synchronously.
-    await user.click(await screen.findByText('Original summary'));
+    // to resolve before querying its child fields synchronously. Under
+    // coverage load the chunk can take longer than findBy's 1s default.
+    await user.click(await screen.findByText('Original summary', undefined, { timeout: 10_000 }));
 
     const summaryInput = screen.getByDisplayValue('Original summary');
     await user.clear(summaryInput);
@@ -320,7 +330,7 @@ describe('DatasetPage editable affordance integration', () => {
       expect(screen.queryByTestId('pending-edits-bar')).not.toBeInTheDocument();
     });
 
-    await user.click(screen.getByText('Original summary'));
+    await user.click(await screen.findByText('Original summary'));
 
     const secondEditInput = screen.getByDisplayValue('Original summary');
     await user.clear(secondEditInput);
@@ -335,7 +345,32 @@ describe('DatasetPage editable affordance integration', () => {
       expect(screen.queryByTestId('pending-edits-bar')).not.toBeInTheDocument();
     });
 
-    expect(screen.getByText('Original summary')).toBeInTheDocument();
+    expect(await screen.findByText('Original summary')).toBeInTheDocument();
+  });
+
+  it('lifts the Ask AI dock above the pending-edits bar only while edits are pending', { timeout: 15_000 }, async () => {
+    setUser(EDITOR_USER);
+    const user = userEvent.setup();
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    expect(await screen.findByTestId('dataset-chat-panel')).toHaveAttribute('data-above-pending-bar', 'false');
+
+    await user.click(await screen.findByText('Original summary'));
+    const summaryInput = screen.getByDisplayValue('Original summary');
+    await user.clear(summaryInput);
+    await user.type(summaryInput, 'Updated summary pending save');
+    await user.keyboard('{Control>}{Enter}{/Control}');
+
+    expect(await screen.findByTestId('pending-edits-bar')).toBeInTheDocument();
+    expect(screen.getByTestId('dataset-chat-panel')).toHaveAttribute('data-above-pending-bar', 'true');
+
+    await user.click(screen.getByTestId('pending-edits-cancel'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('pending-edits-bar')).not.toBeInTheDocument();
+    });
+    expect(screen.getByTestId('dataset-chat-panel')).toHaveAttribute('data-above-pending-bar', 'false');
   });
 
   // fix(#1851): "Leave" on the unsaved-changes dialog let navigation proceed
@@ -469,6 +504,23 @@ describe('DatasetPage editable affordance integration', () => {
     expect(sourceTab).toHaveAttribute('aria-selected', 'true');
   });
 
+  it('guards navigation for unsaved map work beyond a dirty selection', () => {
+    setUser(EDITOR_USER);
+    drawingStoreState.hasUnsavedMapWork = true;
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    expect(mockUseUnsavedGuard).toHaveBeenLastCalledWith(true);
+  });
+
+  it('does not guard navigation with no unsaved work', () => {
+    setUser(EDITOR_USER);
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    expect(mockUseUnsavedGuard).toHaveBeenLastCalledWith(false);
+  });
+
   it('does not show metadata pending controls when only geometry edits are dirty', () => {
     setUser(EDITOR_USER);
     drawingStoreState.isEditDirty = true;
@@ -505,6 +557,35 @@ describe('DatasetPage editable affordance integration', () => {
     expect(
       screen.getByRole('menuitem', { name: 'Re-Upload' }),
     ).toBeInTheDocument();
+  });
+
+  // jsdom has no layout, so assert the class that lets the row wrap instead of
+  // widening the page past a phone viewport.
+  it('lets a raster owner\'s header actions wrap within the viewport', () => {
+    setUser(EDITOR_USER);
+    mockUseDataset.mockReturnValue({
+      data: {
+        ...makeDataset(),
+        record_type: 'raster_dataset',
+        raster: {
+          tile_url: '/raster-tiles/test/{z}/{x}/{y}.png',
+          connect: {
+            download_url: 'https://example.test/cog.tif',
+            tile_url: '/raster-tiles/test/{z}/{x}/{y}.png',
+          },
+        } as DatasetResponse['raster'],
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useDataset>);
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    const downloadCog = screen.getByRole('button', { name: 'Download COG' });
+    expect(downloadCog.parentElement).toHaveClass('flex-wrap');
+    expect(screen.getByRole('button', { name: 'Connect' }).parentElement).toBe(
+      downloadCog.parentElement,
+    );
   });
 
   // VRT stays on the regenerate flow — it never gets a reupload action,

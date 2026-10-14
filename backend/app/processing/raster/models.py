@@ -9,6 +9,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -18,12 +19,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
-from app.core.geo import wkt_metres_per_unit
-
-# fix(#1778): shared with the OGC Records serializer, which cannot import from
-# `app.processing` (CATPORT-02/04). See the module docstring for the two
-# producer shapes these two functions reconcile.
-from app.core.raster_bands import band_display_name, stac_band_nodata
+from app.core.geo import crs_columns
 
 
 class RasterAsset(Base):
@@ -61,6 +57,9 @@ class RasterAsset(Base):
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     driver: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # Who owns the bytes, not where they are: "local" is a COG GeoLens manages
+    # in whichever store is configured, "remote" one it only references by
+    # URL. A hand-set "s3" is read as managed.
     storage_backend: Mapped[str] = mapped_column(
         String(20), nullable=False, server_default="local"
     )
@@ -79,6 +78,13 @@ class RasterAsset(Base):
 
     # -- STAC-facing descriptive metadata --
     crs_wkt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Derived from crs_wkt and written with it (crs_columns), so requests read
+    # these instead of handing the stored text to PROJ. NULL is unknown.
+    crs_is_geographic: Mapped[bool | None] = mapped_column(nullable=True)
+    crs_has_degree_unit: Mapped[bool | None] = mapped_column(nullable=True)
+    crs_metres_per_unit: Mapped[float | None] = mapped_column(Double, nullable=True)
+    # SHA-256 of the crs_wkt those facts describe; see crs_columns.
+    crs_facts_digest: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     epsg: Mapped[int | None] = mapped_column(Integer, nullable=True)
     band_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dtype: Mapped[str | None] = mapped_column(String(30), nullable=True)
@@ -111,55 +117,10 @@ class RasterAsset(Base):
     # timestamp comparison for it.
     built_from: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
-    def to_stac_properties(self) -> dict:
-        """Extract STAC-compatible properties from raster metadata."""
-        props: dict = {}
-        if self.epsg is not None:
-            props["proj:code"] = f"EPSG:{self.epsg}"
-        if self.crs_wkt:
-            props["proj:wkt2"] = self.crs_wkt
-        if self.width is not None and self.height is not None:
-            props["proj:shape"] = [self.height, self.width]
-        if self.res_x is not None and self.res_y is not None:
-            # fix(#1375): STAC's `gsd` is in METRES; publishing raw
-            # res_x/res_y overstated resolution (measured 3.28x for
-            # foot-based state-plane CRSs). PROJ's metres-per-unit converts it.
-            #
-            # A geographic CRS yields None and OMITS the field: an angular
-            # resolution has no fixed length without a latitude. The OGC Records
-            # serializer instead keeps the CRS-unit value, because it ships a
-            # companion `crs_is_geographic` flag that STAC has no room for
-            # (fix(#569)).
-            metres_per_unit = wkt_metres_per_unit(self.crs_wkt)
-            if metres_per_unit is not None:
-                props["gsd"] = min(abs(self.res_x), abs(self.res_y)) * metres_per_unit
-
-        # Bands (STAC Raster Extension v1.1 format)
-        if self.band_info:
-            bands = []
-            for b in self.band_info:
-                if not isinstance(b, dict):
-                    continue
-                band: dict = {}
-                if b.get("dtype"):
-                    band["data_type"] = b["dtype"]
-                nodata = stac_band_nodata(b.get("nodata"))
-                if nodata is not None:
-                    band["nodata"] = nodata
-                name = band_display_name(b)
-                if name:
-                    band["name"] = name
-                # fix(#1778): an empty entry is dropped rather than appended.
-                # A Producer-B row carries none of the three keys above, so
-                # this list used to come out as `[{}, {}, {}]` and `if bands:`
-                # published it: structurally invalid, and worse than omitting
-                # the field.
-                if band:
-                    bands.append(band)
-            if bands:
-                props["raster:bands"] = bands
-
-        return props
+    def set_crs(self, meta: dict) -> None:
+        """Replace the stored CRS text and its facts together."""
+        for column, value in crs_columns(meta).items():
+            setattr(self, column, value)
 
 
 class VrtGeneration(Base):
@@ -251,18 +212,22 @@ class DatasetAsset(Base):
     Stable keys: 'data' (COG), 'vrt', 'thumbnail' (256px), 'overview'
     (512px), 'metadata' (sidecar JSON), 'archived_original:<hash>' (one row
     per pre-conversion upload kept when COG conversion was lossy, ADR-002
-    Decision 7 — hash-suffixed so every kept original counts, not just the
-    newest). The archived key is INTERNAL: it feeds the per-user storage
-    sum but is never published as a STAC asset (see
-    ``app.platform.assets.keys``).
+    Decision 7, hash-suffixed so every kept original counts, not just the
+    newest), 'tileset' (a 3D Tiles dataset's live unpack attempt, sized to
+    the unpacked bytes), 'pointcloud' (a COPC point cloud's live file, sized
+    to the file), 'retained_cog:<attempt_id>' (a superseded COG a VRT may
+    still read, kept until reclaimed). The archived, tileset, pointcloud and
+    retained keys are internal: they feed the per-user storage sum but are
+    never published as STAC assets (see ``app.platform.assets.keys``).
     """
 
     __tablename__ = "dataset_assets"
     __table_args__ = (
         UniqueConstraint("dataset_id", "key", name="uq_dataset_assets_key"),
         CheckConstraint(
-            "key IN ('data', 'vrt', 'thumbnail', 'overview', 'metadata') "
-            "OR key LIKE 'archived_original:%'",
+            "key IN ('data', 'vrt', 'thumbnail', 'overview', 'metadata', 'tileset', "
+            "'pointcloud') OR key LIKE 'archived_original:%' "
+            "OR key LIKE 'retained_cog:%'",
             name="chk_dataset_assets_key",
         ),
         {"schema": "catalog"},

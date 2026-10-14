@@ -275,11 +275,26 @@ class ProcessingPort(Protocol):
         self, session: AsyncSession, ids: list[uuid.UUID]
     ) -> list[tuple[uuid.UUID, str, str | None]]: ...
 
-    async def get_catalog_vocabulary(self, session: AsyncSession) -> list[str]: ...
+    async def get_catalog_vocabulary(
+        self,
+        session: AsyncSession,
+        *,
+        user: Identity | None,
+        user_roles: set[str],
+    ) -> list[str]:
+        """Distinct keywords of the records ``user`` may read."""
+        ...
 
     async def get_keywords_for_records(
-        self, session: AsyncSession, record_ids: list[uuid.UUID]
-    ) -> list[str]: ...
+        self,
+        session: AsyncSession,
+        record_ids: list[uuid.UUID],
+        *,
+        user: Identity | None,
+        user_roles: set[str],
+    ) -> list[str]:
+        """Distinct keywords of those ``record_ids`` that ``user`` may read."""
+        ...
 
     async def get_record_keyword_count(
         self, session: AsyncSession, record_id: uuid.UUID
@@ -321,6 +336,21 @@ class ProcessingPort(Protocol):
         **kwargs: Any,
     ) -> tuple[MapProtocol, list[Any], str | None, str | None]: ...
 
+    async def update_dataset_metadata(
+        self,
+        session: AsyncSession,
+        dataset_id: uuid.UUID,
+        fields: dict[str, Any],
+        *,
+        actor_id: uuid.UUID,
+    ) -> None:
+        """Apply ``fields`` as the metadata PATCH body would, with its checks.
+
+        Raises ``ValueError`` for a change the PATCH would refuse. Does not
+        commit.
+        """
+        ...
+
     def create_ingestion_result(self, **kwargs: Any) -> Any: ...  # -> IngestionResult
 
     # fix(#1314): the refresh/reupload paths can change a dataset's modality,
@@ -348,7 +378,20 @@ class ProcessingPort(Protocol):
         order_field: str | None = None,
         result_limit: int | None = None,
         result_offset: int | None = None,
+        object_ids: list[int] | tuple[int, ...] | None = None,
+        force_arcgis_geojson: bool = False,
     ) -> tuple[str, str]: ...
+
+    async def fetch_arcgis_id_plan(
+        self,
+        base_url: str,
+        layer_id: int | str,
+        client: Any,
+        token: str | None = None,
+        *,
+        expected_oid_field: str | None = None,
+        current_version: str | None = None,
+    ) -> Any: ...
 
     # ORM class helpers: let processing/* call sites pass concrete ORM
     # classes to select()/session.add() without importing app.modules.catalog.*
@@ -389,6 +432,7 @@ class ProcessingPort(Protocol):
     # feat(#1764): ``credential`` is the ``ServiceCredential`` a credentialed
     # refresh claimed for this attempt, and ``catalog_origin`` the catalog
     # address it was given for; a read steered elsewhere is made anonymously.
+    # ``repair_nodata`` asks the resolver for a nodata-only backfill.
     async def resolve_stac_binding(
         self,
         *,
@@ -399,6 +443,7 @@ class ProcessingPort(Protocol):
         asset_key: str | None,
         credential: Any = None,
         catalog_origin: str | None = None,
+        repair_nodata: bool = False,
     ) -> Any: ...
 
     # Preserves joinedload semantics for metadata_service._build_dataset_context.

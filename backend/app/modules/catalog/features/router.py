@@ -1,6 +1,7 @@
 """Feature-serving endpoints: paginated GeoJSON from PostGIS data tables."""
 
 import uuid
+from typing import NamedTuple
 from urllib.parse import urlencode
 
 import structlog
@@ -31,8 +32,10 @@ from app.core.identity import Identity
 from app.platform.catalog_locks import (
     CatalogLockConflict,
     bump_tile_cache_version_on,
+    lock_request_key,
+    record_live_data_write,
 )
-from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
+from app.core.record_types import capabilities
 from app.modules.auth.dependencies import (
     get_current_active_user,
     get_optional_user_fail_open,
@@ -48,15 +51,35 @@ from app.modules.catalog.authorization import (
 from app.modules.catalog.datasets.domain.service import get_dataset
 from app.modules.embed_tokens.service import validate_embed_token_access
 from app.core.dependencies import get_db
+from app.modules.catalog.features.idempotency import (
+    IDEMPOTENCY_ATTEMPT_HEADER,
+    IDEMPOTENCY_ATTEMPT_MAX,
+    IDEMPOTENCY_KEY_HEADER,
+    IDEMPOTENCY_KEY_MAX_LENGTH,
+    IDEMPOTENCY_KEY_PATTERN,
+    CreatedRow,
+    KeyedFeature,
+    claim_create_key,
+    current_row_xmin,
+    current_table_oid,
+    find_live_key,
+    held_table_oid,
+    record_attempt,
+)
 from app.modules.catalog.features.schemas import (
+    TILE_CACHE_VERSION_DESCRIPTION,
+    TILE_CACHE_VERSION_HEADER,
     FeatureCreate,
     FeatureReplace,
     FeatureUpdate,
     GeoJSONFeature,
     GeoJSONFeatureCollection,
+    GeoJSONFeatureRead,
+    GeoJSONFeatureWrite,
     inline_json_schema,
 )
 from app.modules.catalog.features.service import (
+    Bounds,
     UnwritablePropertyError,
     delete_feature,
     effective_geometry_type,
@@ -81,9 +104,6 @@ logger = structlog.get_logger()
 
 features_router = APIRouter(prefix="/datasets", tags=["Features"])
 
-# Datasets with no PostGIS data table behind them. Any feature write 42P01s.
-_NON_FEATURE_RECORD_TYPES = RASTER_FAMILY_RECORD_TYPES
-
 
 def _require_feature_table(dataset) -> None:
     """Reject feature writes to datasets with no writable feature geometry.
@@ -93,7 +113,7 @@ def _require_feature_table(dataset) -> None:
     (`geometry_type is None`), whose table has no `geom`/`geom_4326` column
     (#463).
     """
-    if dataset.record.record_type in _NON_FEATURE_RECORD_TYPES:
+    if not capabilities(dataset.record.record_type).feature_table:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="This dataset has no feature table.",
@@ -173,10 +193,264 @@ async def _lock_catalog_rows_guarded(db: AsyncSession, dataset) -> None:
     await _guard(db, lock_catalog_rows_for_write(db, dataset))
 
 
+def _created_feature_response(
+    row: dict, tile_version: int | None, table_oid: int | None
+) -> JSONResponse:
+    feature = GeoJSONFeatureWrite(
+        id=row["gid"],
+        geometry=row["geometry"],
+        properties=row["properties"],
+        table_id=str(table_oid),
+        tile_cache_version=tile_version,
+    )
+    return JSONResponse(
+        content=feature.model_dump(mode="json"),
+        status_code=status.HTTP_201_CREATED,
+        media_type="application/geo+json",
+    )
+
+
+def _feature_gone(tile_version: int | None = None) -> HTTPException:
+    detail = {
+        "code": "feature_gone",
+        "message": (
+            "The feature created with this Idempotency-Key is gone. "
+            "Use a new key to create another."
+        ),
+    }
+    if tile_version is not None:
+        detail["tile_cache_version"] = tile_version
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+
+def _feature_changed(
+    row: dict, tile_version: int | None, table_oid: int
+) -> HTTPException:
+    """The refusal for a later attempt that would overwrite another writer's edit."""
+    feature = GeoJSONFeatureWrite(
+        id=row["gid"],
+        geometry=row["geometry"],
+        properties=row["properties"],
+        table_id=str(table_oid),
+        tile_cache_version=tile_version,
+    )
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "feature_changed",
+            "message": (
+                "Someone else changed this feature after the last attempt was "
+                "saved, so this attempt was not applied."
+            ),
+            "feature": feature.model_dump(mode="json"),
+        },
+    )
+
+
+def _dataset_replaced(tile_version: int | None) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "dataset_replaced",
+            "message": (
+                "The dataset's data was replaced after this feature was read, "
+                "so nothing was written. Read the feature again."
+            ),
+            "tile_cache_version": tile_version,
+        },
+    )
+
+
+async def _roll_tile_generation(db: AsyncSession, dataset) -> int | None:
+    """Commit a new tile cache version for a dataset found with a replaced table.
+
+    An overwrite made outside GeoLens moves no version, so tiles cached from
+    the old table would go on being served. Nothing else is written.
+    """
+    await _lock_catalog_rows_guarded(db, dataset)
+    tile_version = await bump_tile_cache_version_on(db, dataset)
+    await db.commit()
+    return tile_version
+
+
+async def _hold_table(db: AsyncSession, dataset, table_id: str | None) -> int | None:
+    """Hold the dataset's table for this write, refusing a stale ``table_id``."""
+    table_oid = await held_table_oid(db, dataset.table_name)
+    if table_id is not None and table_id != str(table_oid):
+        raise _dataset_replaced(await _roll_tile_generation(db, dataset))
+    return table_oid
+
+
+# The writes type it `str`, not an optional type, for the reason given on the
+# create route's headers.
+_TABLE_ID_PARAM_DESCRIPTION = (
+    "The `table_id` the feature was read with. If the dataset's data has been "
+    "replaced since, the request is refused with 409 and code "
+    "`dataset_replaced`, and nothing is written."
+)
+
+
+class _Repeat(NamedTuple):
+    """The feature a repeated create answers with, and whether it was written."""
+
+    row: dict
+    prior_bounds: Bounds | None
+    wrote: bool
+    key_id: uuid.UUID
+    attempt: int
+    row_xmin: int | None
+
+
+async def _settle_repeat(
+    db: AsyncSession, dataset, keyed: KeyedFeature, attempt: int, body: FeatureCreate
+) -> _Repeat:
+    """Settle a create whose key already names a feature.
+
+    The feature is read first, so this transaction holds its table, and the
+    table's oid is compared after: a swap or overwrite cannot commit between
+    the two, and a matching oid means the row is the one the key was written
+    for. A higher attempt number than any applied has its body written through
+    the update path, which validates it as a create does; an equal or lower one
+    gets the feature as stored. A higher attempt number is refused with 409 and
+    the stored feature if anyone else has written the feature since the last
+    attempt was applied. The feature is written before the catalog rows are
+    taken, the order every other feature write uses.
+    """
+    row = await get_feature_by_id(db, dataset.table_name, keyed.gid)
+    if keyed.table_oid != await current_table_oid(db, dataset.table_name):
+        raise _feature_gone(await _roll_tile_generation(db, dataset))
+    if row is None:
+        raise _feature_gone()
+    if attempt <= keyed.attempt:
+        return _Repeat(row, None, False, keyed.id, attempt, None)
+    # The row is taken before the version is read, so a writer still in flight
+    # is waited out and its version is what gets compared.
+    current = await current_row_xmin(db, dataset.table_name, keyed.gid, lock=True)
+    if current is None:
+        raise _feature_gone()
+    if current != keyed.row_xmin:
+        await db.refresh(dataset, ["tile_cache_version"])
+        stored = await get_feature_by_id(db, dataset.table_name, keyed.gid)
+        raise _feature_changed(
+            stored or row, dataset.tile_cache_version, keyed.table_oid
+        )
+    try:
+        written = await update_feature(
+            db,
+            dataset.table_name,
+            keyed.gid,
+            body.geometry.model_dump(),
+            body.properties,
+            dataset.column_info or [],
+            await effective_geometry_type(db, dataset),
+            dataset_srid=dataset.srid,
+        )
+    except ValueError as exc:
+        if "not found" in str(exc).lower():
+            raise _feature_gone() from exc
+        raise
+    return _Repeat(
+        written.feature,
+        written.prior_bounds,
+        True,
+        keyed.id,
+        attempt,
+        await current_row_xmin(db, dataset.table_name, keyed.gid),
+    )
+
+
+async def _finish_repeat(
+    db: AsyncSession,
+    dataset,
+    user: Identity,
+    dataset_id: uuid.UUID,
+    body: FeatureCreate,
+    repeat: _Repeat,
+    table_oid: int,
+) -> JSONResponse:
+    """Commit a settled repeat and answer with the feature as stored."""
+    if repeat.wrote:
+        await _refresh_metadata_guarded(
+            db,
+            dataset,
+            count_delta=0,
+            touched_bounds=[
+                repeat.prior_bounds,
+                geojson_bounds(body.geometry.model_dump()),
+            ],
+        )
+        await record_attempt(db, repeat.key_id, repeat.attempt, repeat.row_xmin)
+        dataset.record.updated_by = user.id
+        await audit_emit(
+            db,
+            AuditEvent(
+                user_id=user.id,
+                action="feature.update",
+                resource_type="dataset",
+                resource_id=dataset_id,
+                details={
+                    "gid": repeat.row["gid"],
+                    "geometry_updated": True,
+                    "property_fields": sorted((body.properties or {}).keys()),
+                },
+            ),
+        )
+        tile_version = await record_live_data_write(db, dataset)
+    else:
+        await db.refresh(dataset, ["tile_cache_version"])
+        tile_version = dataset.tile_cache_version
+    # Ends the transaction, so the locks go before the answer does.
+    await db.commit()
+
+    # The attempt that wrote the feature may have died after its commit and
+    # before invalidating tiles.
+    tile_cache = get_tile_cache()
+    if tile_cache is not None:
+        await tile_cache.invalidate_table(dataset.table_name)
+    return _created_feature_response(repeat.row, tile_version, table_oid)
+
+
+# A typed object, not a binary body: the generated Python client parses any
+# `+json` media type with response.json(), which would hand bytes() a dict.
+_FEATURES_GEOJSON_Z_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string", "enum": ["FeatureCollection"]},
+        "features": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "enum": ["Feature"]},
+                    "id": {"type": "integer"},
+                    "geometry": {
+                        "anyOf": [
+                            {"type": "object", "additionalProperties": True},
+                            {"type": "null"},
+                        ]
+                    },
+                    "properties": {"type": "object", "additionalProperties": True},
+                },
+                "required": ["type", "id", "geometry", "properties"],
+            },
+        },
+        "truncated": {"type": "boolean"},
+        "total_count": {"type": "integer"},
+    },
+    "required": ["type", "features", "truncated", "total_count"],
+}
+
+
 @features_router.get(
     "/{dataset_id}/features.geojson",
     response_class=JSONResponse,
-    responses={200: {"content": {"application/geo+json": {}}}, **ERROR_RESPONSES_AUTH},
+    responses={
+        200: {
+            "description": "A GeoJSON FeatureCollection with Z coordinates preserved.",
+            "content": {"application/geo+json": {"schema": _FEATURES_GEOJSON_Z_SCHEMA}},
+        },
+        **ERROR_RESPONSES_AUTH,
+    },
 )
 async def get_features_geojson_z_endpoint(
     dataset_id: uuid.UUID,
@@ -236,7 +510,7 @@ async def get_features_geojson_z_endpoint(
     # fix(#315): raster/VRT datasets have no backing PostGIS feature table —
     # a feature query would raise UndefinedTableError -> 500 (and hold a DB
     # connection). Fast 404 before any feature query is attempted.
-    if dataset.record.record_type in RASTER_FAMILY_RECORD_TYPES:
+    if not capabilities(dataset.record.record_type).feature_table:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=(
@@ -330,7 +604,7 @@ async def list_features(
     # fix(#315): raster/VRT datasets have no backing PostGIS feature table —
     # fast 404 before any query. The ProgrammingError->503 catch below stays
     # a backstop for genuinely-missing tables on non-raster datasets.
-    if dataset.record.record_type in RASTER_FAMILY_RECORD_TYPES:
+    if not capabilities(dataset.record.record_type).feature_table:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=(
@@ -476,7 +750,9 @@ async def list_features(
     responses={
         200: {
             "content": {
-                "application/geo+json": {"schema": inline_json_schema(GeoJSONFeature)}
+                "application/geo+json": {
+                    "schema": inline_json_schema(GeoJSONFeatureRead)
+                }
             }
         },
         **ERROR_RESPONSES_AUTH,
@@ -488,7 +764,12 @@ async def get_single_feature(
     user: Identity = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
-    """Get a single GeoJSON feature by gid."""
+    """Get a single GeoJSON feature by gid.
+
+    `table_id` identifies the data table the feature was read from. Send it
+    with a later PUT, PATCH or DELETE of the feature so that write is refused
+    if the dataset's data has been replaced in between.
+    """
     dataset = await get_dataset(db, dataset_id)
     if dataset is None:
         raise HTTPException(
@@ -501,7 +782,7 @@ async def get_single_feature(
     # fix(#315): raster/VRT datasets have no backing PostGIS feature table —
     # get_feature_by_id would raise UndefinedTableError -> unhandled 500 (a
     # DoS reachable by any authenticated user). Fast 404 before any query.
-    if dataset.record.record_type in RASTER_FAMILY_RECORD_TYPES:
+    if not capabilities(dataset.record.record_type).feature_table:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=(
@@ -521,10 +802,12 @@ async def get_single_feature(
             detail="Feature not found",
         )
 
-    feature = GeoJSONFeature(
+    feature = GeoJSONFeatureRead(
         id=row["gid"],
         geometry=row["geometry"],
         properties=row["properties"],
+        # Read after the row, which holds the table until this transaction ends.
+        table_id=str(await current_table_oid(db, dataset.table_name)),
     )
 
     return JSONResponse(
@@ -540,7 +823,9 @@ async def get_single_feature(
     responses={
         201: {
             "content": {
-                "application/geo+json": {"schema": inline_json_schema(GeoJSONFeature)}
+                "application/geo+json": {
+                    "schema": inline_json_schema(GeoJSONFeatureWrite)
+                }
             }
         },
         **ERROR_RESPONSES_WRITE,
@@ -549,10 +834,50 @@ async def get_single_feature(
 async def create_feature(
     dataset_id: uuid.UUID,
     body: FeatureCreate,
+    # Annotated `str` and `int`, not optional types: a nullable optional header
+    # becomes a generated-client parameter that accepts None and then sends it.
+    idempotency_key: str = Header(
+        default=None,
+        alias=IDEMPOTENCY_KEY_HEADER,
+        min_length=1,
+        max_length=IDEMPOTENCY_KEY_MAX_LENGTH,
+        pattern=IDEMPOTENCY_KEY_PATTERN,
+        description=(
+            "Optional key that makes a retried create safe. Letters, digits "
+            "and `._:-`, up to 128 characters."
+        ),
+    ),
+    idempotency_attempt: int = Header(
+        default=None,
+        alias=IDEMPOTENCY_ATTEMPT_HEADER,
+        ge=1,
+        le=IDEMPOTENCY_ATTEMPT_MAX,
+        description=(
+            "Attempt number sent with `Idempotency-Key`, counting up by one "
+            "each time the body is sent again. Counts as 1 when omitted."
+        ),
+    ),
     user: Identity = Depends(require_permission("edit_metadata")),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
-    """Insert a new GeoJSON feature into a dataset."""
+    """Insert a new GeoJSON feature into a dataset.
+
+    Send the same `Idempotency-Key` on every attempt to create one feature, and
+    `Idempotency-Attempt` numbering the attempts 1, 2, 3 and so on. A repeat
+    from the same user on the same dataset never inserts a second feature. It
+    answers with the feature as stored, with the same 201 status and body
+    shape. If its attempt number is higher than any applied so far, it first
+    applies its geometry and the properties it names to that feature, with the
+    validation a create gets, unless anyone else has written the feature since
+    the last attempt was applied: then it is refused with 409, the stored
+    feature in `detail.feature`, and nothing is overwritten. If it is equal or
+    lower, the stored feature comes back unchanged, so a request that arrives
+    late cannot undo a later one. Two requests with one key never both insert. A key is honored for 24 hours. If
+    the feature it created has been deleted since, or the dataset's data has
+    been replaced by a reupload or an overwrite, the repeat is refused with 409
+    rather than creating another. Without the key every request inserts, and
+    an attempt number sent without one is ignored.
+    """
     dataset = await get_dataset(db, dataset_id)
     if dataset is None:
         raise HTTPException(
@@ -564,17 +889,53 @@ async def create_feature(
     await require_dataset_editing_enabled(db)
     _require_feature_table(dataset)
 
+    keyed = None
     try:
-        row = await insert_feature(
-            db,
-            dataset.table_name,
-            body.geometry.model_dump(),
-            body.properties,
-            dataset.column_info or [],
-            # fix(#430): generic for created datasets — see effective_geometry_type
-            await effective_geometry_type(db, dataset),
-            dataset_srid=dataset.srid,
-        )
+        if idempotency_key is not None:
+            # Requests on one key run one at a time. The key's lock comes
+            # before the feature is touched, so waiting on it holds nothing a
+            # PATCH, a replacement or a delete could be waiting for.
+            await lock_request_key(
+                db, scope=f"feature-create:{dataset_id}:{user.id}:{idempotency_key}"
+            )
+            keyed = await find_live_key(db, dataset_id, user.id, idempotency_key)
+        if keyed is not None:
+            repeat = await _settle_repeat(
+                db, dataset, keyed, idempotency_attempt or 1, body
+            )
+        else:
+            row = await insert_feature(
+                db,
+                dataset.table_name,
+                body.geometry.model_dump(),
+                body.properties,
+                dataset.column_info or [],
+                # fix(#430): generic for created datasets — see effective_geometry_type
+                await effective_geometry_type(db, dataset),
+                dataset_srid=dataset.srid,
+            )
+            table_oid = await current_table_oid(db, dataset.table_name)
+            if idempotency_key is not None:
+                # The catalog rows go before the key row: its foreign key
+                # takes a shared lock on the dataset that the metadata
+                # refresh's exclusive one would wait behind.
+                await _lock_catalog_rows_guarded(db, dataset)
+                if not await claim_create_key(
+                    db,
+                    dataset_id,
+                    user.id,
+                    idempotency_key,
+                    CreatedRow(
+                        row["gid"],
+                        table_oid,
+                        await current_row_xmin(db, dataset.table_name, row["gid"]),
+                    ),
+                    idempotency_attempt or 1,
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Another request is using this Idempotency-Key. Retry.",
+                    )
     except UnwritablePropertyError as e:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -588,6 +949,11 @@ async def create_feature(
     except DBAPIError as exc:
         await db.rollback()
         raise _feature_write_db_error(exc)
+
+    if keyed is not None:
+        return await _finish_repeat(
+            db, dataset, user, dataset_id, body, repeat, keyed.table_oid
+        )
 
     # fix(#1778): one row added, at a known envelope. No table scan when that
     # envelope is already inside the stored extent.
@@ -612,9 +978,7 @@ async def create_feature(
             },
         ),
     )
-    # fix(#1902): evaluated at write time, so a counter read before the lock
-    # wait is never written back over a peer's commit.
-    tile_version = await bump_tile_cache_version_on(db, dataset)
+    tile_version = await record_live_data_write(db, dataset)
     await db.commit()
 
     # Invalidate cached tiles so the new feature appears immediately
@@ -630,16 +994,7 @@ async def create_feature(
         user_id=str(user.id),
     )
 
-    feature = GeoJSONFeature(
-        id=row["gid"],
-        geometry=row["geometry"],
-        properties=row["properties"],
-    )
-    return JSONResponse(
-        content=feature.model_dump(mode="json"),
-        status_code=status.HTTP_201_CREATED,
-        media_type="application/geo+json",
-    )
+    return _created_feature_response(row, tile_version, table_oid)
 
 
 @features_router.put(
@@ -648,7 +1003,9 @@ async def create_feature(
     responses={
         200: {
             "content": {
-                "application/geo+json": {"schema": inline_json_schema(GeoJSONFeature)}
+                "application/geo+json": {
+                    "schema": inline_json_schema(GeoJSONFeatureWrite)
+                }
             }
         },
         **ERROR_RESPONSES_WRITE,
@@ -658,6 +1015,12 @@ async def replace_single_feature(
     dataset_id: uuid.UUID,
     gid: int,
     body: FeatureReplace,
+    table_id: str = Query(
+        default=None,
+        min_length=1,
+        max_length=20,
+        description=_TABLE_ID_PARAM_DESCRIPTION,
+    ),
     user: Identity = Depends(require_permission("edit_metadata")),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
@@ -674,6 +1037,7 @@ async def replace_single_feature(
     _require_feature_table(dataset)
 
     try:
+        table_oid = await _hold_table(db, dataset, table_id)
         written = await replace_feature(
             db,
             dataset.table_name,
@@ -732,9 +1096,7 @@ async def replace_single_feature(
             },
         ),
     )
-    # fix(#1902): evaluated at write time, so a counter read before the lock
-    # wait is never written back over a peer's commit.
-    await bump_tile_cache_version_on(db, dataset)
+    tile_version = await record_live_data_write(db, dataset)
     await db.commit()
 
     # Invalidate cached tiles so the replaced feature renders correctly
@@ -742,10 +1104,12 @@ async def replace_single_feature(
     if tile_cache is not None:
         await tile_cache.invalidate_table(dataset.table_name)
 
-    feature = GeoJSONFeature(
+    feature = GeoJSONFeatureWrite(
         id=row["gid"],
         geometry=row["geometry"],
         properties=row["properties"],
+        table_id=str(table_oid),
+        tile_cache_version=tile_version,
     )
     return JSONResponse(
         content=feature.model_dump(mode="json"),
@@ -759,7 +1123,9 @@ async def replace_single_feature(
     responses={
         200: {
             "content": {
-                "application/geo+json": {"schema": inline_json_schema(GeoJSONFeature)}
+                "application/geo+json": {
+                    "schema": inline_json_schema(GeoJSONFeatureWrite)
+                }
             }
         },
         **ERROR_RESPONSES_WRITE,
@@ -769,6 +1135,12 @@ async def patch_single_feature(
     dataset_id: uuid.UUID,
     gid: int,
     body: FeatureUpdate,
+    table_id: str = Query(
+        default=None,
+        min_length=1,
+        max_length=20,
+        description=_TABLE_ID_PARAM_DESCRIPTION,
+    ),
     user: Identity = Depends(require_permission("edit_metadata")),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
@@ -785,6 +1157,7 @@ async def patch_single_feature(
     _require_feature_table(dataset)
 
     try:
+        table_oid = await _hold_table(db, dataset, table_id)
         written = await update_feature(
             db,
             dataset.table_name,
@@ -848,9 +1221,7 @@ async def patch_single_feature(
             },
         ),
     )
-    # fix(#1902): evaluated at write time, so a counter read before the lock
-    # wait is never written back over a peer's commit.
-    await bump_tile_cache_version_on(db, dataset)
+    tile_version = await record_live_data_write(db, dataset)
     await db.commit()
 
     # Invalidate cached tiles so the updated feature renders correctly
@@ -858,10 +1229,12 @@ async def patch_single_feature(
     if tile_cache is not None:
         await tile_cache.invalidate_table(dataset.table_name)
 
-    feature = GeoJSONFeature(
+    feature = GeoJSONFeatureWrite(
         id=row["gid"],
         geometry=row["geometry"],
         properties=row["properties"],
+        table_id=str(table_oid),
+        tile_cache_version=tile_version,
     )
     return JSONResponse(
         content=feature.model_dump(mode="json"),
@@ -872,15 +1245,38 @@ async def patch_single_feature(
 @features_router.delete(
     "/{dataset_id}/features/{gid}",
     status_code=status.HTTP_204_NO_CONTENT,
-    responses=ERROR_RESPONSES_WRITE,
+    responses={
+        204: {
+            "description": "Feature deleted.",
+            "headers": {
+                TILE_CACHE_VERSION_HEADER: {
+                    "description": TILE_CACHE_VERSION_DESCRIPTION,
+                    "schema": {"type": "integer"},
+                },
+            },
+        },
+        **ERROR_RESPONSES_WRITE,
+    },
 )
 async def delete_single_feature(
     dataset_id: uuid.UUID,
     gid: int,
+    table_id: str = Query(
+        default=None,
+        min_length=1,
+        max_length=20,
+        description=_TABLE_ID_PARAM_DESCRIPTION,
+    ),
     user: Identity = Depends(require_permission("edit_metadata")),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """Delete a feature by gid (hard delete)."""
+    """Delete a feature by gid (hard delete).
+
+    The X-GeoLens-Tile-Cache-Version response header carries the dataset's
+    tile_cache_version after the delete committed; a 204 response has no
+    body to carry it in, unlike the create, replace and patch endpoints,
+    which return it as a field of the written feature.
+    """
     dataset = await get_dataset(db, dataset_id)
     if dataset is None:
         raise HTTPException(
@@ -893,6 +1289,7 @@ async def delete_single_feature(
     _require_feature_table(dataset)
 
     try:
+        await _hold_table(db, dataset, table_id)
         # fix(#1778): the DELETE returns the envelope it removed, so the
         # metadata refresh reasons about the version actually deleted.
         prior_bounds = await delete_feature(db, dataset.table_name, gid)
@@ -926,9 +1323,7 @@ async def delete_single_feature(
             details={"gid": gid},
         ),
     )
-    # fix(#1902): evaluated at write time, so a counter read before the lock
-    # wait is never written back over a peer's commit.
-    tile_version = await bump_tile_cache_version_on(db, dataset)
+    tile_version = await record_live_data_write(db, dataset)
     await db.commit()
 
     # Invalidate cached tiles so the deleted feature disappears immediately
@@ -944,4 +1339,9 @@ async def delete_single_feature(
         user_id=str(user.id),
     )
 
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    headers = (
+        {TILE_CACHE_VERSION_HEADER: str(tile_version)}
+        if tile_version is not None
+        else None
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT, headers=headers)

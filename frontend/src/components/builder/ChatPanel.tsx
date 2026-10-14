@@ -18,6 +18,8 @@ import type { MapLayerResponse, ChatAction, ChatHistoryMessage, LabelConfig, Sty
 import type { EphemeralAnalysisHandoff } from '@/components/builder/hooks/use-ephemeral-layers';
 import { ChatInput } from './ChatInput';
 import { getSmartSuggestions, type ChatSuggestion, type ViewportContext } from './chat-suggestions';
+import { randomId } from '@/lib/random-id';
+import { formatQueryCell } from '@/lib/query-cell';
 
 const prefersReducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false;
 
@@ -914,7 +916,7 @@ export function ChatPanel({
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: randomId(),
               role: 'assistant',
               content: finalText,
               actions: pendingActions.length > 0 ? pendingActions : undefined,
@@ -948,10 +950,13 @@ export function ChatPanel({
     userMsg: string;
     history: ChatHistoryMessage[];
     pendingActions: ChatAction[];
+    signal: AbortSignal;
   }) {
-    const { userMsg, history, pendingActions } = opts;
+    const { userMsg, history, pendingActions, signal } = opts;
     try {
-      const response = await sendChatMessage(mapId, userMsg, layers, i18n.language, [...history, { role: 'user', content: userMsg }]);
+      const response = await sendChatMessage(mapId, userMsg, layers, i18n.language, [...history, { role: 'user', content: userMsg }], signal);
+      // A cancel that lands after the response arrives must not apply its actions.
+      if (signal.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
       const responseActions = getChatActions(response.actions);
       applyActions(responseActions, pendingActions, userMsg);
       // Phase 1135 AI-03: clear any existing error banner on non-streaming success.
@@ -959,7 +964,7 @@ export function ChatPanel({
       setMessages((prev) => [
         ...prev,
         {
-          id: crypto.randomUUID(),
+          id: randomId(),
           role: 'assistant',
           content: response.explanation,
           // fix(#392): attach the filtered pendingActions (what actually applied), not the
@@ -969,6 +974,13 @@ export function ChatPanel({
         },
       ]);
     } catch (fallbackErr) {
+      if (signal.aborted) {
+        setMessages((prev) => [
+          ...prev,
+          { id: randomId(), role: 'assistant', content: t('chat.cancelled') },
+        ]);
+        return;
+      }
       // Phase 1135 AI-03: mirror streaming error classification — 403/503 → sticky banner.
       if (fallbackErr instanceof ApiError && (fallbackErr.status === 403 || fallbackErr.status === 503)) {
         setErrorBanner({
@@ -979,7 +991,7 @@ export function ChatPanel({
         setMessages((prev) => [
           ...prev,
           {
-            id: crypto.randomUUID(),
+            id: randomId(),
             role: 'error',
             content: mapApiErrorToMessage(fallbackErr),
             retryMessage: opts.userMsg,
@@ -999,7 +1011,7 @@ export function ChatPanel({
     const history = buildHistory();
     setMessages((prev) => [
       ...prev,
-      { id: crypto.randomUUID(), role: 'user', content: userMsg },
+      { id: randomId(), role: 'user', content: userMsg },
     ]);
     setIsLoading(true);
     const controller = new AbortController();
@@ -1025,12 +1037,12 @@ export function ChatPanel({
             ...prev,
             pendingActions.length > 0
               ? {
-                  id: crypto.randomUUID(),
+                  id: randomId(),
                   role: 'assistant',
                   content: streamState.text || t('chat.cancelled'),
                   actions: pendingActions,
                 }
-              : { id: crypto.randomUUID(), role: 'assistant', content: t('chat.cancelled') },
+              : { id: randomId(), role: 'assistant', content: t('chat.cancelled') },
           ]);
           return;
         case 'partial':
@@ -1038,7 +1050,7 @@ export function ChatPanel({
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: randomId(),
               role: 'assistant',
               content: streamState.text || t('chat.streamInterrupted'),
               actions: pendingActions,
@@ -1054,7 +1066,7 @@ export function ChatPanel({
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: randomId(),
               role: 'error',
               content: mapApiErrorToMessage(err),
               retryMessage: userMsg,
@@ -1063,7 +1075,7 @@ export function ChatPanel({
           break;
         case 'retry':
           // No actions applied yet — safe to retry via the non-streaming path.
-          await sendNonStreamingFallback({ userMsg, history, pendingActions });
+          await sendNonStreamingFallback({ userMsg, history, pendingActions, signal: controller.signal });
           break;
       }
     } finally {
@@ -1229,10 +1241,6 @@ export function ChatPanel({
                   const visibleCount = Math.min(allColumns.length, 5);
                   const visibleColumns = allColumns.slice(0, visibleCount);
                   const hasMore = allColumns.length > 5;
-                  const cellAt = (row: unknown, colIdx: number): string => {
-                    const raw = Array.isArray(row) ? row[colIdx] : undefined;
-                    return raw == null ? '' : String(raw);
-                  };
                   return (
                     <div className="mt-2 rounded-md border border-border overflow-hidden">
                       <div className="max-h-48 overflow-y-auto" role="region" aria-label={t('chat.queryResult.tableLabel')}>
@@ -1251,9 +1259,10 @@ export function ChatPanel({
                             {rows.map((row, idx) => (
                               <tr key={idx} className="border-b border-border last:border-0 hover:bg-muted/40">
                                 {visibleColumns.map((col, colIdx) => {
-                                  const display = cellAt(row, colIdx);
+                                  const raw = Array.isArray(row) ? row[colIdx] : undefined;
+                                  const display = formatQueryCell(raw);
                                   return (
-                                    <td key={col} className="px-2 py-1 text-foreground max-w-[8rem] truncate" title={display}>
+                                    <td key={col} className="px-2 py-1 text-foreground max-w-[8rem] truncate" title={raw == null ? '' : String(raw)}>
                                       {display}
                                     </td>
                                   );

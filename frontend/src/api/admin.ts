@@ -47,7 +47,13 @@ export async function listUsers(
 }
 
 export async function listUserNames(): Promise<{ id: string; username: string }[]> {
-  return apiFetch<{ id: string; username: string }[]>('/admin/users/names/');
+  const limit = 500;
+  const names: { id: string; username: string }[] = [];
+  for (let skip = 0; ; skip += limit) {
+    const page = await apiFetch<{ id: string; username: string }[]>(`/admin/users/names/?skip=${skip}&limit=${limit}`);
+    names.push(...page);
+    if (page.length < limit) return names;
+  }
 }
 
 export async function listAdminJobs(
@@ -115,7 +121,7 @@ export async function createUser(data: {
 }
 
 export async function updateUser(userId: string, data: {
-  email?: string;
+  email?: string | null;
   is_active?: boolean;
   status?: 'active' | 'suspended' | 'deactivated';
   role?: string;
@@ -263,19 +269,20 @@ export async function getEmbeddingStats(): Promise<EmbeddingStatsResponse> {
   return apiFetch<EmbeddingStatsResponse>('/admin/embedding-stats/');
 }
 
-// Backfill embeddings
-export async function triggerBackfill(force = false): Promise<BackfillResponse> {
-  const url = force ? '/admin/backfill-embeddings/?force=true' : '/admin/backfill-embeddings/';
-  return apiFetch<BackfillResponse>(url, {
-    method: 'POST',
-  });
-}
+// An all-tenant backfill queues every tenant's run inside the request, which
+// grows with the fleet. Outlive the edge proxy so a slow fan-out reaches the
+// page as the proxy's verdict rather than a client-side abort.
+const ALL_TENANT_BACKFILL_TIMEOUT_MS = 630_000;
 
-// Semantic search toggle (uses unified settings endpoint)
-export async function updateSemanticSearch(enabled: boolean): Promise<void> {
-  return apiFetch<void>('/settings/', {
-    method: 'PUT',
-    body: JSON.stringify({ settings: { semantic_search_enabled: enabled } }),
+// Backfill embeddings
+export async function triggerBackfill(force = false, allTenants = false): Promise<BackfillResponse> {
+  const params = new URLSearchParams();
+  if (force) params.set('force', 'true');
+  if (allTenants) params.set('all_tenants', 'true');
+  const query = params.toString();
+  return apiFetch<BackfillResponse>(`/admin/backfill-embeddings/${query ? `?${query}` : ''}`, {
+    method: 'POST',
+    ...(allTenants ? { timeoutMs: ALL_TENANT_BACKFILL_TIMEOUT_MS } : {}),
   });
 }
 

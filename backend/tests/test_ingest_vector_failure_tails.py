@@ -14,18 +14,31 @@ Both are asserted by driving the real task, not by reading the source.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import uuid
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from app.modules.auth.models import User
-from app.platform.jobs.models import IngestJob
+from app.platform.jobs.models import ARCHIVE_PENDING_METADATA_KEY, IngestJob
 from app.processing.ingest.ogr import IngestionError
 from app.processing.ingest.tasks_vector import ingest_file
 
 pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture(autouse=True)
+def _embedding_defers(monkeypatch) -> None:
+    """The embedding defer lands, as it does with the task queue open."""
+
+    async def _deferred(dataset) -> bool:
+        return True
+
+    monkeypatch.setattr("app.processing.embeddings.helpers.defer_embedding", _deferred)
 
 
 _GEOJSON = (
@@ -112,6 +125,251 @@ class TestValidationExitKeepsTheLocalOriginal:
             )
         finally:
             await _drop_job(test_db_session, job_id)
+
+
+class TestAnUnarchivedOriginalKeepsItsUpload:
+    """A completed import deletes its upload only once the original is archived."""
+
+    @staticmethod
+    async def _fake_ogr2ogr(file_path, table_name, db_conn_str, *, schema, **kwargs):
+        """Loads the one point ``_GEOJSON`` holds, as ogr2ogr would."""
+        from sqlalchemy import text
+
+        from app.core.db import async_session
+
+        async with async_session() as session:
+            await session.execute(
+                text(
+                    f'CREATE TABLE "{schema}"."{table_name}" '
+                    "(gid serial PRIMARY KEY, name text, geom geometry(Point, 4326))"
+                )
+            )
+            await session.execute(
+                text(
+                    f'INSERT INTO "{schema}"."{table_name}" (name, geom) '
+                    "VALUES ('a', ST_SetSRID(ST_Point(1, 2), 4326))"
+                )
+            )
+            await session.commit()
+
+    async def _import(
+        self,
+        session,
+        tmp_path,
+        *,
+        outcome: str,
+        staged_key=None,
+        extra_patches: tuple = (),
+        raises: type[BaseException] | None = None,
+    ):
+        """Run the import on ``points.geojson``, staged in place or, with
+        ``staged_key``, in object storage and downloaded to that file.
+
+        ``outcome`` is what the archive's write does: lands, fails, or is
+        cancelled, which the import then raises, as it does ``raises``.
+        Returns the job id, the storage double, the local file and the job's
+        stored metadata."""
+        source = tmp_path / "points.geojson"
+        source.write_bytes(_GEOJSON)
+        file_path = staged_key or str(source)
+        admin_id = await _admin_id(session)
+        job = await _queue_upload(session, file_path=file_path, user_id=admin_id)
+        job_id, attempt_id = job.id, job.attempt_id
+        storage = AsyncMock()
+        storage.put.side_effect = {
+            "archived": None,
+            "failed": RuntimeError("S3 unreachable"),
+            "cancelled": asyncio.CancelledError(),
+        }[outcome]
+        ogrinfo = {
+            "srid": 4326,
+            "geometry_type": "Point",
+            "columns": [{"name": "name", "type": "String"}],
+        }
+        with (
+            patch(
+                "app.processing.ingest.service.resolve_file_path",
+                AsyncMock(return_value=str(source)),
+            ),
+            patch(
+                "app.processing.ingest.ogr.run_ogrinfo",
+                AsyncMock(return_value=ogrinfo),
+            ),
+            patch("app.processing.ingest.ogr.run_ogr2ogr", new=self._fake_ogr2ogr),
+            patch("app.processing.ingest.metadata.grant_reader_access", AsyncMock()),
+            patch(
+                "app.processing.ingest.publish_followups.invalidate_catalog_cache",
+                AsyncMock(),
+            ),
+            patch("app.processing.embeddings.helpers.defer_embedding", AsyncMock()),
+            patch("app.processing.ingest.tasks_common.get_storage", lambda: storage),
+            patch("app.processing.ingest.tasks_staging.get_storage", lambda: storage),
+            patch("app.platform.storage.get_storage", lambda: storage),
+            contextlib.ExitStack() as expected,
+        ):
+            for extra in extra_patches:
+                expected.enter_context(extra)
+            if outcome == "cancelled":
+                raises = asyncio.CancelledError
+            if raises is not None:
+                expected.enter_context(pytest.raises(raises))
+            await ingest_file.func(
+                job_id=str(job_id),
+                file_path=file_path,
+                user_id=str(admin_id),
+                attempt_id=str(attempt_id),
+            )
+        session.expire_all()
+        finished = await session.get(IngestJob, job_id)
+        assert finished.status == "complete", finished.error_message
+        metadata = finished.user_metadata or {}
+        assert bool(metadata.get("archive_failed")) is (outcome == "failed")
+        return job_id, storage, source, metadata
+
+    @pytest.mark.parametrize("outcome", ["archived", "failed", "cancelled"])
+    async def test_a_local_upload_goes_only_once_its_original_is_archived(
+        self, test_db_session, tmp_path, outcome
+    ) -> None:
+        job_id, _storage, source, metadata = await self._import(
+            test_db_session, tmp_path, outcome=outcome
+        )
+        try:
+            kept = outcome != "archived"
+            assert source.exists() is kept
+            assert (ARCHIVE_PENDING_METADATA_KEY in metadata) is kept
+        finally:
+            await _drop_job(test_db_session, job_id)
+
+    @pytest.mark.parametrize("outcome", ["archived", "failed", "cancelled"])
+    async def test_a_presigned_upload_goes_only_once_its_original_is_archived(
+        self, test_db_session, tmp_path, outcome
+    ) -> None:
+        frozen_key = f"staging/{uuid.uuid4()}/frozen/points.geojson"
+        job_id, storage, source, metadata = await self._import(
+            test_db_session, tmp_path, outcome=outcome, staged_key=frozen_key
+        )
+        try:
+            kept = outcome != "archived"
+            deleted = [call.args[0] for call in storage.delete.await_args_list]
+            assert (frozen_key in deleted) is not kept
+            assert (ARCHIVE_PENDING_METADATA_KEY in metadata) is kept
+            assert not source.exists()
+        finally:
+            await _drop_job(test_db_session, job_id)
+
+    async def test_a_later_sweep_archives_an_import_whose_archive_was_cancelled(
+        self, test_db_session, tmp_path, monkeypatch
+    ) -> None:
+        """The publish owes the archive, so the sweep makes it, clears the mark and deletes the upload."""
+        from app.core.config import settings
+        from app.processing.ingest.publish_followups import (
+            PUBLISH_FOLLOWUPS_FIELD,
+            run_owed_publish_followups,
+        )
+
+        job_id, _storage, source, metadata = await self._import(
+            test_db_session, tmp_path, outcome="cancelled"
+        )
+        try:
+            archive_key = metadata[PUBLISH_FOLLOWUPS_FIELD]["archive_key"]
+            due = {
+                **metadata[PUBLISH_FOLLOWUPS_FIELD],
+                "next_attempt_at": "2000-01-01T00:00:00+00:00",
+            }
+            await test_db_session.execute(
+                update(IngestJob)
+                .where(IngestJob.id == job_id)
+                .values(user_metadata={**metadata, PUBLISH_FOLLOWUPS_FIELD: due})
+            )
+            await test_db_session.commit()
+            monkeypatch.setattr(settings, "upload_staging_dir", str(tmp_path))
+            storage = AsyncMock()
+            storage.exists = AsyncMock(return_value=False)
+            with (
+                patch(
+                    "app.processing.ingest.tasks_staging.get_storage", lambda: storage
+                ),
+                patch("app.platform.storage.get_storage", lambda: storage),
+            ):
+                await run_owed_publish_followups()
+
+            assert archive_key in [call.args[0] for call in storage.put.await_args_list]
+            assert not source.exists()
+            test_db_session.expire_all()
+            after = (await test_db_session.get(IngestJob, job_id)).user_metadata
+            assert (
+                not {ARCHIVE_PENDING_METADATA_KEY, PUBLISH_FOLLOWUPS_FIELD}
+                & after.keys()
+            )
+        finally:
+            await _drop_job(test_db_session, job_id)
+
+    async def test_the_publish_commit_itself_marks_the_archive_pending(
+        self, test_db_session, tmp_path
+    ) -> None:
+        """A task stopped right after the publish commit leaves the job marked and owing its archive."""
+        from app.processing.ingest.publish_followups import PUBLISH_FOLLOWUPS_FIELD
+
+        from app.processing.ingest.tasks_vector import _finalize_ingest
+
+        async def _stops_after_the_commit(ctx):
+            await _finalize_ingest(ctx)
+            raise asyncio.CancelledError
+
+        stopped = patch(
+            "app.processing.ingest.tasks_vector._finalize_ingest",
+            _stops_after_the_commit,
+        )
+        job_id, storage, source, metadata = await self._import(
+            test_db_session,
+            tmp_path,
+            outcome="archived",
+            extra_patches=(stopped,),
+            raises=asyncio.CancelledError,
+        )
+        try:
+            storage.put.assert_not_awaited()
+            assert metadata[ARCHIVE_PENDING_METADATA_KEY] is True
+            assert "archive_key" in metadata[PUBLISH_FOLLOWUPS_FIELD]
+            assert source.exists()
+        finally:
+            await _drop_job(test_db_session, job_id)
+
+    async def test_a_later_purge_keeps_an_import_whose_archive_never_reported(
+        self, test_db_session, tmp_path, monkeypatch
+    ) -> None:
+        """Past retention, a cancelled archive's job and upload both survive the purge."""
+        from app.core.config import settings
+        from app.platform.jobs.sweep import fail_stale_jobs
+
+        job_id, _storage, source, _metadata = await self._import(
+            test_db_session, tmp_path, outcome="cancelled"
+        )
+        monkeypatch.setattr(settings, "upload_staging_dir", str(tmp_path))
+        monkeypatch.setattr(settings, "ingest_jobs_retention_days", 30)
+        old = datetime.now(timezone.utc) - timedelta(days=90)
+        dataset_id = (await test_db_session.get(IngestJob, job_id)).dataset_id
+        await test_db_session.execute(
+            update(IngestJob)
+            .where(IngestJob.id == job_id)
+            .values(created_at=old, completed_at=old)
+        )
+        # The dataset's latest complete job is exempt, so this one must not be it.
+        latest = IngestJob(dataset_id=dataset_id, status="complete")
+        test_db_session.add(latest)
+        await test_db_session.commit()
+        latest_id = latest.id
+        try:
+            await fail_stale_jobs(test_db_session)
+
+            kept = await test_db_session.scalar(
+                select(IngestJob.id).where(IngestJob.id == job_id)
+            )
+            assert kept == job_id
+            assert source.exists()
+        finally:
+            await _drop_job(test_db_session, job_id)
+            await _drop_job(test_db_session, latest_id)
 
 
 class TestVectorFailureEmitsTheOperatorNotification:
@@ -336,10 +594,10 @@ class TestACleanupFailureCannotSwallowTheFailureWrite:
         status_lines = [
             node.lineno
             for node in ast.walk(tree)
-            if isinstance(node, ast.keyword)
-            and node.arg == "status"
-            and isinstance(node.value, ast.Constant)
-            and node.value.value == "failed"
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "fail"
+            and getattr(node.func.value, "id", None) == "ledger"
         ]
         assert drop_lines and status_lines, "the helper's shape changed"
         assert min(drop_lines) > min(status_lines), (
@@ -347,3 +605,36 @@ class TestACleanupFailureCannotSwallowTheFailureWrite:
             "error aborts the transaction, and every statement after it on "
             "that session raises until a rollback."
         )
+
+
+async def test_a_layer_with_no_crs_fails_with_its_code(
+    test_db_session, tmp_path, monkeypatch
+) -> None:
+    """A spatial layer with no CRS and no override fails its job under missing_crs."""
+    source = tmp_path / "points.gpkg"
+    source.write_bytes(b"")
+    admin_id = await _admin_id(test_db_session)
+    job = await _queue_upload(test_db_session, file_path=str(source), user_id=admin_id)
+    job_id = job.id
+
+    async def _no_crs(*args, **kwargs):
+        return {"srid": None, "geometry_type": "Point"}
+
+    monkeypatch.setattr(
+        "app.processing.ingest.tasks_vector._validate_upload_file_safety", AsyncMock()
+    )
+    monkeypatch.setattr("app.processing.ingest.ogr.run_ogrinfo", _no_crs)
+    try:
+        await ingest_file.func(
+            job_id=str(job_id),
+            file_path=str(source),
+            user_id=str(admin_id),
+            attempt_id=str(job.attempt_id),
+        )
+
+        test_db_session.expire_all()
+        finished = await test_db_session.get(IngestJob, job_id)
+        assert (finished.status, finished.error_code) == ("failed", "missing_crs")
+        assert (finished.error_message or "").startswith("Missing CRS")
+    finally:
+        await _drop_job(test_db_session, job_id)

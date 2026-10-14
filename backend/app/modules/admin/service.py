@@ -9,6 +9,7 @@ from sqlalchemy import delete, func, nulls_last, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
+from app.modules.admin.job_review import job_status_filters
 from app.modules.admin.schemas import (
     CatalogStatsResponse,
     EmbeddingStatsResponse,
@@ -16,7 +17,7 @@ from app.modules.admin.schemas import (
 )
 from app.modules.auth.models import ApiKey, Role, User, UserRole
 from app.modules.auth.oauth.models import OAuthAccount, OAuthProvider
-from app.modules.auth.providers.local import hash_password
+from app.modules.auth.providers.local import hash_password_async
 from app.modules.auth.service import AuthService
 from app.core.text import escape_ilike
 
@@ -252,10 +253,13 @@ class AdminService:
 
         user = User(
             username=username,
-            password_hash=hash_password(password),
+            password_hash=await hash_password_async(password),
             email=email,
             status="active",
             is_active=True,
+            # An address an admin entered counts as verified, so the person's
+            # first SSO sign-in links to this account.
+            email_verified=email is not None,
         )
         self.db.add(user)
         await self.db.flush()
@@ -312,7 +316,7 @@ class AdminService:
                 "-- this account signs in through an identity provider"
             )
 
-        user.password_hash = hash_password(password)
+        user.password_hash = await hash_password_async(password)
         await AuthService(self.db).revoke_all_tokens(
             user_id, commit=False, bump_key_epoch=True
         )
@@ -383,14 +387,15 @@ class AdminService:
             await self._ensure_not_last_admin(user, action, lock_held=True)
 
         # Apply non-None scalar fields
-        if updates.email is not None:
-            await self._ensure_unique_user_field(
-                User.email,
-                updates.email,
-                "Email already registered",
-                exclude_id=user_id,
-            )
-            user.email = updates.email
+        if "email" in updates.model_fields_set:
+            email = updates.email
+            if email is not None:
+                await self._ensure_unique_user_field(
+                    User.email, email, "Email already registered", exclude_id=user_id
+                )
+            if email != user.email:
+                user.email_verified = email is not None
+            user.email = email
 
         if target_status is not None:
             user.status = target_status
@@ -567,7 +572,7 @@ class AdminService:
             )
         saml_account, provider_slug = link_row
 
-        user.password_hash = hash_password(password)
+        user.password_hash = await hash_password_async(password)
 
         # chk_users_auth_provider admits 'local'.
         user.auth_provider = "local"
@@ -815,8 +820,7 @@ class AdminService:
         from app.platform.jobs.models import IngestJob
 
         filters = []
-        if status is not None:
-            filters.append(IngestJob.status == status)
+        filters.extend(job_status_filters(status))
         if user_id is not None:
             filters.append(IngestJob.created_by == user_id)
         if search is not None:

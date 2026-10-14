@@ -7,17 +7,25 @@ search items, and import selected items as raster datasets.
 import asyncio
 import uuid
 from datetime import date, datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
+import httpx
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    HttpUrl,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.standards.ogc.errors import BAD_GATEWAY_RESPONSE, ERROR_RESPONSES_WRITE
 
-from app.core.geo import bbox_to_extent_wkt
+from app.core.geo import bbox_to_extent_wkt, crs_columns
 from app.core.url_redaction import has_url_credentials, redact_url_credentials
 from app.modules.audit.service import AuditEvent, audit_emit
 from app.core.identity import Identity
@@ -38,7 +46,16 @@ from app.modules.catalog.sources.adapters.stac import (
     list_stac_collections,
     search_stac_items,
 )
-from app.modules.catalog.sources.cog_info import fetch_cog_info, reconcile_epsg
+from app.modules.catalog.sources.stac_next_page import (
+    StacNextPage,
+    issue_cursor,
+    open_cursor,
+)
+from app.modules.catalog.sources.cog_info import (
+    fetch_cog_info,
+    import_refusal,
+    reconcile_epsg,
+)
 from app.modules.catalog.sources.schemas import (
     DEPRECATED_TOKEN_SUFFIX,
     SERVICE_AUTH_FIELD_DESCRIPTION,
@@ -72,6 +89,49 @@ def _validate_optional_stac_http_url(v: str | None) -> str | None:
     and ``HttpUrl(None)`` raises.
     """
     return None if v is None else _validate_stac_http_url(v)
+
+
+def _data_asset_import_refusal(
+    href: str | None,
+) -> Literal["not_http", "credentials", "too_long"] | None:
+    """Why ``/import``'s own ``StacImportItem.data_asset_href`` field would
+    refuse *href*, or ``None`` if that field's own checks would accept it.
+    Format, length and credentials only: ``/import`` separately checks each
+    asset's host, which this does not predict.
+
+    Search is the one place that can tell the caller before an item is
+    ticked, rather than after the whole batch 422s on submit — but only if
+    this predicts the SAME field in the SAME order: the field's own
+    ``max_length=4096`` (pydantic enforces this before any field_validator
+    runs), then ``HttpUrl(href)``, then ``has_url_credentials`` only once
+    ``HttpUrl`` has passed — exactly ``_validate_stac_http_url``'s own
+    order. A too-long, credentialed href is ``too_long``, not
+    ``credentials``: that is what ``HttpUrl`` raises on before the
+    credential check ever runs, and checking credentials first would
+    answer for input the real validator never reaches.
+
+    ``HttpUrl`` also enforces its OWN, tighter length ceiling internally,
+    independently of the field's 4096 cap, so an href in between comes
+    back as pydantic's ``url_too_long`` error rather than the field's
+    ``string_too_long`` one the length check above catches — read off the
+    raised error's type rather than hardcoding a second length, so this
+    keeps matching ``HttpUrl`` even if a future pydantic release changes
+    that ceiling. Any other ``HttpUrl`` failure — an unparseable
+    authority, a disallowed scheme — is ``not_http``.
+    """
+    if href is None:
+        return None
+    if len(href) > 4096:
+        return "too_long"
+    try:
+        HttpUrl(href)
+    except ValidationError as exc:
+        if any(error["type"] == "url_too_long" for error in exc.errors()):
+            return "too_long"
+        return "not_http"
+    if has_url_credentials(href):
+        return "credentials"
+    return None
 
 
 router = APIRouter(
@@ -121,6 +181,13 @@ class StacConnectResponse(BaseModel):
     title: str = Field(description="Catalog title.")
     description: str = Field(description="Catalog description.")
     stac_version: str = Field(description="STAC specification version.")
+    conforms_to: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Conformance classes from the landing page conformsTo, which "
+            "tell a client which search extensions the catalog supports."
+        ),
+    )
 
 
 class StacCollectionSummary(BaseModel):
@@ -184,6 +251,35 @@ class StacSearchRequest(BaseModel):
         default=None, description=SERVICE_AUTH_FIELD_DESCRIPTION
     )
     _reject_auth_conflict = model_validator(mode="after")(reject_service_auth_conflict)
+    max_cloud_cover: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description="Only items at or below this eo:cloud_cover percentage.",
+    )
+    cloud_cover_mode: Literal["query", "filter"] | None = Field(
+        default=None,
+        description=(
+            "How to send max_cloud_cover: 'query' for the STAC Query "
+            "extension, 'filter' for CQL2 JSON. Pick the one the catalog "
+            "lists in its landing page conformsTo."
+        ),
+    )
+    next_page: StacNextPage | None = Field(
+        default=None,
+        description=(
+            "The next_page of the previous response, to fetch the page after "
+            "it. Send the same filters as the first request."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _cloud_cover_needs_a_mode(self) -> "StacSearchRequest":
+        if (self.max_cloud_cover is None) != (self.cloud_cover_mode is None):
+            raise ValueError(
+                "max_cloud_cover and cloud_cover_mode must be sent together"
+            )
+        return self
 
 
 class StacItemSummary(BaseModel):
@@ -233,6 +329,26 @@ class StacItemSummary(BaseModel):
         default=None,
         description="Size of the primary data asset in bytes (from STAC file:size). None when not in manifest.",
     )
+    data_asset_import_refusal: Literal["not_http", "credentials", "too_long"] | None = (
+        Field(
+            # Optional, not required: a generated SDK client raises on any
+            # field a required-but-nullable schema promises but an older
+            # server never sends. The web app ships bundled with its own
+            # API and always gets this field; the SDK, CLI and MCP can run
+            # ahead of an older GeoLens server that predates this check.
+            default=None,
+            description=(
+                "Why /import would refuse this item's data asset, based on its "
+                "URL alone, or null if the href passes import's format, length "
+                "and credential checks. 'not_http' for a scheme other than "
+                "http/https, such as s3://; 'credentials' for a URL carrying a "
+                "credential query parameter GeoLens won't store; 'too_long' for "
+                "a URL over the length import allows. Import also checks each "
+                "asset's host, and can still refuse a null item there as a "
+                "per-item failure that leaves the rest of the batch importing."
+            ),
+        )
+    )
     thumbnail_href: str | None = Field(
         default=None, description="Thumbnail URL if available."
     )
@@ -245,6 +361,13 @@ class StacSearchResponse(BaseModel):
         default=None, description="Total matches (if reported by API)."
     )
     returned: int = Field(description="Number of items in this response.")
+    next_page: StacNextPage | None = Field(
+        default=None,
+        description=(
+            "Link to the next page of results, or null on the last page. "
+            "Send it back as next_page with the same filters."
+        ),
+    )
 
 
 class StacImportItem(BaseModel):
@@ -416,7 +539,15 @@ async def stac_connect(
         title=result["title"],
         description=result["description"],
         stac_version=result["stac_version"],
+        conforms_to=_conformance_classes(result.get("conforms_to")),
     )
+
+
+def _conformance_classes(value: object) -> list[str]:
+    """The landing page's conformsTo as a bounded list of strings."""
+    if not isinstance(value, list):
+        return []
+    return [c for c in value if isinstance(c, str) and len(c) <= 512][:200]
 
 
 @router.post(
@@ -454,6 +585,37 @@ async def stac_collections(
     )
 
 
+def _issued_next_page(
+    request: StacSearchRequest, next_page: dict[str, Any] | None
+) -> StacNextPage | None:
+    if next_page is None:
+        return None
+    cursor = issue_cursor(request.url, request.collections, next_page)
+    return None if cursor is None else StacNextPage(cursor=cursor)
+
+
+async def _validate_next_page_href(catalog_url: str, href: str) -> None:
+    """Refuse a next-page URL that the catalog's own response could not have named.
+
+    The follow-up carries the caller's credential and is fetched by this
+    server, so the client may not steer it to another origin or an internal
+    address.
+    """
+    try:
+        has_userinfo = bool(httpx.URL(href).userinfo)
+    except httpx.InvalidURL:
+        has_userinfo = True
+    if has_userinfo or not same_origin(catalog_url, href):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The next page must be on the same origin as the catalog URL.",
+        )
+    try:
+        await validate_url_for_ssrf(href)
+    except SSRFError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
 @router.post(
     "/search",
     response_model=StacSearchResponse,
@@ -474,6 +636,18 @@ async def stac_search(
     except SSRFError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
+    next_page = None
+    if request.next_page is not None:
+        next_page = open_cursor(
+            request.url, request.collections, request.next_page.cursor
+        )
+        if next_page is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The next page link is not valid for this search.",
+            )
+        await _validate_next_page_href(request.url, next_page["href"])
+
     try:
         result = await search_stac_items(
             request.url,
@@ -482,6 +656,9 @@ async def stac_search(
             datetime_range=request.datetime_range,
             limit=request.limit,
             credential=credential,
+            next_page=next_page,
+            max_cloud_cover=request.max_cloud_cover,
+            cloud_cover_mode=request.cloud_cover_mode,
         )
     except Exception as exc:  # broad: STAC /search client/HTTP/parse can throw varied errors; map to 502 for the user
         logger.warning("STAC search failed", url=safe_url, error=str(exc))
@@ -491,9 +668,18 @@ async def stac_search(
         )
 
     return StacSearchResponse(
-        items=[StacItemSummary(**item) for item in result["items"]],
+        items=[
+            StacItemSummary(
+                **item,
+                data_asset_import_refusal=_data_asset_import_refusal(
+                    item.get("data_asset_href")
+                ),
+            )
+            for item in result["items"]
+        ],
         matched=result["matched"],
         returned=result["returned"],
+        next_page=_issued_next_page(request, result.get("next_page")),
     )
 
 
@@ -619,6 +805,13 @@ async def stac_import(
     from app.modules.quota.service import reserve_dataset_slot
 
     for item in importable:
+        refusal = import_refusal(cog_info_map.get(item.data_asset_href))
+        if refusal is not None:
+            results.append(
+                StacImportResult(item_id=item.id, status="error", error=refusal)
+            )
+            errors += 1
+            continue
         try:
             # Savepoint per item so a failure doesn't corrupt the session
             async with db.begin_nested():
@@ -718,7 +911,7 @@ async def stac_import(
                     height=ci.get("height"),
                     nodata=str(nodata_raw) if nodata_raw is not None else None,
                     band_info=ci.get("band_info"),
-                    crs_wkt=ci.get("crs_wkt"),
+                    **crs_columns(ci),
                     # fix(#1375): res_x/res_y/is_rotated come off /cog/stac's
                     # proj:transform as one fact — written together or not at
                     # all, since a probe with no transform must leave them at

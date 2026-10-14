@@ -20,6 +20,8 @@ async def test_admin_job_list_includes_retry_capability(monkeypatch) -> None:
         source_filename="roads.geojson",
         dataset_id=None,
         error_message="Import failed.",
+        error_code=None,
+        source_url=None,
         user_metadata={"service_auth_required": True},
         created_by=uuid.uuid4(),
         started_at=None,

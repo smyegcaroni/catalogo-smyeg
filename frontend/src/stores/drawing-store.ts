@@ -5,6 +5,8 @@ interface SelectedFeature {
   gid: number;
   tdId: string;
   properties: Record<string, unknown>;
+  /** The table_id the feature was read with, sent with every write to it. */
+  tableId?: string | null;
 }
 
 interface DrawingState {
@@ -15,6 +17,10 @@ interface DrawingState {
   targetGeometryType: string | null;
   selectedFeature: SelectedFeature | null;
   isEditDirty: boolean;
+  /** Any unsaved work on the mounted dataset map (a dirty or undoable
+   *  selection, a sketch, a pending new geometry, an open attribute
+   *  editor), as that map computes it, for the page's unsaved-changes guard. */
+  hasUnsavedMapWork: boolean;
   /**
    * fix(#1713): the identity that adopted the current target, for
    * bookkeeping. NOT the write gate below (see `sessionEpoch`) — fix(#1761
@@ -59,6 +65,7 @@ interface DrawingState {
   setSelectedFeature: (sf: SelectedFeature, epoch: number) => void;
   clearSelectedFeature: () => void;
   setEditDirty: (dirty: boolean) => void;
+  setHasUnsavedMapWork: (unsaved: boolean) => void;
   /**
    * fix(#1761 review P1): invalidates every target/selection adopted before
    * this call. Called ONLY from lib/auth-cache-reset.ts's identity-change
@@ -90,6 +97,7 @@ const CLEARED_STATE = {
   targetGeometryType: null,
   selectedFeature: null,
   isEditDirty: false,
+  hasUnsavedMapWork: false,
   ownerId: null,
 } as const;
 
@@ -113,6 +121,7 @@ export const useDrawingStore = create<DrawingState>()((set, get) => ({
       targetGeometryType: geometryType,
       selectedFeature: null,
       isEditDirty: false,
+      hasUnsavedMapWork: false,
       ownerId: currentUserId(),
     }),
   setMode: (mode) => set({ activeMode: mode }),
@@ -158,5 +167,6 @@ export const useDrawingStore = create<DrawingState>()((set, get) => ({
   },
   clearSelectedFeature: () => set({ selectedFeature: null, isEditDirty: false }),
   setEditDirty: (dirty) => set({ isEditDirty: dirty }),
+  setHasUnsavedMapWork: (unsaved) => set({ hasUnsavedMapWork: unsaved }),
   bumpSessionEpoch: () => set((state) => ({ sessionEpoch: state.sessionEpoch + 1 })),
 }));

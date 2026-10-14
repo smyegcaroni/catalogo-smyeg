@@ -2,6 +2,7 @@
 import { RefreshCw, TableProperties } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
+import { LiveAnnouncement } from '@/components/ui/live-announcement';
 import {
   Sheet,
   SheetContent,
@@ -24,6 +25,8 @@ interface AccessibleMapDataPanelProps {
   onRefresh: () => void;
   disabled?: boolean;
 }
+
+const SUMMARY_ANNOUNCE_DELAY_MS = 1000;
 
 function humanizeKey(key: string): string {
   return key
@@ -54,19 +57,26 @@ export function AccessibleMapDataPanel({
 }: AccessibleMapDataPanelProps) {
   const { t, i18n } = useTranslation('common');
   const layerEntries = createViewerLayerEntries(layers);
+  const resultSummary = featureResult.truncated
+    ? t('viewer.data.resultSummaryTruncated', {
+        shown: featureResult.features.length,
+        total: featureResult.total,
+      })
+    : t('viewer.data.resultSummary', { count: featureResult.total });
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetTrigger asChild>
-        <Button
+<Button
           type="button"
           variant="outline"
           size="sm"
           disabled={disabled}
-          className="absolute bottom-20 left-3 z-30 bg-background/95 shadow-md backdrop-blur-sm"
+          title={t('viewer.data.launch')}
+          className="absolute bottom-0 left-1/2 z-30 h-[calc(2rem+env(safe-area-inset-bottom))] max-w-[calc(100%-13rem)] -translate-x-1/2 rounded-b-none border-b-0 bg-background/95 pb-[env(safe-area-inset-bottom)] shadow-md backdrop-blur-sm focus-visible:ring-inset"
         >
           <TableProperties aria-hidden="true" />
-          {t('viewer.data.launch')}
+          <span className="truncate max-[399px]:sr-only">{t('viewer.data.launch')}</span>
         </Button>
       </SheetTrigger>
       <SheetContent
@@ -129,14 +139,9 @@ export function AccessibleMapDataPanel({
               <h3 id="map-data-features-heading" className="text-sm font-semibold">
                 {t('viewer.data.featuresHeading')}
               </h3>
-              <p className="text-xs text-muted-foreground" role="status" aria-live="polite">
-                {featureResult.truncated
-                  ? t('viewer.data.resultSummaryTruncated', {
-                      shown: featureResult.features.length,
-                      total: featureResult.total,
-                    })
-                  : t('viewer.data.resultSummary', { count: featureResult.total })}
-              </p>
+              <p className="text-xs text-muted-foreground" aria-hidden="true">{resultSummary}</p>
+              {/* The map refreshes this on every idle; the delay debounces the announcement. */}
+              <LiveAnnouncement text={resultSummary} delayMs={SUMMARY_ANNOUNCE_DELAY_MS} />
             </div>
 
             {featureResult.features.length === 0 ? (

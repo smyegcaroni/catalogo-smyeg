@@ -14,6 +14,7 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from app.core.auth_settings import AuthSettings
 
 
 def reveal(secret: SecretStr | None) -> str | None:
@@ -283,7 +284,7 @@ MIN_SIGNABLE_JOB_LIFETIME_SECONDS = 60
 MAX_PRESIGNED_URL_LIFETIME_SECONDS = 604800
 
 
-class Settings(BaseSettings):
+class Settings(AuthSettings, BaseSettings):
     postgres_user: str = "geolens"
     postgres_password: SecretStr
     postgres_host: str = "localhost"
@@ -313,7 +314,6 @@ class Settings(BaseSettings):
     password_require_classes: int = Field(default=3, ge=1, le=4)
     geolens_admin_username: str
     geolens_admin_password: SecretStr
-    registration_enabled: bool = False
     # FRONT-01 (Phase 1223): when True the root route redirects anonymous
     # visitors to the login page as the product landing surface.
     # Default False — self-hosters see zero change on upgrade.
@@ -326,13 +326,15 @@ class Settings(BaseSettings):
 
     cors_allowed_origins: str = ""
     upload_max_size_mb: int = Field(default=500, gt=0)
+    # Both are checked against a tileset's central directory before anything is
+    # unpacked, so they bound a zip bomb as well as an honest large tileset.
+    max_tileset_unpacked_mb: int = Field(default=20480, gt=0)
+    max_tileset_entries: int = Field(default=100_000, gt=0)
     upload_staging_dir: str = "/app/staging"
     # NOTE: this is a PersistentConfig default — deployments where an admin
     # has stored an override keep their stored list and must add new
     # extensions (e.g. .parquet) themselves in Admin → Storage.
-    upload_allowed_extensions: str = (
-        ".zip,.gpkg,.geojson,.json,.csv,.tif,.tiff,.xlsx,.xls,.parquet,.fgb,.kml,.kmz"
-    )
+    upload_allowed_extensions: str = ".zip,.gpkg,.geojson,.json,.csv,.tif,.tiff,.xlsx,.xls,.parquet,.fgb,.kml,.kmz,.3tz,.laz"
     # fix(#1236): capped at S3's single-PUT hard limit (5GiB). The invariant
     # that actually matters is enforced in code, not config -- see the clamp
     # in `recheck_transfer_margin_seconds()` (platform/jobs/router.py).
@@ -427,12 +429,16 @@ class Settings(BaseSettings):
 
     storage_provider: Literal["local", "s3", "azure"] = "local"
     s3_endpoint: str | None = None
+    # Presigned URLs are signed against this host when set, for clients that
+    # can't reach s3_endpoint (a container hostname, say).
+    s3_public_endpoint: str | None = None
     s3_bucket: str | None = None
     s3_access_key_id: str | None = None
     s3_secret_access_key: SecretStr | None = None
     s3_region: str = "us-east-1"
     s3_allow_http: bool = False
     s3_addressing_style: Literal["auto", "path", "virtual"] = "auto"
+    s3_presigned_downloads: bool = False
 
     # Ambient AWS credential markers, injected by the runtime not an operator:
     # EKS IRSA/Pod Identity set AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE;
@@ -459,12 +465,12 @@ class Settings(BaseSettings):
     # Revealed only at the SDK boundary in init_storage(); never logged.
     azure_storage_account_key: SecretStr | None = None
 
-    # IN-01: env-overridable Titiler base URL, matching the Docker Compose
-    # service name by default; override via TITILER_BASE_URL for bare-metal
-    # or alternative service names.
+    # Compose service origins by default: the API reaches Titiler at the first,
+    # and Titiler reads every remote raster through the API relay at the second.
     titiler_base_url: str = "http://titiler:8000"
+    remote_raster_relay_base_url: str = "http://api:8000"
 
-    redis_url: str | None = None
+    redis_url: str | None = None  # unset refuses token-protected service dispatch
     cdn_base_url: str | None = None
     tile_signing_secret: SecretStr | None = None
     tile_cache_ttl: int = Field(default=300, ge=0)
@@ -587,13 +593,13 @@ class Settings(BaseSettings):
     # would trip it has already lost its client.
     db_statement_timeout_seconds: int = Field(default=300, ge=0)
 
-    # fix(#1249): how old an object under the `staging/` prefix must be
-    # before the reconciliation sweep deletes it for having no ingest_jobs
-    # row. Not a guess at upload duration -- the row check decides
-    # ownership, so this only needs to outlast a LISTING racing the row's
-    # own write. Floored at an hour so misconfiguration can't turn the
-    # sweep into a deleter of objects still landing. Consumer:
-    # `reconcile_orphaned_staging_objects` in platform/jobs/staging_reconcile.py.
+    # How old a staged upload (a `staging/` object, or a local staging file
+    # whose naming rows must also have ended this long ago) must be before a
+    # reconciliation sweep deletes it for having no ingest_jobs row that still
+    # needs it. Not a guess at upload duration -- the row check decides
+    # ownership. Floored at an hour so misconfiguration can't turn the sweeps
+    # into deleters of uploads still landing. Consumers in platform/jobs/:
+    # `reconcile_orphaned_staging_objects`, `reconcile_orphaned_local_uploads`.
     staging_orphan_min_age_seconds: int = Field(default=86400, ge=3600)
 
     # Outbound Notification channels (NOTIF-02/03/05). All defaults are
@@ -656,6 +662,7 @@ class Settings(BaseSettings):
         "geolens_migration_db_role",
         "tile_database_url_override",
         "s3_endpoint",
+        "s3_public_endpoint",
         "s3_bucket",
         "s3_access_key_id",
         "s3_secret_access_key",
@@ -678,7 +685,6 @@ class Settings(BaseSettings):
         "smtp_from_address",
         "notification_webhook_url",
         "notification_webhook_secret",
-        # Phase 1230 EVENT-05 recipient field — blank env value normalizes to None
         "notification_admin_email",
         # fix(#441): compose passes ENVIRONMENT through as "${ENVIRONMENT:-}",
         # so an unset value arrives as "" — normalize to None (LOG_JSON fallback)

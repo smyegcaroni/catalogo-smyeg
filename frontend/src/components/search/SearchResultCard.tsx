@@ -130,6 +130,8 @@ function buildAutoDescription(
       });
     case 'table':
       return t('card.autoDesc.table', { count: properties.feature_count ?? 0 });
+    case 'tiles3d_dataset':
+      return t('card.autoDesc.tiles3d');
     default:
       break;
   }
@@ -154,7 +156,11 @@ export const SearchResultCard = memo(function SearchResultCard({ feature }: { fe
   // 404s are cached in quicklook-cache.ts for the session so we skip re-fetching.
   const featureId = feature.id as string;
   const enableQuicklook = !isCollection && !isTable && Boolean(properties.has_quicklook);
-  const { url: quicklookBlobUrl } = useQuicklook(enableQuicklook ? featureId : null, 256);
+  const { url: quicklookBlobUrl } = useQuicklook(
+    enableQuicklook ? featureId : null,
+    256,
+    properties.quicklook_version ?? null,
+  );
 
   // Provenance (for non-collection types)
   const neverEditedLabel = t('card.neverEdited', { defaultValue: 'Never' });
@@ -206,7 +212,7 @@ export const SearchResultCard = memo(function SearchResultCard({ feature }: { fe
   return (
     <Link
       to={linkPath}
-      className="group block"
+      className="group block rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       data-testid="search-result-card"
       onMouseEnter={prefetchDetail}
       onFocus={prefetchDetail}
@@ -227,9 +233,9 @@ export const SearchResultCard = memo(function SearchResultCard({ feature }: { fe
                     </Badge>
                   )}
                 </div>
-                <span className="block text-base font-semibold leading-tight text-foreground transition-colors group-hover:text-primary line-clamp-1">
+                <h3 className="block text-base font-semibold leading-tight text-foreground transition-colors group-hover:text-primary line-clamp-1">
                   {properties.title}
-                </span>
+                </h3>
                 {properties.description && (
                   <p className="text-sm leading-5 text-muted-foreground line-clamp-1">
                     {properties.description}
@@ -251,9 +257,9 @@ export const SearchResultCard = memo(function SearchResultCard({ feature }: { fe
                       </Badge>
                     )}
                   </div>
-                  <span className="block text-base font-semibold leading-tight text-foreground transition-colors group-hover:text-primary line-clamp-2">
+                  <h3 className="block text-base font-semibold leading-tight text-foreground transition-colors group-hover:text-primary line-clamp-2">
                     {properties.title}
-                  </span>
+                  </h3>
                   {sourceOrganization && (
                     <p
                       className="text-xs leading-4 text-muted-foreground line-clamp-1"

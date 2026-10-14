@@ -8,18 +8,16 @@ const ViewerMap = lazy(() =>
   import('@/components/viewer/ViewerMap').then((m) => ({ default: m.ViewerMap }))
 );
 import { LayerLegend } from '@/components/viewer/LayerLegend';
+import type { DrawnLayer } from '@/components/map/legend-facts';
 import { MapTitlePill } from '@/components/map/MapTitlePill';
 import { BasemapToggle } from '@/components/map/BasemapToggle';
 import { Clock, MapPinOff } from 'lucide-react';
 import { ApiError } from '@/api/client';
 import { useTranslation } from 'react-i18next';
 import { LoadingState } from '@/components/layout/LoadingState';
-import { AppFooter } from '@/components/layout/AppFooter';
 import { SiteBanner } from '@/components/layout/SiteBanner';
 import { useDocumentTitle } from '@/hooks/use-document-title';
 import { MapErrorBoundary } from '@/components/error';
-import { useEdition } from '@/hooks/use-edition';
-import { useBranding } from '@/hooks/use-settings';
 import { Button } from '@/components/ui/button';
 
 function parseCenter(raw: string | null): { lng: number; lat: number } | null {
@@ -40,14 +38,15 @@ function parseZoom(raw: string | null): number | null {
   return z;
 }
 
+// Keyed by share token so the basemap choice and drawn layers start fresh
+// when the route switches to another map without a remount.
 export function PublicViewerPage() {
+  const { token } = useParams<{ token: string }>();
+  return <PublicViewer key={token} />;
+}
+
+function PublicViewer() {
   const { t } = useTranslation('common');
-  useDocumentTitle(t('common:pageTitle.sharedMap'));
-  const { isEnterprise } = useEdition();
-  const { data: branding } = useBranding();
-  // Gate on branding !== undefined so enterprise users with show_badge:false do
-  // not see a flash of the footer badge while the branding query is loading (IN-02).
-  const showFooterBranding = branding !== undefined && (!isEnterprise || branding?.show_badge !== false);
   const { token } = useParams<{ token: string }>();
   const [searchParams] = useSearchParams();
   const isEmbed = searchParams.get('embed') === 'true';
@@ -58,13 +57,15 @@ export function PublicViewerPage() {
   const legendParam = searchParams.get('legend');
 
   const { data, isLoading, isError, error } = useSharedMap(token, apiKey, embedToken);
+  useDocumentTitle(data?.name || t('common:pageTitle.sharedMap'));
 
   const effectiveShowLegend = legendParam !== null ? legendParam === 'true' : !isEmbed;
 
   const { visibleLayers, handleToggleVisibility, isLegendOpen, setIsLegendOpen } =
-    useViewerLayers(data?.layers, { showLegend: effectiveShowLegend });
+    useViewerLayers(data?.layers, { showLegend: effectiveShowLegend, mapKey: token });
 
   const [basemapId, setBasemapId] = useState<string | null>(null);
+  const [drawnLayers, setDrawnLayers] = useState<ReadonlyMap<string, DrawnLayer>>();
   const handleLegendToggle = useCallback(() => setIsLegendOpen((prev) => !prev), [setIsLegendOpen]);
 
   // fix(#553): every branch shows the site banner (except embeds), including
@@ -73,9 +74,9 @@ export function PublicViewerPage() {
     return (
       <div className="flex h-dvh flex-col">
         {!isEmbed && <SiteBanner />}
-        <div className="flex min-h-0 w-full flex-1 items-center justify-center bg-muted">
+        <main className="flex min-h-0 w-full flex-1 items-center justify-center bg-muted">
           <LoadingState message={t('viewer.loading')} />
-        </div>
+        </main>
       </div>
     );
   }
@@ -87,10 +88,10 @@ export function PublicViewerPage() {
       // min-h-screen overflowed the viewport by the banner's height.
       <div className="flex h-dvh flex-col">
       {!isEmbed && <SiteBanner />}
-      <div className="app-surface-gradient flex min-h-0 flex-1 overflow-y-auto px-6">
+      <main className="app-surface-gradient flex min-h-0 flex-1 overflow-y-auto px-6">
         {/* m-auto (not items-center on the parent) so a card taller than a
             short viewport scrolls instead of clipping its top */}
-        <div className="m-auto flex w-full max-w-xl flex-col items-center rounded-2xl border bg-background/95 p-8 text-center shadow-lg backdrop-blur">
+        <div role="alert" className="m-auto flex w-full max-w-xl flex-col items-center rounded-2xl border bg-background/95 p-8 text-center shadow-lg backdrop-blur">
           {isExpired ? (
             <>
               <Clock className="size-10 text-muted-foreground" />
@@ -135,7 +136,7 @@ export function PublicViewerPage() {
             </Button>
           </div>
         </div>
-      </div>
+      </main>
       </div>
     );
   }
@@ -154,7 +155,7 @@ export function PublicViewerPage() {
   return (
     // fix(#553): flex column so the banner takes height from the map viewport
     // instead of pushing it below the fold; embeds never show the host banner
-    <div className="flex h-dvh flex-col">
+    <div className="relative flex h-dvh flex-col">
       {!isEmbed && <SiteBanner />}
       <main id="map-viewport" className="w-full min-h-0 flex-1 relative overflow-hidden">
       {/* Full-viewport map */}
@@ -170,7 +171,7 @@ export function PublicViewerPage() {
             visibleLayers={visibleLayers}
             apiKey={apiKey}
             embedToken={embedToken}
-            showInlineBranding={isEmbed}
+            onDrawnChange={setDrawnLayers}
           />
         </Suspense>
       </MapErrorBoundary>
@@ -187,6 +188,7 @@ export function PublicViewerPage() {
           onToggle={handleLegendToggle}
           terrainConfig={data.terrain_config ?? null}
           legendTitle={data.legend_title ?? null}
+          drawn={drawnLayers}
         />
       )}
 
@@ -200,14 +202,8 @@ export function PublicViewerPage() {
         />
       )}
 
-      {!isEmbed && (
-        <AppFooter
-          showBranding={showFooterBranding}
-          className="pointer-events-none absolute inset-x-0 bottom-0 z-10 hidden min-[400px]:block px-3 pb-2 text-2xs text-muted-foreground"
-          navClassName="pointer-events-auto mx-auto inline-flex max-w-full rounded-full border border-border/50 bg-background/75 px-3 py-1.5 shadow-sm backdrop-blur-sm"
-        />
-      )}
       </main>
+
     </div>
   );
 }

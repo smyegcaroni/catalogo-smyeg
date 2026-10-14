@@ -42,8 +42,6 @@ _TEST_BUDGET_MS = 400
 _HELPER_ROUTED_TAILS = {
     ("tasks_vector", "ingest_file"): "_job_phase_session",
     ("tasks_vector", "ingest_service"): "_job_phase_session",
-    ("tasks_reupload", "reupload_file"): "load_job_for_error_write",
-    ("tasks_reupload", "reupload_service"): "load_job_for_error_write",
     ("tasks_vrt", "ingest_vrt"): "load_job_for_error_write",
 }
 
@@ -85,28 +83,16 @@ def _method_call_lines(tree: ast.AST, attr: str) -> list[int]:
     ]
 
 
-def _failed_status_lines(tree: ast.AST) -> list[int]:
-    """Line numbers of every ``status="failed"`` keyword or dict entry."""
-    lines = [
+def _failure_write_lines(tree: ast.AST) -> list[int]:
+    """Line numbers of every ``ledger.fail`` call, the write that fails a job."""
+    return [
         node.lineno
         for node in ast.walk(tree)
-        if isinstance(node, ast.keyword)
-        and node.arg == "status"
-        and isinstance(node.value, ast.Constant)
-        and node.value.value == "failed"
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "fail"
+        and getattr(node.func.value, "id", None) == "ledger"
     ]
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Dict):
-            continue
-        for key, value in zip(node.keys, node.values):
-            if (
-                isinstance(key, ast.Constant)
-                and key.value == "status"
-                and isinstance(value, ast.Constant)
-                and value.value == "failed"
-            ):
-                lines.append(key.lineno)
-    return lines
 
 
 def _is_error_write_bracket(node: ast.AST) -> bool:
@@ -143,7 +129,7 @@ class TestTheBoundIsWhereTheBlockingStatementIs:
         rollbacks = _method_call_lines(tree, "rollback")
         commits = _method_call_lines(tree, "commit")
         arms = _arm_call_lines(tree)
-        failure_update = _failed_status_lines(tree)
+        failure_update = _failure_write_lines(tree)
         assert len(arms) == 1, (
             f"expected one arm_job_error_write_budget call; found {len(arms)}"
         )
@@ -193,13 +179,13 @@ class TestTheBoundIsWhereTheBlockingStatementIs:
         bracket = brackets[0]
         inside = [
             line
-            for line in _failed_status_lines(tree)
+            for line in _failure_write_lines(tree)
             if bracket.lineno < line <= bracket.end_lineno
         ]
         assert inside, (
-            "ingest_raster's status=failed UPDATE is no longer inside the "
-            "bracket that installs the budget, so it runs on a transaction "
-            "carrying no SET LOCAL while the kwarg gate stays green"
+            "ingest_raster's failure write is no longer inside the bracket that "
+            "installs the budget, so it runs on a transaction carrying no SET "
+            "LOCAL while the kwarg gate stays green"
         )
 
     def test_the_vrt_regeneration_tail_arms_before_its_writes(self) -> None:
@@ -213,7 +199,7 @@ class TestTheBoundIsWhereTheBlockingStatementIs:
             "no budget, so a contended job row parks the worker there — and the "
             "publish wait above it gives up after 15s and lands exactly here"
         )
-        assert min(arms) < min(_failed_status_lines(tree)), (
+        assert min(arms) < min(_failure_write_lines(tree)), (
             "the budget is armed after the writes it exists to bound"
         )
 
@@ -226,11 +212,10 @@ class TestTheBoundIsWhereTheBlockingStatementIs:
                 "regenerate_vrt",
                 lambda: _task_source("tasks_vrt", "regenerate_vrt"),
             ),
-            # The four helper-routed tails load the job row BEFORE the helper,
-            # under the same budget, so an expiry there lands in a frame the
-            # helper's own handler cannot reach (#1950 codex r2). The two
-            # vector tails guard that load in place; the two re-upload tails
-            # share `load_job_for_error_write`, whose guard is its own entry.
+            # The helper-routed tails load the job row BEFORE the helper, under
+            # the same budget, so an expiry there lands in a frame the helper's
+            # own handler cannot reach. The two vector tails guard that load in
+            # place; `load_job_for_error_write`'s guard is its own entry.
             ("ingest_file", lambda: _task_source("tasks_vector", "ingest_file")),
             ("ingest_service", lambda: _task_source("tasks_vector", "ingest_service")),
             ("load_job_for_error_write", lambda: load_job_for_error_write),
@@ -266,7 +251,6 @@ class TestTheBoundIsWhereTheBlockingStatementIs:
         [
             ("tasks_vector", "ingest_file"),
             ("tasks_raster", "ingest_raster"),
-            ("tasks_reupload", "reupload_file"),
         ],
     )
     def test_the_terminal_status_survives_a_raised_error_write(
@@ -366,7 +350,7 @@ class TestAHeldJobRowEndsTheFailureWrite:
     async def test_the_shared_helper_gives_up(
         self, running_job, monkeypatch, test_db_session
     ) -> None:
-        job_id, _attempt_id = running_job
+        job_id, attempt_id = running_job
         # `arm_job_error_write_budget` reads this as a global of its OWN module,
         # resolved per call, so no import placement elsewhere can sever the
         # patch. The upper bound below is what proves the patch was read.
@@ -395,7 +379,7 @@ class TestAHeldJobRowEndsTheFailureWrite:
                             job=err_job,
                             exc=RuntimeError("ogr2ogr could not read the layer"),
                             task_name="ingest_file",
-                            attempt_id=None,
+                            attempt_id=attempt_id,
                         ),
                         timeout=30,
                     )
@@ -655,7 +639,7 @@ class TestTheTimeoutDoesNotReplaceTheCause:
                 job=job,
                 exc=cause,
                 task_name="ingest_file",
-                attempt_id=None,
+                attempt_id=job.attempt_id,
             )
         finally:
             final_status = "failed"

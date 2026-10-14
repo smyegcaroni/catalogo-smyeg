@@ -1,3 +1,4 @@
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -11,14 +12,24 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    and_,
+    cast,
     func,
+    literal,
+    or_,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
+from app.core.tiles3d import UNPUBLISHED_TILESET_ATTEMPTS_FIELD
 
+# Every value chk_ingest_jobs_status allows, in its order, and the two a live job
+# holds. Tuples, so an IN list built from them renders the same every time.
+ALL_STATUSES = ("pending", "running", "complete", "failed", "cancelled", "fanned_out")
+ACTIVE_STATUSES = ("pending", "running")
+TERMINAL_STATUSES = tuple(s for s in ALL_STATUSES if s not in ACTIVE_STATUSES)
 
 # Statuses whose row still needs the staged `file_path`: pending/running read
 # it now, failed keeps it for /jobs/{id}/retry. fix(#1249): lives here, not
@@ -35,6 +46,12 @@ FAN_OUT_INTERRUPTED_METADATA_KEY = "fan_out_interrupted"
 # than a complete file, so `_retry_capability` refuses the ordinary ingest
 # retry: a crash-truncated CSV is still valid to a streaming reader.
 URL_DOWNLOAD_IN_FLIGHT_METADATA_KEY = "url_download_in_flight"
+
+# Stamped by the URL-import door and kept through staging. Its value is the
+# source URL with userinfo, query and fragment dropped, so a failed job can
+# still be classified as a URL import and prefill the form once its staged
+# file is gone.
+URL_IMPORT_METADATA_KEY = "url_import"
 
 # fix(#1744): stamped by ``defer_with_orphan_guard`` at dispatch time. ABSENCE
 # is load-bearing — a stamp-less pending row was never queued, so the stale
@@ -66,6 +83,132 @@ ACTIVE_BACKFILL_INDEX_NAME = "uq_ingest_jobs_active_embedding_backfill"
 # staging-orphan reconciliation may take the key over; one string, two readers.
 STAGING_REAPED_FINAL_MARKER = "s3_key_reaped_final"
 
+# Set by that sweep's first pass; the re-check pass adds the final marker.
+STAGING_REAPED_MARKER = "s3_key_reaped"
+
+# The pre-queue stage a manifest job is in. The manifest reservation's exits
+# clear it; a settled row that keeps it is inert, since the in-flight read
+# filters on status.
+MANIFEST_STAGE_METADATA_KEY = "manifest_stage"
+
+# The manifest entry's content fingerprint, which the apply compares to skip an
+# entry it has already imported or is importing.
+MANIFEST_FINGERPRINT_METADATA_KEY = "manifest_fingerprint"
+
+# The unpacked total the tileset upload door measured, which the commit door
+# checks against the quota again.
+TILESET_UNPACKED_BYTES_FIELD = "tileset_unpacked_bytes"
+
+# Written by the transaction that publishes a staged upload whose original is
+# still to be archived, and removed only once that archive is confirmed. Until
+# then the upload may be the original's only copy.
+ARCHIVE_PENDING_METADATA_KEY = "archive_pending"
+# Why a row holding an unarchived original can't have its archive owed again.
+# The row keeps its flags, and its upload, for an operator to review.
+ARCHIVE_REVIEW_METADATA_KEY = "archive_review"
+
+# The previous version a restore was admitted for; the worker refuses any other.
+EXPECTED_PREVIOUS_VERSION_KEY = "expected_previous_version"
+
+# Artifact records. A worker names each object, table or owed follow-up here no
+# later than it creates it, so a killed attempt still leaves an owner, and the
+# retention purge keeps a row while any of them is set.
+UNPUBLISHED_STORAGE_KEYS_FIELD = "unpublished_storage_keys"
+ANALYSIS_OUTPUT_TABLE_FIELD = "analysis_out_table"
+# The follow-ups a landed terminal commit still owes, each record naming the
+# task and the attempt that wrote it, since a retry keeps the row and its
+# metadata. The storage items stay in the layout an earlier release reads,
+# marked claimed so it runs them alone, and the run-once steps go in a record
+# of their own it never reads.
+PUBLISH_FOLLOWUPS_FIELD = "publish_followups"
+PUBLISH_OBLIGATIONS_FIELD = "publish_obligations"
+# The owed follow-up item naming the COG a raster replacement superseded.
+SUPERSEDED_COG_ITEM = "superseded_cog"
+# The run-once item that redraws the dataset's quicklook; present until the new
+# image's pointer has landed.
+QUICKLOOK_ITEM = "quicklook"
+UNREAPED_ARTIFACT_FIELDS = (
+    UNPUBLISHED_STORAGE_KEYS_FIELD,
+    ANALYSIS_OUTPUT_TABLE_FIELD,
+    UNPUBLISHED_TILESET_ATTEMPTS_FIELD,
+    PUBLISH_FOLLOWUPS_FIELD,
+    PUBLISH_OBLIGATIONS_FIELD,
+)
+# Set beside an obligations record, under a field an earlier release's retention
+# purge keeps a row for and its readers take as naming no table, so a rollback
+# can't purge a job that still owes run-once steps.
+OBLIGATIONS_HOLD_FIELD = ANALYSIS_OUTPUT_TABLE_FIELD
+OBLIGATIONS_HOLD = {PUBLISH_OBLIGATIONS_FIELD: True}
+
+# The user_metadata keys the admin job list shows: what the user supplied at
+# upload, commit or in a manifest, the job's request and its outcome. Any other
+# key, including one added later, is door or worker state and is left out.
+PUBLIC_METADATA_KEYS = frozenset(
+    {
+        # Commit and upload fields.
+        "title",
+        "summary",
+        "tags",
+        "visibility",
+        "temporal_start",
+        "temporal_end",
+        "file_type",
+        "vrt_type",
+        "layer_name",
+        "srid_override",
+        "geom_column",
+        "x_column",
+        "y_column",
+        "compression",
+        "nodata_override",
+        "resampling",
+        "strict_cog",
+        # The request that created the job.
+        "analysis",
+        "dataset_id",
+        "reupload",
+        "refresh",
+        "origin_kind",
+        "verification_policy",
+        "service_type",
+        "layer_id",
+        "object_id_field",
+        "geometry_type",
+        "source_type",
+        "fan_out_parent_id",
+        "all_layers",
+        EMBEDDING_BACKFILL_METADATA_KEY,
+        # What a manifest's author wrote.
+        "record_status",
+        "manifest_key",
+        "manifest_source_type",
+        "manifest_source_uri",
+        "manifest_publication_intent",
+        "manifest_tags",
+        "manifest_organization",
+        "manifest_license",
+        "manifest_attribution",
+        "manifest_bbox",
+        # The outcome.
+        "warnings",
+        "rows_failed",
+        "temporal_parse_errors",
+        "collision_warning",
+        "archive_failed",
+        ARCHIVE_REVIEW_METADATA_KEY,
+    }
+)
+
+
+def public_job_metadata(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The job's public metadata keys, or None when it has none."""
+    kept = {
+        key: value
+        for key, value in (metadata or {}).items()
+        if key in PUBLIC_METADATA_KEYS
+    }
+    return kept or None
+
 
 def owned_presigned_staging_key(
     job_id: uuid.UUID | str,
@@ -92,7 +235,7 @@ class IngestJob(Base):
     __tablename__ = "ingest_jobs"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'running', 'complete', 'failed', 'cancelled', 'fanned_out')",
+            "status IN ({})".format(", ".join(f"'{s}'" for s in ALL_STATUSES)),
             name="chk_ingest_jobs_status",
         ),
         # DBM-03: partial index for stale-job recovery scans.
@@ -140,6 +283,8 @@ class IngestJob(Base):
     source_url: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     source_layer: Mapped[str | None] = mapped_column(String(500), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The code of a fixed reason in ``error_message``; NULL for free text.
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     user_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -167,4 +312,50 @@ class IngestJob(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+def obligations_hold():
+    """The obligations hold as a JSONB value."""
+    return cast(literal(json.dumps(OBLIGATIONS_HOLD)), JSONB)
+
+
+def carries_unreaped(field: str):
+    """Predicate: the row's ``field`` names an artifact or follow-up nothing has settled.
+
+    The obligations hold names neither; the record beside it keeps the row.
+    """
+    value = IngestJob.user_metadata[field]
+    if field != OBLIGATIONS_HOLD_FIELD:
+        return value.is_not(None)
+    return and_(value.is_not(None), value != obligations_hold())
+
+
+def holds_unarchived_original():
+    """Predicate: the row published an original not yet confirmed in ``originals/``.
+
+    Its archive failed or is still pending, so the staged upload may be that
+    original's only copy. A failed job never published one, and deleting the
+    dataset clears ``dataset_id``.
+    """
+    metadata = IngestJob.user_metadata
+    return and_(
+        IngestJob.status == "complete",
+        IngestJob.dataset_id.is_not(None),
+        or_(
+            metadata["archive_failed"].astext.is_not(None),
+            metadata[ARCHIVE_PENDING_METADATA_KEY].astext.is_not(None),
+        ),
+    )
+
+
+def needs_staged_input():
+    """Predicate: the row still needs the staged file its ``file_path`` names.
+
+    Pending and running rows read it, a failed row may retry from it, and a row
+    holding an unarchived original keeps that original's only copy in it.
+    """
+    return or_(
+        IngestJob.status.in_(STATUSES_NEEDING_STAGED_INPUT),
+        holds_unarchived_original(),
     )

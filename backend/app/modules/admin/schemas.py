@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import datetime
-from typing import Any, Literal, get_args
+from typing import Any, Literal
 
 from pydantic import (
     AwareDatetime,
@@ -13,11 +13,9 @@ from pydantic import (
     model_validator,
 )
 
-from app.modules.auth.schemas import UserResponse, validate_future_expiry
+from app.modules.auth.schemas import VALID_ROLES, UserResponse, validate_future_expiry
 from app.processing.ai.schemas import AIProbeReport
 
-RoleName = Literal["admin", "editor", "viewer"]
-VALID_ROLES = frozenset(get_args(RoleName))
 
 # Mirror the CHECK constraint on IngestJob.status — see jobs/models.py
 JobStatus = Literal[
@@ -112,7 +110,10 @@ class ApproveRequest(BaseModel):
 class UserUpdate(BaseModel):
     email: EmailStr | None = Field(
         default=None,
-        description="New email address. Set to update; omit to leave unchanged.",
+        description=(
+            "New email address. Set to update, send null or an empty string to "
+            "clear it, omit to leave unchanged."
+        ),
     )
     is_active: bool | None = Field(
         default=None,
@@ -133,6 +134,13 @@ class UserUpdate(BaseModel):
         max_length=50,
         description="New role: 'admin', 'editor', or 'viewer'. Omit to leave unchanged.",
     )
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def blank_email_clears(cls, v: Any) -> Any:
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
     @field_validator("role")
     @classmethod
@@ -219,7 +227,8 @@ class UserListResponse(BaseModel):
 class AdminJobResponse(BaseModel):
     id: uuid.UUID = Field(description="Unique ingestion job identifier.")
     status: JobStatus = Field(
-        description="Current job status: 'pending', 'running', 'complete', 'failed', or 'cancelled'."
+        description="Current job status: 'pending', 'running', 'complete', 'failed', "
+        "'cancelled', or 'fanned_out' (a multi-layer upload split into per-layer child jobs)."
     )
     source_filename: str | None = Field(
         description="Original filename of the uploaded file, if applicable."
@@ -228,14 +237,37 @@ class AdminJobResponse(BaseModel):
         description="ID of the dataset created by this job, if completed successfully."
     )
     error_message: str | None = Field(description="Error details if the job failed.")
+    error_code: str | None = Field(
+        default=None,
+        description="Stable code for a fixed failure reason, so a client can show "
+        "it in the reader's language; `error_message` keeps its English text. "
+        "Null when the reason is free text.",
+    )
+    review_state: Literal["awaiting", "resolved"] | None = Field(
+        default=None,
+        description="Set on a replacement the pipeline held for review rather than "
+        "failed: 'awaiting' while the held run still needs a decision, 'resolved' "
+        "once it was accepted. Null for every other job.",
+    )
     can_retry: bool = Field(
         description="Whether the failed job can be retried with its retained source."
     )
     retry_reason: str | None = Field(
         description="Why the job cannot be retried, when retry is unavailable."
     )
+    source_url: str | None = Field(
+        default=None,
+        description="URL a service or file URL import was started from, with userinfo and "
+        "credential query values redacted. Null for every other job.",
+    )
+    restart_source: Literal["url", "service"] | None = Field(
+        default=None,
+        description="Import tab a failed job whose retry is refused can be started "
+        "again from: 'url' for a file URL import, 'service' for a service import. "
+        "Null otherwise.",
+    )
     user_metadata: dict[str, Any] | None = Field(
-        description="User-supplied metadata captured at upload time (title, summary, tags, vrt_type, file_type, warnings, etc.). Heterogeneous shape across ingest paths -- canonical keys: title, summary, visibility, file_type, vrt_type, warnings.",
+        description="Metadata captured with the job: the fields supplied at upload and commit (title, summary, tags, visibility, file_type, vrt_type, etc.) and outcomes such as warnings. Heterogeneous shape across ingest paths. Worker bookkeeping, such as staging keys and unpublished artifacts, is left out; null when nothing else is recorded.",
     )
     created_by: uuid.UUID | None = Field(
         description="ID of the user who initiated the job."
@@ -437,6 +469,23 @@ class EmbeddingStatsResponse(BaseModel):
     )
 
 
+class BackfillTenantRun(BaseModel):
+    """What an all-tenant backfill request did for one other tenant."""
+
+    tenant_id: uuid.UUID = Field(description="The tenant the run was queued for.")
+    job_id: uuid.UUID | None = Field(
+        description=(
+            "Identifier of the job queued in that tenant, or null when none was queued."
+        )
+    )
+    status: Literal["pending", "already_running", "not_queued"] = Field(
+        description=(
+            "'pending' when a run was queued, 'already_running' when that tenant "
+            "already had one in flight, 'not_queued' when queueing failed."
+        )
+    )
+
+
 class BackfillResponse(BaseModel):
     """Acknowledgement that a backfill run was queued.
 
@@ -444,10 +493,27 @@ class BackfillResponse(BaseModel):
     ``GET /jobs/{job_id}`` for status.
     """
 
-    job_id: uuid.UUID = Field(
-        description="Identifier of the queued backfill job; poll /jobs/{job_id}."
+    job_id: uuid.UUID | None = Field(
+        description=(
+            "Identifier of the queued backfill job; poll /jobs/{job_id}. Null only "
+            "with status 'already_running' when the caller may not read that run."
+        )
     )
-    status: str = Field(description="Job status at enqueue time ('pending').")
+    status: str = Field(
+        description=(
+            "'pending' when this request queued job_id. 'already_running' when an "
+            "all_tenants request found a run in flight in the calling tenant; "
+            "job_id is then that run, which this request did not queue. Run the "
+            "backfill again once it ends."
+        )
+    )
+    other_tenants: list[BackfillTenantRun] = Field(
+        default_factory=list,
+        description=(
+            "Runs queued for the other tenants by an all_tenants request in a "
+            "multi-tenant deployment. Empty otherwise."
+        ),
+    )
 
 
 class ProviderHealth(BaseModel):

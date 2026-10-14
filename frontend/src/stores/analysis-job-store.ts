@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { useAuthStore } from '@/stores/auth-store';
+import { randomId } from '@/lib/random-id';
 
 export interface TrackedAnalysisJob {
   jobId: string;
@@ -79,7 +80,7 @@ export const ANALYSIS_JOB_STORAGE_KEY = 'geolens-analysis-job';
 
 /** Identifies this tab for the lifetime of the document. */
 const TAB_ID =
-  globalThis.crypto?.randomUUID?.() ?? `tab-${Math.random().toString(36).slice(2)}`;
+  randomId();
 
 /** Web Locks name serializing every read-modify-write on this record. */
 const ANALYSIS_JOB_LOCK = 'geolens-analysis-job-write';
@@ -323,18 +324,34 @@ useAuthStore.subscribe((s, prev) => {
   }
 });
 
+interface AnalysisAddToMapState {
+  /** The mounted builder's add-dataset handler, or null when none is mounted. */
+  add: ((datasetId: string) => void) | null;
+  /** The map that builder is editing. */
+  mapId: string | null;
+}
+
 /**
  * Add-to-map handler registered by MapBuilderPage while it is mounted.
  *
- * A module ref rather than store state: it is a live callback (not
- * serializable, and re-rendering the watcher when it changes is pointless).
- * The watcher offers "Add to map" only when a builder for the job's own map
- * is mounted, and falls back to navigating to the dataset otherwise.
+ * A store so an open completion toast can follow the builder: the watcher
+ * offers "Add to map" only while a builder for the job's own map is
+ * registered here, and navigates to the dataset otherwise.
  */
-export const analysisAddToMap: {
-  current: ((datasetId: string) => void) | null;
-  mapId: string | null;
-} = { current: null, mapId: null };
+export const useAnalysisAddToMapStore = create<AnalysisAddToMapState>()(() => ({
+  add: null,
+  mapId: null,
+}));
+
+/** Register the mounted builder. A write that changes nothing notifies no one. */
+export function registerAnalysisAddToMap(
+  add: ((datasetId: string) => void) | null,
+  mapId: string | null,
+) {
+  useAnalysisAddToMapStore.setState((s) =>
+    s.add === add && s.mapId === mapId ? s : { add, mapId },
+  );
+}
 
 /**
  * fix(#833): dataset ids already added to a map through an analysis

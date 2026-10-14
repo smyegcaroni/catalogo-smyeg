@@ -1,33 +1,29 @@
 """Procrastinate task definitions for raster/COG file ingestion."""
 
 import uuid
-from datetime import datetime, timezone
 
 import structlog
 from sqlalchemy.exc import DBAPIError
 
-from app.core.failure_reason import redact_failure_reason
-from app.core.db.tenant_session import current_tenant_var, tenant_task
-from app.core.tenancy import is_multi_tenant
-from app.platform.cache.tiles import invalidate_catalog_cache
+from app.core.failure_reason import FixedReason, redact_failure_reason
+from app.core.db.tenant_session import tenant_task
+from app.platform.jobs import ledger
 from app.platform.jobs.heartbeat import (
     JOB_ERROR_WRITE_TIMEOUT_MS,
     claim_job_attempt_and_start_heartbeat,
     log_job_error_write_failure,
-    require_ingest_job_update,
     resolve_ingest_attempt_or_skip,
     stop_ingest_job_heartbeat,
-    update_ingest_job_for_attempt,
 )
 from app.processing.raster.cog import (
+    MissingRasterCrsError,
     _scratch_dir,
     check_and_prepare_cog,
     cog_preserves_source,
-    extract_raster_metadata,
     resolve_crs_assignment,
     sha256_file,
 )
-from app.processing.raster.quicklook import generate_quicklook
+from app.processing.raster.probe import read_raster_metadata, render_quicklook
 
 from app.platform.jobs.models import owned_presigned_staging_key
 from app.processing.ingest.tasks_raster_swap import (
@@ -45,14 +41,18 @@ from app.processing.ingest.tasks_raster_common import (
     _resolve_managed_raster_storage_keys,
     absorb_cancellation,
     create_raster_dataset,
-    extract_source_raster_metadata,
+    inspect_source_raster,
     publish_commit_landed,
+    publishing_xid,
     record_unpublished_storage_keys,
+)
+from app.processing.ingest.publish_followups import (
+    note_publish_followups,
+    run_publish_followups,
 )
 from app.processing.ingest.tasks_common import (
     _bind_task_log_context,
     cleanup_step,
-    _emit_billing_event,
     _job_phase_session,
     _parse_temporal_fields,
     apply_manifest_record_metadata,
@@ -63,6 +63,18 @@ from app.processing.ingest.tasks_staging import (
     reap_downloaded_staging_source,
     reap_presigned_staging_object,
 )
+
+
+def _raster_ingest_failure_reason(exc: BaseException) -> str | BaseException:
+    """The job's stored reason for a raster-ingest failure.
+
+    A missing CRS is a stable reason a client can localize, not an
+    exception's own text; the raster text differs from the vector gate's,
+    so it carries its own code.
+    """
+    if isinstance(exc, MissingRasterCrsError):
+        return FixedReason(str(exc), code="missing_crs_raster")
+    return exc
 
 
 @task_app.task(queue="raster", retry=0, aliases=["app.ingest.tasks.ingest_raster"])
@@ -104,8 +116,6 @@ async def ingest_raster(
     import shutil
     import tempfile
     from pathlib import Path as _Path
-
-    from app.platform.jobs.models import IngestJob
 
     resolved = await resolve_ingest_attempt_or_skip(
         job_id, attempt_id, task_label="raster"
@@ -190,16 +200,7 @@ async def ingest_raster(
                     source_filename=job.source_filename,
                 )
             except ValueError as exc:
-                await update_ingest_job_for_attempt(
-                    session,
-                    job_uuid,
-                    attempt_uuid,
-                    values={
-                        "status": "failed",
-                        "error_message": redact_failure_reason(exc),
-                        "completed_at": datetime.now(timezone.utc),
-                    },
-                )
+                await ledger.fail(session, job_uuid, attempt_uuid, reason=exc)
                 await session.commit()
                 # fix(#1290): NO unlink here — unconditional delete
                 # destroyed a local-storage install's only copy of a file
@@ -245,21 +246,22 @@ async def ingest_raster(
         # 4. Hash source file
         source_sha256 = await asyncio.to_thread(sha256_file, file_path)
 
-        # 5. Extract metadata from the SOURCE. Only two things come from this
-        # read now (fix(#1290)): whether a CRS assignment is needed, and
-        # `original_srid`. Everything the catalog stores describes the COG.
-        # fix(#1661): extract_source_raster_metadata (not extract_raster_metadata
-        # directly) so an unopenable upload raises a friendly message built from
-        # `source_filename` instead of leaking the staging path in `file_path`.
-        source_meta = await asyncio.to_thread(
-            extract_source_raster_metadata,
-            file_path,
-            original_filename=source_filename,
-        )
-
         # Read GDAL options from user_metadata (set at commit time)
         assign_crs = um.get("srid_override")
         user_compression = um.get("compression") or "DEFLATE"
+
+        # 5. Inspect the SOURCE in the probe child. From its metadata come
+        # only whether a CRS assignment is needed and `original_srid`;
+        # everything the catalog stores describes the COG. Its compliance
+        # verdict, against the requested compression, feeds the strict gate
+        # and the conversion below.
+        source_inspection = await asyncio.to_thread(
+            inspect_source_raster,
+            file_path,
+            original_filename=source_filename,
+            expected_compression=user_compression,
+        )
+        source_meta = source_inspection["metadata"]
         user_resampling = um.get("resampling") or None
         user_nodata = um.get("nodata_override")
         # fix(#1186): derive this from the raster, not an upload-time
@@ -279,9 +281,8 @@ async def ingest_raster(
         # instead of silently routing through check_and_prepare_cog
         # conversion. Manifest-VRT jobs are excluded (VRTs are XML, not
         # TIFFs — the COG compliance check would fail for unrelated reasons).
-        await _enforce_strict_cog(
-            file_path,
-            expected_compression=user_compression,
+        _enforce_strict_cog(
+            source_inspection,
             is_manifest_vrt=is_manifest_vrt,
             strict_cog=bool(um.get("strict_cog")),
         )
@@ -329,6 +330,7 @@ async def ingest_raster(
                 check_and_prepare_cog,
                 file_path,
                 tmp_dir,
+                inspection=source_inspection,
                 compression=user_compression,
                 resampling=user_resampling,
                 nodata=user_nodata,
@@ -352,7 +354,11 @@ async def ingest_raster(
         # assignment unchanged (only the label changes), so reading the
         # COG interprets them in the assigned CRS — the reading the
         # caller asked for. Reading the source would use the wrong CRS.
-        cog_meta = await asyncio.to_thread(extract_raster_metadata, local_cog_path)
+        cog_meta = (
+            source_meta
+            if local_cog_path == file_path
+            else await asyncio.to_thread(read_raster_metadata, local_cog_path)
+        )
 
         # 7. Hash COG
         asset_sha256 = await asyncio.to_thread(sha256_file, local_cog_path)
@@ -421,8 +427,8 @@ async def ingest_raster(
                 await _progress_session.commit()
 
         # 8. Generate quicklooks
-        ql256 = await asyncio.to_thread(generate_quicklook, local_cog_path, 256)
-        ql512 = await asyncio.to_thread(generate_quicklook, local_cog_path, 512)
+        ql256 = await asyncio.to_thread(render_quicklook, local_cog_path, 256)
+        ql512 = await asyncio.to_thread(render_quicklook, local_cog_path, 512)
 
         # Phase 2 (short-lived session via _job_phase_session — REMED-03/
         # P2-05): create DB records, store assets, commit job. Re-loads
@@ -660,18 +666,24 @@ async def ingest_raster(
             # ingests have no rows (the COG and quicklooks ARE the
             # asset). Vector ingests set rows_processed in
             # tasks_common._finalize_ingest from metadata["feature_count"].
-            await require_ingest_job_update(
+            await note_publish_followups(
+                session,
+                job_uuid,
+                attempt_uuid,
+                "ingest_raster",
+                reaps_staged_upload=source_preserved_in_cog or lossy_original_archived,
+            )
+            await ledger.complete(
                 session,
                 job_uuid,
                 attempt_uuid,
                 values={
-                    "status": "complete",
                     "dataset_id": dataset.id,
-                    "completed_at": datetime.now(timezone.utc),
                     "current_step": "complete",
                     "progress": 1.0,
                 },
             )
+            xid = publishing_xid(session)
             try:
                 await session.commit()
             except BaseException as exc:
@@ -680,62 +692,27 @@ async def ingest_raster(
                 # acknowledgement left the reap below deleting the COG and
                 # quicklooks the committed RasterAsset had just been pointed at.
                 if not await publish_commit_landed(
-                    job_uuid, attempt_uuid, job_id=job_id, task="ingest_raster"
+                    job_uuid,
+                    attempt_uuid,
+                    xid=xid,
+                    error=exc,
+                    job_id=job_id,
+                    task="ingest_raster",
                 ):
                     raise
-                # fix(#1778): stand down rather than re-raise —
-                # the dataset is durable, so the handler below would send
-                # an `ingest_failed` notification for a succeeded ingest.
-                # `final_status` stays non-complete since it also licenses
-                # deleting the uploader's staged original.
-                # fix(#1778): nothing to reap here — a first
-                # ingest supersedes no asset, and the skipped followups
-                # (notification, cache purge, embedding defer, metering)
-                # are all recoverable.
+                # Stand down: the dataset may be live, and the handler below
+                # would mail `ingest_failed` for it. `final_status` stays
+                # non-complete, so the cleanup below keeps the staged original;
+                # the follow-ups delete it once the publish is visible, whether
+                # they run here or from the sweep.
                 publish_committed = True
                 absorb_cancellation(exc)
+                await run_publish_followups(job_uuid)
                 return
             publish_committed = True
             final_status = "complete"
 
-            # EVENT-02: notify on ingest complete (non-fatal, after commit — deferred import).
-            # status="complete" is already committed above so a notification error cannot
-            # roll back or alter the terminal job write (T-1230-09 fail-safe).
-            _complete_title = title  # resolved at line ~486 in this session block
-            _complete_job_id = str(job_uuid)
-            from app.platform.notifications.events import (
-                build_event_notification,
-                emit_event_safe,
-            )
-
-            await emit_event_safe(
-                event_key="ingest_complete",
-                build=lambda: build_event_notification(
-                    "ingest_complete",
-                    subject=f"Raster ingest complete: {_complete_title}",
-                    body=f"Raster dataset '{_complete_title}' has been successfully ingested.",
-                    extra={"job_id": _complete_job_id, "dataset": _complete_title},
-                ),
-            )
-
-            # Invalidate cache
-            await invalidate_catalog_cache()
-
-            # 13. Generate embedding (non-fatal)
-            from app.processing.embeddings.helpers import defer_embedding
-
-            await defer_embedding(dataset)
-
-            # METER-01 (Phase 1213-02): emit raster ingest billable event through
-            # the billing-import-free seam. Resolve the optional billing
-            # dimension separately from provider keys; event_id = job_id keeps
-            # task retries idempotent at the DB layer.
-            billing_tenant_id = current_tenant_var.get() if is_multi_tenant() else None
-            await _emit_billing_event(
-                str(billing_tenant_id) if billing_tenant_id else None,
-                "ingest_jobs",
-                event_id=job_id,
-            )
+            await run_publish_followups(job_uuid)
 
     except Exception as exc:  # broad: raster ingest spans GDAL/COG/Titiler — any step can fail; record failure
         if publish_committed:
@@ -775,21 +752,8 @@ async def ingest_raster(
                 err_session,
                 _err_job,
             ):
-                from sqlalchemy import update as sa_update
-
-                await err_session.execute(
-                    sa_update(IngestJob)
-                    .where(
-                        IngestJob.id == job_uuid,
-                        IngestJob.attempt_id == attempt_uuid,
-                        IngestJob.status == "running",
-                    )
-                    .values(
-                        status="failed",
-                        error_message=redact_failure_reason(exc),
-                        completed_at=datetime.now(timezone.utc),
-                    )
-                )
+                reason = _raster_ingest_failure_reason(exc)
+                await ledger.fail(err_session, job_uuid, attempt_uuid, reason=reason)
                 await err_session.commit()
         except DBAPIError as write_failure:
             # fix(#1950): swallowed so the `raise` below re-raises the ingest

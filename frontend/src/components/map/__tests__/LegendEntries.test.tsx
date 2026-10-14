@@ -1,23 +1,104 @@
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
-import { CategoricalLegend } from '../LegendEntries';
+import { HeatmapLegend, LegendClassesList } from '../LegendEntries';
+import type { LegendClasses, LegendRamp, LegendSwatch } from '../legend-facts';
 
-describe('CategoricalLegend', () => {
-  it('uses category labels when saved map metadata provides them', () => {
+function legendSwatch(overrides: Partial<LegendSwatch> = {}): LegendSwatch {
+  return { fill: null, fillOpacity: 1, opacity: 1, stroke: null, pattern: null, ...overrides };
+}
+
+function categories(items: { value: string; label?: string; color: string }[]): LegendClasses {
+  return {
+    mode: 'categorical',
+    target: 'color',
+    title: 'class',
+    items: items.map(({ value, label, color }) => ({ color, label: label ?? value })),
+    breaks: [],
+  };
+}
+
+describe('LegendClassesList', () => {
+  it('labels categories with their own labels', () => {
     render(
-      <CategoricalLegend
+      <LegendClassesList
         geometryType="Polygon"
-        categories={[
+        classes={[categories([
           { value: '01', label: 'Residential', color: '#ff5a5f' },
           { value: '02', label: 'Mixed Residential/Commercial', color: '#ffb000' },
-        ]}
+        ])]}
       />,
     );
 
     expect(screen.getByText('Residential')).toBeInTheDocument();
     expect(screen.getByText('Mixed Residential/Commercial')).toBeInTheDocument();
     expect(screen.queryByText('01')).not.toBeInTheDocument();
-    expect(screen.queryByText('02')).not.toBeInTheDocument();
+  });
+
+  it('wraps long class labels instead of truncating them', () => {
+    const long = 'Mixed residential and commercial use with ground-floor retail';
+    render(
+      <LegendClassesList
+        geometryType="Polygon"
+        classes={[categories([{ value: '02', label: long, color: '#ffb000' }])]}
+      />,
+    );
+
+    const label = screen.getByText(long);
+    expect(label).toHaveClass('break-words');
+    expect(label).not.toHaveClass('truncate');
+    expect(label).toHaveAttribute('title', long);
+  });
+
+  it('labels graduated classes by break range and titles only a following colour classification', () => {
+    const { container } = render(
+      <LegendClassesList
+        geometryType="Point"
+        classes={[
+          { mode: 'graduated', target: 'radius', title: 'Magnitude', items: [{ color: '#ef4444', size: 4 }, { color: '#ef4444', size: 8 }], breaks: [6] },
+          { mode: 'graduated', target: 'color', title: 'Depth', items: [{ color: '#fde725' }, { color: '#7d3c98' }], breaks: [50] },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText('Size: Magnitude')).toBeInTheDocument();
+    expect(screen.getByText('Color: Depth')).toBeInTheDocument();
+    expect(screen.getAllByText('< 6')).toHaveLength(1);
+    expect(screen.getByText('≥ 50')).toBeInTheDocument();
+    const circles = Array.from(container.querySelectorAll('svg[viewBox="0 0 24 24"] circle'));
+    expect(circles.map((circle) => [circle.getAttribute('r'), circle.getAttribute('fill')])).toEqual([
+      ['4', '#ef4444'],
+      ['8', '#ef4444'],
+    ]);
+  });
+
+  it('draws width classes as lines of each width in the class colour', () => {
+    const { container } = render(
+      <LegendClassesList
+        geometryType="LineString"
+        classes={[{ mode: 'graduated', target: 'width', title: 'Flow', items: [{ color: '#0284c7', size: 1 }, { color: '#0284c7', size: 6 }], breaks: [10] }]}
+      />,
+    );
+
+    expect(screen.getByText('Width: Flow')).toBeInTheDocument();
+    const lines = Array.from(container.querySelectorAll('line'));
+    expect(lines.map((line) => [line.getAttribute('stroke-width'), line.getAttribute('stroke')])).toEqual([
+      ['1', '#0284c7'],
+      ['6', '#0284c7'],
+    ]);
+  });
+
+  it('draws no title for a lone colour classification', () => {
+    render(<LegendClassesList geometryType="Polygon" classes={[categories([{ value: 'a', color: '#ff5a5f' }])]} />);
+
+    expect(screen.queryByText(/Color:/)).not.toBeInTheDocument();
+  });
+
+  it('labels the class of every other value Other', () => {
+    const zoning = categories([{ value: 'R', label: 'Residential', color: '#ff5a5f' }]);
+    render(<LegendClassesList geometryType="Polygon" classes={[{ ...zoning, items: [...zoning.items, { color: '#cccccc', other: true }] }]} />);
+
+    expect(screen.getByText('Residential')).toBeInTheDocument();
+    expect(screen.getByText('Other')).toBeInTheDocument();
   });
 });
 
@@ -29,10 +110,10 @@ describe('CategoricalLegend', () => {
 describe('GeometrySwatch — patterned polygons', () => {
   it('draws the pattern preview, in the class colour, instead of a solid block', () => {
     const { container } = render(
-      <CategoricalLegend
+      <LegendClassesList
         geometryType="Polygon"
-        categories={[{ value: 'a', label: 'A', color: '#ff5a5f' }]}
-        style={{ fillPattern: 'geolens-fill-hatch' }}
+        classes={[categories([{ value: 'a', label: 'A', color: '#ff5a5f' }])]}
+        style={legendSwatch({ pattern: { id: 'geolens-fill-hatch', tint: null } })}
       />,
     );
     const swatch = container.querySelector('[aria-hidden="true"]') as HTMLElement;
@@ -47,10 +128,10 @@ describe('GeometrySwatch — patterned polygons', () => {
   // chip has to draw that colour, not whatever its own `color` fell back to.
   it('draws the pattern in the colour the map tints it with, not the chip colour', () => {
     const { container } = render(
-      <CategoricalLegend
+      <LegendClassesList
         geometryType="Polygon"
-        categories={[{ value: 'a', label: 'A', color: '#ff5a5f' }]}
-        style={{ fillPattern: 'geolens-fill-hatch', fillPatternColor: '#1d4ed8' }}
+        classes={[categories([{ value: 'a', label: 'A', color: '#ff5a5f' }])]}
+        style={legendSwatch({ pattern: { id: 'geolens-fill-hatch', tint: '#1d4ed8' } })}
       />,
     );
     const swatch = container.querySelector('[aria-hidden="true"]') as HTMLElement;
@@ -60,9 +141,9 @@ describe('GeometrySwatch — patterned polygons', () => {
 
   it('leaves unpatterned polygons on the solid chip', () => {
     const { container } = render(
-      <CategoricalLegend
+      <LegendClassesList
         geometryType="Polygon"
-        categories={[{ value: 'a', label: 'A', color: '#ff5a5f' }]}
+        classes={[categories([{ value: 'a', label: 'A', color: '#ff5a5f' }])]}
       />,
     );
     const swatch = container.querySelector('[aria-hidden="true"]') as HTMLElement;
@@ -76,10 +157,10 @@ describe('GeometrySwatch — patterned polygons', () => {
   // is applied via plain CSS opacity on the fill layer, not string parsing.
   it('applies fillOpacity to the pattern layer only, not the border', () => {
     const { container } = render(
-      <CategoricalLegend
+      <LegendClassesList
         geometryType="Polygon"
-        categories={[{ value: 'a', label: 'A', color: 'rgb(255, 90, 95)' }]}
-        style={{ fillPattern: 'geolens-fill-hatch', fillOpacity: 0, outlineColor: '#ec4b7f' }}
+        classes={[categories([{ value: 'a', label: 'A', color: 'rgb(255, 90, 95)' }])]}
+        style={legendSwatch({ pattern: { id: 'geolens-fill-hatch', tint: null }, fillOpacity: 0, stroke: { color: '#ec4b7f', width: 1 } })}
       />,
     );
     const swatch = container.querySelector('[aria-hidden="true"]') as HTMLElement;
@@ -95,10 +176,10 @@ describe('GeometrySwatch — patterned polygons', () => {
 describe('GeometrySwatch — stroke-only polygons (fix #1288)', () => {
   it('renders a transparent fill inside a fully opaque border', () => {
     const { container } = render(
-      <CategoricalLegend
+      <LegendClassesList
         geometryType="Polygon"
-        categories={[{ value: 'a', label: 'A', color: '#3b82f6' }]}
-        style={{ fillOpacity: 0, outlineColor: '#ec4b7f' }}
+        classes={[categories([{ value: 'a', label: 'A', color: '#3b82f6' }])]}
+        style={legendSwatch({ fillOpacity: 0, stroke: { color: '#ec4b7f', width: 1 } })}
       />,
     );
     const swatch = container.querySelector('[aria-hidden="true"]') as HTMLElement;
@@ -114,10 +195,10 @@ describe('GeometrySwatch — stroke-only polygons (fix #1288)', () => {
   // (and every other CSS color syntax) with no format-specific parsing.
   it('dims a fill given in a non-6-digit-hex color format', () => {
     const { container } = render(
-      <CategoricalLegend
+      <LegendClassesList
         geometryType="Polygon"
-        categories={[{ value: 'a', label: 'A', color: '#f00' }]}
-        style={{ fillOpacity: 0.3 }}
+        classes={[categories([{ value: 'a', label: 'A', color: '#f00' }])]}
+        style={legendSwatch({ fillOpacity: 0.3 })}
       />,
     );
     const swatch = container.querySelector('[aria-hidden="true"]') as HTMLElement;
@@ -128,9 +209,9 @@ describe('GeometrySwatch — stroke-only polygons (fix #1288)', () => {
 
   it('leaves a normal fill unchanged', () => {
     const { container } = render(
-      <CategoricalLegend
+      <LegendClassesList
         geometryType="Polygon"
-        categories={[{ value: 'a', label: 'A', color: '#3b82f6' }]}
+        classes={[categories([{ value: 'a', label: 'A', color: '#3b82f6' }])]}
       />,
     );
     const swatch = container.querySelector('[aria-hidden="true"]') as HTMLElement;
@@ -141,28 +222,91 @@ describe('GeometrySwatch — stroke-only polygons (fix #1288)', () => {
 
   it('still applies layer-level opacity to the whole swatch', () => {
     const { container } = render(
-      <CategoricalLegend
+      <LegendClassesList
         geometryType="Polygon"
-        categories={[{ value: 'a', label: 'A', color: '#3b82f6' }]}
-        style={{ opacity: 0.5 }}
+        classes={[categories([{ value: 'a', label: 'A', color: '#3b82f6' }])]}
+        style={legendSwatch({ opacity: 0.5 })}
       />,
     );
     const swatch = container.querySelector('[aria-hidden="true"]') as HTMLElement;
     expect(swatch.style.opacity).toBe('0.5');
   });
 
-  // fix(#1288 codex): a truthy check on strokeWidth dropped an EXPLICIT 0,
-  // falling back to the default 1px border even though the map draws no
-  // outline at width 0.
-  it('honors an explicit zero-width outline as no border', () => {
+  it('draws the stroke as the border at its width', () => {
     const { container } = render(
-      <CategoricalLegend
+      <LegendClassesList
         geometryType="Polygon"
-        categories={[{ value: 'a', label: 'A', color: '#3b82f6' }]}
-        style={{ strokeWidth: 0, outlineColor: '#ec4b7f' }}
+        classes={[categories([{ value: 'a', label: 'A', color: '#3b82f6' }])]}
+        style={legendSwatch({ stroke: { color: '#ec4b7f', width: 2 } })}
       />,
     );
-    const swatch = container.querySelector('[aria-hidden="true"]') as HTMLElement;
-    expect(swatch.style.borderWidth).toBe('0px');
+    const chip = container.querySelector('[aria-hidden="true"]') as HTMLElement;
+    expect(chip).toHaveClass('border');
+    expect(chip.style.borderColor).toBe('rgb(236, 75, 127)');
+    expect(chip.style.borderWidth).toBe('2px');
+  });
+
+  it('draws no border when the swatch has no stroke', () => {
+    const { container } = render(
+      <LegendClassesList
+        geometryType="Polygon"
+        classes={[categories([{ value: 'a', label: 'A', color: '#3b82f6' }])]}
+        style={legendSwatch()}
+      />,
+    );
+    const chip = container.querySelector('[aria-hidden="true"]') as HTMLElement;
+    expect(chip).not.toHaveClass('border');
+    expect(chip.style.borderColor).toBe('');
+  });
+});
+
+describe('GeometrySwatch — points', () => {
+  it('draws the ring the swatch has, and none without one', () => {
+    const { container } = render(
+      <>
+        <LegendClassesList
+          geometryType="Point"
+          classes={[categories([{ value: 'a', label: 'A', color: '#fff7ed' }])]}
+          style={legendSwatch({ stroke: { color: '#ea580c', width: 2 } })}
+        />
+        <LegendClassesList
+          geometryType="Point"
+          classes={[categories([{ value: 'b', label: 'B', color: '#fff7ed' }])]}
+          style={legendSwatch()}
+        />
+      </>,
+    );
+    const [ringed, ringless] = Array.from(container.querySelectorAll('circle'));
+    expect(ringed).toHaveAttribute('stroke', '#ea580c');
+    expect(ringed).toHaveAttribute('stroke-width', '2');
+    expect(ringless).not.toHaveAttribute('stroke');
+    expect(ringless).toHaveAttribute('stroke-width', '0');
+  });
+});
+
+describe('HeatmapLegend', () => {
+  function gradientOf(ramp: Pick<LegendRamp, 'colors' | 'stops' | 'mode'>): string {
+    const { container } = render(
+      <HeatmapLegend name="Heat" ramp={{ ...ramp, name: null, reversed: false }} lowLabel="Low" highLabel="High" />,
+    );
+    return (container.querySelector('.h-3.rounded-sm.w-full') as HTMLElement).style.background;
+  }
+
+  it('draws each colour at its stop', () => {
+    expect(gradientOf({ colors: ['#0000ff', '#00ff00', '#ff0000'], stops: [0, 0.1, 1], mode: 'interpolate' })).toBe(
+      'linear-gradient(to right, rgb(0, 0, 255) 0%, rgb(0, 255, 0) 10%, rgb(255, 0, 0) 100%)',
+    );
+  });
+
+  it('draws a step as hard bands', () => {
+    expect(gradientOf({ colors: ['#fde725', '#440154'], stops: [0, 0.3], mode: 'step' })).toBe(
+      'linear-gradient(to right, rgb(253, 231, 37) 0%, rgb(253, 231, 37) 30%, rgb(68, 1, 84) 30%, rgb(68, 1, 84) 100%)',
+    );
+  });
+
+  it('draws a single colour as a solid bar', () => {
+    expect(gradientOf({ colors: ['#dc2626'], stops: [0], mode: 'interpolate' })).toBe(
+      'linear-gradient(to right, rgb(220, 38, 38) 0%, rgb(220, 38, 38) 100%)',
+    );
   });
 });

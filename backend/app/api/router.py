@@ -18,17 +18,27 @@ from app.modules.catalog.datasets.api.router_data import router as datasets_data
 from app.modules.catalog.datasets.api.router_export import (
     router as datasets_export_router,
 )
+from app.observability.health.router import router as readiness_router
 from app.modules.catalog.datasets.api.router_health import (
     router as datasets_health_router,
 )
 from app.modules.catalog.datasets.api.router_metadata import (
     router as datasets_metadata_router,
 )
+from app.modules.catalog.datasets.api.router_pointcloud import (
+    router as datasets_pointcloud_router,
+)
+from app.modules.catalog.datasets.api.router_previous_version import (
+    router as datasets_previous_version_router,
+)
 from app.modules.catalog.datasets.api.router_refresh import (
     router as datasets_refresh_router,
 )
 from app.modules.catalog.datasets.api.router_reupload import (
     router as datasets_reupload_router,
+)
+from app.modules.catalog.datasets.api.router_tiles3d import (
+    router as datasets_tiles3d_router,
 )
 from app.modules.catalog.datasets.api.router_vrt import router as datasets_vrt_router
 from app.modules.embed_tokens.admin_router import router as embed_tokens_admin_router
@@ -38,14 +48,19 @@ from app.processing.export.router import router as export_router
 from app.modules.catalog.features.router import features_router
 from app.processing.ingest.manifest_router import manifest_router
 from app.processing.ingest.router import router as ingest_router
+from app.processing.ingest.router_url_import import router as url_import_router
 from app.platform.jobs.router import router as jobs_router
 from app.modules.catalog.layers.router import layers_router
 from app.modules.catalog.maps.router import router as maps_router
 from app.modules.catalog.maps.router_assets import sprites_router as maps_sprites_router
+from app.modules.catalog.maps.router_ownership import router as maps_ownership_router
 from app.standards.ogc.router import ogc_features_router, ogc_router
 from app.modules.catalog.records.router import router as records_router
 from app.modules.catalog.search.router import collections_router, search_router
 from app.modules.catalog.sources.router import router as services_router
+from app.modules.catalog.sources.stac_asset_size_router import (
+    router as stac_asset_size_router,
+)
 from app.modules.catalog.sources.stac_router import router as stac_import_router
 from app.modules.settings.router import (
     public_router as settings_public_router,
@@ -53,6 +68,7 @@ from app.modules.settings.router import (
 )
 from app.standards.stac.router import stac_router
 from app.processing.tiles.router import router as tiles_router
+from app.processing.tiles.raster_relay import router as raster_relay_router
 
 
 api_router = APIRouter()
@@ -64,6 +80,7 @@ api_router.include_router(admin_router)
 api_router.include_router(audit_router)
 api_router.include_router(audit_datasets_router)
 api_router.include_router(ingest_router)
+api_router.include_router(url_import_router)
 api_router.include_router(manifest_router)
 
 # Export must stay before dataset CRUD because /dcat conflicts with /{dataset_id}.
@@ -71,11 +88,15 @@ api_router.include_router(datasets_export_router)
 api_router.include_router(datasets_router)
 api_router.include_router(datasets_analysis_router)
 api_router.include_router(datasets_vrt_router)
+api_router.include_router(datasets_tiles3d_router)
+api_router.include_router(datasets_pointcloud_router)
 api_router.include_router(datasets_data_router)
 api_router.include_router(datasets_metadata_router)
 api_router.include_router(datasets_reupload_router)
 api_router.include_router(datasets_refresh_router)
+api_router.include_router(datasets_previous_version_router)
 api_router.include_router(datasets_health_router)
+api_router.include_router(readiness_router)
 api_router.include_router(records_router)
 api_router.include_router(features_router)
 api_router.include_router(export_router)
@@ -88,6 +109,7 @@ api_router.include_router(collections_crud_router)
 api_router.include_router(ogc_features_router)
 
 api_router.include_router(maps_router)
+api_router.include_router(maps_ownership_router)
 # fix(#1440): sprites are unauthenticated reads; mounted as a sibling of
 # maps_router (not nested inside it) so they don't inherit its
 # ERROR_RESPONSES_WRITE defaults — see the comment on sprites_router in
@@ -99,6 +121,7 @@ api_router.include_router(ai_router)
 api_router.include_router(query_router)
 api_router.include_router(services_router)
 api_router.include_router(stac_import_router)
+api_router.include_router(stac_asset_size_router)
 api_router.include_router(layers_router)
 api_router.include_router(settings_router)
 api_router.include_router(settings_public_router)
@@ -110,6 +133,7 @@ api_router.include_router(embed_tokens_admin_router)
 # /m/{token} embed shell (consumed by the nginx auth_request edge wiring).
 api_router.include_router(embed_frame_policy_router)
 api_router.include_router(tiles_router)
+api_router.include_router(raster_relay_router)
 api_router.include_router(stac_router)
 
 __all__ = ["api_router"]

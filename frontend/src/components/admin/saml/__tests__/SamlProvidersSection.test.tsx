@@ -3,6 +3,7 @@ import { render, screen, waitFor, within } from '@/test/test-utils';
 import userEvent from '@testing-library/user-event';
 import { SamlProvidersSection } from '../SamlProvidersSection';
 import { queryKeys } from '@/lib/query-keys';
+import { ApiError } from '@/api/client';
 import {
   listSamlProviders,
   createSamlProvider,
@@ -113,6 +114,12 @@ describe('SamlProvidersSection provider mutations', () => {
     await user.click(screen.getByRole('button', { name: 'Create Provider' }));
   }
 
+  it('leaves the page title to the page header', async () => {
+    render(<SamlProvidersSection />);
+    await screen.findByRole('button', { name: /add saml provider/i });
+    expect(screen.queryByRole('heading', { name: 'SAML SSO' })).not.toBeInTheDocument();
+  });
+
   it('invalidates every provider cache after a create', async () => {
     vi.mocked(createSamlProvider).mockResolvedValueOnce(SAML_PROVIDER);
     const invalidateQueries = spyOnInvalidate();
@@ -178,5 +185,103 @@ describe('SamlProvidersSection provider mutations', () => {
 
     await waitFor(() => expect(createSamlProvider).toHaveBeenCalledOnce());
     await waitFor(() => expect(listSamlProviders).toHaveBeenCalledTimes(2));
+  });
+  it('opens the editor with the persisted entity IDs and SSO URL, and keeps the certificate blank', async () => {
+    vi.mocked(listSamlProviders).mockResolvedValueOnce([SAML_PROVIDER]);
+    const user = userEvent.setup();
+
+    render(<SamlProvidersSection />);
+
+    const providerRow = (await screen.findByText('Okta')).closest('tr');
+    await user.click(within(providerRow!).getByRole('button', { name: 'Edit provider' }));
+
+    expect(await screen.findByLabelText('IdP Entity ID')).toHaveValue(SAML_PROVIDER.idp_entity_id);
+    expect(screen.getByLabelText('IdP SSO URL')).toHaveValue(SAML_PROVIDER.idp_sso_url);
+    expect(screen.getByLabelText('SP Entity ID')).toHaveValue(SAML_PROVIDER.sp_entity_id);
+    expect(screen.getByLabelText(/IdP Signing Certificate/)).toHaveValue('');
+    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled();
+  });
+
+  it('gives the default role select an accessible name', async () => {
+    const user = userEvent.setup();
+
+    render(<SamlProvidersSection />);
+
+    await user.click(await screen.findByRole('button', { name: /Add/ }));
+    expect(await screen.findByRole('combobox', { name: 'Default Role' })).toBeInTheDocument();
+  });
+
+  it('shows a certificate field error when the server rejects the certificate', async () => {
+    vi.mocked(createSamlProvider).mockRejectedValueOnce(
+      new ApiError('Unprocessable', 422, [
+        { loc: ['body', 'idp_certificate'], msg: 'invalid', type: 'value_error' },
+      ]),
+    );
+    const user = userEvent.setup();
+
+    render(<SamlProvidersSection />);
+
+    await fillAndSubmitCreateForm(user);
+
+    const field = await screen.findByLabelText('IdP Signing Certificate (PEM)');
+    const error = await screen.findByText(
+      'IdP certificate must be a valid X.509 certificate (PEM)',
+    );
+    expect(field).toHaveAttribute('aria-invalid', 'true');
+    expect(field.getAttribute('aria-describedby')).toContain(error.id);
+
+    await user.type(field, 'x');
+    expect(
+      screen.queryByText('IdP certificate must be a valid X.509 certificate (PEM)'),
+    ).not.toBeInTheDocument();
+  });
+  it.each([
+    ['a default role of admin', { default_role: 'admin' }, /everyone this provider signs up/i],
+    ['a group mapped to admin', { group_claim: 'groups', group_role_mapping: { Admins: 'admin' } }, /members of the groups mapped to admin/i],
+  ])('asks for confirmation before saving %s', async (_label, overrides, description) => {
+    vi.mocked(listSamlProviders).mockResolvedValueOnce([{ ...SAML_PROVIDER, ...overrides }]);
+    vi.mocked(updateSamlProvider).mockResolvedValueOnce(SAML_PROVIDER);
+    const user = userEvent.setup();
+
+    render(<SamlProvidersSection />);
+
+    const providerRow = (await screen.findByText('Okta')).closest('tr');
+    await user.click(within(providerRow!).getByRole('button', { name: 'Edit provider' }));
+    await screen.findByLabelText('Display Name');
+    await user.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    expect(updateSamlProvider).not.toHaveBeenCalled();
+    expect(await screen.findByText(description)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /save with admin role/i }));
+    await waitFor(() => expect(updateSamlProvider).toHaveBeenCalledOnce());
+  });
+
+  it('binds malformed group role mapping JSON to its textarea and focuses it', async () => {
+    const user = userEvent.setup();
+
+    render(<SamlProvidersSection />);
+
+    await user.click(screen.getByRole('button', { name: /add saml provider/i }));
+    await user.type(await screen.findByLabelText('Display Name'), 'Okta');
+    await user.type(screen.getByLabelText('IdP Entity ID'), 'https://okta.example.com/saml/metadata');
+    await user.type(screen.getByLabelText('IdP SSO URL'), 'https://okta.example.com/saml/sso');
+    await user.type(screen.getByLabelText('IdP Signing Certificate (PEM)'), 'cert-pem');
+    const mapping = screen.getByLabelText('Group Role Mapping (JSON)');
+    await user.click(mapping);
+    await user.paste('{not json');
+    await user.click(screen.getByRole('button', { name: 'Create Provider' }));
+
+    const error = await screen.findByText('Group role mapping must be valid JSON');
+    expect(createSamlProvider).not.toHaveBeenCalled();
+    expect(mapping).toHaveAttribute('aria-invalid', 'true');
+    expect(mapping.getAttribute('aria-describedby')).toContain(error.id);
+    expect(mapping).toHaveFocus();
+
+    await user.type(screen.getByLabelText('IdP Signing Certificate (PEM)'), 'x');
+    expect(screen.getByText('Group role mapping must be valid JSON')).toBeInTheDocument();
+
+    await user.type(mapping, 'x');
+    expect(screen.queryByText('Group role mapping must be valid JSON')).not.toBeInTheDocument();
+    expect(mapping).not.toHaveAttribute('aria-invalid');
   });
 });

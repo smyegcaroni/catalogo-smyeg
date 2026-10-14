@@ -13,7 +13,7 @@ from fastapi import (
     Response,
     status,
 )
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
@@ -27,7 +27,7 @@ from app.modules.auth.models import User
 from app.core.config import settings
 from app.modules.catalog.authorization import (
     apply_visibility_filter,
-    check_dataset_access,
+    can_export_dataset,
     check_dataset_access_or_anonymous,
     get_user_roles,
     visible_lineage_summaries,
@@ -44,6 +44,7 @@ from app.standards.dcat_us.service import (
     record_to_dcat_us3,
 )
 from app.standards.dcat_us.validation import validate_dcat_us3
+from app.standards.distributions import is_cog_download_eligible
 from app.standards.geodcat_ap.service import (
     catalog_to_geodcat_ap,
     geodcat_ap_fallback_fields,
@@ -60,14 +61,14 @@ from app.core.dependencies import get_db
 from app.core.db.tenant_session import current_tenant_var
 from app.core.tenancy import is_multi_tenant
 from app.core.public_urls import get_public_urls
-from app.platform.extensions import get_catalog_port, get_permission_extension
-from app.platform.http.ranges import (
-    RANGE_UNSATISFIABLE,
-    if_match_passes,
-    if_none_match_matches,
-    not_modified_response,
-    parse_byte_range,
-    range_bound_to_this_version,
+from app.platform.extensions import get_catalog_port
+from app.platform.http.ranges import range_bound_to_this_version
+from app.platform.http.stored_bytes import (
+    StoredObjectMissing,
+    StoredObjectUnreadable,
+    evaluate_preconditions,
+    head_response,
+    serve_stored_bytes,
 )
 from app.platform.storage import get_storage
 from app.platform.storage.titiler_url import resolve_storage_key
@@ -84,6 +85,10 @@ logger = structlog.get_logger()
 router = APIRouter(
     prefix="/datasets", tags=["Datasets - Export"], responses=ERROR_RESPONSES_PUBLIC
 )
+
+# Declared as bytes, so a generated client hands back the file rather than
+# None (see sdks/python/.openapi-python-client.yaml's content_type_overrides).
+_COG_BODY = {"image/tiff": {"schema": {"type": "string", "format": "binary"}}}
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +280,47 @@ async def _visible_record_lineage(
     return (await _visible_lineage(db, [dataset], user))[dataset.record_id]
 
 
+async def _raster_asset_dataset_ids(
+    db: AsyncSession, dataset_ids: list[uuid.UUID]
+) -> set[uuid.UUID]:
+    """The subset of *dataset_ids* that have a RasterAsset row.
+
+    One id-only query: callers here only ever ask "does the row exist",
+    so there is no reason to load the full ORM rows list_raster_assets
+    returns.
+    """
+    if not dataset_ids:
+        return set()
+    RasterAsset = get_catalog_port().raster_asset_orm_class()
+    result = await db.execute(
+        select(RasterAsset.dataset_id).where(RasterAsset.dataset_id.in_(dataset_ids))
+    )
+    return set(result.scalars().all())
+
+
+async def _dcat_raster_asset_presence(
+    db: AsyncSession, datasets: list[DatasetModel]
+) -> dict[uuid.UUID, bool]:
+    """Per-page bulk answer to "does this dataset have the RasterAsset row
+    the download route requires", keyed by dataset id.
+
+    One query instead of one per dataset, mirroring _visible_lineage --
+    scoped first to datasets the download route could ever serve anonymously,
+    since a page can hold far more ineligible rows (private, unpublished,
+    STAC-sourced, non-raster) than eligible ones.
+    """
+    eligible_ids = [ds.id for ds in datasets if is_cog_download_eligible(ds)]
+    found = await _raster_asset_dataset_ids(db, eligible_ids)
+    return {dataset_id: True for dataset_id in found}
+
+
+async def _dcat_dataset_has_raster_asset(
+    db: AsyncSession, dataset: DatasetModel
+) -> bool:
+    """One dataset's answer. See _dcat_raster_asset_presence."""
+    return (await _dcat_raster_asset_presence(db, [dataset])).get(dataset.id, False)
+
+
 async def _get_dcat_dataset_for_export(
     db: AsyncSession,
     dataset_id: uuid.UUID,
@@ -320,6 +366,7 @@ async def get_dcat_catalog(
         app_base_url=app_base_url,
         preferred_languages=preferred_languages,
         lineage_by_record_id=await _visible_lineage(db, datasets, user),
+        has_raster_asset_by_id=await _dcat_raster_asset_presence(db, datasets),
     )
     completeness = _catalog_completeness(
         datasets,
@@ -357,6 +404,7 @@ async def validate_dcat3_catalog(
         base_url,
         app_base_url=app_base_url,
         lineage_by_record_id=await _visible_lineage(db, datasets, user),
+        has_raster_asset_by_id=await _dcat_raster_asset_presence(db, datasets),
     )
     report = validate_dcat3(catalog, "Catalog")
     report.update(
@@ -394,6 +442,7 @@ async def get_dcat_us3_catalog(
         app_base_url=app_base_url,
         catalog_contact_email=settings.dcat_contact_email,
         lineage_by_record_id=await _visible_lineage(db, datasets, user),
+        has_raster_asset_by_id=await _dcat_raster_asset_presence(db, datasets),
     )
     fallback_fields = [
         dcat_us3_fallback_fields(dataset, settings.dcat_contact_email)
@@ -433,6 +482,7 @@ async def validate_dcat_us3_catalog(
         app_base_url=app_base_url,
         catalog_contact_email=settings.dcat_contact_email,
         lineage_by_record_id=await _visible_lineage(db, datasets, user),
+        has_raster_asset_by_id=await _dcat_raster_asset_presence(db, datasets),
     )
     report = validate_dcat_us3(catalog, "Catalog")
     fallback_fields = [
@@ -462,6 +512,7 @@ async def get_geodcat_ap_catalog(
         base_url,
         app_base_url=app_base_url,
         lineage_by_record_id=await _visible_lineage(db, datasets, user),
+        has_raster_asset_by_id=await _dcat_raster_asset_presence(db, datasets),
     )
     completeness = _catalog_completeness(
         datasets,
@@ -497,6 +548,7 @@ async def validate_geodcat_ap_catalog(
         base_url,
         app_base_url=app_base_url,
         lineage_by_record_id=await _visible_lineage(db, datasets, user),
+        has_raster_asset_by_id=await _dcat_raster_asset_presence(db, datasets),
     )
     report = validate_geodcat_ap(catalog, "Catalog")
     report.update(
@@ -532,6 +584,7 @@ async def validate_dcat3_record(
         base_url,
         app_base_url=app_base_url,
         lineage_summary=await _visible_record_lineage(db, dataset, user),
+        has_raster_asset=await _dcat_dataset_has_raster_asset(db, dataset),
     )
     report = validate_dcat3(dcat, "Dataset")
     fallback_fields = dcat_fallback_fields(dataset)
@@ -563,6 +616,7 @@ async def get_dcat_record(
         app_base_url=app_base_url,
         preferred_languages=preferred_languages,
         lineage_summary=await _visible_record_lineage(db, dataset, user),
+        has_raster_asset=await _dcat_dataset_has_raster_asset(db, dataset),
     )
     fallback_fields = dcat_fallback_fields(dataset, preferred_languages)
     return JSONResponse(
@@ -597,6 +651,7 @@ async def validate_dcat_us3_record(
         app_base_url=app_base_url,
         catalog_contact_email=settings.dcat_contact_email,
         lineage_summary=await _visible_record_lineage(db, dataset, user),
+        has_raster_asset=await _dcat_dataset_has_raster_asset(db, dataset),
     )
     report = validate_dcat_us3(dcat, "Dataset")
     fallback_fields = dcat_us3_fallback_fields(dataset, settings.dcat_contact_email)
@@ -634,6 +689,7 @@ async def get_dcat_us3_record(
         app_base_url=app_base_url,
         catalog_contact_email=settings.dcat_contact_email,
         lineage_summary=await _visible_record_lineage(db, dataset, user),
+        has_raster_asset=await _dcat_dataset_has_raster_asset(db, dataset),
     )
     fallback_fields = dcat_us3_fallback_fields(dataset, settings.dcat_contact_email)
     _ensure_conformant_dcat_us3(dcat, "Dataset")
@@ -669,6 +725,7 @@ async def validate_geodcat_ap_record(
         base_url,
         app_base_url=app_base_url,
         lineage_summary=await _visible_record_lineage(db, dataset, user),
+        has_raster_asset=await _dcat_dataset_has_raster_asset(db, dataset),
     )
     report = validate_geodcat_ap(geodcat, "Dataset")
     fallback_fields = geodcat_ap_fallback_fields(dataset)
@@ -701,6 +758,7 @@ async def get_geodcat_ap_record(
         base_url,
         app_base_url=app_base_url,
         lineage_summary=await _visible_record_lineage(db, dataset, user),
+        has_raster_asset=await _dcat_dataset_has_raster_asset(db, dataset),
     )
     fallback_fields = geodcat_ap_fallback_fields(dataset)
 
@@ -893,7 +951,14 @@ async def _resolve_download_user(
     response_class=Response,
     # fix(#1778): the ranged-download branch raises 412
     # on a failed If-Match; the published contract omitted it.
-    responses={403: FORBIDDEN_RESPONSE, 412: PRECONDITION_FAILED_RESPONSE},
+    responses={
+        200: {"description": "The whole COG file", "content": _COG_BODY},
+        206: {"description": "One byte range of the COG file", "content": _COG_BODY},
+        302: {"description": "Redirect to the COG's object-storage or remote URL"},
+        304: {"description": "The caller already holds this version of the file"},
+        403: FORBIDDEN_RESPONSE,
+        412: PRECONDITION_FAILED_RESPONSE,
+    },
 )
 async def download_cog(
     dataset_id: uuid.UUID,
@@ -903,8 +968,12 @@ async def download_cog(
 ) -> Response:
     """Download the Cloud-Optimized GeoTIFF for a raster dataset.
 
-    Local storage: streams the COG file with Content-Type image/tiff.
-    S3 storage: returns a 302 redirect to a presigned GET URL (1-hour expiry).
+    On S3 storage with presigned downloads enabled, answers 302 to a
+    short-lived presigned URL (at most 5 minutes, and never past the expiry of
+    a ``?token=`` download token); otherwise streams the object with
+    Content-Type image/tiff. Even then, a GET carrying If-Match, or a resume
+    whose If-Range no longer matches, is streamed. A COG imported by reference
+    redirects to its origin.
     Accepts standard auth or ?token= JWT query parameter for browser downloads.
 
     ``user`` may be None when a no-sub anonymous
@@ -925,8 +994,6 @@ async def download_cog(
     # anonymous caller unconditionally.
     from slugify import slugify
 
-    from app.modules.auth.permissions import get_effective_permissions
-
     # 1. Fetch dataset FIRST so we can branch visibility/permission on user-None.
     dataset = await get_dataset(db, dataset_id)
     if dataset is None:
@@ -935,45 +1002,20 @@ async def download_cog(
             detail="Dataset not found",
         )
 
-    # 2. Visibility + permission check (branches on authenticated vs anonymous).
-    # Mirrors export_dataset_endpoint's gate (processing/export/router.py)
-    # exactly: anonymous covers both a plain unauthenticated GET (no header,
-    # no ?token=) and a mint-issued no-sub token, since _resolve_download_user
-    # returns None for both.
-    if user is None:
-        # Anonymous download: enforce public+published gate via the anon-aware
-        # helper (raises 404 to hide existence on denial), then a
-        # defense-in-depth guard requiring public visibility — a tampered or
-        # replayed download token cannot grant access to a private dataset.
-        await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
-        if dataset.record.visibility != "public":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Anonymous download requires public dataset",
-            )
-    else:
-        # Authenticated path: full RBAC visibility check + export capability.
-        await check_dataset_access(db, dataset, dataset_id, user)
-        user_roles = await get_user_roles(db, user)
-        matrix = await get_effective_permissions(db)
-        # Route through the permission extension point (same call
-        # export_dataset_endpoint makes) rather than inlining the per-role
-        # matrix check, so a deployment that registers a custom
-        # PermissionExtension applies its policy here too.
-        # DefaultPermissionExtension.check_permission reduces to the same
-        # any(matrix...) check, so OSS behavior is unchanged.
-        granted = await get_permission_extension().check_permission(
-            db,
-            user,
-            "export",
-            user_roles=user_roles,
-            permission_matrix=matrix,
+    # 2. Visibility + permission check, the same gate export_dataset_endpoint
+    # applies. Anonymous covers both a plain unauthenticated GET and a
+    # mint-issued no-sub token, since _resolve_download_user returns None for
+    # both.
+    user_roles = await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
+    if not await can_export_dataset(db, dataset, dataset_id, user, user_roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Anonymous download requires public dataset"
+                if user is None
+                else "Missing permission: export"
+            ),
         )
-        if not granted:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Missing permission: export",
-            )
 
     # 3. Verify raster type
     if dataset.record.record_type != "raster_dataset":
@@ -1017,24 +1059,11 @@ async def download_cog(
             physical_asset_key=_managed_key(raster_asset),
             dataset_id=dataset_id,
         )
-        if not if_match_passes(request.headers.get("if-match"), etag):
-            # A resuming client may send If-Match instead of If-Range;
-            # ignoring it let a mid-download replacement answer with a
-            # 206 of the new COG at old offsets -- the same splice
-            # through a different header. A failed If-Match is a 412,
-            # not a degradation: unlike If-Range, the RFC gives it no
-            # "ignore and serve the whole thing" fallback.
-            raise HTTPException(
-                status_code=status.HTTP_412_PRECONDITION_FAILED,
-                detail="COG has changed since the version you hold",
-                headers={"ETag": etag} if etag is not None else None,
-            )
-        # fix(#1554): evaluated whatever `etag` is -- the old `etag is
-        # not None` guard was wrong for `*`, which asks whether a
-        # representation exists, not which one, so a legacy row with no
-        # `sha256` answered a wildcard revalidation with the whole COG.
-        if if_none_match_matches(request.headers.get("if-none-match"), etag):
-            return not_modified_response(etag)
+        not_modified = evaluate_preconditions(
+            request, etag, changed_detail="COG has changed since the version you hold"
+        )
+        if not_modified is not None:
+            return not_modified
 
     # 6. Audit log. user_id may be None for anonymous downloads (KNOWN-01);
     # audit_logs.user_id is nullable to match.
@@ -1097,7 +1126,8 @@ async def download_cog(
 
     physical_asset_key = _managed_key(raster_asset)
 
-    if raster_asset.storage_backend == "s3":
+    # A managed row's tag doesn't name its store; the configured provider does.
+    if settings.storage_provider == "s3" and settings.s3_presigned_downloads:
         return await _s3_cog_response(
             request,
             storage,
@@ -1193,58 +1223,62 @@ async def _s3_cog_response(
     etag: str | None,
     total_bytes: int | None = None,
 ) -> Response:
-    """The s3 backend: HEAD here, a stale resume here, everything else redirected.
+    """The S3 store: HEAD and the GETs the bucket would misjudge are served here.
 
-    fix(#1540): HEAD served from object metadata, not the presigned
-    redirect -- method is part of the SigV4 canonical request, and a
-    redirect-following client keeps HEAD across a 302, so it arrives
-    signed for the wrong verb (MEASURED: MinIO answers a get_object URL
-    HEAD 403).
+    HEAD is served from object metadata, not the presigned redirect: the
+    method is part of the SigV4 canonical request, and a redirect-following
+    client keeps HEAD across a 302, so it arrives signed for the wrong verb
+    (MinIO answers a get_object URL's HEAD with 403).
 
-    fix(#1540): a resumed range whose validator no longer matches is
-    also answered here, the one case bytes pass through this process --
-    a presigned GET ignores `If-Range` entirely and answers 206
-    regardless (MEASURED), so a redirect can't stop it splicing an old
-    resume onto a new COG.
+    Two GETs pass their bytes through this process, because the bucket would
+    judge them by its own validator. A client keeps If-Match across the
+    redirect, and the bucket compares a tag with its MD5 ETag rather than this
+    route's SHA-256, so an unchanged COG would get a 412; a bucket may also
+    refuse a wildcard it doesn't support. A presigned GET
+    ignores If-Range and answers 206 regardless, so a redirect can't stop a
+    resume whose validator no longer matches from splicing an old range onto
+    a new COG.
 
-    Everything else still redirects: whole-object GETs and matching
-    resumes, the multi-GB payloads, never touch this process's bandwidth.
+    Everything else redirects: whole-object GETs and matching resumes, the
+    multi-GB payloads, never touch this process's bandwidth.
     """
     if request.method == "HEAD":
-        return _cog_head_response(
+        return head_response(
             await _cog_size_once(
                 total_bytes,
                 storage,
                 physical_asset_key=physical_asset_key,
                 dataset_id=dataset_id,
             ),
-            filename,
-            etag,
+            media_type="image/tiff",
+            etag=etag,
+            headers=_cog_disposition(filename),
         )
 
-    if request.headers.get("range") and not range_bound_to_this_version(
+    if_match = request.headers.get("if-match", "").strip()
+    stale_resume = request.headers.get("range") and not range_bound_to_this_version(
         request.headers.get("if-range"), etag
-    ):
-        # fix(#1540): ONE get_object, streamed — not
-        # `_iter_storage_range` over the whole object, which issues a ranged
-        # request per 1 MiB chunk. A caller can select this branch deliberately
-        # by sending any stale validator, so at a chunk apiece a 5 GiB COG cost
-        # 5,120 object-store requests that the per-request rate limiter counts
-        # as one. `_iter_storage_range` is right where the client named a
-        # window and wrong here, where the answer is the entire object.
+    )
+    if if_match or stale_resume:
+        # A stale resume's answer is the entire object, read as ONE streamed
+        # get_object, not `_iter_storage_range`'s ranged request per 1 MiB
+        # chunk: a caller can pick this branch with any stale validator, and a
+        # 5 GiB COG would cost 5,120 object-store requests the rate limiter
+        # counts as one.
         total_bytes = await _cog_size_once(
             total_bytes,
             storage,
             physical_asset_key=physical_asset_key,
             dataset_id=dataset_id,
         )
-        return StreamingResponse(
-            storage.get_stream(physical_asset_key),
-            media_type="image/tiff",
-            headers={
-                **_cog_headers(filename, etag),
-                "Content-Length": str(total_bytes),
-            },
+        return await _cog_bytes(
+            request,
+            storage,
+            physical_asset_key,
+            total_bytes=total_bytes,
+            filename=filename,
+            dataset_id=dataset_id,
+            etag=etag,
         )
 
     url = storage.generate_presigned_get_url(
@@ -1319,16 +1353,26 @@ async def _cog_object_size(
     try:
         return await storage.size(physical_asset_key)
     except FileNotFoundError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="COG file not found",
-        )
+        raise _cog_file_not_found()
     except Exception:  # broad: storage backend (S3/MinIO/local) can throw varied SDK/I/O errors; map to 503
-        logger.exception("cog_storage_error", dataset_id=str(dataset_id))
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="COG download temporarily unavailable",
-        )
+        raise _cog_storage_failed(dataset_id)
+
+
+def _cog_file_not_found() -> HTTPException:
+    """The 404 for a COG whose object is gone, at the stat or at the first read."""
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="COG file not found",
+    )
+
+
+def _cog_storage_failed(dataset_id: uuid.UUID) -> HTTPException:
+    """Log the store's failure and build the 503 the stat and the first read share."""
+    logger.exception("cog_storage_error", dataset_id=str(dataset_id))
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="COG download temporarily unavailable",
+    )
 
 
 async def _cog_size_once(
@@ -1353,45 +1397,11 @@ async def _cog_size_once(
     )
 
 
-def _cog_headers(filename: str, etag: str | None) -> dict[str, str]:
-    """Headers every stored-bytes response from this route carries.
-
-    fix(#1528): ``accept-ranges`` goes on all of them, including the 416,
-    since RFC 9110 scopes it to the RESOURCE and a client that just got a
-    416 is exactly the one that needs to know it may retry.
-
-    fix(#1540): ``ETag`` likewise, on 200/206/HEAD: advertising
-    ``Accept-Ranges`` without a validator invites a client that can
-    splice two COGs. Content-Disposition does NOT go on the 416 -- that
-    response's body is the JSON error, not the raster.
-    """
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Disposition": get_catalog_port().safe_content_disposition(filename),
+def _cog_disposition(filename: str) -> dict[str, str]:
+    """The route's own header on each COG representation; the 416 carries none."""
+    return {
+        "Content-Disposition": get_catalog_port().safe_content_disposition(filename)
     }
-    if etag is not None:
-        headers["ETag"] = etag
-    return headers
-
-
-def _cog_head_response(total_bytes: int, filename: str, etag: str | None) -> Response:
-    """The HEAD answer: one stat, no read, a real length.
-
-    A HEAD that streamed the object to learn its length would make every
-    /vsicurl/ open cost a full download. Range on a HEAD is deliberately
-    ignored, since answering 206 would report a tile's length as the COG's.
-
-    Content-Length is passed explicitly to override starlette's own
-    ``content-length: 0`` for this empty body, which reads as an empty
-    COG (``test_head_cog_carries_the_real_content_length`` pins this).
-    ETag matters most here: it's the only answer the ``s3`` backend gets
-    from this process at all.
-    """
-    return Response(
-        status_code=status.HTTP_200_OK,
-        media_type="image/tiff",
-        headers={**_cog_headers(filename, etag), "Content-Length": str(total_bytes)},
-    )
 
 
 async def _local_cog_response(
@@ -1404,81 +1414,50 @@ async def _local_cog_response(
     etag: str | None,
     total_bytes: int | None = None,
 ) -> Response:
-    """Serve stored COG bytes: HEAD, a byte range, or the whole object.
+    """Serve COG bytes through this process: HEAD, a byte range, or the whole object.
 
-    Split out of ``download_cog`` in fix(#1528) — folding three response
-    shapes into a handler that already branches over three storage backends put
-    it past ruff's complexity ceiling (C901, 17 > 15).
-
-    Everything that decides the STATUS has already run in the caller: access
-    control, the raster-type gate, and the RasterAsset lookup. This function
-    only decides which representation to send, which is why it is safe for HEAD
-    and GET to share it.
+    Access, the raster-type gate and the asset lookup have already run in the
+    caller. What is left is one stat for the length, then the representation.
     """
-    # Local storage: stream bytes from disk in 1 MiB chunks (ING-03 / P2-03).
-    # The full file is NOT buffered into memory — a 5 GB COG no longer pins
-    # 5 GB of resident memory before the first byte streams.
     total_bytes = await _cog_size_once(
         total_bytes,
         storage,
         physical_asset_key=physical_asset_key,
         dataset_id=dataset_id,
     )
-    cog_headers = _cog_headers(filename, etag)
-
-    if request.method == "HEAD":
-        return _cog_head_response(total_bytes, filename, etag)
-
-    byte_range = parse_byte_range(request.headers.get("range"), total_bytes)
-
-    if byte_range is not None and not range_bound_to_this_version(
-        request.headers.get("if-range"), etag
-    ):
-        # fix(#1540): the resumed range names a version this object is no
-        # longer at. RFC 9110 §13.1.5 says ignore the Range and serve the
-        # whole current COG with 200 -- before this, a 206 of the NEW
-        # bytes at the OLD offsets got appended to the client's existing
-        # prefix, writing out a half-and-half file with no error anywhere.
-        # Before the 416 check on purpose: "ignore" means ignore, even
-        # when the stale offsets no longer fit the new object.
-        byte_range = None
-
-    if byte_range == RANGE_UNSATISFIABLE:
-        raise HTTPException(
-            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
-            detail="Requested range not satisfiable",
-            headers={
-                "Accept-Ranges": "bytes",
-                # The size is the whole point of the 416: it is how a client
-                # that guessed at the length learns the real one and retries.
-                "Content-Range": f"bytes */{total_bytes}",
-                # And the version that size belongs to: a client that retries
-                # against a length it learned here should be able to tell if the
-                # object changed again in between.
-                **({"ETag": etag} if etag is not None else {}),
-            },
-        )
-
-    if byte_range is not None:
-        # The reason the format exists: a client reads the COG header, then
-        # fetches only the tiles it needs. Served through get_range() so the
-        # bytes outside the window are never read — see
-        # `test_range_request_does_not_read_the_whole_object`, which fails if
-        # this is ever implemented by slicing a full-object stream.
-        start, end = byte_range
-        return StreamingResponse(
-            storage.get_range_stream(physical_asset_key, start, end - start + 1),
-            status_code=status.HTTP_206_PARTIAL_CONTENT,
-            media_type="image/tiff",
-            headers={
-                **cog_headers,
-                "Content-Range": f"bytes {start}-{end}/{total_bytes}",
-                "Content-Length": str(end - start + 1),
-            },
-        )
-
-    return StreamingResponse(
-        storage.get_stream(physical_asset_key),
-        media_type="image/tiff",
-        headers={**cog_headers, "Content-Length": str(total_bytes)},
+    return await _cog_bytes(
+        request,
+        storage,
+        physical_asset_key,
+        total_bytes=total_bytes,
+        filename=filename,
+        dataset_id=dataset_id,
+        etag=etag,
     )
+
+
+async def _cog_bytes(
+    request: Request,
+    storage,
+    physical_asset_key: str,
+    *,
+    total_bytes: int,
+    filename: str,
+    dataset_id: uuid.UUID,
+    etag: str | None,
+) -> Response:
+    """The shared serving, with a failed first read answered as the stat answers it."""
+    try:
+        return await serve_stored_bytes(
+            request,
+            storage,
+            physical_asset_key,
+            total_bytes=total_bytes,
+            media_type="image/tiff",
+            etag=etag,
+            headers=_cog_disposition(filename),
+        )
+    except StoredObjectMissing:
+        raise _cog_file_not_found() from None
+    except StoredObjectUnreadable:
+        raise _cog_storage_failed(dataset_id) from None

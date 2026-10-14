@@ -4,7 +4,7 @@ Validates uploaded files beyond extension checks:
 - Content-type verification via magic byte detection (puremagic), plus
   direct header sniffs for formats puremagic has no signature for (Parquet,
   FlatGeobuf)
-- ZIP archive safety (compression ratio, nested archives, decompressed size)
+- ZIP archive safety (compression method and ratio, nested archives, size)
 - File size enforcement against configured limits
 - VRT XML sniff + path-traversal guard on `<SourceFilename>` body (IA-P1-03)
 """
@@ -24,7 +24,11 @@ from defusedxml import ElementTree as ET
 import puremagic
 import structlog
 
-from app.core.upload_errors import UnsafeUploadError  # noqa: F401  (re-exported)
+from app.core.pointcloud import POINTCLOUD_SUFFIX
+from app.core.upload_errors import (  # noqa: F401  (re-exported)
+    CodedRefusal,
+    UnsafeUploadError,
+)
 from app.core.url_redaction import redact_url_credentials
 
 logger = structlog.get_logger()
@@ -94,7 +98,11 @@ MAX_COMPRESSION_RATIO = 500
 MAX_DECOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 MAX_ARCHIVE_ENTRIES = 10_000
 MAX_CENTRAL_DIRECTORY_BYTES = 32 * 1024 * 1024
-ZIP_CONTAINER_EXTENSIONS = frozenset({".zip", ".xlsx", ".kmz"})
+ZIP_CONTAINER_EXTENSIONS = frozenset({".zip", ".xlsx", ".kmz", ".3tz"})
+
+# zipfile bounds a member read's output only for deflate. A bzip2, LZMA or
+# Zstandard read expands a whole compressed chunk before any budget sees it.
+_READABLE_ZIP_METHODS = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
 
 _EOCD_SIGNATURE = b"PK\x05\x06"
 _ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
@@ -304,7 +312,9 @@ def _refuse_virtual_table(entry: str, module: str | None, source: str | None) ->
         f"{_describe(source)} declares the virtual table '{entry}', which "
         "tells the database engine to read its rows from somewhere outside "
         "the file. Uploads may only carry their own data. Export the layers "
-        "you want as ordinary tables and upload that."
+        "you want as ordinary tables and upload that.",
+        code="sqlite_virtual_table",
+        values={"entry": entry},
     )
 
 
@@ -330,7 +340,8 @@ def _handle_unreadable_database(exc: sqlite3.Error, source: str | None) -> None:
     if getattr(exc, "sqlite_errorcode", None) in _NOT_A_READABLE_DATABASE:
         return
     raise UnsafeUploadError(
-        f"{_describe(source)} could not be read as a database file."
+        f"{_describe(source)} could not be read as a database file.",
+        code="unreadable_database_file",
     ) from exc
 
 
@@ -368,11 +379,13 @@ def _scan_sqlite_schema(db_path: str, source: str | None) -> None:
             "WHERE sql IS NOT NULL"
         ).fetchone()
         if total_bytes > MAX_SQLITE_SCHEMA_BYTES:
+            limit_mb = MAX_SQLITE_SCHEMA_BYTES // (1024 * 1024)
             raise UnsafeUploadError(
                 f"{_describe(source)} declares "
                 f"{total_bytes // (1024 * 1024)} MB of schema, more than the "
-                f"{MAX_SQLITE_SCHEMA_BYTES // (1024 * 1024)} MB an upload is "
-                "checked for."
+                f"{limit_mb} MB an upload is checked for.",
+                code="sqlite_schema_too_large",
+                values={"limit_mb": limit_mb},
             )
         rows = connection.execute(
             "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL "
@@ -390,7 +403,9 @@ def _scan_sqlite_schema(db_path: str, source: str | None) -> None:
         # looked at, which is the one outcome this must not produce quietly.
         raise UnsafeUploadError(
             f"{_describe(source)} declares more than {MAX_SQLITE_SCHEMA_ROWS} "
-            "schema objects, which is more than an upload is checked for."
+            "schema objects, which is more than an upload is checked for.",
+            code="sqlite_too_many_schema_objects",
+            values={"limit": MAX_SQLITE_SCHEMA_ROWS},
         )
 
     for name, sql in rows:
@@ -424,8 +439,8 @@ def _scan_sqlite_schema(db_path: str, source: str | None) -> None:
 # `validate_zip_safety` never reads member DATA (central directory only), so
 # it can't have caught this on the way past; the conversion lives at the reads.
 # RuntimeError (password-protected member) and NotImplementedError
-# (unsupported compression method) are ordinary things to find in an upload
-# rather than bugs, so they join the corruption cases here. The tuple is
+# (strongly encrypted or patched member) are ordinary things to find in an
+# upload rather than bugs, so they join the corruption cases here. The tuple is
 # narrow and only wraps the member reads, so a genuine RuntimeError from
 # elsewhere is untouched.
 _CORRUPT_MEMBER_ERRORS = (
@@ -445,8 +460,9 @@ def _member_read_errors(entry: str):
     except _CORRUPT_MEMBER_ERRORS as exc:
         raise UnsafeUploadError(
             f"The archive entry '{entry}' could not be read. The upload may be "
-            "corrupt, truncated, password-protected, or compressed with a "
-            "method this server does not support."
+            "corrupt, truncated or encrypted.",
+            code="corrupt_archive_member",
+            values={"entry": entry},
         ) from exc
 
 
@@ -466,9 +482,12 @@ class _ScanBudget:
     def spend(self, count: int, entry: str) -> None:
         self.remaining -= count
         if self.remaining < 0:
+            limit_gb = MAX_DECOMPRESSED_BYTES // (1024**3)
             raise UnsafeUploadError(
                 f"Reading '{entry}' would take this upload past the "
-                f"{MAX_DECOMPRESSED_BYTES // (1024**3)} GB decompressed limit."
+                f"{limit_gb} GB decompressed limit.",
+                code="zip_bomb_unpacked_size",
+                values={"limit_gb": limit_gb},
             )
 
 
@@ -494,7 +513,9 @@ def _refuse_vrt_member(entry: str, source: str | None) -> None:
     raise UnsafeUploadError(
         f"The archive entry '{entry}' is a GDAL VRT. A VRT describes where to "
         "read data from rather than carrying any, so it is not accepted "
-        "inside an upload. Upload the data files themselves."
+        "inside an upload. Upload the data files themselves.",
+        code="driver_metadata_member",
+        values={"entry": entry},
     )
 
 
@@ -535,10 +556,10 @@ def _scan_archive_members(file_path: str, filename: str | None) -> None:
     except UnsafeUploadError:
         raise
     except ValueError as exc:
-        # The same refusal, raised as this module's own class so the endpoints
-        # that let a content refusal's wording through let this one through
-        # too instead of flattening it into a generic message.
-        raise UnsafeUploadError(str(exc)) from exc
+        # validate_zip_safety's own refusals are already UnsafeUploadError and
+        # caught above; this is a defensive net for anything else zipfile
+        # could raise as a plain ValueError.
+        raise UnsafeUploadError(str(exc), code="unsafe_upload_content") from exc
 
     budget = _ScanBudget(MAX_DECOMPRESSED_BYTES)
     try:
@@ -546,7 +567,9 @@ def _scan_archive_members(file_path: str, filename: str | None) -> None:
     except zipfile.BadZipFile as exc:
         # validate_zip_safety above would normally refuse this already; kept
         # here because the guard belongs with the open, not upstream of it.
-        raise UnsafeUploadError("File is not a valid ZIP container.") from exc
+        raise UnsafeUploadError(
+            "File is not a valid ZIP container.", code="invalid_zip_container"
+        ) from exc
     with archive:
         for info in archive.infolist():
             if info.is_dir():
@@ -602,6 +625,25 @@ def validate_content_directives(file_path: str, filename: str | None = None) -> 
         _scan_archive_members(file_path, source)
 
 
+def _end_record_index(tail: bytes) -> int:
+    """Where the end-of-central-directory record starts in a file's tail, or -1.
+
+    The record's comment runs to the end of the file, which tells the record
+    from its signature appearing inside a comment.
+    """
+    search_end = len(tail)
+    while search_end > 0:
+        candidate = tail.rfind(_EOCD_SIGNATURE, 0, search_end)
+        if candidate < 0:
+            break
+        if candidate + _EOCD.size <= len(tail):
+            comment_length = _EOCD.unpack_from(tail, candidate)[7]
+            if candidate + _EOCD.size + comment_length == len(tail):
+                return candidate
+        search_end = candidate
+    return -1
+
+
 def _zip_directory_metadata(file_path: str) -> tuple[int, int, int]:
     """Return member count, central-directory offset, and size without parsing members."""
     path = Path(file_path)
@@ -612,24 +654,10 @@ def _zip_directory_metadata(file_path: str) -> tuple[int, int, int]:
         archive.seek(file_size - tail_size)
         tail = archive.read(tail_size)
 
-        search_end = len(tail)
-        eocd_offset = -1
-        eocd: tuple | None = None
-        while search_end > 0:
-            candidate = tail.rfind(_EOCD_SIGNATURE, 0, search_end)
-            if candidate < 0:
-                break
-            if candidate + _EOCD.size <= len(tail):
-                unpacked = _EOCD.unpack_from(tail, candidate)
-                comment_length = unpacked[7]
-                if candidate + _EOCD.size + comment_length == len(tail):
-                    eocd_offset = file_size - tail_size + candidate
-                    eocd = unpacked
-                    break
-            search_end = candidate
-
-        if eocd is None:
+        candidate = _end_record_index(tail)
+        if candidate < 0:
             raise zipfile.BadZipFile("End of central directory not found")
+        eocd_offset = file_size - tail_size + candidate
 
         (
             _signature,
@@ -640,7 +668,7 @@ def _zip_directory_metadata(file_path: str) -> tuple[int, int, int]:
             directory_size,
             directory_offset,
             _comment_length,
-        ) = eocd
+        ) = _EOCD.unpack_from(tail, candidate)
 
         uses_zip64 = (
             entries_on_disk == 0xFFFF
@@ -686,20 +714,29 @@ def _zip_directory_metadata(file_path: str) -> tuple[int, int, int]:
         return int(total_entries), int(directory_offset), int(directory_size)
 
 
-def _validate_zip_directory_cardinality(file_path: str) -> None:
-    """Bound ZIP metadata before ZipFile materializes a ZipInfo per member."""
+def _validate_zip_directory_cardinality(
+    file_path: str, max_entries: int | None = None
+) -> None:
+    """Bound ZIP metadata before ZipFile materializes a ZipInfo per member.
+
+    ``max_entries`` defaults to ``MAX_ARCHIVE_ENTRIES``.
+    """
+    max_entries = MAX_ARCHIVE_ENTRIES if max_entries is None else max_entries
     reported_entries, directory_offset, directory_size = _zip_directory_metadata(
         file_path
     )
-    if reported_entries > MAX_ARCHIVE_ENTRIES:
-        raise ValueError(
-            f"ZIP contains {reported_entries} entries; the maximum is "
-            f"{MAX_ARCHIVE_ENTRIES}."
+    if reported_entries > max_entries:
+        raise UnsafeUploadError(
+            f"ZIP contains {reported_entries} entries; the maximum is {max_entries}.",
+            code="zip_too_many_entries",
+            values={"max_entries": max_entries},
         )
     if directory_size > MAX_CENTRAL_DIRECTORY_BYTES:
-        raise ValueError(
-            "ZIP central directory exceeds the "
-            f"{MAX_CENTRAL_DIRECTORY_BYTES // (1024 * 1024)} MB metadata limit."
+        limit_mb = MAX_CENTRAL_DIRECTORY_BYTES // (1024 * 1024)
+        raise UnsafeUploadError(
+            f"ZIP central directory exceeds the {limit_mb} MB metadata limit.",
+            code="zip_directory_too_large",
+            values={"limit_mb": limit_mb},
         )
 
     count = 0
@@ -724,9 +761,11 @@ def _validate_zip_directory_cardinality(file_path: str) -> None:
                 archive.seek(variable_size, 1)
                 remaining -= entry_size
                 count += 1
-                if count > MAX_ARCHIVE_ENTRIES:
-                    raise ValueError(
-                        f"ZIP contains more than {MAX_ARCHIVE_ENTRIES} entries."
+                if count > max_entries:
+                    raise UnsafeUploadError(
+                        f"ZIP contains more than {max_entries} entries.",
+                        code="zip_too_many_entries",
+                        values={"max_entries": max_entries},
                     )
                 continue
 
@@ -770,9 +809,13 @@ def _xml_local_name(tag: object) -> str:
 def _reject_uploaded_vrt_source(raw_path: str) -> None:
     """Reject SourceFilename values that can escape the staged upload bundle."""
     if not raw_path:
-        raise ValueError("VRT <SourceFilename> is empty.")
+        raise UnsafeUploadError(
+            "VRT <SourceFilename> is empty.", code="unsafe_vrt_source"
+        )
     if "\x00" in raw_path:
-        raise ValueError("VRT <SourceFilename> contains a null byte.")
+        raise UnsafeUploadError(
+            "VRT <SourceFilename> contains a null byte.", code="unsafe_vrt_source"
+        )
     if ".." in raw_path:
         logger.warning(
             "VRT body contains path-traversal marker",
@@ -780,9 +823,10 @@ def _reject_uploaded_vrt_source(raw_path: str) -> None:
             reason="vrt_path_traversal",
             source_filename=redact_url_credentials(raw_path)[:200],
         )
-        raise ValueError(
+        raise UnsafeUploadError(
             "VRT <SourceFilename> contains a path-traversal marker. "
-            "Use relative paths without '..' segments."
+            "Use relative paths without '..' segments.",
+            code="unsafe_vrt_source",
         )
     if (
         raw_path.startswith("/")
@@ -795,9 +839,10 @@ def _reject_uploaded_vrt_source(raw_path: str) -> None:
             reason="vrt_absolute_path",
             source_filename=redact_url_credentials(raw_path)[:200],
         )
-        raise ValueError(
+        raise UnsafeUploadError(
             "VRT <SourceFilename> uses an absolute path. "
-            "Uploaded VRTs may only reference relative files in the upload bundle."
+            "Uploaded VRTs may only reference relative files in the upload bundle.",
+            code="unsafe_vrt_source",
         )
     if _URL_SCHEME_RE.match(raw_path) or raw_path.lower().startswith("/vsi"):
         logger.warning(
@@ -806,9 +851,10 @@ def _reject_uploaded_vrt_source(raw_path: str) -> None:
             reason="vrt_remote_source",
             source_filename=redact_url_credentials(raw_path)[:200],
         )
-        raise ValueError(
+        raise UnsafeUploadError(
             "VRT <SourceFilename> uses a remote or GDAL VSI source. "
-            "Uploaded VRTs may only reference relative files in the upload bundle."
+            "Uploaded VRTs may only reference relative files in the upload bundle.",
+            code="unsafe_vrt_source",
         )
 
 
@@ -836,24 +882,29 @@ def validate_vrt_body(file_path: str) -> None:
         body = f.read(VRT_BODY_MAX_BYTES + 1)
 
     if not body:
-        raise ValueError("The uploaded VRT file is empty.")
+        raise UnsafeUploadError("The uploaded VRT file is empty.", code="empty_upload")
     if len(body) > VRT_BODY_MAX_BYTES:
-        raise ValueError(
-            f"Uploaded VRT XML exceeds the {VRT_BODY_MAX_BYTES // (1024 * 1024)} MB limit."
+        limit_mb = VRT_BODY_MAX_BYTES // (1024 * 1024)
+        raise UnsafeUploadError(
+            f"Uploaded VRT XML exceeds the {limit_mb} MB limit.",
+            code="vrt_body_too_large",
+            values={"limit_mb": limit_mb},
         )
 
     try:
         root = ET.fromstring(body)
     except ET.ParseError as exc:
-        raise ValueError(
+        raise UnsafeUploadError(
             "File has .vrt extension but is not a valid VRT XML document "
-            f"(missing <VRTDataset root element or invalid XML: {exc})."
+            f"(missing <VRTDataset root element or invalid XML: {exc}).",
+            code="invalid_vrt_body",
         ) from exc
 
     if _xml_local_name(root.tag) != "VRTDataset":
-        raise ValueError(
+        raise UnsafeUploadError(
             "File has .vrt extension but is not a valid VRT XML document "
-            "(missing <VRTDataset root element)."
+            "(missing <VRTDataset root element).",
+            code="invalid_vrt_body",
         )
 
     for elem in root.iter():
@@ -871,16 +922,20 @@ def validate_parquet_file(file_path: str) -> None:
     # 12 bytes = header magic + 4-byte footer length + footer magic.
     # codeql[py/path-injection] fix(#1708): file_path is always server-staged — every caller (router upload_file/upload_from_url, tasks_common, presigned probe) builds it under managed staging from a basename-stripped, byte-clamped name. This module sniffs content and never derives a path, so the guarantee is the caller's.
     if path.stat().st_size < 12:
-        raise ValueError("The uploaded file is not a valid Parquet file.")
+        raise UnsafeUploadError(
+            "The uploaded file is not a valid Parquet file.",
+            code="invalid_parquet_file",
+        )
     # codeql[py/path-injection] fix(#1708): file_path is always server-staged — every caller (router upload_file/upload_from_url, tasks_common, presigned probe) builds it under managed staging from a basename-stripped, byte-clamped name. This module sniffs content and never derives a path, so the guarantee is the caller's.
     with path.open("rb") as f:
         head = f.read(4)
         f.seek(-4, 2)
         tail = f.read(4)
     if head != _PARQUET_MAGIC or tail != _PARQUET_MAGIC:
-        raise ValueError(
+        raise UnsafeUploadError(
             "File has .parquet extension but is not a valid Parquet file "
-            "(missing PAR1 magic bytes — the file may be corrupt or truncated)."
+            "(missing PAR1 magic bytes — the file may be corrupt or truncated).",
+            code="invalid_parquet_file",
         )
 
 
@@ -900,9 +955,10 @@ def validate_flatgeobuf_file(file_path: str) -> None:
         or header[0:3] != _FGB_MAGIC_WORD
         or header[4:7] != _FGB_MAGIC_WORD
     ):
-        raise ValueError(
+        raise UnsafeUploadError(
             "File has .fgb extension but is not a valid FlatGeobuf file "
-            "(missing the FlatGeobuf magic bytes)."
+            "(missing the FlatGeobuf magic bytes).",
+            code="invalid_flatgeobuf_file",
         )
 
 
@@ -959,14 +1015,22 @@ def validate_file_content(file_path: str, filename: str) -> None:
         header = f.read(HEADER_READ_SIZE)
 
     if len(header) == 0:
-        raise ValueError("The uploaded file is empty.")
+        raise UnsafeUploadError("The uploaded file is empty.", code="empty_upload")
+
+    # The point cloud path runs the COPC checks; this keeps a renamed database out.
+    if suffix == POINTCLOUD_SUFFIX and not header.startswith(b"LASF"):
+        raise UnsafeUploadError(
+            "The file is not a LAS or LAZ point cloud.", code="pointcloud_invalid"
+        )
 
     # Skip magic-byte validation for extensions without known content rules
     if suffix not in EXTENSION_CONTENT_MAP:
         return
 
+    # puremagic opens any filename that names an existing file; given only the
+    # extension, it judges the uploaded bytes alone.
     try:
-        detected = puremagic.from_string(header, filename=filename)
+        detected = puremagic.from_string(header, filename=suffix)
     except puremagic.PureError:
         detected = ""
 
@@ -992,10 +1056,25 @@ def validate_file_content(file_path: str, filename: str) -> None:
         declared_extension=suffix,
         detected_type=detected,
     )
-    raise ValueError(
+    raise UnsafeUploadError(
         f"File content detected as '{detected or 'unknown'}' "
         f"but extension is '{suffix}'. "
-        f"Please upload with the correct extension."
+        f"Please upload with the correct extension.",
+        code="content_type_mismatch",
+        values={"detected": detected or "unknown", "extension": suffix},
+    )
+
+
+def compression_refusal(info: zipfile.ZipInfo) -> str | None:
+    """The refusal for an entry that is neither stored nor deflated, else None."""
+    kind = info.compress_type
+    if kind in _READABLE_ZIP_METHODS:
+        return None
+    method = zipfile.compressor_names.get(kind, f"method {kind}")
+    return (
+        f"The archive has an entry compressed with {method}. Only stored and "
+        "deflate-compressed entries are read; re-create the archive with "
+        "standard ZIP compression."
     )
 
 
@@ -1004,6 +1083,7 @@ def validate_zip_safety(file_path: str) -> None:
 
     Raises ValueError if:
     - File is not a valid ZIP
+    - Any entry is compressed with anything but store or deflate
     - Any entry has compression ratio > MAX_COMPRESSION_RATIO
     - Any entry is a GDAL driver-metadata document (see
       DRIVER_METADATA_EXTENSIONS)
@@ -1018,6 +1098,16 @@ def validate_zip_safety(file_path: str) -> None:
             for info in zf.infolist():
                 total_uncompressed += info.file_size
 
+                if refusal := compression_refusal(info):
+                    method = zipfile.compressor_names.get(
+                        info.compress_type, f"method {info.compress_type}"
+                    )
+                    raise UnsafeUploadError(
+                        refusal,
+                        code="unsupported_zip_compression",
+                        values={"method": method},
+                    )
+
                 if info.compress_size > 0:
                     ratio = info.file_size / info.compress_size
                     if ratio > MAX_COMPRESSION_RATIO:
@@ -1029,10 +1119,12 @@ def validate_zip_safety(file_path: str) -> None:
                             entry=info.filename,
                             ratio=f"{ratio:.0f}:1",
                         )
-                        raise ValueError(
+                        raise UnsafeUploadError(
                             f"ZIP entry '{info.filename}' has suspicious compression "
                             f"ratio ({ratio:.0f}:1). Maximum allowed is "
-                            f"{MAX_COMPRESSION_RATIO}:1."
+                            f"{MAX_COMPRESSION_RATIO}:1.",
+                            code="zip_bomb_ratio",
+                            values={"max_ratio": MAX_COMPRESSION_RATIO},
                         )
 
                 entry_ext = Path(info.filename).suffix.lower()
@@ -1045,11 +1137,13 @@ def validate_zip_safety(file_path: str) -> None:
                         filename=Path(file_path).name,
                         entry=info.filename,
                     )
-                    raise ValueError(
+                    raise UnsafeUploadError(
                         f"ZIP entry '{info.filename}' is a GDAL VRT. A VRT "
                         "describes where to read data from rather than "
                         "carrying any, so it is not accepted inside an "
-                        "upload. Upload the data files themselves."
+                        "upload. Upload the data files themselves.",
+                        code="driver_metadata_member",
+                        values={"entry": info.filename},
                     )
 
                 if entry_ext in ARCHIVE_EXTENSIONS:
@@ -1060,9 +1154,11 @@ def validate_zip_safety(file_path: str) -> None:
                         filename=Path(file_path).name,
                         nested_entry=info.filename,
                     )
-                    raise ValueError(
+                    raise UnsafeUploadError(
                         f"ZIP contains nested archive '{info.filename}'. "
-                        f"Nested archives are not supported for geospatial uploads."
+                        f"Nested archives are not supported for geospatial uploads.",
+                        code="zip_nested_archive",
+                        values={"entry": info.filename},
                     )
 
             if total_uncompressed > MAX_DECOMPRESSED_BYTES:
@@ -1075,13 +1171,17 @@ def validate_zip_safety(file_path: str) -> None:
                     filename=Path(file_path).name,
                     decompressed_gb=f"{size_gb:.1f}",
                 )
-                raise ValueError(
+                raise UnsafeUploadError(
                     f"ZIP total decompressed size ({size_gb:.1f} GB) exceeds "
-                    f"the {limit_gb} GB limit."
+                    f"the {limit_gb} GB limit.",
+                    code="zip_bomb_unpacked_size",
+                    values={"limit_gb": limit_gb},
                 )
 
     except zipfile.BadZipFile:
-        raise ValueError("File is not a valid ZIP container.")
+        raise UnsafeUploadError(
+            "File is not a valid ZIP container.", code="invalid_zip_container"
+        )
 
 
 def validate_archive_safety(file_path: str, filename: str) -> None:
@@ -1099,6 +1199,8 @@ def validate_file_size(file_path: str, max_size_bytes: int) -> None:
     if file_size > max_size_bytes:
         size_mb = file_size / (1024 * 1024)
         limit_mb = max_size_bytes / (1024 * 1024)
-        raise ValueError(
-            f"File size ({size_mb:.1f} MB) exceeds the maximum allowed ({limit_mb:.0f} MB)."
+        raise CodedRefusal(
+            f"File size ({size_mb:.1f} MB) exceeds the maximum allowed ({limit_mb:.0f} MB).",
+            code="file_size_exceeded",
+            values={"size_mb": round(size_mb, 1), "limit_mb": round(limit_mb)},
         )

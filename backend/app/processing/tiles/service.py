@@ -5,6 +5,8 @@ import re
 import asyncpg
 import structlog
 
+from app.platform.timestamptz_text import utc_timestamptz_text
+
 logger = structlog.stdlib.get_logger(__name__)
 
 # builder-audit #338 MVT-09: SINGLE SOURCE OF TRUTH for the tile table/column
@@ -280,16 +282,25 @@ def _select_tile_columns(
     return base
 
 
+def _attr_select(alias: str, col: dict) -> str:
+    """One attribute's projection, named after the column."""
+    ref = f'{alias}."{col["name"]}"'
+    if str(col.get("type") or "").lower() == "timestamp with time zone":
+        ref = utc_timestamptz_text(ref)
+    return f'{ref} AS "{col["name"]}"'
+
+
 def _build_attr_columns(columns: list[dict]) -> str:
     """Build the attribute column list for the MVT query.
 
     Excludes geometry columns and gid (gid is always included separately
     as the feature ID). All column names are revalidated against
     ``_COLUMN_NAME_RE`` before substitution to defend against a
-    misconfigured allowlist.
+    misconfigured allowlist, then quoted so a mixed-case name reaches its
+    column and keeps its case as the MVT property name.
     """
     attr_cols = [
-        f"t.{col['name']}"
+        _attr_select("t", col)
         for col in columns
         if col.get("name")
         and col["name"] not in _EXCLUDED_COLUMNS
@@ -469,10 +480,10 @@ def _build_cluster_tile_query(
     # Schema name derives from validated-UUID tenant_data_schema() — safe to quote.
     qualified_table = f'"{schema}"."{table_name}"'
 
-    # Mirrors _build_attr_columns' exclusion + revalidation rules, projecting
-    # from the joined source row for unclustered features only.
+    # Mirrors _build_attr_columns' exclusion, revalidation and quoting rules,
+    # projecting from the joined source row for unclustered features only.
     unclustered_attr_select = "".join(
-        f",\n        src.{col['name']} AS {col['name']}"
+        f",\n        {_attr_select('src', col)}"
         for col in (attr_columns or [])
         if col.get("name")
         and col["name"] not in _EXCLUDED_COLUMNS

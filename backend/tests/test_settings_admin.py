@@ -162,9 +162,14 @@ class TestResetSettings:
         monkeypatch,
     ):
         """A false runtime default cannot bypass the PUT/import SSO guard."""
-        from app.core.persistent_config import PASSWORD_LOGIN_ENABLED
+        from app.core.config import settings
 
-        monkeypatch.setattr(PASSWORD_LOGIN_ENABLED, "_env_default_static", False)
+        monkeypatch.setattr(settings, "password_login_enabled", False)
+        # An enabled provider exists, so only the lock can refuse the reset.
+        monkeypatch.setattr(
+            "app.modules.settings.router.oauth_service.list_providers",
+            AsyncMock(return_value=[object()]),
+        )
         provider_lock = AsyncMock(return_value=[])
         monkeypatch.setattr(
             "app.modules.settings.router.oauth_service.lock_enabled_providers",
@@ -194,7 +199,7 @@ class TestResetSettings:
         }
         assert values["password_login_enabled"] is True
 
-        monkeypatch.setattr(PASSWORD_LOGIN_ENABLED, "_env_default_static", True)
+        monkeypatch.setattr(settings, "password_login_enabled", True)
         cleanup = await client.post(
             "/settings/reset/",
             json={"keys": ["password_login_enabled"]},

@@ -1,6 +1,6 @@
-import { lazy, Suspense, useCallback, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Calendar, MapPin } from 'lucide-react';
+import { Calendar, ChevronDown, MapPin } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -17,6 +17,11 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible';
 import { FilterChip } from './FilterChip';
 import { FilterSheet } from './FilterSheet';
 import { KeywordFacetPicker } from './KeywordFacetPicker';
@@ -37,13 +42,10 @@ const GEOMETRY_TYPES = [
   'MULTIPOLYGON',
 ] as const;
 const SORT_OPTIONS = ['relevance', 'date_added', 'name', 'last_updated'] as const;
-const LazySpatialFilterPanel = lazy(async () => {
-  const module = await import('./SpatialFilterPanel');
-  return { default: module.SpatialFilterPanel };
-});
 
 interface FilterPanelProps {
   totalResults: number | undefined;
+  allTypesTotal?: number;
   showDesktop?: boolean;
   showMobile?: boolean;
   desktopLayout?: 'toolbar' | 'rail';
@@ -98,6 +100,7 @@ function parseTemporalInterval(datetime: string): [string, string] {
  */
 export function FilterPanel({
   totalResults,
+  allTypesTotal,
   showDesktop = true,
   showMobile = true,
   desktopLayout = 'toolbar',
@@ -139,10 +142,13 @@ export function FilterPanel({
   const { data: facets } = useFacets();
   const counts = facets?.record_type ?? {};
   const allTypeCount =
-    (counts.vector_dataset ?? 0) +
+    allTypesTotal ??
+    ((counts.vector_dataset ?? 0) +
     (counts.raster_dataset ?? 0) +
     (counts.vrt_dataset ?? 0) +
-    (counts.table ?? 0);
+    (counts.table ?? 0) +
+    (counts.tiles3d_dataset ?? 0) +
+    (counts.pointcloud_dataset ?? 0));
 
   const { data: summaries } = useCatalogSummary();
 
@@ -165,6 +171,8 @@ export function FilterPanel({
   const hasSearchState = hasToolbarChanges || q !== '';
   const activeGeomLabel = geometryType ? getGeometryTypeLabel(t, geometryType) : null;
   const showsTableToggle = counts.table !== undefined;
+  const showsTiles3dToggle = counts.tiles3d_dataset !== undefined;
+  const showsPointcloudToggle = counts.pointcloud_dataset !== undefined;
   const showSridFilter = srids.length > 0 && recordType !== 'table';
   const showSecondaryFilterRow = Boolean(recordType) && (
     recordType === 'vector_dataset' || organizations.length > 0 || showSridFilter
@@ -179,6 +187,10 @@ export function FilterPanel({
         return t('filters.vrt', { defaultValue: 'Virtual Raster' });
       case 'table':
         return t('card.table', { defaultValue: 'Table' });
+      case 'tiles3d_dataset':
+        return t('card.tiles3d', { defaultValue: '3D Tiles' });
+      case 'pointcloud_dataset':
+        return t('card.pointcloud', { defaultValue: 'Point cloud' });
       default:
         return value;
     }
@@ -192,9 +204,9 @@ export function FilterPanel({
   // search refetch. Other open/close booleans are pure UI state.
   // ====================================================================
   const [dateOpen, setDateOpen] = useState(false);
+  const [advancedFiltersOpen, setAdvancedFiltersOpen] = useState(false);
   const [localDateFrom, setLocalDateFrom] = useState(dateFrom);
   const [localDateTo, setLocalDateTo] = useState(dateTo);
-  const spatialPanelOpen = useSearchStore((s) => s.spatialPanelOpen);
   const setSpatialPanelOpen = useSearchStore((s) => s.setSpatialPanelOpen);
 
   const syncLocalDates = () => {
@@ -227,6 +239,7 @@ export function FilterPanel({
     if (dateTo) return dateTo;
     return '';
   })();
+  const dataCoverageDateChipLabel = `${t('filters.dataCoverageDate', { defaultValue: 'Dates covered by the data' })}: ${temporalStart || '..'} - ${temporalEnd || '..'}`;
 
   const clearFilters = () => {
     useSearchStore.getState().resetFilters();
@@ -318,28 +331,16 @@ export function FilterPanel({
   const renderDesktopLocationFilter = (fullWidth = false) => {
     if (bbox) {
       return (
-        <div
-          className="cursor-pointer"
-          onClick={() => setSpatialPanelOpen(true)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter' || event.key === ' ') {
-              event.preventDefault();
-              setSpatialPanelOpen(true);
-            }
+        <FilterChip
+          label={t('filters.areaSelected', { defaultValue: 'Area selected' })}
+          onSelect={() => setSpatialPanelOpen(true)}
+          onRemove={() => {
+            const store = useSearchStore.getState();
+            store.setFilter('bbox', '');
+            store.setFilter('geometry', '');
+            store.setFilter('spatial_predicate', 'intersects');
           }}
-          role="button"
-          tabIndex={0}
-        >
-          <FilterChip
-            label={t('filters.areaSelected', { defaultValue: 'Area selected' })}
-            onRemove={() => {
-              const store = useSearchStore.getState();
-              store.setFilter('bbox', '');
-              store.setFilter('geometry', '');
-              store.setFilter('spatial_predicate', 'intersects');
-            }}
-          />
-        </div>
+        />
       );
     }
 
@@ -391,11 +392,7 @@ export function FilterPanel({
     if (datetime) {
       return (
         <FilterChip
-          label={t('filters.temporalExtentRange', {
-            start: temporalStart || '..',
-            end: temporalEnd || '..',
-            defaultValue: 'Temporal Extent: {{start}} - {{end}}',
-          })}
+          label={dataCoverageDateChipLabel}
           onRemove={() => useSearchStore.getState().setFilter('datetime', '')}
         />
       );
@@ -406,7 +403,7 @@ export function FilterPanel({
           <PopoverTrigger asChild>
             <Button variant="outline" size="sm" className={cn(fullWidth && 'w-full justify-start')}>
               <Calendar className="me-1 size-3.5" />
-              {t('filters.temporalExtent', { defaultValue: 'Temporal Extent' })}
+              {t('filters.dataCoverageDate', { defaultValue: 'Dates covered by the data' })}
             </Button>
           </PopoverTrigger>
         <PopoverContent align="start" className="w-64">
@@ -585,7 +582,7 @@ export function FilterPanel({
       <div className="flex items-start justify-between gap-3">
         <div className="space-y-1">
           <p className="text-sm font-semibold text-foreground">
-            {t('filters.filtersButton', { defaultValue: 'Filters' })}
+            {t('filters.datasetFilters', { defaultValue: 'Dataset filters' })}
           </p>
           {totalResultsLabel ? (
             <p className="text-sm text-muted-foreground">{totalResultsLabel}</p>
@@ -609,6 +606,84 @@ export function FilterPanel({
         </div>
       ) : null}
 
+      {hasActiveFilters && (
+        <div className="space-y-2 border-y border-border/60 py-3">
+          <p className="eyebrow">
+            {t('filters.activeRefinements', { defaultValue: 'Active refinements' })}
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {recordType && (
+              <FilterChip
+                label={getRecordTypeLabel(recordType)}
+                onRemove={() => useSearchStore.getState().setFilter('record_type', '')}
+              />
+            )}
+            {collectionId && facets?.collections && (
+              <FilterChip
+                label={facets.collections.find((c) => c.id === collectionId)?.name || t('filters.collection', { defaultValue: 'Collection' })}
+                onRemove={() => useSearchStore.getState().setFilter('collection_id', '')}
+              />
+            )}
+            {geometryType && (
+              <FilterChip
+                label={activeGeomLabel || geometryType}
+                onRemove={() => useSearchStore.getState().setFilter('geometry_type', '')}
+              />
+            )}
+            {sourceOrganization && (
+              <FilterChip
+                label={sourceOrganization}
+                onRemove={() => useSearchStore.getState().setFilter('source_organization', '')}
+              />
+            )}
+            {srid && (
+              <FilterChip
+                label={`EPSG:${srid}`}
+                onRemove={() => useSearchStore.getState().setFilter('srid', '')}
+              />
+            )}
+            {bbox && (
+              <FilterChip
+                label={t('filters.areaSelected', { defaultValue: 'Area selected' })}
+                onRemove={() => {
+                  const store = useSearchStore.getState();
+                  store.setFilter('bbox', '');
+                  store.setFilter('geometry', '');
+                  store.setFilter('spatial_predicate', 'intersects');
+                }}
+              />
+            )}
+            {(dateFrom || dateTo) && (
+              <FilterChip
+                label={dateChipLabel}
+                onRemove={() => {
+                  useSearchStore.getState().setFilter('date_from', '');
+                  useSearchStore.getState().setFilter('date_to', '');
+                  setLocalDateFrom('');
+                  setLocalDateTo('');
+                }}
+              />
+            )}
+            {datetime && (
+              <FilterChip
+                label={dataCoverageDateChipLabel}
+                onRemove={() => useSearchStore.getState().setFilter('datetime', '')}
+              />
+            )}
+            {selectedKeywords.map((keyword) => (
+              <FilterChip
+                key={keyword}
+                label={keyword}
+                onRemove={() => useSearchStore.getState().setFilter(
+                  'keywords',
+                  useSearchStore.getState().keywords.filter((value) => value !== keyword),
+                )}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="space-y-2">
         <p className="eyebrow">
           {t('filters.type', { defaultValue: 'Type' })}
@@ -623,7 +698,7 @@ export function FilterPanel({
         >
           <ToggleGroupItem value="all" className="h-8 justify-between px-3 text-xs">
             {t('filters.allTypes', { defaultValue: 'All' })}
-            {Object.keys(counts).length > 0 && <span className="readout text-muted-foreground">{allTypeCount}</span>}
+            {(allTypesTotal !== undefined || Object.keys(counts).length > 0) && <span className="readout text-muted-foreground">{allTypeCount}</span>}
           </ToggleGroupItem>
           <ToggleGroupItem value="vector_dataset" className="h-8 justify-between px-3 text-xs" disabled={counts.vector_dataset === 0}>
             {t('filters.vector', { defaultValue: 'Vector' })}
@@ -641,6 +716,18 @@ export function FilterPanel({
             <ToggleGroupItem value="table" className="h-8 justify-between px-3 text-xs" disabled={counts.table === 0}>
               {t('card.table', { defaultValue: 'Table' })}
               {counts.table !== undefined && <span className="readout text-muted-foreground">{counts.table}</span>}
+            </ToggleGroupItem>
+          )}
+          {showsTiles3dToggle && (
+            <ToggleGroupItem value="tiles3d_dataset" className="h-8 justify-between px-3 text-xs" disabled={counts.tiles3d_dataset === 0}>
+              {t('card.tiles3d', { defaultValue: '3D Tiles' })}
+              <span className="readout text-muted-foreground">{counts.tiles3d_dataset}</span>
+            </ToggleGroupItem>
+          )}
+          {showsPointcloudToggle && (
+            <ToggleGroupItem value="pointcloud_dataset" className="h-8 justify-between px-3 text-xs" disabled={counts.pointcloud_dataset === 0}>
+              {t('card.pointcloud', { defaultValue: 'Point cloud' })}
+              <span className="readout text-muted-foreground">{counts.pointcloud_dataset}</span>
             </ToggleGroupItem>
           )}
         </ToggleGroup>
@@ -685,26 +772,10 @@ export function FilterPanel({
 
       <div className="space-y-2">
         <p className="eyebrow">
-          {t('filters.dateRange')}
-        </p>
-        {renderDesktopDateFilter(true)}
-      </div>
-
-      <div className="space-y-2">
-        <p className="eyebrow">
-          {t('filters.temporalExtent', { defaultValue: 'Temporal Extent' })}
+          {t('filters.dataCoverageDate', { defaultValue: 'Dates covered by the data' })}
         </p>
         {renderTemporalExtentControl(true)}
       </div>
-
-      {recordType === 'vector_dataset' && (
-        <div className="space-y-2">
-          <p className="eyebrow">
-            {t('filters.geometry')}
-          </p>
-          {renderGeometryControl()}
-        </div>
-      )}
 
       {organizations.length > 0 && (
         <div className="space-y-2">
@@ -715,19 +786,45 @@ export function FilterPanel({
         </div>
       )}
 
-      {showSridFilter && (
-        <div className="space-y-2">
-          <p className="eyebrow">
-            {t('filters.crs')}
-          </p>
-          {renderSridControl()}
-        </div>
-      )}
+      <Collapsible open={advancedFiltersOpen} onOpenChange={setAdvancedFiltersOpen}>
+        <CollapsibleTrigger asChild>
+          <Button
+            type="button"
+            variant="outline"
+            className="w-full justify-between"
+          >
+            {t('filters.advancedFilters', { defaultValue: 'Advanced filters' })}
+            <ChevronDown
+              className={cn('size-4 transition-transform', advancedFiltersOpen && 'rotate-180')}
+              aria-hidden="true"
+            />
+          </Button>
+        </CollapsibleTrigger>
+        <CollapsibleContent className="space-y-4 pt-4">
+          {recordType === 'vector_dataset' && (
+            <div className="space-y-2">
+              <p className="eyebrow">{t('filters.geometry')}</p>
+              {renderGeometryControl()}
+            </div>
+          )}
+
+          {showSridFilter && (
+            <div className="space-y-2">
+              <p className="eyebrow">{t('filters.crs')}</p>
+              {renderSridControl()}
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <p className="eyebrow">{t('filters.dateRange')}</p>
+            {renderDesktopDateFilter(true)}
+          </div>
+
+        </CollapsibleContent>
+      </Collapsible>
 
       <div className="space-y-2">
-        <p className="eyebrow">
-          {t('filters.sort')}
-        </p>
+        <p className="eyebrow">{t('filters.sort')}</p>
         {renderSortControl(true, false)}
       </div>
     </div>
@@ -737,7 +834,7 @@ export function FilterPanel({
   // Section 5: JSX layout
   // ----
   // The render is split into three responsive layers:
-  //   - Mobile (`md:hidden`): condensed bar with a "Filters" button that
+  //   - Mobile (`lg:hidden`): condensed bar with a "Filters" button that
   //     opens the AdvancedSheet, plus the active filter chip row
   //   - Desktop primary row (`hidden md:flex`): record-type tabs, keyword
   //     facets, collection select, location, date, temporal extent, sort,
@@ -749,7 +846,7 @@ export function FilterPanel({
   return (
     <>
       {/* ---- Mobile bar + chip row + sheet ---- */}
-      {showMobile && <FilterSheet totalResults={totalResults} />}
+      {showMobile && <FilterSheet totalResults={totalResults} allTypesTotal={allTypesTotal} />}
 
       {/* ---- Desktop primary filter row ---- */}
       {showDesktop && desktopLayout === 'rail' ? renderDesktopRail() : null}
@@ -768,7 +865,7 @@ export function FilterPanel({
               >
                 <ToggleGroupItem value="all" className="text-xs px-2.5 h-7">
                   {t('filters.allTypes', { defaultValue: 'All' })}
-                  {Object.keys(counts).length > 0 && ` (${allTypeCount})`}
+                  {(allTypesTotal !== undefined || Object.keys(counts).length > 0) && ` (${allTypeCount})`}
                 </ToggleGroupItem>
                 <ToggleGroupItem value="vector_dataset" className="text-xs px-2.5 h-7" disabled={counts.vector_dataset === 0}>
                   {t('filters.vector', { defaultValue: 'Vector' })}
@@ -786,6 +883,18 @@ export function FilterPanel({
                   <ToggleGroupItem value="table" className="text-xs px-2.5 h-7" disabled={counts.table === 0}>
                     {t('card.table', { defaultValue: 'Table' })}
                     {counts.table !== undefined && ` (${counts.table})`}
+                  </ToggleGroupItem>
+                )}
+                {showsTiles3dToggle && (
+                  <ToggleGroupItem value="tiles3d_dataset" className="text-xs px-2.5 h-7" disabled={counts.tiles3d_dataset === 0}>
+                    {t('card.tiles3d', { defaultValue: '3D Tiles' })}
+                    {` (${counts.tiles3d_dataset})`}
+                  </ToggleGroupItem>
+                )}
+                {showsPointcloudToggle && (
+                  <ToggleGroupItem value="pointcloud_dataset" className="text-xs px-2.5 h-7" disabled={counts.pointcloud_dataset === 0}>
+                    {t('card.pointcloud', { defaultValue: 'Point cloud' })}
+                    {` (${counts.pointcloud_dataset})`}
                   </ToggleGroupItem>
                 )}
               </ToggleGroup>
@@ -865,24 +974,6 @@ export function FilterPanel({
         </>
       )}
 
-
-      <Suspense fallback={null}>
-        {spatialPanelOpen ? (
-          <LazySpatialFilterPanel
-            open={spatialPanelOpen}
-            onClose={() => setSpatialPanelOpen(false)}
-            onApply={(bboxValue, predicate, geometry) => {
-              const store = useSearchStore.getState();
-              store.setFilter('bbox', bboxValue);
-              store.setFilter('spatial_predicate', predicate);
-              store.setFilter('geometry', geometry ? JSON.stringify(geometry) : '');
-              setSpatialPanelOpen(false);
-            }}
-            initialBbox={bbox}
-            initialPredicate={useSearchStore.getState().spatial_predicate}
-          />
-        ) : null}
-      </Suspense>
     </>
   );
 }

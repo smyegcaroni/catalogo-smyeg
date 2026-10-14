@@ -2,15 +2,27 @@
 
 [English](README.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [简体中文](README.zh.md)
 
-**El centro autohospedado de datos espaciales de tu equipo: consulta, representa y comparte todo desde un único lugar.**
+**Convierte archivos SIG dispersos en un catálogo consultable y mapas para compartir, en tu propia infraestructura.**
 
-GeoLens es un centro de datos espaciales de código abierto para equipos de SIG y datos: un único lugar donde encontrar y usar datos en la infraestructura que controlas y sin telemetría. GeoLens no se comunica con ningún servicio externo por sí mismo, salvo las teselas de mapa base predeterminadas, que se cargan desde tiles.openfreemap.org hasta que un administrador configure otras. (El resto de funciones que actives sí pueden realizar llamadas salientes: el asistente de IA al endpoint compatible con OpenAI o la clave de Anthropic que elijas, el inicio de sesión OAuth/OIDC, SMTP, fuentes de datos remotas/S3 y copias de seguridad externas). Sube archivos, crea datasets en el navegador, registra sin copiarlas tablas que ya estén en la base de datos PostGIS de GeoLens, importa copias puntuales desde WFS, ArcGIS FeatureServer u OGC API Features, o mantén referencias activas a recursos STAC remotos. GeoLens registra el origen de cada dataset, indexa los metadatos del catálogo con pg_trgm para ofrecer búsqueda difusa desde el primer momento (pgvector añade clasificación semántica cuando configuras un proveedor de embeddings y activas la búsqueda semántica) y publica APIs OGC/STAC a las que QGIS, ArcGIS y MapLibre se conectan de forma nativa. Compón, aplica estilos y comparte mapas multicapa directamente en el navegador. Construido con FastAPI y React. Desplegado con un solo comando.
+GeoLens reúne archivos, tablas de bases de datos, instantáneas de servicios y recursos remotos en un catálogo espacial que controlas. Busca metadatos, previsualiza datos y conserva visible el origen de cada conjunto. Crea mapas en el navegador, publica enlaces o incrustaciones y sigue usando QGIS y estándares abiertos con las herramientas de tu equipo.
 
 <p align="center">
   <a href="https://demo.getgeolens.com"><img src="https://img.shields.io/badge/%E2%96%B6%20Try%20the%20live%20demo-demo.getgeolens.com-2563eb?style=for-the-badge" alt="Prueba la demostración en vivo" /></a>
   <br />
   <sub>No requiere instalación. Explora el catálogo y los mapas de ejemplo sin una cuenta, o inicia sesión con Google, GitHub o Microsoft para probar el constructor de mapas. Los datos de demostración pueden borrarse en cualquier momento.</sub>
 </p>
+
+<p align="center">
+  <a href="https://demo.getgeolens.com/maps"><img src=".github/assets/geolens-manhattan-3d-hero.jpg" alt="Constructor de mapas de GeoLens con los edificios de Manhattan extruidos en un horizonte 3D, coloreados por época de construcción, junto al metro y la pila de capas reordenable" width="900" /></a>
+  <br />
+  <em>El constructor de mapas: cada edificio de Manhattan extruido a la altura real de su tejado y coloreado según la época en que se construyó, con el metro discurriendo por debajo; creado a partir de datos abiertos con <code>scripts/seed-showcase.py</code></em>
+</p>
+
+## Lo que puedes hacer
+
+- **Encuentra datasets:** busca en un solo catálogo entre archivos cargados, tablas de bases de datos e instantáneas de servicios importadas.
+- **Crea y comparte mapas:** compón mapas multicapa en el navegador y publica un enlace o incrústalos donde trabaja tu equipo.
+- **Usa tus herramientas actuales:** conecta QGIS, ArcGIS, MapLibre y scripts mediante APIs OGC/STAC y URLs directas de teselas.
 
 [![CI](https://github.com/geolens-io/geolens/actions/workflows/ci.yml/badge.svg)](https://github.com/geolens-io/geolens/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -23,11 +35,11 @@ curl -fsSL https://getgeolens.com/install.sh | sh
 # Open http://localhost:8080, then log in with the credentials you chose
 ```
 
-<p align="center">
-  <img src=".github/assets/geolens-manhattan-3d-hero.jpg" alt="Constructor de mapas de GeoLens con los edificios de Manhattan extruidos en un horizonte 3D, coloreados por época de construcción, junto al metro y la pila de capas reordenable" width="900" />
-  <br />
-  <em>El constructor de mapas: cada edificio de Manhattan extruido a la altura real de su tejado y coloreado según la época en que se construyó, con el metro discurriendo por debajo; creado a partir de datos abiertos con <code>scripts/seed-showcase.py</code></em>
-</p>
+## Privacidad, conexiones salientes y fuentes de datos
+
+GeoLens no tiene telemetría ni se comunica con ningún servicio externo, salvo las teselas de mapa base predeterminadas de tiles.openfreemap.org hasta que un administrador configure otro proveedor. Las funciones que actives pueden realizar llamadas salientes: asistencia de IA al endpoint compatible con OpenAI o la clave de Anthropic que elijas, inicio de sesión OAuth/OIDC, SMTP, fuentes de datos remotas o S3 y copias de seguridad externas.
+
+Sube archivos, crea datasets en el navegador o registra sin copiarlas tablas que ya estén en la base de datos PostGIS de GeoLens. Las importaciones desde WFS, ArcGIS FeatureServer u OGC API Features crean copias puntuales; los recursos STAC remotos permanecen como referencias activas. GeoLens registra el origen de cada dataset, indexa metadatos con pg_trgm para búsqueda difusa y puede añadir clasificación semántica con pgvector después de configurar un proveedor de embeddings y activar esa búsqueda.
 
 > [!NOTE]
 > **Estabilidad de la API.** Las superficies estándar (OGC API Features/Records,
@@ -199,7 +211,7 @@ Cada ejemplo anterior tiene una guía completa en la [documentación](https://do
 
 ## Inicio rápido
 
-**Requisitos previos:** Docker Engine 24+ y Docker Compose v2. El entorno incluido incorpora PostgreSQL 18. Si conectas GeoLens a una base de datos administrada externamente, debe ser **PostgreSQL 13+** (para `gen_random_uuid()`) con **pgvector 0.5+** (para índices HNSW de búsqueda semántica), además de PostGIS, pg_trgm y unaccent. La API y el worker se ejecutan en contenedores (se incluye Python 3.14; no hace falta Python en el host). La CLI opcional se ejecuta en el host y requiere Python 3.11+; el SDK de Python y los scripts de datos iniciales requieren Python 3.10+.
+**Requisitos previos:** Docker Engine 24+ y Docker Compose v2. El entorno incluido incorpora PostgreSQL 18. Si conectas GeoLens a una base de datos administrada externamente, debe ser **PostgreSQL 15+** (para los índices únicos `NULLS NOT DISTINCT`) con **pgvector 0.5+** (para índices HNSW de búsqueda semántica), además de PostGIS, pg_trgm y unaccent. La API y el worker se ejecutan en contenedores (se incluye Python 3.14; no hace falta Python en el host). La CLI opcional se ejecuta en el host y requiere Python 3.11+; el SDK de Python y los scripts de datos iniciales requieren Python 3.10+.
 
 La instalación en una línea descarga las imágenes precompiladas y fijadas a una versión e inicia el entorno:
 
@@ -323,7 +335,7 @@ flowchart TB
 | Teselas ráster | Titiler (servidor de teselas COG) |
 | Almacenamiento de objetos | MinIO (compatible con S3, desarrollo local) o cualquier proveedor S3 |
 | Caché | Valkey (caché de teselas y consultas) |
-| Base de datos | PostgreSQL 18 + PostGIS 3.6 + pgvector + pg_trgm (mínimo: PostgreSQL 13, pgvector 0.5) |
+| Base de datos | PostgreSQL 18 + PostGIS 3.6 + pgvector + pg_trgm (mínimo: PostgreSQL 15, pgvector 0.5) |
 | Proxy inverso | Nginx (producción) / proxy de desarrollo Vite (desarrollo) |
 
 ## Configuración

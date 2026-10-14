@@ -11,15 +11,16 @@ import {
   startUrlImport,
   type UrlImportSession,
 } from '@/api/url-import-session';
-import { useJobStatus } from '@/components/import/hooks/use-ingest';
+import { useJobStatus, useUploadConfig } from '@/components/import/hooks/use-ingest';
+import { describeFailureReason } from '@/lib/failure-reason';
 import type {
   CommitImportRequest,
-  FilePreviewResponse,
-  RasterPreviewResponse,
+  UrlUploadKind,
 } from '@/types/api';
-import { isFilePreview, isRasterPreview } from './utils';
+import { allowedTilesetExtensions, isFilePreview, isRasterPreview, isTilesetPreview } from './utils';
 import { ImportPreview } from './ImportPreview';
 import { ImportMetadataForm } from './ImportMetadataForm';
+import { UploadKindChoice } from './UploadKindChoice';
 import { JobProgress } from './JobProgress';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -80,21 +81,24 @@ function isGoneError(err: unknown): boolean {
  * track. Single-file, single-dataset; multi-layer containers get a layer
  * picker before commit.
  */
-export function UrlImportForm() {
+export function UrlImportForm({ initialUrl = '' }: { initialUrl?: string }) {
   const { t } = useTranslation('import');
   const [step, setStep] = useState<UrlStep>('idle');
-  const [url, setUrl] = useState('');
+  const [url, setUrl] = useState(initialUrl);
   const [filename, setFilename] = useState('');
   const [jobId, setJobId] = useState<string | null>(null);
-  const [previewData, setPreviewData] = useState<
-    FilePreviewResponse | RasterPreviewResponse | null
-  >(null);
+  const [previewData, setPreviewData] = useState<Awaited<ReturnType<typeof previewFile>> | null>(null);
   const [error, setError] = useState<string | null>(null);
   // fix(#1708 codex r22): survives a resume, where previewData does not.
   const [isRaster, setIsRaster] = useState(false);
   // fix(review #1800 P2): disables "Cancel and start over" for the duration
   // of the cancel call, so a double-click cannot fire two cancels.
   const [isCancelling, setIsCancelling] = useState(false);
+  const [chosenKind, setChosenKind] = useState<UrlUploadKind | null>(null);
+  const { data: uploadConfig } = useUploadConfig();
+  const tilesetAvailable =
+    allowedTilesetExtensions(uploadConfig?.allowed_extensions?.split(',').map((e) => e.trim())).length > 0;
+  const kind = tilesetAvailable ? chosenKind : null;
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -296,7 +300,13 @@ export function UrlImportForm() {
     // form IS the feedback; an error toast would report their own click back
     // to them. Every other terminal status is a failure the form must explain.
     if (trackedJob.status !== 'cancelled') {
-      const msg = trackedJob.error_message || t('urlImport.downloadFailed');
+      const msg = trackedJob.error_message
+        ? describeFailureReason(
+            trackedJob.error_message,
+            t('common:errors.internalFailureReason'),
+            trackedJob.error_code,
+          )
+        : t('urlImport.downloadFailed');
       setError(msg);
       toast.error(msg);
     }
@@ -350,6 +360,7 @@ export function UrlImportForm() {
   useEffect(() => {
     const session = peekUrlImport();
     if (!session) return;
+    setChosenKind(session.kind);
     if (session.commit && session.jobId) {
       setIsRaster(session.isRaster);
       void runResumedCommit(session.commit, session.jobId);
@@ -375,7 +386,7 @@ export function UrlImportForm() {
     if (jobId) return;
     const trimmed = url.trim();
     if (!trimmed) return;
-    await runSession(startUrlImport(trimmed, filename.trim() || undefined));
+    await runSession(startUrlImport(trimmed, filename.trim() || undefined, kind));
   };
 
   const handleLayerChange = async (layerName: string) => {
@@ -522,6 +533,7 @@ export function UrlImportForm() {
           onCommit={handleCommit}
           isCommitting={commitInFlight}
           isRaster={raster}
+          isTileset={isTilesetPreview(previewData)}
           previewData={raster ? previewData : undefined}
           previewColumns={fp?.columns}
           detectedGeometryType={fp?.geometry_type}
@@ -592,6 +604,12 @@ export function UrlImportForm() {
         </div>
       )}
       <form onSubmit={handleFetch} className="space-y-5">
+        <UploadKindChoice
+          value={kind}
+          onChange={(next) => setChosenKind(next === 'tiles3d' ? next : null)}
+          disabled={!!jobId}
+          tilesetAvailable={tilesetAvailable}
+        />
         <div>
           <label className="eyebrow mb-2.5 block" htmlFor="file-url-input">
             {t('urlImport.label')}
@@ -618,17 +636,19 @@ export function UrlImportForm() {
               {t('urlImport.fetch')}
             </button>
           </div>
-          <div className="mt-2.5 flex flex-wrap gap-4 text-xs text-muted-foreground">
-            <span>
-              {t('urlImport.supported')}{' '}
-              <code className="rounded-sm bg-surface-2 px-1.5 py-px font-mono text-mini text-muted-foreground">GeoParquet</code>{' '}
-              <code className="rounded-sm bg-surface-2 px-1.5 py-px font-mono text-mini text-muted-foreground">FlatGeobuf</code>{' '}
-              <code className="rounded-sm bg-surface-2 px-1.5 py-px font-mono text-mini text-muted-foreground">GeoJSON</code>{' '}
-              <code className="rounded-sm bg-surface-2 px-1.5 py-px font-mono text-mini text-muted-foreground">GeoPackage</code>{' '}
-              <code className="rounded-sm bg-surface-2 px-1.5 py-px font-mono text-mini text-muted-foreground">GeoTIFF</code>{' '}
-              <code className="rounded-sm bg-surface-2 px-1.5 py-px font-mono text-mini text-muted-foreground">CSV</code>
-            </span>
-          </div>
+          {kind === null && (
+            <div className="mt-2.5 flex flex-wrap gap-4 text-xs text-muted-foreground">
+              <span>
+                {t('urlImport.supported')}{' '}
+                <code className="rounded-sm bg-surface-2 px-1.5 py-px font-mono text-mini text-muted-foreground">GeoParquet</code>{' '}
+                <code className="rounded-sm bg-surface-2 px-1.5 py-px font-mono text-mini text-muted-foreground">FlatGeobuf</code>{' '}
+                <code className="rounded-sm bg-surface-2 px-1.5 py-px font-mono text-mini text-muted-foreground">GeoJSON</code>{' '}
+                <code className="rounded-sm bg-surface-2 px-1.5 py-px font-mono text-mini text-muted-foreground">GeoPackage</code>{' '}
+                <code className="rounded-sm bg-surface-2 px-1.5 py-px font-mono text-mini text-muted-foreground">GeoTIFF</code>{' '}
+                <code className="rounded-sm bg-surface-2 px-1.5 py-px font-mono text-mini text-muted-foreground">CSV</code>
+              </span>
+            </div>
+          )}
         </div>
 
         <div className="space-y-2">

@@ -30,9 +30,10 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
+from app.platform.jobs import ledger
 from app.platform.jobs.heartbeat import require_ingest_job_update
 from app.platform.jobs.models import IngestJob
-from app.platform.jobs.router import _reconcile_cancelled_vrt_regeneration
+from app.platform.jobs.ledger import release_vrt_regeneration
 from app.processing.raster.models import RasterAsset, VrtGeneration, VrtSourceLink
 from tests.factories import create_dataset, get_user_id
 
@@ -201,12 +202,7 @@ async def test_cancel_blocked_by_publish_lock_leaves_worker_state_intact(
     generation.completed_at = now
     asset.status = "ready"
     asset.current_generation_id = None
-    await require_ingest_job_update(
-        test_db_session,
-        job.id,
-        job.attempt_id,
-        values={"status": "complete", "completed_at": now},
-    )
+    await ledger.complete(test_db_session, job.id, job.attempt_id)
     await test_db_session.commit()
 
     await test_db_session.refresh(generation)
@@ -276,8 +272,11 @@ class TestReconcileGuards:
         generation.error_message = "GDAL exploded"
         await test_db_session.commit()
 
-        await _reconcile_cancelled_vrt_regeneration(
-            test_db_session, asset.dataset_id, datetime.now(timezone.utc)
+        await release_vrt_regeneration(
+            test_db_session,
+            asset.dataset_id,
+            datetime.now(timezone.utc),
+            message="Cancelled by user",
         )
         await test_db_session.commit()
         await test_db_session.refresh(generation)
@@ -294,8 +293,11 @@ class TestReconcileGuards:
         generation.completed_at = datetime.now(timezone.utc)
         await test_db_session.commit()
 
-        await _reconcile_cancelled_vrt_regeneration(
-            test_db_session, asset.dataset_id, datetime.now(timezone.utc)
+        await release_vrt_regeneration(
+            test_db_session,
+            asset.dataset_id,
+            datetime.now(timezone.utc),
+            message="Cancelled by user",
         )
         await test_db_session.commit()
         await test_db_session.refresh(generation)

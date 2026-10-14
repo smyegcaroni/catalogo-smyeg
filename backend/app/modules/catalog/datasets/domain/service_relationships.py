@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 import structlog
@@ -13,7 +14,6 @@ if TYPE_CHECKING:
         DatasetRelationshipCreate,
     )
 
-from fastapi import HTTPException, status
 from sqlalchemy import select, text
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,12 +21,22 @@ from sqlalchemy.orm import joinedload
 
 from app.core.identity import Identity
 from app.modules.catalog.authorization import apply_visibility_filter
-from app.modules.catalog.datasets.domain._sql_safety import SAFE_COLUMN_NAME_RE
+from app.modules.catalog.datasets.domain._sql_safety import (
+    SAFE_COLUMN_NAME_RE,
+    _safe_column_ref,
+)
 from app.modules.catalog.datasets.domain.models import (
     AttributeMetadata,
     Dataset,
     DatasetGrant,
     Record,
+)
+from app.modules.catalog.datasets.domain.relationship_columns import (
+    has_missing_column,
+    is_undefined_column,
+    join_column_error,
+    refresh_dropped_join_column,
+    tables_unavailable_error,
 )
 from app.modules.catalog.datasets.domain.service_query import get_dataset
 from app.platform.extensions import get_catalog_port, get_permission_extension
@@ -41,6 +51,7 @@ __all__ = [
     "get_related_records",
     "get_relationship_datasets",
     "list_relationships",
+    "validate_relationship_columns",
 ]
 
 
@@ -164,6 +175,16 @@ async def get_related_datasets(
         return []
 
 
+def validate_relationship_columns(
+    source: Dataset, target: Dataset, rel: "DatasetRelationshipCreate"
+) -> None:
+    """Raise ``ValueError`` for a join column absent from a dataset's stored schema."""
+    for dataset, column in ((source, rel.source_column), (target, rel.target_column)):
+        known = {"gid", *(c["name"] for c in dataset.column_info or [])}
+        if dataset.column_info is None or column not in known:
+            raise ValueError(f"Column {column!r} not found in its dataset")
+
+
 async def create_relationship(
     session: AsyncSession,
     dataset_id: uuid.UUID,
@@ -204,9 +225,10 @@ async def _visible_relationships(
     # Dataset.id, so resolve the source's Dataset.id here (dataset_id is its
     # record_id). Create-input still takes target_dataset_id as a
     # record_id -- intentional asymmetry, unchanged here.
-    source_dataset_id = (
-        await session.execute(select(Dataset.id).where(Dataset.record_id == dataset_id))
+    source_dataset = (
+        await session.execute(select(Dataset).where(Dataset.record_id == dataset_id))
     ).scalar_one_or_none()
+    source_dataset_id = source_dataset.id if source_dataset is not None else None
 
     # Inner-join Dataset so relationships whose target has no backing
     # Dataset are dropped (fail-closed).
@@ -238,6 +260,8 @@ async def _visible_relationships(
                 "relationship_type": rel.relationship_type,
                 "label": rel.label,
                 "target_dataset_title": title,
+                "broken": source_dataset is not None
+                and has_missing_column(source_dataset, target_ds, rel),
             }
         )
     return visible_items
@@ -484,9 +508,9 @@ async def _fetch_fk_value(
     """Read the FK value from the source feature row, or None if absent."""
     table_ref = get_catalog_port().quote_table(source_table)
     result = await session.execute(
-        text(f"SELECT {source_column} FROM {table_ref} WHERE gid = :gid").bindparams(
-            gid=feature_gid
-        )
+        text(
+            f"SELECT {_safe_column_ref(source_column)} FROM {table_ref} WHERE gid = :gid"
+        ).bindparams(gid=feature_gid)
     )
     return result.scalar_one_or_none()
 
@@ -497,7 +521,8 @@ async def _count_target_rows(
     table_ref = get_catalog_port().quote_table(target_table)
     result = await session.execute(
         text(
-            f"SELECT COUNT(*) FROM {table_ref} WHERE {target_column} = :fk_val"
+            f"SELECT COUNT(*) FROM {table_ref} "
+            f"WHERE {_safe_column_ref(target_column)} = :fk_val"
         ).bindparams(fk_val=fk_value)
     )
     return int(result.scalar_one())
@@ -524,12 +549,11 @@ async def _fetch_target_rows(
     # projection -- a relationship may legitimately target a column the
     # projection drops (e.g. `geom`/`geom_4326`), and predicating on the
     # projected alias made such a fetch an undefined-column error.
-    qcol = '"' + target_column.replace('"', '""').replace(":", "\\:") + '"'
     rows_result = await session.execute(
         text(
             f"SELECT gid, to_jsonb(t.*) - 'gid' AS properties "
             f"FROM (SELECT gid{prop_sel} FROM {table_ref} "
-            f"      WHERE {qcol} = :fk_val "
+            f"      WHERE {_safe_column_ref(target_column)} = :fk_val "
             f"      ORDER BY gid LIMIT :lim OFFSET :off) t"
         ).bindparams(fk_val=fk_value, lim=limit, off=after)
     )
@@ -548,6 +572,7 @@ async def get_related_records(
     source_record_id: uuid.UUID | None = None,
     limit: int = 50,
     after: int = 0,
+    may_repair: Callable[[uuid.UUID], Awaitable[bool]] | None = None,
 ) -> dict:
     """Get related records for a feature via FK relationship.
 
@@ -558,7 +583,8 @@ async def get_related_records(
     URL: a relationship id cannot be replayed through an unrelated source
     dataset to read its target. Callers (the API layer) must pass the
     authorized source record id; access to the target dataset is authorized
-    separately at the call site.
+    separately at the call site. ``may_repair`` says whether the caller may
+    modify a dataset; only then is a dropped join column stored in the catalog.
     """
     from app.modules.catalog.datasets.domain.models import DatasetRelationship
 
@@ -594,6 +620,7 @@ async def get_related_records(
     # vector table) resolves to a missing data.<table>, raising
     # UndefinedTableError. Map that to 503 instead of an uncaught 500 that
     # holds the DB connection.
+    join_ds, join_column = source_ds, rel.source_column
     try:
         fk_value = await _fetch_fk_value(
             session, source_ds.table_name, rel.source_column, feature_gid
@@ -606,6 +633,7 @@ async def get_related_records(
                 "columns": [],
             }
 
+        join_ds, join_column = target_ds, rel.target_column
         total = await _count_target_rows(
             session, target_ds.table_name, rel.target_column, fk_value
         )
@@ -616,11 +644,15 @@ async def get_related_records(
         columns = await get_catalog_port().get_column_info(
             session, target_ds.table_name
         )
-    except (ProgrammingError, OperationalError):
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="A related dataset table is temporarily unavailable",
-        )
+    except ProgrammingError as exc:
+        error = join_column_error(exc, join_ds, join_column)
+        if error is None and is_undefined_column(exc):
+            error = await refresh_dropped_join_column(
+                session, join_ds.id, join_ds.table_name, join_column, may_repair
+            )
+        raise (error or tables_unavailable_error()) from exc
+    except OperationalError as exc:
+        raise tables_unavailable_error() from exc
     col_list = [{"name": c["name"], "type": c["type"]} for c in columns]
 
     next_cursor = after + limit if after + limit < total else None

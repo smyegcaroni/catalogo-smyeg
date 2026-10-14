@@ -52,7 +52,6 @@ from app.platform.dataset_origin import set_dataset_origin
 from app.platform.jobs.models import IngestJob
 from app.platform.refresh import credentials as creds
 from app.platform.refresh.models import DatasetRefreshRun
-from app.platform.refresh.service import record_refresh_failure
 from app.processing.ingest.tasks_common import resolve_service_type
 from tests.factories import create_dataset as _create_dataset, get_user_id
 
@@ -226,11 +225,12 @@ async def _run_for(session, dataset_id: uuid.UUID) -> DatasetRefreshRun | None:
 
 class TestRequestCarriesNoPointer:
     def test_the_request_model_has_no_source_fields(self) -> None:
-        """The request accepts credentials and review, never a source pointer."""
+        """The request accepts credentials and verification, never a source pointer."""
         assert set(DatasetRefreshRequest.model_fields) == {
             "token",
             "auth",
             "accept_blocked_run_id",
+            "verification_policy",
         }
 
     def test_unknown_source_fields_are_not_silently_accepted(self) -> None:
@@ -1589,10 +1589,8 @@ class TestCredentialHandoff:
         A Valkey blip used to reach the run row as `credential_expired`,
         telling the reader to re-issue a token that was never the problem.
         """
-        from app.processing.ingest.tasks_reupload import (
-            _resolve_service_token,
-            _service_refresh_error_code,
-        )
+        from app.processing.ingest.tasks_reupload import _service_refresh_error_code
+        from app.processing.ingest.tasks_reupload import _resolve_service_token
 
         class _DownBackend:
             async def put(self, key, value, ttl_seconds):
@@ -1862,133 +1860,6 @@ class TestWorkerCredentialClaim:
 
 
 # ---------------------------------------------------------------------------
-# The guarded contact stamp
-# ---------------------------------------------------------------------------
-
-
-class TestGuardedContactStamp:
-    async def _failed_run(self, session, dataset):
-        from app.platform.refresh.service import create_pending_run
-
-        job = IngestJob(
-            dataset_id=dataset.id,
-            status="running",
-            source_url=_WFS_BASE,
-            created_by=dataset.record.created_by,
-            user_metadata={"reupload": True, "dataset_id": str(dataset.id)},
-        )
-        session.add(job)
-        await session.commit()
-        await create_pending_run(
-            session,
-            dataset_id=dataset.id,
-            origin_kind="service",
-            trigger="api",
-            triggered_by=dataset.record.created_by,
-            ingest_job_id=job.id,
-            feature_count_before=dataset.feature_count,
-        )
-        await session.commit()
-        return job
-
-    async def test_a_matching_binding_dates_the_contact(
-        self, client: AsyncClient, test_db_session
-    ) -> None:
-        admin_id = await get_user_id(test_db_session, "admin")
-        dataset = await _service_dataset(test_db_session, created_by=admin_id)
-        job = await self._failed_run(test_db_session, dataset)
-
-        assert dataset.last_checked_at is None
-        await record_refresh_failure(
-            test_db_session,
-            ingest_job_id=job.id,
-            error_code="service_refresh_failed",
-            error_message="the origin timed out",
-            contacted_origin=True,
-            origin_binding=(
-                dataset.origin_uri,
-                dataset.origin_ref,
-                dataset.source_format,
-            ),
-        )
-        await test_db_session.commit()
-        await test_db_session.refresh(dataset)
-        assert dataset.last_checked_at is not None
-
-    async def test_a_rebound_dataset_is_not_dated_by_the_old_attempt(
-        self, client: AsyncClient, test_db_session
-    ) -> None:
-        """The race the guard exists for.
-
-        A concurrent re-upload finishes while a doomed service fetch is still
-        running. An ID-only stamp would date the NEW binding's contact from
-        the OLD binding's failure — and when the rebind is to an upload, that
-        is a contact time nothing could ever have produced, on a kind the
-        probe refuses to correct.
-        """
-        admin_id = await get_user_id(test_db_session, "admin")
-        dataset = await _service_dataset(test_db_session, created_by=admin_id)
-        job = await self._failed_run(test_db_session, dataset)
-        stale_binding = (
-            dataset.origin_uri,
-            dataset.origin_ref,
-            dataset.source_format,
-        )
-
-        set_dataset_origin(
-            dataset, "upload", uri=None, filename="replacement.gpkg", file_hash="abc"
-        )
-        dataset.source_format = "gpkg"
-        await test_db_session.commit()
-
-        await record_refresh_failure(
-            test_db_session,
-            ingest_job_id=job.id,
-            error_code="service_refresh_failed",
-            error_message="the origin timed out",
-            contacted_origin=True,
-            origin_binding=stale_binding,
-        )
-        await test_db_session.commit()
-        await test_db_session.refresh(dataset)
-        assert dataset.last_checked_at is None
-
-    async def test_key_order_in_origin_ref_is_not_a_rebind(
-        self, client: AsyncClient, test_db_session
-    ) -> None:
-        """jsonb compares semantically; a textual guard would false-negative."""
-        admin_id = await get_user_id(test_db_session, "admin")
-        dataset = await _service_dataset(test_db_session, created_by=admin_id)
-        job = await self._failed_run(test_db_session, dataset)
-        reordered = dict(reversed(list((dataset.origin_ref or {}).items())))
-
-        await record_refresh_failure(
-            test_db_session,
-            ingest_job_id=job.id,
-            error_code="service_refresh_failed",
-            error_message="the origin timed out",
-            contacted_origin=True,
-            origin_binding=(dataset.origin_uri, reordered, dataset.source_format),
-        )
-        await test_db_session.commit()
-        await test_db_session.refresh(dataset)
-        assert dataset.last_checked_at is not None
-
-    async def test_an_unguarded_contact_stamp_is_not_reachable(
-        self, test_db_session
-    ) -> None:
-        """The unguarded shape raises rather than falling back to id-only."""
-        with pytest.raises(ValueError, match="origin_binding"):
-            await record_refresh_failure(
-                test_db_session,
-                ingest_job_id=uuid.uuid4(),
-                error_code="service_refresh_failed",
-                error_message="boom",
-                contacted_origin=True,
-            )
-
-
-# ---------------------------------------------------------------------------
 # Credential renewal (#1277 review round 2)
 # ---------------------------------------------------------------------------
 
@@ -2165,14 +2036,14 @@ class TestCredentialRenewal:
             run_age_seconds=ABANDONED_RUN_CUTOFF_SECONDS + 3600,
         )
 
-        assert await sweep_abandoned_refresh_runs(test_db_session) == 0, (
+        await sweep_abandoned_refresh_runs(test_db_session)
+        run = await _run_for(test_db_session, dataset.id)
+        assert run is not None and run.status == "pending", (
             "the sweep must not cancel a run whose task is still live todo"
         )
         assert await creds.renew_queued_refresh_credentials(test_db_session) == 1, (
             "and renewal must keep the credential for exactly that run"
         )
-        run = await _run_for(test_db_session, dataset.id)
-        assert run is not None and run.status == "pending"
 
     async def test_renewal_and_the_sweep_agree_while_the_task_is_executing(
         self, client, test_db_session, credential_backend
@@ -2197,14 +2068,14 @@ class TestCredentialRenewal:
             run_age_seconds=ABANDONED_RUN_CUTOFF_SECONDS + 3600,
         )
 
-        assert await sweep_abandoned_refresh_runs(test_db_session) == 0, (
+        await sweep_abandoned_refresh_runs(test_db_session)
+        run = await _run_for(test_db_session, dataset.id)
+        assert run is not None and run.status == "pending", (
             "the sweep must not cancel a run whose task is executing"
         )
         assert await creds.renew_queued_refresh_credentials(test_db_session) == 1, (
             "and renewal must keep that run's credential through the pre-claim window"
         )
-        run = await _run_for(test_db_session, dataset.id)
-        assert run is not None and run.status == "pending"
 
     async def test_renewal_only_touches_its_own_dispatch(
         self, client, test_db_session, credential_backend

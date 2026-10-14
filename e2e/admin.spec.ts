@@ -1,4 +1,4 @@
-import { test, expect, type Locator, type Page } from '@playwright/test';
+import { test, expect, type Locator, type Page } from './helpers/session';
 
 // fix(#1204): the sortable column headers are tabbable buttons sitting between
 // the filter bar and the row toggles, so the first row control is a bounded
@@ -159,7 +159,7 @@ test.describe('Admin Panel', () => {
       timeout: 10_000,
     });
     await expect(page.getByText('Access Token Lifetime (minutes)')).toBeVisible();
-    await expect(page.getByText('Refresh Token Lifetime (days)')).toBeVisible();
+    await expect(page.getByText('Session idle timeout (days)')).toBeVisible();
   });
 
   test('settings: network page loads', async ({ page }) => {
@@ -308,4 +308,22 @@ test.describe('Admin Panel', () => {
       page.getByRole('heading', { level: 1, name: 'Map', exact: true }),
     ).toBeVisible();
   });
+
+  for (const width of [320, 390]) {
+    test(`published maps keeps every filter reachable at ${width}px`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 800 });
+      await page.goto('/admin/shared-maps');
+      await expect(
+        page.getByRole('heading', { level: 1, name: 'Published Maps' }),
+      ).toBeVisible();
+
+      for (const name of ['All', 'Active', 'Expired', 'Revoked']) {
+        const box = await page.getByRole('button', { name, exact: true }).boundingBox();
+        expect(box, `${name} filter`).not.toBeNull();
+        expect(box!.x + box!.width, `${name} filter right edge`).toBeLessThanOrEqual(width);
+      }
+      const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
+      expect(scrollWidth).toBeLessThanOrEqual(width);
+    });
+  }
 });

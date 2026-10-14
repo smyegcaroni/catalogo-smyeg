@@ -19,7 +19,10 @@ from app.modules.catalog.maps.schemas import (
     _MAX_LAYERS_PER_MAP,
     split_legacy_builder_paint,
 )
-from app.modules.catalog.maps.service_layers import bulk_check_dataset_access
+from app.modules.catalog.maps.service_layers import (
+    bulk_check_dataset_access,
+    lock_map_layers,
+)
 from app.modules.catalog.maps.service_shared import (
     LayerRow,
     _fetch_layer_rows_ordered,
@@ -55,11 +58,11 @@ def _prepare_layer_storage(
     dataset_id = layer_data["dataset_id"]
     record_type, geometry_type, is_dem = ds_meta.get(dataset_id, (None, None, None))
 
+    # Asked even when the caller names a layer type, so a dataset that cannot
+    # be a layer is refused either way.
+    dataset_layer_type = _infer_layer_type(record_type)
     explicit_lt = layer_data.get("layer_type")
-    if explicit_lt is not None:
-        resolved_layer_type = explicit_lt
-    else:
-        resolved_layer_type = _infer_layer_type(record_type)
+    resolved_layer_type = explicit_lt if explicit_lt is not None else dataset_layer_type
 
     paint = layer_data.get("paint")
     layout = layer_data.get("layout")
@@ -104,6 +107,7 @@ async def apply_layer_diff(
     user_roles: set[str],
 ) -> tuple[Map, list[LayerRow], str | None, str | None]:
     """Apply an incremental layer diff. Flushes but does NOT commit."""
+    await lock_map_layers(session, map_id)
     result = await session.execute(select(Map).where(Map.id == map_id))
     map_obj = result.scalar_one_or_none()
     if map_obj is None:

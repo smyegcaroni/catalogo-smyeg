@@ -119,6 +119,31 @@ export interface StacAsset {
   size_bytes?: number;
 }
 
+/** A COPC point cloud's published file. */
+export interface PointCloudMetadata {
+  /** URL path of the COPC file on the app origin; a replaced file gets a new URL. */
+  url: string | null;
+  size_bytes: number | null;
+  point_count: number | null;
+  /** LAS point data record format: 6, 7 (RGB) or 8 (RGB and near infrared). */
+  point_format: number | null;
+  vertical_crs: string | null;
+}
+
+/** A 3D Tiles dataset's published tileset. */
+export interface TilesetMetadata {
+  /** URL path of the tileset's tileset.json on the app origin, e.g. /api/datasets/{id}/tiles3d/tileset.json. */
+  url: string;
+  size_bytes: number | null;
+  version: string | null;
+  geometric_error: number | null;
+  bounding_volume: 'region' | 'box' | 'sphere' | null;
+  /** Tile formats in the tileset, sorted; null for a tileset published before they were recorded. */
+  content_types?: string[] | null;
+  /** Extensions a client must support to load it, sorted; null before they were recorded. */
+  extensions_required?: string[] | null;
+}
+
 export interface RasterMetadata {
   epsg: number | null;
   /** True when the CRS is geographic (res_x/res_y are degrees, not meters). */
@@ -126,6 +151,8 @@ export interface RasterMetadata {
   res_x: number | null;
   res_y: number | null;
   band_count: number | null;
+  /** Whether the raster is stored as elevation, so its tiles are terrain-RGB. */
+  is_dem?: boolean | null;
   nodata: string | null;
   compression: string | null;
   width: number | null;
@@ -140,6 +167,14 @@ export interface RasterMetadata {
   source_count: number | null;
   resolution_strategy: string | null;
 }
+
+/** What a staged 3D Tiles tileset archive holds, read without unpacking it. */
+export type TilesetPreviewResponse = components['schemas']['TilesetPreviewResponse'];
+export type PointCloudPreviewResponse = components['schemas']['PointCloudPreviewResponse'];
+
+/** Upload kinds for 3D Tiles archives and COPC point clouds. */
+export type UploadKind = NonNullable<components['schemas']['PresignedUploadRequest']['kind']>;
+export type UrlUploadKind = NonNullable<components['schemas']['UrlUploadRequest']['kind']>;
 
 export interface RasterPreviewResponse {
   job_id: string;
@@ -161,7 +196,7 @@ export interface RasterPreviewResponse {
 }
 
 // Mirrors backend chk_records_record_type CHECK constraint
-// (catalog/datasets/domain/models.py:52). Keep in sync if values change.
+// (catalog/datasets/domain/models.py). Keep in sync if values change.
 export type RecordType =
   | 'vector_dataset'
   | 'raster_dataset'
@@ -169,7 +204,9 @@ export type RecordType =
   | 'map'
   | 'service'
   | 'collection'
-  | 'table';
+  | 'table'
+  | 'tiles3d_dataset'
+  | 'pointcloud_dataset';
 // Mirrors backend chk_records_visibility CHECK constraint
 // (catalog/datasets/domain/models.py:35). Keep in sync if values change.
 export type DatasetVisibility = 'public' | 'internal' | 'restricted' | 'private';
@@ -227,6 +264,9 @@ export type ServiceAuthRequest = components['schemas']['ServiceAuthRequest'];
  * drops any dataset id the caller cannot see. */
 export interface DerivedFrom {
   dataset_id: string;
+  /** CQL2-JSON filter that selected the source features; absent when the
+   * whole source dataset was used. */
+  source_filter?: Record<string, unknown> | null;
   operation: string;
   params: Record<string, unknown>;
   created_at: string;
@@ -318,12 +358,14 @@ export interface DatasetResponse {
     overall: number;
     metadata_completeness: number;
     geometry_validity: number | null;
-    attribute_completeness: number;
+    attribute_completeness: number | null;
     crs_defined: number | null;
     computed_at: string | null;
   } | null;
   record_type: RecordType;
   raster: RasterMetadata | null;
+  tileset?: TilesetMetadata | null;
+  pointcloud?: PointCloudMetadata | null;
   stac_assets?: Record<string, StacAsset> | null;
   stac_extensions?: string[];
   language?: string;
@@ -335,7 +377,14 @@ export interface DatasetResponse {
    * visibility/status change exposing keywords inherited from an analysis
    * source the new audience cannot open. PATCH responses only. */
   metadata_warnings?: string[] | null;
+  /** The data the last replacement or restore replaced, restorable through
+   * POST /datasets/{id}/previous-version/restore. Detail endpoint only. */
+  previous_version?: PreviousVersion | null;
 }
+
+export type PreviousVersion = components['schemas']['PreviousVersionResponse'];
+export type RestorePreviousVersionResponse =
+  components['schemas']['RestorePreviousVersionResponse'];
 
 export interface DatasetListResponse {
   datasets: DatasetResponse[];
@@ -354,8 +403,8 @@ export interface DatasetUpdateRequest {
   license?: string;
   attribution?: string | null;
   source_organization?: string;
-  data_vintage_start?: string;
-  data_vintage_end?: string;
+  data_vintage_start?: string | null;
+  data_vintage_end?: string | null;
   lineage_summary?: string;
   update_frequency?: string;
   usage_constraints?: string;
@@ -557,7 +606,7 @@ export interface OGCRecordProperties {
     overall: number;
     metadata_completeness: number;
     geometry_validity: number | null;
-    attribute_completeness: number;
+    attribute_completeness: number | null;
     crs_defined: number | null;
     computed_at: string | null;
   } | null;
@@ -575,6 +624,7 @@ export interface OGCRecordProperties {
   last_refreshed_at?: string | null;
   update_frequency?: string | null;
   has_quicklook?: boolean;
+  quicklook_version?: string | null;
   band_count?: number | null;
   dataset_count?: number;
   vrt_type?: string | null;
@@ -641,6 +691,7 @@ export interface OGCRecordResponse {
 export interface SearchResponse {
   type: "FeatureCollection";
   numberMatched: number;
+  numberMatchedAllTypes?: number | null;
   numberReturned: number;
   features: OGCRecordResponse[];
   links?: OGCRecordLink[] | null;
@@ -719,8 +770,13 @@ export interface AdminJobResponse {
   source_filename: string | null;
   dataset_id: string | null;
   error_message: string | null;
+  error_code?: string | null;
   can_retry: boolean;
   retry_reason: string | null;
+  source_url?: string | null;
+  restart_source?: 'url' | 'service' | null;
+  /** Set on a replacement held for review rather than failed. */
+  review_state?: 'awaiting' | 'resolved' | null;
   user_metadata: Record<string, unknown> | null;
   created_by: string | null;
   username: string | null;
@@ -759,6 +815,7 @@ export interface JobStatusResponse {
   dataset_id: string | null;
   source_filename: string | null;
   error_message: string | null;
+  error_code?: string | null;
   can_retry: boolean;
   retry_reason: string | null;
   warning_message: string | null;
@@ -792,6 +849,8 @@ export interface JobStatusResponse {
   // as a clean success.
   rows_failed?: number | null;
   archive_failed: boolean;
+  /** True until the dataset's quicklook has been redrawn after publication. */
+  quicklook_pending?: boolean;
   temporal_parse_errors: Partial<
     Record<'temporal_start' | 'temporal_end', string>
   >;
@@ -990,6 +1049,17 @@ export type ReuploadSourceType = 'file' | 'service_url';
 
 export type ReuploadServicePreviewRequest = ServicePreviewRequest;
 
+export type ReviewReason =
+  | 'source_count_unavailable'
+  | 'empty_result'
+  | 'destructive_schema_change'
+  | 'geometry_type_changed'
+  | 'srid_changed'
+  | 'coordinate_dimension_reduced'
+  | 'arcgis_id_coverage_unavailable'
+  | 'arcgis_source_membership_changed'
+  | 'live_data_changed';
+
 export interface ReuploadPreviewResponse {
   job_id: string;
   source_filename: string | null;
@@ -1003,6 +1073,10 @@ export interface ReuploadPreviewResponse {
   // GPKG-01 Phase 1058: multi-layer support fields
   all_layers?: Array<{ name: string; feature_count: number; field_count: number }> | null;
   previous_source_layer?: string | null;
+  /** Changes that hold this replacement for review. */
+  review_reasons?: ReviewReason[];
+  /** Sent back on the commit once a person has seen `review_reasons`. */
+  review_fingerprint?: string | null;
 }
 
 export interface ReuploadCommitResponse {
@@ -1023,6 +1097,8 @@ export interface ReuploadCommitRequest {
    *  upload/preview/confirm window is not silently rebound to an upload.
    *  Optional — omitting it is the pre-#1768 contract. */
   expected_origin_kind?: DatasetOrigin | null;
+  /** The preview's `review_fingerprint`, once a person has seen its changes. */
+  review_fingerprint?: string | null;
 }
 
 export interface DatasetVersionResponse {
@@ -1037,6 +1113,8 @@ export interface DatasetVersionResponse {
   file_hash: string | null;
   uploaded_by: string | null;
   uploaded_at: string;
+  /** The version a restore published again as this one. */
+  restored_from_version?: number | null;
 }
 
 export interface DatasetVersionListResponse {
@@ -1051,6 +1129,8 @@ export interface DatasetVersionListResponse {
 export interface DatasetRefreshRequest {
   /** Transient credential for a protected service; never persisted. */
   token?: string | null;
+  /** Preserves a blocked run's stronger verification transport on review retry. */
+  verification_policy?: 'standard' | 'arcgis_id_set_v1';
   accept_blocked_run_id?: string | null;
   // feat(#1746 B4): structured credential, mutually exclusive with `token`
   // above — see `ServiceAuthRequest`.
@@ -1077,9 +1157,13 @@ export interface DatasetRefreshRunResponse {
    *  flight; see refresh/models.py's CHECK constraint comment for a
    *  concrete case. 'raster' is reserved for a future distinct
    *  raster-replace door label; today's raster-replace runs are recorded
-   *  'upload'. */
+   *  'upload'. 'restore' republishes the dataset's previous version. */
   origin_kind: string;
   trigger: string;
+  /** UTC occurrence time for scheduler-dispatched runs; absent on manual history. */
+  scheduled_for?: string | null;
+  /** Safe scheduler admission cutoff; no execution or credential reference. */
+  claim_deadline?: string | null;
   /** "pending" | "running" | "succeeded" | "failed" | "cancelled" | "blocked", kept as a
    *  plain string so an unrecognized future value degrades to its raw text
    *  instead of a type error. */
@@ -1097,19 +1181,23 @@ export interface DatasetRefreshRunResponse {
   /** Redacted to null for a reader who is neither the owner nor an admin. */
   verification?: {
     decision: 'allowed' | 'blocked' | 'rejected';
+    /** Policy captured when this run fetched and verified the source. */
+    verification_policy?: 'standard' | 'arcgis_id_set_v1';
     source_binding: Record<string, unknown>;
     source_count: number | null;
     fetched_count: number | null;
     count_status: 'matched' | 'mismatched' | 'unavailable';
-    identity_check: 'unavailable' | 'content_digest';
+    identity_check: 'unavailable' | 'content_digest' | 'arcgis_id_set';
     content_digest?: string | null;
+    arcgis_id_coverage?: Record<string, unknown> | null;
     staged_geometry_type?: string | null;
     staged_srid?: number | null;
     staged_coordinate_dimension?: number | null;
-    review_reasons: Array<
-      'source_count_unavailable' | 'empty_result' | 'destructive_schema_change'
-    >;
+    geometry_contract?: Record<string, unknown> | null;
+    review_reasons: ReviewReason[];
     review_fingerprint: string | null;
+    /** Why a file replacement with review reasons published. */
+    review_acknowledged_by?: 'preview' | 'accepted_run' | null;
     accepted_blocked_run_id: string | null;
     acceptance_consumed_by_run_id?: string | null;
   } | null;
@@ -1400,6 +1488,7 @@ export interface DuplicateMapResponse extends MapResponse {
 
 export interface MapSummaryResponse {
   id: string;
+  created_by?: string | null;
   name: string;
   description: string | null;
   visibility: MapVisibility;
@@ -1447,6 +1536,7 @@ export interface MapBrowseParams {
   sort_by?: string;
   sort_dir?: string;
   visibility?: string;
+  owned_only?: boolean;
 }
 
 export interface MapCreateRequest {
@@ -1593,6 +1683,8 @@ export interface SharedLayerResponse {
   /** feat(#1472): the backing dataset's required credit line (viewer parity
    * with MapLayerResponse.dataset_attribution). */
   dataset_attribution?: string | null;
+  /** Viewer parity with MapLayerResponse.dataset_extent_bbox. */
+  dataset_extent_bbox?: number[] | null;
 }
 
 export interface SharedMapResponse {
@@ -1697,9 +1789,16 @@ export interface EmbeddingStatsResponse {
 // acknowledgement, not a result. A full regenerate takes minutes and used to
 // hold the request open past the 600s edge timeout. Poll /jobs/{job_id} for
 // the run's outcome.
+export interface BackfillTenantRun {
+  tenant_id: string;
+  job_id: string | null;
+  status: 'pending' | 'already_running' | 'not_queued';
+}
+
 export interface BackfillResponse {
-  job_id: string;
+  job_id: string | null;
   status: string;
+  other_tenants?: BackfillTenantRun[];
 }
 
 // AI Map Generation
@@ -1807,6 +1906,10 @@ export interface LayerInfo {
   layer_type: string;
   layer_id: number | string | null;
   object_id_field: string | null;
+  source_layer_type?: string | null;
+  parent_layer_id?: number | null;
+  /** False for ArcGIS group, raster and annotation layers, which hold no features. */
+  importable?: boolean;
   /**
    * Backend-classified layer kind. Phase 1057 CLASS-07 D-09 / D-10.
    * Backend (schemas.py LayerInfo) always emits this field with default 'vector'.
@@ -1884,17 +1987,20 @@ export interface FileEntry {
   fileName: string;
   status: FileEntryStatus;
   jobId: string | null;
-  previewData: FilePreviewResponse | RasterPreviewResponse | null;
+  previewData: FilePreviewResponse | RasterPreviewResponse | TilesetPreviewResponse | PointCloudPreviewResponse | null;
+  uploadKind?: UploadKind | null;
   error: string | null;
   /** Byte-transfer progress (0–1) during the `uploading` phase; null when unknown/done. */
   progress?: number | null;
   submittedTitle?: string | null;
   submittedVisibility?: string | null;
   submittedKind?: DataKind | null;
+  /** The latest commit's request, so a refused commit's review keeps the user's edits. */
+  commitRequest?: CommitImportRequest | null;
 }
 
 /** Canonical data-kind union used by TypeTag, StatusPill, and import utilities */
-export type DataKind = 'vector' | 'raster' | 'table' | 'vrt';
+export type DataKind = 'vector' | 'raster' | 'table' | 'vrt' | 'tiles3d' | 'pointcloud';
 
 // Table discovery types
 export interface DiscoveredTable {
@@ -1902,6 +2008,8 @@ export interface DiscoveredTable {
   geometry_type: GeometryTypeName | null;
   srid: number | null;
   estimated_rows: number | null;
+  /** A GeoLens code for why registration would refuse this table; null when discovery finds none. */
+  refusal_reason?: string | null;
 }
 
 export interface DiscoverResponse {
@@ -2019,11 +2127,7 @@ export interface UploadConfig {
   remaining_dataset_quota: number | null;
 }
 
-export interface PresignedUploadRequest {
-  filename: string;
-  file_size: number;
-  content_type?: string;
-}
+export type PresignedUploadRequest = components['schemas']['PresignedUploadRequest'];
 
 export interface PresignedUploadResponse {
   job_id: string;
@@ -2128,6 +2232,8 @@ export interface StacConnectResponse {
   title: string;
   description: string;
   stac_version: string;
+  /** Landing page conformance classes; absent from servers that predate the field. */
+  conforms_to?: string[];
 }
 
 export interface StacCollectionSummary {
@@ -2147,12 +2253,22 @@ export interface StacCollectionsResponse {
   collections: StacCollectionSummary[];
 }
 
+export interface StacNextPage {
+  /** Opaque, server-issued; echo it back unchanged. */
+  cursor?: string | null;
+}
+
 export interface StacSearchRequest {
   url: string;
   collections?: string[];
   bbox?: number[];
   datetime_range?: string;
   limit?: number;
+  /** The previous response's `next_page`, sent with the same filters. */
+  next_page?: StacNextPage;
+  /** Percent; sent together with `cloud_cover_mode`. */
+  max_cloud_cover?: number;
+  cloud_cover_mode?: 'query' | 'filter';
   // feat(#1764): a credential for a protected catalog, applied to this call.
   auth?: ServiceAuthRequest;
 }
@@ -2173,6 +2289,15 @@ export interface StacItemSummary {
   data_asset_type: string | null;
   data_asset_key: string | null;
   data_asset_size_bytes: number | null; // EW-05: STAC file:size extension
+  // Why /import would refuse this item's asset by its URL alone, or null if
+  // the href passes import's format, length and credential checks (also
+  // null when there's no asset at all — check data_asset_href for that).
+  // Import separately checks each asset's host and can still refuse a null
+  // item there, per item, without failing the rest of the batch. Optional
+  // rather than always-present so an older server that predates this field
+  // still parses: this app always matches its own API, but the field
+  // itself is a newer contract than some servers a client could still hit.
+  data_asset_import_refusal?: 'not_http' | 'credentials' | 'too_long' | null;
   thumbnail_href: string | null;
   asset_count: number;
 }
@@ -2181,6 +2306,17 @@ export interface StacSearchResponse {
   items: StacItemSummary[];
   matched: number | null;
   returned: number;
+  next_page?: StacNextPage | null;
+}
+
+export interface StacAssetSizesRequest {
+  url: string;
+  assets: { id: string; href: string }[];
+  auth?: ServiceAuthRequest | null;
+}
+
+export interface StacAssetSizesResponse {
+  sizes: { id: string; size_bytes: number | null }[];
 }
 
 export interface StacImportItem {
@@ -2221,6 +2357,7 @@ export interface DatasetRelationship {
   relationship_type: string;
   label: string | null;
   target_dataset_title: string | null;
+  broken?: boolean;
 }
 
 /** GAP-033: list envelope for GET /datasets/{id}/relationships/. */
@@ -2275,6 +2412,10 @@ export interface AnalysisPreviewRequest {
    * whole dataset, unchanged from before this field existed.
    */
   bbox?: number[];
+  /** CQL2-JSON filters on the source, mask and join layers. */
+  filter?: Record<string, unknown>;
+  mask_filter?: Record<string, unknown>;
+  join_filter?: Record<string, unknown>;
 }
 
 export interface AnalysisPreviewResponse {
@@ -2329,6 +2470,10 @@ export interface AnalysisMaterializeRequest {
   join_dataset_id?: string;
   /** Columns copied from the intersecting join feature, prefixed 'join_' (spatial_join only). */
   join_fields?: string[];
+  /** CQL2-JSON filters on the source, mask and join layers. */
+  filter?: Record<string, unknown>;
+  mask_filter?: Record<string, unknown>;
+  join_filter?: Record<string, unknown>;
 }
 
 export interface AnalysisMaterializeResponse {

@@ -20,18 +20,16 @@ absence.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import httpx
 import pytest
+import rasterio.crs
 
+from app.modules.catalog.sources import cog_info
 from app.modules.catalog.sources.cog_info import fetch_cog_info, reconcile_epsg
 
 pytestmark = pytest.mark.anyio
-
-# Captured before any monkeypatching so the factory below can build a real
-# client: it replaces the module's `httpx.AsyncClient` attribute, so a
-# factory that referenced `httpx.AsyncClient` itself would recurse into its
-# own replacement.
-_RealAsyncClient = httpx.AsyncClient
 
 # A Titiler 2.2.1 /cog/info reply, captured live against a real COG: `crs` is
 # an OGC CRS URI, and `bounds` is in the dataset's OWN projection (UTM 21N
@@ -90,6 +88,7 @@ def _install(
     monkeypatch,
     info: dict,
     *,
+    stats: dict | None = None,
     stats_status: int = 200,
     stac_item: dict | None = _TITILER_STAC_ITEM,
     stac_status: int = 200,
@@ -98,26 +97,27 @@ def _install(
 
     fetch_cog_info builds its own ``httpx.AsyncClient`` directly rather than
     through a factory seam (Titiler is an internal trusted service, not a
-    caller-controlled origin), so the client class itself is the thing to
-    replace.
+    caller-controlled origin), so the module's ``httpx`` is swapped for one
+    whose client answers from this table. Every other client, such as the
+    origin probe's, stays real.
     """
 
     def _handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "/cog/statistics" in url:
-            return httpx.Response(
-                stats_status, json={} if stats_status == 200 else None
-            )
+            if stats_status != 200:
+                return httpx.Response(stats_status, json=None)
+            return httpx.Response(stats_status, json=stats if stats is not None else {})
         if "/cog/stac" in url:
             return httpx.Response(stac_status, json=stac_item)
         return httpx.Response(200, json=info)
 
     def _factory(*args, **kwargs) -> httpx.AsyncClient:
-        kwargs.pop("timeout", None)
-        return _RealAsyncClient(transport=httpx.MockTransport(_handler))
+        return httpx.AsyncClient(transport=httpx.MockTransport(_handler))
 
     monkeypatch.setattr(
-        "app.modules.catalog.sources.cog_info.httpx.AsyncClient", _factory
+        "app.modules.catalog.sources.cog_info.httpx",
+        SimpleNamespace(AsyncClient=_factory, Timeout=httpx.Timeout),
     )
 
 
@@ -133,11 +133,7 @@ class TestGeoreferencing:
         assert "32621" in result["crs_wkt"]
 
     async def test_crs_wkt_is_serialized_as_wkt2(self, monkeypatch) -> None:
-        """fix(#1376): this value reaches ``RasterAsset.crs_wkt``, which
-        ``to_stac_properties()`` publishes as ``proj:wkt2``. rasterio's
-        default export is WKT1_GDAL, so the version has to be asked for —
-        and the root keyword is the whole difference a strict consumer sees
-        (``PROJCS[`` vs ``PROJCRS[``)."""
+        """The remote probe stores WKT2 (``PROJCRS[``), not rasterio's default WKT1."""
         _install(monkeypatch, _TITILER_INFO)
         result = await fetch_cog_info("https://origin.test/scene.tif")
         assert result is not None
@@ -179,6 +175,160 @@ class TestGeoreferencing:
         result = await fetch_cog_info("https://origin.test/scene.tif")
         assert result is not None
         assert result["crs_wkt"] is None
+
+
+# Valid WKT, as Titiler reports a CRS PROJ cannot match to an authority code.
+_UTM_21N_WKT = rasterio.crs.CRS.from_epsg(32621).to_wkt()
+
+# The CRS84 forms a probe may report. The first is what the pinned Titiler
+# sends (rio-tiler writes version 0 for an authority with no version); the
+# rest are the forms parse_crs_uri would otherwise map to EPSG:4326.
+_CRS84_FORMS = [
+    "http://www.opengis.net/def/crs/OGC/0/CRS84",
+    "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+    "http://www.opengis.net/def/crs/OGC/1.3/CRS84/",
+    "https://www.opengis.net/def/crs/OGC/1.3/CRS84",
+    "https://www.opengis.net/def/crs/OGC/1.3/CRS84/",
+    "urn:ogc:def:crs:OGC:1.3:CRS84",
+]
+_CRS84_URI = _CRS84_FORMS[0]
+# What main stored for each: its own call on the reported string, which gives
+# PROJ's CRS84, longitude first.
+_MAIN_CRS84_WKT = {
+    form: rasterio.crs.CRS.from_user_input(form).to_wkt(version="WKT2_2019")
+    for form in _CRS84_FORMS
+}
+
+
+@pytest.fixture
+def crs_text_parses(monkeypatch) -> list[str]:
+    """Swap rasterio's CRS for one that refuses CRS text, recording each attempt.
+
+    The one text it accepts is the probe's own CRS84 constant.
+    """
+    real = rasterio.crs.CRS
+    attempts: list[str] = []
+
+    def _refuse(name: str):
+        def _parse(*args, **kwargs):
+            if name == "from_user_input" and args == (cog_info._CRS84_URI,):
+                return real.from_user_input(*args)
+            attempts.append(name)
+            raise AssertionError(f"CRS text parsed through {name}")
+
+        return staticmethod(_parse)
+
+    class _EpsgOnlyCRS:
+        from_epsg = staticmethod(real.from_epsg)
+        from_user_input = _refuse("from_user_input")
+        from_wkt = _refuse("from_wkt")
+        from_string = _refuse("from_string")
+
+    monkeypatch.setattr(rasterio.crs, "CRS", _EpsgOnlyCRS)
+    return attempts
+
+
+class TestAuthorityCrsOnly:
+    @pytest.mark.parametrize(
+        ("crs", "epsg"),
+        [
+            ("EPSG:32621", 32621),
+            ("http://www.opengis.net/def/crs/EPSG/0/32621", 32621),
+            ("urn:ogc:def:crs:EPSG::32621", 32621),
+        ],
+    )
+    async def test_an_epsg_reference_builds_the_wkt_from_the_registry(
+        self, monkeypatch, crs_text_parses, crs, epsg
+    ) -> None:
+        """An EPSG reference yields its code and the registry's WKT2."""
+        _install(monkeypatch, {**_TITILER_INFO, "crs": crs})
+        result = await fetch_cog_info("https://origin.test/scene.tif")
+
+        assert result is not None
+        assert result["epsg"] == epsg
+        assert result["crs_wkt"] == rasterio.crs.CRS.from_epsg(epsg).to_wkt(
+            version="WKT2_2019"
+        )
+        assert (
+            result["crs_is_geographic"],
+            result["crs_has_degree_unit"],
+            result["crs_metres_per_unit"],
+        ) == (False, False, 1.0)
+        assert crs_text_parses == []
+
+    @pytest.mark.parametrize(
+        "crs",
+        [
+            _UTM_21N_WKT,
+            "http://www.opengis.net/def/crs/ESRI/0/102100",
+            "EPSG:999999999",
+        ],
+        ids=["wkt", "esri-uri", "unknown-code"],
+    )
+    async def test_any_other_crs_is_unidentified_without_parsing_it(
+        self, monkeypatch, crs_text_parses, crs
+    ) -> None:
+        """WKT, another authority or a code PROJ lacks is reported, not dropped."""
+        _install(monkeypatch, {**_TITILER_INFO, "crs": crs})
+        result = await fetch_cog_info("https://origin.test/scene.tif")
+
+        assert result is not None
+        assert (result["crs_wkt"], result["epsg"]) == (None, None)
+        assert result["crs_unidentified"] is True
+        assert reconcile_epsg(result, 32621) is None
+        assert crs_text_parses == []
+
+    @pytest.mark.parametrize("crs", _CRS84_FORMS)
+    async def test_crs84_stays_crs84(self, monkeypatch, crs_text_parses, crs) -> None:
+        """CRS84 is not EPSG:4326: it is longitude first, and has no EPSG code."""
+        _install(monkeypatch, {**_TITILER_INFO, "crs": crs})
+        result = await fetch_cog_info("https://origin.test/scene.tif")
+
+        assert result is not None
+        assert result["crs_wkt"] == _MAIN_CRS84_WKT[crs]
+        assert result["epsg"] is None
+        assert (
+            result["crs_is_geographic"],
+            result["crs_has_degree_unit"],
+            result["crs_metres_per_unit"],
+        ) == (True, True, None)
+        assert "crs_unidentified" not in result
+        assert reconcile_epsg(result, 4326) is None
+        assert crs_text_parses == []
+
+    @pytest.mark.parametrize(
+        "crs", ["EPSG:4326", "EPSG:32618", "EPSG:2263", "EPSG:4807", _CRS84_FORMS[0]]
+    )
+    async def test_the_registry_facts_match_the_probe_childs(
+        self, monkeypatch, crs
+    ) -> None:
+        """A remote row's facts equal what ingest's probe child says of its text."""
+        from app.processing.raster import probe
+
+        _install(monkeypatch, {**_TITILER_INFO, "crs": crs})
+        result = await fetch_cog_info("https://origin.test/scene.tif")
+
+        assert result is not None
+        assert {
+            key: result[key]
+            for key in (
+                "crs_is_geographic",
+                "crs_has_degree_unit",
+                "crs_metres_per_unit",
+            )
+        } == probe.crs_facts(result["crs_wkt"])
+
+    async def test_no_reported_crs_still_takes_the_declared_code(
+        self, monkeypatch
+    ) -> None:
+        """Titiler naming no CRS is the one case the declaration may fill."""
+        info = {k: v for k, v in _TITILER_INFO.items() if k != "crs"}
+        _install(monkeypatch, info)
+        result = await fetch_cog_info("https://origin.test/scene.tif")
+
+        assert result is not None
+        assert "crs_unidentified" not in result
+        assert reconcile_epsg(result, 32621) == 32621
 
 
 class TestGeotransform:
@@ -309,6 +459,54 @@ class TestGeotransform:
         assert result is not None
         assert result["crs_wkt"] is not None
         assert "res_x" not in result
+
+
+class TestBandStatistics:
+    async def test_band_info_stays_in_band_order_past_nine_bands(
+        self, monkeypatch
+    ) -> None:
+        stats = {
+            f"b{n}": {"min": float(n), "max": float(n) + 1, "mean": float(n) + 0.5}
+            for n in range(1, 12)
+        }
+        _install(monkeypatch, {**_TITILER_INFO, "count": 11}, stats=stats)
+        result = await fetch_cog_info("https://origin.test/scene.tif")
+        assert result is not None
+        assert [entry["min"] for entry in result["band_info"]] == [
+            float(n) for n in range(1, 12)
+        ]
+
+    async def test_a_non_numeric_b_key_does_not_drop_the_numbered_bands(
+        self, monkeypatch
+    ) -> None:
+        stats = {
+            f"b{n}": {"min": float(n), "max": float(n) + 1, "mean": float(n) + 0.5}
+            for n in range(1, 4)
+        }
+        stats["blue"] = {"min": -1.0, "max": -1.0, "mean": -1.0}
+        _install(monkeypatch, {**_TITILER_INFO, "count": 3}, stats=stats)
+        result = await fetch_cog_info("https://origin.test/scene.tif")
+        assert result is not None
+        assert [entry["min"] for entry in result["band_info"]] == [1.0, 2.0, 3.0]
+
+
+class TestNodata:
+    async def test_a_nodata_type_stores_its_value(self, monkeypatch) -> None:
+        info = {**_TITILER_INFO, "nodata_type": "Nodata", "nodata_value": 0.0}
+        _install(monkeypatch, info)
+        result = await fetch_cog_info("https://origin.test/scene.tif")
+        assert result is not None
+        assert result["nodata"] == 0.0
+
+    @pytest.mark.parametrize("nodata_type", ["Mask", "Alpha", "None"])
+    async def test_a_non_scalar_nodata_type_stores_none(
+        self, monkeypatch, nodata_type
+    ) -> None:
+        info = {**_TITILER_INFO, "nodata_type": nodata_type, "nodata_value": None}
+        _install(monkeypatch, info)
+        result = await fetch_cog_info("https://origin.test/scene.tif")
+        assert result is not None
+        assert result["nodata"] is None
 
 
 class TestReconcileEpsg:

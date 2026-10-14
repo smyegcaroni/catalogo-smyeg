@@ -1,5 +1,5 @@
 from http import HTTPStatus
-from typing import Any, cast
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -9,7 +9,9 @@ from ...types import Response, UNSET
 from ... import errors
 
 from ...models.problem_detail import ProblemDetail
+from ...types import File
 from ...types import Unset
+from io import BytesIO
 
 
 def _get_kwargs(
@@ -78,9 +80,10 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | ProblemDetail | None:
+) -> File | ProblemDetail | None:
     if response.status_code == 200:
-        response_200 = cast(Any, None)
+        response_200 = File(payload=BytesIO(response.content))
+
         return response_200
 
     if response.status_code == 400:
@@ -126,7 +129,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | ProblemDetail]:
+) -> Response[File | ProblemDetail]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -141,14 +144,14 @@ def sync_detailed(
     x: int,
     y: int,
     *,
-    client: AuthenticatedClient,
+    client: AuthenticatedClient | Client,
     sig: None | str | Unset = UNSET,
     exp: int | None | Unset = UNSET,
     scope: None | str | Unset = UNSET,
     cols: None | str | Unset = UNSET,
     cluster_radius: int | Unset = 48,
     cluster_max_zoom: int | Unset = 14,
-) -> Response[Any | ProblemDetail]:
+) -> Response[File | ProblemDetail]:
     """Cluster Tile Endpoint
 
      Serve a server-side clustered vector tile for a point dataset.
@@ -157,12 +160,14 @@ def sync_detailed(
 
     Authorization matches the plain vector tile route, in three cases. A
     public, published dataset is readable without credentials. A non-public
-    dataset needs either valid signature parameters (``sig``, ``exp``,
-    ``scope``) or an embed token scoped to it, and answers 403 without one. A
-    public dataset that is not yet published is readable by its owner, by an
-    admin, with an embed token, or with valid signature parameters, and answers
-    404 to other callers, so a refusal keeps its existence undisclosed. An
-    unknown table is 404 too.
+    dataset needs valid signature parameters (``sig``, ``exp``, ``scope``), an
+    embed token scoped to it, or an API key (``X-Api-Key`` header or
+    ``api_key`` query parameter) or bearer token for a caller with access to
+    it. It answers 403 to a request carrying none of these and 404 to a caller
+    without access. A public dataset that is not yet published is readable by
+    its owner, by an admin, with an embed token, or with valid signature
+    parameters, and answers 404 to other callers, so a refusal keeps its
+    existence undisclosed. An unknown table is 404 too.
 
     A request that no capability authorized and that carried a credential which
     did not resolve is refused with 401 rather than served as an anonymous
@@ -180,11 +185,11 @@ def sync_detailed(
 
     A tile holding no features answers 204, and a repeat request whose
     ``If-None-Match`` matches answers 304. Where a deployment runs cold storage,
-    a dataset still being restored answers 202 with a job id to poll. Three
-    cases answer 429 with ``Retry-After``: waiting past the tile pool's
-    connection budget, a tile query that outruns the pool's per-command
-    timeout, and exceeding a configured per-tenant concurrency limit. Any other
-    failure serving the tile answers 503.
+    a dataset still being restored answers 202 with a job id to poll. Requests
+    answer 429 with ``Retry-After`` when the per-process capacity for uncached
+    renders is full, tile-pool acquisition times out, a tile query exceeds the
+    pool's per-command timeout, or the configured per-tenant concurrency limit
+    is exceeded. Any other failure serving the tile answers 503.
 
     Args:
         table_path (str):
@@ -203,7 +208,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | ProblemDetail]
+        Response[File | ProblemDetail]
     """
 
     kwargs = _get_kwargs(
@@ -232,14 +237,14 @@ def sync(
     x: int,
     y: int,
     *,
-    client: AuthenticatedClient,
+    client: AuthenticatedClient | Client,
     sig: None | str | Unset = UNSET,
     exp: int | None | Unset = UNSET,
     scope: None | str | Unset = UNSET,
     cols: None | str | Unset = UNSET,
     cluster_radius: int | Unset = 48,
     cluster_max_zoom: int | Unset = 14,
-) -> Any | ProblemDetail | None:
+) -> File | ProblemDetail | None:
     """Cluster Tile Endpoint
 
      Serve a server-side clustered vector tile for a point dataset.
@@ -248,12 +253,14 @@ def sync(
 
     Authorization matches the plain vector tile route, in three cases. A
     public, published dataset is readable without credentials. A non-public
-    dataset needs either valid signature parameters (``sig``, ``exp``,
-    ``scope``) or an embed token scoped to it, and answers 403 without one. A
-    public dataset that is not yet published is readable by its owner, by an
-    admin, with an embed token, or with valid signature parameters, and answers
-    404 to other callers, so a refusal keeps its existence undisclosed. An
-    unknown table is 404 too.
+    dataset needs valid signature parameters (``sig``, ``exp``, ``scope``), an
+    embed token scoped to it, or an API key (``X-Api-Key`` header or
+    ``api_key`` query parameter) or bearer token for a caller with access to
+    it. It answers 403 to a request carrying none of these and 404 to a caller
+    without access. A public dataset that is not yet published is readable by
+    its owner, by an admin, with an embed token, or with valid signature
+    parameters, and answers 404 to other callers, so a refusal keeps its
+    existence undisclosed. An unknown table is 404 too.
 
     A request that no capability authorized and that carried a credential which
     did not resolve is refused with 401 rather than served as an anonymous
@@ -271,11 +278,11 @@ def sync(
 
     A tile holding no features answers 204, and a repeat request whose
     ``If-None-Match`` matches answers 304. Where a deployment runs cold storage,
-    a dataset still being restored answers 202 with a job id to poll. Three
-    cases answer 429 with ``Retry-After``: waiting past the tile pool's
-    connection budget, a tile query that outruns the pool's per-command
-    timeout, and exceeding a configured per-tenant concurrency limit. Any other
-    failure serving the tile answers 503.
+    a dataset still being restored answers 202 with a job id to poll. Requests
+    answer 429 with ``Retry-After`` when the per-process capacity for uncached
+    renders is full, tile-pool acquisition times out, a tile query exceeds the
+    pool's per-command timeout, or the configured per-tenant concurrency limit
+    is exceeded. Any other failure serving the tile answers 503.
 
     Args:
         table_path (str):
@@ -294,7 +301,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | ProblemDetail
+        File | ProblemDetail
     """
 
     return sync_detailed(
@@ -318,14 +325,14 @@ async def asyncio_detailed(
     x: int,
     y: int,
     *,
-    client: AuthenticatedClient,
+    client: AuthenticatedClient | Client,
     sig: None | str | Unset = UNSET,
     exp: int | None | Unset = UNSET,
     scope: None | str | Unset = UNSET,
     cols: None | str | Unset = UNSET,
     cluster_radius: int | Unset = 48,
     cluster_max_zoom: int | Unset = 14,
-) -> Response[Any | ProblemDetail]:
+) -> Response[File | ProblemDetail]:
     """Cluster Tile Endpoint
 
      Serve a server-side clustered vector tile for a point dataset.
@@ -334,12 +341,14 @@ async def asyncio_detailed(
 
     Authorization matches the plain vector tile route, in three cases. A
     public, published dataset is readable without credentials. A non-public
-    dataset needs either valid signature parameters (``sig``, ``exp``,
-    ``scope``) or an embed token scoped to it, and answers 403 without one. A
-    public dataset that is not yet published is readable by its owner, by an
-    admin, with an embed token, or with valid signature parameters, and answers
-    404 to other callers, so a refusal keeps its existence undisclosed. An
-    unknown table is 404 too.
+    dataset needs valid signature parameters (``sig``, ``exp``, ``scope``), an
+    embed token scoped to it, or an API key (``X-Api-Key`` header or
+    ``api_key`` query parameter) or bearer token for a caller with access to
+    it. It answers 403 to a request carrying none of these and 404 to a caller
+    without access. A public dataset that is not yet published is readable by
+    its owner, by an admin, with an embed token, or with valid signature
+    parameters, and answers 404 to other callers, so a refusal keeps its
+    existence undisclosed. An unknown table is 404 too.
 
     A request that no capability authorized and that carried a credential which
     did not resolve is refused with 401 rather than served as an anonymous
@@ -357,11 +366,11 @@ async def asyncio_detailed(
 
     A tile holding no features answers 204, and a repeat request whose
     ``If-None-Match`` matches answers 304. Where a deployment runs cold storage,
-    a dataset still being restored answers 202 with a job id to poll. Three
-    cases answer 429 with ``Retry-After``: waiting past the tile pool's
-    connection budget, a tile query that outruns the pool's per-command
-    timeout, and exceeding a configured per-tenant concurrency limit. Any other
-    failure serving the tile answers 503.
+    a dataset still being restored answers 202 with a job id to poll. Requests
+    answer 429 with ``Retry-After`` when the per-process capacity for uncached
+    renders is full, tile-pool acquisition times out, a tile query exceeds the
+    pool's per-command timeout, or the configured per-tenant concurrency limit
+    is exceeded. Any other failure serving the tile answers 503.
 
     Args:
         table_path (str):
@@ -380,7 +389,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | ProblemDetail]
+        Response[File | ProblemDetail]
     """
 
     kwargs = _get_kwargs(
@@ -407,14 +416,14 @@ async def asyncio(
     x: int,
     y: int,
     *,
-    client: AuthenticatedClient,
+    client: AuthenticatedClient | Client,
     sig: None | str | Unset = UNSET,
     exp: int | None | Unset = UNSET,
     scope: None | str | Unset = UNSET,
     cols: None | str | Unset = UNSET,
     cluster_radius: int | Unset = 48,
     cluster_max_zoom: int | Unset = 14,
-) -> Any | ProblemDetail | None:
+) -> File | ProblemDetail | None:
     """Cluster Tile Endpoint
 
      Serve a server-side clustered vector tile for a point dataset.
@@ -423,12 +432,14 @@ async def asyncio(
 
     Authorization matches the plain vector tile route, in three cases. A
     public, published dataset is readable without credentials. A non-public
-    dataset needs either valid signature parameters (``sig``, ``exp``,
-    ``scope``) or an embed token scoped to it, and answers 403 without one. A
-    public dataset that is not yet published is readable by its owner, by an
-    admin, with an embed token, or with valid signature parameters, and answers
-    404 to other callers, so a refusal keeps its existence undisclosed. An
-    unknown table is 404 too.
+    dataset needs valid signature parameters (``sig``, ``exp``, ``scope``), an
+    embed token scoped to it, or an API key (``X-Api-Key`` header or
+    ``api_key`` query parameter) or bearer token for a caller with access to
+    it. It answers 403 to a request carrying none of these and 404 to a caller
+    without access. A public dataset that is not yet published is readable by
+    its owner, by an admin, with an embed token, or with valid signature
+    parameters, and answers 404 to other callers, so a refusal keeps its
+    existence undisclosed. An unknown table is 404 too.
 
     A request that no capability authorized and that carried a credential which
     did not resolve is refused with 401 rather than served as an anonymous
@@ -446,11 +457,11 @@ async def asyncio(
 
     A tile holding no features answers 204, and a repeat request whose
     ``If-None-Match`` matches answers 304. Where a deployment runs cold storage,
-    a dataset still being restored answers 202 with a job id to poll. Three
-    cases answer 429 with ``Retry-After``: waiting past the tile pool's
-    connection budget, a tile query that outruns the pool's per-command
-    timeout, and exceeding a configured per-tenant concurrency limit. Any other
-    failure serving the tile answers 503.
+    a dataset still being restored answers 202 with a job id to poll. Requests
+    answer 429 with ``Retry-After`` when the per-process capacity for uncached
+    renders is full, tile-pool acquisition times out, a tile query exceeds the
+    pool's per-command timeout, or the configured per-tenant concurrency limit
+    is exceeded. Any other failure serving the tile answers 503.
 
     Args:
         table_path (str):
@@ -469,7 +480,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | ProblemDetail
+        File | ProblemDetail
     """
 
     return (

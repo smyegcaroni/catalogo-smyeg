@@ -1,19 +1,12 @@
-"""#1202 review r5: the presigned staging key must be swept at job end.
+"""Presigned staging ownership, terminal disposal and post-expiry retention.
 
-A completed presigned upload points ``file_path`` at a frozen copy, which
-leaves ``user_metadata["s3_key"]`` as the only reference to the key the
-client can still write through its unexpired PUT URL. Both staging reapers
-now sweep it, and this file pins the decision policy plus the reaper that is
-directly callable.
-
-The decision policy is tested as a pure helper rather than by driving
-ogr2ogr, matching ``test_ingest_staging_cleanup_gap018.py`` — the sibling
-file that pins ``_should_unlink_staging`` for the same reason.
+A frozen upload and its client-writable presigned key have distinct owners.
+These tests cover the existing reaper and durable sweep; task-ending disposal
+is exercised through ``UploadedSource`` in ``test_uploaded_source.py``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from unittest.mock import AsyncMock, patch
 
@@ -238,33 +231,6 @@ class TestReapPresignedStagingObject:
         storage.delete.assert_awaited_once()
 
 
-def test_both_task_tails_sweep_through_the_shared_helper():
-    """Neither ingest path may grow its own copy of the sweep.
-
-    The raster tail was added a round after the vector one precisely because
-    the two had drifted; this catches a third path arriving without the sweep,
-    or either call being deleted outright.
-
-    KNOWN BLIND SPOT, stated so nobody mistakes this for reachability: it
-    greps the module source, so a call that is PRESENT but UNREACHABLE passes.
-    Measured — disabling the raster sweep with `if False:` left this test
-    green. ``test_failed_raster_ingest_sweeps_its_presigned_staging_object``
-    is the one that fails in that case, and it is the one to trust.
-    """
-    import inspect
-
-    from app.processing.ingest import tasks_raster, tasks_vector
-
-    for module in (tasks_vector, tasks_raster):
-        source = inspect.getsource(module)
-        assert "reap_presigned_staging_object(" in source, (
-            f"{module.__name__} does not sweep the presigned staging key"
-        )
-        assert "owned_presigned_staging_key(" in source, (
-            f"{module.__name__} does not resolve staging-key ownership"
-        )
-
-
 def _geotiff_bytes(*, crs=None) -> bytes:
     """Minimal in-memory GeoTIFF. Mirrors the copy in test_raster_ingest.py."""
     import io
@@ -435,6 +401,25 @@ class TestPostExpirySweep:
     forever. This pass runs once per job, after the URL can no longer be used.
     """
 
+    @pytest.fixture(autouse=True)
+    async def _reap_jobs_this_class_commits(self, test_db_session):
+        """Delete the ``ingest_jobs`` rows this class's tests commit.
+
+        A backdated row is left reaped but not final, so every later
+        post-expiry sweep on this worker would delete its key again.
+        """
+        self._created_job_ids: list = []
+        yield
+        if self._created_job_ids:
+            from sqlalchemy import delete
+
+            from app.platform.jobs.models import IngestJob
+
+            await test_db_session.execute(
+                delete(IngestJob).where(IngestJob.id.in_(self._created_job_ids))
+            )
+            await test_db_session.commit()
+
     @staticmethod
     def _outcome(**overrides):
         from app.platform.jobs.router import StaleCleanupOutcome
@@ -502,6 +487,7 @@ class TestPostExpirySweep:
             )
         )
         await test_db_session.commit()
+        self._created_job_ids.append(job.id)
         return job, staging_key
 
     async def test_a_recreated_object_past_the_deadline_is_swept_once(
@@ -534,6 +520,53 @@ class TestPostExpirySweep:
         # The key itself survives in metadata — the marker is what stops the
         # re-sweep, not deleting the record of which key it was.
         assert refreshed.user_metadata["s3_key"] == staging_key
+
+    async def test_a_key_another_writer_clears_during_the_sweep_stays_cleared(
+        self, test_db_session, monkeypatch
+    ) -> None:
+        from sqlalchemy import select, text
+
+        import app.core.db as db_module
+        from app.platform.jobs import router as jobs_router
+        from app.platform.jobs.models import ARCHIVE_PENDING_METADATA_KEY, IngestJob
+
+        job, _staging_key = await self._make_job(test_db_session, age_seconds=10_000)
+
+        async def _set_mark(sql: str) -> None:
+            async with db_module.async_session() as session:
+                await session.execute(
+                    text(sql), {"id": job.id, "key": ARCHIVE_PENDING_METADATA_KEY}
+                )
+                await session.commit()
+
+        await _set_mark(
+            "UPDATE catalog.ingest_jobs SET user_metadata = user_metadata || "
+            "jsonb_build_object(CAST(:key AS text), true) WHERE id = :id"
+        )
+
+        async def _cleared_meanwhile(key):
+            await _set_mark(
+                "UPDATE catalog.ingest_jobs SET user_metadata = user_metadata - "
+                "CAST(:key AS text) WHERE id = :id"
+            )
+
+        storage = AsyncMock()
+        storage.delete = AsyncMock(side_effect=_cleared_meanwhile)
+        monkeypatch.setattr(
+            "app.platform.storage.get_storage", lambda: storage, raising=True
+        )
+
+        await jobs_router._sweep_expired_presigned_staging(
+            test_db_session, self._outcome()
+        )
+
+        metadata = (
+            await test_db_session.execute(
+                select(IngestJob.user_metadata).where(IngestJob.id == job.id)
+            )
+        ).scalar_one()
+        assert metadata["s3_key_reaped"] is True
+        assert ARCHIVE_PENDING_METADATA_KEY not in metadata
 
     async def test_a_second_pass_costs_no_storage_call(
         self, test_db_session, monkeypatch
@@ -835,6 +868,80 @@ class TestPostExpirySweep:
         final_row = await _row()
         assert final_row.user_metadata["s3_key_reaped_final"] is True
 
+    @pytest.mark.parametrize("reaped_before", [False, True], ids=["first", "recheck"])
+    @pytest.mark.parametrize("archived", [False, True], ids=["unarchived", "archived"])
+    async def test_a_presigned_object_that_may_be_the_only_original_is_kept(
+        self, test_db_session, monkeypatch, reaped_before, archived
+    ) -> None:
+        """A job naming no file_path may hold its original only at its s3_key."""
+        from datetime import timedelta, timezone
+
+        from sqlalchemy import delete, select, update
+
+        from app.core.config import MAX_PRESIGNED_URL_LIFETIME_SECONDS
+        from app.modules.catalog.datasets.domain.models import Record
+        from app.platform.jobs import router as jobs_router
+        from app.platform.jobs.models import ARCHIVE_PENDING_METADATA_KEY, IngestJob
+        from app.platform.jobs.router import _RECHECK_TRANSFER_MARGIN_SECONDS
+        from tests.factories import create_dataset
+
+        job, staging_key = await self._make_job(test_db_session, age_seconds=10_000)
+        dataset = await create_dataset(test_db_session, created_by=job.created_by)
+        metadata = {"presigned": True, "s3_key": staging_key}
+        if not archived:
+            metadata[ARCHIVE_PENDING_METADATA_KEY] = True
+        if reaped_before:
+            metadata["s3_key_reaped"] = True
+        await test_db_session.execute(
+            update(IngestJob)
+            .where(IngestJob.id == job.id)
+            .values(file_path=None, dataset_id=dataset.id, user_metadata=metadata)
+        )
+        await test_db_session.commit()
+        storage = AsyncMock()
+        monkeypatch.setattr(
+            "app.platform.storage.get_storage", lambda: storage, raising=True
+        )
+        try:
+            created_at = (
+                await test_db_session.execute(
+                    select(IngestJob.created_at).where(IngestJob.id == job.id)
+                )
+            ).scalar_one()
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            now = None
+            if reaped_before:
+                now = created_at + timedelta(
+                    seconds=MAX_PRESIGNED_URL_LIFETIME_SECONDS
+                    + _RECHECK_TRANSFER_MARGIN_SECONDS
+                    + 1
+                )
+
+            await jobs_router._sweep_expired_presigned_staging(
+                test_db_session, self._outcome(), now=now
+            )
+
+            deleted = staging_key in {c.args[0] for c in storage.delete.await_args_list}
+            stored = (
+                await test_db_session.execute(
+                    select(IngestJob.user_metadata).where(IngestJob.id == job.id)
+                )
+            ).scalar_one()
+            assert deleted is archived
+            assert (stored.get("s3_key_reaped") is True) is (archived or reaped_before)
+            assert (stored.get("s3_key_reaped_final") is True) is (
+                archived and reaped_before
+            )
+        finally:
+            await test_db_session.execute(
+                delete(IngestJob).where(IngestJob.id == job.id)
+            )
+            await test_db_session.execute(
+                delete(Record).where(Record.id == dataset.record_id)
+            )
+            await test_db_session.commit()
+
     async def test_retention_purge_defers_a_presigned_job_within_the_url_lifetime(
         self, test_db_session, monkeypatch
     ) -> None:
@@ -952,6 +1059,7 @@ class TestPostExpirySweep:
         test_db_session.add(parent)
         await test_db_session.commit()
         await test_db_session.refresh(parent)
+        self._created_job_ids.append(parent.id)
         parent_staging_key = f"staging/{parent.id}/roads.geojson"
         await test_db_session.execute(
             update(IngestJob)
@@ -975,6 +1083,7 @@ class TestPostExpirySweep:
         test_db_session.add(child)
         await test_db_session.commit()
         await test_db_session.refresh(child)
+        self._created_job_ids.append(child.id)
         await test_db_session.execute(
             update(IngestJob)
             .where(IngestJob.id == child.id)
@@ -1035,101 +1144,3 @@ class TestPostExpirySweep:
             "the key was reaped more than once — the child's purge reaped "
             "a key it does not own, in addition to the parent's own sweep"
         )
-
-
-class TestFailedSourceRetention:
-    """fix(#1213 review r6): whether a FAILED job's source may be reaped is a
-    property of the CALLER, not of the helper.
-
-    `_retry_capability` refuses reupload, service-auth and analysis jobs; an
-    ordinary failed import with a `staging/` file_path is retryable exactly
-    when the object still exists. Reaping it there is what makes the retry the
-    endpoint advertises impossible, and the stale purge is the designed
-    eventual owner ("failed keeps it for /jobs/{id}/retry").
-    """
-
-    @staticmethod
-    async def _reap(monkeypatch, *, final_status: str, replayable: bool):
-        from app.processing.ingest.tasks_staging import (
-            reap_downloaded_staging_source,
-        )
-
-        storage = AsyncMock()
-        monkeypatch.setattr(
-            "app.platform.storage.get_storage", lambda: storage, raising=True
-        )
-        await reap_downloaded_staging_source(
-            "job-1",
-            original_file_path="staging/job-1/frozen/roads.geojson",
-            final_status=final_status,
-            failed_source_replayable=replayable,
-        )
-        return storage
-
-    async def test_an_ordinary_import_retains_its_source_on_failure(
-        self, monkeypatch
-    ) -> None:
-        """The retry endpoint promises a replay while the object exists."""
-        storage = await self._reap(monkeypatch, final_status="failed", replayable=True)
-        storage.delete.assert_not_awaited()
-
-    async def test_a_reupload_still_reaps_on_failure(self, monkeypatch) -> None:
-        """_retry_capability refuses these outright, so nothing else ever will."""
-        storage = await self._reap(monkeypatch, final_status="failed", replayable=False)
-        storage.delete.assert_awaited_once()
-
-    async def test_success_reaps_for_both_kinds(self, monkeypatch) -> None:
-        """Retention is about the RETRY, which only exists for failed jobs."""
-        for replayable in (True, False):
-            storage = await self._reap(
-                monkeypatch, final_status="complete", replayable=replayable
-            )
-            storage.delete.assert_awaited_once()
-
-
-class TestTerminalCleanupDrainsThroughCancellation:
-    """fix(#1213 review r6): both tails call the source reap BEFORE the
-    presigned-key sweep, so a CancelledError escaping the first skips the
-    second — and that second one deletes the key a client may still hold an
-    unexpired PUT URL for. Same pattern r5 restored in _cleanup_presigned_object.
-    """
-
-    async def test_a_cancelled_source_delete_does_not_escape(self, monkeypatch) -> None:
-        from app.processing.ingest.tasks_staging import (
-            reap_downloaded_staging_source,
-        )
-
-        storage = AsyncMock()
-        storage.delete.side_effect = asyncio.CancelledError()
-        monkeypatch.setattr(
-            "app.platform.storage.get_storage", lambda: storage, raising=True
-        )
-
-        # Must not raise: the caller has a second sweep to run after this.
-        await reap_downloaded_staging_source(
-            "job-1",
-            original_file_path="staging/job-1/frozen/roads.geojson",
-            final_status="complete",
-            failed_source_replayable=True,
-        )
-
-        storage.delete.assert_awaited_once()
-
-    async def test_a_cancelled_presigned_sweep_does_not_escape(
-        self, monkeypatch
-    ) -> None:
-        from app.processing.ingest.tasks_staging import (
-            reap_presigned_staging_object,
-        )
-
-        storage = AsyncMock()
-        storage.delete.side_effect = asyncio.CancelledError()
-        monkeypatch.setattr(
-            "app.platform.storage.get_storage", lambda: storage, raising=True
-        )
-
-        await reap_presigned_staging_object(
-            "job-1", "staging/job-1/roads.geojson", final_status="complete"
-        )
-
-        storage.delete.assert_awaited_once()

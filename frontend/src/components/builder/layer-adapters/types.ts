@@ -1,6 +1,8 @@
 import type { Map as MaplibreMap } from 'maplibre-gl';
-import type { FilterSpecification } from 'maplibre-gl';
+import type { FilterSpecification, LayerSpecification } from 'maplibre-gl';
 import type { LabelConfig, StyleConfig } from '@/types/api';
+import type { LayoutPropertyName, PaintPropertyName } from './shared';
+import type { ZoomRange } from '../layer-description';
 
 type AdapterStyleConfig = Partial<StyleConfig> & {
   builder?: StyleConfig['builder'];
@@ -31,6 +33,8 @@ export interface AdapterLayerInput {
   sourceId: string;
   layerId: string;
   sourceLayer: string;
+  /** The layer's saved zoom range; null or absent when it saves none. */
+  zoom?: ZoomRange | null;
   // Source type: 'vector' (MVT, default) or 'geojson' (GeoJSON-Z)
   sourceType?: 'vector' | 'geojson';
   // Raster-specific (from TileToken)
@@ -46,8 +50,48 @@ export interface AdapterLayerInput {
   attribution?: string | null;
 }
 
+/**
+ * One map layer a saved layer draws. `layer` is the layer as MapLibre adds it.
+ * On a layer already on the map, a write keeps only the owned keys in step: it
+ * sets each to the spec's value, or clears it when the spec leaves it out.
+ */
+export interface LayerSpec {
+  layer: {
+    id: string;
+    type: LayerSpecification['type'];
+    source: string;
+    'source-layer'?: string;
+    filter?: FilterSpecification;
+    /** A range of the spec's own, set in place of the layer's. */
+    minzoom?: number;
+    maxzoom?: number;
+    layout: Record<string, unknown>;
+    paint: Record<string, unknown>;
+  };
+  ownedPaint: readonly PaintPropertyName[];
+  ownedLayout: readonly LayoutPropertyName[];
+}
+
+/** An image the specs draw with: a sprite sheet by URL, or one image built only when the map lacks it. */
+export type ImageSpec =
+  | { kind: 'sprite'; id: string; url: string }
+  | {
+    kind: 'image';
+    id: string;
+    data: () => { width: number; height: number; data: Uint8ClampedArray };
+    options?: { sdf?: boolean; pixelRatio?: number };
+  };
+
+/** The map layers an adapter draws for one saved layer, bottom first, and the images they use. */
+export interface LayerDrawing {
+  specs: readonly LayerSpec[];
+  images: readonly ImageSpec[];
+}
+
 export interface LayerAdapter {
   type: 'fill' | 'line' | 'circle' | 'symbol' | 'raster' | 'heatmap' | 'hillshade' | 'cluster' | 'mixed';
+  /** Present on the adapters whose layers the writer adds and updates. */
+  describe?(input: AdapterLayerInput): LayerDrawing;
   addLayers(map: MaplibreMap, input: AdapterLayerInput): void;
   syncPaint(map: MaplibreMap, input: AdapterLayerInput): void;
   syncVisibility(map: MaplibreMap, input: AdapterLayerInput): void;

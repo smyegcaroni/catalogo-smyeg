@@ -10,8 +10,9 @@ Requirements:
 """
 
 import uuid
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import text
@@ -369,6 +370,147 @@ class TestStacSearch:
                 headers=admin_auth_header,
             )
             assert resp.status_code == 502
+
+
+class TestStacSearchAssetEligibility:
+    """`data_asset_import_refusal` predicts /import's own StacImportItem
+    validation, so a caller can screen an item out before ticking it rather
+    than after the whole batch 422s (#2296)."""
+
+    async def _search_one(self, client, admin_auth_header, data_asset_href):
+        with patch(
+            "app.modules.catalog.sources.stac_router.search_stac_items",
+            new_callable=AsyncMock,
+        ) as mock:
+            mock.return_value = {
+                "items": [
+                    {
+                        "id": "item-001",
+                        "collection": "dem-collection",
+                        "bbox": None,
+                        "datetime": None,
+                        "datetime_start": None,
+                        "datetime_end": None,
+                        "title": "Item",
+                        "epsg": None,
+                        "gsd": None,
+                        "cloud_cover": None,
+                        "data_asset_href": data_asset_href,
+                        "data_asset_type": None,
+                        "thumbnail_href": None,
+                        "asset_count": 1,
+                    },
+                ],
+                "matched": 1,
+                "returned": 1,
+            }
+            return await client.post(
+                "/services/stac/search",
+                json={"url": "https://stac.example.com/v1"},
+                headers=admin_auth_header,
+            )
+
+    async def test_flags_a_non_http_asset(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        resp = await self._search_one(
+            client, admin_auth_header, "s3://copernicus-dem-90m/tile.tif"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] == "not_http"
+
+    async def test_flags_a_credentialed_asset(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        resp = await self._search_one(
+            client,
+            admin_auth_header,
+            "https://example.com/data.tif?X-Amz-Signature=abc123",
+        )
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] == "credentials"
+
+    async def test_flags_an_overlong_asset(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        href = "https://example.com/" + ("a" * 4090) + ".tif"
+        assert len(href) > 4096
+        resp = await self._search_one(client, admin_auth_header, href)
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] == "too_long"
+
+    async def test_flags_an_asset_between_httpurls_and_the_fields_length_ceiling(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        # Under the field's 4096-char cap but over HttpUrl's own, tighter
+        # 2083-char ceiling: /import's validator refuses this via HttpUrl
+        # itself (pydantic error type url_too_long), not the field's own
+        # length constraint — the reason must still read as too_long, not
+        # a scheme problem.
+        prefix = "https://example.com/"
+        href = prefix + "a" * (2100 - len(prefix))
+        assert len(href) == 2100
+        resp = await self._search_one(client, admin_auth_header, href)
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] == "too_long"
+
+    async def test_flags_a_too_long_credentialed_asset_as_too_long_not_credentials(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        # /import's validator runs HttpUrl(v) before the credential check —
+        # an href over HttpUrl's own length ceiling never reaches that
+        # check, so the real refusal is too_long even though this href also
+        # carries a credential query parameter.
+        prefix = "https://example.com/"
+        suffix = "?X-Amz-Signature=abc123"
+        href = prefix + "a" * (2100 - len(prefix) - len(suffix)) + suffix
+        assert len(href) == 2100
+        resp = await self._search_one(client, admin_auth_header, href)
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] == "too_long"
+
+    async def test_flags_a_malformed_asset_as_not_http(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        # has_url_credentials() deliberately returns True for an
+        # unparsable authority ("cannot tell" resolves to refusal, not to
+        # "no") — checked after HttpUrl now, so this never reaches that
+        # check either; HttpUrl's own url_parsing failure makes it not_http.
+        resp = await self._search_one(client, admin_auth_header, "https://[invalid")
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] == "not_http"
+
+    async def test_does_not_flag_an_asset_at_httpurls_own_length_ceiling(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        prefix = "https://example.com/"
+        href = prefix + "a" * (2083 - len(prefix))
+        assert len(href) == 2083
+        resp = await self._search_one(client, admin_auth_header, href)
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] is None
+
+    async def test_does_not_flag_a_plain_https_asset(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        resp = await self._search_one(
+            client, admin_auth_header, "https://example.com/data.tif"
+        )
+        assert resp.status_code == 200
+        item = resp.json()["items"][0]
+        # The field is required (no default) rather than optional, so a
+        # client can tell "checked, and clear" from "never checked".
+        assert "data_asset_import_refusal" in item
+        assert item["data_asset_import_refusal"] is None
+
+    async def test_does_not_flag_a_missing_asset(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        # No data asset at all is a distinct, pre-existing UI state (the
+        # frontend's own noCogAsset reason) — not an import refusal code.
+        resp = await self._search_one(client, admin_auth_header, None)
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] is None
 
 
 async def _create_stac_dataset(
@@ -783,19 +925,9 @@ class TestStacImport:
         case where res_x/res_y stay NULL. The sibling test below covers the
         one that does carry it.
         """
-        crs_wkt = (
-            'PROJCS["WGS 84 / UTM zone 21N",GEOGCS["WGS 84",'
-            'DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],'
-            'PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],'
-            'PROJECTION["Transverse_Mercator"],'
-            'PARAMETER["latitude_of_origin",0],'
-            'PARAMETER["central_meridian",-57],'
-            'PARAMETER["scale_factor",0.9996],'
-            'PARAMETER["false_easting",500000],'
-            'PARAMETER["false_northing",0],'
-            'UNIT["metre",1],AXIS["Easting",EAST],AXIS["Northing",NORTH],'
-            'AUTHORITY["EPSG","32621"]]'
-        )
+        from app.modules.catalog.sources.cog_info import _georeferencing
+
+        georeferencing = _georeferencing({"crs": "EPSG:32621"})
         with patch(
             "app.modules.catalog.sources.stac_router.fetch_cog_info",
             new=AsyncMock(
@@ -806,7 +938,7 @@ class TestStacImport:
                     "height": 2667,
                     "nodata": None,
                     "band_info": None,
-                    "crs_wkt": crs_wkt,
+                    **georeferencing,
                 }
             ),
         ):
@@ -836,8 +968,7 @@ class TestStacImport:
         detail = await client.get(f"/datasets/{dataset_id}", headers=admin_auth_header)
         assert detail.status_code == 200
         raster = detail.json()["raster"]
-        # A projected UTM CRS, not geographic — proves crs_wkt round-tripped
-        # far enough for PROJ to classify it, not just landed as a string.
+        # A projected UTM CRS: the probe's facts were stored with its text.
         assert raster["crs_is_geographic"] is False
         # A probe that established no transform leaves these NULL rather
         # than guessing — see the docstring above.
@@ -847,13 +978,14 @@ class TestStacImport:
         row = (
             await test_db_session.execute(
                 text(
-                    "SELECT ra.crs_wkt FROM catalog.raster_assets ra"
+                    "SELECT ra.crs_wkt, ra.crs_is_geographic, ra.crs_has_degree_unit,"
+                    " ra.crs_metres_per_unit FROM catalog.raster_assets ra"
                     " JOIN catalog.datasets d ON d.id = ra.dataset_id"
                     " WHERE d.id = :did"
                 ).bindparams(did=uuid.UUID(dataset_id))
             )
         ).one()
-        assert row.crs_wkt == crs_wkt
+        assert tuple(row) == (georeferencing["crs_wkt"], False, False, 1.0)
 
     async def test_import_records_the_probed_resolution_and_rotation(
         self,
@@ -936,12 +1068,7 @@ class TestStacImport:
         mock_stac_ssrf,
         test_db_session,
     ):
-        """The item declares one EPSG (4326, stale or
-        simply wrong) while the probe's own CRS says another (32621) — the
-        raster row and the dataset's srid mirror the probe, not the item, so
-        RasterAsset.to_stac_properties() cannot publish a proj:code and a
-        proj:wkt2 that name different projections.
-        """
+        """The raster row and the dataset's srid follow the probe's CRS, not the item's."""
         crs_wkt = (
             'PROJCS["WGS 84 / UTM zone 21N",GEOGCS["WGS 84",'
             'DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],'
@@ -1344,6 +1471,26 @@ class TestStacImport:
 # ---------------------------------------------------------------------------
 
 
+def _streaming_stac_client(payload: dict) -> httpx.AsyncClient:
+    """A real client over a MockTransport that answers every request with *payload*.
+
+    The adapter reads through ``bounded_probe_read``, which streams the body
+    via ``aiter_raw``; a response built from an in-memory body refuses that
+    with ``StreamConsumed``, so the body is served from an async generator.
+    """
+    import json as _json
+
+    raw = _json.dumps(payload).encode()
+
+    async def _chunks():
+        yield raw
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_chunks())
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handle))
+
+
 class TestStacAdapter:
     """Unit tests for the STAC adapter functions with mocked httpx."""
 
@@ -1427,19 +1574,9 @@ class TestStacAdapter:
     async def test_list_collections(self):
         from app.modules.catalog.sources.adapters.stac import list_stac_collections
 
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = STAC_COLLECTIONS
-        mock_response.raise_for_status = lambda: None
-
-        mock_client = AsyncMock()
-        mock_client.get.return_value = mock_response
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
         with patch(
             "app.modules.catalog.sources.adapters.stac._make_client",
-            return_value=mock_client,
+            return_value=_streaming_stac_client(STAC_COLLECTIONS),
         ):
             result = await list_stac_collections("https://stac.example.com/v1")
 
@@ -1451,19 +1588,9 @@ class TestStacAdapter:
     async def test_search_items(self):
         from app.modules.catalog.sources.adapters.stac import search_stac_items
 
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = STAC_SEARCH_RESULTS
-        mock_response.raise_for_status = lambda: None
-
-        mock_client = AsyncMock()
-        mock_client.post.return_value = mock_response
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
         with patch(
             "app.modules.catalog.sources.adapters.stac._make_client",
-            return_value=mock_client,
+            return_value=_streaming_stac_client(STAC_SEARCH_RESULTS),
         ):
             result = await search_stac_items(
                 "https://stac.example.com/v1",
@@ -1528,3 +1655,96 @@ class TestStacImportContactSemantics:
         assert detail.status_code == 200
         assert detail.json()["last_checked_at"] is None
         assert detail.json()["source_health"] == "unknown"
+
+
+class TestStacImportProbedCrs:
+    """The CRS Titiler reads off the asset decides what the import stores.
+
+    Titiler's own ``/cog/info`` JSON is mocked, so the real probe parses it.
+    """
+
+    async def _import(self, client, headers, monkeypatch, *, crs: str, epsg: int):
+        from tests.test_cog_info import _TITILER_INFO, _install
+
+        _install(monkeypatch, {**_TITILER_INFO, "crs": crs})
+        href = f"https://example.com/data/{uuid.uuid4().hex[:8]}.tif"
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [
+                    {
+                        "id": f"test-item-{uuid.uuid4().hex[:8]}",
+                        "collection": "dem-collection",
+                        "title": "Probed CRS STAC Import",
+                        "data_asset_href": href,
+                        "bbox": [-1, -1, 1, 1],
+                        "epsg": epsg,
+                    }
+                ],
+                "visibility": "private",
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        return resp.json(), href
+
+    async def test_a_crs_titiler_cannot_code_refuses_the_item(
+        self, client, admin_auth_header, mock_stac_ssrf, test_db_session, monkeypatch
+    ):
+        """The declared EPSG may name a different projection, so it is not used."""
+        from tests.test_cog_info import _UTM_21N_WKT
+
+        data, href = await self._import(
+            client, admin_auth_header, monkeypatch, crs=_UTM_21N_WKT, epsg=32633
+        )
+
+        assert (data["created"], data["errors"]) == (0, 1)
+        assert data["results"][0]["status"] == "error"
+        assert data["results"][0]["error"] == (
+            "GeoLens imports remote COGs whose CRS has an EPSG code or is OGC "
+            "CRS84, and this item's asset has neither. Reproject the file to an "
+            "EPSG CRS, for example with gdalwarp -t_srs EPSG:<code>, and import "
+            "it again."
+        )
+        stored = await test_db_session.scalar(
+            text("SELECT count(*) FROM catalog.datasets WHERE source_url = :u"),
+            {"u": href},
+        )
+        assert stored == 0
+
+    @pytest.mark.parametrize(
+        "crs",
+        [
+            "http://www.opengis.net/def/crs/OGC/0/CRS84",
+            "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+        ],
+    )
+    async def test_a_crs84_asset_is_stored_as_crs84(
+        self,
+        client,
+        admin_auth_header,
+        mock_stac_ssrf,
+        test_db_session,
+        monkeypatch,
+        crs,
+    ):
+        """Main's CRS84 WKT, longitude first, and no EPSG code on either row."""
+        from tests.test_cog_info import _MAIN_CRS84_WKT
+
+        data, _href = await self._import(
+            client, admin_auth_header, monkeypatch, crs=crs, epsg=4326
+        )
+
+        assert data["created"] == 1
+        row = (
+            await test_db_session.execute(
+                text(
+                    "SELECT ra.crs_wkt, ra.epsg, d.srid FROM catalog.raster_assets ra"
+                    " JOIN catalog.datasets d ON d.id = ra.dataset_id"
+                    " WHERE d.id = :did"
+                ).bindparams(did=uuid.UUID(data["results"][0]["dataset_id"]))
+            )
+        ).one()
+        assert row.crs_wkt == _MAIN_CRS84_WKT[crs]
+        assert (row.epsg, row.srid) == (None, None)

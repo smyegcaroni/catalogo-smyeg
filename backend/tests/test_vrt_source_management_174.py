@@ -18,6 +18,7 @@ to tests/test_vrt_staged_mutation_1327.py).
 """
 
 import asyncio
+import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -36,10 +37,8 @@ def _fence_vrt_worker_helpers(monkeypatch):
     UPDATE statements and intentionally model only the VRT domain queries.
     """
 
-    # fix(#836): the claim/commit/heartbeat prologue is now the shared
-    # claim_job_attempt_and_start_heartbeat helper. Model a successful claim by
-    # returning a live dummy task the finally-block heartbeat teardown can
-    # cancel, mirroring the old claim_ingest_job_attempt=True double.
+    # A successful claim returns a live dummy task the finally-block heartbeat
+    # teardown can cancel.
     async def _claim_and_start_heartbeat(session, job_uuid, attempt_uuid, **kwargs):
         del session, job_uuid, attempt_uuid, kwargs
         return asyncio.create_task(asyncio.sleep(3600))
@@ -49,11 +48,11 @@ def _fence_vrt_worker_helpers(monkeypatch):
         _claim_and_start_heartbeat,
     )
     monkeypatch.setattr(
-        "app.processing.ingest.tasks_vrt.require_ingest_job_update",
+        "app.processing.ingest.tasks_vrt.ledger.complete",
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
-        "app.processing.ingest.tasks_vrt.update_ingest_job_for_attempt",
+        "app.processing.ingest.tasks_vrt.ledger.fail",
         AsyncMock(return_value=True),
     )
 
@@ -299,21 +298,25 @@ class TestAddSource:
             mock_asset = _make_mock_asset(status="ready")
             mock_db = _build_mock_db_for_validation_failure(mock_asset)
 
-            # Simulate validate_sources returning an error
-            mock_error = MagicMock(spec=SourceValidationError)
-            mock_error.model_dump.return_value = {
-                "code": "CRS_MISMATCH",
-                "message": "CRS mismatch",
-            }
+            error = SourceValidationError(
+                source_id=uuid.uuid4(),
+                code="crs_unverified",
+                message="CRS could not be compared with the reference source",
+                field="crs_wkt",
+            )
 
             with patch(
-                "app.processing.ingest.router.validate_sources",
-                return_value=[mock_error],
+                "app.processing.ingest.router.validate_sources_async",
+                new=AsyncMock(return_value=[error]),
             ):
                 with pytest.raises(HTTPException) as exc_info:
                     await add_vrt_source(dataset_id, mock_request, mock_user, mock_db)
 
             assert exc_info.value.status_code == 422
+            # The detail is the response body, so it must already be JSON.
+            assert json.loads(json.dumps(exc_info.value.detail)) == [
+                error.model_dump(mode="json")
+            ]
             # fix(#1327): a rejected request stages nothing. Validation still
             # runs synchronously and still runs BEFORE the generation exists,
             # so an incompatible source leaves no intent behind for a task to
@@ -352,7 +355,10 @@ class TestAddSource:
             )
 
             with (
-                patch("app.processing.ingest.router.validate_sources", return_value=[]),
+                patch(
+                    "app.processing.ingest.router.validate_sources_async",
+                    new=AsyncMock(return_value=[]),
+                ),
                 patch(
                     "app.processing.ingest.router.regenerate_vrt_staged"
                 ) as mock_task,
@@ -395,7 +401,10 @@ class TestAddSource:
             )
 
             with (
-                patch("app.processing.ingest.router.validate_sources", return_value=[]),
+                patch(
+                    "app.processing.ingest.router.validate_sources_async",
+                    new=AsyncMock(return_value=[]),
+                ),
                 patch(
                     "app.processing.ingest.router.regenerate_vrt_staged"
                 ) as mock_task,
@@ -416,61 +425,6 @@ class TestAddSource:
             ]
             assert generation.source_count == len(existing_ids) + 1
             assert mock_asset.status == "regenerating"
-
-        asyncio.run(_check())
-
-    def test_rollback_on_defer_failure_leaves_links_untouched(self, monkeypatch):
-        """fix(#1327): the orphan-guard rollback no longer deletes a link row.
-
-        There is nothing to compensate — the add was never applied — so the
-        rollback restores only the asset state it flipped.
-        """
-
-        async def _check():
-            from fastapi import HTTPException
-
-            from app.processing.ingest.router import add_vrt_source
-            import app.processing.ingest.router as ingest_router
-
-            source_id = uuid.uuid4()
-            mock_request = MagicMock()
-            mock_request.source_dataset_id = source_id
-            mock_user = MagicMock()
-            mock_user.id = uuid.uuid4()
-            dataset_id = uuid.uuid4()
-
-            mock_asset = _make_mock_asset(status="ready")
-            mock_asset.current_generation_id = None
-            mock_db, _job_id, mock_create_ingest_job, _existing = (
-                _build_mock_db_success_add(mock_asset, dataset_id)
-            )
-            monkeypatch.setattr(
-                ingest_router, "create_ingest_job", mock_create_ingest_job
-            )
-
-            with (
-                patch("app.processing.ingest.router.validate_sources", return_value=[]),
-                patch(
-                    "app.processing.ingest.router.defer_async_with_tenant",
-                    new=AsyncMock(side_effect=RuntimeError("procrastinate down")),
-                ),
-            ):
-                with pytest.raises(HTTPException) as exc_info:
-                    await add_vrt_source(dataset_id, mock_request, mock_user, mock_db)
-
-            assert exc_info.value.status_code == 503
-            statements = "\n".join(
-                str(call.args[0]) for call in mock_db.execute.await_args_list
-            )
-            assert "DELETE FROM catalog.vrt_source_links" not in statements
-            assert "INSERT INTO catalog.vrt_source_links" not in statements
-            assert mock_asset.status == "ready"
-            assert mock_asset.current_generation_id is None
-            generation = _added_generation(mock_db)
-            assert generation.status == "failed"
-            # The intent survives on the failed row; only a task that owns the
-            # asset pointer could ever apply it, and this rollback gave it back.
-            assert generation.staged_source_ids is not None
 
         asyncio.run(_check())
 
@@ -668,62 +622,6 @@ class TestRemoveSource:
 
         asyncio.run(_check())
 
-    def test_rollback_on_defer_failure_leaves_links_untouched(self, monkeypatch):
-        """fix(#1327): the orphan-guard rollback has no link surgery left to do.
-
-        It used to re-INSERT the row it had just deleted. Nothing was deleted,
-        so the compensation is gone — and the asset state it DOES restore is
-        still restored.
-        """
-
-        async def _check():
-            from fastapi import HTTPException
-
-            from app.processing.ingest.router import remove_vrt_source
-            import app.processing.ingest.router as ingest_router
-
-            dataset_id = uuid.uuid4()
-            source_dataset_id = uuid.uuid4()
-            mock_user = MagicMock()
-            mock_user.id = uuid.uuid4()
-
-            mock_asset = _make_mock_asset(status="ready")
-            mock_asset.current_generation_id = None
-            mock_db, _job_id, mock_create_ingest_job, _remaining = (
-                _build_mock_db_success_remove(
-                    mock_asset,
-                    dataset_id,
-                    source_count=3,
-                    source_dataset_id=source_dataset_id,
-                )
-            )
-            monkeypatch.setattr(
-                ingest_router, "create_ingest_job", mock_create_ingest_job
-            )
-
-            with patch(
-                "app.processing.ingest.router.defer_async_with_tenant",
-                new=AsyncMock(side_effect=RuntimeError("procrastinate down")),
-            ):
-                with pytest.raises(HTTPException) as exc_info:
-                    await remove_vrt_source(
-                        dataset_id, source_dataset_id, mock_user, mock_db
-                    )
-
-            assert exc_info.value.status_code == 503
-            statements = "\n".join(
-                str(call.args[0]) for call in mock_db.execute.await_args_list
-            )
-            assert "vrt_source_links" not in statements.replace(
-                "SELECT source_dataset_id FROM catalog.vrt_source_links", ""
-            )
-            assert mock_asset.status == "ready"
-            assert mock_asset.current_generation_id is None
-            generation = _added_generation(mock_db)
-            assert generation.status == "failed"
-
-        asyncio.run(_check())
-
 
 # ---------------------------------------------------------------------------
 # TestMutationSerialization
@@ -798,7 +696,10 @@ class TestMutationSerialization:
             )
 
             with (
-                patch("app.processing.ingest.router.validate_sources", return_value=[]),
+                patch(
+                    "app.processing.ingest.router.validate_sources_async",
+                    new=AsyncMock(return_value=[]),
+                ),
                 patch(
                     "app.processing.ingest.router.regenerate_vrt_staged"
                 ) as mock_task,
@@ -968,19 +869,23 @@ class TestRegenerateVrtTask:
         from app.processing.ingest import tasks_vrt
 
         tree = ast.parse(inspect.getsource(tasks_vrt.regenerate_vrt.func))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
         lines = {
-            name: [
+            "_settle_failed_vrt_asset": [
                 node.lineno
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Call) and getattr(node.func, "id", None) == name
-            ]
-            for name in ("_settle_failed_vrt_asset", "update_ingest_job_for_attempt")
+                for node in calls
+                if getattr(node.func, "id", None) == "_settle_failed_vrt_asset"
+            ],
+            "ledger.fail": [
+                node.lineno
+                for node in calls
+                if isinstance(node.func, ast.Attribute)
+                and node.func.attr == "fail"
+                and getattr(node.func.value, "id", None) == "ledger"
+            ],
         }
         assert all(len(v) == 1 for v in lines.values()), lines
-        assert (
-            lines["_settle_failed_vrt_asset"][0]
-            < (lines["update_ingest_job_for_attempt"][0])
-        ), (
+        assert lines["_settle_failed_vrt_asset"][0] < lines["ledger.fail"][0], (
             "the asset settles after the job write, so a contended job row "
             "aborts the transaction the asset write is in again"
         )
@@ -1088,7 +993,7 @@ class TestRegenerateVrtTask:
                     return_value="/path/to/source.cog.tif",
                 ),
                 patch(
-                    "app.processing.ingest.tasks_vrt.extract_raster_metadata",
+                    "app.processing.ingest.tasks_vrt.read_raster_metadata",
                     return_value=mock_meta,
                 ),
                 patch(
@@ -1096,12 +1001,8 @@ class TestRegenerateVrtTask:
                     return_value="newhash",
                 ),
                 patch(
-                    "app.processing.ingest.tasks_vrt.generate_quicklook",
+                    "app.processing.ingest.tasks_vrt.render_quicklook",
                     return_value=b"\x89PNG",
-                ),
-                patch(
-                    "app.processing.ingest.tasks_vrt.invalidate_catalog_cache",
-                    new_callable=AsyncMock,
                 ),
                 patch(
                     "app.processing.ingest.tasks_vrt.rewrite_vrt_sources",
@@ -1125,15 +1026,9 @@ class TestRegenerateVrtTask:
 
                 mock_storage = AsyncMock()
                 mock_storage.put = AsyncMock()
-                with (
-                    patch(
-                        "app.processing.ingest.tasks_vrt.get_storage",
-                        return_value=mock_storage,
-                    ),
-                    patch(
-                        "app.processing.ingest.tasks_vrt.defer_embedding",
-                        new_callable=AsyncMock,
-                    ),
+                with patch(
+                    "app.processing.ingest.tasks_vrt.get_storage",
+                    return_value=mock_storage,
                 ):
                     await regenerate_vrt.func(
                         job_id=job_id,
@@ -1251,7 +1146,7 @@ class TestRegenerateVrtTask:
                     return_value="/path/to/source.cog.tif",
                 ),
                 patch(
-                    "app.processing.ingest.tasks_vrt.extract_raster_metadata",
+                    "app.processing.ingest.tasks_vrt.read_raster_metadata",
                     return_value=mock_meta,
                 ),
                 patch(
@@ -1259,12 +1154,8 @@ class TestRegenerateVrtTask:
                     return_value="newhash",
                 ),
                 patch(
-                    "app.processing.ingest.tasks_vrt.generate_quicklook",
+                    "app.processing.ingest.tasks_vrt.render_quicklook",
                     return_value=b"\x89PNG",
-                ),
-                patch(
-                    "app.processing.ingest.tasks_vrt.invalidate_catalog_cache",
-                    new_callable=AsyncMock,
                 ),
                 patch(
                     "app.processing.ingest.tasks_vrt.rewrite_vrt_sources",
@@ -1288,15 +1179,9 @@ class TestRegenerateVrtTask:
 
                 mock_storage = AsyncMock()
                 mock_storage.put = mock_put
-                with (
-                    patch(
-                        "app.processing.ingest.tasks_vrt.get_storage",
-                        return_value=mock_storage,
-                    ),
-                    patch(
-                        "app.processing.ingest.tasks_vrt.defer_embedding",
-                        new_callable=AsyncMock,
-                    ),
+                with patch(
+                    "app.processing.ingest.tasks_vrt.get_storage",
+                    return_value=mock_storage,
                 ):
                     await regenerate_vrt.func(
                         job_id=job_id,

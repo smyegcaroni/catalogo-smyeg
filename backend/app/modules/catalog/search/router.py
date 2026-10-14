@@ -15,7 +15,11 @@ from sqlalchemy.exc import DataError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.identity import Identity
-from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
+from app.core.record_types import (
+    RASTER_FAMILY_RECORD_TYPES,
+    RECORD_TYPES,
+    capabilities,
+)
 from app.platform.assets.keys import is_public_asset_key
 from app.platform.extensions import get_catalog_port
 from app.modules.auth.dependencies import get_optional_user
@@ -25,6 +29,7 @@ from app.modules.catalog.authorization import (
     get_user_roles,
     visible_lineage_summaries,
     visible_lineage_summary,
+    visible_vrt_source_counts,
 )
 from app.modules.catalog.datasets.domain.models import (
     Dataset,
@@ -70,12 +75,15 @@ from app.modules.catalog.search.records_protocol import (
     validate_legacy_external_id_access,
 )
 from app.modules.catalog.search.service import (
+    UNRESOLVED,
     SearchFilters,
     consume_paired_query_claim,
     count_collections,
+    count_datasets,
     dataset_to_ogc_record,
     get_facet_counts,
     record_paired_query_claim,
+    resolve_query_embedding,
     search_collections,
     search_datasets,
 )
@@ -114,14 +122,15 @@ def _build_pagination_url(
 async def _build_raster_assets(
     db: AsyncSession,
     dataset_id: uuid.UUID,
+    user: Identity | None,
+    user_roles: set[str],
 ) -> dict | None:
     """Fetch raster metadata for a single dataset (column list lives in
     app/processing/raster/queries.py — KISS-6).
 
-    For VRT datasets, also counts the source rasters the served VRT is made of.
+    For VRT datasets, also counts the source rasters the served VRT is made of
+    that the caller may read.
     """
-    from sqlalchemy import text
-
     meta = await get_catalog_port().fetch_raster_meta_one(db, dataset_id)
     if meta is None:
         return None
@@ -130,14 +139,9 @@ async def _build_raster_assets(
     # not the in-flight VrtGeneration.source_count — the link write happens at
     # the artifact swap, so the generation's own count can lag what is served.
     if meta.get("vrt_type") is not None:
-        count_result = await db.execute(
-            text(
-                "SELECT COUNT(*) FROM catalog.vrt_source_links "
-                "WHERE vrt_dataset_id = :id"
-            ),
-            {"id": str(dataset_id)},
-        )
-        meta["source_count"] = count_result.scalar() or 0
+        meta["source_count"] = (
+            await visible_vrt_source_counts(db, [dataset_id], user, user_roles)
+        )[dataset_id]
 
     # fix(#1327): current_generation_id must not reach a caller.
     meta.pop("current_generation_id", None)
@@ -211,6 +215,11 @@ async def _handle_search(
         if cached is not None:
             return OGCFeatureCollectionResponse(**cached)
 
+    # A typed search counts the untyped candidates too; resolving the query
+    # embedding once keeps a slow provider from being waited on twice.
+    embedding = (
+        await resolve_query_embedding(db, filters) if params.record_type else UNRESOLVED
+    )
     try:
         datasets, total = await search_datasets(
             db,
@@ -218,6 +227,7 @@ async def _handle_search(
             user_roles,
             filters,
             preferred_languages=preferred_languages,
+            embedding=embedding,
         )
     except DataError:
         raise HTTPException(
@@ -229,7 +239,7 @@ async def _handle_search(
         stac_assets_by_dataset,
         raster_meta,
         extent_geojson_map,
-    ) = await _bulk_fetch_dataset_metadata(db, datasets)
+    ) = await _bulk_fetch_dataset_metadata(db, datasets, user, user_roles)
 
     # fix(#1103): one visibility query for the page, not one per row.
     lineage = await visible_lineage_summaries(
@@ -258,16 +268,16 @@ async def _handle_search(
     # Collections are surfaced for text searches, explicit collection IDs, or
     # an explicit public collection type when the request is not scoped to an
     # internal record type or collection membership.
-    collections_applicable = bool(
+    collections_in_scope = bool(
         (
             text_search_requested
             or collection_ids is not None
             or collection_type_requested
         )
-        and not params.record_type
         and not params.collection_id
         and (resource_types is None or "collection" in resource_types)
     )
+    collections_applicable = collections_in_scope and not params.record_type
     collections_paginated = bool(
         collections_applicable
         and (collection_type_requested or collection_ids is not None)
@@ -277,13 +287,26 @@ async def _handle_search(
     # fix(#475): explicit Records collection filters participate in the combined
     # dataset-first result set, including its count and pagination.
     page0_collection_cap = 5
-    collection_total = 0
-    if collections_applicable:
-        collection_total = await count_collections(
+
+    async def _collection_total() -> int:
+        count = await count_collections(
             db, params.q or "", collection_ids=collection_ids
         )
-        if not collections_paginated:
-            collection_total = min(collection_total, page0_collection_cap)
+        if collection_type_requested or collection_ids is not None:
+            return count
+        return min(count, page0_collection_cap)
+
+    collection_total = await _collection_total() if collections_applicable else 0
+
+    # With a type selected, the untyped total lets the Type filter's All option
+    # match what choosing All returns.
+    matched_all_types: int | None = None
+    if params.record_type:
+        matched_all_types = await count_datasets(
+            db, user, user_roles, replace(filters, record_type=None, skip=0), embedding
+        )
+        if collections_in_scope:
+            matched_all_types += await _collection_total()
 
     if collections_paginated:
         collection_limit = max(0, params.limit - len(features))
@@ -375,6 +398,7 @@ async def _handle_search(
         # fix(#315): stable across pages; fix(#475): explicitly selected
         # collections are counted and paginated with datasets.
         numberMatched=total + collection_total,
+        numberMatchedAllTypes=matched_all_types,
         numberReturned=len(features),
         features=features,
         links=links,
@@ -805,6 +829,11 @@ async def list_collections(
     ds_base = (
         select(Dataset)
         .join(Record, Dataset.record_id == Record.id)
+        .where(
+            Record.record_type.in_(
+                [t for t in RECORD_TYPES if capabilities(t).ogc_item_type is not None]
+            )
+        )
         .options(_jl(Dataset.record))
     )
     ds_base = apply_visibility_filter(ds_base, user, user_roles, Record, DatasetGrant)
@@ -852,7 +881,8 @@ async def list_collections(
         # fix(#315): raster/VRT have no feature table -> mirror the detail
         # endpoint (coverage, no rel=items, add rel=tiles) so crawlers skip
         # the dead /items and still find the data.
-        is_raster = ds.record.record_type in RASTER_FAMILY_RECORD_TYPES
+        item_type = capabilities(ds.record.record_type).ogc_item_type
+        is_coverage = item_type == "coverage"
 
         links: list[dict] = [
             {
@@ -864,7 +894,7 @@ async def list_collections(
                 "type": "application/json",
             },
         ]
-        if not is_raster:
+        if not is_coverage:
             links.append(
                 {
                     "rel": "items",
@@ -903,7 +933,7 @@ async def list_collections(
             "id": str(ds.id),
             "title": ds.record.title,
             "description": ds.record.summary,
-            "itemType": "coverage" if is_raster else "feature",
+            "itemType": item_type,
             "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
             "links": links,
         }
@@ -1248,7 +1278,9 @@ async def get_collection_item(
     rec_type = getattr(dataset.record, "record_type", None)
     if rec_type in RASTER_FAMILY_RECORD_TYPES:
         try:
-            item_raster_meta = await _build_raster_assets(db, record_id)
+            item_raster_meta = await _build_raster_assets(
+                db, record_id, user, user_roles
+            )
         except Exception:  # broad: raster meta enrichment is best-effort; any DB error degrades to no raster props
             logger.warning(
                 "ogc_item_raster_meta_failed",
@@ -1286,6 +1318,8 @@ async def get_collection_item(
 async def _bulk_fetch_dataset_metadata(
     db: AsyncSession,
     datasets: list[Dataset],
+    user: Identity | None,
+    user_roles: set[str],
 ) -> tuple[
     dict[str, list[dict]],
     dict[str, dict],
@@ -1403,26 +1437,11 @@ async def _bulk_fetch_dataset_metadata(
                     for did in raster_ids
                     if raster_meta.get(str(did), {}).get("vrt_type") is not None
                 ]
-                if vrt_dataset_ids:
-                    RasterAsset = get_catalog_port().raster_asset_orm_class()
-                    VrtGeneration = get_catalog_port().vrt_generation_orm_class()
-                    vg_stmt = (
-                        select(
-                            RasterAsset.dataset_id,
-                            VrtGeneration.source_count,
-                        )
-                        .join(
-                            VrtGeneration,
-                            VrtGeneration.id == RasterAsset.current_generation_id,
-                        )
-                        .where(RasterAsset.dataset_id.in_(vrt_dataset_ids))
-                    )
-                    vg_result = await db.execute(vg_stmt)
-                    for row in vg_result.all():
-                        if str(row.dataset_id) in raster_meta:
-                            raster_meta[str(row.dataset_id)]["source_count"] = (
-                                row.source_count
-                            )
+                source_counts = await visible_vrt_source_counts(
+                    db, vrt_dataset_ids, user, user_roles
+                )
+                for vrt_id, count in source_counts.items():
+                    raster_meta[str(vrt_id)]["source_count"] = count
             except Exception:  # broad: VRT source-count enrichment is best-effort; any DB error skips the field
                 logger.warning(
                     "search_bulk_fetch_vrt_source_count_failed",

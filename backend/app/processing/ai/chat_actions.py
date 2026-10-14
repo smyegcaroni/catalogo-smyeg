@@ -305,6 +305,11 @@ async def _handle_query_data(
         "row_count": result.row_count,
         "truncated": result.truncated,
     }
+    if len(out["rows"]) < len(rows):
+        # `truncated` describes the overlay when there is one, and the overlay
+        # still carries every row this table dropped.
+        out["rows_truncated"] = True
+        out["truncated"] = out["truncated"] or geojson_result is None
     if result.row_count == 0:
         out["note"] = (
             "No matching results found. The user may want to try different criteria."
@@ -456,15 +461,22 @@ async def _execute_chat_tool(
     # chip can show a human name instead of the raw UUID.
     # Name resolution is best-effort — a lookup miss/error must not block the
     # add, so we degrade silently to the dataset_id fallback on the frontend.
+    # A dataset the caller can't read fails the access check and gets the
+    # same result as a missing one.
     if tool_name == "add_layer":
         result = {"status": "ok", **tool_input}
         raw_id = tool_input.get("dataset_id")
         if raw_id:
             try:
-                dataset = await port.get_dataset(session, UUID(str(raw_id)))
-                title = getattr(getattr(dataset, "record", None), "title", None)
-                if title:
-                    result["dataset_name"] = title
+                dataset_id = UUID(str(raw_id))
+                dataset = await port.get_dataset(session, dataset_id)
+                if dataset is not None:
+                    await port.check_dataset_access(
+                        session, dataset, dataset_id, user, user_roles=user_roles
+                    )
+                    title = getattr(getattr(dataset, "record", None), "title", None)
+                    if title:
+                        result["dataset_name"] = title
             except Exception:  # noqa: BLE001 — name lookup is best-effort; never block the add
                 logger.debug(
                     "add_layer.dataset_name_lookup_failed", dataset_id=str(raw_id)

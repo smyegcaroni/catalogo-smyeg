@@ -16,12 +16,16 @@ from typing import Any
 
 import structlog
 from fastapi import HTTPException, UploadFile, status
-from sqlalchemy import String, and_, literal, or_, select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.async_io import run_in_thread_draining
 from app.core.identity import Identity
 from app.core.config import settings
+from app.core.upload_errors import CodedRefusal
+from app.core.failure_reason import is_composed_exception, redact_failure_reason
+from app.core.pointcloud import POINTCLOUD_FILE_TYPE
+from app.core.tiles3d import TILESET_FILE_TYPE
 from app.core.service_tokens import (
     ServiceCredential,
     header_token_rejection_reason,
@@ -31,14 +35,20 @@ from app.core.db.tenant_session import defer_async_with_tenant
 from app.platform.dataset_origin import set_postgis_origin
 from app.platform.extensions import get_processing_port
 from app.processing.ingest.metadata import (
+    GID_UNUSABLE_SQL,
     add_4326_column,
+    add_gid_column,
     linearize_existing_4326,
     extract_metadata,
+    get_declared_srid,
     get_sample_values,
     get_table_srid,
     grant_reader_access,
+    probe_gid,
 )
 from app.processing.ingest.schemas import (
+    UNDECLARED_SRID_CODE,
+    UNUSABLE_GID_CODE,
     DiscoveredTable,
     RegisterRequest,
     VrtCreateRequest,
@@ -49,10 +59,13 @@ from app.platform.jobs.defer_guard import (
 )
 from app.platform.jobs.heartbeat import (
     ATTEMPT_STAGING_NAME_PATTERN,
+    PREVIOUS_VERSION_NAME_PATTERN,
     is_attempt_scoped_staging_table,
+    is_previous_version_table,
 )
+from app.platform.jobs import ledger
 from app.platform.jobs.models import (
-    FAN_OUT_INTERRUPTED_METADATA_KEY,
+    COMMIT_ATTEMPTED_METADATA_KEY,
     IngestJob,
     commit_attempted_marker,
 )
@@ -67,6 +80,20 @@ _UPLOAD_SPOOL_MAX_BYTES: int = 16 * 1024 * 1024  # 16 MiB
 # fix(#836): lives here, not router.py, so CatalogPort (platform layer) can
 # read it without importing the API edge (which registers routes on import).
 PART_SIZE = 10 * 1024 * 1024  # 10MB per part
+
+UNDECLARED_SRID_REASON = (
+    "PostGIS reports no SRID for its geom column, so GeoLens cannot tell where "
+    "its coordinates are. Give the column an SRID, for example with "
+    "UpdateGeometrySRID on a plain geometry column, then register the table."
+)
+
+UNUSABLE_GID_REASON = (
+    "GeoLens identifies features by a column named gid: an integer that is NOT "
+    "NULL and unique, such as a primary key, in a table no other table "
+    "inherits from. This table does not meet that. Add or fix the gid "
+    "column, or rename one GeoLens can't use so it can add its own, then "
+    "register the table."
+)
 
 
 async def _await_provider_call_draining(awaitable: Any) -> Any:
@@ -114,6 +141,7 @@ async def discover_unregistered_tables(
         tenant_join_clause = ""
         bind_params = dict(schema=schema, limit=limit)
     bind_params["attempt_staging_pattern"] = ATTEMPT_STAGING_NAME_PATTERN
+    bind_params["previous_version_pattern"] = PREVIOUS_VERSION_NAME_PATTERN
 
     result = await session.execute(
         text(
@@ -122,7 +150,9 @@ async def discover_unregistered_tables(
                 t.table_name,
                 gc.type AS geometry_type,
                 gc.srid,
-                c.reltuples::bigint AS estimated_rows
+                CASE WHEN c.reltuples >= 0 THEN c.reltuples::bigint END
+                    AS estimated_rows,
+                {GID_UNUSABLE_SQL} AS gid_unusable
             FROM information_schema.tables t
             LEFT JOIN catalog.datasets d ON d.table_name = t.table_name
                 {tenant_join_clause}
@@ -135,6 +165,10 @@ async def discover_unregistered_tables(
                 AND c.relnamespace = (
                     SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = :schema
                 )
+            LEFT JOIN pg_catalog.pg_attribute a
+                ON a.attrelid = c.oid
+                AND a.attname = 'gid'
+                AND NOT a.attisdropped
             WHERE t.table_schema = :schema
                 AND t.table_type = 'BASE TABLE'
                 AND d.table_name IS NULL
@@ -147,13 +181,32 @@ async def discover_unregistered_tables(
                 -- listed here and permanently registerable. Same expression
                 -- the registration refusal uses.
                 AND t.table_name !~ :attempt_staging_pattern
+                AND t.table_name !~ :previous_version_pattern
                 AND t.table_name != 'spatial_ref_sys'
             ORDER BY t.table_name
             LIMIT :limit
             """
         ).bindparams(**bind_params)
     )
-    return [DiscoveredTable(**dict(row)) for row in result.mappings().all()]
+    return [
+        DiscoveredTable(
+            table_name=row["table_name"],
+            geometry_type=row["geometry_type"],
+            srid=row["srid"],
+            estimated_rows=row["estimated_rows"],
+            refusal_reason=_discovery_refusal(row),
+        )
+        for row in result.mappings().all()
+    ]
+
+
+def _discovery_refusal(row: Any) -> str | None:
+    """The code registration would refuse a discovered table with, if any."""
+    if row["srid"] == 0:
+        return UNDECLARED_SRID_CODE
+    if row["gid_unusable"]:
+        return UNUSABLE_GID_CODE
+    return None
 
 
 async def get_job_or_404(
@@ -184,6 +237,64 @@ async def get_job_or_404(
             )
 
     return job
+
+
+async def admit_import_commit(
+    db: AsyncSession,
+    job: IngestJob,
+    attempt_id: uuid.UUID | None,
+    commit_metadata: dict,
+) -> None:
+    """Commit an import commit's metadata onto its job, or raise 400 when another writer took it.
+
+    The row lock orders concurrent commits of one upload, and the dispatch
+    marker rides this commit, so a later one finds the job taken. It also
+    refuses when a cancel or retry moved the status or attempt.
+    """
+    await db.refresh(job, with_for_update=True)
+    if (
+        job.status != "pending"
+        or job.attempt_id != attempt_id
+        or (job.user_metadata or {}).get(COMMIT_ATTEMPTED_METADATA_KEY)
+    ):
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Job already processed",
+        )
+    # Service jobs already carry service_type and layer_id from preview.
+    job.user_metadata = {
+        **(job.user_metadata or {}),
+        **commit_metadata,
+        **commit_attempted_marker(),
+    }
+    await db.commit()
+
+
+async def record_preview_layers(
+    db: AsyncSession, job_id: uuid.UUID, layers: list
+) -> None:
+    """Merge a preview's layer list into a pending upload's metadata, and commit.
+
+    A merge into the row, not a write of the copy the preview read: a commit
+    may have written its own metadata and dispatch marker since.
+    """
+    from sqlalchemy import bindparam, func, update
+    from sqlalchemy.dialects.postgresql import JSONB
+
+    await db.execute(
+        update(IngestJob)
+        .where(IngestJob.id == job_id, IngestJob.status == "pending")
+        .values(
+            user_metadata=func.coalesce(
+                IngestJob.user_metadata, text("'{}'::jsonb")
+            ).op("||")(
+                bindparam("preview_layers", value={"all_layers": layers}, type_=JSONB)
+            )
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
 
 
 def safe_upload_basename(filename: str | None) -> str:
@@ -242,12 +353,20 @@ async def save_upload_file(
                     while chunk := await file.read(65536):
                         total += len(chunk)
                         if total > max_size_bytes:
+                            limit_mb = round(max_size_bytes / (1024 * 1024), 1)
                             raise HTTPException(
                                 status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-                                detail=(
-                                    f"File size exceeds maximum allowed "
-                                    f"({max_size_bytes / (1024 * 1024):.1f} MB)."
-                                ),
+                                detail={
+                                    # Aborted mid-stream, so there's no true
+                                    # size to report: a distinct code from
+                                    # file_size_exceeded, whose key needs one.
+                                    "code": "file_size_limit_exceeded",
+                                    "message": (
+                                        f"File size exceeds maximum allowed "
+                                        f"({limit_mb} MB)."
+                                    ),
+                                    "limit_mb": limit_mb,
+                                },
                             )
                         spooled.write(chunk)
                     spooled.seek(0)
@@ -289,12 +408,17 @@ async def save_upload_file(
                 if max_size_bytes is not None:
                     total += len(chunk)
                     if total > max_size_bytes:
+                        limit_mb = round(max_size_bytes / (1024 * 1024), 1)
                         raise HTTPException(
                             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-                            detail=(
-                                f"File size exceeds maximum allowed "
-                                f"({max_size_bytes / (1024 * 1024):.1f} MB)."
-                            ),
+                            detail={
+                                "code": "file_size_limit_exceeded",
+                                "message": (
+                                    f"File size exceeds maximum allowed "
+                                    f"({limit_mb} MB)."
+                                ),
+                                "limit_mb": limit_mb,
+                            },
                         )
                 # Drain the write before closing/unlinking, since a cancelled
                 # request doesn't stop the worker thread.
@@ -436,7 +560,11 @@ def validate_file_extension(
     )
     suffix = Path(filename).suffix.lower()
     if suffix not in exts:
-        raise ValueError(f"File extension {suffix!r} not allowed. Allowed: {exts}")
+        raise CodedRefusal(
+            f"File extension {suffix!r} not allowed. Allowed: {exts}",
+            code="disallowed_extension",
+            values={"extension": suffix, "allowed": ", ".join(exts)},
+        )
 
 
 # PostgreSQL truncates any identifier past NAMEDATALEN-1 = 63 bytes, silently
@@ -562,7 +690,10 @@ async def generate_table_name(
     )
     existing |= {row[0] for row in retired_result.all()}
 
-    if slug in existing:
+    # Names GeoLens derives from another table's would let this dataset take
+    # a table a swap later drops or renames; the `_N` suffix moves off them.
+    reserved = is_previous_version_table(slug) or is_attempt_scoped_staging_table(slug)
+    if slug in existing or reserved:
         suffix = 2
         while _with_collision_suffix(base_slug, suffix) in existing:
             suffix += 1
@@ -573,7 +704,8 @@ async def generate_table_name(
                     "Give this dataset a more distinctive title."
                 )
         slug = _with_collision_suffix(base_slug, suffix)
-        collision_warning = f"Table name '{base_slug}' already exists, using '{slug}'"
+        taken = "is reserved" if reserved else "already exists"
+        collision_warning = f"Table name '{base_slug}' {taken}, using '{slug}'"
 
     return slug, collision_warning
 
@@ -602,15 +734,53 @@ async def create_ingest_job(
     user_id: uuid.UUID,
 ) -> IngestJob:
     """Create and persist an IngestJob record with status='pending'."""
-    job = IngestJob(
-        source_filename=filename,
-        file_path=file_path,
-        created_by=user_id,
-        status="pending",
+    job = ledger.create(
+        session, created_by=user_id, source_filename=filename, file_path=file_path
     )
-    session.add(job)
     await session.flush()
     return job
+
+
+def registration_failure_reason(exc: Exception, table_name: str) -> str:
+    """What a failed bulk registration item reports: its refusal or a code."""
+    if not is_composed_exception(exc):
+        logger.error(
+            "Unexpected error during bulk table registration",
+            table_name=table_name,
+            exc_info=exc,
+        )
+    return redact_failure_reason(exc)
+
+
+def _step_refusal(message: str, exc: Exception) -> ValueError:
+    """``message``, ending with the cause only when this codebase wrote it.
+
+    A driver's text can quote the statement or the table's rows, and this
+    message reaches the response.
+    """
+    if is_composed_exception(exc):
+        return ValueError(f"{message}: {redact_failure_reason(exc)}")
+    logger.warning("register_table_step_failed", step=message, exc_info=exc)
+    return ValueError(f"{message}.")
+
+
+async def _ensure_keyable_gid(
+    session: AsyncSession, table_name: str, *, schema: str
+) -> None:
+    """Refuse a ``gid`` readers cannot key features on; add one where there is none."""
+    keyable = await probe_gid(session, table_name, schema=schema)
+    if keyable is False:
+        raise ValueError(
+            f"Table '{table_name}' cannot be registered. {UNUSABLE_GID_REASON}"
+        )
+    if keyable is None:
+        try:
+            async with session.begin_nested():
+                await add_gid_column(session, table_name, schema=schema)
+        except Exception as exc:  # broad: ALTER TABLE inside savepoint can fail for schema/permission reasons
+            raise _step_refusal(
+                f"Failed to add a gid column to '{table_name}'", exc
+            ) from exc
 
 
 async def register_existing_table(
@@ -623,8 +793,8 @@ async def register_existing_table(
     """Register an existing data-schema table into the dataset catalog.
 
     Verifies the table exists, checks for duplicate registration,
-    ensures geom_4326 column and reader access, extracts metadata,
-    and creates a Dataset record.
+    ensures the gid and geom_4326 columns and reader access, extracts
+    metadata, and creates a Dataset record.
 
     fix(#1114): registered-table linear-geometry contract. ``geom_4326`` on a
     registered table must stay linear (no CIRCULARSTRING, COMPOUNDCURVE,
@@ -677,6 +847,12 @@ async def register_existing_table(
             "single import attempt and is dropped when that attempt ends, so a "
             "dataset registered against it would lose its rows. Rename the "
             "table if you mean to keep it."
+        )
+    if is_previous_version_table(table_name):
+        raise ValueError(
+            f"Table '{table_name}' holds a dataset's previous version, which "
+            "GeoLens drops or replaces at that dataset's next replacement. "
+            "Rename the table if you mean to keep it."
         )
 
     result = await session.execute(
@@ -763,6 +939,13 @@ async def register_existing_table(
     # correct reader role; no-op in single_tenant ('data'/'geolens_reader').
     _grant_role = _current_tenant_role()
 
+    if has_geom and await get_declared_srid(session, table_name, schema=_schema) == 0:
+        raise ValueError(
+            f"Table '{table_name}' cannot be registered. {UNDECLARED_SRID_REASON}"
+        )
+
+    await _ensure_keyable_gid(session, table_name, schema=_schema)
+
     if has_geom:
         if not has_4326:
             srid = await get_table_srid(session, table_name, schema=_schema)
@@ -774,8 +957,8 @@ async def register_existing_table(
                         session, table_name, srid or 4326, schema=_schema
                     )
             except Exception as exc:  # broad: ALTER TABLE/CREATE INDEX inside savepoint can fail for schema/permission reasons
-                raise ValueError(
-                    f"Failed to add geom_4326 column to '{table_name}': {exc}"
+                raise _step_refusal(
+                    f"Failed to add geom_4326 column to '{table_name}'", exc
                 ) from exc
         else:
             # fix(#1113): a table registered after migration 0034 is
@@ -787,8 +970,8 @@ async def register_existing_table(
                 async with session.begin_nested():
                     await linearize_existing_4326(session, table_name, schema=_schema)
             except Exception as exc:  # broad: UPDATE inside savepoint can fail for schema/permission reasons
-                raise ValueError(
-                    f"Failed to linearize geom_4326 on '{table_name}': {exc}"
+                raise _step_refusal(
+                    f"Failed to linearize geom_4326 on '{table_name}'", exc
                 ) from exc
 
     await grant_reader_access(session, table_name, schema=_schema, role=_grant_role)
@@ -850,7 +1033,7 @@ async def create_vrt_job(
 
     from app.processing.ingest.tasks import ingest_vrt
     from app.processing.raster.models import RasterAsset
-    from app.processing.raster.validation import validate_sources
+    from app.processing.raster.validation import validate_sources_async
 
     _port = get_processing_port()
     Dataset = _port.get_dataset_orm_class()
@@ -898,11 +1081,11 @@ async def create_vrt_job(
     user_roles = await get_user_roles(db, user)
     await check_datasets_access_bulk(db, request.source_dataset_ids, user, user_roles)
 
-    errors = validate_sources(request.vrt_type, list(found_assets))
+    errors = await validate_sources_async(request.vrt_type, list(found_assets))
     if errors:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=[e.model_dump() for e in errors],
+            detail=[e.model_dump(mode="json") for e in errors],
         )
 
     job = await create_ingest_job(db, f"vrt_{request.vrt_type}", "", user.id)
@@ -985,11 +1168,11 @@ async def create_fan_out_jobs(
         file_base = _re.sub(r"\.[^.]+$", "", file_base)
         title = layer.title if layer.title else f"{file_base}: {layer.layer_name}"
 
-        new_job = IngestJob(
+        new_job = ledger.create(
+            session,
+            created_by=original_job.created_by,
             file_path=original_job.file_path,
             source_filename=original_job.source_filename,
-            status="pending",
-            created_by=original_job.created_by,
             user_metadata={
                 **(original_job.user_metadata or {}),
                 "layer_name": layer.layer_name,
@@ -1006,7 +1189,6 @@ async def create_fan_out_jobs(
                 **commit_attempted_marker(),
             },
         )
-        session.add(new_job)
         await session.flush()  # assigns new_job.id
         # COMMIT before deferring: defer_async uses a separate DB connection,
         # so an uncommitted row makes the worker log "job not found" and the
@@ -1108,26 +1290,9 @@ async def claim_fan_out_parent(
 
     Returns whether the claim landed. The caller renders the refusal.
     """
-    from datetime import datetime, timezone
-
-    from sqlalchemy import update as sa_update
-
-    attempt_predicate = (
-        IngestJob.attempt_id == parent_attempt_id
-        if parent_attempt_id is not None
-        else IngestJob.attempt_id.is_(None)
-    )
-    claim = await session.execute(
-        sa_update(IngestJob)
-        .where(
-            IngestJob.id == job.id,
-            IngestJob.status == "pending",
-            attempt_predicate,
-        )
-        .values(status="fanned_out", completed_at=datetime.now(timezone.utc))
-    )
+    claimed = await ledger.fan_out(session, job.id, parent_attempt_id)
     await session.commit()
-    return bool(claim.rowcount)
+    return claimed
 
 
 async def restore_fan_out_parent_pending(
@@ -1155,38 +1320,9 @@ async def restore_fan_out_parent_pending(
 
     Returns whether the CAS matched, so the caller can report a lost undo.
     """
-    from sqlalchemy import update as sa_update
-
-    attempt_predicate = (
-        IngestJob.attempt_id == parent_attempt_id
-        if parent_attempt_id is not None
-        else IngestJob.attempt_id.is_(None)
-    )
-    restored = await session.execute(
-        sa_update(IngestJob)
-        .where(
-            IngestJob.id == job.id,
-            or_(
-                IngestJob.status == "fanned_out",
-                and_(
-                    IngestJob.status == "failed",
-                    IngestJob.user_metadata[FAN_OUT_INTERRUPTED_METADATA_KEY].astext
-                    == "true",
-                ),
-            ),
-            attempt_predicate,
-        )
-        .values(
-            status="pending",
-            completed_at=None,
-            error_message=None,
-            user_metadata=IngestJob.user_metadata.op("-")(
-                literal(FAN_OUT_INTERRUPTED_METADATA_KEY, String)
-            ),
-        )
-    )
+    restored = await ledger.restore(session, job.id, parent_attempt_id)
     await session.commit()
-    return bool(restored.rowcount)
+    return restored
 
 
 def job_service_format(job: IngestJob) -> str | None:
@@ -1236,6 +1372,17 @@ def _assert_header_token_dispatchable(job: IngestJob, token: str | None) -> None
         )
 
 
+def _assert_commit_credential_dispatchable(
+    job: IngestJob, token: str | None, credential: ServiceCredential | None
+) -> None:
+    """Refuse a commit credential the worker would reject or could not receive."""
+    from app.platform.refresh.credentials import refuse_without_credential_store
+
+    _assert_header_token_dispatchable(job, token)
+    if credential is not None:
+        refuse_without_credential_store(door="import", operation="import")
+
+
 async def queue_ingest_job(
     job: IngestJob,
     user_id: str,
@@ -1247,8 +1394,9 @@ async def queue_ingest_job(
     """Route a committed ingest job to the right Procrastinate task.
 
     Chooses between ``ingest_service`` (source_url set), ``ingest_raster``
-    (file_type=raster), and ``ingest_file`` (default vector path), and sends
-    small vector files to the priority queue.
+    (file_type=raster), ``ingest_tileset`` (file_type=tiles3d),
+    ``ingest_pointcloud`` (file_type=pointcloud) and ``ingest_file`` (default
+    vector path), and sends small vector files to the priority queue.
 
     Each ``defer_async`` call is wrapped in ``defer_with_orphan_guard`` so a
     queue outage flips the committed pending job to ``failed`` and surfaces
@@ -1256,8 +1404,9 @@ async def queue_ingest_job(
 
     Raises ``HTTPException 400`` when the job has no file_path and no
     source_url. Raises ``HTTPException 503`` when Procrastinate is
-    unreachable, or a configured credential store can't be reached to stage
-    a service token (see ``resolve_dispatch_credential``).
+    unreachable, or when a service token cannot be staged because the
+    credential store is not configured or cannot be reached (see
+    ``resolve_dispatch_credential``).
 
     feat(#1746) D2: ``credential`` is the structured spelling of the same
     thing as ``token``, so a caller with no HTTP layer (e.g. an overlay
@@ -1277,11 +1426,18 @@ async def queue_ingest_job(
 
     from app.platform.refresh.credentials import (
         CredentialStoreUnavailable,
+        credential_store_refusal,
         discard_service_credential,
         resolve_dispatch_credential,
     )
     from app.processing.ingest.constants import PRIORITY_QUEUE_THRESHOLD_BYTES
-    from app.processing.ingest.tasks import ingest_file, ingest_raster, ingest_service
+    from app.processing.ingest.tasks import (
+        ingest_file,
+        ingest_pointcloud,
+        ingest_raster,
+        ingest_service,
+        ingest_tileset,
+    )
 
     if job.source_url and not job.file_path:
         # Capture source_url into a local so mypy preserves the ``str``
@@ -1301,43 +1457,24 @@ async def queue_ingest_job(
         if credential is None:
             _assert_header_token_dispatchable(job, token)
 
-        # feat(#1746) plan D9: what crosses to the worker under `token` is
-        # one finished header line for the two header-auth formats, or the
-        # bare token for ArcGIS — composed here since the queue hop has no
-        # later site to compose it, from whichever spelling the caller used.
+        # What is staged for the worker is one finished header line for the
+        # two header-auth formats, or the bare token for ArcGIS, composed here
+        # because the worker has no later site to compose it.
         service_format = job_service_format(job)
         token = wire_credential(
             credential if credential is not None else bearer_credential(token),
             service_format=service_format,
         )
 
-        # feat(#1676): the import door's half of the lease. With a shared
-        # credential store this returns (None, ref) and the secret never
-        # becomes a task argument; without one it returns the token
-        # unchanged. resolve_dispatch_credential owns that whole decision,
-        # so this door can't drift from the re-upload one.
-        credential_ref: str | None = None
         try:
-            token, credential_ref = await resolve_dispatch_credential(
-                token, door="import"
-            )
+            credential_ref = await resolve_dispatch_credential(token, door="import")
         except CredentialStoreUnavailable as exc:
             # The job row is already committed (commit_import commits before
             # dispatching), so a bare raise would strand it until the stale
             # sweep. Finalize it as the orphan guard would, then 503.
             await job_failed(exc)
             await db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={
-                    "code": "credential_store_unavailable",
-                    "message": (
-                        "Could not stage the service credential for this "
-                        "import. Check that the credential store is "
-                        "reachable and try again."
-                    ),
-                },
-            ) from exc
+            raise credential_store_refusal(exc, operation="import") from exc
 
         async def _defer_service() -> None:
             task = ingest_service
@@ -1348,28 +1485,21 @@ async def queue_ingest_job(
                 source_url=source_url,
                 source_layer=job.source_layer or "",
                 user_id=user_id,
-                token=token,
-                # fix(#1689): ROLLING-DEPLOY SKEW, accepted like
-                # #1220 accepted it at the refresh door. A previous-generation
-                # worker takes `credential_ref` through `**kwargs`, discards
-                # it, fetches unauthenticated, and fails the job blaming the
-                # origin. The alternative — a task name old workers don't
-                # register — is worse: Procrastinate fails its own job on
-                # TaskNotFound without writing the ingest_jobs row, so it
-                # hangs `pending` until the stale-job sweep, which reads
-                # worse than a retriable failure. Narrower window than the
-                # refresh door too: a storeless install dispatches no
-                # reference at all, so only a REDIS_URL install mid-rollout
-                # on a token-bearing import is exposed, and single-node
-                # compose deploys never overlap generations. Nothing strands:
-                # the old worker fails the job and the credential dies by TTL.
+                # A worker from the previous release takes `credential_ref`
+                # through `**kwargs`, ignores it, fetches unauthenticated and
+                # fails the job blaming the origin. Accepted: a new task name
+                # would be worse, since Procrastinate fails an unregistered
+                # task without writing the ingest_jobs row, leaving it
+                # `pending` until the stale-job sweep. The credential dies by
+                # its TTL.
                 credential_ref=credential_ref,
             )
 
         async def _rollback_service(defer_exc: BaseException) -> None:
-            await job_failed(defer_exc)
-            # Best-effort: the TTL is the real guarantee, this just shortens
-            # a window nothing will use.
+            if not await job_failed(defer_exc):
+                return
+            # Only a landed job write means no worker will redeem it. After a
+            # miss, the credential's TTL is the real guarantee.
             await discard_service_credential(credential_ref)
 
         await defer_with_orphan_guard(
@@ -1387,11 +1517,16 @@ async def queue_ingest_job(
         )
     file_path = job.file_path
 
-    if (job.user_metadata or {}).get("file_type") == "raster":
+    whole_file_task = {
+        "raster": ingest_raster,
+        TILESET_FILE_TYPE: ingest_tileset,
+        POINTCLOUD_FILE_TYPE: ingest_pointcloud,
+    }.get((job.user_metadata or {}).get("file_type"))
+    if whole_file_task is not None:
 
-        async def _defer_raster() -> None:
+        async def _defer_whole_file() -> None:
             await defer_async_with_tenant(
-                ingest_raster,
+                whole_file_task,
                 job_id=str(job.id),
                 attempt_id=str(job.attempt_id),
                 file_path=file_path,
@@ -1399,7 +1534,7 @@ async def queue_ingest_job(
             )
 
         await defer_with_orphan_guard(
-            _defer_raster,
+            _defer_whole_file,
             rollback=make_ingest_job_failed_rollback(job),
             db=db,
             job=job,

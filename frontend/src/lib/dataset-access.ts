@@ -1,4 +1,5 @@
 import { API_BASE } from '@/lib/constants';
+import { recordTypeCapabilities } from '@/lib/record-types';
 import type { TileConfig } from '@/api/settings';
 import type { DatasetResponse, DistributionResponse } from '@/types/api';
 
@@ -122,6 +123,11 @@ export function getPublicApiBaseUrl(
   return getRuntimeApiBaseUrl();
 }
 
+/** An app-origin path, such as `tileset.url`, as an absolute URL. */
+export function appOriginUrl(path: string): string {
+  return isAbsoluteUrl(path) ? path : `${window.location.origin}${path}`;
+}
+
 export function resolveDistributionUrl(url: string, publicApiBaseUrl: string | null | undefined): string {
   if (!url) {
     return url;
@@ -149,6 +155,26 @@ function resolveByType(
   return dist ? resolveDistributionUrl(dist.url, publicApiBaseUrl) : null;
 }
 
+// The key requirement applies to this instance's own tile route, not to an
+// external tile service someone registered as a distribution.
+const GEOLENS_VECTOR_TILE_RE = /\/tiles\/data\.[^/?#]+\/\{z\}\/\{x\}\/\{y\}\.pbf/;
+
+export function isGeoLensVectorTileUrl(url: string, publicApiBaseUrl: string | null | undefined): boolean {
+  if (!GEOLENS_VECTOR_TILE_RE.test(url)) return false;
+  if (!isAbsoluteUrl(url) || isSameOriginAbsoluteUrl(url)) return true;
+  return !!publicApiBaseUrl && url.startsWith(`${stripTrailingSlashes(publicApiBaseUrl)}/`);
+}
+
+/** A non-public dataset's own tile template with the API key placeholder desktop GIS clients fill in. */
+export function vectorTileUrlForClients(
+  url: string,
+  visibility: DatasetResponse['visibility'],
+  publicApiBaseUrl: string | null | undefined,
+): string {
+  if (visibility === 'public' || !isGeoLensVectorTileUrl(url, publicApiBaseUrl)) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}api_key={your_key}`;
+}
+
 export interface DatasetAccessEndpoints {
   csvExportUrl: string | null;
   ogcFeaturesUrl: string | null;
@@ -156,26 +182,25 @@ export interface DatasetAccessEndpoints {
 }
 
 export function getDatasetAccessEndpoints(
-  dataset: Pick<DatasetResponse, 'id' | 'record_type' | 'table_name'>,
+  dataset: Pick<DatasetResponse, 'id' | 'record_type' | 'table_name' | 'visibility'>,
   publicApiBaseUrl: string | null | undefined,
   distributions: DistributionResponse[] = [],
 ): DatasetAccessEndpoints {
-  const isRaster = dataset.record_type === 'raster_dataset';
-  const isVrt = dataset.record_type === 'vrt_dataset';
+  const { featureTable, tileToken } = recordTypeCapabilities(dataset.record_type);
   const isTable = dataset.record_type === 'table';
-  const isVectorLike = !isRaster && !isVrt;
+  const vectorTilesUrl =
+    resolveByType(distributions, (d) => d.distribution_type === 'vector_tiles', publicApiBaseUrl)
+    ?? (!isTable && tileToken === 'vector' && dataset.table_name
+      ? resolveDistributionUrl(`/tiles/data.${dataset.table_name}/{z}/{x}/{y}.pbf`, publicApiBaseUrl)
+      : null);
 
   return {
     ogcFeaturesUrl:
       resolveByType(distributions, (d) => d.distribution_type === 'ogc_features', publicApiBaseUrl)
-      ?? (isVectorLike ? resolveDistributionUrl(`/collections/${dataset.id}/items`, publicApiBaseUrl) : null),
+      ?? (featureTable ? resolveDistributionUrl(`/collections/${dataset.id}/items`, publicApiBaseUrl) : null),
     csvExportUrl:
       resolveByType(distributions, (d) => d.distribution_type === 'download' && d.format === 'csv', publicApiBaseUrl)
-      ?? (isVectorLike ? resolveDistributionUrl(`/datasets/${dataset.id}/export?format=csv`, publicApiBaseUrl) : null),
-    vectorTilesUrl:
-      resolveByType(distributions, (d) => d.distribution_type === 'vector_tiles', publicApiBaseUrl)
-      ?? (!isTable && isVectorLike && dataset.table_name
-        ? resolveDistributionUrl(`/tiles/data.${dataset.table_name}/{z}/{x}/{y}.pbf`, publicApiBaseUrl)
-        : null),
+      ?? (featureTable ? resolveDistributionUrl(`/datasets/${dataset.id}/export?format=csv`, publicApiBaseUrl) : null),
+    vectorTilesUrl: vectorTilesUrl && vectorTileUrlForClients(vectorTilesUrl, dataset.visibility, publicApiBaseUrl),
   };
 }

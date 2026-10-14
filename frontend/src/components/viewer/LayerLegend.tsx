@@ -1,26 +1,15 @@
-import { useEffect, useMemo, useRef } from 'react';
-import type { MapTerrainConfig, SharedLayerResponse, StyleConfig } from '@/types/api';
+import { useMemo, useRef, type KeyboardEvent } from 'react';
+import type { MapTerrainConfig, SharedLayerResponse } from '@/types/api';
 import { useTranslation } from 'react-i18next';
 import { demChipGlyph, LayerTypeIcon, RasterGlyphChip } from '@/components/map/layer-icons';
-import {
-  CategoricalLegend,
-  GraduatedColorLegend,
-  GraduatedRadiusLegend,
-  GraduatedWidthLegend,
-  HeatmapLegend,
-} from '@/components/map/LegendEntries';
-import type { SwatchStyle } from '@/components/map/LegendEntries';
-import { fillPatternFromPaint, fillPatternTint } from '@/lib/fill-pattern-preview';
+import { HeatmapLegend, LegendClassesList } from '@/components/map/LegendEntries';
 import { Eye, EyeOff, Layers, X } from 'lucide-react';
-import { parseStepOrInterpolate } from '@/lib/normalize-style-config';
-import { MAP_COLORS } from '@/lib/map-colors';
 import { createViewerLayerEntries, isTerrainBackingLiveVisible } from '@/components/viewer/layer-identity';
 import {
   deriveTerrainLegendEntry,
-  isDemTerrainVisualSuppressed,
   terrainSourceIsShownAsLayer,
 } from '@/components/builder/terrain-legend';
-import { getClusterSourceStrategy, isClusterRenderMode } from '@/components/builder/cluster-source';
+import { legendFacts, type DrawnLayer } from '@/components/map/legend-facts';
 
 interface LayerLegendProps {
   layers: SharedLayerResponse[];
@@ -36,179 +25,8 @@ interface LayerLegendProps {
    * the default heading.
    */
   legendTitle?: string | null;
-}
-
-/**
- * ENH-06: effective viewer legend entry name. A non-empty per-entry
- * style_config.legendLabel override wins, else the layer's display name, else
- * the dataset name. Mirrors LegendPlugin.legendEntryName for builder/viewer
- * parity.
- */
-function viewerLegendEntryName(layer: SharedLayerResponse): string {
-  const override = layer.style_config?.legendLabel;
-  if (typeof override === 'string' && override.trim() !== '') return override;
-  return layer.display_name || layer.dataset_name;
-}
-
-/** Build SwatchStyle from viewer layer paint for consistent legend rendering. */
-export function viewerSwatchStyle(layer: SharedLayerResponse): SwatchStyle {
-  const gt = (layer.geometry_type ?? '').toUpperCase();
-  const isPoint = gt.includes('POINT');
-  const builder = layer.style_config?.builder;
-
-  const rawStrokeW = isPoint
-    ? layer.paint?.['circle-stroke-width']
-    : (builder?.outlineWidth ?? layer.paint?.['_outline-width']);
-  const strokeWidth = typeof rawStrokeW === 'number' ? rawStrokeW : undefined;
-
-  // fix(#1288 codex): builder.strokeDisabled/outlineWidth win over the paint
-  // mirror, matching extractStyleHints/getSwatchStyleFromPaint — a stroke the
-  // user turned off through the builder can leave paint's
-  // _stroke-disabled/_outline-width unchanged, and a zero-width outline draws
-  // nothing on the map either way.
-  const strokeDisabled = isPoint
-    ? !!layer.paint?.['_stroke-disabled']
-    : Boolean(builder?.strokeDisabled ?? layer.paint?.['_stroke-disabled']) || strokeWidth === 0;
-
-  // fix(#1288): builder.outlineColor wins over the flat paint mirror, which can
-  // go stale — the map itself renders from style_config.builder.
-  const rawOutline = isPoint
-    ? layer.paint?.['circle-stroke-color']
-    : (builder?.outlineColor ?? layer.paint?.['_outline-color']);
-  const outlineColor = typeof rawOutline === 'string' ? rawOutline : undefined;
-
-  const rawFillOp = isPoint
-    ? layer.paint?.['circle-opacity']
-    : gt.includes('LINE') ? layer.paint?.['line-opacity'] : layer.paint?.['fill-opacity'];
-  const fillOpacity = typeof rawFillOp === 'number' ? rawFillOp : undefined;
-  return {
-    outlineColor,
-    strokeDisabled,
-    opacity: layer.opacity ?? 1,
-    fillOpacity,
-    strokeWidth,
-    fillPattern: fillPatternFromPaint(layer.paint ?? undefined),
-    fillPatternColor: fillPatternTint(layer.paint ?? undefined, layer.style_config?.builder),
-  };
-}
-
-function parsePaintColors(paintColorValue: unknown): { colors: string[]; breaks: number[] } | null {
-  if (typeof paintColorValue === 'string' || !paintColorValue) return null;
-  const parsed = parseStepOrInterpolate(paintColorValue);
-  if (!parsed || !parsed.values.every((v) => typeof v === 'string')) return null;
-  return { colors: parsed.values as string[], breaks: parsed.breaks };
-}
-
-function expressionColumn(value: unknown): string | null {
-  if (!Array.isArray(value)) return null;
-  if (value[0] === 'get' && typeof value[1] === 'string') return value[1];
-  for (const entry of value) {
-    const column = expressionColumn(entry);
-    if (column) return column;
-  }
-  return null;
-}
-
-function displayColumn(value: string | undefined): string {
-  if (!value) return 'value';
-  return value
-    .replace(/^_+/, '')
-    .replace(/_/g, ' ')
-    .replace(/\bmhi\b/i, 'income')
-    .replace(/\bkm\b/i, 'km');
-}
-
-function clusterLegendKind(layer: SharedLayerResponse) {
-  if (!isClusterRenderMode(layer)) return null;
-  const strategy = getClusterSourceStrategy(layer);
-  return strategy.kind;
-}
-
-function colorPaintKey(geometryType: string | null | undefined): string {
-  const gt = (geometryType ?? '').toUpperCase();
-  if (gt.includes('POINT')) return 'circle-color';
-  if (gt.includes('LINE')) return 'line-color';
-  return 'fill-color';
-}
-
-function GraduatedLegend({
-  layer,
-  styleConfig,
-  swatchStyle,
-}: {
-  layer: SharedLayerResponse;
-  styleConfig: StyleConfig;
-  swatchStyle: SwatchStyle;
-}) {
-  const { t } = useTranslation('common');
-  const paint = layer.paint ?? {};
-  const breaks = styleConfig.breaks ?? [];
-  const metricLabel = styleConfig.sizeLabel ?? displayColumn(styleConfig.column);
-  const rawColor = paint[colorPaintKey(layer.geometry_type)];
-  const parsedColor = parsePaintColors(rawColor);
-  const colorColumn = expressionColumn(rawColor);
-  // parsePaintColors only handles data-driven expressions; a constant fill is a
-  // plain string, so fall back to it (the layer's real color) before gray.
-  const constantColor =
-    (typeof rawColor === 'string' ? rawColor : undefined) ?? MAP_COLORS.fallback;
-
-  if (styleConfig.target === 'radius' && styleConfig.sizes) {
-    return (
-      <div className="space-y-1">
-        <div className="text-mini font-medium text-muted-foreground">
-          {t('viewer.legend.sizeLabel', { label: metricLabel })}
-        </div>
-        <GraduatedRadiusLegend
-          sizes={styleConfig.sizes}
-          breaks={breaks}
-          circleColor={parsedColor?.colors[0] ?? constantColor}
-          style={swatchStyle}
-        />
-        {parsedColor && colorColumn && colorColumn !== styleConfig.column && (
-          <>
-            <div className="pt-1 text-mini font-medium text-muted-foreground">
-              {t('viewer.legend.colorLabel', {
-                label: styleConfig.colorLabel ?? displayColumn(colorColumn),
-              })}
-            </div>
-            <GraduatedColorLegend
-              colors={parsedColor.colors}
-              breaks={parsedColor.breaks}
-              geometryType={layer.geometry_type}
-              style={swatchStyle}
-            />
-          </>
-        )}
-      </div>
-    );
-  }
-
-  if (styleConfig.target === 'width' && styleConfig.sizes) {
-    const rawLineColor = paint['line-color'];
-    return (
-      <div className="space-y-1">
-        <div className="text-mini font-medium text-muted-foreground">
-          {t('viewer.legend.widthLabel', { label: metricLabel })}
-        </div>
-        <GraduatedWidthLegend
-          sizes={styleConfig.sizes}
-          breaks={breaks}
-          lineColor={(typeof rawLineColor === 'string' ? rawLineColor : undefined) ?? MAP_COLORS.fallback}
-          style={swatchStyle}
-        />
-      </div>
-    );
-  }
-
-  if (!styleConfig.colors) return null;
-  return (
-    <GraduatedColorLegend
-      colors={styleConfig.colors}
-      breaks={breaks}
-      geometryType={layer.geometry_type}
-      style={swatchStyle}
-    />
-  );
+  /** What the map drew each layer as, by layer key. A layer missing from it follows its saved style. */
+  drawn?: ReadonlyMap<string, DrawnLayer>;
 }
 
 export function LayerLegend({
@@ -219,22 +37,25 @@ export function LayerLegend({
   onToggle,
   terrainConfig = null,
   legendTitle = null,
+  drawn,
 }: LayerLegendProps) {
   const { t } = useTranslation('common');
   const panelRef = useRef<HTMLDivElement>(null);
+  const toggleRef = useRef<HTMLButtonElement>(null);
   const customTitle = legendTitle?.trim() ? legendTitle.trim() : null;
 
-  // D-02: exclude terrain-suppressed DEM layers (render_mode:"terrain") using
-  // the SAME shared predicate as the stack/builder — never re-derived. The
-  // synthetic entry is injected only here in LayerLegend's local derivation, so
-  // the shared createViewerLayerEntries output (also consumed by ViewerMap for
-  // real map-layer wiring) is never polluted with a non-paintable entry.
+  // The synthetic terrain entry below stays local to this legend: ViewerMap
+  // also reads createViewerLayerEntries and must not see a row that draws nothing.
   const sorted = useMemo(
     () =>
       createViewerLayerEntries(layers)
-        .filter(({ layer }) => layer.show_in_legend !== false && !isDemTerrainVisualSuppressed(layer))
+        .flatMap((entry) => {
+          if (entry.layer.show_in_legend === false) return [];
+          const facts = legendFacts(entry.layer, drawn?.get(entry.key));
+          return facts ? [{ ...entry, facts }] : [];
+        })
         .sort((a, b) => a.layer.sort_order - b.layer.sort_order),
-    [layers],
+    [layers, drawn],
   );
 
   // D-01: single synthetic "3D terrain" entry driven by terrain_config — only
@@ -257,22 +78,23 @@ export function LayerLegend({
     return terrainSourceIsShownAsLayer(terrainConfig, visibleSourceLayers) ? null : entry;
   }, [terrainConfig, layers, sorted, visibleLayers]);
 
-  // Dismiss on Escape
-  useEffect(() => {
-    if (!isOpen) return;
-    function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape') onToggle();
-    }
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, onToggle]);
+  // Escape closes the panel only while focus is in the legend, and marks the
+  // event handled so FeaturePopup and BasemapToggle's document listeners skip it.
+  function handleEscape(e: KeyboardEvent<HTMLElement>) {
+    if (e.key !== 'Escape' || e.defaultPrevented || !isOpen) return;
+    e.preventDefault();
+    onToggle();
+    toggleRef.current?.focus();
+  }
 
   return (
     <>
       {/* Toggle button — always visible */}
       <button
+        ref={toggleRef}
         type="button"
         onClick={onToggle}
+        onKeyDown={handleEscape}
         aria-expanded={isOpen}
         aria-controls="layer-legend-panel"
         aria-label={isOpen ? t('viewer.legend.hide') : t('viewer.legend.show')}
@@ -284,8 +106,10 @@ export function LayerLegend({
       {/* Legend panel — unmounted when closed (PR #330: prevent keyboard trap
           into invisible per-layer toggles; was opacity-0 + pointer-events-none only). */}
       {isOpen && (
+      // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- Escape dismisses the region from any control focused inside it
       <div
         ref={panelRef}
+        onKeyDown={handleEscape}
         id="layer-legend-panel"
         role="region"
         aria-label={t('viewer.legend.title')}
@@ -326,11 +150,11 @@ export function LayerLegend({
               </div>
             </li>
           )}
-          {sorted.map(({ layer, key }) => {
+          {sorted.map(({ layer, key, facts }) => {
             const isVisible = visibleLayers.has(key);
             const sc = layer.style_config;
-            const layerName = viewerLegendEntryName(layer);
-            const clusterKind = clusterLegendKind(layer);
+            const layerName = facts.name;
+            const clusterKind = facts.cluster?.kind;
             return (
               <li key={key} className="px-3 py-2 hover:bg-accent/50">
                 <div className="flex items-center gap-2">
@@ -375,31 +199,26 @@ export function LayerLegend({
                 )}
 
                 {/* Data-driven legend entries */}
-                {sc?.column && isVisible && (
-                  sc?.render_mode === 'heatmap' ? (
+                {isVisible && (
+                  facts.ramp ? (
                     <div className="mt-1.5 ms-6">
                       <HeatmapLegend
                         name=""
-                        rampName={(layer.paint?.['_heatmap-ramp'] as string) ?? sc.ramp ?? 'YlOrRd'}
+                        ramp={facts.ramp}
+                        weightColumn={facts.weight?.column}
                         opacity={layer.opacity ?? 1}
                         lowLabel={t('viewer.heatmapLow')}
                         highLabel={t('viewer.heatmapHigh')}
+                        weightedByLabel={facts.weight
+                          ? t(facts.weight.scaled ? 'viewer.legend.weightedByScaled' : 'viewer.legend.weightedBy', { column: facts.weight.column })
+                          : undefined}
                       />
                     </div>
-                  ) : (
+                  ) : facts.classes ? (
                     <div className="mt-1.5 ms-6">
-                      {sc.mode === 'categorical' && sc.categories && (
-                        <CategoricalLegend categories={sc.categories} geometryType={layer.geometry_type} style={viewerSwatchStyle(layer)} />
-                      )}
-                      {sc.mode === 'graduated' && (sc.colors || sc.sizes) && (
-                        <GraduatedLegend
-                          layer={layer}
-                          styleConfig={sc}
-                          swatchStyle={viewerSwatchStyle(layer)}
-                        />
-                      )}
+                      <LegendClassesList classes={facts.classes} geometryType={layer.geometry_type} style={facts.swatch} />
                     </div>
-                  )
+                  ) : null
                 )}
               </li>
             );

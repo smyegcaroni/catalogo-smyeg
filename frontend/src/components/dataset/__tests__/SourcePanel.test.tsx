@@ -8,6 +8,8 @@ import {
 } from '@/components/dataset/hooks/use-dataset';
 import { useVrtGenerations, useVrtSources, useVrtStatus } from '@/components/import/hooks/use-vrt';
 import { useAuthStore } from '@/stores/auth-store';
+import { changeTestLanguage } from '@/test/i18n';
+import { useDrawingStore } from '@/stores/drawing-store';
 import { SourcePanel } from '../SourcePanel';
 import type { DatasetRefreshRunResponse, DatasetResponse, VrtSourceHealth } from '@/types/api';
 
@@ -156,7 +158,8 @@ function mockActiveAndTerminalRuns() {
           dataset_version_id: 'version-2',
           ingest_job_id: 'job-done',
           origin_kind: 'service',
-          trigger: 'api',
+          trigger: 'scheduled',
+          scheduled_for: '2026-08-06T02:00:00Z',
           status: 'succeeded',
           triggered_by: 'user-1',
           triggered_by_username: 'jdoe',
@@ -171,6 +174,47 @@ function mockActiveAndTerminalRuns() {
         },
       ],
       total: 2,
+    } satisfies { runs: DatasetRefreshRunResponse[]; total: number },
+    isLoading: false,
+    isError: false,
+  } as unknown as ReturnType<typeof useDatasetRefreshRuns>);
+}
+
+function mockBlockedUploadRun() {
+  vi.mocked(useDatasetRefreshRuns).mockReturnValue({
+    data: {
+      runs: [{
+        id: 'run-upload-blocked',
+        dataset_id: 'dataset-1',
+        dataset_version_id: null,
+        ingest_job_id: 'job-1',
+        origin_kind: 'upload',
+        trigger: 'manual',
+        status: 'blocked',
+        triggered_by: 'user-1',
+        triggered_by_username: 'jdoe',
+        started_at: '2026-08-05T00:00:00Z',
+        claimed_at: '2026-08-05T00:00:01Z',
+        finished_at: '2026-08-05T00:01:00Z',
+        feature_count_before: 1200,
+        feature_count_after: 1200,
+        schema_diff: null,
+        verification: {
+          decision: 'blocked',
+          source_binding: { kind: 'upload', filename: 'roads.geojson', file_hash: 'abc' },
+          source_count: null,
+          fetched_count: 1200,
+          count_status: 'unavailable',
+          identity_check: 'unavailable',
+          review_reasons: ['destructive_schema_change'],
+          review_fingerprint: 'fingerprint',
+          review_acknowledged_by: null,
+          accepted_blocked_run_id: null,
+        },
+        error_code: 'review_required',
+        error_message: 'Review the detected changes before publication.',
+      }],
+      total: 1,
     } satisfies { runs: DatasetRefreshRunResponse[]; total: number },
     isLoading: false,
     isError: false,
@@ -199,6 +243,45 @@ describe('SourcePanel', () => {
     expect(screen.getByText(/parks-v2\.geojson/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Future source action' })).toBeInTheDocument();
   });
+
+  it('labels the pointer as a credential-free source URL', () => {
+    render(
+      <SourcePanel
+        dataset={makeDataset({
+          origin: 'service',
+          source_format: 'arcgis_featureserver',
+          origin_ref: { kind: 'service', service_type: 'arcgis_featureserver', url: 'https://origin.test/FeatureServer' },
+        })}
+      />,
+    );
+
+    expect(screen.getByText('Source URL (credentials removed)')).toBeInTheDocument();
+    expect(screen.queryByText('Safe source pointer')).not.toBeInTheDocument();
+  });
+
+  it('explains when an unchecked source health is evaluated', () => {
+    render(
+      <SourcePanel
+        dataset={makeDataset({
+          source_health: 'unknown',
+          origin: 'postgis',
+        })}
+      />,
+    );
+
+    expect(screen.getByText('Not checked')).toBeInTheDocument();
+    expect(screen.getByText('Checked when the source is refreshed.')).toBeInTheDocument();
+  });
+
+  it.each(['upload', 'service'] as const)(
+    'does not promise a health check for a %s source',
+    (origin) => {
+    render(<SourcePanel dataset={makeDataset({ source_health: 'unknown', origin })} />);
+
+    expect(screen.getByText('Not checked')).toBeInTheDocument();
+    expect(screen.queryByText('Checked when the source is refreshed.')).not.toBeInTheDocument();
+    },
+  );
 
   it('renders refresh run history distinctly from source version history', () => {
     vi.mocked(useDatasetRefreshRuns).mockReturnValue({
@@ -278,7 +361,8 @@ describe('SourcePanel', () => {
           dataset_version_id: null,
           ingest_job_id: 'job-1',
           origin_kind: 'service',
-          trigger: 'api',
+          trigger: 'scheduled',
+          scheduled_for: '2026-08-06T02:00:00Z',
           status: 'succeeded',
           triggered_by: 'user-1',
           triggered_by_username: 'jdoe',
@@ -580,7 +664,7 @@ describe('SourcePanel', () => {
     );
 
     expect(screen.getByText('Owned copy')).toBeInTheDocument();
-    expect(screen.getByText('arcgis_featureserver')).toBeInTheDocument();
+    expect(screen.getByText('ArcGIS FeatureServer')).toBeInTheDocument();
     expect(screen.getByText('https://origin.test/FeatureServer')).toBeInTheDocument();
     expect(
       screen.getByText(
@@ -855,6 +939,120 @@ describe('SourcePanel', () => {
     expect(screen.queryByText('An unexpected error occurred')).not.toBeInTheDocument();
   });
 
+  // A scheduled refresh's coded reason must show in the reader's language,
+  // not its stored English sentence.
+  it('renders the translated reason for a coded refresh-run failure, in es', async () => {
+    await changeTestLanguage('es');
+
+    vi.mocked(useDatasetRefreshRuns).mockReturnValue({
+      data: {
+        runs: [
+          {
+            id: 'run-1',
+            dataset_id: 'dataset-1',
+            dataset_version_id: null,
+            ingest_job_id: 'job-1',
+            origin_kind: 'service',
+            trigger: 'api',
+            status: 'failed',
+            triggered_by: 'user-1',
+            triggered_by_username: 'jdoe',
+            started_at: '2026-08-05T00:00:00Z',
+            claimed_at: '2026-08-05T00:00:01Z',
+            finished_at: '2026-08-05T00:01:00Z',
+            feature_count_before: 1200,
+            feature_count_after: null,
+            schema_diff: null,
+            error_code: 'scheduled_execution_timeout',
+            error_message: 'The admitted refresh exceeded its execution time limit.',
+          },
+        ],
+        total: 1,
+      } satisfies { runs: DatasetRefreshRunResponse[]; total: number },
+      isLoading: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useDatasetRefreshRuns>);
+
+    render(<SourcePanel dataset={makeDataset()} />);
+
+    expect(
+      screen.getByText('La actualización admitida superó su tiempo máximo de ejecución.'),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText('The admitted refresh exceeded its execution time limit.'),
+    ).not.toBeInTheDocument();
+
+    await changeTestLanguage('en');
+  });
+
+  // The sweep settles an abandoned run as `cancelled`, the same terminal
+  // status a deliberate user cancel lands in, so each needs its own reason
+  // shown -- not just a failed run's -- or an abandoned run reads exactly
+  // like a user's own click.
+  it("renders each cancelled run's own translated reason, styled as muted rather than an error", () => {
+    vi.mocked(useDatasetRefreshRuns).mockReturnValue({
+      data: {
+        runs: [
+          {
+            id: 'run-abandoned',
+            dataset_id: 'dataset-1',
+            dataset_version_id: null,
+            ingest_job_id: 'job-1',
+            origin_kind: 'service',
+            trigger: 'scheduled',
+            status: 'cancelled',
+            triggered_by: null,
+            triggered_by_username: null,
+            started_at: '2026-08-05T00:00:00Z',
+            claimed_at: '2026-08-05T00:00:01Z',
+            finished_at: '2026-08-05T00:01:00Z',
+            feature_count_before: 1200,
+            feature_count_after: null,
+            schema_diff: null,
+            error_code: 'abandoned',
+            error_message:
+              'The refresh task was never picked up by a worker, or the worker disappeared before recording an outcome.',
+          },
+          {
+            id: 'run-user-cancelled',
+            dataset_id: 'dataset-1',
+            dataset_version_id: null,
+            ingest_job_id: 'job-2',
+            origin_kind: 'service',
+            trigger: 'api',
+            status: 'cancelled',
+            triggered_by: 'user-1',
+            triggered_by_username: 'jdoe',
+            started_at: '2026-08-04T00:00:00Z',
+            claimed_at: '2026-08-04T00:00:01Z',
+            finished_at: '2026-08-04T00:01:00Z',
+            feature_count_before: 1100,
+            feature_count_after: null,
+            schema_diff: null,
+            error_code: 'user_cancelled',
+            error_message: 'Cancelled by user.',
+          },
+        ],
+        total: 2,
+      } satisfies { runs: DatasetRefreshRunResponse[]; total: number },
+      isLoading: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useDatasetRefreshRuns>);
+
+    render(<SourcePanel dataset={makeDataset()} />);
+
+    const abandonedReason = screen.getByText(
+      'The refresh task was never picked up by a worker, or the worker disappeared before recording an outcome.',
+    );
+    const userCancelledReason = screen.getByText('Cancelled by user');
+
+    expect(abandonedReason).toBeInTheDocument();
+    expect(userCancelledReason).toBeInTheDocument();
+    expect(abandonedReason.textContent).not.toBe(userCancelledReason.textContent);
+    expect(abandonedReason.className).toContain('text-muted-foreground');
+    expect(abandonedReason.className).not.toContain('text-destructive');
+  });
+
   it('shows verification evidence and offers an exact blocked-run retry', async () => {
     const onAcceptBlockedRun = vi.fn();
     const verification: NonNullable<DatasetRefreshRunResponse['verification']> = {
@@ -863,13 +1061,24 @@ describe('SourcePanel', () => {
         service_type: 'wfs',
         url: 'https://user:secret@example.com/wfs?token=hidden#private',
         layer_id: 'roads',
+        verification_policy: 'arcgis_id_set_v1',
       },
       source_count: 0,
       fetched_count: 0,
       count_status: 'matched',
-      identity_check: 'content_digest',
+      identity_check: 'arcgis_id_set',
       content_digest: 'sha256:content-digest',
-      review_reasons: ['empty_result'],
+      arcgis_id_coverage: {
+        status: 'matched',
+        source_membership_status: 'changed',
+      },
+      review_reasons: [
+        'geometry_type_changed',
+        'srid_changed',
+        'coordinate_dimension_reduced',
+        'arcgis_id_coverage_unavailable',
+        'arcgis_source_membership_changed',
+      ],
       review_fingerprint: 'fingerprint',
       accepted_blocked_run_id: null,
     };
@@ -881,7 +1090,8 @@ describe('SourcePanel', () => {
           dataset_version_id: null,
           ingest_job_id: 'job-1',
           origin_kind: 'service',
-          trigger: 'api',
+          trigger: 'scheduled',
+          scheduled_for: '2026-08-06T02:00:00Z',
           status: 'blocked',
           triggered_by: 'user-1',
           triggered_by_username: 'jdoe',
@@ -923,11 +1133,26 @@ describe('SourcePanel', () => {
       'text-warning',
     );
     expect(screen.getByText('Source: 0 · fetched: 0')).toBeInTheDocument();
+    expect(screen.getByText(/Scheduled for/)).toBeInTheDocument();
     expect(screen.getByText('Source used: https://example.com/wfs')).toBeInTheDocument();
+    expect(screen.getByText('The new data changes the geometry type.')).toBeInTheDocument();
+    expect(screen.getByText('The new data changes the coordinate system.')).toBeInTheDocument();
+    expect(
+      screen.getByText('The new data drops coordinate dimensions such as elevation.'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText('GeoLens could not verify ArcGIS object ID coverage.'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText('The ArcGIS source changed while this refresh was running.'),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/secret|hidden|private/)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Load older runs' })).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Review and retry' }));
-    expect(onAcceptBlockedRun).toHaveBeenCalledWith('run-blocked');
+    expect(onAcceptBlockedRun).toHaveBeenCalledWith({
+      id: 'run-blocked',
+      verificationPolicy: 'arcgis_id_set_v1',
+    });
   });
 
   it('disables blocked-run retry while a refresh is busy', () => {
@@ -1001,5 +1226,159 @@ describe('SourcePanel', () => {
       />,
     );
     expect(screen.queryByRole('button', { name: 'Review and retry' })).not.toBeInTheDocument();
+  });
+
+  it('offers to publish a held-back file replacement, with no source count to show', async () => {
+    const onAcceptBlockedRun = vi.fn();
+    mockBlockedUploadRun();
+
+    render(
+      <SourcePanel
+        dataset={makeDataset({ origin: 'upload' })}
+        canEdit
+        onAcceptBlockedRun={onAcceptBlockedRun}
+      />,
+    );
+
+    expect(screen.getByText('The new data removes columns or changes their types.')).toBeInTheDocument();
+    expect(screen.queryByText('Source count unavailable.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Record identities were not compared.')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Review and retry' }));
+    expect(onAcceptBlockedRun).toHaveBeenCalledWith({ id: 'run-upload-blocked', upload: true });
+  });
+
+  it('does not offer review for a held replacement that a later publish superseded', () => {
+    const held = {
+      id: 'run-upload-blocked',
+      dataset_id: 'dataset-1',
+      dataset_version_id: null,
+      ingest_job_id: 'job-1',
+      origin_kind: 'upload',
+      trigger: 'manual',
+      status: 'blocked',
+      started_at: '2026-08-05T00:00:00Z',
+      verification: {
+        decision: 'blocked',
+        source_binding: { kind: 'upload' },
+        review_reasons: ['destructive_schema_change'],
+        review_fingerprint: 'fingerprint',
+        accepted_blocked_run_id: null,
+      },
+    };
+    const later = {
+      id: 'run-later',
+      dataset_id: 'dataset-1',
+      dataset_version_id: 'version-2',
+      ingest_job_id: 'job-2',
+      origin_kind: 'upload',
+      trigger: 'manual',
+      status: 'succeeded',
+      started_at: '2026-08-06T00:00:00Z',
+      verification: null,
+    };
+    vi.mocked(useDatasetRefreshRuns).mockReturnValue({
+      data: { runs: [later, held], total: 2 },
+      isLoading: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useDatasetRefreshRuns>);
+
+    render(
+      <SourcePanel dataset={makeDataset({ origin: 'upload' })} canEdit onAcceptBlockedRun={vi.fn()} />,
+    );
+
+    expect(screen.getByText('Needs review')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Review and retry' })).not.toBeInTheDocument();
+  });
+
+  it('labels a held replacement whose acceptance was consumed as accepted', () => {
+    vi.mocked(useDatasetRefreshRuns).mockReturnValue({
+      data: {
+        runs: [{
+          id: 'run-upload-blocked',
+          dataset_id: 'dataset-1',
+          dataset_version_id: null,
+          ingest_job_id: 'job-1',
+          origin_kind: 'upload',
+          trigger: 'manual',
+          status: 'blocked',
+          started_at: '2026-08-05T00:00:00Z',
+          verification: {
+            decision: 'blocked',
+            source_binding: { kind: 'upload' },
+            review_reasons: ['destructive_schema_change'],
+            review_fingerprint: 'fingerprint',
+            accepted_blocked_run_id: null,
+            acceptance_consumed_by_run_id: 'run-accepting',
+          },
+        }],
+        total: 1,
+      },
+      isLoading: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useDatasetRefreshRuns>);
+
+    render(
+      <SourcePanel dataset={makeDataset({ origin: 'upload' })} canEdit onAcceptBlockedRun={vi.fn()} />,
+    );
+
+    expect(screen.getByText('Accepted')).toBeInTheDocument();
+    expect(screen.queryByText('Needs review')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Review and retry' })).not.toBeInTheDocument();
+  });
+
+  it('labels the review reasons of a succeeded run as accepted', () => {
+    vi.mocked(useDatasetRefreshRuns).mockReturnValue({
+      data: {
+        runs: [{
+          id: 'run-accepting',
+          dataset_id: 'dataset-1',
+          dataset_version_id: 'version-2',
+          ingest_job_id: 'job-2',
+          origin_kind: 'upload',
+          trigger: 'manual',
+          status: 'succeeded',
+          started_at: '2026-08-06T00:00:00Z',
+          verification: {
+            decision: 'accepted',
+            source_binding: { kind: 'upload' },
+            review_reasons: ['destructive_schema_change'],
+            review_fingerprint: 'fingerprint',
+            accepted_blocked_run_id: 'run-upload-blocked',
+          },
+        }],
+        total: 1,
+      },
+      isLoading: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useDatasetRefreshRuns>);
+
+    render(<SourcePanel dataset={makeDataset({ origin: 'upload' })} canEdit />);
+
+    expect(screen.getByText('Review reasons that were accepted:')).toBeInTheDocument();
+    expect(screen.getByText('The new data removes columns or changes their types.')).toBeInTheDocument();
+  });
+
+  it('disables publishing a held-back replacement while a feature is selected, and says why', () => {
+    mockBlockedUploadRun();
+    useDrawingStore.setState({
+      targetDatasetId: 'dataset-1',
+      selectedFeature: { gid: 1, tdId: 'feature-1', properties: {} },
+    });
+    try {
+      render(
+        <SourcePanel
+          dataset={makeDataset({ origin: 'upload' })}
+          canEdit
+          onAcceptBlockedRun={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByRole('button', { name: 'Review and retry' })).toBeDisabled();
+      expect(
+        screen.getByText('Finish editing or deselect the feature before refreshing.'),
+      ).toBeInTheDocument();
+    } finally {
+      useDrawingStore.setState({ targetDatasetId: null, selectedFeature: null });
+    }
   });
 });

@@ -1,4 +1,4 @@
-import { type FormEvent, useState } from 'react';
+import { type FormEvent, useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Loader2 } from 'lucide-react';
@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { Label } from '@/components/ui/label';
 import { removeSessionStorage } from '@/lib/storage';
+import { postSignInPath } from '@/lib/post-sign-in-path';
 
 /**
  * Login form for username + password authentication.
@@ -16,9 +17,11 @@ import { removeSessionStorage } from '@/lib/storage';
  * destination (from `location.state.from`) or the catalog home. Renders inside
  * the right-hand sign-in panel next to the optional OAuth provider buttons;
  * both code paths feed the same auth store. Handles password visibility
- * toggling and inline error display.
+ * toggling and inline error display. The contact-an-administrator hint shows
+ * only while sign-up is closed, since the page offers its own sign-up link
+ * otherwise.
  */
-export function LoginForm() {
+export function LoginForm({ signupOpen = false }: { signupOpen?: boolean }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -27,6 +30,14 @@ export function LoginForm() {
   const navigate = useNavigate();
   const location = useLocation();
   const { t } = useTranslation('auth');
+  const mountedRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -37,11 +48,13 @@ export function LoginForm() {
       await login(username, password);
       const from = (location.state as { from?: string } | null)?.from;
       // The root route is the canonical search workspace.
-      const target = from && from.startsWith('/') ? from : '/';
+      const target = postSignInPath(from);
       // Keep storage cleanup exception-safe after authentication so it cannot
       // turn a successful login into an inline error before navigation.
       removeSessionStorage('geolens-login-redirect');
-      navigate(target, { replace: true });
+      // The login page already forwards a signed-in tab, and the user may have
+      // moved on while the profile loaded.
+      if (mountedRef.current) navigate(target, { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : t('loginFailed'));
     } finally {
@@ -98,9 +111,11 @@ export function LoginForm() {
         {loading && <Loader2 className="size-4 animate-spin" />}
         {loading ? t('signingIn') : t('signIn')}
       </Button>
-      <p className="text-xs leading-relaxed text-muted-foreground">
-        {t('supportHint')}
-      </p>
+      {!signupOpen && (
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          {t('supportHint')}
+        </p>
+      )}
     </form>
   );
 }

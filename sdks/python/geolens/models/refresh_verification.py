@@ -20,6 +20,12 @@ from ..models.refresh_verification_identity_check import (
 from ..models.refresh_verification_identity_check import (
     RefreshVerificationIdentityCheck,
 )
+from ..models.refresh_verification_review_acknowledged_by_type_0 import (
+    check_refresh_verification_review_acknowledged_by_type_0,
+)
+from ..models.refresh_verification_review_acknowledged_by_type_0 import (
+    RefreshVerificationReviewAcknowledgedByType0,
+)
 from ..models.refresh_verification_review_reasons_item import (
     check_refresh_verification_review_reasons_item,
 )
@@ -30,6 +36,12 @@ from typing import cast
 from uuid import UUID
 
 if TYPE_CHECKING:
+    from ..models.refresh_verification_arcgis_id_coverage_type_0 import (
+        RefreshVerificationArcgisIdCoverageType0,
+    )
+    from ..models.refresh_verification_geometry_contract_type_0 import (
+        RefreshVerificationGeometryContractType0,
+    )
     from ..models.refresh_verification_source_binding import (
         RefreshVerificationSourceBinding,
     )
@@ -49,12 +61,22 @@ class RefreshVerification:
         count_status (RefreshVerificationCountStatus):
         identity_check (RefreshVerificationIdentityCheck):
         review_reasons (list[RefreshVerificationReviewReasonsItem]):
-        review_fingerprint (None | str):
+        review_fingerprint (None | str): Identifies what a blocked run asks a person to accept. A service refresh
+            fingerprints all of its evidence, so its acceptance must fetch the same data again. A file replacement or
+            service re-upload fingerprints only its review reasons, removed columns, type changes and, for a geometry
+            reason, the geometry facts, which is what its preview shows. A run held because features were edited while it
+            ran also names the edits it found, so accepting it does not cover a later edit.
         accepted_blocked_run_id (None | UUID):
+        source_binding_fingerprint (None | str | Unset):
         content_digest (None | str | Unset):
+        arcgis_id_coverage (None | RefreshVerificationArcgisIdCoverageType0 | Unset):
         staged_geometry_type (None | str | Unset):
         staged_srid (int | None | Unset):
         staged_coordinate_dimension (int | None | Unset):
+        geometry_contract (None | RefreshVerificationGeometryContractType0 | Unset):
+        review_acknowledged_by (None | RefreshVerificationReviewAcknowledgedByType0 | Unset): Why a replacement judged
+            on its preview published: its commit carried the preview's fingerprint, or a person accepted a blocked run with
+            the same changes.
         acceptance_consumed_by_run_id (None | Unset | UUID):
     """
 
@@ -67,14 +89,27 @@ class RefreshVerification:
     review_reasons: list[RefreshVerificationReviewReasonsItem]
     review_fingerprint: None | str
     accepted_blocked_run_id: None | UUID
+    source_binding_fingerprint: None | str | Unset = UNSET
     content_digest: None | str | Unset = UNSET
+    arcgis_id_coverage: None | RefreshVerificationArcgisIdCoverageType0 | Unset = UNSET
     staged_geometry_type: None | str | Unset = UNSET
     staged_srid: int | None | Unset = UNSET
     staged_coordinate_dimension: int | None | Unset = UNSET
+    geometry_contract: None | RefreshVerificationGeometryContractType0 | Unset = UNSET
+    review_acknowledged_by: (
+        None | RefreshVerificationReviewAcknowledgedByType0 | Unset
+    ) = UNSET
     acceptance_consumed_by_run_id: None | Unset | UUID = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.refresh_verification_arcgis_id_coverage_type_0 import (
+            RefreshVerificationArcgisIdCoverageType0,
+        )
+        from ..models.refresh_verification_geometry_contract_type_0 import (
+            RefreshVerificationGeometryContractType0,
+        )
+
         decision: str = self.decision
 
         source_binding = self.source_binding.to_dict()
@@ -103,11 +138,27 @@ class RefreshVerification:
         else:
             accepted_blocked_run_id = self.accepted_blocked_run_id
 
+        source_binding_fingerprint: None | str | Unset
+        if isinstance(self.source_binding_fingerprint, Unset):
+            source_binding_fingerprint = UNSET
+        else:
+            source_binding_fingerprint = self.source_binding_fingerprint
+
         content_digest: None | str | Unset
         if isinstance(self.content_digest, Unset):
             content_digest = UNSET
         else:
             content_digest = self.content_digest
+
+        arcgis_id_coverage: dict[str, Any] | None | Unset
+        if isinstance(self.arcgis_id_coverage, Unset):
+            arcgis_id_coverage = UNSET
+        elif isinstance(
+            self.arcgis_id_coverage, RefreshVerificationArcgisIdCoverageType0
+        ):
+            arcgis_id_coverage = self.arcgis_id_coverage.to_dict()
+        else:
+            arcgis_id_coverage = self.arcgis_id_coverage
 
         staged_geometry_type: None | str | Unset
         if isinstance(self.staged_geometry_type, Unset):
@@ -126,6 +177,24 @@ class RefreshVerification:
             staged_coordinate_dimension = UNSET
         else:
             staged_coordinate_dimension = self.staged_coordinate_dimension
+
+        geometry_contract: dict[str, Any] | None | Unset
+        if isinstance(self.geometry_contract, Unset):
+            geometry_contract = UNSET
+        elif isinstance(
+            self.geometry_contract, RefreshVerificationGeometryContractType0
+        ):
+            geometry_contract = self.geometry_contract.to_dict()
+        else:
+            geometry_contract = self.geometry_contract
+
+        review_acknowledged_by: None | str | Unset
+        if isinstance(self.review_acknowledged_by, Unset):
+            review_acknowledged_by = UNSET
+        elif isinstance(self.review_acknowledged_by, str):
+            review_acknowledged_by = self.review_acknowledged_by
+        else:
+            review_acknowledged_by = self.review_acknowledged_by
 
         acceptance_consumed_by_run_id: None | str | Unset
         if isinstance(self.acceptance_consumed_by_run_id, Unset):
@@ -150,14 +219,22 @@ class RefreshVerification:
                 "accepted_blocked_run_id": accepted_blocked_run_id,
             }
         )
+        if source_binding_fingerprint is not UNSET:
+            field_dict["source_binding_fingerprint"] = source_binding_fingerprint
         if content_digest is not UNSET:
             field_dict["content_digest"] = content_digest
+        if arcgis_id_coverage is not UNSET:
+            field_dict["arcgis_id_coverage"] = arcgis_id_coverage
         if staged_geometry_type is not UNSET:
             field_dict["staged_geometry_type"] = staged_geometry_type
         if staged_srid is not UNSET:
             field_dict["staged_srid"] = staged_srid
         if staged_coordinate_dimension is not UNSET:
             field_dict["staged_coordinate_dimension"] = staged_coordinate_dimension
+        if geometry_contract is not UNSET:
+            field_dict["geometry_contract"] = geometry_contract
+        if review_acknowledged_by is not UNSET:
+            field_dict["review_acknowledged_by"] = review_acknowledged_by
         if acceptance_consumed_by_run_id is not UNSET:
             field_dict["acceptance_consumed_by_run_id"] = acceptance_consumed_by_run_id
 
@@ -165,6 +242,12 @@ class RefreshVerification:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.refresh_verification_arcgis_id_coverage_type_0 import (
+            RefreshVerificationArcgisIdCoverageType0,
+        )
+        from ..models.refresh_verification_geometry_contract_type_0 import (
+            RefreshVerificationGeometryContractType0,
+        )
         from ..models.refresh_verification_source_binding import (
             RefreshVerificationSourceBinding,
         )
@@ -229,6 +312,17 @@ class RefreshVerification:
             d.pop("accepted_blocked_run_id")
         )
 
+        def _parse_source_binding_fingerprint(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        source_binding_fingerprint = _parse_source_binding_fingerprint(
+            d.pop("source_binding_fingerprint", UNSET)
+        )
+
         def _parse_content_digest(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -237,6 +331,29 @@ class RefreshVerification:
             return cast(None | str | Unset, data)
 
         content_digest = _parse_content_digest(d.pop("content_digest", UNSET))
+
+        def _parse_arcgis_id_coverage(
+            data: object,
+        ) -> None | RefreshVerificationArcgisIdCoverageType0 | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                arcgis_id_coverage_type_0 = (
+                    RefreshVerificationArcgisIdCoverageType0.from_dict(data)
+                )
+
+                return arcgis_id_coverage_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | RefreshVerificationArcgisIdCoverageType0 | Unset, data)
+
+        arcgis_id_coverage = _parse_arcgis_id_coverage(
+            d.pop("arcgis_id_coverage", UNSET)
+        )
 
         def _parse_staged_geometry_type(data: object) -> None | str | Unset:
             if data is None:
@@ -269,6 +386,52 @@ class RefreshVerification:
             d.pop("staged_coordinate_dimension", UNSET)
         )
 
+        def _parse_geometry_contract(
+            data: object,
+        ) -> None | RefreshVerificationGeometryContractType0 | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                geometry_contract_type_0 = (
+                    RefreshVerificationGeometryContractType0.from_dict(data)
+                )
+
+                return geometry_contract_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | RefreshVerificationGeometryContractType0 | Unset, data)
+
+        geometry_contract = _parse_geometry_contract(d.pop("geometry_contract", UNSET))
+
+        def _parse_review_acknowledged_by(
+            data: object,
+        ) -> None | RefreshVerificationReviewAcknowledgedByType0 | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                review_acknowledged_by_type_0 = (
+                    check_refresh_verification_review_acknowledged_by_type_0(data)
+                )
+
+                return review_acknowledged_by_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(
+                None | RefreshVerificationReviewAcknowledgedByType0 | Unset, data
+            )
+
+        review_acknowledged_by = _parse_review_acknowledged_by(
+            d.pop("review_acknowledged_by", UNSET)
+        )
+
         def _parse_acceptance_consumed_by_run_id(data: object) -> None | Unset | UUID:
             if data is None:
                 return data
@@ -298,10 +461,14 @@ class RefreshVerification:
             review_reasons=review_reasons,
             review_fingerprint=review_fingerprint,
             accepted_blocked_run_id=accepted_blocked_run_id,
+            source_binding_fingerprint=source_binding_fingerprint,
             content_digest=content_digest,
+            arcgis_id_coverage=arcgis_id_coverage,
             staged_geometry_type=staged_geometry_type,
             staged_srid=staged_srid,
             staged_coordinate_dimension=staged_coordinate_dimension,
+            geometry_contract=geometry_contract,
+            review_acknowledged_by=review_acknowledged_by,
             acceptance_consumed_by_run_id=acceptance_consumed_by_run_id,
         )
 

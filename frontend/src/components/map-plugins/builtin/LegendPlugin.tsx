@@ -1,120 +1,13 @@
 import { memo, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { demChipGlyph, LayerTypeIcon, RasterGlyphChip } from '@/components/map/layer-icons';
-import {
-  CategoricalLegend,
-  GraduatedColorLegend,
-  GraduatedRadiusLegend,
-  GraduatedWidthLegend,
-  HeatmapLegend,
-} from '@/components/map/LegendEntries';
-import type { SwatchStyle } from '@/components/map/LegendEntries';
-import { fillPatternFromPaint, fillPatternTint } from '@/lib/fill-pattern-preview';
-import type { MapLayerResponse, StyleConfig } from '@/types/api';
-import { MAP_COLORS } from '@/lib/map-colors';
-import { parseStepOrInterpolate } from '@/lib/normalize-style-config';
+import { HeatmapLegend, LegendClassesList } from '@/components/map/LegendEntries';
+import type { MapLayerResponse } from '@/types/api';
 import { inferGeometryType } from '@/lib/geo-utils';
-import { isFolderGroupLayer } from '@/lib/layer-capabilities';
+import { legendEntryName, legendFacts } from '@/components/map/legend-facts';
 import { Pencil, Check } from 'lucide-react';
-import {
-  deriveTerrainLegendEntry,
-  isDemTerrainVisualSuppressed,
-  terrainSourceIsShownAsLayer,
-} from '@/components/builder/terrain-legend';
-import { resolveTerrainSourceLayer } from '@/components/builder/map-stack';
+import { syntheticTerrainEntry } from '@/components/builder/terrain-legend';
 import type { PluginContext } from '../types';
-
-/** Extract swatch style properties from layer paint based on geometry type. */
-export function getSwatchStyleFromPaint(
-  paint: Record<string, unknown> | undefined,
-  geometryType: string | null | undefined,
-  masterOpacity: number,
-  // fix(#914): the builder block carries the fill-pattern tint stash.
-  // fix(#1288): also carries outlineColor/strokeDisabled/outlineWidth — the map
-  // renders from builder state, so the legend must prefer it over the paint
-  // mirror below, which can go stale (toggling a stroke off leaves paint's
-  // _stroke-disabled/_outline-width unchanged).
-  builder?: { fillColorSaved?: string; outlineColor?: string; strokeDisabled?: boolean; outlineWidth?: number },
-): SwatchStyle {
-  const gt = (inferGeometryType(paint, geometryType) ?? '').toUpperCase();
-  const isPoint = gt.includes('POINT');
-
-  const rawStrokeW = isPoint ? paint?.['circle-stroke-width'] : (builder?.outlineWidth ?? paint?.['_outline-width']);
-  const strokeWidth = typeof rawStrokeW === 'number' ? rawStrokeW : undefined;
-
-  // fix(#1288 codex): an explicit zero-width outline draws nothing on the map,
-  // same "treat explicit zero as disabled" precedence as extractStyleHints.
-  const strokeDisabled = isPoint
-    ? !!paint?.['_stroke-disabled']
-    : Boolean(builder?.strokeDisabled ?? paint?.['_stroke-disabled']) || strokeWidth === 0;
-
-  const rawOutline = isPoint
-    ? paint?.['circle-stroke-color']
-    : (builder?.outlineColor ?? paint?.['_outline-color']);
-  const outlineColor = typeof rawOutline === 'string' ? rawOutline : undefined;
-
-  const rawFillOp = isPoint
-    ? paint?.['circle-opacity']
-    : gt.includes('LINE')
-      ? paint?.['line-opacity']
-      : paint?.['fill-opacity'];
-  const fillOpacity = typeof rawFillOp === 'number' ? rawFillOp : undefined;
-
-  return {
-    outlineColor,
-    strokeDisabled,
-    opacity: masterOpacity,
-    fillOpacity,
-    strokeWidth,
-    fillPattern: fillPatternFromPaint(paint),
-    fillPatternColor: fillPatternTint(paint, builder),
-  };
-}
-
-/** Extract colors and breaks from a paint color expression for the legend. */
-function parsePaintColors(paintColorValue: unknown): { colors: string[]; breaks: number[] } | null {
-  if (typeof paintColorValue === 'string' || !paintColorValue) return null;
-  const parsed = parseStepOrInterpolate(paintColorValue);
-  if (!parsed || !parsed.values.every((v) => typeof v === 'string')) return null;
-  const colors = parsed.values as string[];
-  // For interpolate, breaks already has the first stop dropped by parseStepOrInterpolate
-  return { colors, breaks: parsed.breaks };
-}
-
-export function expressionColumn(value: unknown): string | null {
-  if (!Array.isArray(value)) return null;
-  if (value[0] === 'get' && typeof value[1] === 'string') return value[1];
-  for (const entry of value) {
-    const column = expressionColumn(entry);
-    if (column) return column;
-  }
-  return null;
-}
-
-export function displayColumn(value: string | undefined): string {
-  if (!value) return 'value';
-  return value
-    .replace(/^_+/, '')
-    .replace(/_/g, ' ')
-    .replace(/\bmhi\b/i, 'income')
-    .replace(/\bkm\b/i, 'km');
-}
-
-type LegendLabelStyleConfig = StyleConfig & {
-  sizeLabel?: string;
-  colorLabel?: string;
-};
-
-/**
- * Effective legend entry name (ENH-06): a non-empty per-entry
- * style_config.legendLabel override wins, else the layer's display name, else
- * the dataset name. Shared by the plugin and the viewer for parity.
- */
-export function legendEntryName(layer: MapLayerResponse): string {
-  const override = layer.style_config?.legendLabel;
-  if (typeof override === 'string' && override.trim() !== '') return override;
-  return layer.display_name ?? layer.dataset_name;
-}
 
 export function LegendPlugin({ ctx }: { ctx: PluginContext }) {
   const { t } = useTranslation('builder');
@@ -125,46 +18,17 @@ export function LegendPlugin({ ctx }: { ctx: PluginContext }) {
   // callbacks (the builder); read-only contexts (viewer/tests) hide it.
   const canEdit = Boolean(ctx.onLegendTitleChange || ctx.onLegendLabelChange);
 
-  // D-02: exclude terrain-suppressed DEM layers (render_mode:"terrain") — they
-  // have no stack row and paint nothing, so they must not appear as per-layer
-  // legend entries. Consume the shared predicate, never re-derive it.
-  // fix(#769): synthetic group:folder rows are built by spreading the group's
-  // first child, so they inherit visible/show_in_legend/paint — without this
-  // predicate every folder group renders a phantom legend entry.
   const legendLayers = useMemo(
     () => ctx.layers.filter(
-      (l) => l.visible && l.show_in_legend !== false && !isFolderGroupLayer(l)
-        && !isDemTerrainVisualSuppressed(l),
+      (l) => l.visible && l.show_in_legend !== false && legendFacts(l) !== null,
     ),
     [ctx.layers],
   );
 
-  // D-01: single synthetic "3D terrain" entry driven by terrain_config — only
-  // when a backing terrain-capable DEM layer for the source dataset is present
-  // (999.17 MD-01: no phantom entry for a dangling terrain_config).
-  const terrainEntryRaw = useMemo(
-    () => deriveTerrainLegendEntry(ctx.terrainConfig, ctx.layers, { labelKey: 'plugins.legend.terrain3d' }),
-    [ctx.terrainConfig, ctx.layers],
+  const terrainEntry = useMemo(
+    () => syntheticTerrainEntry(ctx.terrainConfig, ctx.layers, legendLayers, { labelKey: 'plugins.legend.terrain3d' }),
+    [ctx.terrainConfig, ctx.layers, legendLayers],
   );
-  // The synthetic entry must track what the map ACTUALLY renders. In the builder,
-  // BuilderMap clears terrain when the bound DEM is hidden (effectiveTerrainEnabled
-  // = enabled && demLayerVisible), so a hidden source = no mesh = no synthetic row.
-  // Resolve the bound DEM with the SAME shared resolver BuilderMap uses so the two
-  // can't drift. (fix(HT-12): useViewerTerrain now honors saved visibility the
-  // same way; LayerLegend still gates on its own visible set for local toggles.)
-  const boundTerrainDem = useMemo(
-    () => resolveTerrainSourceLayer(ctx.layers, ctx.terrainConfig),
-    [ctx.layers, ctx.terrainConfig],
-  );
-  // Show the synthetic entry only when terrain is effectively rendering (bound DEM
-  // visible) AND the source DEM isn't ALSO shown as a per-layer entry (e.g. a
-  // visible hillshade of the same dataset would list one DEM twice). Kept for the
-  // pure-terrain case where the suppressed DEM has no per-layer row.
-  const terrainEntry = terrainEntryRaw
-    && boundTerrainDem?.visible !== false
-    && !terrainSourceIsShownAsLayer(ctx.terrainConfig, legendLayers)
-    ? terrainEntryRaw
-    : null;
 
   if (legendLayers.length === 0 && !terrainEntry) {
     return (
@@ -217,26 +81,26 @@ export function LegendPlugin({ ctx }: { ctx: PluginContext }) {
             />
           )}
           {ctx.onLegendLabelChange &&
-            legendLayers.map((layer) => (
-              <input
-                key={layer.id}
-                type="text"
-                defaultValue={
-                  typeof layer.style_config?.legendLabel === 'string'
-                    ? layer.style_config.legendLabel
-                    : ''
-                }
-                maxLength={120}
-                placeholder={t('plugins.legend.entryLabelPlaceholder', {
-                  name: layer.display_name ?? layer.dataset_name,
-                })}
-                aria-label={t('plugins.legend.entryLabelPlaceholder', {
-                  name: layer.display_name ?? layer.dataset_name,
-                })}
-                className="w-full rounded-sm border border-border bg-background px-1.5 py-0.5 text-xs"
-                onBlur={(e) => ctx.onLegendLabelChange?.(layer.id, e.target.value.trim())}
-              />
-            ))}
+            legendLayers.map((layer) => {
+              // The name the entry falls back to once the override is cleared.
+              const name = legendEntryName({ display_name: layer.display_name, dataset_name: layer.dataset_name }) ?? '';
+              return (
+                <input
+                  key={layer.id}
+                  type="text"
+                  defaultValue={
+                    typeof layer.style_config?.legendLabel === 'string'
+                      ? layer.style_config.legendLabel
+                      : ''
+                  }
+                  maxLength={120}
+                  placeholder={t('plugins.legend.entryLabelPlaceholder', { name })}
+                  aria-label={t('plugins.legend.entryLabelPlaceholder', { name })}
+                  className="w-full rounded-sm border border-border bg-background px-1.5 py-0.5 text-xs"
+                  onBlur={(e) => ctx.onLegendLabelChange?.(layer.id, e.target.value.trim())}
+                />
+              );
+            })}
         </div>
       )}
 
@@ -283,53 +147,36 @@ const LegendLayerEntry = memo(function LegendLayerEntry({
   isLast: boolean;
 }) {
   const { t } = useTranslation('builder');
+  const facts = legendFacts(layer);
+  const entryName = facts?.name ?? '';
 
   try {
     const opacity = layer.opacity ?? 1;
     const effectiveGeom = inferGeometryType(layer.paint, layer.dataset_geometry_type);
-    const swatchStyle = getSwatchStyleFromPaint(
-      layer.paint, effectiveGeom, opacity, layer.style_config?.builder,
-    );
-    const weightCol = layer.paint?.['_heatmap-weight-column'] as string | undefined;
-    // ENH-06: per-entry legendLabel override wins over display/dataset name.
-    const entryName = legendEntryName(layer);
+    const swatch = facts?.swatch ?? null;
+    const weight = facts?.weight ?? null;
 
     return (
       <div>
         <div className="p-1 text-xs">
-          {layer.style_config?.render_mode === 'heatmap' ? (
+          {facts?.ramp ? (
             <HeatmapLegend
               name={entryName}
-              rampName={(layer.paint?.['_heatmap-ramp'] as string) ?? 'YlOrRd'}
-              weightColumn={weightCol}
+              ramp={facts.ramp}
+              weightColumn={weight?.column}
               opacity={opacity}
               lowLabel={t('plugins.legend.low')}
               highLabel={t('plugins.legend.high')}
-              weightedByLabel={weightCol ? t('plugins.legend.weightedBy', { column: weightCol }) : undefined}
+              weightedByLabel={weight
+                ? t(weight.scaled ? 'plugins.legend.weightedByScaled' : 'plugins.legend.weightedBy', { column: weight.column })
+                : undefined}
             />
-          ) : layer.style_config?.column ? (
+          ) : facts?.classes ? (
             <>
               <div className="font-medium text-foreground mb-1 truncate">
                 {entryName}
               </div>
-
-              {layer.style_config.mode === 'categorical' && layer.style_config.categories && (
-                <CategoricalLegend
-                  categories={layer.style_config.categories}
-                  geometryType={effectiveGeom}
-                  style={swatchStyle}
-                />
-              )}
-
-              {layer.style_config.mode === 'graduated' &&
-                layer.style_config.breaks && (
-                  <GraduatedLegendSwitch
-                    styleConfig={layer.style_config}
-                    paint={layer.paint ?? {}}
-                    style={swatchStyle}
-                    geometryType={effectiveGeom}
-                  />
-                )}
+              <LegendClassesList classes={facts.classes} geometryType={effectiveGeom} style={swatch} />
             </>
           ) : (
             <div className="flex items-center gap-1.5">
@@ -350,12 +197,12 @@ const LegendLayerEntry = memo(function LegendLayerEntry({
       </div>
     );
   } catch (err) {
-    if (import.meta.env.DEV) console.error(`[LegendPlugin] Failed to render layer "${layer.display_name ?? layer.dataset_name}":`, err);
+    if (import.meta.env.DEV) console.error(`[LegendPlugin] Failed to render layer "${entryName}":`, err);
     return (
       <div>
         <div className="p-1 text-xs">
           <span className="font-medium text-foreground truncate">
-            {legendEntryName(layer)}
+            {entryName}
           </span>
           <span className="text-muted-foreground italic ms-1">
             {t('plugins.legend.unavailable', { defaultValue: '(legend unavailable)' })}
@@ -366,86 +213,3 @@ const LegendLayerEntry = memo(function LegendLayerEntry({
     );
   }
 });
-
-/** Picks the right graduated sub-legend based on target (color/radius/width). */
-function GraduatedLegendSwitch({
-  styleConfig,
-  paint,
-  style,
-  geometryType,
-}: {
-  styleConfig: StyleConfig;
-  paint: Record<string, unknown>;
-  style: SwatchStyle;
-  geometryType?: string | null;
-}) {
-  const { t } = useTranslation('common');
-  const breaks = styleConfig.breaks ?? [];
-  const labelConfig = styleConfig as LegendLabelStyleConfig;
-  const metricLabel = labelConfig.sizeLabel ?? displayColumn(styleConfig.column);
-
-  // Parse circle-color expression unconditionally (Rules of Hooks)
-  const rawCircleColor = paint['circle-color'];
-  const parsedCircleColor = useMemo(() => parsePaintColors(rawCircleColor), [rawCircleColor]);
-  const colorColumn = expressionColumn(rawCircleColor);
-
-  if (styleConfig.target === 'radius' && styleConfig.sizes) {
-    const circleColor = (typeof rawCircleColor === 'string' ? rawCircleColor : undefined) ?? MAP_COLORS.fallback;
-    return (
-      <div className="space-y-1">
-        <div className="text-mini font-medium text-muted-foreground">
-          {t('common:viewer.legend.sizeLabel', { label: metricLabel })}
-        </div>
-        <GraduatedRadiusLegend
-          sizes={styleConfig.sizes}
-          breaks={breaks}
-          circleColor={parsedCircleColor?.colors[0] ?? circleColor}
-          style={style}
-        />
-        {parsedCircleColor && colorColumn && colorColumn !== styleConfig.column && (
-          <>
-            <div className="pt-1 text-mini font-medium text-muted-foreground">
-              {t('common:viewer.legend.colorLabel', {
-                label: labelConfig.colorLabel ?? displayColumn(colorColumn),
-              })}
-            </div>
-            <GraduatedColorLegend
-              colors={parsedCircleColor.colors}
-              breaks={parsedCircleColor.breaks}
-              geometryType={geometryType}
-              style={style}
-            />
-          </>
-        )}
-      </div>
-    );
-  }
-
-  if (styleConfig.target === 'width' && styleConfig.sizes) {
-    const raw = paint['line-color'];
-    const lineColor = (typeof raw === 'string' ? raw : undefined) ?? MAP_COLORS.fallback;
-    return (
-      <div className="space-y-1">
-        <div className="text-mini font-medium text-muted-foreground">
-          {t('common:viewer.legend.widthLabel', { label: metricLabel })}
-        </div>
-        <GraduatedWidthLegend
-          sizes={styleConfig.sizes}
-          breaks={breaks}
-          lineColor={lineColor}
-          style={style}
-        />
-      </div>
-    );
-  }
-
-  if (!styleConfig.colors) return null;
-  return (
-    <GraduatedColorLegend
-      colors={styleConfig.colors}
-      breaks={breaks}
-      geometryType={geometryType}
-      style={style}
-    />
-  );
-}

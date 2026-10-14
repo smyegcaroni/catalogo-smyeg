@@ -347,7 +347,7 @@ export type AdminJobResponse = {
     /**
      * Status
      *
-     * Current job status: 'pending', 'running', 'complete', 'failed', or 'cancelled'.
+     * Current job status: 'pending', 'running', 'complete', 'failed', 'cancelled', or 'fanned_out' (a multi-layer upload split into per-layer child jobs).
      */
     status: 'pending' | 'running' | 'complete' | 'failed' | 'cancelled' | 'fanned_out';
     /**
@@ -369,6 +369,18 @@ export type AdminJobResponse = {
      */
     error_message: string | null;
     /**
+     * Error Code
+     *
+     * Stable code for a fixed failure reason, so a client can show it in the reader's language; `error_message` keeps its English text. Null when the reason is free text.
+     */
+    error_code?: string | null;
+    /**
+     * Review State
+     *
+     * Set on a replacement the pipeline held for review rather than failed: 'awaiting' while the held run still needs a decision, 'resolved' once it was accepted. Null for every other job.
+     */
+    review_state?: 'awaiting' | 'resolved' | null;
+    /**
      * Can Retry
      *
      * Whether the failed job can be retried with its retained source.
@@ -381,9 +393,21 @@ export type AdminJobResponse = {
      */
     retry_reason: string | null;
     /**
+     * Source Url
+     *
+     * URL a service or file URL import was started from, with userinfo and credential query values redacted. Null for every other job.
+     */
+    source_url?: string | null;
+    /**
+     * Restart Source
+     *
+     * Import tab a failed job whose retry is refused can be started again from: 'url' for a file URL import, 'service' for a service import. Null otherwise.
+     */
+    restart_source?: 'url' | 'service' | null;
+    /**
      * User Metadata
      *
-     * User-supplied metadata captured at upload time (title, summary, tags, vrt_type, file_type, warnings, etc.). Heterogeneous shape across ingest paths -- canonical keys: title, summary, visibility, file_type, vrt_type, warnings.
+     * Metadata captured with the job: the fields supplied at upload and commit (title, summary, tags, visibility, file_type, vrt_type, etc.) and outcomes such as warnings. Heterogeneous shape across ingest paths. Worker bookkeeping, such as staging keys and unpublished artifacts, is left out; null when nothing else is recorded.
      */
     user_metadata: {
         [key: string]: unknown;
@@ -589,6 +613,30 @@ export type AnalysisMaterializeRequest = {
      * Columns to copy from the intersecting join feature, prefixed 'join_' in the output. Ties break on the lowest join-layer gid (spatial_join only)
      */
     join_fields?: Array<string> | null;
+    /**
+     * Filter
+     *
+     * CQL2-JSON filter on the source dataset, in the language /collections/{dataset_id}/items accepts as filter-lang=cql2-json. Only the features it keeps are analysed, counted, and checked against the operation's size limit.
+     */
+    filter?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Mask Filter
+     *
+     * CQL2-JSON filter on the mask_dataset_id layer: only its matching features form the mask or overlay. Requires mask_dataset_id.
+     */
+    mask_filter?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Join Filter
+     *
+     * CQL2-JSON filter on the join layer: only its matching features are joined (spatial_join only).
+     */
+    join_filter?: {
+        [key: string]: unknown;
+    } | null;
 };
 
 /**
@@ -658,6 +706,30 @@ export type AnalysisPreviewRequest = {
      * [minx, miny, maxx, maxy] in EPSG:4326, typically the map's current viewport. When present, only source features intersecting the envelope are considered before the preview's row cap applies, so a capped result reflects what is on screen rather than an arbitrary sample in ingest order. Applies to every operation, not just one, so it is deliberately absent from _ANALYSIS_PARAM_OWNERS — omit it to preview the whole dataset, unchanged from before this field existed.
      */
     bbox?: Array<number> | null;
+    /**
+     * Filter
+     *
+     * CQL2-JSON filter on the source dataset, in the language /collections/{dataset_id}/items accepts as filter-lang=cql2-json. Only the features it keeps are analysed, counted, and checked against the operation's size limit.
+     */
+    filter?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Mask Filter
+     *
+     * CQL2-JSON filter on the mask_dataset_id layer: only its matching features form the mask or overlay. Requires mask_dataset_id.
+     */
+    mask_filter?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Join Filter
+     *
+     * CQL2-JSON filter on the join layer: only its matching features are joined (spatial_join only).
+     */
+    join_filter?: {
+        [key: string]: unknown;
+    } | null;
 };
 
 /**
@@ -687,13 +759,13 @@ export type AnalysisPreviewResponse = {
     /**
      * Source Feature Count
      *
-     * Total feature count of the source dataset (1:1 operations only; null when the operation filters rows, e.g. clip). When the request carried a bbox this is a live count of rows intersecting it rather than the dataset's cached whole-table total. It is also null, like match_count, when that live count could not be computed within the query budget
+     * Total feature count of the source dataset (1:1 operations only; null when the operation filters rows, e.g. clip). When the request carried a bbox or a filter this is a live count of the rows intersecting the bbox and matching the filter rather than the dataset's cached whole-table total. It is also null, like match_count, when that live count could not be computed within the query budget
      */
     source_feature_count?: number | null;
     /**
      * Match Count
      *
-     * Exact total across the WHOLE source, not just the previewed features — WHOLE meaning the request's bbox when one was sent, the same sense source_feature_count uses that word. What it counts is per-operation, so read it against the operation you sent rather than as one number: select_by_location gives the selected source features and intersect gives the output pieces, and for both of those it IS the output total; spatial_join gives intersecting source/join PAIRS, which is NOT the output total, because the join keeps every source row (use source_feature_count for that operation). intersect and spatial_join both scope this total to a bbox on the request; select_by_location's count is a separate uncapped query the request's bbox does not reach, so it stays unscoped even though its preview rows are viewport-limited too. Null for operations that report no such total, and when the count could not be computed within the query budget
+     * Exact total across the WHOLE source, not just the previewed features — WHOLE meaning the request's bbox when one was sent, the same sense source_feature_count uses that word, and always within the request's layer filters. What it counts is per-operation, so read it against the operation you sent rather than as one number: select_by_location gives the selected source features and intersect gives the output pieces, and for both of those it IS the output total; spatial_join gives intersecting source/join PAIRS, which is NOT the output total, because the join keeps every source row (use source_feature_count for that operation). intersect and spatial_join both scope this total to a bbox on the request; select_by_location's count is a separate uncapped query the request's bbox does not reach, so it stays unscoped even though its preview rows are viewport-limited too. Null for operations that report no such total, and when the count could not be computed within the query budget
      */
     match_count?: number | null;
 };
@@ -1123,15 +1195,21 @@ export type BackfillResponse = {
     /**
      * Job Id
      *
-     * Identifier of the queued backfill job; poll /jobs/{job_id}.
+     * Identifier of the queued backfill job; poll /jobs/{job_id}. Null only with status 'already_running' when the caller may not read that run.
      */
-    job_id: string;
+    job_id: string | null;
     /**
      * Status
      *
-     * Job status at enqueue time ('pending').
+     * 'pending' when this request queued job_id. 'already_running' when an all_tenants request found a run in flight in the calling tenant; job_id is then that run, which this request did not queue. Run the backfill again once it ends.
      */
     status: string;
+    /**
+     * Other Tenants
+     *
+     * Runs queued for the other tenants by an all_tenants request in a multi-tenant deployment. Empty otherwise.
+     */
+    other_tenants?: Array<BackfillTenantRun>;
 };
 
 /**
@@ -1226,6 +1304,32 @@ export type BackfillRunSummary = {
      * Short code identifying how a run failed, when it failed.
      */
     error_code?: string | null;
+};
+
+/**
+ * BackfillTenantRun
+ *
+ * What an all-tenant backfill request did for one other tenant.
+ */
+export type BackfillTenantRun = {
+    /**
+     * Tenant Id
+     *
+     * The tenant the run was queued for.
+     */
+    tenant_id: string;
+    /**
+     * Job Id
+     *
+     * Identifier of the job queued in that tenant, or null when none was queued.
+     */
+    job_id: string | null;
+    /**
+     * Status
+     *
+     * 'pending' when a run was queued, 'already_running' when that tenant already had one in flight, 'not_queued' when queueing failed.
+     */
+    status: 'pending' | 'already_running' | 'not_queued';
 };
 
 /**
@@ -1414,6 +1518,12 @@ export type BodyUploadFileIngestUploadPost = {
      * File
      */
     file: Blob | File;
+    /**
+     * Kind
+     *
+     * 'tiles3d' uploads a 3D Tiles tileset as a .zip or .3tz archive holding tileset.json. Omit it for any other file; a .zip without it is read as geospatial data, and a .3tz without it is refused. 'pointcloud' uploads a COPC point cloud as a .laz file; a .laz without it is refused.
+     */
+    kind?: string | null;
 };
 
 /**
@@ -2329,7 +2439,7 @@ export type ColumnValuesResponse = {
     /**
      * Values
      */
-    values: Array<string | number | number | null>;
+    values: Array<boolean | string | number | number | null>;
     /**
      * Count
      */
@@ -2351,6 +2461,7 @@ export type ColumnValuesResponse = {
  * - ``VectorCommitRequest`` — default for file uploads
  * - ``RasterCommitRequest`` — when ``job.user_metadata['file_type'] == 'raster'``
  * - ``ServiceCommitRequest`` — when ``job.source_url`` is set and ``job.file_path`` is None
+ * - ``TilesetCommitRequest`` — when ``job.user_metadata['file_type'] == 'tiles3d'``
  *
  * For new internal code that constructs a commit view, prefer importing
  * the appropriate subclass directly. This flat class is the wire contract,
@@ -2522,13 +2633,13 @@ export type ConfigResponse = {
     /**
      * Registration Enabled
      *
-     * Whether self-service registration is open
+     * Whether self-service registration is open. Single sign-on can create accounts whenever this is true.
      */
     registration_enabled: boolean;
     /**
      * Allow Signup
      *
-     * Whether self-serve registration is open. Alias for registration_enabled; login UI uses this to show/hide the signup link.
+     * Whether password sign-up is open: registration is enabled and password login is enabled. Login UI uses this to show/hide the signup link.
      */
     allow_signup?: boolean;
     /**
@@ -3147,6 +3258,12 @@ export type DatasetMeta = {
      * Ordered vector-tile property allowlist; null restores zoom defaults, [] emits geometry-only tiles, list emits those properties at any zoom.
      */
     tile_columns?: Array<string> | null;
+    /**
+     * Owner Id
+     *
+     * Admin only: transfer the dataset to this active user.
+     */
+    owner_id?: string | null;
 };
 
 /**
@@ -3167,9 +3284,15 @@ export type DatasetRefreshRequest = {
      */
     token?: string | null;
     /**
+     * Verification Policy
+     *
+     * Verification policy for this refresh. arcgis_id_set_v1 performs the stronger ArcGIS object-ID membership check.
+     */
+    verification_policy?: 'standard' | 'arcgis_id_set_v1';
+    /**
      * Accept Blocked Run Id
      *
-     * A blocked run whose reviewed source and staged content may be accepted once. A different result blocks again.
+     * A blocked run whose reviewed source and staged content may be accepted. The refresh that uses the acceptance holds it until it ends, and a cancelled or failed refresh gives it back. A different result blocks again. A blocked file replacement is accepted from the upload its run kept.
      */
     accept_blocked_run_id?: string | null;
     /**
@@ -3271,15 +3394,27 @@ export type DatasetRefreshRunResponse = {
     /**
      * Origin Kind
      *
-     * The run's execution door, not the dataset's origin: upload, postgis, service, stac, or raster. The two can visibly diverge; for example a STAC-imported raster's pending or failed replace run is recorded 'upload' while the dataset's origin stays 'stac' until the replace succeeds. 'raster' itself is reserved for a future, distinct raster-replace door label, with today's raster-replace runs recorded 'upload'.
+     * The run's execution door, not the dataset's origin: upload, postgis, service, stac, raster, or restore (the previous version published again). The two can visibly diverge; for example a STAC-imported raster's pending or failed replace run is recorded 'upload' while the dataset's origin stays 'stac' until the replace succeeds. 'raster' itself is reserved for a future, distinct raster-replace door label, with today's raster-replace runs recorded 'upload'.
      */
     origin_kind: string;
     /**
      * Trigger
      *
-     * manual, api, or cli
+     * manual, api, cli, or scheduled
      */
     trigger: string;
+    /**
+     * Scheduled For
+     *
+     * The scheduled occurrence time. Null for manual, API, and CLI runs.
+     */
+    scheduled_for?: string | null;
+    /**
+     * Claim Deadline
+     *
+     * The immutable admission deadline for a scheduled or keyed run. Null for legacy runs without an admission fence.
+     */
+    claim_deadline?: string | null;
     /**
      * Status
      *
@@ -3425,6 +3560,12 @@ export type DatasetRelationshipResponse = {
      * Target Dataset Title
      */
     target_dataset_title?: string | null;
+    /**
+     * Broken
+     *
+     * True when a join column no longer exists in its dataset. Related-records reads for it fail until the relationship is deleted or recreated.
+     */
+    broken?: boolean;
 };
 
 /**
@@ -3730,13 +3871,21 @@ export type DatasetResponse = {
     /**
      * Record Type
      *
-     * Record type: 'vector_dataset' (spatial features), 'raster_dataset' (single COG), 'vrt_dataset' (VRT mosaic), 'table' (non-spatial tabular), 'map' (saved map), 'service' (catalogued remote service), 'collection' (flat dataset group).
+     * Record type: 'vector_dataset' (spatial features), 'raster_dataset' (single COG), 'vrt_dataset' (VRT mosaic), 'table' (non-spatial tabular), 'map' (saved map), 'service' (catalogued remote service), 'collection' (flat dataset group), 'tiles3d_dataset' (3D Tiles tileset), 'pointcloud_dataset' (COPC point cloud).
      */
     record_type?: string;
     /**
      * Raster-specific metadata (null for vectors)
      */
     raster?: RasterMetadata | null;
+    /**
+     * 3D Tiles metadata on the dataset detail response; null for other record types and before a tileset is published
+     */
+    tileset?: TilesetMetadata | null;
+    /**
+     * COPC point cloud metadata on the dataset detail response; null for other record types and before a point cloud is published
+     */
+    pointcloud?: PointCloudMetadata | null;
     /**
      * Stac Assets
      *
@@ -3761,6 +3910,10 @@ export type DatasetResponse = {
      * Advisory warnings produced by a metadata update — e.g. a visibility or status change exposing keywords inherited from an analysis source the new audience cannot open. Only ever set on the PATCH response; the change has already applied.
      */
     metadata_warnings?: Array<string> | null;
+    /**
+     * The data the last replacement or restore replaced, which POST /previous-version/restore publishes again. Set on the detail endpoint only; null elsewhere and when there is none.
+     */
+    previous_version?: PreviousVersionResponse | null;
 };
 
 /**
@@ -3859,6 +4012,12 @@ export type DatasetVersionResponse = {
      * Uploaded At
      */
     uploaded_at: string;
+    /**
+     * Restored From Version
+     *
+     * The version a restore published again as this one
+     */
+    restored_from_version?: number | null;
 };
 
 /**
@@ -3906,6 +4065,14 @@ export type DerivedFromResponse = {
      */
     dataset_id: string;
     /**
+     * Source Filter
+     *
+     * CQL2-JSON filter that selected the source features, or null when the whole source dataset was used
+     */
+    source_filter?: {
+        [key: string]: unknown;
+    } | null;
+    /**
      * Operation
      *
      * Analysis operation that produced it
@@ -3946,7 +4113,7 @@ export type DiscoverResponse = {
     /**
      * Tables
      *
-     * Tables in the `data` schema that are eligible for registration as datasets.
+     * Tables in the `data` schema not yet registered as datasets. `refusal_reason` marks those discovery knows registration would refuse.
      */
     tables: Array<DiscoveredTable>;
 };
@@ -3979,6 +4146,12 @@ export type DiscoveredTable = {
      * PostgreSQL row count estimate from `pg_class.reltuples`.
      */
     estimated_rows: number | null;
+    /**
+     * Refusal Reason
+     *
+     * Why registration would refuse this table, as one of a fixed set of GeoLens codes: source_srid_undeclared, source_gid_unusable. Null when discovery finds none, though registration can still refuse a table for a reason discovery does not check.
+     */
+    refusal_reason?: string | null;
 };
 
 /**
@@ -4178,7 +4351,7 @@ export type DryRunResponse = {
     /**
      * Preview Token
      *
-     * Short-lived signed confirmation token required to apply an overwrite. Bound to the normalized payload, overwrite mode, and current configuration state.
+     * Short-lived signed confirmation token required to apply an overwrite, or a merge that would delete the stored embeddings. Bound to the normalized payload, mode, and current configuration state.
      */
     preview_token?: string | null;
 };
@@ -5048,6 +5221,12 @@ export type JobStatusResponse = {
      */
     error_message: string | null;
     /**
+     * Error Code
+     *
+     * Stable code for a fixed failure reason, so a client can show it in the reader's language; `error_message` keeps its English text. Null when the reason is free text.
+     */
+    error_code?: string | null;
+    /**
      * Can Retry
      */
     can_retry: boolean;
@@ -5083,6 +5262,12 @@ export type JobStatusResponse = {
      * Archive Failed
      */
     archive_failed?: boolean;
+    /**
+     * Quicklook Pending
+     *
+     * True while the dataset's quicklook image is still owed after publication, so a client showing the thumbnail can poll again until the image has been replaced.
+     */
+    quicklook_pending?: boolean;
     /**
      * Temporal Parse Errors
      */
@@ -5270,6 +5455,24 @@ export type LayerInfo = {
      */
     layer_type?: string;
     /**
+     * Source Layer Type
+     *
+     * ArcGIS sub-layer type as the service reports it, for example 'Feature Layer', 'Table', 'Group Layer', 'Raster Layer' or 'Annotation Layer'. Null for other service types.
+     */
+    source_layer_type?: string | null;
+    /**
+     * Parent Layer Id
+     *
+     * ArcGIS ID of the group layer that contains this layer, if any.
+     */
+    parent_layer_id?: number | null;
+    /**
+     * Importable
+     *
+     * False when the layer holds no features (ArcGIS composite, raster and annotation layers) and a preview of it is refused with 'unsupported_layer_type'.
+     */
+    importable?: boolean;
+    /**
      * Layer Id
      *
      * Numeric or string layer ID used by ArcGIS services.
@@ -5331,8 +5534,10 @@ export type ManifestApplyEntryResult = {
     dataset_key: string;
     /**
      * Action
+     *
+     * What apply did with the entry. `blocked` means the entry is unchanged since its last apply, whose replacement is held for review, so nothing was queued. Accept it by sending `run_id` as `accept_blocked_run_id` to the dataset's refresh endpoint, or change the entry.
      */
-    action: 'create' | 'update' | 'skip' | 'error';
+    action: 'create' | 'update' | 'skip' | 'blocked' | 'error';
     /**
      * Job Id
      */
@@ -5341,6 +5546,18 @@ export type ManifestApplyEntryResult = {
      * Dataset Id
      */
     dataset_id?: string | null;
+    /**
+     * Run Id
+     *
+     * The blocked refresh run to accept, when action is `blocked`.
+     */
+    run_id?: string | null;
+    /**
+     * Review Reasons
+     *
+     * Why the blocked run needs review, when action is `blocked`.
+     */
+    review_reasons?: Array<string>;
     /**
      * Message
      */
@@ -5513,7 +5730,7 @@ export type ManifestSource = {
     /**
      * Uri
      *
-     * Relative path (no `..` traversal), HTTP(S) URL, or storage URI.
+     * Relative path (no `..` traversal), HTTP(S) URL, or s3:// storage URI.
      */
     uri: string;
     /**
@@ -5863,7 +6080,7 @@ export type MapLayerInput = {
     /**
      * Label Config
      *
-     * Text label configuration
+     * Text label configuration. Accepted keys: allowOverlap, column, fontSize, haloColor, haloWidth, maxZoom, minZoom, placement, textAnchor, textColor, textOffset, textOpacity. Unknown keys are dropped when the map is exported as a MapLibre style. See https://docs.getgeolens.com/guides/api/publishing-from-desktop-gis/
      */
     label_config?: {
         [key: string]: unknown;
@@ -5875,7 +6092,7 @@ export type MapLayerInput = {
     /**
      * Style Config
      *
-     * Data-driven and builder UI style configuration. Builder-only state lives under builder, e.g. fill_disabled, stroke_disabled, outline settings, heatmap metadata, and height_column.
+     * Data-driven and builder UI style configuration. Accepted top-level keys: breaks, builder, categories, classCount, colorLabel, colors, column, heatmapPaint, legendLabel, method, mode, ramp, render_mode, reversed, savedCirclePaint, sizeLabel, sizeRange, sizes, symbol, target; other top-level keys are dropped when the map is exported as a MapLibre style. Builder-only state lives under builder, whose interpreted keys are arrow_color, arrow_size, arrow_spacing, cluster_color, cluster_color_ramp, cluster_max_zoom, cluster_radius, cluster_show_counts, cluster_text_color, cluster_text_size, colormap, extrusion_min_zoom, extrusion_opacity, fill_color_saved, fill_disabled, fill_opacity_saved, folder_group_expanded, folder_group_id, folder_group_name, heatmap_ramp, heatmap_reversed, heatmap_weight_column, height_column, height_scale, hypso_enabled, hypso_ramp, hypso_reversed, lineGradient, outline_color, outline_width, outline_width_saved, pmax, pmin, sigma, stretch, stroke_disabled, symbol. Other builder keys are stored and exported unchanged but have no effect. See https://docs.getgeolens.com/guides/api/publishing-from-desktop-gis/
      */
     style_config?: {
         [key: string]: unknown;
@@ -6116,6 +6333,20 @@ export type MapListResponse = {
      * Total
      */
     total: number;
+};
+
+/**
+ * MapPatch
+ *
+ * Partial map update. PUT /maps/{map_id} edits the map's content.
+ */
+export type MapPatch = {
+    /**
+     * Owner Id
+     *
+     * Admin only: transfer the map to this active user.
+     */
+    owner_id: string;
 };
 
 /**
@@ -6431,6 +6662,10 @@ export type MapSummaryResponse = {
      * Updated At
      */
     updated_at: string;
+    /**
+     * Created By
+     */
+    created_by?: string | null;
 };
 
 /**
@@ -6772,7 +7007,7 @@ export type OAuthProviderCreate = {
     /**
      * Group Role Mapping
      *
-     * JSON object mapping IdP group names to GeoLens roles. First match wins. Falls back to default_role if no group matches.
+     * JSON object mapping IdP group names to GeoLens roles ('viewer', 'editor' or 'admin'). A user in several mapped groups gets the most privileged of their roles; a user in none gets default_role.
      */
     group_role_mapping?: {
         [key: string]: unknown;
@@ -7044,7 +7279,7 @@ export type OAuthProviderUpdate = {
     /**
      * Default Role
      *
-     * Updated default role for new users.
+     * Updated default role for new users: 'viewer', 'editor', or 'admin'.
      */
     default_role?: string | null;
     /**
@@ -7056,7 +7291,7 @@ export type OAuthProviderUpdate = {
     /**
      * Group Role Mapping
      *
-     * Updated group-to-role mapping. Pass an empty object to clear.
+     * Updated group-to-role mapping, with the same rules as on create. Pass an empty object to clear.
      */
     group_role_mapping?: {
         [key: string]: unknown;
@@ -7082,7 +7317,7 @@ export type OgcAsset = {
     /**
      * Type
      */
-    type: string;
+    type?: string | null;
     /**
      * Title
      */
@@ -7225,6 +7460,12 @@ export type OgcFeatureCollectionResponse = {
      * Total records matching the query
      */
     numberMatched: number;
+    /**
+     * Numbermatchedalltypes
+     *
+     * Total records matching the query with record_type removed and every other filter kept; present only when record_type is set
+     */
+    numberMatchedAllTypes?: number | null;
     /**
      * Numberreturned
      *
@@ -7509,6 +7750,12 @@ export type OgcRecordProperties = {
      */
     has_quicklook?: boolean;
     /**
+     * Quicklook Version
+     *
+     * Changes whenever the quicklook image is replaced. Pass it as the `v` query parameter of the quicklook request so caches fetch the new image.
+     */
+    quicklook_version?: string | null;
+    /**
      * Gsd
      */
     gsd?: number | null;
@@ -7641,6 +7888,112 @@ export type PermissionsResponse = {
 };
 
 /**
+ * PointCloudMetadata
+ *
+ * A COPC point cloud's published file.
+ */
+export type PointCloudMetadata = {
+    /**
+     * Url
+     *
+     * URL path of the COPC file on the app origin, e.g. /api/datasets/{id}/copc/{attempt}/data.copc.laz. A replaced file gets a new URL
+     */
+    url?: string | null;
+    /**
+     * Size Bytes
+     *
+     * Size of the COPC file in bytes
+     */
+    size_bytes?: number | null;
+    /**
+     * Point Count
+     *
+     * Number of points, from the file's header
+     */
+    point_count?: number | null;
+    /**
+     * Point Format
+     *
+     * LAS point data record format: 6 (no colour), 7 (RGB) or 8 (RGB and near infrared)
+     */
+    point_format?: number | null;
+    /**
+     * Vertical Crs
+     *
+     * Name of the file's vertical CRS, when its WKT gives one
+     */
+    vertical_crs?: string | null;
+};
+
+/**
+ * PointCloudPreviewResponse
+ *
+ * What a staged COPC point cloud holds, read from its header and hierarchy.
+ */
+export type PointCloudPreviewResponse = {
+    /**
+     * Job Id
+     *
+     * Identifier of the point cloud ingestion job being previewed.
+     */
+    job_id: string;
+    /**
+     * Source Filename
+     *
+     * Original filename of the uploaded point cloud.
+     */
+    source_filename: string | null;
+    /**
+     * Point Count
+     *
+     * Number of points in the file.
+     */
+    point_count: number;
+    /**
+     * Point Format
+     *
+     * The file's LAS point data record format.
+     */
+    point_format: 6 | 7 | 8;
+    /**
+     * Srid
+     *
+     * EPSG code of the horizontal coordinate reference system.
+     */
+    srid: number;
+    /**
+     * Vertical Crs
+     *
+     * Name of the vertical coordinate reference system, if any.
+     */
+    vertical_crs: string | null;
+    /**
+     * Extent Bbox
+     *
+     * The extent as [west, south, east, north] in degrees; west > east when it crosses the antimeridian.
+     */
+    extent_bbox: Array<number>;
+    /**
+     * Z Min
+     *
+     * Lowest elevation, in the file's units.
+     */
+    z_min: number;
+    /**
+     * Z Max
+     *
+     * Highest elevation, in the file's units.
+     */
+    z_max: number;
+    /**
+     * Size Bytes
+     *
+     * Size of the file in bytes.
+     */
+    size_bytes: number;
+};
+
+/**
  * PopupConfig
  *
  * Per-layer popup configuration: enable/disable + custom title template
@@ -7717,6 +8070,12 @@ export type PresignedUploadRequest = {
      * MIME type to associate with the uploaded object.
      */
     content_type?: string;
+    /**
+     * Kind
+     *
+     * 'tiles3d' uploads a 3D Tiles tileset as a .zip or .3tz archive holding tileset.json. Omit it for any other file; a .zip without it is read as geospatial data, and a .3tz without it is refused. 'pointcloud' uploads a COPC point cloud as a .laz file; a .laz without it is refused.
+     */
+    kind?: 'tiles3d' | 'pointcloud' | null;
 };
 
 /**
@@ -7823,6 +8182,36 @@ export type PreviewResponse = {
     detected_geometry_columns?: {
         [key: string]: unknown;
     } | null;
+};
+
+/**
+ * PreviousVersionResponse
+ *
+ * The data a replacement or restore replaced, kept until the next one.
+ */
+export type PreviousVersionResponse = {
+    /**
+     * Version Number
+     *
+     * The version whose data is kept
+     */
+    version_number: number;
+    /**
+     * Retained At
+     */
+    retained_at?: string | null;
+    /**
+     * Size Bytes
+     *
+     * Its table's size; not counted toward quota
+     */
+    size_bytes?: number | null;
+    /**
+     * Feature Count
+     *
+     * As recorded on that version
+     */
+    feature_count?: number | null;
 };
 
 /**
@@ -7946,7 +8335,7 @@ export type QualityDetail = {
     /**
      * Attribute Completeness
      */
-    attribute_completeness: number;
+    attribute_completeness: number | null;
     /**
      * Crs Defined
      */
@@ -8314,6 +8703,10 @@ export type RefreshVerification = {
         [key: string]: unknown;
     };
     /**
+     * Source Binding Fingerprint
+     */
+    source_binding_fingerprint?: string | null;
+    /**
      * Source Count
      */
     source_count: number | null;
@@ -8328,11 +8721,17 @@ export type RefreshVerification = {
     /**
      * Identity Check
      */
-    identity_check: 'unavailable' | 'content_digest';
+    identity_check: 'unavailable' | 'content_digest' | 'arcgis_id_set';
     /**
      * Content Digest
      */
     content_digest?: string | null;
+    /**
+     * Arcgis Id Coverage
+     */
+    arcgis_id_coverage?: {
+        [key: string]: unknown;
+    } | null;
     /**
      * Staged Geometry Type
      */
@@ -8346,13 +8745,27 @@ export type RefreshVerification = {
      */
     staged_coordinate_dimension?: number | null;
     /**
+     * Geometry Contract
+     */
+    geometry_contract?: {
+        [key: string]: unknown;
+    } | null;
+    /**
      * Review Reasons
      */
-    review_reasons: Array<'source_count_unavailable' | 'empty_result' | 'destructive_schema_change'>;
+    review_reasons: Array<'source_count_unavailable' | 'empty_result' | 'destructive_schema_change' | 'geometry_type_changed' | 'srid_changed' | 'coordinate_dimension_reduced' | 'arcgis_id_coverage_unavailable' | 'arcgis_source_membership_changed' | 'live_data_changed'>;
     /**
      * Review Fingerprint
+     *
+     * Identifies what a blocked run asks a person to accept. A service refresh fingerprints all of its evidence, so its acceptance must fetch the same data again. A file replacement or service re-upload fingerprints only its review reasons, removed columns, type changes and, for a geometry reason, the geometry facts, which is what its preview shows. A run held because features were edited while it ran also names the edits it found, so accepting it does not cover a later edit.
      */
     review_fingerprint: string | null;
+    /**
+     * Review Acknowledged By
+     *
+     * Why a replacement judged on its preview published: its commit carried the preview's fingerprint, or a person accepted a blocked run with the same changes.
+     */
+    review_acknowledged_by?: 'preview' | 'accepted_run' | null;
     /**
      * Accepted Blocked Run Id
      */
@@ -8512,6 +8925,32 @@ export type ReservedRenameWarning = {
 };
 
 /**
+ * RestorePreviousVersionRequest
+ */
+export type RestorePreviousVersionRequest = {
+    /**
+     * Expected Version Number
+     *
+     * The previous version the caller confirmed restoring
+     */
+    expected_version_number: number;
+};
+
+/**
+ * RestorePreviousVersionResponse
+ */
+export type RestorePreviousVersionResponse = {
+    /**
+     * Job Id
+     */
+    job_id: string;
+    /**
+     * Run Id
+     */
+    run_id: string;
+};
+
+/**
  * ReuploadCommitRequest
  */
 export type ReuploadCommitRequest = {
@@ -8539,6 +8978,12 @@ export type ReuploadCommitRequest = {
      * Structured credential for a protected service. Mutually exclusive with the token field.
      */
     auth?: ServiceAuthRequest | null;
+    /**
+     * Review Fingerprint
+     *
+     * The preview's `review_fingerprint`, sent once a person has seen the changes it describes. A file replacement or service re-upload with review reasons publishes only when the worker's own fingerprint matches; otherwise its run ends `blocked`.
+     */
+    review_fingerprint?: string | null;
 };
 
 /**
@@ -8567,6 +9012,12 @@ export type ReuploadPreviewRequest = {
      * Layer Name
      */
     layer_name?: string | null;
+    /**
+     * Srid Override
+     *
+     * The SRID override the commit will send, so the preview judges the coordinate system the replacement will be stored in.
+     */
+    srid_override?: number | null;
 };
 
 /**
@@ -8618,6 +9069,18 @@ export type ReuploadPreviewResponse = {
      * Previous Source Layer
      */
     previous_source_layer?: string | null;
+    /**
+     * Review Reasons
+     *
+     * Changes in this file replacement or service re-upload that hold it for review.
+     */
+    review_reasons?: Array<'source_count_unavailable' | 'empty_result' | 'destructive_schema_change' | 'geometry_type_changed' | 'srid_changed' | 'coordinate_dimension_reduced' | 'arcgis_id_coverage_unavailable' | 'arcgis_source_membership_changed' | 'live_data_changed'>;
+    /**
+     * Review Fingerprint
+     *
+     * Fingerprint of the reviewed changes. Send it as the commit's `review_fingerprint` once a person has seen them; null when nothing needs review.
+     */
+    review_fingerprint?: string | null;
 };
 
 /**
@@ -9208,6 +9671,12 @@ export type SettingItem = {
      * Human-readable label for display in the admin UI.
      */
     label: string;
+    /**
+     * Default Value
+     *
+     * Runtime default the setting resets to. Reported only for embedding_dims, so the UI can tell whether a reset changes the live width.
+     */
+    default_value?: unknown;
 };
 
 /**
@@ -9421,6 +9890,10 @@ export type SharedLayerResponse = {
      * Dataset Attribution
      */
     dataset_attribution?: string | null;
+    /**
+     * Dataset Extent Bbox
+     */
+    dataset_extent_bbox?: Array<number> | null;
 };
 
 /**
@@ -9521,6 +9994,24 @@ export type SourceHealthResponse = {
 };
 
 /**
+ * SsoExchangeRequest
+ */
+export type SsoExchangeRequest = {
+    /**
+     * Code
+     *
+     * The one-time code from the `code` parameter of the sign-in redirect's URL fragment.
+     */
+    code: string;
+    /**
+     * Nonce
+     *
+     * The nonce the page sent when it started this sign-in.
+     */
+    nonce: string;
+};
+
+/**
  * StacAsset
  */
 export type StacAsset = {
@@ -9548,6 +10039,76 @@ export type StacAsset = {
      * Size Bytes
      */
     size_bytes?: number | null;
+};
+
+/**
+ * StacAssetSize
+ */
+export type StacAssetSize = {
+    /**
+     * Id
+     *
+     * STAC item ID.
+     */
+    id: string;
+    /**
+     * Size Bytes
+     *
+     * Asset size in bytes, or null when the server did not report one.
+     */
+    size_bytes?: number | null;
+};
+
+/**
+ * StacAssetSizeTarget
+ */
+export type StacAssetSizeTarget = {
+    /**
+     * Id
+     *
+     * STAC item ID the asset belongs to.
+     */
+    id: string;
+    /**
+     * Href
+     *
+     * URL of the item's data asset.
+     */
+    href: string;
+};
+
+/**
+ * StacAssetSizesRequest
+ */
+export type StacAssetSizesRequest = {
+    /**
+     * Url
+     *
+     * STAC API root URL the assets were found in.
+     */
+    url: string;
+    /**
+     * Assets
+     *
+     * Assets to measure (max 50 per request).
+     */
+    assets: Array<StacAssetSizeTarget>;
+    /**
+     * Credential for a protected catalog. It is sent only to assets on the catalog's own origin.
+     */
+    auth?: ServiceAuthRequest | null;
+};
+
+/**
+ * StacAssetSizesResponse
+ */
+export type StacAssetSizesResponse = {
+    /**
+     * Sizes
+     *
+     * One entry per requested asset.
+     */
+    sizes: Array<StacAssetSize>;
 };
 
 /**
@@ -9827,6 +10388,12 @@ export type StacConnectResponse = {
      * STAC specification version.
      */
     stac_version: string;
+    /**
+     * Conforms To
+     *
+     * Conformance classes from the landing page conformsTo, which tell a client which search extensions the catalog supports.
+     */
+    conforms_to?: Array<string>;
 };
 
 /**
@@ -10293,6 +10860,12 @@ export type StacItemSummary = {
      */
     data_asset_size_bytes?: number | null;
     /**
+     * Data Asset Import Refusal
+     *
+     * Why /import would refuse this item's data asset, based on its URL alone, or null if the href passes import's format, length and credential checks. 'not_http' for a scheme other than http/https, such as s3://; 'credentials' for a URL carrying a credential query parameter GeoLens won't store; 'too_long' for a URL over the length import allows. Import also checks each asset's host, and can still refuse a null item there as a per-item failure that leaves the rest of the batch importing.
+     */
+    data_asset_import_refusal?: 'not_http' | 'credentials' | 'too_long' | null;
+    /**
      * Thumbnail Href
      *
      * Thumbnail URL if available.
@@ -10336,6 +10909,20 @@ export type StacLink = {
      * HTTP method to use (defaults to GET).
      */
     method?: string | null;
+};
+
+/**
+ * StacNextPage
+ *
+ * Opaque handle for the next page of a search.
+ */
+export type StacNextPage = {
+    /**
+     * Cursor
+     *
+     * Server-issued token for the next page. Echo the next_page of the previous response unchanged, with the same url and collections; a missing or altered cursor is refused.
+     */
+    cursor?: string | null;
 };
 
 /**
@@ -10429,6 +11016,22 @@ export type StacSearchRequest = {
      * Structured credential for a protected service. Mutually exclusive with the token field.
      */
     auth?: ServiceAuthRequest | null;
+    /**
+     * Max Cloud Cover
+     *
+     * Only items at or below this eo:cloud_cover percentage.
+     */
+    max_cloud_cover?: number | null;
+    /**
+     * Cloud Cover Mode
+     *
+     * How to send max_cloud_cover: 'query' for the STAC Query extension, 'filter' for CQL2 JSON. Pick the one the catalog lists in its landing page conformsTo.
+     */
+    cloud_cover_mode?: 'query' | 'filter' | null;
+    /**
+     * The next_page of the previous response, to fetch the page after it. Send the same filters as the first request.
+     */
+    next_page?: StacNextPage | null;
 };
 
 /**
@@ -10453,6 +11056,10 @@ export type StacSearchResponse = {
      * Number of items in this response.
      */
     returned: number;
+    /**
+     * Link to the next page of results, or null on the last page. Send it back as next_page with the same filters.
+     */
+    next_page?: StacNextPage | null;
 };
 
 /**
@@ -10760,6 +11367,112 @@ export type TileTokenBatchResponse = {
 };
 
 /**
+ * TilesetMetadata
+ *
+ * A 3D Tiles dataset's published tileset.
+ */
+export type TilesetMetadata = {
+    /**
+     * Url
+     *
+     * URL path of the tileset's tileset.json on the app origin, e.g. /api/datasets/{id}/tiles3d/tileset.json
+     */
+    url: string;
+    /**
+     * Size Bytes
+     *
+     * Unpacked size of the tileset in bytes
+     */
+    size_bytes?: number | null;
+    /**
+     * Version
+     *
+     * The tileset's asset.version: '1.0' or '1.1'
+     */
+    version?: string | null;
+    /**
+     * Geometric Error
+     *
+     * The root tile's geometricError, when tileset.json gives one
+     */
+    geometric_error?: number | null;
+    /**
+     * Bounding Volume
+     *
+     * The kind of the root tile's bounding volume. A box or sphere not in Earth-centred coordinates leaves the dataset's extent null.
+     */
+    bounding_volume?: 'region' | 'box' | 'sphere' | null;
+    /**
+     * Content Types
+     *
+     * The tile formats in the tileset, sorted: b3dm, i3dm, pnts, cmpt, glb, gltf, subtree, vctr or geom, including the tiles inside a cmpt. Null for a tileset published before GeoLens recorded them.
+     */
+    content_types?: Array<string> | null;
+    /**
+     * Extensions Required
+     *
+     * Every extension a client must support to load the tileset, sorted: the extensionsRequired of its tileset JSON, external tilesets included, and of its glTF content. Null for a tileset published before GeoLens recorded them.
+     */
+    extensions_required?: Array<string> | null;
+};
+
+/**
+ * TilesetPreviewResponse
+ *
+ * What a staged 3D Tiles tileset archive holds, read without unpacking it.
+ */
+export type TilesetPreviewResponse = {
+    /**
+     * Job Id
+     *
+     * Identifier of the tileset ingestion job being previewed.
+     */
+    job_id: string;
+    /**
+     * Source Filename
+     *
+     * Original filename of the uploaded tileset archive.
+     */
+    source_filename: string | null;
+    /**
+     * Version
+     *
+     * The tileset's asset.version from its tileset.json.
+     */
+    version: '1.0' | '1.1';
+    /**
+     * Geometric Error
+     *
+     * The root tile's geometricError, or null when tileset.json gives none.
+     */
+    geometric_error: number | null;
+    /**
+     * Bounding Volume
+     *
+     * The kind of the root tile's bounding volume.
+     */
+    bounding_volume: 'region' | 'box' | 'sphere';
+    /**
+     * Extent Bbox
+     *
+     * The root bounding volume's extent as [west, south, east, north] in degrees; west > east when it crosses the antimeridian. Null for a box or sphere that is not placed in Earth-centred coordinates.
+     */
+    extent_bbox: Array<number> | null;
+    /**
+     * Unpacked Bytes
+     *
+     * Total size of the archive's files once unpacked.
+     */
+    unpacked_bytes: number;
+    /**
+     * Entry Count
+     *
+     * Number of entries, files and folders, in the archive.
+     */
+    entry_count: number;
+};
+
+/**
  * TokenResponse
  */
 export type TokenResponse = {
@@ -10936,6 +11649,12 @@ export type UrlUploadRequest = {
      * Filename override for URLs whose path does not end in the actual file name (e.g. download links keyed by query id). Must carry an allowed extension. Defaults to the URL path's basename.
      */
     filename?: string | null;
+    /**
+     * Kind
+     *
+     * 'tiles3d' uploads a 3D Tiles tileset as a .zip or .3tz archive holding tileset.json. Omit it for any other file; a .zip without it is read as geospatial data, and a .3tz without it is refused.
+     */
+    kind?: 'tiles3d' | null;
 };
 
 /**
@@ -11081,7 +11800,7 @@ export type UserUpdate = {
     /**
      * Email
      *
-     * New email address. Set to update; omit to leave unchanged.
+     * New email address. Set to update, send null or an empty string to clear it, omit to leave unchanged.
      */
     email?: string | null;
     /**
@@ -11239,7 +11958,7 @@ export type VrtCreateRequest = {
     /**
      * Source Dataset Ids
      *
-     * Source raster dataset IDs to include in the VRT mosaic or band stack (1-500).
+     * Source raster dataset IDs to include in the VRT mosaic or band stack (2-500).
      */
     source_dataset_ids: Array<string>;
     /**
@@ -11991,10 +12710,12 @@ export type ExportAuditLogsAdminAuditLogsExportFormatGetError = ExportAuditLogsA
 
 export type ExportAuditLogsAdminAuditLogsExportFormatGetResponses = {
     /**
-     * Successful Response
+     * The CSV file, or a JSON file when the format is json
      */
-    200: unknown;
+    200: Blob | File;
 };
+
+export type ExportAuditLogsAdminAuditLogsExportFormatGetResponse = ExportAuditLogsAdminAuditLogsExportFormatGetResponses[keyof ExportAuditLogsAdminAuditLogsExportFormatGetResponses];
 
 export type TriggerBackfillAdminBackfillEmbeddingsPostData = {
     body?: never;
@@ -12004,6 +12725,10 @@ export type TriggerBackfillAdminBackfillEmbeddingsPostData = {
          * Force
          */
         force?: boolean;
+        /**
+         * All Tenants
+         */
+        all_tenants?: boolean;
     };
     url: '/admin/backfill-embeddings/';
 };
@@ -12301,6 +13026,8 @@ export type ListAdminJobsAdminJobsGetData = {
     query?: {
         /**
          * Status
+         *
+         * Job status to match. 'failed' leaves out replacements held for review, which 'awaiting_review' lists while their run still needs a decision.
          */
         status?: string | null;
         /**
@@ -12765,10 +13492,12 @@ export type ExportUsersCsvAdminUsersExportCsvGetError = ExportUsersCsvAdminUsers
 
 export type ExportUsersCsvAdminUsersExportCsvGetResponses = {
     /**
-     * Successful Response
+     * The CSV file
      */
-    200: unknown;
+    200: Blob | File;
 };
+
+export type ExportUsersCsvAdminUsersExportCsvGetResponse = ExportUsersCsvAdminUsersExportCsvGetResponses[keyof ExportUsersCsvAdminUsersExportCsvGetResponses];
 
 export type ListUserNamesAdminUsersNamesGetData = {
     body?: never;
@@ -14560,6 +15289,67 @@ export type MeUsageAuthMeUsageGetResponses = {
 
 export type MeUsageAuthMeUsageGetResponse = MeUsageAuthMeUsageGetResponses[keyof MeUsageAuthMeUsageGetResponses];
 
+export type ExchangeSignInCodeAuthOauthExchangePostData = {
+    body: SsoExchangeRequest;
+    headers?: {
+        /**
+         * X-Geolens-Auth-Mode
+         *
+         * Must be `cookie`: this call only establishes a browser cookie session.
+         */
+        'X-GeoLens-Auth-Mode'?: string | null;
+    };
+    path?: never;
+    query?: never;
+    url: '/auth/oauth/exchange/';
+};
+
+export type ExchangeSignInCodeAuthOauthExchangePostErrors = {
+    /**
+     * Bad request — invalid query parameters or payload
+     */
+    400: ProblemDetail;
+    /**
+     * Unauthorized — missing or invalid credentials
+     */
+    401: ProblemDetail;
+    /**
+     * Forbidden — caller lacks access to this resource
+     */
+    403: ProblemDetail;
+    /**
+     * Not found
+     */
+    404: ProblemDetail;
+    /**
+     * Validation error
+     */
+    422: ProblemDetail;
+    /**
+     * Too many requests — retry after the advertised interval
+     */
+    429: ProblemDetail;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetail;
+    /**
+     * Service unavailable — the database could not serve the request
+     */
+    503: ProblemDetail;
+};
+
+export type ExchangeSignInCodeAuthOauthExchangePostError = ExchangeSignInCodeAuthOauthExchangePostErrors[keyof ExchangeSignInCodeAuthOauthExchangePostErrors];
+
+export type ExchangeSignInCodeAuthOauthExchangePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: TokenResponse;
+};
+
+export type ExchangeSignInCodeAuthOauthExchangePostResponse = ExchangeSignInCodeAuthOauthExchangePostResponses[keyof ExchangeSignInCodeAuthOauthExchangePostResponses];
+
 export type ListPublicProvidersAuthOauthProvidersGetData = {
     body?: never;
     path?: never;
@@ -14679,7 +15469,14 @@ export type OauthLoginAuthOauthProviderSlugLoginGetData = {
          */
         provider_slug: string;
     };
-    query?: never;
+    query: {
+        /**
+         * Nonce
+         *
+         * A random 256-bit value, base64url without padding, that the page starting this sign-in keeps. The callback hands it back, and the page completes only a sign-in carrying its own value.
+         */
+        nonce: string;
+    };
     url: '/auth/oauth/{provider_slug}/login';
 };
 
@@ -15487,7 +16284,7 @@ export type ListCollectionsCollectionsGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -15532,7 +16329,7 @@ export type GetCollectionMetadataCollectionsDatasetsGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -15702,7 +16499,7 @@ export type CollectionItemsCollectionsDatasetsItemsGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -15752,7 +16549,7 @@ export type GetCollectionItemCollectionsDatasetsItemsRecordIdGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -15924,7 +16721,7 @@ export type GetDatasetCollectionCollectionsDatasetIdGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -16033,7 +16830,7 @@ export type GetCollectionItemsCollectionsDatasetIdItemsGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -16165,7 +16962,7 @@ export type GetCollectionItemFeatureCollectionsDatasetIdItemsFeatureIdGetErrors 
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -16294,7 +17091,7 @@ export type GetCollectionQueryablesCollectionsDatasetIdQueryablesGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -16448,7 +17245,7 @@ export type ImportConfigurationConfigOpsImportPostData = {
         /**
          * X-Config-Preview-Token
          *
-         * Signed token returned by the matching dry-run. Required for overwrite mode.
+         * Signed token returned by the matching dry-run. Required for overwrite mode and for a merge that would delete the stored embeddings.
          */
         'X-Config-Preview-Token'?: string | null;
     };
@@ -16496,7 +17293,7 @@ export type ImportConfigurationConfigOpsImportPostErrors = {
      */
     500: ProblemDetail;
     /**
-     * Service unavailable — the database could not serve the request
+     * Service unavailable — the configuration could not be applied
      */
     503: ProblemDetail;
 };
@@ -16813,7 +17610,7 @@ export type GetDcatUs3CatalogDatasetsDcatUs30GetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -16856,7 +17653,7 @@ export type ValidateDcatUs3CatalogDatasetsDcatUs30ValidationGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -16912,7 +17709,7 @@ export type GetDcatCatalogDatasetsDcatGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -16955,7 +17752,7 @@ export type ValidateDcat3CatalogDatasetsDcatValidationGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -17011,7 +17808,7 @@ export type GetGeodcatApCatalogDatasetsGeodcatApGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -17054,7 +17851,7 @@ export type ValidateGeodcatApCatalogDatasetsGeodcatApValidationGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -17858,6 +18655,80 @@ export type GetColumnValuesDatasetsDatasetIdColumnsColumnNameValuesGetResponses 
 
 export type GetColumnValuesDatasetsDatasetIdColumnsColumnNameValuesGetResponse = GetColumnValuesDatasetsDatasetIdColumnsColumnNameValuesGetResponses[keyof GetColumnValuesDatasetsDatasetIdColumnsColumnNameValuesGetResponses];
 
+export type GetPointcloudFileDatasetsDatasetIdCopcAttemptIdNameCopcLazGetData = {
+    body?: never;
+    path: {
+        /**
+         * Dataset Id
+         */
+        dataset_id: string;
+        /**
+         * Attempt Id
+         */
+        attempt_id: string;
+        /**
+         * Name
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/datasets/{dataset_id}/copc/{attempt_id}/{name}.copc.laz';
+};
+
+export type GetPointcloudFileDatasetsDatasetIdCopcAttemptIdNameCopcLazGetErrors = {
+    /**
+     * A credential was supplied and could not be resolved (expired, revoked or malformed); a read with none is anonymous
+     */
+    401: ProblemDetail;
+    /**
+     * Not found
+     */
+    404: ProblemDetail;
+    /**
+     * Precondition failed — the caller's If-Match no longer matches the current representation
+     */
+    412: ProblemDetail;
+    /**
+     * The Range names no byte of the file, or is malformed
+     */
+    416: ProblemDetail;
+    /**
+     * Validation error
+     */
+    422: ProblemDetail;
+    /**
+     * Too many requests — retry after the advertised interval
+     */
+    429: ProblemDetail;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetail;
+    /**
+     * Bad gateway — an upstream provider failed
+     */
+    502: ProblemDetail;
+    /**
+     * Service unavailable — the database could not serve the request
+     */
+    503: ProblemDetail;
+};
+
+export type GetPointcloudFileDatasetsDatasetIdCopcAttemptIdNameCopcLazGetError = GetPointcloudFileDatasetsDatasetIdCopcAttemptIdNameCopcLazGetErrors[keyof GetPointcloudFileDatasetsDatasetIdCopcAttemptIdNameCopcLazGetErrors];
+
+export type GetPointcloudFileDatasetsDatasetIdCopcAttemptIdNameCopcLazGetResponses = {
+    /**
+     * The whole COPC file
+     */
+    200: Blob | File;
+    /**
+     * One byte range of the COPC file
+     */
+    206: Blob | File;
+};
+
+export type GetPointcloudFileDatasetsDatasetIdCopcAttemptIdNameCopcLazGetResponse = GetPointcloudFileDatasetsDatasetIdCopcAttemptIdNameCopcLazGetResponses[keyof GetPointcloudFileDatasetsDatasetIdCopcAttemptIdNameCopcLazGetResponses];
+
 export type GetDcatUs3RecordDatasetsDatasetIdDcatUs30GetData = {
     body?: never;
     path: {
@@ -17876,7 +18747,7 @@ export type GetDcatUs3RecordDatasetsDatasetIdDcatUs30GetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -17924,7 +18795,7 @@ export type ValidateDcatUs3RecordDatasetsDatasetIdDcatUs30ValidationGetErrors = 
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -17972,7 +18843,7 @@ export type GetDcatRecordDatasetsDatasetIdDcatGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -18020,7 +18891,7 @@ export type ValidateDcat3RecordDatasetsDatasetIdDcatValidationGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -18068,7 +18939,7 @@ export type DownloadCogDatasetsDatasetIdDownloadCogGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -18105,10 +18976,16 @@ export type DownloadCogDatasetsDatasetIdDownloadCogGetError = DownloadCogDataset
 
 export type DownloadCogDatasetsDatasetIdDownloadCogGetResponses = {
     /**
-     * Successful Response
+     * The whole COG file
      */
-    200: unknown;
+    200: Blob | File;
+    /**
+     * One byte range of the COG file
+     */
+    206: Blob | File;
 };
+
+export type DownloadCogDatasetsDatasetIdDownloadCogGetResponse = DownloadCogDatasetsDatasetIdDownloadCogGetResponses[keyof DownloadCogDatasetsDatasetIdDownloadCogGetResponses];
 
 export type ExportDatasetEndpointDatasetsDatasetIdExportGetData = {
     body?: never;
@@ -18151,7 +19028,7 @@ export type ExportDatasetEndpointDatasetsDatasetIdExportGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -18192,10 +19069,16 @@ export type ExportDatasetEndpointDatasetsDatasetIdExportGetError = ExportDataset
 
 export type ExportDatasetEndpointDatasetsDatasetIdExportGetResponses = {
     /**
-     * Successful Response
+     * The exported file
      */
-    200: unknown;
+    200: Blob | File;
+    /**
+     * One byte range of the exported file
+     */
+    206: Blob | File;
 };
+
+export type ExportDatasetEndpointDatasetsDatasetIdExportGetResponse = ExportDatasetEndpointDatasetsDatasetIdExportGetResponses[keyof ExportDatasetEndpointDatasetsDatasetIdExportGetResponses];
 
 export type GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetData = {
     body?: never;
@@ -18223,7 +19106,7 @@ export type GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetErrors
      */
     400: ProblemDetail;
     /**
-     * Unauthorized — missing or invalid credentials
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a valid X-Embed-Token that authorizes the request on its own. That request is served and the unrelated credential is ignored.
      */
     401: ProblemDetail;
     /**
@@ -18256,10 +19139,26 @@ export type GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetError 
 
 export type GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponses = {
     /**
-     * Successful Response
+     * A GeoJSON FeatureCollection with Z coordinates preserved.
      */
-    200: unknown;
+    200: {
+        type: 'FeatureCollection';
+        features: Array<{
+            type: 'Feature';
+            id: number;
+            geometry: {
+                [key: string]: unknown;
+            } | null;
+            properties: {
+                [key: string]: unknown;
+            };
+        }>;
+        truncated: boolean;
+        total_count: number;
+    };
 };
+
+export type GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponse = GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponses[keyof GetFeaturesGeojsonZEndpointDatasetsDatasetIdFeaturesGeojsonGetResponses];
 
 export type ListFeaturesDatasetsDatasetIdFeaturesGetData = {
     body?: never;
@@ -18426,6 +19325,20 @@ export type ListFeaturesDatasetsDatasetIdFeaturesGetResponse = ListFeaturesDatas
 
 export type CreateFeatureDatasetsDatasetIdFeaturesPostData = {
     body: FeatureCreate;
+    headers?: {
+        /**
+         * Idempotency-Key
+         *
+         * Optional key that makes a retried create safe. Letters, digits and `._:-`, up to 128 characters.
+         */
+        'Idempotency-Key'?: string;
+        /**
+         * Idempotency-Attempt
+         *
+         * Attempt number sent with `Idempotency-Key`, counting up by one each time the body is sent again. Counts as 1 when omitted.
+         */
+        'Idempotency-Attempt'?: number;
+    };
     path: {
         /**
          * Dataset Id
@@ -18481,7 +19394,7 @@ export type CreateFeatureDatasetsDatasetIdFeaturesPostResponses = {
     /**
      * GeoJSONFeature
      *
-     * A single GeoJSON Feature.
+     * A written GeoJSON Feature, plus the dataset's committed tile version.
      */
     201: {
         /**
@@ -18529,6 +19442,18 @@ export type CreateFeatureDatasetsDatasetIdFeaturesPostResponses = {
         properties: {
             [key: string]: unknown;
         };
+        /**
+         * Table Id
+         *
+         * Opaque id of the data table this feature was read from or written to. A reupload or an overwrite of the dataset's data replaces the table, and the replacement can reuse feature ids. Send it back as the `table_id` query parameter of a PUT, PATCH or DELETE of this feature to have the write refused if the table was replaced since.
+         */
+        table_id?: string | null;
+        /**
+         * Tile Cache Version
+         *
+         * The dataset's tile_cache_version after this write committed. Send it as the tile routes' `_v` query parameter when reloading tiles, so a request that reaches a different API worker is forced to re-read the dataset instead of serving that worker's own cached snapshot.
+         */
+        tile_cache_version?: number | null;
     };
 };
 
@@ -18546,7 +19471,14 @@ export type DeleteSingleFeatureDatasetsDatasetIdFeaturesGidDeleteData = {
          */
         gid: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Table Id
+         *
+         * The `table_id` the feature was read with. If the dataset's data has been replaced since, the request is refused with 409 and code `dataset_replaced`, and nothing is written.
+         */
+        table_id?: string;
+    };
     url: '/datasets/{dataset_id}/features/{gid}';
 };
 
@@ -18593,7 +19525,7 @@ export type DeleteSingleFeatureDatasetsDatasetIdFeaturesGidDeleteError = DeleteS
 
 export type DeleteSingleFeatureDatasetsDatasetIdFeaturesGidDeleteResponses = {
     /**
-     * Successful Response
+     * Feature deleted.
      */
     204: void;
 };
@@ -18657,7 +19589,7 @@ export type GetSingleFeatureDatasetsDatasetIdFeaturesGidGetResponses = {
     /**
      * GeoJSONFeature
      *
-     * A single GeoJSON Feature.
+     * A GeoJSON Feature, plus the id of the table it was read from.
      */
     200: {
         /**
@@ -18705,6 +19637,12 @@ export type GetSingleFeatureDatasetsDatasetIdFeaturesGidGetResponses = {
         properties: {
             [key: string]: unknown;
         };
+        /**
+         * Table Id
+         *
+         * Opaque id of the data table this feature was read from or written to. A reupload or an overwrite of the dataset's data replaces the table, and the replacement can reuse feature ids. Send it back as the `table_id` query parameter of a PUT, PATCH or DELETE of this feature to have the write refused if the table was replaced since.
+         */
+        table_id?: string | null;
     };
 };
 
@@ -18722,7 +19660,14 @@ export type PatchSingleFeatureDatasetsDatasetIdFeaturesGidPatchData = {
          */
         gid: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Table Id
+         *
+         * The `table_id` the feature was read with. If the dataset's data has been replaced since, the request is refused with 409 and code `dataset_replaced`, and nothing is written.
+         */
+        table_id?: string;
+    };
     url: '/datasets/{dataset_id}/features/{gid}';
 };
 
@@ -18771,7 +19716,7 @@ export type PatchSingleFeatureDatasetsDatasetIdFeaturesGidPatchResponses = {
     /**
      * GeoJSONFeature
      *
-     * A single GeoJSON Feature.
+     * A written GeoJSON Feature, plus the dataset's committed tile version.
      */
     200: {
         /**
@@ -18819,6 +19764,18 @@ export type PatchSingleFeatureDatasetsDatasetIdFeaturesGidPatchResponses = {
         properties: {
             [key: string]: unknown;
         };
+        /**
+         * Table Id
+         *
+         * Opaque id of the data table this feature was read from or written to. A reupload or an overwrite of the dataset's data replaces the table, and the replacement can reuse feature ids. Send it back as the `table_id` query parameter of a PUT, PATCH or DELETE of this feature to have the write refused if the table was replaced since.
+         */
+        table_id?: string | null;
+        /**
+         * Tile Cache Version
+         *
+         * The dataset's tile_cache_version after this write committed. Send it as the tile routes' `_v` query parameter when reloading tiles, so a request that reaches a different API worker is forced to re-read the dataset instead of serving that worker's own cached snapshot.
+         */
+        tile_cache_version?: number | null;
     };
 };
 
@@ -18836,7 +19793,14 @@ export type ReplaceSingleFeatureDatasetsDatasetIdFeaturesGidPutData = {
          */
         gid: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Table Id
+         *
+         * The `table_id` the feature was read with. If the dataset's data has been replaced since, the request is refused with 409 and code `dataset_replaced`, and nothing is written.
+         */
+        table_id?: string;
+    };
     url: '/datasets/{dataset_id}/features/{gid}';
 };
 
@@ -18885,7 +19849,7 @@ export type ReplaceSingleFeatureDatasetsDatasetIdFeaturesGidPutResponses = {
     /**
      * GeoJSONFeature
      *
-     * A single GeoJSON Feature.
+     * A written GeoJSON Feature, plus the dataset's committed tile version.
      */
     200: {
         /**
@@ -18933,6 +19897,18 @@ export type ReplaceSingleFeatureDatasetsDatasetIdFeaturesGidPutResponses = {
         properties: {
             [key: string]: unknown;
         };
+        /**
+         * Table Id
+         *
+         * Opaque id of the data table this feature was read from or written to. A reupload or an overwrite of the dataset's data replaces the table, and the replacement can reuse feature ids. Send it back as the `table_id` query parameter of a PUT, PATCH or DELETE of this feature to have the write refused if the table was replaced since.
+         */
+        table_id?: string | null;
+        /**
+         * Tile Cache Version
+         *
+         * The dataset's tile_cache_version after this write committed. Send it as the tile routes' `_v` query parameter when reloading tiles, so a request that reaches a different API worker is forced to re-read the dataset instead of serving that worker's own cached snapshot.
+         */
+        tile_cache_version?: number | null;
     };
 };
 
@@ -19035,7 +20011,7 @@ export type GetGeodcatApRecordDatasetsDatasetIdGeodcatApGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -19083,7 +20059,7 @@ export type ValidateGeodcatApRecordDatasetsDatasetIdGeodcatApValidationGetErrors
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -19255,6 +20231,137 @@ export type DatasetMapsDatasetsDatasetIdMapsGetResponses = {
 
 export type DatasetMapsDatasetsDatasetIdMapsGetResponse = DatasetMapsDatasetsDatasetIdMapsGetResponses[keyof DatasetMapsDatasetsDatasetIdMapsGetResponses];
 
+export type DeletePreviousVersionDatasetsDatasetIdPreviousVersionDeleteData = {
+    body?: never;
+    path: {
+        /**
+         * Dataset Id
+         */
+        dataset_id: string;
+    };
+    query: {
+        /**
+         * Expected Version Number
+         *
+         * The previous version the caller confirmed deleting
+         */
+        expected_version_number: number;
+    };
+    url: '/datasets/{dataset_id}/previous-version';
+};
+
+export type DeletePreviousVersionDatasetsDatasetIdPreviousVersionDeleteErrors = {
+    /**
+     * Bad request — invalid payload
+     */
+    400: ProblemDetail;
+    /**
+     * Unauthorized — missing or invalid credentials
+     */
+    401: ProblemDetail;
+    /**
+     * Forbidden — caller lacks write access
+     */
+    403: ProblemDetail;
+    /**
+     * Not found
+     */
+    404: ProblemDetail;
+    /**
+     * Conflict — resource state prevents the operation
+     */
+    409: ProblemDetail;
+    /**
+     * Validation error
+     */
+    422: ProblemDetail;
+    /**
+     * Too many requests — retry after the advertised interval
+     */
+    429: ProblemDetail;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetail;
+    /**
+     * Service unavailable — the database could not serve the request
+     */
+    503: ProblemDetail;
+};
+
+export type DeletePreviousVersionDatasetsDatasetIdPreviousVersionDeleteError = DeletePreviousVersionDatasetsDatasetIdPreviousVersionDeleteErrors[keyof DeletePreviousVersionDatasetsDatasetIdPreviousVersionDeleteErrors];
+
+export type DeletePreviousVersionDatasetsDatasetIdPreviousVersionDeleteResponses = {
+    /**
+     * Successful Response
+     */
+    204: void;
+};
+
+export type DeletePreviousVersionDatasetsDatasetIdPreviousVersionDeleteResponse = DeletePreviousVersionDatasetsDatasetIdPreviousVersionDeleteResponses[keyof DeletePreviousVersionDatasetsDatasetIdPreviousVersionDeleteResponses];
+
+export type RestorePreviousVersionDatasetsDatasetIdPreviousVersionRestorePostData = {
+    body: RestorePreviousVersionRequest;
+    path: {
+        /**
+         * Dataset Id
+         */
+        dataset_id: string;
+    };
+    query?: never;
+    url: '/datasets/{dataset_id}/previous-version/restore';
+};
+
+export type RestorePreviousVersionDatasetsDatasetIdPreviousVersionRestorePostErrors = {
+    /**
+     * Bad request — invalid payload
+     */
+    400: ProblemDetail;
+    /**
+     * Unauthorized — missing or invalid credentials
+     */
+    401: ProblemDetail;
+    /**
+     * Forbidden — caller lacks write access
+     */
+    403: ProblemDetail;
+    /**
+     * Not found
+     */
+    404: ProblemDetail;
+    /**
+     * Conflict — resource state prevents the operation
+     */
+    409: ProblemDetail;
+    /**
+     * Validation error
+     */
+    422: ProblemDetail;
+    /**
+     * Too many requests — retry after the advertised interval
+     */
+    429: ProblemDetail;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetail;
+    /**
+     * Service unavailable — the database could not serve the request
+     */
+    503: ProblemDetail;
+};
+
+export type RestorePreviousVersionDatasetsDatasetIdPreviousVersionRestorePostError = RestorePreviousVersionDatasetsDatasetIdPreviousVersionRestorePostErrors[keyof RestorePreviousVersionDatasetsDatasetIdPreviousVersionRestorePostErrors];
+
+export type RestorePreviousVersionDatasetsDatasetIdPreviousVersionRestorePostResponses = {
+    /**
+     * Successful Response
+     */
+    202: RestorePreviousVersionResponse;
+};
+
+export type RestorePreviousVersionDatasetsDatasetIdPreviousVersionRestorePostResponse = RestorePreviousVersionDatasetsDatasetIdPreviousVersionRestorePostResponses[keyof RestorePreviousVersionDatasetsDatasetIdPreviousVersionRestorePostResponses];
+
 export type GetQuicklookDatasetsDatasetIdQuicklookGetData = {
     body?: never;
     path: {
@@ -19270,6 +20377,12 @@ export type GetQuicklookDatasetsDatasetIdQuicklookGetData = {
          * Quicklook size in pixels (256 or 512)
          */
         size?: number;
+        /**
+         * V
+         *
+         * The record's `quicklook_version`; it only keys caches and does not change the response.
+         */
+        v?: string | null;
     };
     url: '/datasets/{dataset_id}/quicklook';
 };
@@ -19317,10 +20430,12 @@ export type GetQuicklookDatasetsDatasetIdQuicklookGetError = GetQuicklookDataset
 
 export type GetQuicklookDatasetsDatasetIdQuicklookGetResponses = {
     /**
-     * Successful Response
+     * The quicklook image
      */
-    200: unknown;
+    200: Blob | File;
 };
+
+export type GetQuicklookDatasetsDatasetIdQuicklookGetResponse = GetQuicklookDatasetsDatasetIdQuicklookGetResponses[keyof GetQuicklookDatasetsDatasetIdQuicklookGetResponses];
 
 export type RefreshDatasetDatasetsDatasetIdRefreshPostData = {
     /**
@@ -20325,6 +21440,64 @@ export type SetTargetStatusDatasetsDatasetIdTargetStatusPatchResponses = {
 
 export type SetTargetStatusDatasetsDatasetIdTargetStatusPatchResponse = SetTargetStatusDatasetsDatasetIdTargetStatusPatchResponses[keyof SetTargetStatusDatasetsDatasetIdTargetStatusPatchResponses];
 
+export type GetTilesetFileDatasetsDatasetIdTiles3dPathGetData = {
+    body?: never;
+    path: {
+        /**
+         * Dataset Id
+         */
+        dataset_id: string;
+        /**
+         * Path
+         */
+        path: string;
+    };
+    query?: never;
+    url: '/datasets/{dataset_id}/tiles3d/{path}';
+};
+
+export type GetTilesetFileDatasetsDatasetIdTiles3dPathGetErrors = {
+    /**
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
+     */
+    401: ProblemDetail;
+    /**
+     * Not found
+     */
+    404: ProblemDetail;
+    /**
+     * Precondition failed — the caller's If-Match no longer matches the current representation
+     */
+    412: ProblemDetail;
+    /**
+     * Validation error
+     */
+    422: ProblemDetail;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetail;
+    /**
+     * Bad gateway — an upstream provider failed
+     */
+    502: ProblemDetail;
+    /**
+     * Service unavailable — the database could not serve the request
+     */
+    503: ProblemDetail;
+};
+
+export type GetTilesetFileDatasetsDatasetIdTiles3dPathGetError = GetTilesetFileDatasetsDatasetIdTiles3dPathGetErrors[keyof GetTilesetFileDatasetsDatasetIdTiles3dPathGetErrors];
+
+export type GetTilesetFileDatasetsDatasetIdTiles3dPathGetResponses = {
+    /**
+     * The requested tileset file
+     */
+    200: Blob | File;
+};
+
+export type GetTilesetFileDatasetsDatasetIdTiles3dPathGetResponse = GetTilesetFileDatasetsDatasetIdTiles3dPathGetResponses[keyof GetTilesetFileDatasetsDatasetIdTiles3dPathGetResponses];
+
 export type ValidateDatasetDatasetsDatasetIdValidateGetData = {
     body?: never;
     path: {
@@ -20861,6 +22034,10 @@ export type CommitImportIngestCommitJobIdPostErrors = {
      */
     409: ProblemDetail;
     /**
+     * Payload too large
+     */
+    413: ProblemDetail;
+    /**
      * Validation error
      */
     422: ProblemDetail;
@@ -21076,7 +22253,7 @@ export type PreviewFileIngestPreviewJobIdPostResponses = {
      *
      * Successful Response
      */
-    200: PreviewResponse | RasterPreviewResponse;
+    200: PreviewResponse | RasterPreviewResponse | TilesetPreviewResponse | PointCloudPreviewResponse;
 };
 
 export type PreviewFileIngestPreviewJobIdPostResponse = PreviewFileIngestPreviewJobIdPostResponses[keyof PreviewFileIngestPreviewJobIdPostResponses];
@@ -22404,6 +23581,10 @@ export type ListMapsEndpointMapsGetData = {
          * Visibility
          */
         visibility?: string | null;
+        /**
+         * Owned Only
+         */
+        owned_only?: boolean;
     };
     url: '/maps/';
 };
@@ -22684,10 +23865,12 @@ export type GetMapIconAssetEndpointMapsIconsIconIdAssetGetError = GetMapIconAsse
 
 export type GetMapIconAssetEndpointMapsIconsIconIdAssetGetResponses = {
     /**
-     * Successful Response
+     * The icon image
      */
-    200: unknown;
+    200: Blob | File;
 };
+
+export type GetMapIconAssetEndpointMapsIconsIconIdAssetGetResponse = GetMapIconAssetEndpointMapsIconsIconIdAssetGetResponses[keyof GetMapIconAssetEndpointMapsIconsIconIdAssetGetResponses];
 
 export type ImportMapStyleEndpointMapsImportPostData = {
     body: MapStyleImportRequest;
@@ -22772,7 +23955,7 @@ export type GetSharedMapEndpointMapsSharedTokenGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthorized — missing or invalid credentials
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a valid X-Embed-Token that authorizes the request on its own. That request is served and the unrelated credential is ignored.
      */
     401: ProblemDetail;
     /**
@@ -22909,10 +24092,12 @@ export type GetGeolensSpritePngEndpointMapsSpritesGeolensPngGetError = GetGeolen
 
 export type GetGeolensSpritePngEndpointMapsSpritesGeolensPngGetResponses = {
     /**
-     * Successful Response
+     * The sprite sheet
      */
-    200: unknown;
+    200: Blob | File;
 };
+
+export type GetGeolensSpritePngEndpointMapsSpritesGeolensPngGetResponse = GetGeolensSpritePngEndpointMapsSpritesGeolensPngGetResponses[keyof GetGeolensSpritePngEndpointMapsSpritesGeolensPngGetResponses];
 
 export type DeleteMapEndpointMapsMapIdDeleteData = {
     body?: never;
@@ -23037,6 +24222,68 @@ export type GetMapEndpointMapsMapIdGetResponses = {
 };
 
 export type GetMapEndpointMapsMapIdGetResponse = GetMapEndpointMapsMapIdGetResponses[keyof GetMapEndpointMapsMapIdGetResponses];
+
+export type PatchMapEndpointMapsMapIdPatchData = {
+    body: MapPatch;
+    path: {
+        /**
+         * Map Id
+         */
+        map_id: string;
+    };
+    query?: never;
+    url: '/maps/{map_id}';
+};
+
+export type PatchMapEndpointMapsMapIdPatchErrors = {
+    /**
+     * Bad request — invalid payload
+     */
+    400: ProblemDetail;
+    /**
+     * Unauthorized — missing or invalid credentials
+     */
+    401: ProblemDetail;
+    /**
+     * Forbidden — caller lacks write access
+     */
+    403: ProblemDetail;
+    /**
+     * Not found
+     */
+    404: ProblemDetail;
+    /**
+     * Conflict — resource state prevents the operation
+     */
+    409: ProblemDetail;
+    /**
+     * Validation error
+     */
+    422: ProblemDetail;
+    /**
+     * Too many requests — retry after the advertised interval
+     */
+    429: ProblemDetail;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetail;
+    /**
+     * Service unavailable — the database could not serve the request
+     */
+    503: ProblemDetail;
+};
+
+export type PatchMapEndpointMapsMapIdPatchError = PatchMapEndpointMapsMapIdPatchErrors[keyof PatchMapEndpointMapsMapIdPatchErrors];
+
+export type PatchMapEndpointMapsMapIdPatchResponses = {
+    /**
+     * Successful Response
+     */
+    200: MapResponse;
+};
+
+export type PatchMapEndpointMapsMapIdPatchResponse = PatchMapEndpointMapsMapIdPatchResponses[keyof PatchMapEndpointMapsMapIdPatchResponses];
 
 export type UpdateMapEndpointMapsMapIdPutData = {
     body: MapUpdate;
@@ -23858,10 +25105,12 @@ export type GetOgImageMapsMapIdOgImageGetError = GetOgImageMapsMapIdOgImageGetEr
 
 export type GetOgImageMapsMapIdOgImageGetResponses = {
     /**
-     * Successful Response
+     * The social preview image
      */
-    200: unknown;
+    200: Blob | File;
 };
+
+export type GetOgImageMapsMapIdOgImageGetResponse = GetOgImageMapsMapIdOgImageGetResponses[keyof GetOgImageMapsMapIdOgImageGetResponses];
 
 export type UploadOgImageMapsMapIdOgImagePutData = {
     body: OgImageUploadRequest;
@@ -24301,10 +25550,12 @@ export type GetThumbnailMapsMapIdThumbnailGetError = GetThumbnailMapsMapIdThumbn
 
 export type GetThumbnailMapsMapIdThumbnailGetResponses = {
     /**
-     * Successful Response
+     * The thumbnail image
      */
-    200: unknown;
+    200: Blob | File;
 };
+
+export type GetThumbnailMapsMapIdThumbnailGetResponse = GetThumbnailMapsMapIdThumbnailGetResponses[keyof GetThumbnailMapsMapIdThumbnailGetResponses];
 
 export type UploadThumbnailMapsMapIdThumbnailPutData = {
     body: ThumbnailUploadRequest;
@@ -25572,7 +26823,7 @@ export type SearchDatasetsEndpointSearchDatasetsGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -25680,7 +26931,7 @@ export type SearchFacetsEndpointSearchFacetsGetData = {
 
 export type SearchFacetsEndpointSearchFacetsGetErrors = {
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -26263,6 +27514,67 @@ export type ProbeServiceUrlServicesProbePostResponses = {
 
 export type ProbeServiceUrlServicesProbePostResponse = ProbeServiceUrlServicesProbePostResponses[keyof ProbeServiceUrlServicesProbePostResponses];
 
+export type StacAssetSizesServicesStacAssetSizesPostData = {
+    body: StacAssetSizesRequest;
+    path?: never;
+    query?: never;
+    url: '/services/stac/asset-sizes';
+};
+
+export type StacAssetSizesServicesStacAssetSizesPostErrors = {
+    /**
+     * Bad request — invalid payload
+     */
+    400: ProblemDetail;
+    /**
+     * Unauthorized — missing or invalid credentials
+     */
+    401: ProblemDetail;
+    /**
+     * Forbidden — caller lacks write access
+     */
+    403: ProblemDetail;
+    /**
+     * Not found
+     */
+    404: ProblemDetail;
+    /**
+     * Conflict — resource state prevents the operation
+     */
+    409: ProblemDetail;
+    /**
+     * Validation error
+     */
+    422: ProblemDetail;
+    /**
+     * Too many requests — retry after the advertised interval
+     */
+    429: ProblemDetail;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetail;
+    /**
+     * Service unavailable — the database could not serve the request
+     */
+    503: ProblemDetail;
+    /**
+     * Gateway timeout — an upstream address check ran out of time
+     */
+    504: ProblemDetail;
+};
+
+export type StacAssetSizesServicesStacAssetSizesPostError = StacAssetSizesServicesStacAssetSizesPostErrors[keyof StacAssetSizesServicesStacAssetSizesPostErrors];
+
+export type StacAssetSizesServicesStacAssetSizesPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: StacAssetSizesResponse;
+};
+
+export type StacAssetSizesServicesStacAssetSizesPostResponse = StacAssetSizesServicesStacAssetSizesPostResponses[keyof StacAssetSizesServicesStacAssetSizesPostResponses];
+
 export type StacCollectionsServicesStacCollectionsPostData = {
     body: StacConnectRequest;
     path?: never;
@@ -26524,6 +27836,10 @@ export type UpdateSettingsSettingsPutErrors = {
      */
     404: ProblemDetail;
     /**
+     * Conflict — another embedding change holds the lock
+     */
+    409: ProblemDetail;
+    /**
      * Validation error
      */
     422: ProblemDetail;
@@ -26536,7 +27852,7 @@ export type UpdateSettingsSettingsPutErrors = {
      */
     500: ProblemDetail;
     /**
-     * Service unavailable — the database could not serve the request
+     * Service unavailable — the embedding vector column could not be rebuilt
      */
     503: ProblemDetail;
 };
@@ -27201,6 +28517,10 @@ export type CreateOauthProviderSettingsOauthProvidersPostErrors = {
      */
     404: ProblemDetail;
     /**
+     * Conflict — resource state prevents the operation
+     */
+    409: ProblemDetail;
+    /**
      * Validation error
      */
     422: ProblemDetail;
@@ -27317,6 +28637,10 @@ export type UpdateOauthProviderSettingsOauthProvidersProviderIdPutErrors = {
      */
     404: ProblemDetail;
     /**
+     * Conflict — resource state prevents the operation
+     */
+    409: ProblemDetail;
+    /**
      * Validation error
      */
     422: ProblemDetail;
@@ -27370,6 +28694,10 @@ export type ResetSettingsSettingsResetPostErrors = {
      */
     404: ProblemDetail;
     /**
+     * Conflict — another embedding change holds the lock
+     */
+    409: ProblemDetail;
+    /**
      * Validation error
      */
     422: ProblemDetail;
@@ -27382,7 +28710,7 @@ export type ResetSettingsSettingsResetPostErrors = {
      */
     500: ProblemDetail;
     /**
-     * Service unavailable — the database could not serve the request
+     * Service unavailable — the embedding vector column could not be rebuilt
      */
     503: ProblemDetail;
 };
@@ -27444,7 +28772,7 @@ export type LandingPageStacGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -27485,7 +28813,7 @@ export type GetCollectionsStacCollectionsGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -27531,7 +28859,7 @@ export type GetCollectionStacCollectionsCollectionIdGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -27606,7 +28934,7 @@ export type GetCollectionItemsStacCollectionsCollectionIdItemsGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -27660,7 +28988,7 @@ export type GetCollectionItemStacCollectionsCollectionIdItemsItemIdGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -27743,7 +29071,7 @@ export type GetItemStacItemsItemIdGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -27831,7 +29159,7 @@ export type SearchGetStacSearchGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -27876,7 +29204,7 @@ export type SearchPostStacSearchPostErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -27992,10 +29320,12 @@ export type ClusterTileEndpointTilesClustersTablePathZxyPbfGetError = ClusterTil
 
 export type ClusterTileEndpointTilesClustersTablePathZxyPbfGetResponses = {
     /**
-     * Successful Response
+     * The vector tile
      */
-    200: unknown;
+    200: Blob | File;
 };
+
+export type ClusterTileEndpointTilesClustersTablePathZxyPbfGetResponse = ClusterTileEndpointTilesClustersTablePathZxyPbfGetResponses[keyof ClusterTileEndpointTilesClustersTablePathZxyPbfGetResponses];
 
 export type RasterTileProxyTilesRasterProxyDatasetIdZxyFmtGetData = {
     body?: never;
@@ -28087,10 +29417,12 @@ export type RasterTileProxyTilesRasterProxyDatasetIdZxyFmtGetError = RasterTileP
 
 export type RasterTileProxyTilesRasterProxyDatasetIdZxyFmtGetResponses = {
     /**
-     * Successful Response
+     * The raster tile image
      */
-    200: unknown;
+    200: Blob | File;
 };
+
+export type RasterTileProxyTilesRasterProxyDatasetIdZxyFmtGetResponse = RasterTileProxyTilesRasterProxyDatasetIdZxyFmtGetResponses[keyof RasterTileProxyTilesRasterProxyDatasetIdZxyFmtGetResponses];
 
 export type GetTileTokenTilesTokenDatasetIdGetData = {
     body?: never;
@@ -28110,7 +29442,7 @@ export type GetTileTokenTilesTokenDatasetIdGetErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset.
      */
     401: ProblemDetail;
     /**
@@ -28163,7 +29495,7 @@ export type GetTileTokensBatchTilesTokensPostErrors = {
      */
     400: ProblemDetail;
     /**
-     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a capability that authorizes the request on its own — a valid X-Embed-Token or a valid signed tile template (sig, exp, scope). Those are served and the unrelated credential is ignored.
+     * Unauthenticated — a credential was supplied and could not be resolved (expired, revoked, or malformed). Sending no credential at all is not an error on these operations; they answer anonymously with the public subset. Neither is sending an unresolvable credential alongside a valid X-Embed-Token that authorizes the request on its own. That request is served and the unrelated credential is ignored.
      */
     401: ProblemDetail;
     /**
@@ -28271,7 +29603,9 @@ export type TileEndpointTilesTablePathZxyPbfGetError = TileEndpointTilesTablePat
 
 export type TileEndpointTilesTablePathZxyPbfGetResponses = {
     /**
-     * Successful Response
+     * The vector tile
      */
-    200: unknown;
+    200: Blob | File;
 };
+
+export type TileEndpointTilesTablePathZxyPbfGetResponse = TileEndpointTilesTablePathZxyPbfGetResponses[keyof TileEndpointTilesTablePathZxyPbfGetResponses];
