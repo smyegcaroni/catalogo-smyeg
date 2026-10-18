@@ -6,7 +6,7 @@
 # Dependabot bumps this concrete patch pin. Both backend stages inherit this
 # system layer so they use the same patched runtime libraries.
 # Security invariant: fail closed if the mirror cannot supply fixed Perl.
-FROM python:3.14.7-slim AS backend-system
+FROM python:3.14.8-slim AS backend-system
 
 RUN apt-get update && apt-get upgrade -y --no-install-recommends && \
     apt-get install -y --no-install-recommends \
