@@ -96,7 +96,7 @@ export function VerifyEmailPage() {
         {/* sr-only <h1>: the cards below use CardTitle (a plain <div>), so the
             page would have no level-one heading. */}
         <h1 className="sr-only">{t('verifyEmail.title')}</h1>
-        <GeoLensLogo size="lg" className="justify-center" />
+        <GeoLensLogo size="lg" className="justify-center rounded-xl bg-[#116AAB] px-5 py-4" />
         <p className="text-muted-foreground mt-1 text-sm">
           {t('geospatialDataCatalog')}
         </p>

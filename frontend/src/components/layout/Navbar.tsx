@@ -33,11 +33,11 @@ import { VrtCreateDialog } from '@/components/import/VrtCreateDialog';
 const navLinkClass = ({ isActive }: { isActive: boolean }) =>
   cn(
     'relative inline-flex h-14 items-center px-3 text-sm font-medium transition-colors',
-    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset',
-    'after:pointer-events-none after:absolute after:inset-x-3 after:bottom-0 after:h-0.5 after:bg-primary after:opacity-0 after:transition-opacity',
+    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-inset',
+    'after:pointer-events-none after:absolute after:inset-x-3 after:bottom-0 after:h-0.5 after:bg-white after:opacity-0 after:transition-opacity',
     isActive
-      ? 'text-foreground after:opacity-100'
-      : 'text-muted-foreground hover:text-foreground',
+      ? 'text-white after:opacity-100'
+      : 'text-white/75 hover:text-white',
   );
 
 const mobileNavLinkClass = ({ isActive }: { isActive: boolean }) =>
@@ -73,7 +73,11 @@ function CreateMenu() {
     <>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="sm">
+          <Button
+            variant="outline"
+            size="sm"
+            className="border-white/35 bg-transparent text-white hover:bg-white/15 hover:text-white"
+          >
             <Plus className="h-4 w-4 me-1" />
             {t('create')}
           </Button>
@@ -140,7 +144,12 @@ function UserMenu() {
 
   if (!user) {
     return (
-      <Button variant="outline" size="sm" asChild>
+      <Button
+        variant="outline"
+        size="sm"
+        className="border-white/35 bg-transparent text-white hover:bg-white/15 hover:text-white"
+        asChild
+      >
         <Link to="/login">
           <LogIn className="h-4 w-4 me-1" />
           {tAuth('signIn')}
@@ -157,10 +166,10 @@ function UserMenu() {
         <Button
           variant="ghost"
           size="sm"
-          className="relative h-9 rounded-full ps-1 pe-1 md:pe-2"
+          className="relative h-9 rounded-full ps-1 pe-1 text-white hover:bg-white/15 hover:text-white md:pe-2"
         >
           {initial ? (
-            <span className="flex size-7 items-center justify-center rounded-full bg-primary text-primary-foreground text-xs font-medium">
+            <span className="flex size-7 items-center justify-center rounded-full bg-white text-xs font-medium text-[#116AAB]">
               {initial}
             </span>
           ) : (
@@ -171,7 +180,7 @@ function UserMenu() {
               <span className="hidden max-w-28 truncate text-sm font-medium md:block">
                 {user.username}
               </span>
-              <ChevronDown className="hidden size-4 text-muted-foreground md:block" />
+              <ChevronDown className="hidden size-4 text-white/70 md:block" />
             </>
           )}
           <span className="sr-only">{t('nav.userMenu')}</span>
@@ -278,7 +287,7 @@ function MobileNav() {
           <Button
             variant="ghost"
             size="icon"
-            className="md:hidden"
+            className="text-white hover:bg-white/15 hover:text-white md:hidden"
           >
             <Menu className="h-5 w-5" />
             <span className="sr-only">{t('nav.menu')}</span>
@@ -286,7 +295,9 @@ function MobileNav() {
         </SheetTrigger>
         <SheetContent side="left" className="w-64">
           <SheetHeader>
-            <SheetTitle><GeoLensLogo size="sm" /></SheetTitle>
+            <SheetTitle className="rounded-md bg-[#245C66] p-3 pe-8">
+              <GeoLensLogo size="sm" />
+            </SheetTitle>
             <SheetDescription className="sr-only">{t('nav.navigationMenu')}</SheetDescription>
           </SheetHeader>
           <nav aria-label={t('nav.navigationMenu')} className="flex flex-col gap-1 px-2">
@@ -299,6 +310,24 @@ function MobileNav() {
             <NavLink to="/maps" className={mobileNavLinkClass}>
               {t('nav.maps')}
             </NavLink>
+            <a
+              href="https://visor.caroni.org.ve"
+              target="_blank"
+              rel="noopener noreferrer"
+              className={mobileNavLinkClass({ isActive: false })}
+              onClick={() => setOpen(false)}
+            >
+              Visor
+            </a>
+            <a
+              href="https://caroni.org.ve"
+              target="_blank"
+              rel="noopener noreferrer"
+              className={mobileNavLinkClass({ isActive: false })}
+              onClick={() => setOpen(false)}
+            >
+              Sobre el Proyecto
+            </a>
             {canAccessAdmin && (
               <NavLink to="/admin" className={mobileNavLinkClass}>
                 {t('nav.admin')}
@@ -400,18 +429,23 @@ export function Navbar() {
   const canAccessAdmin = can('manage_users') || can('manage_settings') || settingsAdmin;
 
   return (
-    // Fixed, not sticky, so it shares the admin sidebar's viewport-fixed
-    // positioning context; otherwise macOS elastic overscroll slides a sticky
-    // navbar over the stationary sidebar. AppLayout reserves its height.
-    <header className="fixed inset-x-0 top-0 z-40 border-b bg-background pt-[env(safe-area-inset-top)]">
-      {/* Full-bleed bar; page content keeps its own max-width. */}
+    // Fixed, not sticky, so the navbar shares the viewport-fixed
+    // positioning context of the admin sidebar — otherwise macOS elastic
+    // overscroll slides the sticky navbar over the stationary fixed sidebar.
+    // AppLayout reserves this header's height (h-14 + safe-area) as top padding.
+    <header
+      className="fixed inset-x-0 top-0 z-40 border-b text-white pt-[env(safe-area-inset-top)]"
+      style={{ backgroundColor: '#245C66', borderColor: '#245C66' }}
+    >
+      {/* Full-bleed control bar — page content keeps its own max-width;
+          the frame spans the viewport like the rest of the chrome. */}
       <div className="flex h-14 w-full items-center justify-between gap-4 px-4 sm:px-6">
         <div className="flex min-w-0 items-center gap-4">
           <MobileNav />
-          <Link to="/" aria-label={t('appName')} className="rounded-md hover:text-primary transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">
+          <Link to="/" aria-label={t('appName')} className="rounded-md transition-opacity duration-150 hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-[#245C66]">
             <GeoLensLogo size="sm" />
           </Link>
-          <Separator orientation="vertical" className="hidden md:block h-6" />
+          <Separator orientation="vertical" className="hidden h-6 bg-white/25 md:block" />
           <nav aria-label={t('nav.mainNavigation')} className="hidden h-14 md:flex items-center gap-1">
             <NavLink to="/" end className={navLinkClass}>
               {t('nav.search')}
@@ -422,7 +456,24 @@ export function Navbar() {
             <NavLink to="/maps" className={navLinkClass}>
               {t('nav.maps')}
             </NavLink>
-            {/* Operators also get a top-level entry. */}
+            <a
+              href="https://visor.caroni.org.ve"
+              target="_blank"
+              rel="noopener noreferrer"
+              className={navLinkClass({ isActive: false })}
+            >
+              Visor
+            </a>
+            <a
+              href="https://caroni.org.ve"
+              target="_blank"
+              rel="noopener noreferrer"
+              className={navLinkClass({ isActive: false })}
+            >
+              Sobre el Proyecto
+            </a>
+            {/* Operators get a first-class entry — previously buried in the
+                user dropdown only. */}
             {canAccessAdmin && (
               <NavLink to="/admin" className={navLinkClass}>
                 {t('nav.admin')}

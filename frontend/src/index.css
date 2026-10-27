@@ -46,8 +46,10 @@
   --card-foreground: oklch(0.145 0.005 250);
   --popover: oklch(0.99 0.002 85);
   --popover-foreground: oklch(0.145 0.005 250);
-  --primary: oklch(0.55 0.18 250);
-  --primary-foreground: oklch(0.985 0 0);
+  /* Caroni actions: white on teal, dark text on green hover. */
+  --primary: oklch(0.442150 0.060074 211.143);
+  --primary-hover: oklch(0.654476 0.129281 166.573); /* #1BA97F */
+  --primary-foreground: #ffffff;
   --secondary: oklch(0.97 0.003 85);
   --secondary-foreground: oklch(0.205 0.005 250);
   --muted: oklch(0.97 0.003 85);
@@ -79,10 +81,11 @@
 
 
   /* ─ Map-native surface tones ─
-     Scoped to the LoginPage brand panel's wireframe-globe illustration, not
-     general surfaces; separate from --surface-* so it can be retuned without
-     shifting app chrome. */
-  --map-paper:  oklch(0.95 0.008 85);
+     Intentionally scoped to the LoginPage brand panel's
+     wireframe-globe illustration, not general surfaces. Kept as their own
+     tokens (rather than folded into --surface-*) so the illustration can be
+     retuned without shifting app chrome. */
+  --map-paper:  oklch(0.959 0 0);
   --map-street: oklch(0.82 0.004 85);
   --map-water:  oklch(0.85 0.02 220);
 
@@ -200,8 +203,9 @@
   --card-foreground: oklch(0.985 0 0);
   --popover: oklch(0.22 0.010 250);
   --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.72 0.17 250);
-  --primary-foreground: oklch(0.18 0.008 250);
+  --primary: oklch(0.442150 0.060074 211.143);
+  --primary-hover: oklch(0.654476 0.129281 166.573);
+  --primary-foreground: #ffffff;
   --secondary: oklch(0.269 0.008 250);
   --secondary-foreground: oklch(0.985 0 0);
   --muted: oklch(0.269 0.008 250);
@@ -310,6 +314,7 @@
   --color-popover: var(--popover);
   --color-popover-foreground: var(--popover-foreground);
   --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
   --color-primary-foreground: var(--primary-foreground);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
@@ -791,4 +796,8 @@ div:has(> [data-group-drop-target="true"]) > [id^="folder-group-children"] {
 }
 .story-floating-scroll::-webkit-scrollbar-track {
   background: transparent;
+}
+
+@media (hover: hover) {
+  .hover\:bg-primary-hover:hover { color: #171f28; }
 }

@@ -1,0 +1,81 @@
+services:
+  api:
+    environment:
+      ALLOWED_EMAIL_DOMAINS: ""
+      ANTHROPIC_API_KEY: ""
+      AZURE_STORAGE_ACCOUNT_KEY: ""
+      AZURE_STORAGE_ACCOUNT_URL: ""
+      AZURE_STORAGE_CONNECTION_STRING: ""
+      AZURE_STORAGE_CONTAINER: ""
+      BANNER_TEXT: ""
+      CDN_BASE_URL: ""
+      CORS_ALLOWED_ORIGINS: ""
+      DATABASE_SSL_CA_CERT: ""
+      DCAT_CONTACT_EMAIL: ""
+      EMBEDDING_BASE_URL: ""
+      GEOLENS_EDITION: ""
+      GEOLENS_RUNTIME_DB_ROLE: ""
+      LLM_MODEL: "claude-sonnet-5"
+      NOTIFICATION_ADMIN_EMAIL: ""
+      NOTIFICATION_WEBHOOK_SECRET: ""
+      NOTIFICATION_WEBHOOK_URL: ""
+      OPENAI_BASE_URL: ""
+      OPENAI_MODEL_LIGHT: ""
+      PUBLIC_BASE_URL: ""
+      S3_ACCESS_KEY_ID: ""
+      S3_BUCKET: ""
+      S3_ENDPOINT: ""
+      S3_SECRET_ACCESS_KEY: ""
+      SANDBOX_QUERY_SLOTS: ""
+      TENANT_BASE_DOMAIN: ""
+      TILE_DATABASE_URL_OVERRIDE: ""
+      TILE_SIGNING_SECRET: ""
+    image: geolens-caroni-api:1.27.1-20261027
+  worker:
+    environment:
+      ANTHROPIC_API_KEY: ""
+      AZURE_STORAGE_ACCOUNT_KEY: ""
+      AZURE_STORAGE_ACCOUNT_URL: ""
+      AZURE_STORAGE_CONNECTION_STRING: ""
+      AZURE_STORAGE_CONTAINER: ""
+      DATABASE_SSL_CA_CERT: ""
+      EMBEDDING_BASE_URL: ""
+      GEOLENS_EDITION: ""
+      GEOLENS_RUNTIME_DB_ROLE: ""
+      LLM_MODEL: "claude-sonnet-5"
+      NOTIFICATION_ADMIN_EMAIL: ""
+      NOTIFICATION_WEBHOOK_SECRET: ""
+      NOTIFICATION_WEBHOOK_URL: ""
+      OPENAI_BASE_URL: ""
+      OPENAI_MODEL_LIGHT: ""
+      S3_ACCESS_KEY_ID: ""
+      S3_BUCKET: ""
+      S3_ENDPOINT: ""
+      S3_SECRET_ACCESS_KEY: ""
+      TENANT_BASE_DOMAIN: ""
+      TILE_DATABASE_URL_OVERRIDE: ""
+    image: geolens-caroni-api:1.27.1-20261027
+  migrate:
+    environment:
+      DATABASE_SSL_CA_CERT: ""
+      GEOLENS_EDITION: ""
+      TENANT_BASE_DOMAIN: ""
+      TILE_DATABASE_URL_OVERRIDE: ""
+    image: geolens-caroni-api:1.27.1-20261027
+  frontend:
+    image: geolens-caroni-dev:1.27.1-20261027
+  valkey:
+    profiles: !reset []
+    ports: !reset []
+    volumes: !reset []
+    image: "valkey/valkey:8.1.10-alpine"
+    restart: "unless-stopped"
+    user: "valkey"
+    security_opt: !override ["no-new-privileges:true"]
+    cap_drop: !override ["ALL"]
+    mem_limit: "268435456"
+    command: !override ["valkey-server", "--save", "", "--appendonly", "no", "--maxmemory", "192mb", "--maxmemory-policy", "volatile-ttl"]
+    healthcheck: {"test": ["CMD", "valkey-cli", "ping"], "timeout": "5s", "interval": "10s", "retries": 3, "start_period": "5s"}
+    logging: {"driver": "json-file", "options": {"max-file": "3", "max-size": "50m"}}
+  titiler:
+    image: "ghcr.io/developmentseed/titiler:2.2.1"

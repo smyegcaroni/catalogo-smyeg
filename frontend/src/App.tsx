@@ -13,6 +13,7 @@ import { StoryEmbedError } from '@/components/stories/StoryEmbedError';
 import { SessionExpiredDialog } from '@/components/auth/SessionExpiredDialog';
 import { SessionRestoreNotice } from '@/components/auth/SessionRestoreNotice';
 import { AnalysisJobWatcher } from '@/components/analysis/AnalysisJobWatcher';
+import { PwaInstallPrompt } from '@/components/layout/PwaInstallPrompt';
 import { preload, requires } from '@/lib/route-preload';
 
 const loadLoginPage = () =>
@@ -116,6 +117,7 @@ function RootLayout() {
           unacknowledged drops the notification. The dataset is already in the
           catalog, so that is accepted. */}
       <AnalysisJobWatcher />
+      <PwaInstallPrompt />
       <Suspense fallback={<LoadingState />}>
         <Outlet />
       </Suspense>

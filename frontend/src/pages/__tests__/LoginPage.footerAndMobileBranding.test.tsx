@@ -131,7 +131,9 @@ describe('LoginPage footer and mobile branding (#1852)', () => {
       expect(screen.getByLabelText(/username/i)).toBeInTheDocument();
     });
 
-    const wordmark = screen.getByRole('button', { name: /GeoLens/ });
+    const wordmark = screen.getByRole('button', {
+      name: /Organización de las Naciones Unidas.*Cuenca del Río Caroní/i,
+    });
     await userEvent.click(wordmark);
 
     // A plain Link to="/" would also land on HOME in this test's stub route,

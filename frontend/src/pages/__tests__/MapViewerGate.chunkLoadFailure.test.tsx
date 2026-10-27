@@ -23,7 +23,7 @@ it('keeps the fallback title once the viewer chunk fails to load', async () => {
     { route: '/maps/map-1' },
   );
 
-  await waitFor(() => expect(document.title).toBe('Map - GeoLens'));
+  await waitFor(() => expect(document.title).toBe('Map - Catálogo Geoespacial Cuenca Río Caroní'));
   await screen.findByRole('button', { name: 'Reload page' });
-  expect(document.title).toBe('Map - GeoLens');
+  expect(document.title).toBe('Map - Catálogo Geoespacial Cuenca Río Caroní');
 });

@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useRef, useState } from 'react';
+import { useEffect, useCallback, useState } from 'react';
 import { Link, Navigate, useLocation, useNavigate } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
@@ -19,6 +19,8 @@ import { useEdition } from '@/hooks/use-edition';
 import { isSafeHttpUrl } from '@/lib/safe-http-url';
 import { postSignInPath } from '@/lib/post-sign-in-path';
 import { writeSessionStorage } from '@/lib/storage';
+import catalogBackground from '@/assets/fondo-catalogo.jpg';
+import catalogVideo from '@/assets/video-login.mp4';
 
 function getOAuthErrorMessage(error: string, t: (key: string, opts?: Record<string, string>) => string): string {
   if (error.includes('invalid_grant')) {
@@ -47,136 +49,6 @@ function getOAuthErrorMessage(error: string, t: (key: string, opts?: Record<stri
 /** Session-scoped key that suppresses the landing-first redirect.
  *  Written by the "Browse Catalog" button; cleared when the tab closes. */
 const GUEST_BROWSE_KEY = 'gl-guest-browse';
-
-const GLOBE = { W: 1600, H: 800, cx: 1050, cy: 400, R: 340 } as const;
-const GLOBE_TILT = (23.4 * Math.PI) / 180; // Earth's axial tilt
-
-/** Lat/long lattice on the unit sphere (denser near the equator) that the
- *  rotating dot-globe is drawn from. Static, so build it once at module load. */
-const GLOBE_DOTS: { lat: number; lon: number }[] = [];
-for (let lat = -72; lat <= 72; lat += 18) {
-  const ringR = Math.cos((lat * Math.PI) / 180);
-  const count = Math.max(6, Math.round(20 * ringR));
-  for (let j = 0; j < count; j++) GLOBE_DOTS.push({ lat, lon: (360 / count) * j });
-}
-
-const GLOBE_MERIDIANS = Array.from({ length: 12 }, (_, i) => i * 30); // longitudes (deg)
-const GLOBE_PARALLELS = [-60, -30, 0, 30, 60]; // latitudes (deg)
-
-/** Orthographic projection of a sphere point (lat/lon, radians) onto the panel,
- *  with the polar axis tilted by GLOBE_TILT in the screen plane (Earth-like).
- *  `near` = the point is on the hemisphere facing the viewer. */
-function projectGlobePoint(lat: number, lon: number, cosT: number, sinT: number) {
-  const cosLat = Math.cos(lat);
-  const ox = cosLat * Math.cos(lon); // screen-x before tilt
-  const oz = Math.sin(lat); // pole (screen-y before tilt)
-  const depth = cosLat * Math.sin(lon); // + = near hemisphere
-  return {
-    x: GLOBE.cx + (ox * cosT - oz * sinT) * GLOBE.R,
-    y: GLOBE.cy - (ox * sinT + oz * cosT) * GLOBE.R,
-    near: depth >= 0,
-  };
-}
-
-/** Build an SVG path for the near-hemisphere portion of a sampled great/small
- *  circle — pen lifts whenever the line passes behind the globe. */
-function nearArcPath(samples: [number, number][], cosT: number, sinT: number) {
-  let d = '';
-  let penDown = false;
-  for (const [lat, lon] of samples) {
-    const p = projectGlobePoint(lat, lon, cosT, sinT);
-    if (p.near) {
-      d += `${penDown ? 'L' : 'M'}${p.x.toFixed(1)} ${p.y.toFixed(1)}`;
-      penDown = true;
-    } else {
-      penDown = false;
-    }
-  }
-  return d;
-}
-
-/** Decorative orthographic SVG globe in a fixed pose. */
-function BrandMapBackdrop() {
-  const { W, H, cx, cy, R } = GLOBE;
-  const cosT = Math.cos(GLOBE_TILT);
-  const sinT = Math.sin(GLOBE_TILT);
-  const dotsRef = useRef<SVGGElement>(null);
-  const meridiansRef = useRef<SVGGElement>(null);
-
-  // Parallels are invariant under polar-axis spin, so their arcs are built once.
-  const parallelPaths = GLOBE_PARALLELS.map((latDeg) => {
-    const lat = (latDeg * Math.PI) / 180;
-    const samples: [number, number][] = [];
-    for (let lon = 0; lon <= 360; lon += 6) samples.push([lat, (lon * Math.PI) / 180]);
-    return nearArcPath(samples, cosT, sinT);
-  });
-
-  useEffect(() => {
-    const dots = dotsRef.current?.querySelectorAll('circle');
-    const meridians = meridiansRef.current?.querySelectorAll('path');
-    const render = (spin: number) => {
-      dots?.forEach((el, idx) => {
-        const { lat, lon } = GLOBE_DOTS[idx];
-        const p = projectGlobePoint((lat * Math.PI) / 180, (lon * Math.PI) / 180 + spin, cosT, sinT);
-        el.setAttribute('cx', p.x.toFixed(1));
-        el.setAttribute('cy', p.y.toFixed(1));
-        el.setAttribute('r', p.near ? '2.4' : '1.4');
-        el.setAttribute('opacity', p.near ? '0.34' : '0.1');
-      });
-      meridians?.forEach((el, idx) => {
-        const lon0 = (GLOBE_MERIDIANS[idx] * Math.PI) / 180 + spin;
-        const samples: [number, number][] = [];
-        for (let lat = -90; lat <= 90; lat += 6) samples.push([(lat * Math.PI) / 180, lon0]);
-        el.setAttribute('d', nearArcPath(samples, cosT, sinT));
-      });
-    };
-    // Fixed earth-like pose: a decorative animation that never stops fails WCAG 2.2.2.
-    render(0.7);
-  }, [cosT, sinT]);
-
-  // Faint full-bleed graticule for texture behind the globe.
-  const vGrat: number[] = [];
-  for (let x = 130; x < W; x += 130) vGrat.push(x);
-  const hGrat: number[] = [];
-  for (let y = 90; y < H; y += 110) hGrat.push(y);
-
-  return (
-    <svg
-      className="absolute inset-0 size-full"
-      viewBox={`0 0 ${W} ${H}`}
-      preserveAspectRatio="xMidYMid slice"
-      aria-hidden="true"
-    >
-      <rect width={W} height={H} className="fill-map-paper" />
-      <g className="fill-none stroke-map-street" strokeOpacity={0.16} strokeWidth={0.6}>
-        {vGrat.map((x) => (
-          <line key={`v${x}`} x1={x} y1={0} x2={x} y2={H} />
-        ))}
-        {hGrat.map((y) => (
-          <line key={`h${y}`} x1={0} y1={y} x2={W} y2={y} />
-        ))}
-      </g>
-      {/* Sphere silhouette — a circle under any rotation/tilt (orthographic). */}
-      <circle cx={cx} cy={cy} r={R} className="fill-none stroke-foreground" strokeOpacity={0.18} strokeWidth={1.2} />
-      {/* Graticule: spin-invariant parallels + per-frame meridians (near side). */}
-      <g className="fill-none stroke-foreground" strokeOpacity={0.15} strokeWidth={1}>
-        {parallelPaths.map((d, i) => (
-          <path key={`par${i}`} d={d} />
-        ))}
-      </g>
-      <g ref={meridiansRef} className="fill-none stroke-foreground" strokeOpacity={0.15} strokeWidth={1}>
-        {GLOBE_MERIDIANS.map((_, i) => (
-          <path key={`mer${i}`} />
-        ))}
-      </g>
-      <g ref={dotsRef} className="fill-foreground">
-        {GLOBE_DOTS.map((_, i) => (
-          <circle key={i} r={2} cx={cx} cy={cy} />
-        ))}
-      </g>
-    </svg>
-  );
-}
 
 export function LoginPage() {
   const { t } = useTranslation('auth');
@@ -250,10 +122,25 @@ export function LoginPage() {
     <div className="flex min-h-screen flex-col">
     <main className="grid flex-1 grid-cols-1 min-[880px]:grid-cols-[1.05fr_0.95fr]">
       {/* ───────── LEFT — brand / map panel (hidden ≤880px) ───────── */}
-      <section className="relative hidden overflow-hidden border-e border-border bg-map-paper px-14 py-12 min-[880px]:flex min-[880px]:flex-col min-[880px]:justify-between">
-        <BrandMapBackdrop />
-        {/* Paper scrim keeps the left-aligned text legible over the map. */}
-        <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-map-paper/90 via-map-paper/70 to-map-paper/30" />
+      <section
+        className="relative hidden overflow-hidden border-e border-border bg-cover bg-center px-14 py-12 min-[880px]:flex min-[880px]:flex-col min-[880px]:justify-between"
+        style={{ backgroundImage: `url(${catalogBackground})` }}
+      >
+        <video
+          className="pointer-events-none absolute inset-0 size-full object-cover object-center motion-reduce:hidden"
+          autoPlay
+          loop
+          muted
+          playsInline
+          preload="metadata"
+          poster={catalogBackground}
+          aria-hidden="true"
+        >
+          <source src={catalogVideo} type="video/mp4" />
+        </video>
+
+        {/* The dark scrim preserves text contrast over the moving background. */}
+        <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-black/75 via-black/50 to-black/20" />
 
         <div className="relative z-10 flex h-full flex-col">
           {/* Top — logo lockup + eyebrow */}
@@ -262,33 +149,33 @@ export function LoginPage() {
             <button
               type="button"
               onClick={handleBrowseCatalog}
-              className="inline-flex text-foreground transition-colors hover:text-primary focus-visible:rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              className="inline-flex text-white transition-colors hover:text-white/80 focus-visible:rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-black"
             >
               <GeoLensLogo size="lg" />
             </button>
-            <p className="eyebrow mt-2.5">
+            <p className="eyebrow mt-2.5" style={{ color: '#ffffff' }}>
               {t('geospatialDataCatalog')}
             </p>
           </div>
 
           {/* Middle — hero (optically centered) */}
           <div className="my-auto max-w-[460px] py-8">
-            <h1 className="text-pretty text-4xl font-semibold leading-[1.08] tracking-[-0.025em] text-foreground">
+            <h1 className="text-pretty text-4xl font-semibold leading-[1.08] tracking-[-0.025em] text-white">
               {t('loginHero')}
             </h1>
-            <p className="mt-4 max-w-[400px] text-base leading-[1.55] text-muted-foreground">
+            <p className="mt-4 max-w-[400px] text-base leading-[1.55] text-white/80">
               {t('loginHeroSub')}
             </p>
 
             <div className="mt-8 flex flex-col gap-3.5">
               {features.map(({ Icon, title, desc }) => (
                 <div key={title} className="flex items-start gap-3">
-                  <span className="flex size-[30px] shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                  <span className="flex size-[30px] shrink-0 items-center justify-center rounded-lg bg-white/15 text-white">
                     <Icon className="size-[15px]" />
                   </span>
                   <span className="text-sm">
-                    <span className="block font-semibold text-foreground">{title}</span>
-                    <span className="leading-[1.45] text-muted-foreground">{desc}</span>
+                    <span className="block font-semibold text-white">{title}</span>
+                    <span className="leading-[1.45] text-white/75">{desc}</span>
                   </span>
                 </div>
               ))}
@@ -296,7 +183,7 @@ export function LoginPage() {
           </div>
 
           {/* Bottom — instance footer */}
-          <div className="flex items-center justify-between font-mono text-2xs tracking-[0.04em] text-muted-foreground">
+          <div className="flex items-center justify-between font-mono text-2xs tracking-[0.04em] text-white/70">
             <span>{instanceHost}</span>
             <span>40.7128°N · 74.0060°W</span>
           </div>
@@ -319,7 +206,7 @@ export function LoginPage() {
           {/* Mobile needs its own branding and level-one heading because the
               desktop brand panel and its heading are hidden below 880px. */}
           <div className="mb-6 flex flex-col items-center gap-2 text-center min-[880px]:hidden">
-            <GeoLensLogo size="md" />
+            <GeoLensLogo size="md" className="rounded-xl bg-[#116AAB] px-4 py-3" />
             <h1 className="text-pretty text-lg font-semibold leading-snug tracking-[-0.01em] text-foreground">
               {t('loginHero')}
             </h1>

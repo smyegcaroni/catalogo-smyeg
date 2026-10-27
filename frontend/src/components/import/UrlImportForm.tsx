@@ -609,7 +609,7 @@ export function UrlImportForm({ initialUrl = '' }: { initialUrl?: string }) {
             <button
               type="submit"
               disabled={!url.trim() || !!jobId}
-              className="bg-primary px-4 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+              className="bg-primary px-4 text-xs font-semibold text-primary-foreground hover:bg-primary-hover disabled:opacity-40"
             >
               {t('urlImport.fetch')}
             </button>

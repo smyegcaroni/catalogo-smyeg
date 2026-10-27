@@ -62,7 +62,7 @@ export function RegisterPage() {
         <div className="text-center">
           {/* sr-only <h1>: every render branch needs one for heading nav. */}
           <h1 className="sr-only">{t('createAccount')}</h1>
-          <GeoLensLogo size="lg" className="justify-center" />
+          <GeoLensLogo size="lg" className="justify-center rounded-xl bg-[#116AAB] px-5 py-4" />
           <p className="text-muted-foreground mt-1 text-sm">
             {t('geospatialDataCatalog')}
           </p>
@@ -96,7 +96,7 @@ export function RegisterPage() {
         <div className="text-center">
           {/* sr-only <h1>: every render branch needs one for heading nav. */}
           <h1 className="sr-only">{t('createAccount')}</h1>
-          <GeoLensLogo size="lg" className="justify-center" />
+          <GeoLensLogo size="lg" className="justify-center rounded-xl bg-[#116AAB] px-5 py-4" />
           <p className="text-muted-foreground mt-1 text-sm">
             {t('geospatialDataCatalog')}
           </p>
@@ -127,7 +127,7 @@ export function RegisterPage() {
         {/* sr-only <h1>: the visual brand mark is a logo, but screen-reader
             heading navigation needs a heading. */}
         <h1 className="sr-only">{t('createAccount')}</h1>
-        <GeoLensLogo size="lg" className="justify-center" />
+        <GeoLensLogo size="lg" className="justify-center rounded-xl bg-[#116AAB] px-5 py-4" />
         <p className="text-muted-foreground mt-1 text-sm">
           {t('geospatialDataCatalog')}
         </p>

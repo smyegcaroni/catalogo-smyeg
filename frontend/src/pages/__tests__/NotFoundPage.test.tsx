@@ -23,8 +23,8 @@ describe('NotFoundPage', () => {
     expect(link).toHaveAttribute('href', '/');
   });
 
-  it('sets document.title to "Page not found - GeoLens" (ROUTE-02)', () => {
+  it('sets document.title with the catalog name (ROUTE-02)', () => {
     render(<NotFoundPage />);
-    expect(document.title).toBe('Page not found - GeoLens');
+    expect(document.title).toBe('Page not found - Catálogo Geoespacial Cuenca Río Caroní');
   });
 });
