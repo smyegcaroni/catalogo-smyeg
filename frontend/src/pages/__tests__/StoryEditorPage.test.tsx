@@ -777,7 +777,7 @@ it('shows a details change, and the draft as it is on reopening', async () => {
   await user.type(title, 'Renamed');
   await user.click(screen.getByRole('button', { name: 'Save details' }));
   expect(await screen.findByRole('heading', { name: 'Renamed' })).toBeInTheDocument();
-  expect(document.title).toBe('Editing Renamed - GeoLens');
+  expect(document.title).toBe('Editing Renamed - Catálogo Geoespacial Cuenca Río Caroní');
 
   await user.click(screen.getByRole('link', { name: 'View story' }));
   vi.mocked(getStoryDraft).mockResolvedValue(draft({ title: 'Renamed' }));
