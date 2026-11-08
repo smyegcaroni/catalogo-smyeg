@@ -2,20 +2,78 @@ import {
   classifyApiError,
   describeUploadRefusal,
   translateApiErrorDetail,
-  translateError,
 } from '@/lib/error-map';
 
 describe('API error localization boundary', () => {
+  it.each([
+    ['retention_unsupported_relation', 'errors.retentionUnsupportedRelation', 'needs the dataset\'s data in an ordinary table'],
+    ['retention_has_children', 'errors.retentionHasChildren', 'other tables inherit from'],
+    ['retention_referenced', 'errors.retentionReferenced', 'Remove the foreign key'],
+    ['retention_delete_trigger', 'errors.retentionDeleteTrigger', 'delete trigger'],
+    ['retention_delete_rule', 'errors.retentionDeleteRule', 'DELETE rule'],
+    ['retention_gid_unusable', 'errors.retentionGidUnusable', 'whole-number gid column'],
+    ['retention_not_feature_dataset', 'errors.retentionNotFeatureDataset', 'features have geometry'],
+    ['retention_column_missing', 'errors.retentionColumnMissing', 'The column seen_at no longer exists'],
+    ['retention_column_not_temporal', 'errors.retentionColumnNotTemporal', 'The column seen_at isn\'t a date'],
+    ['retention_column_in_use', 'errors.retentionColumnInUse', 'Retention deletes rows by the column seen_at'],
+  ])('maps the retention refusal %s to its own message', (code, key, text) => {
+    const detail = { code, message: 'English diagnostic', column: 'seen_at' };
+    expect(classifyApiError(detail, 422).key).toBe(key);
+    expect(translateApiErrorDetail(detail, 422)).toContain(text);
+  });
+
+  it.each([
+    ['unsupported_layer_type', 'errors.serviceLayerNoFeatures', 'holds no features'],
+    ['unsupported_geometry', 'errors.serviceGeometryUnsupported', 'multipatch'],
+  ])('maps the service preview refusal %s to its own message', (code, key, text) => {
+    const detail = { code, message: 'English diagnostic' };
+    expect(classifyApiError(detail, 422).key).toBe(key);
+    expect(translateApiErrorDetail(detail, 422)).toContain(text);
+  });
+
   it('maps known backend details to stable keys', () => {
     expect(classifyApiError('Dataset not found', 404)).toEqual({
       key: 'errors.datasetNotFound',
     });
-    expect(translateError('Dataset not found', 404)).toBe('Dataset not found');
   });
 
-  // fix(#1746): the ArcGIS-worded auth-required refusal (ArcGISTokenError
-  // path) previously fell through to the generic 403 "Access denied" because
-  // only the WFS/OGC wording of the same refusal was mapped.
+  it('maps the value label budget refusal to a translated message', () => {
+    const detail = 'Value labels for this dataset are over the 1 MB limit.';
+    expect(classifyApiError(detail, 422)).toEqual({ key: 'errors.valueLabelsTooLarge' });
+    expect(translateApiErrorDetail(detail, 422)).toContain('1 MB');
+  });
+
+  it('tells an owner at the dataset key limit to revoke one first', () => {
+    const detail = 'This dataset already has 100 active keys. Revoke one to create another.';
+    expect(classifyApiError(detail, 409)).toEqual({ key: 'errors.datasetKeyLimit' });
+    expect(translateApiErrorDetail(detail, 409)).toBe(
+      'This dataset already has 100 active write keys. Revoke one to create another.',
+    );
+  });
+
+  it('maps the trust-link refusals to their own keys', () => {
+    expect(classifyApiError({ code: 'device_trust_link_invalid', message: 'x' }, 404)).toEqual({
+      key: 'errors.deviceTrustLinkInvalid',
+    });
+    expect(classifyApiError({ code: 'device_trust_browser_full', message: 'x' }, 409)).toEqual({
+      key: 'errors.deviceTrustBrowserFull',
+    });
+    expect(classifyApiError({ code: 'device_trust_unavailable', message: 'x' }, 409)).toEqual({
+      key: 'errors.deviceTrustUnavailable',
+    });
+  });
+
+  it('names the way back in when sign-in is throttled for an account', () => {
+    const detail = { code: 'login_throttled', message: 'Too many failed sign-ins' };
+    expect(classifyApiError(detail, 429)).toEqual({ key: 'errors.loginThrottled' });
+    expect(translateApiErrorDetail(detail, 429)).toBe(
+      "Too many failed sign-ins for this account. Use a browser you've signed in with before, sign in with SSO, or use an API key for scripts and desktop apps.",
+    );
+  });
+
+  // The ArcGIS-worded auth-required refusal (ArcGISTokenError
+  // path) maps to the same key as the WFS/OGC wording, not the generic 403
+  // "Access denied".
   it('maps the ArcGIS-worded auth-required refusal to the same key as the generic one', () => {
     expect(
       classifyApiError(
@@ -155,7 +213,7 @@ describe('API error localization boundary', () => {
     ).toEqual({ key: 'errors.refreshReviewSuperseded' });
   });
 
-  // fix(#1768): the re-upload commit door returns the SAME `origin_changed`
+  // The re-upload commit door returns the SAME `origin_changed`
   // code as the refresh door with different copy, so the two must land on
   // different keys — a shared key would tell a user replacing a file that a
   // refresh was queued.
@@ -185,7 +243,7 @@ describe('API error localization boundary', () => {
     ).toEqual({ key: 'errors.refreshOriginChanged' });
   });
 
-  // fix(#2031): keyed on the code, so a reworded server sentence still maps.
+  // Keyed on the code, so a reworded server sentence still maps.
   it('maps the re-upload geometry-loss refusal by its code', () => {
     expect(
       classifyApiError(
@@ -198,7 +256,7 @@ describe('API error localization boundary', () => {
     ).toEqual({ key: 'errors.reuploadGeometryLoss' });
   });
 
-  // fix(#2032): a plain 422 detail string, so without the matcher it lands on
+  // A plain 422 detail string, so without the matcher it lands on
   // the generic "values are invalid" and the code the user typed is lost.
   it('maps the commit doors srid_override refusal and keeps the code', () => {
     expect(
@@ -266,8 +324,7 @@ describe('API error localization boundary', () => {
     );
   });
 
-  // Lane A2 (service-auth wave): POST /services/arcgis/signin/'s refusal
-  // taxonomy (plan 2026-09-01-service-auth-PLAN.md section 3.2).
+  // POST /services/arcgis/signin/'s refusal taxonomy.
   it('maps the ArcGIS sign-in refusal taxonomy to distinct static keys', () => {
     expect(
       classifyApiError(
@@ -301,6 +358,15 @@ describe('API error localization boundary', () => {
     ).toEqual({ key: 'errors.couldNotReachService' });
   });
 
+  it('maps the unrecognized-service probe refusal to its own key', () => {
+    expect(
+      classifyApiError(
+        "Couldn't detect service type. Supported: WFS, ArcGIS Feature Service, and OGC API Features",
+        400,
+      ),
+    ).toEqual({ key: 'errors.serviceNotRecognized' });
+  });
+
   it('falls back the ArcGIS sign-in rate limit to the generic 429 key, unmapped by code', () => {
     // rate_limited carries no dedicated entry: the object branch falls
     // through to its message, which in turn falls through to the generic
@@ -313,8 +379,7 @@ describe('API error localization boundary', () => {
     ).toEqual({ key: 'errors.rateLimited' });
   });
 
-  // fix(service-auth wave, lane A1 contract update, head 85c5fc282): the
-  // limiter's own message names the ArcGIS account, not GeoLens or the
+  // The limiter's own message names the ArcGIS account, not GeoLens or the
   // portal (the limit is keyed on the target account: three attempts per
   // fifteen minutes per ArcGIS account shared across all GeoLens users,
   // plus three per GeoLens user and portal). The fallback below does not
@@ -333,7 +398,6 @@ describe('API error localization boundary', () => {
     ).toEqual({ key: 'errors.rateLimited' });
   });
 
-  // fix(service-auth wave, lane A1 contract update, head 85c5fc282):
   // arcgis_signin_in_progress replaced a 429 rate_limited response for the
   // same-account-concurrency case (one ArcGIS sign-in per account at a
   // time, distinct from the attempt-count limiter above).
@@ -350,7 +414,6 @@ describe('API error localization boundary', () => {
     ).toEqual({ key: 'errors.arcgisSigninInProgress' });
   });
 
-  // fix(service-auth wave, lane A1 contract update, head 85c5fc282):
   // arcgis_portal_not_https is a 422 with the SAME structured
   // {code, message, field} shape as the rest of this taxonomy, not
   // FastAPI's list-shaped validation 422 handled by validationDescriptor,
@@ -369,7 +432,20 @@ describe('API error localization boundary', () => {
     ).toEqual({ key: 'errors.arcgisPortalNotHttps' });
   });
 
-  // fix(service-auth wave, post-merge rebase onto #1758): the sixth and
+  it('maps credential_over_http to its own key', () => {
+    expect(
+      classifyApiError(
+        {
+          code: 'credential_over_http',
+          message: 'This service address uses plain HTTP.',
+          field: 'url',
+        },
+        422,
+      ),
+    ).toEqual({ key: 'errors.credentialOverHttp' });
+  });
+
+  // The sixth and
   // final caller-facing code (backend/app/modules/catalog/sources/
   // arcgis_signin.py, HOST_INVALID), a 422 for a portal hostname that
   // cannot be canonicalized, anchored to the same field: 'url' as
@@ -396,7 +472,7 @@ describe('API error localization boundary', () => {
     ).toBe(
       "This dataset's stored source URL failed a safety check and can't be refreshed automatically. Contact an administrator.",
     );
-    // fix(#1332): the STAC door words the same refusal around its item URL.
+    // The STAC door words the same refusal around its item URL.
     expect(
       translateApiErrorDetail(
         "This dataset's stored STAC item URL is not reachable: DNS resolved to a private address",
@@ -591,7 +667,7 @@ describe('API error localization boundary', () => {
     expect(rendered).toContain('Credentialed requests');
   });
 
-  it('fix(#774): maps the four analysis 4xx literals #718 missed', () => {
+  it('maps the four analysis 4xx literals the first mapping pass missed', () => {
     expect(
       classifyApiError(
         'An analysis job is already running; wait for it to finish',
@@ -612,9 +688,22 @@ describe('API error localization boundary', () => {
     });
   });
 
-  // fix(#790): the sandbox advisory lock is shared between analysis previews
-  // and AI chat data queries. Unmapped, this 429 collapsed to the generic
-  // rate-limit fallback, so a busy chat query refused an analysis preview
+  it('maps the refresh hint on an unknown write column and leaves the plain refusal generic', () => {
+    const hint =
+      "Unknown property columns: notes, tag. notes, tag exists in the table but not in GeoLens's column list; refresh the dataset to pick it up.";
+    expect(classifyApiError(hint, 400)).toEqual({
+      key: 'errors.columnsNeedRefresh',
+      values: { columns: 'notes, tag' },
+    });
+    expect(translateApiErrorDetail(hint, 400)).toContain('notes, tag');
+    expect(classifyApiError('Unknown property columns: notes, tag', 400).key).not.toBe(
+      'errors.columnsNeedRefresh',
+    );
+  });
+
+  // The sandbox advisory lock is shared between analysis previews
+  // and AI chat data queries. Unmapped, this 429 collapses to the generic
+  // rate-limit fallback, so a busy chat query refuses an analysis preview
   // without ever naming the feature holding the shared budget.
   it('names the other feature when the shared query lock refuses a preview', () => {
     expect(
@@ -634,7 +723,7 @@ describe('API error localization boundary', () => {
     ).toBe('The submitted values are invalid.');
   });
 
-  // fix(#931): the backend names the offending maps precisely so a human can go
+  // The backend names the offending maps precisely so a human can go
   // and fix them; unmapped, that list fell through to the generic 422 string.
   it('surfaces the maps a visibility change would strand', () => {
     expect(
@@ -654,7 +743,25 @@ describe('API error localization boundary', () => {
     ).toContain('Flood Risk');
   });
 
-  // fix(#931 codex r5): `MapCreate.name` is length-bounded and NFC-normalized,
+  it('surfaces the maps an unpublish would strand', () => {
+    expect(
+      classifyApiError(
+        'Cannot unpublish: dataset is used in shared maps: Flood Risk, Parcels 2026',
+        422,
+      ),
+    ).toEqual({
+      key: 'errors.datasetUnpublishBlockedByMaps',
+      values: { maps: 'Flood Risk, Parcels 2026' },
+    });
+    expect(
+      translateApiErrorDetail(
+        'Cannot unpublish: dataset is used in shared maps: Flood Risk',
+        422,
+      ),
+    ).toContain('Flood Risk');
+  });
+
+  // `MapCreate.name` is length-bounded and NFC-normalized,
   // nothing more, so a newline in a map name is valid input. Without the `s`
   // flag `.` stopped at it and the whole list fell back to the generic 422 —
   // losing exactly the part that makes the refusal actionable.
@@ -681,7 +788,7 @@ describe('API error localization boundary', () => {
       ),
     ).toBe('These layers were not found in the uploaded file: roads, rivers.');
   });
-  // fix(#1548 review P2): the embed domain-lock refusal. Both compose files
+  // The embed domain-lock refusal. Both compose files
   // ship PUBLIC_APP_URL defaulted to localhost, so a self-hoster reached at a
   // real hostname hits this on a stock install — and its whole value is the
   // remediation. Unmapped it collapses to the generic 422 and the domain lock
@@ -792,5 +899,37 @@ describe('describeUploadRefusal', () => {
     };
 
     expect(translateApiErrorDetail(detail, 413)).not.toContain('{{');
+  });
+
+  it.each([
+    [
+      "This VRT would reach people who cannot see all of its source datasets. Narrow the VRT's visibility or use sources its audience can see.",
+      422,
+      'A VRT dataset would reach people',
+    ],
+    ["A group named 'Planning' already exists", 409, 'A group named "Planning" already exists'],
+    ['Group not found', 404, 'Group not found'],
+  ])('gives the group refusal %j a readable message', (detail, status, text) => {
+    expect(translateApiErrorDetail(detail, status)).toContain(text);
+  });
+});
+
+describe('story write refusals', () => {
+  it.each([
+    [{ code: 'scenes_unreadable', message: 'x' }, 409, "Some scenes were saved by a newer version of GeoLens and can't be published here."],
+    [{ code: 'visibility_unsupported', message: "Stories can't be published as restricted yet." }, 409, "Stories can't be published with this visibility yet."],
+    ['Another change to this story is in progress. Retry shortly.', 409, 'Another change to this story is in progress. Try again in a moment.'],
+    ["This story was saved by a newer version of GeoLens and can't be changed here.", 409, "This story was saved by a newer version of GeoLens and can't be changed here."],
+    ['Story not found', 404, 'Story not found.'],
+    [{ code: 'story_image_too_large', message: 'JPEG images can be at most 15,000 pixels on a side.' }, 413, 'This image is too large. Upload a file under 50 MB with fewer pixels.'],
+    [{ code: 'story_image_unsupported', message: 'x' }, 415, 'Only PNG, JPEG and WebP images can be uploaded.'],
+    [{ code: 'story_image_unreadable', message: 'x' }, 400, "The file isn't a readable image."],
+    [{ code: 'story_image_busy', message: 'x' }, 503, 'Other images are being processed. Try again in a moment.'],
+    [{ code: 'story_image_missing', message: 'x' }, 422, 'No image was sent. Choose a file and try again.'],
+    [{ code: 'story_asset_limit', message: 'x' }, 409, 'This story already holds its most images: 200, or 250 MB of them.'],
+    [{ code: 'story_asset_owner_limit', message: 'x' }, 409, 'Your stories already hold the most image storage an admin allows. Remove images from your stories, or ask an admin to raise the limit.'],
+    [{ code: 'story_assets_not_found', message: 'x', asset_ids: [] }, 422, "Some images in this story weren't found. Remove those image blocks and save again."],
+  ])('localizes %j', (detail, status, expected) => {
+    expect(translateApiErrorDetail(detail, status)).toBe(expected);
   });
 });

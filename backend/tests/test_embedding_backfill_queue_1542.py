@@ -138,7 +138,7 @@ async def _stale_job(
         created_at=old,
         started_at=old if status == "running" else None,
         heartbeat_at=old if status == "running" else None,
-        # fix(#1744): both rows describe work that was dispatched and then
+        # Both rows describe work that was dispatched and then
         # orphaned, which is the class this sweep settles `failed`. Without
         # the stamp the pending half reads them as uploads nobody committed
         # and cancels them, and the non-vacuity assertions below would be
@@ -231,8 +231,8 @@ async def test_enqueue_returns_promptly_instead_of_waiting_for_the_run(
 ):
     """The request must answer before the run's first observable side effect.
 
-    fix(#1778): this used to assert ``elapsed < 1.0`` against a 2s mock sleep
-    — a wall-clock race a loaded CI runner can lose on ordinary scheduling
+    Asserting ``elapsed < 1.0`` against a 2s mock sleep would be a wall-clock
+    race a loaded CI runner can lose on ordinary scheduling
     noise that has nothing to do with whether the backfill ran inline. The
     property under test is an ORDER, not a duration, so it is proven with an
     event instead: ``backfill_started`` is set at the very top of the mock,
@@ -448,8 +448,8 @@ async def test_a_dead_workers_run_holds_the_slot_until_the_sweeper_settles_it(
 ):
     """A stale heartbeat is not proof the old worker is gone.
 
-    fix(#1542 review P1): an earlier revision admitted a new run as soon as the
-    lease lapsed. That cannot be expressed as a partial unique index — the
+    Admitting a new run as soon as the lease lapses cannot be expressed as a
+    partial unique index — the
     predicate has to be immutable, so it cannot consult `now()` — and for a
     force run, "we have not heard from the worker" is the wrong evidence on
     which to start a second DELETE of every embedding. The slot is released by
@@ -485,7 +485,7 @@ async def test_a_failed_run_marks_the_job_failed_without_leaking_the_error(
     test_db_session: AsyncSession,
     monkeypatch,
 ):
-    """RES-2 survives the move: the provider's error text stays in the log."""
+    """The error-text redaction survives the move: the provider's error text stays in the log."""
     secret = "provider-secret-token=do-not-expose"
 
     async def _explode(session, *, force=False, should_continue=None, on_progress=None):
@@ -1193,7 +1193,7 @@ async def test_a_partly_failed_run_still_completes(
 
 
 # ---------------------------------------------------------------------------
-# One guarded terminal exit (#1550 review round 3)
+# One guarded terminal exit
 # ---------------------------------------------------------------------------
 #
 # This class of defect was fixed four times — the dispatch failure, the lost
@@ -1331,7 +1331,7 @@ async def test_a_late_cancellation_does_not_contradict_a_committed_success(
 
 
 # ---------------------------------------------------------------------------
-# Recovery observes the row, it does not infer from the fence (#1550 round 4)
+# Recovery observes the row, it does not infer from the fence
 # ---------------------------------------------------------------------------
 #
 # In-process state cannot describe what the database did. "My fenced update
@@ -2301,9 +2301,9 @@ async def test_an_unacknowledged_creation_commit_does_not_leave_the_slot_held(
     """The commit applies, its acknowledgement is lost, the request unwinds.
 
     A durable `pending` row and a durable `requested` entry, with no worker
-    queued and no dispatch arm reached — the shape #1550 fixed one statement
-    later in the same handler. fix(#1556 review): a shutdown and a dropped
-    connection leave the same row, so both take the same recovery.
+    queued and no dispatch arm reached — the same shape as one statement
+    later in the same handler. A shutdown and a dropped connection leave the
+    same row, so both take the same recovery.
     """
     monkeypatch.setattr(backfill_module, "backfill_embeddings", AsyncMock())
 
@@ -2368,9 +2368,9 @@ async def test_a_failed_startup_read_settles_the_row_it_could_not_read(
 ):
     """The worker's opening read is the run's other unguarded commit-adjacent await.
 
-    With `retry=0` the delivery is not replayed, so a read that raises used to
+    With `retry=0` the delivery is not replayed, so a read that raises would
     end the task with the row still `pending` and no actor left to settle it.
-    fix(#1556 review): a shutdown here is a start failure, not a cancelled run
+    A shutdown here is a start failure, not a cancelled run
     — there is no heartbeat handle, so nothing past the claim can have run.
     """
     monkeypatch.setattr(backfill_module, "backfill_embeddings", AsyncMock())

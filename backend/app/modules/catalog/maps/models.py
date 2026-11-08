@@ -25,10 +25,10 @@ class Map(Base):
     __tablename__ = "maps"
     __table_args__ = (
         CheckConstraint(
-            "visibility IN ('private', 'public', 'internal')",
+            "visibility IN ('private', 'public', 'internal', 'restricted')",
             name="chk_maps_visibility",
         ),
-        # Trigram GIN indexes (migration 0010 H-07), declared here so
+        # Trigram GIN indexes (migration 0010), declared here so
         # alembic-check sees them. `postgresql_ops` sits outside the
         # expression so alembic's index compare can match it.
         Index(
@@ -48,9 +48,8 @@ class Map(Base):
             "forked_from",
             postgresql_where=text("forked_from IS NOT NULL"),
         ),
-        # No composite Map.visibility + created_by index; db-audit M-18
-        # suggested one, but EXPLAIN showed no seq scan below ~10k rows; the
-        # write + disk cost isn't worth it until row count crosses that.
+        # No composite Map.visibility + created_by index: EXPLAIN showed no seq
+        # scan below ~10k rows, so its write and disk cost isn't worth it yet.
         {"schema": "catalog"},
     )
 
@@ -84,7 +83,7 @@ class Map(Base):
     # Active plugin IDs (null = use client defaults, [] = no plugins)
     plugins: Mapped[list | None] = mapped_column(JSONB, nullable=True, default=None)
 
-    # Custom map-level legend title (null = no override). ENH-06. Can't reuse
+    # Custom map-level legend title (null = no override). Can't reuse
     # `plugins` (holds enabled plugin IDs) or the basemap/terrain JSONB blobs
     # (extra="forbid"-validated), so this needs its own nullable column.
     legend_title: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -92,6 +91,17 @@ class Map(Base):
     # Map-level terrain configuration (null = terrain disabled/unconfigured)
     terrain_config: Mapped[dict | None] = mapped_column(
         JSONB, nullable=True, default=None
+    )
+
+    # Widgets on the map's layers, validated by maps/dashboard.py (null = none)
+    dashboard_config: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, default=None
+    )
+
+    # Whether viewers offer the layers' attribute tables; embed tokens may page
+    # rows only while it is on.
+    show_attribute_table: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
     )
 
     # Visibility
@@ -102,15 +112,15 @@ class Map(Base):
     # Preview thumbnail — storage key (e.g. "maps/thumbnails/{id}.jpg")
     thumbnail_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # fix(#1005): thumbnail's own cache version, split from `updated_at`
-    # — a lazy backfill (a read, not an edit) shouldn't bump the edit
-    # timestamp. Nullable; frontend falls back to `updated_at` for old rows.
+    # The thumbnail's own cache version, apart from `updated_at`: a lazy
+    # backfill (a read, not an edit) shouldn't bump the edit timestamp.
+    # Nullable; the frontend falls back to `updated_at` for old rows.
     thumbnail_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
     # OG/social-card image key. Separate from thumbnail_uri: the OG image is
-    # 1200x630 and exceeds the 100KB thumbnail cap (SHARE-08).
+    # 1200x630 and exceeds the 100KB thumbnail cap.
     og_image_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Lineage (fork tracking)
@@ -122,7 +132,7 @@ class Map(Base):
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("catalog.users.id", ondelete="SET NULL"), nullable=True, index=True
     )
-    # TSEAM-01 (Phase 1207): dormant tenant_id — nullable, no FK enforcement.
+    # Dormant tenant_id: nullable, no FK enforcement.
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
@@ -217,6 +227,38 @@ class MapEditHistoryEvent(Base):
     )
 
 
+class MapGroupGrant(Base):
+    """A sharing group that may read a ``restricted`` map."""
+
+    __tablename__ = "map_group_grants"
+    __table_args__ = (
+        Index("ix_map_group_grants_group_id", "group_id"),
+        Index(
+            "ix_map_group_grants_granted_by",
+            "granted_by",
+            postgresql_where=text("granted_by IS NOT NULL"),
+        ),
+        {"schema": "catalog"},
+    )
+
+    map_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("catalog.maps.id", ondelete="CASCADE"), primary_key=True
+    )
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("catalog.groups.id", ondelete="CASCADE"), primary_key=True
+    )
+    granted_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("catalog.users.id", ondelete="SET NULL"), nullable=True
+    )
+    # Derived from the map by trigger, which also refuses another tenant's group.
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class MapShareToken(Base):
     __tablename__ = "map_share_tokens"
     __table_args__ = (
@@ -266,9 +308,7 @@ class MapIconAsset(Base):
         primary_key=True, server_default=func.gen_random_uuid()
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    # db-audit #529 BLOAT-1: no index=True — uq_map_icon_assets_slug's
-    # backing index already covers slug lookups; a second btree was pure
-    # write amplification.
+    # No index=True: uq_map_icon_assets_slug's index already covers slug lookups.
     slug: Mapped[str] = mapped_column(String(255), nullable=False)
     media_type: Mapped[str] = mapped_column(String(50), nullable=False)
     storage_key: Mapped[str] = mapped_column(Text, nullable=False)

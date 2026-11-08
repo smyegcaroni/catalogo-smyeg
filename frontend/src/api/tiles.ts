@@ -1,6 +1,4 @@
-import { apiFetch, safeFetch } from '@/api/client';
-import { API_BASE } from '@/lib/constants';
-import { translateApiErrorDetail } from '@/lib/error-map';
+import { apiFetch } from '@/api/client';
 
 export type VectorTileToken = {
   kind: 'vector';
@@ -8,6 +6,7 @@ export type VectorTileToken = {
   exp: number;
   scope: string;
   expires_in: number;
+  tile_url_template: string | null;
 };
 
 /** An exact mirror of the API's RasterTileToken. Every field is required,
@@ -15,7 +14,7 @@ export type VectorTileToken = {
  * pins that against `openapi.json` in both directions. */
 export type RasterTileToken = {
   kind: 'raster';
-  /** fix(#688): arrives with `?sig=&exp=&scope=` already in it. MapLibre issues
+  /** Arrives with `?sig=&exp=&scope=` already in it. MapLibre issues
    * the tile image requests itself and attaches no header, so the template has
    * to be self-sufficient for a client that cannot use `setTransformRequest`. */
   tile_url: string;
@@ -32,13 +31,11 @@ export type RasterTileToken = {
 
 /** The same shape MINUS the signature, built locally rather than fetched.
  *
- * fix(#688): `rasterTokenFromLayer` (layer-description.ts) assembles this from a saved
- * layer row, which has no signature and cannot have one — the in-app map
- * authenticates with a bearer token through `setTransformRequest` instead. It
- * is a separate type rather than four optional fields on `RasterTileToken`
- * because that type is a contract mirror: marking a field optional there would
- * claim the API might omit it, which is the silent-undefined seed the drift
- * test exists to catch. Consumers that accept either take the union. */
+ * `rasterTokenFromLayer` (layer-description.ts) assembles this from a saved
+ * layer row, which has no signature; the in-app map authenticates with a bearer
+ * token through `setTransformRequest`. It is a separate type because
+ * `RasterTileToken` is a contract mirror: an optional field there would claim
+ * the API might omit it. Consumers that accept either take the union. */
 export type UnsignedRasterTileTemplate = Omit<
   RasterTileToken,
   'sig' | 'exp' | 'scope' | 'expires_in'
@@ -46,11 +43,9 @@ export type UnsignedRasterTileTemplate = Omit<
 
 export type TileToken = VectorTileToken | RasterTileToken;
 
-/**
- * Fetch a signed tile token for a dataset using JWT auth (via apiFetch).
- */
+/** Fetch a signed tile token for a dataset using JWT auth (via apiFetch). */
 export function getTileToken(datasetId: string): Promise<TileToken> {
-  return apiFetch<TileToken>(`/tiles/token/${datasetId}/`);
+  return apiFetch<TileToken>(`/tiles/token/${encodeURIComponent(datasetId)}/`);
 }
 
 /** Error entry returned by the batch endpoint when a single dataset fails. */
@@ -61,36 +56,13 @@ export type TileTokenBatchResponse = {
 };
 
 /**
- * Batch-fetch tile tokens for multiple datasets (PERF-N5). Replaces the
- * N+1 parallel requests the builder previously fired on every map load.
- * Errors for individual datasets are returned as ``{ error: string }``
- * values in the ``tokens`` map; the overall call still resolves.
+ * Batch-fetch tile tokens for multiple datasets. Errors for individual datasets
+ * are returned as `{ error: string }` values in the `tokens` map; the overall
+ * call still resolves. Embed viewers pass their X-Embed-Token so scoped datasets
+ * mint the same tile/DEM descriptors an authenticated viewer would get.
  */
-// fix(#394) SH-04: embed viewers pass their X-Embed-Token so scoped datasets
-// mint the same tile/DEM descriptors an authenticated viewer would get.
-export function getTileTokensBatch(datasetIds: string[], apiKey?: string, embedToken?: string): Promise<TileTokenBatchResponse> {
+export function getTileTokensBatch(datasetIds: string[], embedToken?: string): Promise<TileTokenBatchResponse> {
   const embedHeader: Record<string, string> = embedToken ? { 'X-Embed-Token': embedToken } : {};
-  if (apiKey) {
-    // fix(#438): DATA-11 — the API-key branch used a bare `fetch()`, so a
-    // network failure surfaced as a raw `TypeError` while the JWT branch below
-    // (via apiFetch → safeFetch) yielded a normalized status-0 ApiError.
-    // safeFetch gives both branches the same error shape.
-    return safeFetch(`${API_BASE}/tiles/tokens/`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Api-Key': apiKey, ...embedHeader },
-      body: JSON.stringify({ dataset_ids: datasetIds }),
-    }).then(async (res) => {
-      if (!res.ok) {
-        let detail: unknown;
-        try {
-          const body = await res.json();
-          detail = body.detail;
-        } catch { /* not JSON */ }
-        throw new Error(translateApiErrorDetail(detail, res.status));
-      }
-      return res.json() as Promise<TileTokenBatchResponse>;
-    });
-  }
   return apiFetch<TileTokenBatchResponse>('/tiles/tokens/', {
     method: 'POST',
     headers: embedHeader,

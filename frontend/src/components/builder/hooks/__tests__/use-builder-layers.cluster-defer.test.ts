@@ -40,10 +40,10 @@ function makeLayer(overrides: Partial<MapLayerResponse> = {}): MapLayerResponse 
   });
 }
 
-function makeLoadedMapStub(existingLayerIds: string[] = []): MaplibreMap {
+function makeLoadedMapStub(existingLayerIds: string[] = [], styleLoaded = true): MaplibreMap {
   const existing = new Set(existingLayerIds);
   return {
-    isStyleLoaded: vi.fn(() => true),
+    isStyleLoaded: vi.fn(() => styleLoaded),
     getLayer: vi.fn((id: string) => (existing.has(id) ? { id } : undefined)),
     getSource: vi.fn(() => ({ tiles: ['/tiles/mock/{z}/{x}/{y}.pbf'] })),
     addSource: vi.fn(),
@@ -72,7 +72,7 @@ function renderBuilderLayersHook(
 ) {
   const addLayerMutation = { mutate: vi.fn() } as unknown as Parameters<typeof useBuilderLayers>[3];
   const removeLayerMutation = { mutate: vi.fn() } as unknown as Parameters<typeof useBuilderLayers>[4];
-  // fix(#392): 6th positional param bridging into useBuilderSave's Save-diff baseline.
+  // 6th positional param bridging into useBuilderSave's Save-diff baseline.
   const saveBaselineSyncRef = { current: { add: () => {}, remove: () => {} } } as unknown as Parameters<typeof useBuilderLayers>[5];
   return renderHook(() =>
     useBuilderLayers(mapData, mapRef, 'map-cluster', addLayerMutation, removeLayerMutation, saveBaselineSyncRef),
@@ -84,24 +84,27 @@ describe('render-mode switch — cluster transitions defer to reactive sync', ()
     vi.clearAllMocks();
   });
 
-  it('entering cluster does NOT imperatively add a layer (deferred to syncMapComposition)', () => {
+  // isStyleLoaded() is also false while tiles reload, e.g. after a same-tick filter edit.
+  it.each([true, false])('entering cluster does NOT imperatively add a layer (style loaded: %s)', (styleLoaded) => {
     const layer = makeLayer();
     const mapData = makeBuilderMap([layer]);
-    const mapStub = makeLoadedMapStub([`layer-${LAYER_ID}`]);
+    const mapStub = makeLoadedMapStub([`layer-${LAYER_ID}`], styleLoaded);
     const mapRef = { current: mapStub } as React.RefObject<MaplibreMap | null>;
 
     const { result } = renderBuilderLayersHook(mapData, mapRef);
 
     act(() => {
-      result.current.handleRenderModeChange(LAYER_ID, 'cluster');
+      result.current.handleRenderAsChange(LAYER_ID, 'cluster');
     });
 
     // The crash was an imperative addLayer against a not-yet-created cluster
     // source. The reactive sync owns the ADD now → no imperative addLayer here…
     expect(mapStub.addLayer).not.toHaveBeenCalled();
     // …but the old layer graph MUST be torn down first, or the reconciler skips
-    // re-adding the (now cluster) layer because its id still exists (Codex #351).
+    // re-adding the (now cluster) layer because its id still exists. Left for
+    // `idle`, the teardown could land after the reactive sync redraws it.
     expect(mapStub.removeLayer).toHaveBeenCalledWith(`layer-${LAYER_ID}`);
+    expect(mapStub.once).not.toHaveBeenCalledWith('idle', expect.any(Function));
   });
 
   it('leaving cluster (→ points) also defers — no imperative addLayer', () => {
@@ -115,7 +118,7 @@ describe('render-mode switch — cluster transitions defer to reactive sync', ()
     const { result } = renderBuilderLayersHook(mapData, mapRef);
 
     act(() => {
-      result.current.handleRenderModeChange(LAYER_ID, 'points');
+      result.current.handleRenderAsChange(LAYER_ID, 'point');
     });
 
     expect(mapStub.addLayer).not.toHaveBeenCalled();
@@ -131,7 +134,7 @@ describe('render-mode switch — cluster transitions defer to reactive sync', ()
     const { result } = renderBuilderLayersHook(mapData, mapRef);
 
     act(() => {
-      result.current.handleRenderModeChange(LAYER_ID, 'heatmap');
+      result.current.handleRenderAsChange(LAYER_ID, 'heatmap');
     });
 
     // Heatmap stays on the shared source, so the imperative swap is safe + used.

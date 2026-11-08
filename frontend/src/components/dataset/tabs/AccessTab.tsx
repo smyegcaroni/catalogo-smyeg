@@ -6,6 +6,7 @@ import { toast } from 'sonner';
 import { useDatasetAccessEndpoints } from '@/components/dataset/hooks/use-dataset-access';
 import { useDistributions } from '@/components/dataset/hooks/use-records';
 import { useUpdateDataset } from '@/components/dataset/hooks/use-dataset';
+import { usePermissions } from '@/hooks/use-permissions';
 import { useCanSetPublicVisibility } from '@/hooks/use-settings';
 import { listKeywords } from '@/api/records';
 import type { DatasetResponse, DatasetVisibility } from '@/types/api';
@@ -19,9 +20,9 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
 import {
   Select,
   SelectContent,
@@ -33,10 +34,13 @@ import { formatMutationError } from '@/lib/error-map';
 import { visibilityColors } from '@/lib/status-colors';
 import { VisibilityIcon } from '@/components/maps/VisibilityIcon';
 import { getVisibilityLabel } from '@/i18n/labels';
+import { CopyButton } from '@/components/ui/copy-button';
+import { URL_CHIP_CLASS } from '@/components/dataset/url-chip';
 import { DistributionsList } from '@/components/dataset/DistributionsList';
-import { ExportButton } from '@/components/dataset/ExportButton';
 import { TilesetAccess } from '@/components/dataset/TilesetAccess';
 import { PointCloudAccess } from '@/components/dataset/PointCloudAccess';
+import { DatasetWriteKeys } from '@/components/dataset/DatasetWriteKeys';
+import { DatasetGroupShare } from '@/components/dataset/DatasetGroupShare';
 import { recordTypeCapabilities } from '@/lib/record-types';
 import { cn } from '@/lib/utils';
 
@@ -56,21 +60,23 @@ interface AccessTabProps {
   /** Owner-or-admin editor: mirrors the backend `check_dataset_write_access`.
    * Everyone else keeps the read-only visibility badge. */
   canEdit?: boolean;
+  /** Owner or admin, whatever their role permits: who the dataset's key list
+   * and revoke endpoints serve. Defaults to `canEdit`. */
+  canManageKeys?: boolean;
 }
 
-/** fix(#927): the visibility values this control can move a dataset TO, in
- * ladder order. `restricted` is not one: a non-admin owner who picked it lost
- * access to their own dataset, and grants have no write path (#929). A dataset
- * already stored as `restricted` still displays its own value (see below) — a
- * one-way exit, never a silent coercion to something the user did not pick.
- * fix(#930): `internal` joined the ladder once its permission branches landed;
- * the import pickers deliberately stay at private/public. */
+/** The visibility values this control can move a dataset TO, in ladder order.
+ * `restricted` is not one: it follows from sharing a private dataset with
+ * groups (see DatasetGroupShare), and a non-admin owner who picked it directly
+ * would lose access to their own dataset. A dataset already stored as
+ * `restricted` still displays its own value (see below), a one-way exit, never
+ * a silent coercion. The import pickers stay at private/public. */
 const SELECTABLE_VISIBILITIES = ['private', 'internal', 'public'] as const;
 
-/** fix(#1178 r3): the full ladder in widening order, for deciding whether a
- * visibility move ADDS readers. `restricted` sits between private and
- * internal even though this control cannot move TO it — a stored restricted
- * dataset can still be moved FROM it, and that move's direction matters. */
+/** The full ladder in widening order, for deciding whether a visibility move
+ * ADDS readers. `restricted` sits between private and internal even though this
+ * control cannot move TO it: a stored restricted dataset can still be moved
+ * FROM it, and that move's direction matters. */
 const VISIBILITY_LADDER = ['private', 'restricted', 'internal', 'public'] as const;
 
 /** Copy text to clipboard with textarea fallback for non-HTTPS contexts. */
@@ -91,44 +97,21 @@ async function copyText(value: string): Promise<void> {
 
 function TileUrlSection({ tileUrl }: { tileUrl: string }) {
   const { t } = useTranslation('dataset');
-  const [copied, setCopied] = useState(false);
-  const timerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
-
-  useEffect(() => () => clearTimeout(timerRef.current), []);
-
-  async function handleCopy() {
-    await copyText(tileUrl);
-    setCopied(true);
-    clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => setCopied(false), 2000);
-  }
-
   return (
-    <Card className="mt-3">
-      <CardHeader className="pb-3">
-        <CardTitle level={3} className="text-sm">{t('distributions.tiles')}</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <div className="space-y-1.5">
+    <section className="mt-4" aria-labelledby="distributions-xyz-tiles">
+      <h3 id="distributions-xyz-tiles" className="mb-1 text-sm font-medium">{t('distributions.tiles')}</h3>
+      <div className="py-2">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
           <Badge variant="outline" className="text-xs">XYZ</Badge>
-          <div className="flex items-center gap-2">
-            <code className="flex-1 rounded-sm bg-muted px-2 py-1.5 font-mono text-xs text-foreground truncate" title={tileUrl}>
+          <div className="flex min-w-56 flex-1 basis-56 items-center gap-2">
+            <code className={URL_CHIP_CLASS} title={tileUrl}>
               {tileUrl}
             </code>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-7 w-7 shrink-0"
-              onClick={handleCopy}
-              aria-label={t('distributions.copyUrl')}
-              title={t('distributions.copyUrl')}
-            >
-              {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-            </Button>
+            <CopyButton value={tileUrl} label={t('distributions.copyUrl')} />
           </div>
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </section>
   );
 }
 
@@ -232,16 +215,18 @@ function ApiSnippet({
       </div>
       <div className="rounded-lg overflow-hidden border bg-(--code-bg) text-(--code-text)">
         <div className="flex items-center gap-2 px-3.5 py-2 bg-(--code-chrome) border-b border-(--code-chrome-border)">
-          <span className="px-1.5 py-0.5 rounded-sm font-mono text-mini font-semibold text-(--code-method-badge) bg-(--code-method-badge-bg)">
+          <span className="shrink-0 px-1.5 py-0.5 rounded-sm font-mono text-mini font-semibold text-(--code-method-badge) bg-(--code-method-badge-bg)">
             {activeTab === 'qgis' ? 'ADD' : 'GET'}
           </span>
-          <span className="font-mono text-mini text-(--code-muted)">
+          <span
+            className="min-w-0 flex-1 truncate font-mono text-mini text-(--code-muted)"
+            title={activeTab === 'qgis' ? undefined : ogcFeaturesUrl}
+          >
             {activeTab === 'qgis' ? 'Layer → Add Vector Layer' : ogcFeaturesUrl}
           </span>
-          <span className="flex-1" />
           <button
             onClick={handleCopy}
-            className="px-2 py-0.5 rounded-sm text-mini font-mono bg-(--code-chrome-border) text-(--code-text)/80 hover:text-(--code-text) cursor-pointer border-0"
+            className="shrink-0 px-2 py-0.5 rounded-sm text-mini font-mono bg-(--code-chrome-border) text-(--code-text)/80 hover:text-(--code-text) cursor-pointer border-0"
           >
             {copied ? <Check className="inline size-3 me-1" /> : <Copy className="inline size-3 me-1" />}
             {copied ? t('common:copied') : t('common:copy')}
@@ -255,30 +240,34 @@ function ApiSnippet({
   );
 }
 
-export function AccessTab({ dataset, canEdit = false }: AccessTabProps) {
+export function AccessTab({ dataset, canEdit = false, canManageKeys = canEdit }: AccessTabProps) {
   const { t } = useTranslation('dataset');
   const { endpoints, publicApiBaseUrl } = useDatasetAccessEndpoints(dataset);
   const updateDataset = useUpdateDataset();
-  // feat(#1691): the restrict_public_visibility instance setting caps
-  // non-admins at non-public; the server enforces it with a 403, this only
-  // disables the affordance.
+  // The restrict_public_visibility instance setting caps non-admins at
+  // non-public; the server enforces it with a 403, this only disables the
+  // affordance.
   const canSetPublic = useCanSetPublicVisibility();
+  const canCreateKeys = usePermissions().can('edit_metadata');
   const isLegacyVisibility = !SELECTABLE_VISIBILITIES.includes(
     dataset.visibility as (typeof SELECTABLE_VISIBILITIES)[number],
   );
 
-  // feat(#1070): a visibility change held back while the owner confirms that
-  // keywords inherited from the analysis source may reach readers who cannot
-  // open that source.
+  // A visibility change held back while the owner confirms that keywords
+  // inherited from the analysis source may reach readers who cannot open that
+  // source.
   const [pendingChange, setPendingChange] = useState<{
     visibility: DatasetVisibility;
     keywords: string[];
   } | null>(null);
-  // fix(#1178 r4): probe sequence. Two quick selections leave both probes in
-  // flight, and whichever resolved LAST wrote pendingChange — possibly for
-  // the earlier, no-longer-intended value. Each invocation takes a fresh id;
-  // a response whose id is no longer current is discarded outright.
+  // Probe sequence. Two quick selections leave both probes in flight, and
+  // whichever resolved LAST wrote pendingChange, possibly for the earlier,
+  // no-longer-intended value. Each invocation takes a fresh id; a response whose
+  // id is no longer current is discarded.
   const probeSeq = useRef(0);
+  // Going public is confirmed first, from any level, because anonymous readers
+  // reach the data through the standards endpoints and downloads as well.
+  const [confirmPublic, setConfirmPublic] = useState(false);
 
   function applyVisibility(visibility: DatasetVisibility) {
     updateDataset.mutate(
@@ -286,56 +275,64 @@ export function AccessTab({ dataset, canEdit = false }: AccessTabProps) {
       {
         onSuccess: (result) => {
           toast.success(t('metadataEdit.visibilityUpdated'));
-          // fix(#1178 review): when the preflight probe failed, the PATCH
-          // response is the only warning surface left — reading it is what
-          // makes "a failed probe never blocks" a fallback instead of a hole.
+          // When the preflight probe failed, the PATCH response is the only
+          // warning surface left; reading it makes "a failed probe never
+          // blocks" a fallback instead of a hole.
           if (result?.metadata_warnings?.length) {
             toast.warning(result.metadata_warnings[0]);
           }
         },
-        // fix(#927): moving a dataset away from public while a public map uses
-        // it is a 422 from `_apply_visibility_change`. This control is the
-        // first UI that can trigger it, so the message has to reach the user
-        // rather than leaving the select silently snapping back (#931 owns
-        // turning that prose into its own localized message).
+        // Moving a dataset away from public while a public map uses it is a 422
+        // from `_apply_visibility_change`. This control is the first UI that can
+        // trigger it, so the message must reach the user rather than the select
+        // silently snapping back.
         onError: (err) =>
           toast.error(formatMutationError('dataset:metadataEdit.visibilityFailed', err)),
       },
     );
   }
 
-  async function handleVisibilityChange(value: string) {
+  function handleVisibilityChange(value: string) {
     if (value === dataset.visibility) return;
-    const visibility = value as DatasetVisibility;
+    if (value === 'public') {
+      // Discards any earlier selection's probe still in flight.
+      probeSeq.current++;
+      setConfirmPublic(true);
+      return;
+    }
+    void changeVisibility(value as DatasetVisibility);
+  }
+
+  async function changeVisibility(visibility: DatasetVisibility) {
     const seq = ++probeSeq.current;
-    // fix(#1178 r3): only a move that ADDS readers warrants the dialog. The
-    // probe asks an absolute question ("does this audience exceed the
-    // source?"), so running it on a narrowing move (public -> internal on an
-    // output already wider than its source) blocked the REMEDIATION behind a
-    // dialog claiming a wider audience. An unknown stored value indexes to
-    // -1 and counts as widening — over-warning is the safe direction.
+    // Only a move that ADDS readers warrants the dialog. The probe asks an
+    // absolute question ("does this audience exceed the source?"), so running
+    // it on a narrowing move (public -> internal on an output already wider than
+    // its source) would block the REMEDIATION behind a dialog claiming a wider
+    // audience. An unknown stored value indexes to -1 and counts as widening;
+    // over-warning is the safe direction.
     const widens =
       VISIBILITY_LADDER.indexOf(visibility as (typeof VISIBILITY_LADDER)[number]) >
       VISIBILITY_LADDER.indexOf(
         dataset.visibility as (typeof VISIBILITY_LADDER)[number],
       );
     if (widens) {
-      // feat(#1070): ask the counterfactual — "at this visibility, would
-      // inherited keywords reach someone who cannot open their source?" — and
-      // put the diff in front of the owner before the change applies.
-      // Advisory only: a failed probe never blocks the change (the backend
-      // PATCH response still carries the warning).
+      // Ask the counterfactual ("at this visibility, would inherited keywords
+      // reach someone who cannot open their source?") and put the diff in front
+      // of the owner before the change applies. Advisory only: a failed probe
+      // never blocks the change (the backend PATCH response still carries the
+      // warning).
       try {
         const kw = await listKeywords(dataset.record_id, {
           audienceVisibility: visibility,
         });
-        // fix(#1178 r4): superseded by a newer selection while awaiting —
-        // this response must produce nothing, not even the fall-through.
+        // Superseded by a newer selection while awaiting this response must
+        // produce nothing, not even the fall-through.
         if (seq !== probeSeq.current) return;
-        // fix(#1178 r3): the gap flag is authoritative (computed server-side
-        // over ALL keyword rows); the fetched page only supplies display
-        // names. Keying the dialog on the page's inherited entries let a page
-        // boundary skip the confirmation entirely.
+        // The gap flag is authoritative (computed server-side over ALL keyword
+        // rows); the fetched page only supplies display names. Keying the dialog
+        // on the page's inherited entries let a page boundary skip the
+        // confirmation.
         if (kw.inherited_audience_gap) {
           setPendingChange({
             visibility,
@@ -344,8 +341,8 @@ export function AccessTab({ dataset, canEdit = false }: AccessTabProps) {
           return;
         }
       } catch {
-        // fix(#1178 r4): a superseded FAILED probe must not fire the direct
-        // PATCH for its stale value either.
+        // A superseded FAILED probe must not fire the direct PATCH for its stale
+        // value either.
         if (seq !== probeSeq.current) return;
         // fall through to the plain mutate
       }
@@ -361,62 +358,6 @@ export function AccessTab({ dataset, canEdit = false }: AccessTabProps) {
 
   return (
     <>
-      {/* Downloads and service endpoints */}
-      {showDistributions && (
-        <Card>
-          <CardHeader>
-            <CardTitle level={2} className="text-base">{t('distributions.title')}</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {dataset.record_id ? (
-              <DistributionsList
-                recordId={dataset.record_id}
-                canEdit={canEdit}
-                visibility={dataset.visibility}
-              />
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                {t('distributions.noDistributions')}
-              </p>
-            )}
-            {featureTable && (
-              <div className="mt-4 border-t pt-4 space-y-2">
-                <h3 className="text-sm font-medium">{t('distributions.otherFormats')}</h3>
-                <ExportButton datasetId={dataset.id} datasetName={dataset.title} recordType={dataset.record_type} />
-              </div>
-            )}
-            {/* XYZ Tile URL for raster/VRT datasets */}
-            {tileToken === 'raster' && dataset.raster?.connect?.tile_url && (
-              <TileUrlSection tileUrl={dataset.raster.connect.tile_url} />
-            )}
-            {tileToken === 'vector' && dataset.record_type !== 'table' && dataset.visibility !== 'public' && (
-              <p className="text-xs text-muted-foreground mt-4">{t('serviceUrls.vectorTilesKeyHint')}</p>
-            )}
-            <p className="text-xs text-muted-foreground mt-4">
-              {t('serviceUrls.authHelpSimple')}{' '}
-              <Link to="/settings" className="underline hover:text-foreground">
-                {t('serviceUrls.manageApiKeys')}
-              </Link>
-            </p>
-          </CardContent>
-        </Card>
-      )}
-
-      {dataset.tileset && <TilesetAccess tileset={dataset.tileset} visibility={dataset.visibility} />}
-      {dataset.pointcloud?.url && (
-        <PointCloudAccess url={dataset.pointcloud.url} visibility={dataset.visibility} />
-      )}
-
-      {/* API access snippet */}
-      {featureTable && endpoints.ogcFeaturesUrl && publicApiBaseUrl && (
-        <ApiSnippet
-          apiBaseUrl={publicApiBaseUrl}
-          collectionId={dataset.id}
-          ogcFeaturesUrl={endpoints.ogcFeaturesUrl}
-          srid={dataset.srid ?? 4326}
-        />
-      )}
-
       {/* Visibility */}
       <Card>
         <CardHeader>
@@ -440,7 +381,7 @@ export function AccessTab({ dataset, canEdit = false }: AccessTabProps) {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {/* fix(#927): a stored `restricted` dataset keeps showing what
+                  {/* A stored `restricted` dataset keeps showing what
                       it actually is — offered as the current value only, never
                       as a move. */}
                   {isLegacyVisibility && (
@@ -479,10 +420,92 @@ export function AccessTab({ dataset, canEdit = false }: AccessTabProps) {
               {t('common:visibilityPublicAdminOnly')}
             </p>
           )}
+          {/* The server sends the group list to the owner and admins only. */}
+          {canEdit && dataset.groups && (
+            <DatasetGroupShare
+              datasetId={dataset.id}
+              visibility={dataset.visibility}
+              groups={dataset.groups}
+            />
+          )}
         </CardContent>
       </Card>
 
-      {/* feat(#1070): the publish-moment diff — which inherited keywords the
+      {/* Downloads and service endpoints */}
+      {showDistributions && (
+        <Card>
+          <CardHeader>
+            <CardTitle level={2} className="text-base">{t('distributions.title')}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {dataset.record_id ? (
+              <DistributionsList
+                recordId={dataset.record_id}
+                canEdit={canEdit}
+                visibility={dataset.visibility}
+                datasetTitle={dataset.title}
+              />
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                {t('distributions.noDistributions')}
+              </p>
+            )}
+            {/* XYZ Tile URL for raster/VRT datasets */}
+            {tileToken === 'raster' && dataset.raster?.connect?.tile_url && (
+              <TileUrlSection tileUrl={dataset.raster.connect.tile_url} />
+            )}
+            {tileToken === 'vector' && dataset.record_type !== 'table' && dataset.visibility !== 'public' && (
+              <p className="text-xs text-muted-foreground mt-4">{t('serviceUrls.vectorTilesKeyHint')}</p>
+            )}
+            <p className="text-xs text-muted-foreground mt-4">
+              {t('serviceUrls.authHelpSimple')}{' '}
+              <Link to="/settings" className="underline hover:text-foreground">
+                {t('serviceUrls.manageApiKeys')}
+              </Link>
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
+      {dataset.tileset && <TilesetAccess tileset={dataset.tileset} visibility={dataset.visibility} />}
+      {dataset.pointcloud?.url && (
+        <PointCloudAccess url={dataset.pointcloud.url} visibility={dataset.visibility} />
+      )}
+
+      {/* API access snippet */}
+      {featureTable && endpoints.ogcFeaturesUrl && publicApiBaseUrl && (
+        <ApiSnippet
+          apiBaseUrl={publicApiBaseUrl}
+          collectionId={dataset.id}
+          ogcFeaturesUrl={endpoints.ogcFeaturesUrl}
+          srid={dataset.srid ?? 4326}
+        />
+      )}
+
+      {/* Anyone who may list and revoke the keys sees them; creating one also
+          needs the edit_metadata capability and a geometry column, which every
+          feature write requires. */}
+      {canManageKeys && featureTable && (
+        <DatasetWriteKeys
+          datasetId={dataset.id}
+          canCreate={canCreateKeys && dataset.geometry_type !== null}
+        />
+      )}
+
+      <ConfirmDialog
+        open={confirmPublic}
+        onOpenChange={setConfirmPublic}
+        title={t('metadataEdit.publicConfirmTitle')}
+        description={t('metadataEdit.publicConfirmDescription')}
+        confirm={{
+          label: t('metadataEdit.publicConfirmAction'),
+          onClick: () => {
+            void changeVisibility('public');
+          },
+        }}
+      />
+
+      {/* The publish-moment diff — which inherited keywords the
           wider audience would see, with the option to back out and prune. */}
       <AlertDialog
         open={pendingChange !== null}
@@ -497,7 +520,7 @@ export function AccessTab({ dataset, canEdit = false }: AccessTabProps) {
               {t('keywords.inheritedConfirmBody')}
             </AlertDialogDescription>
           </AlertDialogHeader>
-          {/* fix(#1178 r3): the fetched page supplies display names only; a
+          {/* The fetched page supplies display names only; a
               gap with no inherited names on the page still gets the dialog,
               with a generic line in place of the badges. */}
           {pendingChange && pendingChange.keywords.length > 0 ? (

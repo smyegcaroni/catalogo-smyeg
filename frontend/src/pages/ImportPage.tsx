@@ -14,6 +14,7 @@ import { ServiceUrlForm } from '@/components/import/ServiceUrlForm';
 import { StacImportForm } from '@/components/import/StacImportForm';
 import { WorkflowRail } from '@/components/import/WorkflowRail';
 import { useDocumentTitle } from '@/hooks/use-document-title';
+import { useSettingsAdmin } from '@/hooks/use-settings-admin';
 import { cn } from '@/lib/utils';
 import type { BatchPhase, DataKind } from '@/types/api';
 
@@ -21,7 +22,7 @@ type Tab = 'upload' | 'url' | 'register' | 'service' | 'stac';
 
 const MODE_TABS: { value: Tab; icon: typeof Upload; labelKey: string }[] = [
   { value: 'upload', icon: Upload, labelKey: 'tabs.upload' },
-  // feat(#1705): URL variant of upload — server-side fetch into staging.
+  // URL variant of upload — server-side fetch into staging.
   { value: 'url', icon: Link, labelKey: 'tabs.url' },
   { value: 'register', icon: Database, labelKey: 'tabs.register' },
   { value: 'service', icon: Globe, labelKey: 'tabs.service' },
@@ -63,6 +64,9 @@ export function ImportPage() {
     setUploadOutcome({ state, kinds });
   }, []);
   useDocumentTitle(t('common:pageTitle.import'));
+  // Registering an existing table is an administrator task on the server.
+  const canRegisterTables = useSettingsAdmin();
+  const modeTabs = MODE_TABS.filter((tab) => tab.value !== 'register' || canRegisterTables);
 
   return (
     <PageShell>
@@ -80,7 +84,7 @@ export function ImportPage() {
         className="max-w-full overflow-x-auto"
       >
         <div className="inline-flex min-w-max border-b border-border">
-          {MODE_TABS.map(({ value, icon: Icon, labelKey }) => (
+          {modeTabs.map(({ value, icon: Icon, labelKey }) => (
             <button
               key={value}
               type="button"
@@ -121,7 +125,7 @@ export function ImportPage() {
           <AppErrorBoundary>
             {activeTab === 'upload' && <UploadForm onPhaseChange={handlePhaseChange} onOutcomeChange={handleOutcomeChange} />}
             {activeTab === 'url' && <UrlImportForm initialUrl={tabParam === 'url' ? prefillUrl : ''} />}
-            {activeTab === 'register' && <RegisterForm />}
+            {activeTab === 'register' && canRegisterTables && <RegisterForm />}
             {activeTab === 'service' && <ServiceUrlForm initialUrl={tabParam === 'service' ? prefillUrl : ''} />}
             {activeTab === 'stac' && <StacImportForm />}
           </AppErrorBoundary>

@@ -8,7 +8,7 @@ import re
 from collections.abc import Callable, Sequence
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from shapely import to_geojson
 from shapely.errors import GEOSException
@@ -17,11 +17,16 @@ from shapely.geometry.base import BaseGeometry
 from shapely.validation import explain_validity
 from sqlalchemy import bindparam, func, select, text
 from sqlalchemy import types as sa_types
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db.pg_ranges import check_int8_range, check_pg_value_range
 from app.core.geo import seam_extent_wkt_for_table
+from app.modules.catalog.features.idempotency import (  # noqa: F401 - façade for other domains
+    current_table_oid,
+)
 from app.platform.extensions import get_catalog_port
+from app.platform.timestamptz_text import utc_timestamptz_text
 
 if TYPE_CHECKING:
     from app.modules.catalog.datasets.domain.models import Dataset
@@ -158,6 +163,18 @@ class UnwritablePropertyError(ValueError):
     """
 
 
+class UnknownPropertyError(ValueError):
+    """A property key that is not in the dataset's stored column list."""
+
+    def __init__(self, columns: list[str]) -> None:
+        super().__init__(f"Unknown property columns: {', '.join(columns)}")
+        self.columns = columns
+
+
+class FeatureNotFoundError(ValueError):
+    """The addressed feature row does not exist."""
+
+
 def is_writable_feature_column(name: str) -> bool:
     """Whether the feature write path can address a column by this name.
 
@@ -186,7 +203,7 @@ def _reject_unknown_properties(
     if properties:
         unknown = sorted(k for k in properties if k not in allowed)
         if unknown:
-            raise ValueError(f"Unknown property columns: {', '.join(unknown)}")
+            raise UnknownPropertyError(unknown)
     named = allowed if replaces_all else {k for k in (properties or {}) if k in allowed}
     unwritable = sorted(n for n in named if not is_writable_feature_column(n))
     if unwritable:
@@ -264,7 +281,12 @@ def parse_bbox(bbox: str | Sequence[float]) -> list[float]:
     return values
 
 
-async def live_property_columns(db: AsyncSession, table_name: str) -> str:
+async def live_property_columns(
+    db: AsyncSession,
+    table_name: str,
+    *,
+    only: list[str] | None = None,
+) -> str:
     """Quoted select-list of the table's live columns minus gid/geom/geom_4326.
 
     `to_jsonb` serializes EVERY column first, and the
@@ -273,22 +295,63 @@ async def live_property_columns(db: AsyncSession, table_name: str) -> str:
     `Dataset.column_info`, which can drift on re-upload. Colons
     are backslash-escaped too (`text()` parses `:name` as a bind param even
     quoted; Socrata ships columns named `:id`). Valid only inside `text()`.
+    ``only`` keeps just the named columns; an empty list keeps none. A
+    timestamptz column is projected under its own name as the UTC text vector
+    tiles carry, so a value reads the same on every route whatever the
+    session's TimeZone.
     """
+    allowed = None if only is None else set(only)
+    columns = []
+    for name, is_timestamptz in await _table_columns(db, table_name):
+        if name in ("gid", "geom", "geom_4326") or (
+            allowed is not None and name not in allowed
+        ):
+            continue
+        quoted = '"' + name.replace('"', '""').replace(":", "\\:") + '"'
+        columns.append(
+            f"{utc_timestamptz_text(quoted)} AS {quoted}" if is_timestamptz else quoted
+        )
+    return ", ".join(columns)
+
+
+async def _table_columns(db: AsyncSession, table_name: str) -> list[tuple[str, bool]]:
+    """The tenant-schema table's live columns in column order, each with whether it is a timestamptz."""
     from app.core.db.tenant_schema import tenant_data_schema
     from app.core.db.tenant_session import current_tenant_var
 
-    schema = tenant_data_schema(current_tenant_var.get())
     result = await db.execute(
         text(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = :schema AND table_name = :tn "
-            "AND column_name NOT IN ('gid', 'geom', 'geom_4326') "
-            "ORDER BY ordinal_position"
-        ).bindparams(schema=schema, tn=table_name)
+            "SELECT a.attname, a.atttypid = 'timestamptz'::regtype "
+            "FROM pg_attribute a "
+            "JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = :schema AND c.relname = :tn "
+            "AND c.relkind IN ('r', 'p', 'v', 'm', 'f') "
+            "AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
+        ).bindparams(schema=tenant_data_schema(current_tenant_var.get()), tn=table_name)
     )
-    return ", ".join(
-        '"' + name.replace('"', '""').replace(":", "\\:") + '"'
-        for (name,) in result.all()
+    return [(name, bool(is_timestamptz)) for name, is_timestamptz in result.all()]
+
+
+async def unknown_property_detail(
+    db: AsyncSession, error: UnknownPropertyError, table_name: str, *, registered: bool
+) -> str:
+    """The refusal text, plus the way out when the column was added after registration.
+
+    Reads use the live table while writes check the stored column list, so a
+    column added in SQL to a registered table is readable but not yet writable
+    until a refresh re-reads the table.
+    """
+    detail = str(error)
+    if not registered:
+        return detail
+    live = {name for name, _ in await _table_columns(db, table_name)}
+    present = [c for c in error.columns if c in live and is_writable_feature_column(c)]
+    if not present:
+        return detail
+    return (
+        f"{detail}. {', '.join(present)} exists in the table but not in "
+        "GeoLens's column list; refresh the dataset to pick it up."
     )
 
 
@@ -326,21 +389,27 @@ async def get_feature_queryable_columns(
 
 
 async def _projected_row_source(
-    db: AsyncSession, table_name: str, *, with_geometry: bool
+    db: AsyncSession,
+    table_name: str,
+    *,
+    with_geometry: bool,
+    only: list[str] | None = None,
+    where_sql: str = "",
 ) -> str:
     """Render the projected FROM source feature readers serialize from.
 
     See ``live_property_columns`` for why the row is projected before
-    ``to_jsonb``. ``geom_4326`` rides along when the table is spatial so
-    bbox predicates and the geometry select keep working; the planner
-    flattens the subquery, so index use is unchanged.
+    ``to_jsonb``, and for ``only``. ``geom_4326`` rides along when the table
+    is spatial so the geometry select keeps working. ``where_sql`` filters the
+    base table aliased ``t``, where columns keep their stored types; the
+    planner flattens the subquery, so index use is unchanged.
     """
-    prop_cols = await live_property_columns(db, table_name)
+    prop_cols = await live_property_columns(db, table_name, only=only)
     prop_sel = f", {prop_cols}" if prop_cols else ""
     geom_sel = ", geom_4326" if with_geometry else ""
     return (
         f"(SELECT gid{geom_sel}{prop_sel} "
-        f"FROM {get_catalog_port().quote_table(table_name)})"
+        f"FROM {get_catalog_port().quote_table(table_name)} t {where_sql})"
     )
 
 
@@ -409,7 +478,7 @@ def number_matched_headers(total_is_estimate: bool) -> dict[str, str]:
     return {NUMBER_MATCHED_HEADER: "estimated"} if total_is_estimate else {}
 
 
-async def _planner_row_estimate(
+async def planner_row_estimate(
     db: AsyncSession, quoted_table: str, where_sql: str, binds: dict, apply_binds
 ) -> int:
     """The planner's row estimate for the filtered predicate, or 0.
@@ -451,7 +520,7 @@ async def _bounded_total(
     counted = int(capped_result.scalar_one())
     if counted <= _FILTERED_COUNT_CAP:
         return counted, False
-    estimate = await _planner_row_estimate(db, quoted, where_sql, binds, apply_binds)
+    estimate = await planner_row_estimate(db, quoted, where_sql, binds, apply_binds)
     return max(counted, estimate), True
 
 
@@ -513,36 +582,29 @@ async def get_features(
 
     # Build SELECT columns over the projected row (see live_property_columns
     # for why geom must never reach to_jsonb).
-    if has_geometry and include_geometry:
+    with_geometry = has_geometry and include_geometry
+    if with_geometry:
         select_cols = (
             "gid, ST_AsGeoJSON(geom_4326, 6)::json AS geometry, "
             "to_jsonb(t.*) - 'gid' - 'geom_4326' AS properties"
         )
-    elif has_geometry:
-        select_cols = (
-            "gid, NULL::json AS geometry, "
-            "to_jsonb(t.*) - 'gid' - 'geom_4326' AS properties"
-        )
     else:
         select_cols = "gid, NULL::json AS geometry, to_jsonb(t.*) - 'gid' AS properties"
-    row_source = await _projected_row_source(db, table_name, with_geometry=has_geometry)
 
     where_clauses: list[str] = []
     bind_values: dict = {}
 
     if bbox is not None and has_geometry:
         if bbox[0] > bbox[2]:
-            # Antimeridian-crossing: split into two envelopes (each with && pre-filter for index)
+            # Antimeridian-crossing: split into two envelopes. ST_Intersects supplies
+            # the index condition itself; a separate && would count its selectivity twice.
             where_clauses.append(
-                "((geom_4326 && ST_MakeEnvelope(:minx, :miny, 180, :maxy, 4326)"
-                " AND ST_Intersects(geom_4326, ST_MakeEnvelope(:minx, :miny, 180, :maxy, 4326)))"
-                " OR (geom_4326 && ST_MakeEnvelope(-180, :miny, :maxx, :maxy, 4326)"
-                " AND ST_Intersects(geom_4326, ST_MakeEnvelope(-180, :miny, :maxx, :maxy, 4326))))"
+                "(ST_Intersects(geom_4326, ST_MakeEnvelope(:minx, :miny, 180, :maxy, 4326))"
+                " OR ST_Intersects(geom_4326, ST_MakeEnvelope(-180, :miny, :maxx, :maxy, 4326)))"
             )
         else:
             where_clauses.append(
-                "geom_4326 && ST_MakeEnvelope(:minx, :miny, :maxx, :maxy, 4326)"
-                " AND ST_Intersects(geom_4326, ST_MakeEnvelope(:minx, :miny, :maxx, :maxy, 4326))"
+                "ST_Intersects(geom_4326, ST_MakeEnvelope(:minx, :miny, :maxx, :maxy, 4326))"
             )
         bind_values["minx"] = bbox[0]
         bind_values["miny"] = bbox[1]
@@ -570,17 +632,13 @@ async def get_features(
     where_sql = ""
     if where_clauses:
         where_sql = "WHERE " + " AND ".join(where_clauses)
+    row_source = await _projected_row_source(
+        db, table_name, with_geometry=with_geometry, where_sql=where_sql
+    )
 
-    if use_keyset:
-        data_sql = (
-            f"SELECT {select_cols} FROM {row_source} t "
-            f"{where_sql} ORDER BY gid LIMIT :limit"
-        )
-    else:
-        data_sql = (
-            f"SELECT {select_cols} FROM {row_source} t "
-            f"{where_sql} ORDER BY gid LIMIT :limit OFFSET :offset"
-        )
+    data_sql = f"SELECT {select_cols} FROM {row_source} t ORDER BY gid LIMIT :limit"
+    if not use_keyset:
+        data_sql += " OFFSET :offset"
         bind_values["offset"] = offset
     # One row past the page, so `has_more` is a fact about the
     # rows rather than a comparison against a count that may be estimated.
@@ -635,6 +693,7 @@ async def get_features_geojson_z(
     *,
     cap: int = 5000,
     cached_feature_count: int | None = None,
+    property_columns: list[str] | None = None,
 ) -> tuple[list[dict], bool, int]:
     """Fetch up to `cap` features with Z coordinates preserved.
 
@@ -644,12 +703,15 @@ async def get_features_geojson_z(
     ST_AsGeoJSON natively preserves Z when the geometry has Z.
     total_count: actual row count when not truncated, COUNT(*) when truncated.
     cached_feature_count is ignored — always uses authoritative count.
+    ``property_columns``, when given, limits ``properties`` to those columns.
     """
     select_cols = (
         "gid, ST_AsGeoJSON(geom_4326, 6)::json AS geometry, "
         "to_jsonb(t.*) - 'gid' - 'geom_4326' AS properties"
     )
-    row_source = await _projected_row_source(db, table_name, with_geometry=True)
+    row_source = await _projected_row_source(
+        db, table_name, with_geometry=True, only=property_columns
+    )
     data_sql = f"SELECT {select_cols} FROM {row_source} t ORDER BY gid LIMIT :limit"
     result = await db.execute(text(data_sql).bindparams(limit=cap + 1))
     rows = [dict(row._mapping) for row in result.all()]
@@ -681,6 +743,14 @@ async def get_feature_by_id(
 
     Returns a dict with gid, geometry, and properties, or None if not found.
     """
+    rows = await _features_by_ids(db, table_name, [gid], has_geometry=has_geometry)
+    return rows[0] if rows else None
+
+
+async def _features_by_ids(
+    db: AsyncSession, table_name: str, gids: list[int], *, has_geometry: bool = True
+) -> list[dict]:
+    """The features with these gids, in the order the gids are given."""
     if has_geometry:
         select_cols = (
             "gid, ST_AsGeoJSON(geom_4326, 6)::json AS geometry, "
@@ -690,12 +760,10 @@ async def get_feature_by_id(
         select_cols = "gid, NULL::json AS geometry, to_jsonb(t.*) - 'gid' AS properties"
 
     row_source = await _projected_row_source(db, table_name, with_geometry=has_geometry)
-    sql = f"SELECT {select_cols} FROM {row_source} t WHERE gid = :gid"
-    result = await db.execute(text(sql).bindparams(gid=gid))
-    row = result.first()
-    if row is None:
-        return None
-    return dict(row._mapping)
+    sql = f"SELECT {select_cols} FROM {row_source} t WHERE gid = ANY(:gids)"
+    result = await db.execute(text(sql).bindparams(gids=gids))
+    by_gid = {row.gid: dict(row._mapping) for row in result}
+    return [by_gid[gid] for gid in gids if gid in by_gid]
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +834,115 @@ async def _geom_column_is_measured(session: AsyncSession, table_name: str) -> bo
     )
     typmod_type = result.scalar_one_or_none()
     return typmod_type is not None and typmod_type.strip().upper().endswith("M")
+
+
+DryRunBlocker = Literal[
+    "missing_table", "not_a_table", "insert_side_effects", "user_code"
+]
+
+
+def _trusted(oid: str, catalog: str) -> str:
+    """SQL true when the object is built in or belongs to an installed extension."""
+    return (
+        f"{oid} < 16384 OR EXISTS (SELECT 1 FROM pg_depend e "
+        f"WHERE e.classid = '{catalog}'::regclass AND e.objid = {oid} "
+        "AND e.deptype = 'e')"
+    )
+
+
+# Each user column's type and, for an array, its element type.
+_COLUMN_TYPES = (
+    "SELECT ty.oid FROM pg_attribute a JOIN pg_type ty ON ty.oid = a.atttypid "
+    "WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
+    "UNION SELECT ty.typelem FROM pg_attribute a "
+    "JOIN pg_type ty ON ty.oid = a.atttypid "
+    "WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
+    "AND ty.typcategory = 'A'"
+)
+
+_UNTRUSTED_VOLATILE = f"p.provolatile = 'v' AND NOT ({_trusted('p.oid', 'pg_proc')})"
+
+# Shapes whose insert or readback could run user code. Extension objects are
+# trusted because PostGIS declares its GiST support functions VOLATILE, and
+# element types are checked for JSON casts because the readback's to_jsonb
+# recurses into arrays.
+_USER_CODE = (
+    "EXISTS (SELECT 1 FROM pg_constraint con "
+    "WHERE con.contype IN ('c', 'f') AND con.conrelid = c.oid) "
+    "OR c.relrowsecurity OR c.relispartition "
+    "OR EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid "
+    "AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL)) "
+    "OR NOT EXISTS (SELECT 1 FROM pg_am am "
+    "WHERE am.oid = c.relam AND am.amname = 'heap' AND am.oid < 16384) "
+    "OR EXISTS (SELECT 1 FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+    f"WHERE i.indrelid = c.oid AND NOT ({_trusted('ic.relam', 'pg_am')})) "
+    "OR EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid "
+    "AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated <> '') "
+    f"OR EXISTS (SELECT 1 FROM ({_COLUMN_TYPES}) col WHERE NOT ("
+    f"{_trusted('col.oid', 'pg_type')})) "
+    f"OR EXISTS (SELECT 1 FROM ({_COLUMN_TYPES}) col JOIN pg_cast ca "
+    "ON ca.castsource = col.oid AND ca.casttarget IN "
+    "('json'::regtype, 'jsonb'::regtype) AND ca.castfunc <> 0 "
+    f"WHERE NOT ({_trusted('ca.castfunc', 'pg_proc')})) "
+    "OR EXISTS (SELECT 1 FROM pg_index i, unnest(i.indclass::oid[]) oc(oid) "
+    "JOIN pg_opclass opc ON opc.oid = oc.oid WHERE i.indrelid = c.oid AND ("
+    "EXISTS (SELECT 1 FROM pg_amproc ap JOIN pg_proc p ON p.oid = ap.amproc "
+    f"WHERE ap.amprocfamily = opc.opcfamily AND {_UNTRUSTED_VOLATILE}) "
+    "OR EXISTS (SELECT 1 FROM pg_amop ao "
+    "JOIN pg_operator o ON o.oid = ao.amopopr "
+    "JOIN pg_proc p ON p.oid = o.oprcode::oid "
+    f"WHERE ao.amopfamily = opc.opcfamily AND {_UNTRUSTED_VOLATILE})))"
+)
+
+_RELKIND = text(
+    "SELECT c.relkind::text FROM pg_class c WHERE c.oid = to_regclass("
+    "format('%I.%I', CAST(:schema AS text), CAST(:t AS text)))"
+)
+
+_DRY_RUN_PROBE = text(
+    "SELECT c.relkind::text AS relkind, EXISTS (SELECT 1 FROM pg_trigger tg "
+    "WHERE tg.tgrelid = c.oid AND NOT tg.tgisinternal "
+    "AND tg.tgenabled IN ('O', 'A') AND (tg.tgtype::int & 4) <> 0) "
+    "OR EXISTS (SELECT 1 FROM pg_rewrite rw "
+    "WHERE rw.ev_class = c.oid AND rw.ev_type = '3' "
+    "AND rw.ev_enabled IN ('O', 'A')) AS side_effects, "
+    f"{_USER_CODE} AS user_code "
+    "FROM pg_class c WHERE c.oid = to_regclass(format('%I.%I', "
+    "CAST(:schema AS text), CAST(:t AS text)))"
+)
+
+
+async def dry_run_blocker(
+    session: AsyncSession, table_name: str
+) -> DryRunBlocker | None:
+    """Why a dry-run insert into the table could leave effects behind, or None.
+
+    Only an ordinary table qualifies, and only while it has no enabled user
+    INSERT trigger or rule and none of the shapes in ``_USER_CODE``: each may
+    run code that reaches past the transaction, where the rolled-back insert
+    cannot undo it. The table is locked in ROW EXCLUSIVE mode, the insert's
+    own lock, before the second look, so none of these can be added before
+    the insert; the lock lasts until the transaction ends. A table that is
+    missing at the first look is reported, never inserted into.
+    """
+    from app.core.db.tenant_schema import tenant_data_schema
+    from app.core.db.tenant_session import current_tenant_var
+
+    params = {"schema": tenant_data_schema(current_tenant_var.get()), "t": table_name}
+    relkind = await session.scalar(_RELKIND, params)
+    if relkind is None:
+        return "missing_table"
+    if relkind != "r":
+        return "not_a_table"
+    quoted = get_catalog_port().quote_table(table_name)
+    # codeql[py/sql-injection] table identifier from quote_table, which validates it
+    await session.execute(text(f"LOCK TABLE {quoted} IN ROW EXCLUSIVE MODE"))
+    row = (await session.execute(_DRY_RUN_PROBE, params)).one()
+    if row.relkind != "r":
+        return "not_a_table"
+    if row.side_effects:
+        return "insert_side_effects"
+    return "user_code" if row.user_code else None
 
 
 async def effective_geometry_type(session: AsyncSession, dataset) -> str:
@@ -889,6 +1066,74 @@ async def insert_feature(
     """
     if await _geom_column_is_measured(db, table_name):
         raise ValueError(_MEASURED_LAYER_EDIT_ERROR)
+    gid = await _insert_row(
+        db,
+        table_name,
+        geometry,
+        properties,
+        column_info,
+        dataset_geometry_type,
+        dataset_srid,
+    )
+    row = await get_feature_by_id(db, table_name, gid)
+    if row is None:
+        raise RuntimeError(f"Feature {gid} not found immediately after insert")
+    return row
+
+
+class FeatureBatchError(Exception):
+    """The feature at ``index`` of a batch insert failed with ``cause``."""
+
+    def __init__(self, index: int, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.index = index
+        self.cause = cause
+
+
+async def insert_features(
+    db: AsyncSession,
+    table_name: str,
+    features: Sequence[tuple[dict, dict | None]],
+    column_info: list[dict],
+    dataset_geometry_type: str,
+    dataset_srid: int | None = None,
+) -> list[dict]:
+    """Insert (geometry, properties) pairs in order and return the stored rows.
+
+    Each feature is validated as ``insert_feature`` validates one. The first
+    failure raises ``FeatureBatchError``; earlier rows are still in the
+    transaction, so the caller must roll it back.
+    """
+    if await _geom_column_is_measured(db, table_name):
+        raise ValueError(_MEASURED_LAYER_EDIT_ERROR)
+    gids: list[int] = []
+    for index, (geometry, properties) in enumerate(features):
+        try:
+            gids.append(
+                await _insert_row(
+                    db,
+                    table_name,
+                    geometry,
+                    properties,
+                    column_info,
+                    dataset_geometry_type,
+                    dataset_srid,
+                )
+            )
+        except (ValueError, DBAPIError) as exc:
+            raise FeatureBatchError(index, exc) from exc
+    return await _features_by_ids(db, table_name, gids)
+
+
+async def _insert_row(
+    db: AsyncSession,
+    table_name: str,
+    geometry: dict,
+    properties: dict | None,
+    column_info: list[dict],
+    dataset_geometry_type: str,
+    dataset_srid: int | None,
+) -> int:
     _validate_geometry_type(geometry.get("type", ""), dataset_geometry_type)
     normalized_geom = _validate_geometry_structure(geometry)
     _reject_unknown_properties(properties, column_info)
@@ -915,12 +1160,7 @@ async def insert_feature(
         f"VALUES ({', '.join(vals)}) RETURNING gid"
     )
     result = await db.execute(text(sql).bindparams(**params))
-    gid = result.scalar_one()
-
-    row = await get_feature_by_id(db, table_name, gid)
-    if row is None:
-        raise RuntimeError(f"Feature {gid} not found immediately after insert")
-    return row
+    return result.scalar_one()
 
 
 async def replace_feature(
@@ -969,7 +1209,7 @@ async def replace_feature(
     result = await db.execute(text(sql).bindparams(**params))
     prior = result.first()
     if prior is None:
-        raise ValueError("Feature not found")
+        raise FeatureNotFoundError("Feature not found")
 
     row = await get_feature_by_id(db, table_name, gid)
     if row is None:
@@ -1029,7 +1269,7 @@ async def update_feature(
     result = await db.execute(text(sql).bindparams(**params))
     prior = result.first()
     if prior is None:
-        raise ValueError("Feature not found")
+        raise FeatureNotFoundError("Feature not found")
 
     row = await get_feature_by_id(db, table_name, gid)
     if row is None:
@@ -1059,17 +1299,50 @@ async def delete_feature(
     )
     row = result.first()
     if row is None:
-        raise ValueError("Feature not found")
+        raise FeatureNotFoundError("Feature not found")
     return _prior_bounds_from_row(row)
+
+
+class MissingFeaturesError(Exception):
+    """A batch delete named features that do not exist."""
+
+    def __init__(self, gids: list[int]) -> None:
+        super().__init__(f"Features not found: {', '.join(map(str, gids))}")
+        self.gids = gids
+
+
+async def delete_features(
+    db: AsyncSession, table_name: str, gids: Sequence[int]
+) -> tuple[list[int], list[Bounds | None]]:
+    """Hard-delete features by gid, returning the gids and envelopes removed.
+
+    A gid sent twice is deleted once. Raises ``MissingFeaturesError`` naming
+    every gid that does not exist; the rows that did are already deleted in
+    the transaction, so the caller must roll it back.
+    """
+    wanted = list(dict.fromkeys(gids))
+    # A gid outside bigint can match no row, and binding it would fail. The
+    # bigint array lets an int4 gid column report a larger gid as missing.
+    bindable = [gid for gid in wanted if -(2**63) <= gid < 2**63]
+    result = await db.execute(
+        text(
+            f"DELETE FROM {get_catalog_port().quote_table(table_name)} "
+            f"WHERE gid = ANY(CAST(:gids AS bigint[])) "
+            f"RETURNING gid, {_PRIOR_BOUNDS_COLS}"
+        ).bindparams(gids=bindable)
+    )
+    removed = {row.gid: _prior_bounds_from_row(row) for row in result}
+    missing = [gid for gid in wanted if gid not in removed]
+    if missing:
+        raise MissingFeaturesError(missing)
+    return wanted, [removed[gid] for gid in wanted]
 
 
 async def _refresh_count_and_extent(
     session: AsyncSession, table_name: str
 ) -> tuple[int, str | None]:
-    """Lightweight count + extent query for feature-write metadata refresh.
-
-    Returns (feature_count, extent_wkt) in a single query instead of the
-    5 queries that extract_metadata() runs.
+    """Return (feature_count, extent_wkt) from one query, not the five that
+    extract_metadata() runs.
     """
     # records.spatial_extent admits only POLYGON/MULTIPOLYGON, but
     # ST_Extent of a single point / axis-collinear points casts to POINT /
@@ -1093,13 +1366,11 @@ async def _refresh_count_and_extent(
     )
     row = result.one()
     count, extent_wkt, xmin, xmax = int(row[0]), row[1], row[2], row[3]
-    # A table honestly crossing ±180 must not store the naive
-    # near-global fold on refresh; emit the two-ring MULTIPOLYGON instead. A
-    # crossing dataset's naive width always exceeds 180 degrees, so the
-    # ordinary case skips the second aggregate and stays byte-identical.
+    # A table crossing ±180 must store the two-ring MULTIPOLYGON, not the
+    # naive near-global fold. A crossing dataset's naive width always exceeds
+    # 180 degrees, so the ordinary case skips the second aggregate.
     if xmin is not None and xmax is not None and float(xmax) - float(xmin) > 180.0:
-        # Same tenant data schema the quoted reference above resolves to;
-        # the helper quotes identifiers itself.
+        # Same tenant data schema as the quoted reference above.
         from app.core.db.tenant_schema import tenant_data_schema
         from app.core.db.tenant_session import current_tenant_var
 
@@ -1177,13 +1448,11 @@ def geojson_bounds(geometry: dict | None) -> Bounds | None:
     return (float(minx), float(miny), float(maxx), float(maxy))
 
 
-# The envelope of the row version a write is about to overwrite or remove.
-#
-# Captured as part of the mutating statement, not a separate
-# unlocked SELECT before it — a concurrent edit could otherwise move the
-# feature out of the stored extent and commit in the gap, leaving envelope
-# values that were true when read but false by the time of the write, and
-# the incremental fast path leaving the expanded extent behind.
+# The envelope of the row version a write is about to overwrite or remove,
+# captured by the mutating statement itself. A separate unlocked SELECT could
+# miss a concurrent edit that moves the feature out of the stored extent and
+# commits in the gap, and the incremental fast path would leave the expanded
+# extent behind.
 _PRIOR_BOUNDS_COLS = (
     "ST_XMin(geom_4326) AS prior_minx, ST_YMin(geom_4326) AS prior_miny, "
     "ST_XMax(geom_4326) AS prior_maxx, ST_YMax(geom_4326) AS prior_maxy"
@@ -1233,32 +1502,23 @@ async def lock_catalog_rows_for_write(
 ) -> Bounds | None:
     """Take this dataset's catalog rows in the house order, then read its extent.
 
-    Entry point to `platform.catalog_locks.lock_catalog_rows` — call from
-    ANY request path that dirties either row. Returns None unless the extent
-    is a simple POLYGON: an antimeridian-crossing dataset stores a
-    two-ring MULTIPOLYGON whose ST_XMin/ST_XMax are -180/180, so a longitude
-    in the gap would test inside a box the geometry never occupies.
-    The lock must be taken before either metadata path reads the
-    extent, or interleaved read-decide-write could shrink it from a stale
-    aggregate.
+    The lock is `authorization.lock_dataset_rows_for_write`, which re-checks the
+    writer a guard admitted; a path with no use for the extent calls it directly.
+    Returns None unless the extent is a simple POLYGON: an antimeridian-crossing
+    dataset stores a two-ring MULTIPOLYGON whose ST_XMin/ST_XMax are -180/180, so
+    a longitude in the gap would test inside a box the geometry never occupies.
+    The lock comes before either metadata path reads the extent, so interleaved
+    read-decide-write cannot shrink it from a stale aggregate.
     """
-    from app.modules.catalog.datasets.domain.models import Dataset as DatasetModel
+    from app.modules.catalog.authorization import lock_dataset_rows_for_write
     from app.modules.catalog.datasets.domain.models import Record
-    from app.platform.catalog_locks import lock_catalog_rows
 
-    # Through the port: `catalog/` may not import `app.processing.*`
-    # as enforced by the layering test.
+    # Through the port: the layering test keeps `app.processing.*` out of catalog.
     raster_asset_cls = (
         get_catalog_port().raster_asset_orm_class() if with_raster_asset else None
     )
-
-    await lock_catalog_rows(
-        session,
-        dataset_cls=DatasetModel,
-        record_cls=Record,
-        dataset_id=dataset.id,
-        record_id=dataset.record_id,
-        raster_asset_cls=raster_asset_cls,
+    await lock_dataset_rows_for_write(
+        session, dataset, raster_asset_cls=raster_asset_cls
     )
 
     # Both rows are held now, so this is an ordinary read.
@@ -1334,7 +1594,6 @@ async def _apply_incremental_metadata(
     """Update feature_count alone when the write provably left the extent alone.
 
     Returns False when a full COUNT + ST_Extent recompute is needed.
-    Interior edits can update the count without scanning the full table.
     """
     from app.modules.catalog.datasets.domain.models import Dataset as DatasetModel
 
@@ -1391,8 +1650,8 @@ async def refresh_dataset_metadata(
     scan runs at all; called with no keywords, the full recompute is
     unchanged.
     """
-    # Taken before EITHER branch reads the extent, so a skip
-    # decision cannot be invalidated by a concurrent recompute.
+    # Taken before either branch reads the extent, so a skip decision cannot
+    # be invalidated by a concurrent recompute.
     stored_box = await lock_catalog_rows_for_write(session, dataset)
 
     if count_delta is not None and await _apply_incremental_metadata(
@@ -1405,28 +1664,26 @@ async def refresh_dataset_metadata(
     ):
         return
 
-    # INSIDE the lock, deliberately. A peer that measured before
-    # taking the lock cannot see this transaction's uncommitted row, and would
-    # write a count and extent computed as though it did not exist.
+    # Inside the lock: a peer that measured before taking it cannot see this
+    # transaction's uncommitted row and would write a count and extent computed
+    # without it.
     feature_count, extent_wkt = await _refresh_count_and_extent(
         session, dataset.table_name
     )
     dataset.feature_count = feature_count
 
-    # ST_Extent of a single point is a POINT and of axis-collinear
-    # points a LINESTRING, not always a POLYGON -- store any non-null extent.
+    # ST_Extent of one point is a POINT and of collinear points a LINESTRING;
+    # store any non-null extent. None means no row has a geometry.
     if extent_wkt:
         dataset.record.spatial_extent = func.ST_GeomFromText(extent_wkt, 4326)
-    elif feature_count == 0:
+    else:
         dataset.record.spatial_extent = None
 
-    # Keep generic-column created datasets' DISPLAY
-    # geometry_type in sync with their rows so the builder renders them (see
-    # _derive_created_geometry_type). Validation stays generic via
-    # effective_geometry_type(), so this never re-restricts what subtypes the
-    # layer accepts. Typed 'created' tables (layers module) are excluded by
-    # the genericity probe. Created layers are small (hand-authored), so the
-    # extra DISTINCT scan is in the same cost class as the COUNT above.
+    # Keep a generic-column created dataset's display geometry_type in sync
+    # with its rows (see _derive_created_geometry_type). Validation stays
+    # generic via effective_geometry_type(). Typed 'created' tables (layers
+    # module) are excluded by the genericity probe. Created layers are small,
+    # so the DISTINCT scan costs about the same as the COUNT above.
     if dataset.source_format == "created" and await _geom_column_is_generic(
         session, dataset.table_name
     ):

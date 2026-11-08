@@ -3,15 +3,14 @@
 Rejects requests whose body exceeds the configured maximum (413), via
 stream byte counting on Content-Length or chunked Transfer-Encoding.
 
-BUG-007: the limit is resolved PER-REQUEST from cached PersistentConfig,
-not the boot-time env value, so a raised UPLOAD_MAX_SIZE_MB takes effect
-without a restart. GAP-001: per-route cap — only POST /ingest/upload and
+The limit is resolved PER-REQUEST from cached PersistentConfig, not the
+boot-time env value, so a raised UPLOAD_MAX_SIZE_MB takes effect without
+a restart. The cap is per route: only POST /ingest/upload and
 POST /datasets/{id}/reupload get UPLOAD_MAX_SIZE_MB (500 MB); GeoJSON
-feature mutations get a 1 MB pre-decode cap; everything else gets
-DEFAULT_BODY_LIMIT_BYTES (10 MB). Every deployment strips the app's
-`/api` prefix before this middleware sees the path, so a literal-prefix
-match once silently capped every upload at 10 MB until
-`_is_upload_route` normalised it away.
+feature mutations get a 1 MB pre-decode cap; story image uploads get 51 MB;
+everything else gets DEFAULT_BODY_LIMIT_BYTES (10 MB). Deployments strip the app's `/api` prefix
+before this middleware sees the path, so `_is_upload_route` normalises it
+rather than matching a literal prefix.
 """
 
 import time
@@ -22,6 +21,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 
 from app.api.middleware.liveness import is_liveness_request
+from app.platform.request_credential import mark_refused_before_auth
 from app.standards.ogc.errors import ProblemDetail
 
 # Sync in-memory cache for the upload limit — avoids an async DB pool
@@ -34,7 +34,7 @@ _LIMIT_CACHE_TTL = 30  # seconds — matches PersistentConfig cache TTL
 # (e.g. during lifespan startup before the pool is initialised).
 _FALLBACK_LIMIT_BYTES = 500 * 1024 * 1024  # 500 MB
 
-# GAP-001: small default cap for non-upload routes (protects JSON/form endpoints
+# Small default cap for non-upload routes (protects JSON/form endpoints
 # from large-body DoS while leaving file-upload paths unrestricted).
 DEFAULT_BODY_LIMIT_BYTES = 10 * 1024 * 1024  # 10 MB
 
@@ -43,11 +43,14 @@ DEFAULT_BODY_LIMIT_BYTES = 10 * 1024 * 1024  # 10 MB
 # general API limit; coordinate cardinality is enforced by the feature schema.
 FEATURE_WRITE_BODY_LIMIT_BYTES = 1 * 1024 * 1024  # 1 MB
 
+# A story image upload: the route's own 50 MB file cap plus multipart framing.
+STORY_ASSET_BODY_LIMIT_BYTES = 51 * 1024 * 1024
+
 
 def _too_large_response(max_bytes: int) -> JSONResponse:
     """Build the 413 response in the app-wide RFC 7807 ProblemDetail shape.
 
-    GAP-032: fires before ``register_error_handlers`` installs the shared
+    This fires before ``register_error_handlers`` installs the shared
     handlers, so it builds the ProblemDetail body itself — mirror that
     shape (`type/title/status/detail`, `application/problem+json`) so SDKs
     parse 413 like every other error.
@@ -94,18 +97,18 @@ def _is_uuid(value: str) -> bool:
 def _is_upload_route(path: str, method: str = "POST") -> bool:
     """Return True only for the two POST endpoints that receive file BYTES.
 
-    GAP-001: only these two stream a multipart file body and need the
+    Only these two stream a multipart file body and need the
     large UPLOAD_MAX_SIZE_MB limit; everything else gets
     DEFAULT_BODY_LIMIT_BYTES:
 
         POST /ingest/upload                   (ingest.upload_file)
         POST /datasets/{dataset_id}/reupload  (datasets.reupload_dataset)
 
-    Their presigned/commit/preview sub-routes carry only small JSON (PR
-    #249: a prefix/substring match once let a 500 MB body through
-    there). Mirrors FastAPI routing EXACTLY — method, case-sensitivity,
-    no trailing slash, UUID-parsed dataset_id — so the cap is never
-    handed to a request routing would reject anyway.
+    Their presigned/commit/preview sub-routes carry only small JSON; a
+    prefix/substring match would let a 500 MB body through there. Mirrors
+    FastAPI routing EXACTLY — method, case-sensitivity, no trailing slash,
+    UUID-parsed dataset_id — so the cap is never handed to a request routing
+    would reject anyway.
     """
     if method.upper() != "POST":
         return False
@@ -128,18 +131,18 @@ def _is_upload_route(path: str, method: str = "POST") -> bool:
 
 
 def _is_feature_write_route(path: str, method: str) -> bool:
-    """Return True for the three GeoJSON feature mutation route shapes."""
+    """Return True for the GeoJSON feature mutation and create dry-run route shapes."""
     norm = _strip_api_prefix(path)
     method = method.upper()
     segments = norm.split("/")
 
     if (
         method == "POST"
-        and len(segments) == 5
+        and len(segments) >= 5
         and segments[1] == "datasets"
         and _is_uuid(segments[2])
         and segments[3] == "features"
-        and segments[4] == ""
+        and segments[4:] in ([""], ["dry-run"], ["dry-run", ""])
     ):
         return True
 
@@ -159,10 +162,33 @@ def _is_feature_write_route(path: str, method: str) -> bool:
     return False
 
 
+def _is_story_asset_upload_route(path: str, method: str) -> bool:
+    """Return True for POST /stories/{story_id}/assets, matched as routing does."""
+    segments = _strip_api_prefix(path).split("/")
+    return (
+        method.upper() == "POST"
+        and len(segments) == 4
+        and segments[1] == "stories"
+        and _is_uuid(segments[2])
+        and segments[3] == "assets"
+    )
+
+
+def _route_limit(path: str, method: str) -> int:
+    """The body cap for one request's route."""
+    if _is_upload_route(path, method):
+        return _get_upload_limit()
+    if _is_feature_write_route(path, method):
+        return FEATURE_WRITE_BODY_LIMIT_BYTES
+    if _is_story_asset_upload_route(path, method):
+        return STORY_ASSET_BODY_LIMIT_BYTES
+    return _get_upload_limit(route_override=DEFAULT_BODY_LIMIT_BYTES)
+
+
 def _get_upload_limit(route_override: int | None = None) -> int:
     """Return the effective upload limit in bytes.
 
-    Resolution order (Phase 1184 seam):
+    Resolution order:
         1. route_override  — per-route cap (non-upload routes supply DEFAULT_BODY_LIMIT_BYTES)
         2. cached config   — PersistentConfig UPLOAD_MAX_SIZE_MB (30 s TTL)
         3. fallback        — _FALLBACK_LIMIT_BYTES (boot-time env default)
@@ -215,11 +241,11 @@ async def _refresh_limit_cache() -> int:
 class RequestBodyLimitMiddleware:
     """Enforce body size limit on both Content-Length and chunked-encoding requests.
 
-    The limit is resolved per-request from the cached PersistentConfig value
-    (BUG-007).  ``max_bytes`` passed at construction is used only as the
+    The limit is resolved per-request from the cached PersistentConfig
+    value. ``max_bytes`` passed at construction is used only as the
     initial fallback until the first async cache refresh completes.
 
-    GAP-001: upload and reupload routes get the full UPLOAD_MAX_SIZE_MB limit;
+    Upload and reupload routes get the full UPLOAD_MAX_SIZE_MB limit;
     GeoJSON feature writes get FEATURE_WRITE_BODY_LIMIT_BYTES; other routes get
     DEFAULT_BODY_LIMIT_BYTES (10 MB).
     """
@@ -240,7 +266,7 @@ class RequestBodyLimitMiddleware:
         # non-upload routes pass DEFAULT_BODY_LIMIT_BYTES as route_override
         # so the large upload limit never applies to them.
         #
-        # fix(#1778): skipped for the liveness probe. The refresh is
+        # Skipped for the liveness probe. The refresh is
         # failure-tolerant (falls back to cached/boot-time limit on error),
         # but once the cache expires it makes every request pay a DB
         # connection attempt — against a blackholed database that eats the
@@ -249,16 +275,7 @@ class RequestBodyLimitMiddleware:
         if not is_liveness_request(scope):
             await _refresh_limit_cache()
 
-        path = scope.get("path", "")
-        method = scope.get("method", "")
-        if _is_upload_route(path, method):
-            # Upload/reupload: use the admin-configurable limit (500 MB default)
-            max_bytes = _get_upload_limit()
-        elif _is_feature_write_route(path, method):
-            max_bytes = FEATURE_WRITE_BODY_LIMIT_BYTES
-        else:
-            # All other routes: small default cap (10 MB)
-            max_bytes = _get_upload_limit(route_override=DEFAULT_BODY_LIMIT_BYTES)
+        max_bytes = _route_limit(scope.get("path", ""), scope.get("method", ""))
 
         # Fast path: Content-Length header present — reject before reading the body
         headers = dict(scope.get("headers", []))
@@ -270,6 +287,7 @@ class RequestBodyLimitMiddleware:
                 pass  # Malformed Content-Length — let downstream handle it
             else:
                 if length > max_bytes:
+                    mark_refused_before_auth(scope)
                     response = _too_large_response(max_bytes)
                     await response(scope, receive, send)
                     return
@@ -295,6 +313,7 @@ class RequestBodyLimitMiddleware:
         async def sending(message: dict) -> None:
             if limit_exceeded and message.get("type") == "http.response.start":
                 # Override the response with 413 before headers are sent
+                mark_refused_before_auth(scope)
                 error_response = _too_large_response(max_bytes)
                 await error_response(scope, receive, send)
                 return

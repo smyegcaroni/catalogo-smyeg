@@ -13,7 +13,7 @@ all parked on an upstream fetch every other request in that worker waits out
 ``db_pool_timeout`` and then errors: login, search, the admin UI.
 
 ``/api/tiles/raster-proxy/...`` reaches this anonymously on any public raster,
-which is why the vector path's fix(#1451) remedy applies here too. That one
+which is why the vector path's remedy applies here too. That one
 states the same reasoning at ``_assert_dataset_still_registered`` and is pinned
 by ``test_tile_cached_authz_liveness_1451.py``; this is its raster twin.
 
@@ -50,6 +50,8 @@ def _row(dataset_id: uuid.UUID) -> dict:
         "tile_cache_version": 1,
         "publication_version": 0,
         "member_sources": {},
+        "record_id": uuid.uuid4(),
+        "member_ids": [],
     }
 
 

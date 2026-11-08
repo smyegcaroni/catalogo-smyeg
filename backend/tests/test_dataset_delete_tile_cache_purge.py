@@ -5,7 +5,7 @@ content version — and ``generate_table_name`` only collided against LIVE
 rows and relations, so a table name freed by a delete was immediately
 reusable. Without a purge on delete, the next dataset that landed on the
 freed name was authorized on its OWN visibility while being served the
-deleted dataset's cached bytes for up to ``tile_cache_ttl`` (default 300s,
+deleted dataset's cached bytes for up to ``tile_cache_ttl`` (default 3600s,
 tunable to 86400). Delete a private dataset, re-upload a public one that
 draws the same table name, and the deleted private geometry reached
 anonymous callers.
@@ -97,7 +97,7 @@ async def _run_delete(dataset: MagicMock) -> str:
         ),
         patch("app.platform.storage.provider.get_storage", return_value=_MockStorage()),
     ):
-        # fix(#1847): delete_dataset returns a DatasetDeletion now; these
+        # delete_dataset returns a DatasetDeletion; these
         # tests are about the tile purge, so hand back the table name.
         deletion = await delete_dataset(session, dataset.id, dataset.record.title)
         return deletion.table_name

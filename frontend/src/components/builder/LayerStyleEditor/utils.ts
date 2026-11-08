@@ -1,19 +1,12 @@
+import { deepEqual } from '@/lib/deep-equal';
 import { MAP_COLORS } from '@/lib/map-colors';
 import type { BuilderStyleConfig, MapLayerResponse, StyleConfig } from '@/types/api';
 
-// ---------------------------------------------------------------------------
-// SP-05 (Phase 1045): dirty-tracking helper
-//
-// Exported for unit testing. Returns true iff the editor draft (`draft`)
-// diverges from its server-state baseline (`saved`) in any of:
-//   - paint   (Record<string, unknown>)
-//   - layout  (Record<string, unknown>)
-//   - style_config (StyleConfig | null)
-//
-// Identity-equal references short-circuit to false. When `saved` is undefined,
-// returns false — the caller has no baseline to compare against, so the
-// "Pending style preview" banner stays hidden (smoke check 2026-05-15, M-04).
-// ---------------------------------------------------------------------------
+// Exported for unit testing. True iff the editor draft (`draft`) diverges from
+// its server-state baseline (`saved`) in paint, layout or style_config.
+// Identity-equal references short-circuit to false. When `saved` is undefined it
+// returns false: with no baseline to compare, the "Pending style preview"
+// banner stays hidden.
 export function hasUnsavedStyleChanges(
   draft: MapLayerResponse,
   saved: MapLayerResponse | undefined,
@@ -25,32 +18,6 @@ export function hasUnsavedStyleChanges(
     && deepEqual(draft.layout ?? {}, saved.layout ?? {})
     && deepEqual(draft.style_config ?? null, saved.style_config ?? null)
   );
-}
-
-// Small inline deep-equality for plain JSON-ish values (objects, arrays,
-// primitives, null). Sufficient for paint/layout/style_config which are JSON.
-// Avoids pulling in lodash for a one-call surface.
-export function deepEqual(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') {
-    return false;
-  }
-  if (Array.isArray(a) !== Array.isArray(b)) return false;
-  if (Array.isArray(a) && Array.isArray(b)) {
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i += 1) {
-      if (!deepEqual(a[i], b[i])) return false;
-    }
-    return true;
-  }
-  const aKeys = Object.keys(a as Record<string, unknown>);
-  const bKeys = Object.keys(b as Record<string, unknown>);
-  if (aKeys.length !== bKeys.length) return false;
-  for (const key of aKeys) {
-    if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
-    if (!deepEqual((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key])) return false;
-  }
-  return true;
 }
 
 export const LINE_DASH_PRESETS = [
@@ -88,10 +55,9 @@ export function getPaintValue<T>(paint: Record<string, unknown>, key: string, fa
   return val !== undefined && val !== null ? (val as T) : fallback;
 }
 
-// builder-audit #338 TYPE-01: returns either a scalar number or a MapLibre expression
-// array (data-driven / zoom expression) — never an arbitrary `unknown`. Typed as
-// `number | unknown[]` so callers (ZoomExpressionEditor `value`) get the
-// scalar-or-expression contract the name promises.
+// Returns a scalar number or a MapLibre expression array (data-driven / zoom
+// expression), never an arbitrary `unknown`, so callers (ZoomExpressionEditor
+// `value`) get the scalar-or-expression contract.
 export function getEditableNumericPaintValue(
   paint: Record<string, unknown>,
   key: string,

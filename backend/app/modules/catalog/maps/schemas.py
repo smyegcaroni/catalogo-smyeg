@@ -2,14 +2,16 @@ import json
 import re
 import uuid
 from datetime import datetime, timezone
-from enum import Enum
-from typing import Annotated, Any, TypedDict
+from enum import Enum, StrEnum
+from typing import Annotated, Any, Literal, TypedDict
 
 from pydantic import (
     AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
+    FiniteFloat,
+    PlainSerializer,
     StringConstraints,
     field_validator,
     model_serializer,
@@ -18,6 +20,8 @@ from pydantic import (
 
 from app.core.edition import is_enterprise
 from app.core.text import normalize_nfc as _nfc
+from app.modules.auth.schemas import GroupRef
+from app.modules.catalog.maps.dashboard import DashboardConfig, DashboardConfigInput
 from app.modules.catalog.maps.filter_grammar import validate_filter
 from app.modules.catalog.maps.publish_vocabulary import (
     LABEL_CONFIG_DESCRIPTION,
@@ -27,7 +31,11 @@ from app.modules.catalog.maps.sharing_policy import (
     SHARE_EXPIRATION_SELECTION_ERROR,
     ShareExpirationPresetDays,
 )
+from app.modules.catalog.maps.visibility_contract import (
+    restricted_map_visibility_opted_in,
+)
 from app.modules.embed_tokens.schemas import ADVANCED_SHARING_ERROR
+from app.platform.extensions.reader_theme import ReaderTheme
 
 LEGACY_BUILDER_PAINT_KEYS = {
     "_outline-width": "outline_width",
@@ -43,28 +51,28 @@ LEGACY_BUILDER_PAINT_KEYS = {
     "_heatmap-weight-column": "heatmap_weight_column",
     "_height_column": "height_column",
     # Raster colormap/stretch builder-private keys (buildColormapTileUrl),
-    # moved into style_config.builder so the paint storage boundary stays
-    # clean and the round-trip persists across save/reload.
+    # kept in style_config.builder so paint stays clean and the round-trip
+    # persists across save/reload.
     "_colormap": "colormap",
     "_stretch": "stretch",
     "_pmin": "pmin",
     "_pmax": "pmax",
     "_sigma": "sigma",
     # DEM hypsometric (color-relief) builder-private keys (DEMEditorScene),
-    # moved into style_config.builder for the same reason as above.
+    # kept in style_config.builder for the same reason.
     "_hypso-enabled": "hypso_enabled",
     "_hypso-ramp": "hypso_ramp",
     "_hypso-reversed": "hypso_reversed",
 }
 _STYLE_CONFIG_BUILDER_KEY = "builder"
 
-# fix(Phase 1060 G-x): the frontend normalizes builder keys to camelCase
-# on layer load, so a duplicated layer's POST would persist camelCase
-# while the original stays snake_case without this rewrite.
+# The frontend normalizes builder keys to camelCase on layer load, so without
+# this rewrite a duplicated layer's POST would persist camelCase while the
+# original stays snake_case.
 #
-# builder-audit #338 STYLE-01/SPEC-08: the AUTHORITATIVE alias map — the
-# inverse (below) is what style_json.py imports, so a hand-written copy
-# can't drift and leak snake_case keys into exported style.json.
+# The authoritative alias map. Its inverse (below) is what style_json.py
+# imports, so the two can't drift and leak snake_case keys into exported
+# style.json.
 _BUILDER_CAMEL_TO_SNAKE_KEYS = {
     "fillDisabled": "fill_disabled",
     "strokeDisabled": "stroke_disabled",
@@ -95,9 +103,8 @@ _BUILDER_CAMEL_TO_SNAKE_KEYS = {
     "folderGroupExpanded": "folder_group_expanded",
 }
 
-# builder-audit #338 STYLE-01/SPEC-08: derived inverse of the table
-# above, imported by `style_json.py` instead of a hand-written copy, so
-# export can't drift (exhaustive — includes prior-missed folder_group_* keys).
+# Derived inverse of the table above, imported by `style_json.py` so export
+# can't drift.
 BUILDER_SNAKE_TO_CAMEL_KEYS = {
     snake: camel for camel, snake in _BUILDER_CAMEL_TO_SNAKE_KEYS.items()
 }
@@ -121,9 +128,9 @@ def canonicalize_builder_style_config(
     converted: dict = {}
     for key, value in builder.items():
         canonical = _BUILDER_CAMEL_TO_SNAKE_KEYS.get(key, key)
-        # If both camelCase and snake_case appear, snake_case wins by
-        # virtue of being written last (callers typically pass snake_case
-        # as the default style; camelCase only shows up on duplicates).
+        # If both spellings appear, snake_case wins by being written last
+        # (callers pass snake_case as the default; camelCase shows up on
+        # duplicates).
         if canonical in converted and canonical != key:
             continue
         converted[canonical] = value
@@ -143,11 +150,11 @@ _MAX_STYLE_DICT_BYTES = (
 # MapUpdate.layers caps the per-map layer count. Real maps rarely exceed 50 layers.
 _MAX_LAYERS_PER_MAP = 200
 # How many style-import warnings the summary reports individually before it
-# starts counting instead (fix(#1778)).
+# starts counting instead.
 _MAX_IMPORT_WARNINGS = 100
-# fix(#1778): the raw `layers` array isn't the logical layer
-# count — a GeoLens export emits up to 4 style layers per logical one
-# (companions), so this bound is 4 * _MAX_LAYERS_PER_MAP + 200 headroom.
+# The raw `layers` array isn't the logical layer count: a GeoLens export emits
+# up to 4 style layers per logical one (companions), so this bound is
+# 4 * _MAX_LAYERS_PER_MAP + 200 headroom.
 _MAX_STYLE_DOCUMENT_LAYERS = 4 * _MAX_LAYERS_PER_MAP + 200
 
 
@@ -171,9 +178,9 @@ def _validate_style_dict(v: dict | None) -> dict | None:
 def _validate_filter_field(v: list | None) -> list | None:
     """Bound a layer filter's nesting and size, then normalize its grammar.
 
-    fix(#1778): `filter` was the one open JSONB column missing the size
-    cap (the cap above only covers dicts) — a 20000-clause filter stored
-    2.5 MB of JSONB, re-serialized on every export and builder load.
+    `filter` needs its own size cap (the cap above only covers dicts); an
+    unbounded filter would store megabytes of JSONB, re-serialized on every
+    export and builder load.
 
     `validate_filter` runs first since it carries the nesting bound;
     size-checking an unbounded filter first would RecursionError instead
@@ -187,12 +194,12 @@ def _validate_filter_field(v: list | None) -> list | None:
 def _validate_maplibre_style_dict(v: dict | None) -> dict | None:
     """Size-cap a paint/layout dict, then shape-check any legacy ``stops``.
 
-    fix(#1069): paint/layout were bounded only by serialized size, so a
-    structurally nonsense value (``{"fill-pattern": {"stops": 1}}``)
-    persisted and later 500'd whatever serializer descended into it.
+    A size cap alone would let a structurally nonsense value
+    (``{"fill-pattern": {"stops": 1}}``) persist and later 500 whatever
+    serializer descended into it.
 
     ``stops`` only, and only as a direct property value (not inside an
-    expression operand, fix(#1109)) — the legacy shape (a list of
+    expression operand) — the legacy shape (a list of
     ``[input, output]`` pairs) needs no per-property allowlist to check.
 
     ``style_config`` keeps just the size cap: its own ``stops`` shape
@@ -297,29 +304,46 @@ class PopupConfig(BaseModel):
         return v
 
 
-class MapVisibility(str, Enum):
-    # Note: 'restricted' is intentionally omitted — maps don't support
-    # restricted visibility; only datasets do.
+class MapVisibility(StrEnum):
+    """Who may read a map. A response names `restricted` only to a client
+    that sends `X-GeoLens-Map-Visibility: restricted`; any other client
+    reads a restricted map as `private`."""
+
     private = "private"
     internal = "internal"
     public = "public"
+    restricted = "restricted"
+
+
+def _project_map_visibility(value: MapVisibility) -> MapVisibility:
+    if value == MapVisibility.restricted and not restricted_map_visibility_opted_in():
+        return MapVisibility.private
+    return value
+
+
+ReadMapVisibility = Annotated[
+    MapVisibility,
+    PlainSerializer(
+        _project_map_visibility, return_type=MapVisibility, when_used="json"
+    ),
+]
 
 
 class TerrainConfig(BaseModel):
     enabled: bool = Field(default=False)
     source_dataset_id: uuid.UUID | None = Field(default=None)
     # Upper bound matches frontend TERRAIN_EXAGGERATION_MAX (map-sync.ts):
-    # the client clamps rendered values to [0, 3], so a stored value > 3
-    # would silently render as 3 — accept only what the client can render.
+    # the client clamps to [0, 3], so a larger stored value would silently
+    # render as 3.
     exaggeration: float = Field(default=1.0, ge=0.0, le=3.0)
 
     model_config = ConfigDict(extra="forbid")
 
     @model_validator(mode="after")
     def _enabled_requires_source(self) -> "TerrainConfig":
-        # fix(HT-15): an enabled mesh with no source produces dangling
-        # status text; coerce to disabled rather than raise, since this
-        # model also validates stored JSONB on read (MapResponse).
+        # An enabled mesh with no source leaves dangling status text. Coerce
+        # to disabled rather than raise, since this model also validates
+        # stored JSONB on read (MapResponse).
         if self.enabled and self.source_dataset_id is None:
             self.enabled = False
         return self
@@ -364,9 +388,8 @@ class BasemapProjection(str, Enum):
     globe = "globe"
 
 
-# Regex for #RRGGBB validation: exact 6 hex digits, case-insensitive.
-# Rejects raw names, short/long hex, and URI schemes ("javascript:",
-# "data:") — security: T-1059A-01.
+# #RRGGBB: exactly 6 hex digits. Rejects names, short/long hex and URI schemes
+# ("javascript:", "data:").
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
@@ -447,7 +470,7 @@ class SublayerOverride(BaseModel):
 
     @model_validator(mode="after")
     def _validate_zoom_order(self) -> "SublayerOverride":
-        """WR-02: Ensure min_zoom <= max_zoom when both are specified.
+        """Ensure min_zoom <= max_zoom when both are specified.
 
         MapLibre's behavior with an inverted range is undefined and
         version-dependent — in practice the layer becomes permanently
@@ -558,12 +581,11 @@ class LabelTextAnchor(str, Enum):
 
 
 class LabelConfig(BaseModel):
-    """Per-layer text-label configuration (builder-audit #338 P2-05).
+    """Per-layer text-label configuration.
 
-    Previously ``label_config`` was an untyped ``dict`` at the API boundary
-    while the frontend adapters (``label-layer-utils.ts``) assumed specific
-    camelCase fields. This schema gives the editable fields bounds/enums while
-    staying forward-compatible:
+    The frontend adapters (``label-layer-utils.ts``) read specific camelCase
+    fields. This schema gives the editable fields bounds/enums while staying
+    forward-compatible:
 
     * ``model_config = ConfigDict(extra="allow")`` keeps unknown / future keys
       (migration-safe for rows written by older or newer clients);
@@ -612,8 +634,8 @@ class LabelConfig(BaseModel):
 
     @model_serializer(mode="wrap")
     def _serialize_drop_none(self, handler) -> dict:
-        # Keep the persisted JSONB shape minimal and backward-compatible: only
-        # emit keys the client actually set (extras included via extra="allow").
+        # Keep the persisted JSONB minimal: only emit keys the client set
+        # (extras included via extra="allow").
         data = handler(self)
         return {key: value for key, value in data.items() if value is not None}
 
@@ -621,7 +643,7 @@ class LabelConfig(BaseModel):
 def _validate_label_config_dict(v: dict | None) -> dict | None:
     """Validate label_config bounds/enums through LabelConfig, return a dict.
 
-    builder-audit #338 P2-05: stays a plain ``dict`` on the wire/storage
+    Stays a plain ``dict`` on the wire/storage
     boundary, but every write is validated against ``LabelConfig`` (422 on
     out-of-range/bad-enum values). ``extra="allow"`` plus the None-dropping
     serializer keep unknown keys and the minimal shape, so old rows
@@ -634,9 +656,9 @@ def _validate_label_config_dict(v: dict | None) -> dict | None:
 
 
 class MapLayerInput(BaseModel):
-    # fix(#430): without an id here, _replace_layers' by-id reconcile
-    # (V-14) never matched on real PUTs. Optional: ids match only against
-    # THIS map's existing layers, so a foreign id can't hijack another map's row.
+    # The id lets _replace_layers' by-id reconcile match on PUT. Optional: ids
+    # match only against this map's existing layers, so a foreign id can't
+    # hijack another map's row.
     id: uuid.UUID | None = Field(
         default=None,
         description="Existing layer id to update in place (full-save reconcile)",
@@ -656,7 +678,12 @@ class MapLayerInput(BaseModel):
         default=None, description="MapLibre paint properties override"
     )
     layout: dict | None = Field(
-        default=None, description="MapLibre layout properties override"
+        default=None,
+        description=(
+            "MapLibre layout properties override. `_minzoom` and `_maxzoom` set "
+            "the zoom range where the layer is visible; the exported style "
+            "writes them as `minzoom` and `maxzoom`."
+        ),
     )
     display_name: str | None = Field(
         default=None, max_length=255, description="Label shown in the layer list"
@@ -675,17 +702,15 @@ class MapLayerInput(BaseModel):
 
     _validate_paint = field_validator("paint")(_validate_maplibre_style_dict)
     _validate_layout = field_validator("layout")(_validate_maplibre_style_dict)
-    # builder-audit #338 P2-05: validate label_config bounds/enums via LabelConfig but
-    # keep the stored value a plain dict so downstream JSONB assignment is
-    # unchanged (see _validate_label_config_dict).
+    # Validates label_config bounds/enums via LabelConfig but keeps the stored
+    # value a plain dict (see _validate_label_config_dict).
     _validate_label_config = field_validator("label_config")(
         _validate_label_config_dict
     )
     _validate_style_config = field_validator("style_config")(_validate_style_dict)
-    # builder-audit #338 P1-04: validate/normalize the editable MapLibre filter subset
-    # (shared with style import/export and AI set_filter via filter_grammar).
-    # fix(#1778): through _validate_filter_field, which adds the size cap the
-    # other open columns already carry on top of the shared grammar.
+    # The editable MapLibre filter subset (filter_grammar, shared with style
+    # import/export and AI set_filter), plus the size cap the other open
+    # columns carry, via _validate_filter_field.
     _validate_filter = field_validator("filter")(_validate_filter_field)
     layer_type: str | None = Field(
         default=None,
@@ -702,9 +727,9 @@ class MapLayerInput(BaseModel):
             self.paint,
             self.style_config,
         )
-        # Phase 1060: canonicalize builder keys to snake_case (storage shape)
-        # so frontend-normalized camelCase keys don't persist as a separate
-        # schema after layer duplication. See canonicalize_builder_style_config.
+        # Store builder keys as snake_case so frontend-normalized camelCase
+        # keys don't persist as a second schema (see
+        # canonicalize_builder_style_config).
         self.style_config = canonicalize_builder_style_config(self.style_config)
         _validate_maplibre_style_dict(self.paint)
         _validate_style_dict(self.style_config)
@@ -720,7 +745,11 @@ class MapLayerPatch(BaseModel):
         default=None, description="MapLibre paint properties override"
     )
     layout: dict | None = Field(
-        default=None, description="MapLibre layout properties override"
+        default=None,
+        description=(
+            "MapLibre layout properties override. `_minzoom` and `_maxzoom` set "
+            "the zoom range where the layer is visible."
+        ),
     )
     display_name: str | None = Field(default=None, max_length=255)
     filter: list | None = Field(default=None, description="MapLibre filter expression")
@@ -737,25 +766,24 @@ class MapLayerPatch(BaseModel):
 
     _validate_paint = field_validator("paint")(_validate_maplibre_style_dict)
     _validate_layout = field_validator("layout")(_validate_maplibre_style_dict)
-    # builder-audit #338 P2-05: validate label_config bounds/enums via LabelConfig but
-    # keep the stored value a plain dict so downstream JSONB assignment is
-    # unchanged (see _validate_label_config_dict).
+    # Validates label_config bounds/enums via LabelConfig but keeps the stored
+    # value a plain dict (see _validate_label_config_dict).
     _validate_label_config = field_validator("label_config")(
         _validate_label_config_dict
     )
     _validate_style_config = field_validator("style_config")(_validate_style_dict)
-    # builder-audit #338 P1-04: validate/normalize the editable MapLibre filter subset
-    # (shared with style import/export and AI set_filter via filter_grammar).
-    # fix(#1778): through _validate_filter_field, which adds the size cap the
-    # other open columns already carry on top of the shared grammar.
+    # The editable MapLibre filter subset (filter_grammar, shared with style
+    # import/export and AI set_filter), plus the size cap the other open
+    # columns carry, via _validate_filter_field.
     _validate_filter = field_validator("filter")(_validate_filter_field)
 
     @model_validator(mode="before")
     @classmethod
     def _normalize_paint_boundary(cls, data: Any) -> Any:
-        # fix(HT-14): MUST run in before-mode — an after-validator adding
+        # Must run in before-mode: an after-validator that sets
         # self.paint/style_config unconditionally defeats exclude_unset=True,
-        # so a partial patch like {id, visible} erases stored DEM/builder metadata.
+        # so a partial patch like {id, visible} would erase stored DEM/builder
+        # metadata.
         if not isinstance(data, dict):
             return data
         if "paint" not in data and "style_config" not in data:
@@ -768,9 +796,9 @@ class MapLayerPatch(BaseModel):
             # Let field validation reject the wrong type.
             return data
         paint, style_config = split_legacy_builder_paint(paint, style_config)
-        # Phase 1060: canonicalize builder keys to snake_case (storage shape)
-        # so frontend-normalized camelCase keys don't persist as a separate
-        # schema after layer duplication. See canonicalize_builder_style_config.
+        # Store builder keys as snake_case so frontend-normalized camelCase
+        # keys don't persist as a second schema (see
+        # canonicalize_builder_style_config).
         style_config = canonicalize_builder_style_config(style_config)
         data = dict(data)
         if "paint" in data:
@@ -857,8 +885,12 @@ class MapUpdate(BaseModel):
     def normalize_nfc(cls, v: str | None) -> str | None:
         return _nfc(v)
 
-    center_lng: float | None = Field(default=None, description="Map center longitude")
-    center_lat: float | None = Field(default=None, description="Map center latitude")
+    center_lng: FiniteFloat | None = Field(
+        default=None, description="Map center longitude"
+    )
+    center_lat: FiniteFloat | None = Field(
+        default=None, description="Map center latitude"
+    )
     zoom: float | None = Field(default=None, ge=0, le=24, description="Map zoom level")
     bearing: float | None = Field(
         default=None, ge=-180, le=180, description="Map rotation in degrees"
@@ -870,6 +902,15 @@ class MapUpdate(BaseModel):
         default=None, max_length=2000, description="Basemap style ID or URL"
     )
     show_basemap_labels: bool | None = None
+    show_attribute_table: bool | None = Field(
+        default=None,
+        description=(
+            "Whether viewers offer each layer's attribute table. Embed tokens "
+            "for the map may read a layer's rows only while it is on; the "
+            "columns they may read come from each dataset's tile column "
+            "allowlist."
+        ),
+    )
     basemap_config: BasemapConfig | None = Field(
         default=None,
         description="Curated map-level basemap appearance preferences",
@@ -878,8 +919,17 @@ class MapUpdate(BaseModel):
         default=None,
         description="Map-level terrain source and exaggeration preferences",
     )
+    dashboard_config: DashboardConfigInput | None = Field(
+        default=None,
+        description="The dashboard. Omit to keep it; null removes the widgets you see.",
+    )
     visibility: MapVisibility | None = Field(
-        default=None, description="private, internal, or public"
+        default=None,
+        description=(
+            "private, internal, public or restricted. A map shared with groups "
+            "is restricted when it would otherwise be private, so private keeps "
+            "it restricted; restricted needs at least one group."
+        ),
     )
     layers: list[MapLayerInput] | None = Field(
         default=None,
@@ -899,6 +949,16 @@ class MapUpdate(BaseModel):
             "without a heading override. At most 120 characters."
         ),
     )
+    # Excluded from model_dump: a precondition, not a field the save writes.
+    expected_updated_at: datetime | None = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "The map's `updated_at` the caller read. When set and the map has "
+            "changed since, nothing is written and the answer is 409 with "
+            "`detail.code` `stale_write`. Omit it to write unconditionally."
+        ),
+    )
 
     @field_validator("legend_title", mode="before")
     @classmethod
@@ -907,9 +967,9 @@ class MapUpdate(BaseModel):
 
     @model_validator(mode="after")
     def _validate_unique_layer_ids(self) -> "MapUpdate":
-        # fix(#430): a full-replace repeating an id would
-        # silently collapse entries in the by-id reconcile (second
-        # overwrites first); mirrors PATCH's duplicate-id rejection.
+        # A repeated id would silently collapse entries in the by-id
+        # reconcile (the second overwrites the first); mirrors PATCH's
+        # duplicate-id rejection.
         if self.layers is not None:
             ids = [layer.id for layer in self.layers if layer.id is not None]
             if len(set(ids)) != len(ids):
@@ -925,6 +985,7 @@ class DatasetMetaKwargs(TypedDict, total=False):
     table_name: str
     extent: object
     column_info: list | None
+    tile_columns: list[str] | None
     feature_count: int | None
     sample_values: dict | None
     record_type: str | None
@@ -946,7 +1007,21 @@ class MapLayerResponse(BaseModel):
     dataset_geometry_type: str | None
     dataset_table_name: str
     dataset_extent_bbox: list[float] | None
-    dataset_column_info: list[dict] | None = None
+    dataset_column_info: list[dict] | None = Field(
+        default=None,
+        description=(
+            "The dataset's columns, each with its name and type. In a map "
+            "response each also carries its current attribute title, semantic "
+            "role and value labels when set."
+        ),
+    )
+    dataset_tile_columns: list[str] | None = Field(
+        default=None,
+        description=(
+            "Dataset tile attribute allowlist, used to check cluster filters; "
+            "null allows all queryable columns, [] exposes none."
+        ),
+    )
     dataset_feature_count: int | None = None
     dataset_sample_values: dict | None = None
     display_name: str | None = None
@@ -966,22 +1041,20 @@ class MapLayerResponse(BaseModel):
     is_dem: bool | None = None
     dem_vertical_units: str | None = None
     band_count: int | None = None
-    # fix(#394) VT-02: dataset content version. Feeds the client `_v=` tile-URL
-    # cache-buster (map-sync.ts); the server-side Valkey purge is B-019.
-    # fix(#525): now reads Dataset.tile_cache_version (bumped by feature
-    # edits, column DDL, tile_columns changes, AND reupload) instead of
-    # current_version (reupload-only), so every content mutation rolls the URL.
+    # Dataset content version, the client's `_v=` tile-URL cache-buster
+    # (map-sync.ts). Reads Dataset.tile_cache_version (bumped by feature edits,
+    # column DDL, tile_columns changes and reupload), not current_version
+    # (reupload only), so every content mutation rolls the URL.
     tile_version: int | None = None
-    # fix(#1963): the counter the signed tile scope binds. The saved-map style
-    # document is a tile-signature minter, so it needs the same version the
-    # tile route verifies against.
+    # The counter the signed tile scope binds. The saved-map style document
+    # mints tile signatures, so it needs the version the tile route verifies.
     publication_version: int | None = None
-    # fix(#430): dataset visibility/status so the builder can badge a layer whose
+    # Dataset visibility/status so the builder can badge a layer whose
     # dataset is hidden from a public/shared map's anonymous audience.
     dataset_visibility: str | None = None
     dataset_status: str | None = None
-    # feat(#1472): the dataset's required credit line, so the viewer can put it
-    # in MapLibre's attribution control alongside the basemap's.
+    # The dataset's required credit line, shown in MapLibre's attribution
+    # control alongside the basemap's.
     dataset_attribution: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
@@ -999,9 +1072,19 @@ class MapResponse(BaseModel):
     pitch: float
     basemap_style: str
     show_basemap_labels: bool
+    show_attribute_table: bool = Field(
+        default=True,
+        description=(
+            "Whether viewers offer each layer's attribute table. Embed tokens "
+            "for the map may read a layer's rows only while it is on; the "
+            "columns they may read come from each dataset's tile column "
+            "allowlist."
+        ),
+    )
     basemap_config: BasemapConfig | None = None
     terrain_config: TerrainConfig | None = None
-    visibility: MapVisibility
+    dashboard_config: DashboardConfig | None = None
+    visibility: ReadMapVisibility
     thumbnail_url: str | None = None
     og_image_url: str | None = None
     forked_from_id: uuid.UUID | None = Field(
@@ -1016,8 +1099,99 @@ class MapResponse(BaseModel):
     layer_count: int
     plugins: list[str] | None = None
     legend_title: str | None = None
+    groups: list[GroupRef] | None = Field(
+        default=None,
+        description=(
+            "The sharing groups the map is shared with, by name. Set on the "
+            "detail endpoint for the owner and admins only; null elsewhere."
+        ),
+    )
+    reader_theme: ReaderTheme | None = Field(
+        default=None,
+        description=(
+            "The theme a branding extension sets for the map's viewer and "
+            "dashboard; null without one. The Builder ignores it."
+        ),
+    )
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class MapGroupsUpdate(BaseModel):
+    group_ids: list[uuid.UUID] = Field(
+        max_length=100,
+        description=(
+            "Every group the map is shared with afterwards; an empty list "
+            "unshares it. An owner may add only groups they belong to, and an "
+            "admin any group."
+        ),
+    )
+    confirm: Literal["share_datasets", "map_only"] | None = Field(
+        default=None,
+        description=(
+            "Required when the map would become restricted with layers some "
+            "of its new groups can't read; without it the request answers 409 "
+            "and lists them. `share_datasets` also shares each such dataset "
+            "the caller may share with the groups that lack it; `map_only` "
+            "leaves those layers hidden from them."
+        ),
+    )
+    expected_updated_at: datetime | None = Field(
+        default=None,
+        description=(
+            "The map's `updated_at` the caller read. When set and the map has "
+            "changed since, its groups included, nothing is written and the "
+            "answer is 409 with `detail.code` `stale_write`. Omit it to write "
+            "unconditionally."
+        ),
+    )
+
+
+class MapLayerAccessGap(BaseModel):
+    layer_id: uuid.UUID
+    layer_title: str
+    dataset_id: uuid.UUID
+    dataset_title: str
+    group_ids: list[uuid.UUID] = Field(
+        description="The map's groups that have a member who can't read it."
+    )
+    can_share: bool = Field(
+        description=(
+            "Whether `confirm: share_datasets` would share the dataset with "
+            "those groups."
+        )
+    )
+
+
+class MapGroupsResponse(BaseModel):
+    visibility: ReadMapVisibility = Field(
+        description=(
+            "The map's visibility after the change: a private map shared with "
+            "a group becomes restricted, and a restricted one left with no "
+            "group becomes private."
+        )
+    )
+    groups: list[GroupRef] = Field(
+        description="The sharing groups the map is shared with, by name."
+    )
+    shared_dataset_ids: list[uuid.UUID] = Field(
+        default_factory=list,
+        description="Datasets this request shared with the map's new groups.",
+    )
+    hidden_layers: list[MapLayerAccessGap] = Field(
+        default_factory=list,
+        description=(
+            "Layers that some of the map's new groups still can't read; the "
+            "same shape a 409 lists under `detail.layers`."
+        ),
+    )
+    updated_at: datetime | None = Field(
+        default=None,
+        description=(
+            "The map's `updated_at` after the change, which any change to its "
+            "groups moves."
+        ),
+    )
 
 
 class MapStyleImportWarning(BaseModel):
@@ -1033,9 +1207,9 @@ class MapStyleImportSummary(BaseModel):
     layers_imported: int = 0
     layers_skipped: int = 0
     warnings: list[MapStyleImportWarning] = Field(default_factory=list)
-    # fix(#1778): a document can carry an unbounded number of unmatched
-    # sources, each serialized into the 201 response as a DOM node. Keep
-    # the first _MAX_IMPORT_WARNINGS and count the rest.
+    # A document can carry unboundedly many unmatched sources, each rendered
+    # as a DOM node from the 201 response. Keep the first
+    # _MAX_IMPORT_WARNINGS and count the rest.
     warnings_truncated: int = Field(
         default=0,
         ge=0,
@@ -1070,10 +1244,6 @@ class MapStyleImportRequest(BaseModel):
     forward-compatibility with future MapLibre fields (e.g. ``projection``,
     ``light``, ``transition``) so adding a new key on the client side
     doesn't require a server release.
-
-    Replacing the previous bare-``dict`` body parameter removes
-    ``additionalProperties: true`` from the OpenAPI schema and lets
-    openapi-python-client generate a navigable named model class.
     """
 
     version: int | None = Field(
@@ -1089,7 +1259,7 @@ class MapStyleImportRequest(BaseModel):
         default=None,
         description="Free-form metadata bag (used by GeoLens for center/zoom/basemap hints)",
     )
-    center: list[float] | None = Field(
+    center: list[FiniteFloat] | None = Field(
         default=None,
         description="[longitude, latitude] map center",
     )
@@ -1100,9 +1270,9 @@ class MapStyleImportRequest(BaseModel):
         default=None,
         description="MapLibre sources object keyed by source id",
     )
-    # fix(#1672): the spec allows both the base-URL string and array form,
-    # but GET .../style.json always emits array — a string-only field made
-    # exported styles fail import with 422 (couldn't round-trip).
+    # The spec allows a base-URL string or an array, and GET .../style.json
+    # always emits the array, so a string-only field would make exported
+    # styles fail import with 422.
     sprite: (
         Annotated[str, StringConstraints(max_length=2000)] | list[MapSpriteEntry] | None
     ) = Field(
@@ -1117,9 +1287,9 @@ class MapStyleImportRequest(BaseModel):
         default=None,
         description="MapLibre terrain config (source + exaggeration)",
     )
-    # fix(#1778): bounds the raw document before anything walks it —
-    # _MAX_LAYERS_PER_MAP here would wrongly refuse a >50-polygon export
-    # (the logical limit applies after companion classification instead).
+    # Bounds the raw document before anything walks it. _MAX_LAYERS_PER_MAP
+    # here would refuse a large export; the logical limit applies after
+    # companion classification.
     layers: list[dict] | None = Field(
         default=None,
         max_length=_MAX_STYLE_DOCUMENT_LAYERS,
@@ -1154,13 +1324,16 @@ class MapSummaryResponse(BaseModel):
     id: uuid.UUID
     name: str
     description: str | None
-    visibility: MapVisibility
+    visibility: ReadMapVisibility
     thumbnail_url: str | None = None
-    # fix(#1005): the thumbnail's cache version, separate from the map's edit
-    # timestamp. Null for maps whose thumbnail predates the column; the card
-    # falls back to `updated_at` so it keeps a stable version either way.
+    # The thumbnail's cache version, apart from the map's edit timestamp.
+    # Null for older thumbnails; the card falls back to `updated_at`.
     thumbnail_updated_at: datetime | None = None
     layer_count: int
+    has_dashboard: bool = Field(
+        default=False,
+        description="True when the map shows you at least one dashboard widget.",
+    )
     created_by_username: str | None = None
     created_at: datetime
     updated_at: datetime
@@ -1222,16 +1395,23 @@ class SharedLayerResponse(BaseModel):
     dem_vertical_units: str | None = None
     is_3d: bool | None = None
     feature_count: int | None = None
-    # fix(#394) VT-02: dataset content version for the `_v=` tile cache-buster
-    # (viewer parity with MapLayerResponse.tile_version).
+    # Dataset content version for the `_v=` tile cache-buster, as on
+    # MapLayerResponse.tile_version.
     tile_version: int | None = None
-    # feat(#1472): viewer parity with MapLayerResponse.dataset_attribution. The
-    # shared/embed viewer is the surface a license's display obligation most
-    # needs to reach, since it is the one shown to people outside the instance.
+    # As on MapLayerResponse.dataset_attribution. The shared/embed viewer is
+    # shown to people outside the instance, where a license's display
+    # obligation matters most.
     dataset_attribution: str | None = None
-    # Viewer parity with MapLayerResponse.dataset_extent_bbox: an RFC 7946
-    # bbox, with west > east on an antimeridian crossing.
+    # As on MapLayerResponse.dataset_extent_bbox: an RFC 7946 bbox, with
+    # west > east on an antimeridian crossing.
     dataset_extent_bbox: list[float] | None = None
+    dataset_tile_columns: list[str] | None = Field(
+        default=None,
+        description=(
+            "Dataset tile attribute allowlist, as on MapLayerResponse: null "
+            "allows all queryable columns, [] exposes none."
+        ),
+    )
 
 
 class SharedMapResponse(BaseModel):
@@ -1240,21 +1420,42 @@ class SharedMapResponse(BaseModel):
     center_lng: float
     center_lat: float
     zoom: float
+    has_saved_view: bool = Field(
+        description=(
+            "True when the map stores a center and zoom. When false, center and "
+            "zoom are defaults and a viewer should fit the layers instead."
+        ),
+    )
     bearing: float
     pitch: float
     basemap_style: str
     show_basemap_labels: bool = True
+    show_attribute_table: bool = Field(
+        default=True,
+        description=(
+            "Whether the viewer offers each layer's attribute table. The columns "
+            "an embed may read come from each dataset's tile column allowlist."
+        ),
+    )
     basemap_config: BasemapConfig | None = None
     terrain_config: TerrainConfig | None = None
+    dashboard_config: DashboardConfig | None = None
     has_non_public_layers: bool = False
     legend_title: str | None = None
     layers: list[SharedLayerResponse]
+    reader_theme: ReaderTheme | None = Field(
+        default=None,
+        description=(
+            "The theme a branding extension sets for the viewer and its "
+            "dashboard; null without one."
+        ),
+    )
 
 
 class ShareTokenRequest(BaseModel):
-    # fix(#435): `AwareDatetime`, not bare `datetime` — Pydantic accepts a
-    # naive ISO string, and comparing it to an aware datetime below raised
-    # TypeError (500) instead of AwareDatetime's clean 422.
+    # `AwareDatetime`, not `datetime`: Pydantic accepts a naive ISO string,
+    # and comparing it to an aware datetime below would raise TypeError (500)
+    # instead of a 422.
     expires_at: AwareDatetime | None = Field(
         default=None,
         description=(
@@ -1279,10 +1480,10 @@ class ShareTokenRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_enterprise_controls(self):
-        # fix(#435): the edition boundary was enforced only by the two
-        # route handlers, so a direct service caller could bypass it.
-        # Guard at the schema too, mirroring `EmbedTokenCreate`. ``None`` stays
-        # valid: Community can still clear an existing expiration.
+        # The route handlers enforce the edition boundary, but a direct
+        # service caller could bypass it, so the schema guards too (as
+        # `EmbedTokenCreate` does). ``None`` stays valid: Community can still
+        # clear an expiration.
         if self.expires_at is not None and self.expires_in_days is not None:
             raise ValueError(SHARE_EXPIRATION_SELECTION_ERROR)
         if self.expires_at is not None and not is_enterprise():
@@ -1294,6 +1495,12 @@ class ShareTokenResponse(BaseModel):
     token: str = Field(description="Raw token on create, hint on retrieve")
     share_url: str | None = Field(
         default=None, description="Full shareable URL — only returned on create"
+    )
+    share_url_absolute: str | None = Field(
+        default=None, description="share_url on the public app URL; create only"
+    )
+    viewer_url: str | None = Field(
+        default=None, description="The map page on the public app URL"
     )
     expires_at: datetime | None = None
     is_active: bool = True
@@ -1354,11 +1561,14 @@ class VisibilityCheckResponse(BaseModel):
     has_non_public: bool = Field(
         description="True if any layer references a non-public dataset"
     )
-
-
-# fix(Phase 1047, milestone exception PB-03/PERF-03): one additive
-# endpoint permitted per REQUIREMENTS.md Out-of-Scope, to reduce N
-# sequential DELETEs to one batched bulk-delete call.
+    hidden_from_groups: list[MapLayerAccessGap] = Field(
+        default_factory=list,
+        description=(
+            "On a restricted map, the layers some of its groups can't read, "
+            "among those the caller reads. Empty on other maps, and when the "
+            "permission authority can't say who reads a dataset."
+        ),
+    )
 
 
 class BulkDeleteLayersRequest(BaseModel):

@@ -14,6 +14,7 @@ from app.modules.auth.models import User
 from app.modules.catalog.datasets.domain.models import Dataset, Record
 from app.platform.jobs.models import IngestJob
 from app.processing.ingest.manifest_schemas import ManifestApplyRequest, ManifestDataset
+from app.processing.ingest.manifest_service import MANIFEST_KEY_NOT_OWNED
 from app.processing.ingest.manifest_sources import (
     classify_manifest_source,
     manifest_dataset_fingerprint,
@@ -285,7 +286,7 @@ class TestManifestApplyEndpointRoundTrip:
         test_db_session,
         clean_tables,
     ):
-        # fix(#430 BA-02): the caller must OWN the manifest-managed datasets, else the
+        # The caller must OWN the manifest-managed datasets, else the
         # write-access gate now (correctly) denies the update. This test exercises
         # dry-run side-effect-freeness, not cross-user authz — so run it as the
         # owner (admin). The cross-user denial has its own test below.
@@ -386,7 +387,7 @@ class TestManifestApplyEndpointRoundTrip:
         test_db_session,
         clean_tables,
     ):
-        """fix(#430 BA-02): an editor cannot overwrite another user's manifest-managed
+        """An editor cannot overwrite another user's manifest-managed
         dataset, and dry_run must not leak that dataset's UUID (a pre-write oracle)."""
         owner = await _admin_user(test_db_session)
         original_payload = _dataset_payload(
@@ -454,11 +455,11 @@ class TestManifestApplyEndpointRoundTrip:
         test_db_session,
         clean_tables,
     ):
-        """fix(#430 codex r10, refuted): the BA-02 write gate dereferences
+        """The write gate dereferences
         dataset.record synchronously, which is only safe because the
         Dataset.record relationship is lazy='joined' (models.py) — the
         completed-manifest-job query has no explicit eager-load of its own.
-        Nothing pinned the legitimate NON-admin owner update path: the admin
+        The legitimate NON-admin owner update path is pinned here: the admin
         dry-run test short-circuits before touching record, and the
         cross-user test asserts an error entry. If the model-level eager
         load is ever weakened, this test catches the MissingGreenlet."""
@@ -502,8 +503,8 @@ class TestManifestApplyEndpointRoundTrip:
         assert entry["action"] == "update", entry
         assert entry["dataset_id"] == str(dataset.id)
 
-        # fix(#430 codex r15): the OWNER's same-fingerprint submit still
-        # returns the skip entry WITH ids (the new skip gates only bite
+        # The OWNER's same-fingerprint submit still
+        # returns the skip entry WITH ids (the skip gates only bite
         # non-owners).
         with patch(
             "app.platform.security.validate_url_for_ssrf",
@@ -526,11 +527,11 @@ class TestManifestApplyEndpointRoundTrip:
         test_db_session,
         clean_tables,
     ):
-        """fix(#430 codex r15): submitting a manifest whose key+fingerprint
-        matches ANOTHER user's completed or in-flight job previously returned
+        """Submitting a manifest whose key+fingerprint
+        matches ANOTHER user's completed or in-flight job must not return
         that user's job/dataset UUIDs in a 'skip' entry — the same
-        enumeration oracle BA-02 closed on the update path. Both skip paths
-        now yield an error entry with no ids for non-owners."""
+        enumeration oracle as on the update path. Both skip paths
+        yield an error entry with no ids for non-owners."""
         owner = await _admin_user(test_db_session)
 
         # -- skip_complete: victim has a COMPLETED job for this key --
@@ -606,6 +607,154 @@ class TestManifestApplyEndpointRoundTrip:
                 assert entry["action"] == "error", entry
                 assert entry.get("dataset_id") is None
                 assert entry.get("job_id") is None
+
+    async def test_admin_apply_never_reaches_a_key_another_user_owns(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        editor_auth_header: dict,
+        test_db_session,
+        clean_tables,
+    ):
+        """An admin's apply under a key an editor's dataset or apply holds is refused."""
+        me = await client.get("/auth/me/", headers=editor_auth_header)
+        editor = await test_db_session.get(User, uuid.UUID(me.json()["id"]))
+        held = _dataset_payload(
+            key="editor-held",
+            title="Editor Held",
+            uri="https://data.example.test/editor-held.geojson",
+        )
+        admin_entry = _dataset_payload(
+            key="editor-held",
+            title="Admin Source",
+            uri="https://data.example.test/admin-source.geojson",
+        )
+        in_flight = _dataset_payload(
+            key="editor-in-flight",
+            title="Editor In Flight",
+            uri="https://data.example.test/editor-in-flight.geojson",
+        )
+        held_dataset = await create_dataset(
+            test_db_session, created_by=editor.id, name="Editor Held"
+        )
+        with patch("app.platform.security.validate_url_for_ssrf", new=AsyncMock()):
+            await _create_completed_manifest_job(
+                test_db_session,
+                user=editor,
+                dataset=held_dataset,
+                manifest_dataset=ManifestApplyRequest.model_validate(
+                    _manifest_payload(held)
+                ).datasets[0],
+            )
+            in_flight_entry = ManifestApplyRequest.model_validate(
+                _manifest_payload(in_flight)
+            ).datasets[0]
+            prepared = await classify_manifest_source(in_flight_entry.sources[0])
+        test_db_session.add(
+            IngestJob(
+                source_filename=prepared.source_filename,
+                file_path=prepared.file_path,
+                created_by=editor.id,
+                status="pending",
+                user_metadata=manifest_job_metadata(
+                    in_flight_entry,
+                    prepared,
+                    fingerprint=manifest_dataset_fingerprint(in_flight_entry),
+                ),
+            )
+        )
+        await test_db_session.commit()
+        before_jobs = await test_db_session.scalar(select(func.count(IngestJob.id)))
+
+        for dry_run in (True, False):
+            with (
+                patch("app.platform.security.validate_url_for_ssrf", new=AsyncMock()),
+                patch(
+                    "app.processing.ingest.manifest_service._queue_reupload_job",
+                    new=AsyncMock(),
+                ) as reupload,
+            ):
+                response = await client.post(
+                    "/ingest/manifest/apply",
+                    json=_manifest_payload(admin_entry, in_flight, dry_run=dry_run),
+                    headers=admin_auth_header,
+                )
+                skip = await client.post(
+                    "/ingest/manifest/apply",
+                    json=_manifest_payload(held, dry_run=dry_run),
+                    headers=admin_auth_header,
+                )
+            assert response.status_code == 200
+            assert skip.status_code == 200
+            entries = [*response.json()["results"], *skip.json()["results"]]
+            assert len(entries) == 3
+            for entry in entries:
+                assert entry["action"] == "error", entry
+                assert entry["message"] == MANIFEST_KEY_NOT_OWNED
+                assert entry.get("dataset_id") is None
+                assert entry.get("job_id") is None
+            reupload.assert_not_awaited()
+
+        assert (
+            await test_db_session.scalar(select(func.count(IngestJob.id)))
+            == before_jobs
+        )
+        await test_db_session.refresh(held_dataset, attribute_names=["record"])
+        assert held_dataset.record.title == "Editor Held"
+
+    async def test_a_key_another_user_owns_is_refused_alike_visible_or_not(
+        self,
+        client: AsyncClient,
+        editor_auth_header: dict,
+        test_db_session,
+        clean_tables,
+    ):
+        """The refusal reads the same whether the key's dataset is visible to the caller."""
+        owner = await _admin_user(test_db_session)
+        payloads = []
+        for visibility in ("public", "private"):
+            original = _dataset_payload(
+                key=f"owned-{visibility}",
+                title="Owner Original",
+                uri=f"https://data.example.test/{visibility}-original.geojson",
+            )
+            dataset = await create_dataset(
+                test_db_session,
+                created_by=owner.id,
+                name=f"Owner {visibility}",
+                visibility=visibility,
+            )
+            with patch("app.platform.security.validate_url_for_ssrf", new=AsyncMock()):
+                await _create_completed_manifest_job(
+                    test_db_session,
+                    user=owner,
+                    dataset=dataset,
+                    manifest_dataset=ManifestApplyRequest.model_validate(
+                        _manifest_payload(original)
+                    ).datasets[0],
+                )
+            payloads.append(
+                {
+                    **original,
+                    "title": "Changed",
+                    "sources": [
+                        {
+                            **original["sources"][0],
+                            "uri": f"https://data.example.test/{visibility}-changed.geojson",
+                        }
+                    ],
+                }
+            )
+
+        with patch("app.platform.security.validate_url_for_ssrf", new=AsyncMock()):
+            response = await client.post(
+                "/ingest/manifest/apply",
+                json=_manifest_payload(*payloads, dry_run=True),
+                headers=editor_auth_header,
+            )
+        assert response.status_code == 200
+        messages = {entry["message"] for entry in response.json()["results"]}
+        assert messages == {MANIFEST_KEY_NOT_OWNED}
 
 
 class TestManifestCompletedDatasetRoundTrip:

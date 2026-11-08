@@ -1,6 +1,6 @@
-"""Tests for tenant session GUC wiring (ISO-01).
+"""Tests for tenant session GUC wiring.
 
-Plan 1208-01: ContextVar + after_begin engine hook + dual-entrypoint wiring.
+ContextVar + after_begin engine hook + dual-entrypoint wiring.
 
 Test coverage:
   A — current_tenant_var exists with default None; exported from app.core.db
@@ -225,7 +225,7 @@ async def test_guc_never_set_in_single_tenant(fresh_engine):
 async def test_guc_refuses_a_tenant_id_that_is_not_a_uuid(fresh_engine):
     """A value with a single quote must not raise, and must not reach the GUC.
 
-    fix(#1778 codex r5): the hook issues ``SET LOCAL app.current_tenant = '...'``
+    The hook issues ``SET LOCAL app.current_tenant = '...'``
     rather than ``SELECT set_config(..., true)``, because the SELECT form takes
     the transaction's first snapshot and locks out SET TRANSACTION ISOLATION
     LEVEL / DEFERRABLE. ``SET`` accepts no bind parameter, so the guard moved
@@ -310,7 +310,7 @@ class TestMiddlewareBridge:
     def test_middleware_resolves_slug_and_bridges_uuid_in_multi_tenant(self):
         """multi_tenant: the slug signal is resolved to a UUID, which is bridged.
 
-        Regression for the Gap-A Codex finding (PR #256): the middleware must
+        Regression for PR #256: the middleware must
         hand current_tenant_var a tenant UUID, not the raw subdomain slug — the
         RLS GUC casts ::uuid. We patch the resolver to keep this a fast unit
         test and assert (a) the extracted slug reaches the resolver and (b) the
@@ -505,6 +505,100 @@ class TestResolveTenantUuid:
             core_db, "async_session", side_effect=RuntimeError("db down")
         ):
             assert await _resolve_tenant_uuid("acme") is None
+
+
+def _registry(rows: dict[str, uuid.UUID]) -> tuple[MagicMock, list[str]]:
+    """An async_session stand-in answering slug lookups from ``rows``."""
+    lookups: list[str] = []
+
+    async def _scalar(_statement, params):
+        lookups.append(params["slug"])
+        return rows.get(params["slug"])
+
+    session = MagicMock()
+    session.scalar = _scalar
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=session)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return MagicMock(return_value=cm), lookups
+
+
+class TestTenantHostCache:
+    """Host resolutions are reused for a short TTL; misses are never cached."""
+
+    @pytest.mark.asyncio
+    async def test_repeat_host_is_answered_without_a_lookup(self):
+        import app.core.db as core_db
+        from app.api.middleware.tenant_context import _resolve_tenant_uuid
+
+        target = uuid.uuid4()
+        factory, lookups = _registry({"acme": target})
+        with patch.object(core_db, "async_session", factory):
+            assert await _resolve_tenant_uuid("acme") == str(target)
+            assert await _resolve_tenant_uuid("acme") == str(target)
+        assert lookups == ["acme"]
+
+    @pytest.mark.asyncio
+    async def test_deleted_tenant_stops_resolving_after_the_ttl(self, monkeypatch):
+        import app.core.db as core_db
+        from app.api.middleware import tenant_context
+
+        clock = [1000.0]
+        monkeypatch.setattr(tenant_context.time, "monotonic", lambda: clock[0])
+        rows = {"acme": uuid.uuid4()}
+        factory, lookups = _registry(rows)
+        with patch.object(core_db, "async_session", factory):
+            assert await tenant_context._resolve_tenant_uuid("acme") is not None
+            del rows["acme"]
+            clock[0] += tenant_context._TENANT_HOST_CACHE_TTL_SECONDS
+            assert await tenant_context._resolve_tenant_uuid("acme") is None
+        assert lookups == ["acme", "acme"]
+
+    @pytest.mark.asyncio
+    async def test_reregistered_slug_resolves_to_the_new_tenant_after_the_ttl(
+        self, monkeypatch
+    ):
+        import app.core.db as core_db
+        from app.api.middleware import tenant_context
+
+        clock = [1000.0]
+        monkeypatch.setattr(tenant_context.time, "monotonic", lambda: clock[0])
+        old, new = uuid.uuid4(), uuid.uuid4()
+        rows = {"acme": old}
+        factory, _ = _registry(rows)
+        with patch.object(core_db, "async_session", factory):
+            assert await tenant_context._resolve_tenant_uuid("acme") == str(old)
+            rows["acme"] = new
+            clock[0] += tenant_context._TENANT_HOST_CACHE_TTL_SECONDS
+            assert await tenant_context._resolve_tenant_uuid("acme") == str(new)
+
+    @pytest.mark.asyncio
+    async def test_unknown_host_is_looked_up_every_time(self):
+        import app.core.db as core_db
+        from app.api.middleware.tenant_context import _resolve_tenant_uuid
+
+        rows: dict[str, uuid.UUID] = {}
+        factory, lookups = _registry(rows)
+        with patch.object(core_db, "async_session", factory):
+            assert await _resolve_tenant_uuid("acme") is None
+            rows["acme"] = uuid.uuid4()
+            assert await _resolve_tenant_uuid("acme") == str(rows["acme"])
+        assert lookups == ["acme", "acme"]
+
+    @pytest.mark.asyncio
+    async def test_cache_is_bounded(self, monkeypatch):
+        import app.core.db as core_db
+        from app.api.middleware import tenant_context
+
+        monkeypatch.setattr(tenant_context, "_TENANT_HOST_CACHE_MAX_ENTRIES", 2)
+        factory, lookups = _registry(
+            {slug: uuid.uuid4() for slug in ("a1", "b2", "c3")}
+        )
+        with patch.object(core_db, "async_session", factory):
+            for slug in ("a1", "b2", "c3", "a1"):
+                await tenant_context._resolve_tenant_uuid(slug)
+        assert lookups == ["a1", "b2", "c3", "a1"]
+        assert len(tenant_context._tenant_host_cache) == 2
 
 
 class TestVerifiedJwtTenantClaim:
@@ -1443,7 +1537,7 @@ async def test_live_tenant_tile_binary_has_tenant_qualified_mvt_layer_name():
                 )
 
         assert tile is not None
-        assert _mvt_layer_names(bytes(tile)) == [f"{schema}.{table}"]
+        assert _mvt_layer_names(tile.mvt) == [f"{schema}.{table}"]
     finally:
         _reload_settings()
         if role_created:
@@ -1502,6 +1596,8 @@ async def test_raster_metadata_cache_is_tenant_scoped_and_filtered():
         "tile_cache_version": 1,
         "publication_version": 0,
         "member_sources": {},
+        "record_id": uuid.uuid4(),
+        "member_ids": [],
     }
     result_a = MagicMock()
     result_a.mappings.return_value.one_or_none.return_value = row

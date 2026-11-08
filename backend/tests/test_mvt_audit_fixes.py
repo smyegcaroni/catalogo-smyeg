@@ -1,10 +1,10 @@
-"""Unit tests for the builder-audit #338 MVT remediation (service/router pure helpers).
+"""Unit tests for the MVT remediation (service/router pure helpers).
 
 Covers (no DB / no asyncpg pool):
-  - MVT-07: continuous simplification-tolerance schedule across the z5->z6 boundary.
-  - MVT-01: the MVT source-layer name stays schema-qualified for client parity.
-  - MVT-09: the table-name regex has a single shared definition.
-  - MVT-04: ETag generation + conditional-request (If-None-Match -> 304) helpers.
+  - Continuous simplification-tolerance schedule across the z5->z6 boundary.
+  - The MVT source-layer name stays schema-qualified for client parity.
+  - The table-name regex has a single shared definition.
+  - ETag generation + conditional-request (If-None-Match -> 304) helpers.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from app.processing.tiles.router import (
 )
 from app.processing.tiles.service import (
     _NO_SIMPLIFY_AT_OR_ABOVE_ZOOM,
+    _SAMPLE_ORDER,
     _build_cluster_tile_query,
     _build_tile_query,
     _simplify_tolerance_degrees,
@@ -31,7 +32,7 @@ from app.processing.tiles.service import (
 
 
 # ---------------------------------------------------------------------------
-# MVT-07: simplification-tolerance continuity
+# Simplification-tolerance continuity
 # ---------------------------------------------------------------------------
 
 
@@ -75,9 +76,9 @@ def test_tile_query_uses_single_continuous_simplify_basis():
 
 
 # ---------------------------------------------------------------------------
-# MVT-01: the source-layer name stays schema-qualified.
+# The source-layer name stays schema-qualified.
 #
-# builder-audit #338 MVT-01 flagged that the multi_tenant MVT layer name
+# The multi_tenant MVT layer name
 # (data_t_<tid>.table) diverged from the client's hardcoded data.table. The
 # tile-config contract now gives clients the resolved physical prefix while tile
 # signing retains its logical data.table route. This server regression keeps the
@@ -88,10 +89,10 @@ def test_tile_query_uses_single_continuous_simplify_basis():
 async def test_get_tile_layer_name_is_schema_qualified():
     """get_tile passes ``{schema}.{table}`` — "data.table" in single_tenant."""
     conn = AsyncMock()
-    conn.fetchval.return_value = b"\x1a"  # non-empty MVT bytes
+    conn.fetchrow.return_value = (b"\x1a", False)  # non-empty MVT bytes
     await get_tile(None, "places", 5, 1, 1, [{"name": "gid"}], conn=conn, schema="data")
-    # fetchval(query, z, x, y, layer_name) — single_tenant matches the client.
-    assert conn.fetchval.call_args.args[4] == "data.places"
+    # fetchrow(query, z, x, y, layer_name) — single_tenant matches the client.
+    assert conn.fetchrow.call_args.args[4] == "data.places"
 
 
 def test_tile_query_from_clause_is_schema_qualified():
@@ -101,7 +102,7 @@ def test_tile_query_from_clause_is_schema_qualified():
 
 
 # ---------------------------------------------------------------------------
-# MVT-09: single source of truth for the table-name regex
+# Single source of truth for the table-name regex
 # ---------------------------------------------------------------------------
 
 
@@ -111,7 +112,7 @@ def test_table_name_regex_is_single_source():
 
 
 # ---------------------------------------------------------------------------
-# MVT-04: ETag + conditional request helpers
+# ETag + conditional request helpers
 # ---------------------------------------------------------------------------
 
 
@@ -156,12 +157,12 @@ def test_tile_response_returns_304_on_matching_if_none_match():
 
 
 # ---------------------------------------------------------------------------
-# fix(#394) VT-05 / VT-06 / VT-07: 2026-07-03 builder-audit query-shape fixes
+# Query-shape fixes
 # ---------------------------------------------------------------------------
 
 
 def test_tile_query_makevalid_guards_simplify_only():
-    """VT-05: ST_MakeValid wraps the simplify input; the z>=cutoff branch is untouched."""
+    """ST_MakeValid wraps the simplify input; the z>=cutoff branch is untouched."""
     query = _build_tile_query("places", [])
     assert "ST_MakeValid(t.geom_4326)" in query
     # The unsimplified branch must still serve the original geometry.
@@ -169,13 +170,13 @@ def test_tile_query_makevalid_guards_simplify_only():
 
 
 def test_tile_query_drops_null_geometry_features():
-    """VT-06: the vector query filters NULL post-clip geometries like the cluster query."""
+    """The vector query filters NULL post-clip geometries like the cluster query."""
     query = _build_tile_query("places", [])
     assert "WHERE mvtgeom.geom IS NOT NULL" in query
 
 
 def test_cluster_query_emits_positive_offset_gid():
-    """VT-07: cluster feature ids are positive (ST_AsMVT drops non-positive ids)
+    """Cluster feature ids are positive (ST_AsMVT drops non-positive ids)
     and offset out of the realistic serial-gid range."""
     query = _build_cluster_tile_query("places")
     assert "-row_number()" not in query
@@ -185,12 +186,12 @@ def test_cluster_query_emits_positive_offset_gid():
 
 
 # ---------------------------------------------------------------------------
-# fix(#868): cluster bucket grid — px->extent conversion + absolute anchoring
+# Cluster bucket grid — px->extent conversion + absolute anchoring
 # ---------------------------------------------------------------------------
 
 
 def test_cluster_query_converts_px_radius_to_extent_units():
-    """fix(#868): $6 arrives in CSS/screen pixels but the grid lives in MVT
+    """$6 arrives in CSS/screen pixels but the grid lives in MVT
     extent units. At 512 px tile display one pixel is 4096/512 = 8 extent
     units; the old math skipped the factor and built a ~8x-too-fine grid
     (overlapping clusters + unclustered singles leaking at low zoom)."""
@@ -200,7 +201,7 @@ def test_cluster_query_converts_px_radius_to_extent_units():
 
 
 def test_cluster_query_buckets_on_absolute_3857_grid():
-    """fix(#868): the bucket grid anchors to absolute EPSG:3857 coordinates,
+    """The bucket grid anchors to absolute EPSG:3857 coordinates,
     not the tile's own minx/miny. Bucket size at a fixed zoom is identical
     for every tile, so absolute anchoring is what makes adjacent tiles at
     one zoom share a single aligned grid (no cluster seams at borders)."""
@@ -211,37 +212,37 @@ def test_cluster_query_buckets_on_absolute_3857_grid():
     assert "ST_Y(candidates.geom_3857)" in query
     # The degenerate-size guard must survive the rework.
     assert "GREATEST(bounds.width * $6::float8" in query
-    # codex P2 rounds (#872): straddling cells — expanded candidate scan,
+    # #872: straddling cells — expanded candidate scan,
     # deterministic membership under the cap, and cell-ORIGIN anchor
     # ownership (pure grid geometry, never dependent on the scanned subset).
     assert "ST_Expand(" in query
-    assert "ORDER BY t.gid" in query
+    assert f"ORDER BY {_SAMPLE_ORDER}" in query
     assert "anchored.anchor_x >= ST_XMin(bounds.geom)" in query
-    # codex round 3 (#872): the grid anchors to the WORLD MINIMUM, so every
+    # #872: the grid anchors to the WORLD MINIMUM, so every
     # in-world point yields an in-world cell origin (a 0-anchored grid lost
     # cells straddling lon -180 to ownership rejection).
     assert "ST_XMin(ST_TileEnvelope(0, 0, 0)) AS world_min_x" in query
     assert "(ST_X(candidates.geom_3857) - grid.world_min_x)" in query
     assert "grid.world_min_x + bucketed.bucket_x * grid.bucket_w" in query
-    # codex round 3 (#872): no scan expansion past cluster max zoom — ring
+    # #872: no scan expansion past cluster max zoom — ring
     # rows would only burn the candidate cap before ownership drops them.
     assert "ELSE 0.0" in query
     # World-edge tiles own boundary anchors via inclusive upper bounds.
     assert "(1 << $1::integer) - 1" in query  # east edge: x = 2^z - 1
     assert "$3::integer = 0" in query  # north edge: y = 0
-    # codex round 4 (#872): ownership must filter BEFORE the feature cap so
+    # #872: ownership must filter BEFORE the feature cap so
     # neighbor-owned cells cannot consume the output budget.
     assert query.index("anchored.anchor_x >= ST_XMin(bounds.geom)") < query.index(
         "GROUP BY bucket_x, bucket_y"
     )
-    # codex round 4 (#872): emitted geometry is clamped into the owning
+    # #872: emitted geometry is clamped into the owning
     # tile — an out-of-tile centroid would be invisible to a client whose
     # viewport never requests the owner tile.
     assert "LEAST(GREATEST(ST_X(grouped.geom_3857)" in query
 
 
 def test_cluster_query_derives_expansion_zoom_from_member_spread():
-    """fix(#874): expansion_zoom is the cluster's own split zoom, derived from
+    """expansion_zoom is the cluster's own split zoom, derived from
     the member spread against the halving bucket grid — not the constant
     cluster_max_zoom + 1 that made click-to-zoom jump from z2 to z15."""
     query = _build_cluster_tile_query("places")
@@ -256,7 +257,7 @@ def test_cluster_query_derives_expansion_zoom_from_member_spread():
 
 
 # ---------------------------------------------------------------------------
-# fix(#394) B-019/VT-01: reupload purges the MVT tile cache post-commit
+# Reupload purges the MVT tile cache post-commit
 # ---------------------------------------------------------------------------
 
 
@@ -286,7 +287,7 @@ async def test_invalidate_tile_cache_for_table_noop_without_provider(monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# fix(#403): cluster tiles project attribute columns onto UNCLUSTERED features
+# Cluster tiles project attribute columns onto UNCLUSTERED features
 # ---------------------------------------------------------------------------
 
 
@@ -324,7 +325,7 @@ async def test_get_cluster_tile_resolves_columns_like_get_tile():
     cols= opt-in projects at ANY zoom, and the low-zoom default projects
     nothing without an opt-in."""
     conn = AsyncMock()
-    conn.fetchval.return_value = b"\x1a"
+    conn.fetchrow.return_value = (b"\x1a", False)
     columns = [{"name": "mag"}, {"name": "place"}]
 
     # z=3 (< z10 default) with an explicit cols= opt-in for one column.
@@ -339,11 +340,11 @@ async def test_get_cluster_tile_resolves_columns_like_get_tile():
         conn=conn,
         schema="data",
     )
-    query = conn.fetchval.call_args.args[0]
+    query = conn.fetchrow.call_args.args[0]
     assert 'src."mag" AS "mag"' in query
     assert 'src."place"' not in query
 
     # Same zoom, no opt-in -> no projection at all.
     await get_cluster_tile(None, "places", 3, 1, 1, columns, conn=conn, schema="data")
-    query = conn.fetchval.call_args.args[0]
+    query = conn.fetchrow.call_args.args[0]
     assert "src." not in query

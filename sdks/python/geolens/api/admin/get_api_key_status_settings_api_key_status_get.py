@@ -90,9 +90,9 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[ApiKeyStatusResponse | ProblemDetail]:
-    """Get Api Key Status
+    """Get LLM provider key status
 
-     Return which LLM API keys are configured (without exposing values).
+     Return which LLM providers are configured (without exposing values).
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -115,9 +115,9 @@ def sync(
     *,
     client: AuthenticatedClient,
 ) -> ApiKeyStatusResponse | ProblemDetail | None:
-    """Get Api Key Status
+    """Get LLM provider key status
 
-     Return which LLM API keys are configured (without exposing values).
+     Return which LLM providers are configured (without exposing values).
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -136,9 +136,9 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[ApiKeyStatusResponse | ProblemDetail]:
-    """Get Api Key Status
+    """Get LLM provider key status
 
-     Return which LLM API keys are configured (without exposing values).
+     Return which LLM providers are configured (without exposing values).
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -159,9 +159,9 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
 ) -> ApiKeyStatusResponse | ProblemDetail | None:
-    """Get Api Key Status
+    """Get LLM provider key status
 
-     Return which LLM API keys are configured (without exposing values).
+     Return which LLM providers are configured (without exposing values).
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

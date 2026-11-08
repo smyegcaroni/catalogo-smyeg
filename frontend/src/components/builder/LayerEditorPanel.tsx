@@ -1,6 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronLeft, X } from 'lucide-react';
+import { ChevronLeft, Table2, X } from 'lucide-react';
 import { LayerStyleEditor } from './LayerStyleEditor';
 import { LayerFilterEditor } from './LayerFilterEditor';
 import { LabelEditor } from './LabelEditor';
@@ -8,7 +8,7 @@ import { PopupConfigEditor } from './PopupConfigEditor';
 import { RasterLayerControls } from './RasterLayerControls';
 import { InlineDeleteConfirm } from './row-chrome';
 import { cn } from '@/lib/utils';
-import { getLayerCapabilities } from '@/lib/layer-capabilities';
+import { canOpenAttributeTable, getLayerCapabilities } from '@/lib/layer-capabilities';
 import { getGeometryTypeLabel } from '@/i18n/labels';
 import { getRenderAsOptions, getCurrentRenderAs, hasCustomizedRenderAsStyle, type RenderAsId } from './renderAs';
 import { ColorizedGeometryIcon, getLayerColors, extractStyleHints, isDiscreteColorStyle } from '@/components/map/layer-icons';
@@ -27,13 +27,9 @@ export interface LayerEditorHandlers {
   onPopupChange: (layerId: string, config: PopupConfig | null) => void;
   onStyleConfigChange: (layerId: string, config: StyleConfig | null, paint: Record<string, unknown>, opts?: { replace?: boolean; restore?: boolean }) => void;
   onLayoutChange: (layerId: string, layout: Record<string, unknown>) => void;
-  // SF-02 (Phase 1049): widened to all RenderAsId values. use-builder-layers'
-  // handleRenderModeChange now dispatches non-circle modes through
-  // handleRenderAsChange to avoid stale layout/paint keys leaking across adapter
-  // boundaries (e.g. line→arrow leaving behind line-cap / line-join).
   onRenderModeChange?: (layerId: string, mode: RenderAsId) => void;
   onRemove: (layerId: string) => void;
-  /** fix(#913): called after a banner Revert so the page can re-derive whether
+  /** Called after a banner Revert so the page can re-derive whether
    *  the map is still dirty (the revert itself routes through the ordinary
    *  mutation handlers, which all mark it dirty). */
   onRevertToSaved?: () => void;
@@ -42,14 +38,14 @@ export interface LayerEditorHandlers {
 interface LayerEditorPanelProps {
   layer: MapLayerResponse;
   /**
-   * SP-05 (Phase 1045): server-state baseline for `layer`. When set, the
-   * embedded LayerStyleEditor gates its "Pending style preview" banner on a
-   * deep-equal diff against this baseline.
+   * Server-state baseline for `layer`. When set, the embedded LayerStyleEditor
+   * gates its "Pending style preview" banner on a deep-equal diff against this
+   * baseline.
    */
   savedLayer?: MapLayerResponse;
   activeTab?: LayerEditorTab | null;
   handlers: LayerEditorHandlers;
-  /** New: closes the flyout and deselects the row */
+  /** Closes the flyout and deselects the row */
   onClose: () => void;
   /** When true, shows a leading ‹ back arrow (used at <800px drill-down mode) */
   isDrillDown?: boolean;
@@ -67,17 +63,18 @@ interface LayerEditorPanelProps {
   breadcrumbPresetName?: string;
   /** Click handler for the breadcrumb element when editorScene === 'basemap-sublayer'. */
   onBreadcrumbClick?: () => void;
+  /** Opens the read-only attribute-table drawer for this layer. Rendered in
+   *  the default scene only, and only for layers whose dataset carries a
+   *  data table. */
+  onOpenAttributeTable?: (layerId: string) => void;
   /**
-   * EASY-18 (Phase 1138-03): rendered-feature count for the active layer;
-   * forwarded to the filter-tab LayerFilterEditor so it can render the
-   * empty-state hint when a filter is applied but 0 features are visible.
+   * Rendered-feature count for the active layer; forwarded to the filter-tab
+   * LayerFilterEditor so it can render the empty-state hint when a filter is
+   * applied but 0 features are visible.
    */
   featureCount?: number | null;
 }
 
-// ---------------------------------------------------------------------------
-// LayerEditorTypePill — small inline chip showing layer type in the header
-// ---------------------------------------------------------------------------
 function LayerEditorTypePill({ layer }: { layer: MapLayerResponse }) {
   const { t } = useTranslation('builder');
   const caps = getLayerCapabilities(layer);
@@ -87,7 +84,6 @@ function LayerEditorTypePill({ layer }: { layer: MapLayerResponse }) {
   let label: string;
   if (caps.kind === 'raster' || caps.kind === 'vrt') {
     if (layer.is_dem) {
-      // i18n: was the raw internal render_mode enum ('hillshade'/'terrain').
       const modeLabel = renderMode === 'hillshade'
         ? t('layerEditor.typePill.hillshade', { defaultValue: 'Hillshade' })
         : renderMode === 'terrain'
@@ -114,9 +110,6 @@ function LayerEditorTypePill({ layer }: { layer: MapLayerResponse }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Pip — tab status indicator (count badge or on/off dot)
-// ---------------------------------------------------------------------------
 function Pip({ count, on }: { count?: number | null; on?: boolean }) {
   if (typeof count === 'number') {
     return (
@@ -137,11 +130,9 @@ function Pip({ count, on }: { count?: number | null; on?: boolean }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Filter condition counter — best-effort: handles {match,conditions[]} shape
-// and raw maplibre expression arrays. Falls back to "1" for any non-null/empty
-// filter so the pip never lies in the false-negative direction.
-// ---------------------------------------------------------------------------
+// Filter condition counter, best-effort: handles {match,conditions[]} and raw
+// maplibre expression arrays. Falls back to "1" for any non-null/empty filter
+// so the pip never lies in the false-negative direction.
 function countFilterConditions(filter: FilterSpecification | null | undefined): number {
   if (filter == null) return 0;
   if (typeof filter === 'object' && !Array.isArray(filter)) {
@@ -171,6 +162,7 @@ export const LayerEditorPanel = memo(function LayerEditorPanel({
   sceneFooter,
   breadcrumbPresetName,
   onBreadcrumbClick,
+  onOpenAttributeTable,
   featureCount,
 }: LayerEditorPanelProps) {
   const { t } = useTranslation('builder');
@@ -196,11 +188,12 @@ export const LayerEditorPanel = memo(function LayerEditorPanel({
 
   const layerName = layer.display_name ?? layer.dataset_name;
   const isPureSettings = editorScene === 'settings';
+  const panelTitle = isPureSettings ? t('settings.panelTitle', { defaultValue: 'Settings' }) : layerName;
   const isDefaultScene = editorScene === 'default' || editorScene === undefined;
 
-  // Which tabs are available for this layer? Style is always present.
-  // Filter / Labels / Popup depend on layer capabilities. Source is gone — it
-  // lives in the row (···) menu in StackRow.
+  // Which tabs are available for this layer? Style is always present; Filter /
+  // Labels / Popup depend on layer capabilities. Source lives in the row (···)
+  // menu in StackRow.
   const availableTabs = useMemo<LayerEditorTab[]>(() => {
     const tabs: LayerEditorTab[] = ['style'];
     if (caps.supportsFilterEditor) tabs.push('filter');
@@ -219,10 +212,10 @@ export const LayerEditorPanel = memo(function LayerEditorPanel({
     return 'style';
   }, [activeTab, availableTabs]);
 
-  // fix(#524 B-034): roving-tabindex tablists need an arrow-key handler —
-  // inactive tabs carry tabIndex=-1, so without this a keyboard-only user has
-  // no path to the Filter/Labels/Popup editors at all. Selection follows focus
-  // (WAI-ARIA automatic-activation tabs pattern).
+  // Roving-tabindex tablists need an arrow-key handler: inactive tabs carry
+  // tabIndex=-1, so a keyboard-only user would otherwise have no path to the
+  // Filter/Labels/Popup editors. Selection follows focus (WAI-ARIA
+  // automatic-activation tabs pattern).
   const handleTablistKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
     const currentIndex = availableTabs.indexOf(resolvedActiveTab);
     let nextTab: LayerEditorTab | undefined;
@@ -245,14 +238,14 @@ export const LayerEditorPanel = memo(function LayerEditorPanel({
   // pill, hold the intended target until they confirm. null = no pending switch.
   const [pendingRenderAs, setPendingRenderAs] = useState<RenderAsId | null>(null);
 
-  // Reset local state when the layer changes (defensive — keyed remount upstream
-  // is the primary mechanism, but a future caller that omits the key would
-  // otherwise carry over stale pendingRenderAs).
+  // Reset local state when the layer changes (defensive: keyed remount upstream
+  // is the primary mechanism, but a caller that omits the key would carry over
+  // stale pendingRenderAs).
   useEffect(() => {
     setPendingRenderAs(null);
   }, [layer.id, editorScene]);
 
-  // POL-18: Scroll + focus preservation across scene transitions
+  // Scroll + focus preservation across scene transitions
   const bodyRef = useRef<HTMLDivElement>(null);
   const savedScrollTopRef = useRef<number | null>(null);
   const prevSceneRef = useRef(editorScene);
@@ -284,20 +277,17 @@ export const LayerEditorPanel = memo(function LayerEditorPanel({
     prevSceneRef.current = editorScene;
   }, [editorScene]);
 
-  // Pip data per tab — see commentary above availableTabs.
   const filterCount = countFilterConditions(layer.filter);
   const popupOn = layer.popup_config?.enabled === true;
   const labelsOn = Boolean(layer.label_config?.column);
 
   function handleRenderAsClick(target: RenderAsId) {
     if (target === currentRenderAs) return;
-    // fix(#430 V-09): only confirm when the CURRENT mode actually carries
-    // mode-specific style settings that diverge from that mode's defaults
-    // (see hasCustomizedRenderAsStyle). A fresh/default layer has nothing
-    // mode-specific to lose, so switch immediately — a clean layer clicking
-    // Point → Heatmap should not be interrupted. A layer whose current mode
-    // has been customized (e.g. a non-default cluster radius or arrow size)
-    // still confirms before applying.
+    // Only confirm when the CURRENT mode carries mode-specific style settings
+    // that diverge from that mode's defaults (see hasCustomizedRenderAsStyle).
+    // A fresh/default layer has nothing mode-specific to lose, so switch
+    // immediately; a customized one (e.g. a non-default cluster radius or arrow
+    // size) confirms before applying.
     if (hasCustomizedRenderAsStyle(layer)) {
       setPendingRenderAs(target);
       return;
@@ -309,7 +299,7 @@ export const LayerEditorPanel = memo(function LayerEditorPanel({
     if (pendingRenderAs) {
       handlers.onRenderModeChange?.(layer.id, pendingRenderAs);
       setPendingRenderAs(null);
-      // fix(#788): the confirm held focus (autofocused button); hand it to the
+      // The confirm held focus (autofocused button); hand it to the
       // pill that just became active instead of dropping to <body>.
       document.getElementById(`renderas-${layer.id}-${pendingRenderAs}`)?.focus();
     }
@@ -317,7 +307,7 @@ export const LayerEditorPanel = memo(function LayerEditorPanel({
 
   function cancelRenderAsSwitch() {
     setPendingRenderAs(null);
-    // fix(#788): return focus to the still-active pill instead of <body>.
+    // Return focus to the still-active pill instead of <body>.
     document.getElementById(`renderas-${layer.id}-${currentRenderAs}`)?.focus();
   }
 
@@ -343,9 +333,8 @@ export const LayerEditorPanel = memo(function LayerEditorPanel({
               onClick={onBreadcrumbClick}
               className="block text-mini leading-tight tracking-[0.04em] text-muted-foreground hover:text-foreground hover:underline"
             >
-              {/* fix(#788 item 1): translated — the visible text was a
-                  hardcoded English literal while the aria-label above is
-                  translated, so the two disagreed in non-English locales. */}
+              {/* Translated so the visible text agrees with the translated
+                  aria-label above. */}
               {t('basemapSublayer.breadcrumb', {
                 defaultValue: 'Basemap · {{name}} ›',
                 name:
@@ -385,27 +374,39 @@ export const LayerEditorPanel = memo(function LayerEditorPanel({
             <div className="flex items-center gap-2 min-w-0">
               <span
                 id="layer-editor-title"
+                title={panelTitle}
                 className="text-sm font-semibold truncate min-w-0"
               >
-                {isPureSettings ? t('settings.panelTitle', { defaultValue: 'Settings' }) : layerName}
+                {panelTitle}
               </span>
               {!isPureSettings && editorScene !== 'basemap-group' && editorScene !== 'basemap-sublayer' && (
                 <LayerEditorTypePill layer={layer} />
               )}
             </div>
-            {!isPureSettings && editorScene !== 'basemap-group' && editorScene !== 'basemap-sublayer' && (layer.dataset_geometry_type || caps.kind === 'raster' || caps.kind === 'vrt') && (
+            {!isPureSettings && editorScene !== 'basemap-group' && editorScene !== 'basemap-sublayer' &&
+              (caps.kind === 'raster' || caps.kind === 'vrt') &&
+              typeof layer.band_count === 'number' && layer.band_count >= 1 && (
               <span className="text-mini text-muted-foreground truncate">
-                {layer.dataset_geometry_type ?? (
-                  (caps.kind === 'raster' || caps.kind === 'vrt')
-                    ? (typeof layer.band_count === 'number' && layer.band_count >= 1
-                        ? t('style.raster.bandCount', { count: layer.band_count })
-                        : '')
-                    : ''
-                )}
+                {t('style.raster.bandCount', { count: layer.band_count })}
               </span>
             )}
           </div>
 
+          {/* Read-only data inspection from the editor header, mirroring the
+              layer-row kebab action. Default scene only: the DEM, basemap and
+              settings scenes have no dataset-backed layer behind them. */}
+          {isDefaultScene && onOpenAttributeTable && canOpenAttributeTable(layer) && (
+            <button
+              type="button"
+              data-testid="layer-editor-open-attribute-table"
+              onClick={() => onOpenAttributeTable(layer.id)}
+              aria-label={t('layerEditor.openAttributeTable', { defaultValue: 'Open attribute table' })}
+              title={t('layerEditor.openAttributeTable', { defaultValue: 'Open attribute table' })}
+              className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-[var(--surface-2)] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <Table2 className="h-4 w-4" aria-hidden="true" />
+            </button>
+          )}
           <button
             type="button"
             onClick={onClose}
@@ -479,11 +480,11 @@ export const LayerEditorPanel = memo(function LayerEditorPanel({
                     <section
                       aria-labelledby={`section-renderas-${layer.id}`}
                       className="rounded-md border bg-muted/25 p-3"
-                      // fix(#788): Escape with the render-as confirm pending
-                      // cancels the pending switch (consumed) — previously it
-                      // bubbled to the editor <aside> and closed the whole
-                      // panel with the confirm still open. Section-level so it
-                      // also covers focus resting on the pills.
+                      // Escape with the render-as confirm pending cancels the
+                      // pending switch (consumed) instead of bubbling to the
+                      // editor <aside> and closing the whole panel with the
+                      // confirm still open. Section-level so it also covers
+                      // focus resting on the pills.
                       onKeyDown={(e) => {
                         if (e.key === 'Escape' && pendingRenderAs) {
                           e.preventDefault();
@@ -504,7 +505,7 @@ export const LayerEditorPanel = memo(function LayerEditorPanel({
                           return (
                             <button
                               key={option.id}
-                              // fix(#788): stable id so confirm/cancel can
+                              // Stable id so confirm/cancel can
                               // restore keyboard focus to the pill.
                               id={`renderas-${layer.id}-${option.id}`}
                               type="button"
@@ -524,11 +525,11 @@ export const LayerEditorPanel = memo(function LayerEditorPanel({
                         })}
                       </div>
                       {pendingRenderAs && (
-                        // ux(#777): shared builder-wide inline confirm — safe
-                        // action left, destructive right, cancel autofocused.
-                        // fix(#788): the shared component supplies the
-                        // group+alert semantics and Escape-to-cancel; onCancel
-                        // (cancelRenderAsSwitch) restores focus to the pill.
+                        // Shared builder-wide inline confirm: safe action left,
+                        // destructive right, cancel autofocused. The shared
+                        // component supplies the group+alert semantics and
+                        // Escape-to-cancel; onCancel (cancelRenderAsSwitch)
+                        // restores focus to the pill.
                         <InlineDeleteConfirm
                           confirmId={`confirm-render-as-${layer.id}`}
                           message={t('layerEditor.confirmRenderAs.message', {
@@ -619,12 +620,13 @@ export const LayerEditorPanel = memo(function LayerEditorPanel({
           </>
         )}
 
-        {/* Non-default scene body — Plans 02/03/04 pass their scene component via sceneContent */}
+        {/* Non-default scene body: the scene component arrives via
+            sceneContent. */}
         {!isDefaultScene && sceneContent}
       </div>
 
-      {/* Footer — only rendered for non-default scenes that supply a sceneFooter.
-          Per v3 design, Delete moved into the row (···) menu (StackRow). */}
+      {/* Footer: only rendered for non-default scenes that supply a
+          sceneFooter. Delete lives in the row (···) menu (StackRow). */}
       {!isDefaultScene && !!sceneFooter && (
         <footer data-testid="layer-editor-footer" className="shrink-0 border-t p-3">
           {sceneFooter}

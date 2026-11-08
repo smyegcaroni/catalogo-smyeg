@@ -5,7 +5,7 @@ it: what happens when the caller DID supply a credential and it does not
 resolve — expired, revoked, or mistyped? There are only two answers, and before
 #1518 the codebase gave both. ``get_optional_user_or_401`` returned 401 and
 reached 8 handlers (the OGC and STAC detail routes, because those were the
-routers in scope for fix(#401)); the other 58 took the plain dependency and
+routers in scope for that fix); the other 58 took the plain dependency and
 silently continued as anonymous, returning 200 and the public subset. The split
 was never designed. It was inherited from which router got patched.
 
@@ -89,13 +89,25 @@ FAIL_OPEN_ALLOWLIST: dict[str, tuple[str, str]] = {
         "that expired, so refusing the call because it did not resolve makes "
         "the dead session permanent — the user cannot clear it and the browser "
         "keeps replaying it. The handler is not fail-open in effect: it falls "
-        "back to the refresh cookie and then a body token (fix(#1446)) and "
+        "back to the refresh cookie and then a body token and "
         "raises its own 401 when NOTHING presented resolves, so an entirely "
         "credential-less caller is still refused. See app/modules/auth/router.py.",
     ),
+    "app.modules.catalog.datasets.api.router_aggregate.aggregate_endpoint": (
+        CAPABILITY,
+        "Accepts X-Embed-Token as an independent capability, in the same order "
+        "as the GeoJSON-Z route: reject_unresolvable_credentials runs on the "
+        "`not embed_ok` path only.",
+    ),
+    "app.modules.catalog.datasets.api.router_data.get_dataset_rows_endpoint": (
+        CAPABILITY,
+        "Accepts X-Embed-Token as an independent capability, in the same order "
+        "as the aggregate route: reject_unresolvable_credentials runs on the "
+        "`not embed_ok` path only.",
+    ),
     "app.modules.catalog.features.router.get_features_geojson_z_endpoint": (
         CAPABILITY,
-        "Accepts X-Embed-Token as an independent capability (fix(#390)). The "
+        "Accepts X-Embed-Token as an independent capability. The "
         "embed branch runs first; reject_unresolvable_credentials is applied on "
         "the `not embed_ok` path, so a stale bearer alongside a VALID embed "
         "token is served and the same bearer alongside an invalid or absent one "
@@ -103,7 +115,7 @@ FAIL_OPEN_ALLOWLIST: dict[str, tuple[str, str]] = {
     ),
     "app.modules.catalog.maps.router_sharing.get_shared_map_endpoint": (
         CAPABILITY,
-        "Accepts X-Embed-Token to widen the layer scope (fix(#394) SH-01). "
+        "Accepts X-Embed-Token to widen the layer scope. "
         "get_shared_map now reports whether that capability authorized anything, "
         "and the handler applies the rule when it did not. The share token in "
         "the path selects the map but does not vouch for a dead session bearer, "
@@ -111,7 +123,7 @@ FAIL_OPEN_ALLOWLIST: dict[str, tuple[str, str]] = {
     ),
     "app.processing.tiles.router.get_tile_tokens_batch": (
         CAPABILITY,
-        "Accepts X-Embed-Token as a per-dataset fallback (fix(#394) SH-04). The "
+        "Accepts X-Embed-Token as a per-dataset fallback. The "
         "capability authorizes a SCOPE, so whether it authorized THIS request is "
         "only known after the id loop; the rule is applied after it when nothing "
         "in the batch was authorized by the token.",
@@ -475,7 +487,7 @@ async def test_the_two_dependencies_actually_differ(test_db_session) -> None:
     assert excinfo.value.status_code == 401
 
     # The no-schema variant exists to keep bearer security markers off public
-    # operations (fix(#430)), NOT to opt out of the failure-mode rule. It
+    # operations, NOT to opt out of the failure-mode rule. It
     # delegates, so it must answer identically — a future edit that pointed it
     # at the raw resolver would reintroduce the #1518 split on the STAC public
     # routes without tripping the allowlist above.
@@ -940,7 +952,7 @@ def test_no_security_schema_ops_get_401_without_security() -> None:
     """Documenting the status must not stamp auth back onto public operations.
 
     ``get_optional_user_no_security_schema`` exists so genuinely public STAC
-    operations carry no bearer markers in generated clients (fix(#430)). A 401
+    operations carry no bearer markers in generated clients. A 401
     RESPONSE is not a security REQUIREMENT, and this is the test that keeps the
     two from being conflated — without it, moving the 401 into
     ``_normalize_security_contract`` (the obvious place) would quietly
@@ -979,7 +991,7 @@ def test_no_security_schema_ops_get_401_without_security() -> None:
                 ), (
                     f"{method} {path} gained a credential security requirement. "
                     "The 401 response must be documented WITHOUT marking these "
-                    "public operations as authenticated (fix(#430))."
+                    "public operations as authenticated."
                 )
 
     assert checked > 0, (
@@ -1047,6 +1059,8 @@ def test_401_capability_sentence_matches_the_allowlist() -> None:
     }
 
     EXPECTED_CAPABILITY_TEXT = {
+        "app.modules.catalog.datasets.api.router_aggregate.aggregate_endpoint": embed_token_description,
+        "app.modules.catalog.datasets.api.router_data.get_dataset_rows_endpoint": embed_token_description,
         "app.modules.catalog.features.router.get_features_geojson_z_endpoint": embed_token_description,
         "app.modules.catalog.maps.router_sharing.get_shared_map_endpoint": embed_token_description,
         "app.processing.tiles.router.get_tile_tokens_batch": embed_token_description,
@@ -1136,7 +1150,7 @@ def test_401_capability_sentence_matches_the_allowlist() -> None:
 
 
 class TestEveryNoCapabilityExitAppliesTheRule:
-    """One row per no-capability EXIT CLASS, not per handler (codex P2 round 3).
+    """One row per no-capability EXIT CLASS, not per handler (codex P2).
 
     The first two rounds applied the rule at one exit point per handler and
     tested the success and plain-invalid rows, so whole classes of exit went
@@ -1155,7 +1169,7 @@ class TestEveryNoCapabilityExitAppliesTheRule:
     5. resource REVOKED           — expired share link            (EXEMPT, see below)
     6. dataset SHAPE refused      — cluster tiles on a non-point  (cluster tiles)
 
-    Round 4 filled in the two handlers the table named but never exercised —
+    Filled in the two handlers the table named but never exercised —
     the class-1 row claimed "tiles" while only features and the shared map were
     asserted, and no row touched the raster routes at all even though the
     raster proxy is one of the two sites codex reported. Class 4 on the vector
@@ -1163,9 +1177,9 @@ class TestEveryNoCapabilityExitAppliesTheRule:
     ``_authorize_vector_tile_request``, so the rule never reached them, and the
     raster sibling already answered 401 for the same request shape.
 
-    Round 4 also took the shared map back OUT of classes 4 and 5, which round 3
-    had put in. The test for an exit has to ask whether a credential could have
-    changed that exit's answer, and on a missing or revoked share link it could
+    The shared map was also taken back OUT of classes 4 and 5, where an
+    earlier revision had put it. The test for an exit has to ask whether a
+    credential could have changed that exit's answer, and on a missing or revoked share link it could
     not: the lookup takes no user at all. Turning those into 401s refused a
     caller for a failure that was not theirs and cost the viewer the one error
     message that tells them what to do about it. The rule still applies to that
@@ -1554,7 +1568,7 @@ def test_capability_declines_route_through_the_helper() -> None:
     The previous structural test could only require that a CAPABILITY handler
     CALLS ``reject_unresolvable_credentials`` somewhere reachable — it could not
     check that the call is on every no-capability path, which is exactly how
-    three exit classes shipped uncovered (codex P2 round 3).
+    three exit classes shipped uncovered (codex P2).
 
     Routing the declines through ``capability_declined`` makes that checkable:
     the ordering is a property of the call rather than of where a line sits, so

@@ -30,8 +30,6 @@
     "byVisibility": "按可见性统计的数据集",
     "noDatasets": "暂无数据集",
     "totalUsers": "用户总数",
-    "usersByStatus": "按状态统计的用户",
-    "noUsers": "暂无用户",
     "errorLoading": "加载统计信息失败：{{message}}"
   },
   "users": {
@@ -236,11 +234,6 @@
       "user": "用户",
       "allUsers": "所有用户",
       "allActions": "全部操作",
-      "datasetView": "数据集查看",
-      "datasetExport": "数据集导出",
-      "metadataEdit": "元数据编辑",
-      "datasetCreate": "数据集创建",
-      "datasetDelete": "数据集删除",
       "action": "操作",
       "userId": "用户 ID",
       "resourceType": "资源类型",
@@ -285,14 +278,8 @@
     "tileCache": "瓦片缓存",
     "type": "类型",
     "status": "状态",
-    "latency": "延迟",
-    "ttl": "TTL",
     "cdn": "CDN",
-    "pooler": "连接池",
-    "connected": "已连接",
-    "disconnected": "已断开",
     "configured": "已配置",
-    "notConfigured": "未配置",
     "loading": "正在加载基础设施状态...",
     "errorLoading": "加载基础设施状态失败",
     "allOperational": "所有系统运行正常",
@@ -385,6 +372,8 @@
     "openaiKeyRequired": "未设置 OPENAI_API_KEY。即使推理使用 Anthropic，嵌入生成也需要 OpenAI 兼容的 API 密钥。",
     "keyConfigured": "已配置",
     "keyNotSet": "未设置",
+    "claudePlatformConfigured": "{{platform}} 上的 Claude：已配置",
+    "claudePlatformNotConfigured": "{{platform}} 上的 Claude：未配置",
     "testConnection": "测试连接",
     "testing": "测试中…",
     "testConnectionDescription": "对每个已配置的提供商发起一次真实调用，以验证密钥和连通性。会消耗少量模型 token（词元）。",
@@ -416,6 +405,20 @@
     "scope": "范围",
     "scopeFull": "完全访问",
     "scopeReadOnly": "只读",
+    "scopePublish": "发布",
+    "scopePublishDescription": "添加您自己的数据与地图，编辑您的数据集信息，并替换已上传的数据集，保留其先前版本。不能将任何内容设为公开或提高数据集的可见性级别，不能更新已有地图，不能替换栅格数据集或绑定到服务、STAC 项或数据表的数据集，不能写入要素，也不能删除任何内容。",
+    "scopeDatasetWrite": "单个数据集",
+    "scopeDatasetAppend": "单个数据集，仅添加",
+    "expiry": "有效期",
+    "expiryOptions": {
+      "never": "永不过期",
+      "30d": "30 天",
+      "90d": "90 天",
+      "1y": "1 年"
+    },
+    "expired": "已过期",
+    "expiresOn": "{{date}} 过期",
+    "expiredOn": "已于 {{date}} 过期",
     "creating": "正在创建...",
     "createError": "创建密钥失败",
     "loadingKeys": "正在加载密钥...",
@@ -446,8 +449,9 @@
   },
   "apiKeyReveal": {
     "title": "API 密钥已创建",
-    "description": "请立即复制此密钥，它不会再次显示。",
+    "description": "请立即复制此密钥。",
     "warning": "此密钥不会再次显示，请务必现在复制。",
+    "copy": "复制 API 密钥",
     "done": "完成"
   },
   "sharedMaps": {
@@ -510,8 +514,6 @@
     "tableLabel": "嵌入地图访问令牌"
   },
   "settings": {
-    "copySPEntityId": "复制 SP 实体 ID",
-    "copyAcsUrl": "复制 ACS URL",
     "page": {
       "title": "设置",
       "loadFailed": "加载设置失败：{{message}}",
@@ -554,6 +556,7 @@
         "upload": "上传数据集",
         "create_layers": "创建图层",
         "export": "导出数据",
+        "exportDescription": "下载数据集文件，并与“上传数据集”权限一起将分析结果保存为新数据集。任何人仍可下载已发布的公开数据集，能够查看数据集的用户也可通过 API、地图瓦片和属性表读取其要素。",
         "edit_metadata": "编辑元数据",
         "manage_collections": "管理集合",
         "use_ai_chat": "AI 聊天",
@@ -568,12 +571,9 @@
       "descriptionSuffix": "以启用管理员覆盖。"
     },
     "saved": "设置已保存",
-    "saveFailed": "保存设置失败",
     "resetDefaults": "恢复默认值",
     "general": {
       "title": "常规",
-      "cardTitle": "功能开关",
-      "cardDescription": "启用或禁用平台功能。",
       "registration": "自助注册",
       "registrationDescription": "允许用户自行创建账户：使用密码注册，或通过已启用的 SSO 提供商登录。SSO 账户会立即以该提供商的默认角色激活。密码注册在邮箱验证后激活（需要 SMTP），否则需管理员批准后激活。",
       "landingFirst": "以登录页作为落地页",
@@ -589,7 +589,7 @@
       "bannerEnabled": "启用站点横幅",
       "bannerEnabledDescription": "向所有访客显示公告横幅。还须设置下方的横幅文本。",
       "bannerText": "站点横幅文本",
-      "bannerTextDescription": "显示在应用顶部、面向所有访客的公告横幅。留空则不显示横幅。",
+      "bannerTextDescription": "显示在应用顶部、面向所有访客的公告横幅。留空则不显示横幅。链接文字：[标签](https://example.org)。",
       "bannerColor": "站点横幅颜色",
       "bannerColorDescription": "公告横幅的颜色。",
       "bannerColorWarning": "警告（琥珀色）",
@@ -607,7 +607,11 @@
       "logJsonLabel": "日志格式（JSON）",
       "logJsonDescription": "以结构化 JSON 格式输出日志。",
       "saved": "设置已保存",
-      "saveFailed": "保存设置失败"
+      "auditRetentionDays": "审计日志保留期（天）",
+      "auditRetentionDaysDescription": "超过该天数的审计记录将被自动删除。留空则永久保留。",
+      "auditRetentionKeepForever": "永久保留",
+      "auditRetentionInvalid": "请输入整数天数（{{min}} 至 {{max}}），或将该字段留空。",
+      "auditRetentionComplianceWarning": "部分合规制度要求审计记录至少保留 {{days}} 天。"
     },
     "basemaps": {
       "title": "底图",
@@ -630,8 +634,7 @@
       "checkingUrl": "检查中…",
       "removeBasemap": "移除底图",
       "add": "添加",
-      "saved": "底图已保存",
-      "saveFailed": "保存底图失败"
+      "saved": "底图已保存"
     },
     "mapDefaults": {
       "title": "地图默认设置",
@@ -641,9 +644,7 @@
       "longitude": "经度",
       "zoomLevel": "缩放级别",
       "preview": "预览",
-      "useCurrentView": "使用当前视图",
-      "saved": "地图默认设置已保存",
-      "saveFailed": "保存地图默认设置失败"
+      "saved": "地图默认设置已保存"
     },
     "plugins": {
       "title": "地图插件",
@@ -686,8 +687,6 @@
     },
     "security": {
       "title": "安全",
-      "cardTitle": "登录速率限制",
-      "cardDescription": "控制每个 IP 地址每分钟的最大登录尝试次数。",
       "loginRateLimit": "每分钟登录尝试次数",
       "accessTokenExpire": "访问令牌有效期（分钟）",
       "refreshTokenExpire": "会话空闲超时（天）",
@@ -695,7 +694,6 @@
       "tokenLifetimeNote": "令牌有效期的更改仅对新签发的令牌生效。",
       "loginRateLimitDescription": "单个 IP 地址每分钟允许的最大登录请求数（1–1000）。",
       "saved": "安全设置已保存",
-      "saveFailed": "保存安全设置失败",
       "passwordLogin": "允许密码登录",
       "passwordLoginDescription": "允许用户使用用户名和密码登录。禁用后用户必须通过 SSO 提供商登录，请先启用一个提供商。管理员仍可使用密码登录作为应急方式。",
       "emailVerificationRequired": "要求电子邮箱验证",
@@ -711,14 +709,16 @@
     },
     "uploads": {
       "title": "上传设置",
-      "cardTitle": "上传限制",
-      "cardDescription": "配置数据集上传的最大文件大小和允许的文件扩展名。",
       "maxSizeMb": "最大文件大小（MB）",
       "maxSizeMbDescription": "最大上传文件大小，单位为兆字节（1-10,000）。更改在下次上传时生效，无需重启。",
       "allowedExtensions": "允许的扩展名",
       "allowedExtensionsDescription": "允许的文件扩展名列表，以逗号分隔（例如 .zip,.gpkg,.geojson,.json,.csv,.tif,.tiff,.xlsx,.xls）。",
       "tileCacheTtl": "瓦片缓存 TTL（秒）",
       "tileCacheTtlDescription": "瓦片缓存条目过期前的秒数（0 = 不缓存）。",
+      "previousVersionsKept": "每个数据集保留的上一版本数",
+      "previousVersionsKeptDescription": "每个数据集可恢复的已替换版本数量，范围 1 到 50。调低后，存储空间会在各数据集下次替换或恢复时释放。",
+      "invalidPreviousVersionsKept": "请输入 1 到 50 之间的整数。",
+      "previousVersionsStorage": "保留的版本当前占用 {{size}}。",
       "perUserLimitsTitle": "每用户限制",
       "perUserLimitsDescription": "对每个用户生效的上限，在上传时强制执行。设为 0 表示不限。",
       "maxStoragePerUser": "每用户最大存储量",
@@ -729,8 +729,9 @@
       "invalidStorageQuantity": "请输入可换算为整数个字节的数量。",
       "maxDatasetsPerUser": "每用户最大数据集数",
       "maxDatasetsPerUserDescription": "每个用户可创建的最大数据集数（0 = 不限）。",
-      "saved": "上传设置已保存",
-      "saveFailed": "保存上传设置失败"
+      "maxStoryImageMbPerUser": "每用户最大故事图片存储量（MB）",
+      "maxStoryImageMbPerUserDescription": "一个用户的所有故事可容纳的图片总大小，以兆字节计（0 = 不限）。已存储的图片保留；仅拒绝新的上传和复制。",
+      "saved": "上传设置已保存"
     },
     "oauth": {
       "title": "OAuth 提供商",
@@ -824,6 +825,20 @@
       "registrationAdminConfirmDescription": "每个通过邮箱验证的密码注册用户都将成为管理员。请确认这是您想要的。",
       "signupAdminActivationDescription": "此更改后，注册的人无需管理员批准即可成为管理员。请确认这是您想要的。",
       "verificationNeedsRegistration": "在启用自助注册时适用。"
+    },
+    "storyFrames": {
+      "title": "故事中的嵌入内容和视频",
+      "description": "故事可以在框架中显示其页面和视频播放器的网站。读者的浏览器会直接从这些网站加载内容。没有网站时，嵌入内容和视频块处于关闭状态。",
+      "empty": "尚未添加网站，因此嵌入内容和视频块处于关闭状态。",
+      "hostLabel": "网站主机名",
+      "add": "添加网站",
+      "invalid": "请输入主机名，例如 media.example.org，不含 https:// 或路径。不接受通配符。",
+      "duplicate": "该网站已在列表中。",
+      "full": "列表最多包含 {{max}} 个网站。",
+      "sameOrigin": "保留网站来源",
+      "sameOriginHint": "某些视频播放器需要保留自身来源才能播放。无论网站把框架带到哪里，框架都会保留该来源，因此它打开的任何其他已批准网站也会获得该来源。仅对您愿意连同所有已批准网站一并信任的网站启用。",
+      "remove": "移除 {{host}}",
+      "reloadHint": "已打开的页面需重新加载后才会使用此列表。"
     }
   },
   "saml": {
@@ -833,8 +848,7 @@
       "title": "SAML 单点登录",
       "description": "此构建版本中不可用。",
       "heading": "SAML 不可用",
-      "body": "此 GeoLens 构建版本支持本地账户以及 Google、GitHub 和通用 OIDC 等 OAuth 提供商。",
-      "docsLink": "SAML 在此构建版本中不可用"
+      "body": "此 GeoLens 构建版本支持本地账户以及 Google、GitHub 和通用 OIDC 等 OAuth 提供商。"
     },
     "addProvider": "添加 SAML 提供商",
     "loading": "正在加载 SAML 提供商...",
@@ -894,5 +908,66 @@
   "sortable": {
     "sortAscending": "升序排序",
     "sortDescending": "降序排序"
+  },
+  "groups": {
+    "title": "用户组",
+    "listHeading": "共享用户组",
+    "errorLoading": "无法加载用户组：{{message}}",
+    "nameLabel": "用户组名称",
+    "actionsFor": "用户组 {{name}} 的操作",
+    "table": {
+      "name": "名称",
+      "members": "成员",
+      "created": "创建时间",
+      "actions": "操作",
+      "manageMembers": "成员",
+      "memberCount_one": "{{count}} 位成员",
+      "memberCount_other": "{{count}} 位成员"
+    },
+    "empty": {
+      "title": "还没有用户组",
+      "hint": "创建用户组，添加成员，然后向该组共享数据集、地图和故事。"
+    },
+    "create": {
+      "button": "创建用户组",
+      "title": "创建用户组",
+      "description": "用户组可让您将受限的数据集、地图和故事共享给一组人员。"
+    },
+    "rename": {
+      "button": "重命名",
+      "title": "重命名用户组",
+      "description": "为 {{name}} 选择新名称。"
+    },
+    "delete": {
+      "title": "删除 {{name}}？",
+      "description_one": "该用户组有 {{count}} 位成员。他们将立即失去对共享给该组的数据集、地图和故事的访问权限。此操作无法撤销。",
+      "description_other": "该用户组有 {{count}} 位成员。他们将立即失去对共享给该组的数据集、地图和故事的访问权限。此操作无法撤销。",
+      "deleting": "正在删除..."
+    },
+    "members": {
+      "title": "{{name}} 的成员",
+      "description": "该组中的成员可以打开共享给该组的数据集、地图和故事。",
+      "addLabel": "添加成员",
+      "listHeading_one": "{{count}} 位成员",
+      "listHeading_other": "{{count}} 位成员",
+      "listLabel": "{{name}} 的成员",
+      "removeLabel": "将 {{name}} 从 {{group}} 中移除",
+      "empty": "该用户组还没有成员。",
+      "added": "已添加 {{name}}",
+      "removed": "已移除 {{name}}",
+      "errorLoading": "无法加载成员：{{message}}",
+      "needsUserManagement": "添加成员需要用户管理权限。您仍可查看和移除成员。"
+    },
+    "picker": {
+      "placeholder": "按用户名搜索",
+      "noMatches": "没有匹配的用户",
+      "results_one": "有 {{count}} 位可选用户",
+      "results_other": "有 {{count}} 位可选用户"
+    },
+    "toasts": {
+      "created": "用户组已创建",
+      "renamed": "用户组已重命名",
+      "deleted": "用户组已删除"
+    }
   }
 }

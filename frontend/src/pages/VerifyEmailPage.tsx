@@ -17,12 +17,11 @@ import {
   CardTitle,
 } from '@/components/ui/card';
 
-type PageState = 'loading' | 'success' | 'error';
+type PageState = 'loading' | 'success' | 'awaitingApproval' | 'error';
 
 export function VerifyEmailPage() {
   const { t } = useTranslation('auth');
-  // fix(#438): UX-09 — this page is landed on directly from an email link, so it
-  // is the one that most needs a real tab title.
+  // Landed on directly from an email link, so it needs a real tab title.
   useDocumentTitle(t('common:pageTitle.verifyEmail'));
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -47,7 +46,13 @@ export function VerifyEmailPage() {
     }
 
     verifyEmail(token)
-      .then(() => {
+      .then((response) => {
+        // The address is confirmed but an administrator still has to approve
+        // the account, so signing in would only be refused.
+        if (response.next_step === 'await_approval') {
+          setPageState('awaitingApproval');
+          return;
+        }
         setPageState('success');
         toast.success(t('verifyEmail.success'));
       })
@@ -88,8 +93,8 @@ export function VerifyEmailPage() {
   return (
     <main className="flex min-h-screen flex-col items-center justify-center gap-6 bg-background px-4">
       <div className="text-center">
-        {/* sr-only level-1 heading: the state cards below use CardTitle (a plain
-            <div>), so without this the page has no heading-one for SR nav. */}
+        {/* sr-only <h1>: the cards below use CardTitle (a plain <div>), so the
+            page would have no level-one heading. */}
         <h1 className="sr-only">{t('verifyEmail.title')}</h1>
         <GeoLensLogo size="lg" className="justify-center rounded-xl bg-[#116AAB] px-5 py-4" />
         <p className="text-muted-foreground mt-1 text-sm">
@@ -100,7 +105,7 @@ export function VerifyEmailPage() {
       {pageState === 'loading' && (
         <Card className="w-full max-w-sm">
           <CardHeader className="items-center text-center">
-            <Loader2 className="text-muted-foreground mb-2 h-10 w-10 animate-spin" />
+            <Loader2 className="text-muted-foreground mx-auto mb-2 h-10 w-10 animate-spin" />
             <CardTitle level={2} className="text-xl">{t('verifyEmail.title')}</CardTitle>
             <CardDescription>{t('verifyEmail.verifying')}</CardDescription>
           </CardHeader>
@@ -110,9 +115,27 @@ export function VerifyEmailPage() {
       {pageState === 'success' && (
         <Card className="w-full max-w-sm">
           <CardHeader className="items-center text-center">
-            <Mail className="text-primary mb-2 h-10 w-10" />
+            <Mail className="text-primary mx-auto mb-2 h-10 w-10" />
             <CardTitle level={2} className="text-xl">{t('verifyEmail.title')}</CardTitle>
             <CardDescription>{t('verifyEmail.success')}</CardDescription>
+          </CardHeader>
+          <CardContent className="flex justify-center">
+            <Link
+              to="/login"
+              className="text-primary text-sm underline hover:text-primary/80"
+            >
+              {t('backToSignIn')}
+            </Link>
+          </CardContent>
+        </Card>
+      )}
+
+      {pageState === 'awaitingApproval' && (
+        <Card className="w-full max-w-sm">
+          <CardHeader className="items-center text-center">
+            <Mail className="text-primary mx-auto mb-2 h-10 w-10" />
+            <CardTitle level={2} className="text-xl">{t('pendingApproval')}</CardTitle>
+            <CardDescription>{t('verifyEmail.awaitingApproval')}</CardDescription>
           </CardHeader>
           <CardContent className="flex justify-center">
             <Link

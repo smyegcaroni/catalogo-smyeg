@@ -66,14 +66,22 @@ def _context(from_status: str, to_status: str, *, mode: str = "status"):
 def _dataset(record_status: str):
     return SimpleNamespace(
         id=uuid.uuid4(),
-        # fix(#458 E-48): the PATCH handler snapshots tile_columns pre-update
+        # the PATCH handler snapshots tile_columns pre-update
         # to detect no-op echoes, so the fake needs the attribute.
         tile_columns=None,
-        # fix(#1178 review): the status endpoints run the inherited-keyword
+        # The status endpoints run the inherited-keyword
         # disclosure check on the resolved state, which starts from
         # record.derived_from — None models a record that is not
         # analysis-derived, so the check exits before touching the fake DB.
-        record=SimpleNamespace(record_status=record_status, derived_from=None),
+        record=SimpleNamespace(
+            id=uuid.uuid4(),
+            record_status=record_status,
+            derived_from=None,
+            visibility="public",
+            record_type="raster_dataset",
+            # No owner and no VRT links: the VRT audience check needs no queries.
+            created_by=None,
+        ),
     )
 
 
@@ -94,6 +102,7 @@ class _FakeDB:
         self.committed = False
         self.flushed = False
         self.refreshed = None
+        self.info = {}
 
     async def execute(self, stmt):
         self.statement = stmt
@@ -105,7 +114,7 @@ class _FakeDB:
     async def flush(self):
         self.flushed = True
 
-    async def refresh(self, dataset):
+    async def refresh(self, dataset, attribute_names=None):
         self.refreshed = dataset
 
 
@@ -338,7 +347,7 @@ async def test_metadata_patch_endpoint_uses_overlay_block():
     db = _FakeDB(dataset)
     ext_mod._extensions["workflow"] = BlockingWorkflow()
 
-    # fix(#1881): the PATCH takes the catalog pair on every body, and the
+    # The PATCH takes the catalog pair on every body, and the
     # fake DB has no rows to lock.
     with (
         patch(

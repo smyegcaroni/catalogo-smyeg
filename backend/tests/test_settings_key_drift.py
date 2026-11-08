@@ -1,7 +1,7 @@
 """Static-analysis test: every settings-key literal the admin frontend sends
 or reads must be a member of the backend PersistentConfig registry.
 
-fix(#1778): the settings channel (46 registry keys against ~120 hand-written
+The settings channel (46 registry keys against ~120 hand-written
 frontend literals) has no type, no OpenAPI enum, and no drift test.
 ``updateSettings`` (frontend/src/api/settings.ts) takes a bare
 ``Record<string, unknown>`` and PUTs it to ``/settings/``. The registry map
@@ -27,8 +27,8 @@ the reset callback directly: ``settings.find((s) => s.key ===
 ``onReset('role_permissions')``. A first version of this test only
 recognized the ``useSettingsForm`` shapes, so a typo anywhere in that
 direct-access tab would have kept passing while still producing the same
-400-on-write / silent-default-on-read failure this guard exists to catch
-(fix(#1778): review round 1). The parser below also walks every
+400-on-write / silent-default-on-read failure this guard exists to catch.
+The parser below also walks every
 ``.find(...)``/``onSave(...)``/``onReset(...)`` call site and pulls out
 whatever key literal reaches it, rather than only the field-def shape, so
 a new hand-rolled access pattern is still covered.

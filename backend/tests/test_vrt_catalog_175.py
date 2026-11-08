@@ -1,11 +1,11 @@
-"""Tests for VRT catalog API extension (Phase 175-02).
+"""Tests for VRT catalog API extension.
 
 Covers:
 - TestRasterMetadataVrtFields: _build_raster_metadata returns vrt_type, source_count, resolution_strategy for VRT assets
 - TestDatasetToResponseVrt: dataset_to_response populates raster sub-object for vrt_dataset record_type
 - TestQuicklookVrt: quicklook guard accepts vrt_dataset (200), rejects vector_dataset (400)
 - TestVrtSourcesEndpoint: list_vrt_sources returns ordered source list; 404 for non-VRT/non-existent datasets
-- TestTileTokenVrt: raster_auth_check accepts vrt_dataset record_type (CAT-04 regression)
+- TestTileTokenVrt: raster_auth_check accepts vrt_dataset record_type (regression)
 - TestSearchEnrichmentVrt: search enrichment includes vrt_dataset in band_count batch fetch
 
 All tests are pure unit tests -- no DB, no real files, no network.
@@ -71,7 +71,7 @@ def _make_mock_dataset(record_type: str, title: str = "Test Dataset") -> MagicMo
     ds.current_version = 1
     ds.source_url = None
     ds.quality_statement = None
-    # feat(#1218): source-origin & refresh state. A bare MagicMock returns a
+    # source-origin & refresh state. A bare MagicMock returns a
     # MagicMock for any attribute never set, which DatasetResponse rejects, so
     # every new dataset column has to be pinned here explicitly.
     ds.origin_uri = None
@@ -81,9 +81,11 @@ def _make_mock_dataset(record_type: str, title: str = "Test Dataset") -> MagicMo
     ds.source_health = None
     ds.source_health_detail = None
     ds.schema_drift_status = None
-    # fix(#1372): _build_raster_metadata reads this into the tile URL's `v=`.
+    ds.retention_column = None
+    ds.retention_days = None
+    # _build_raster_metadata reads this into the tile URL's `v=`.
     ds.tile_cache_version = 1
-    # fix(#2007): and this into its `pv=`.
+    # And this into its `pv=`.
     ds.publication_version = 0
 
     ds.record = MagicMock()
@@ -97,7 +99,7 @@ def _make_mock_dataset(record_type: str, title: str = "Test Dataset") -> MagicMo
     ds.record.updated_at = datetime(2026, 1, 2)
     ds.record.record_status = "published"
     ds.record.license = None
-    # feat(#1472): see the note above — an unset attribute yields a MagicMock,
+    # See the note above — an unset attribute yields a MagicMock,
     # which DatasetResponse.attribution (str | None) rejects.
     ds.record.attribution = None
     ds.record.source_organization = None
@@ -422,7 +424,7 @@ class TestVrtSourcesEndpoint:
 
     @pytest.fixture(autouse=True)
     def _stub_vrt_member_authz(self):
-        """SEC-E (Phase 1172): list_vrt_sources now drops members the caller
+        """list_vrt_sources now drops members the caller
         cannot access via get_permission_extension().can_access_dataset(per
         member). These unit tests mock the SQL rows and ``check_dataset_access``
         (which they set to return None), then assert the FULL returned list, so
@@ -430,7 +432,7 @@ class TestVrtSourcesEndpoint:
         would run for real against a None user_roles and raise. The filtering
         behavior itself is covered by tests/test_vrt_source_authz_1172.py.
 
-        fix(#435): the endpoint now batch-loads member datasets in one query instead
+        The endpoint batch-loads member datasets in one query instead
         of calling `get_dataset()` per row, so stub `_load_source_datasets` too. These
         tests point a blanket `db.execute` mock at the raw-SQL result, which the
         batch loader would otherwise read as "no member datasets exist".
@@ -765,21 +767,7 @@ class TestSearchEnrichmentVrt:
     async def test_bulk_fetch_dataset_metadata_includes_raster_and_vrt_records(
         self, monkeypatch
     ):
-        """The search metadata helper requests raster metadata for raster and VRT rows.
-
-        After PERF-02 (Phase 274), blocks 1 (STAC assets) and 4 (extents) run
-        concurrently inside ``asyncio.gather`` against fresh short-lived
-        sessions opened from ``app.core.db.async_session``. Blocks 2 + 3
-        (raster_meta + VRT source_count) stay sequential against the
-        caller's ``db`` because block 3 mutates block 2's output in place.
-
-        This test only cares about the raster/VRT enrichment contract:
-        - ``seen_ids`` must include raster + VRT (not vector)
-        - ``raster_meta[vrt.id]['source_count']`` must be merged in
-
-        The inner sessions used by blocks 1 and 4 are mocked to be no-ops
-        so the test stays unit-level — no real DB.
-        """
+        """The search metadata helper requests raster metadata for raster and VRT rows."""
         import app.modules.catalog.search.router as search_module
 
         vector = _make_mock_dataset("vector_dataset", "Vector")
@@ -828,28 +816,6 @@ class TestSearchEnrichmentVrt:
             search_module, "visible_vrt_source_counts", fake_visible_vrt_source_counts
         )
 
-        # PERF-02: stub out the inner-session factory used by blocks 1 + 4.
-        # Each inner block opens `async with async_session() as inner_db:`,
-        # so we need a lightweight async context manager that yields a
-        # session whose `execute(...)` returns empty results.
-        class _InnerSession:
-            async def execute(self, _stmt):
-                return FakeExecuteResult()
-
-        class _InnerSessionCtx:
-            async def __aenter__(self):
-                return _InnerSession()
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
-        def _fake_async_session(*args, **kwargs):
-            return _InnerSessionCtx()
-
-        import app.core.db as _db_module
-
-        monkeypatch.setattr(_db_module, "async_session", _fake_async_session)
-
         _, raster_meta, _ = await search_module._bulk_fetch_dataset_metadata(
             FakeSession(), [vector, raster, vrt], None, set()
         )
@@ -891,21 +857,15 @@ class TestSearchEnrichmentVrt:
 
 
 class TestDatasetDetailSessionIsolation:
-    """fix(#1436): get_dataset_detail's raster/VRT/asset fetches run on the caller's session.
+    """get_dataset_detail's raster/VRT/asset fetches run on the caller's session.
 
-    Regression guard, revised after codex review. The raster asset,
-    VRT source-count, and dataset-asset fetches were originally gathered via
-    ``asyncio.gather`` against the caller's ``db`` while a comment claimed
-    they ran "in parallel" — false (AsyncSession is not safe for concurrent
-    use, so asyncpg's per-connection execute lock silently serialized them
-    anyway). The first fix gave each branch its own short-lived
-    ``async_session()``, matching the pattern search/router.py and
-    stac/router.py use for their gather sites — but codex review flagged that
-    pattern here as a nested pool checkout while the caller's own connection
-    is held for the rest of the request, which the default (non-external-
-    pooler) connection pool cannot absorb under moderate concurrency. The
-    fetches now run sequentially on the caller's own session instead: no
-    extra checkout, no false "parallel" claim, no shared-session concurrency.
+    The raster asset, VRT source-count, and dataset-asset fetches run
+    sequentially on the caller's own session. ``asyncio.gather`` on one
+    ``AsyncSession`` is unsafe (asyncpg's per-connection execute lock
+    serializes the calls anyway), and a short-lived ``async_session()`` per
+    branch would be a nested pool checkout while the caller's connection is
+    held for the rest of the request, which the default (non-external-pooler)
+    connection pool cannot absorb under moderate concurrency.
     """
 
     @pytest.mark.anyio

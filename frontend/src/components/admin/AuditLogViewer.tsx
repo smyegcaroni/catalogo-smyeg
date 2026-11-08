@@ -47,23 +47,20 @@ function parseSortOrder(raw: string | null): SortDirection {
   return raw === 'desc' || raw === 'asc' ? raw : DEFAULT_ORDER;
 }
 
-// fix(#620): resource types with a frontend detail route the name can link to.
+// Resource types with a frontend detail route the name can link to.
 const RESOURCE_ROUTES: Record<string, string> = {
   dataset: '/datasets',
   map: '/maps',
   collection: '/collections',
 };
 
-// Canonical action strings currently emitted by audited application paths. Keep
-// the exact stored values visible so operators can correlate filters with API
-// responses and SIEM rules instead of relying on stale display-only aliases.
-//
-// fix(#1230): kept in sync by hand against the backend's authoritative
-// registry (backend/app/modules/audit/actions.py, enforced there by
-// test_audit_action_registry.py) — this array itself is not generated. The
-// four `layer.*` entries removed here (layer.add, layer.remove,
-// layer.reorder, layer.bulk_remove) were ghosts: builder layer edits write
-// to map edit history, not audit_logs, so nothing ever emitted them.
+// Canonical action strings emitted by audited application paths, kept as the
+// exact stored values so operators can correlate filters with API responses
+// and SIEM rules. Maintained by hand against the backend registry
+// (backend/app/modules/audit/actions.py, enforced there by
+// test_audit_action_registry.py). The `layer.*` entries are column changes;
+// adding, removing or reordering a map's layers in the builder writes to map
+// edit history, not audit_logs.
 const CURRENT_AUDIT_ACTIONS = [
   'api_key.create',
   'api_key.revoke',
@@ -71,6 +68,7 @@ const CURRENT_AUDIT_ACTIONS = [
   'attribute.edit',
   'attribute.reset',
   'audit.export',
+  'audit.prune',
   'collection.add_datasets',
   'collection.create',
   'collection.delete',
@@ -87,6 +85,7 @@ const CURRENT_AUDIT_ACTIONS = [
   'dataset.pointcloud_read',
   'dataset.previous_version_dropped',
   'dataset.restore',
+  'dataset.retention_prune',
   'dataset.transfer_owner',
   'dataset.view',
   'embed_token.bulk_revoke',
@@ -94,10 +93,17 @@ const CURRENT_AUDIT_ACTIONS = [
   'embed_token.revoke',
   'embed_token.update',
   'embedding.backfill',
+  'feature.bulk_delete',
+  'feature.bulk_insert',
   'feature.delete',
   'feature.insert',
   'feature.replace',
   'feature.update',
+  'group.add_members',
+  'group.create',
+  'group.delete',
+  'group.remove_member',
+  'group.rename',
   'job.cancel',
   'job.cleanup_stale',
   'job.retry',
@@ -111,6 +117,7 @@ const CURRENT_AUDIT_ACTIONS = [
   'map.create',
   'map.delete',
   'map.duplicate',
+  'map.import_arcgis_webmap',
   'map.import_style',
   'map.patch_layers',
   'map.remove_layer',
@@ -124,7 +131,7 @@ const CURRENT_AUDIT_ACTIONS = [
   'oauth.login.failure',
   'oauth.login.init',
   'oauth.login.success',
-  // fix(#1778): the IdP group-role mapping is applied on every OAuth login now,
+  // The IdP group-role mapping is applied on every OAuth login,
   // so a role can move without an admin touching it. These two are how that
   // shows up here.
   'oauth.role.change_refused',
@@ -146,9 +153,15 @@ const CURRENT_AUDIT_ACTIONS = [
   'reupload.commit',
   'stac_connect',
   'stac_import',
+  'story.create',
+  'story.delete',
+  'story.duplicate',
+  'story.publish',
+  'story.update',
   'update',
   'user.approve',
   'user.change_password',
+  'user.change_password.throttled',
   'user.convert_saml_to_local',
   'user.create',
   'user.deactivate',
@@ -156,6 +169,7 @@ const CURRENT_AUDIT_ACTIONS = [
   'user.export',
   'user.login.failure',
   'user.login.success',
+  'user.login.throttled',
   'user.logout',
   'user.password_reset',
   'user.register',
@@ -169,12 +183,11 @@ export function AuditLogViewer() {
   const { can } = usePermissions();
   const canSelectUser = can('manage_users');
   // Sort lives in the URL so a sorted view is shareable. Sort clicks REPLACE
-  // the history entry rather than pushing — deliberately, per the #1200
-  // review: pushing would make five header clicks cost five Back presses to
-  // leave the page, and it matches JobList's replace-on-refinement pattern
-  // (#1185). The trade is that Back leaves the page instead of stepping
-  // through orderings. An unrecognised ?sort= falls back to the default
-  // rather than erroring the page; the API refuses it independently.
+  // the history entry: pushing would make five header clicks cost five Back
+  // presses to leave the page, and it matches JobList's replace-on-refinement
+  // pattern. The trade is that Back leaves the page instead of stepping
+  // through orderings. An unrecognised ?sort= falls back to the default; the
+  // API refuses it independently.
   const [searchParams, setSearchParams] = useSearchParams();
   const sortField = parseSortField(searchParams.get('sort'));
   const sortOrder = parseSortOrder(searchParams.get('order'));

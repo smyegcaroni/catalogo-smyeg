@@ -5,9 +5,9 @@ restore procedures, monitoring, and incident response. An operator can recover a
 GeoLens installation from a backup using this document alone, with no external
 documentation.
 
-> **Implements BKP-04.** See [UPGRADING.md](UPGRADING.md) for the upgrade and
-> rollback quick-reference; this document is the authoritative source for DR /
-> restore / monitoring / incident response for both database modes.
+> See [UPGRADING.md](UPGRADING.md) for the upgrade and rollback quick-reference.
+> This document is the authoritative source for DR, restore, monitoring and
+> incident response in both database modes.
 
 ---
 
@@ -24,6 +24,7 @@ documentation.
 9. [Uploaded source-file retention](#9-uploaded-source-file-retention)
 10. [Routine version upgrade: outage and rollback](#10-routine-version-upgrade-outage-and-rollback)
 11. [Secret rotation](#11-secret-rotation)
+12. [Password sign-in throttled for an account](#12-password-sign-in-throttled-for-an-account)
 
 ---
 
@@ -52,39 +53,32 @@ documentation.
 > import that was being changed around the backup time. A file the catalog no
 > longer references is orphan storage that costs only disk space. Keep it
 > unless you have checked every table that stores paths under the staging
-> volume (datasets, ingest jobs, map thumbnails and map icons). The
-> application's own sweep removes only stale upload files, not every orphan.
+> volume (datasets, ingest jobs, map thumbnails, map icons and story images
+> in `catalog.story_assets`). The application's own sweeps remove stale upload
+> files, and a periodic sweep deletes story image objects that no
+> `catalog.story_assets` row names once they are a day old. They do not remove
+> every orphan.
 
 ### Automated backups are on by default
 
-Backup runs automatically on every `docker compose up` — no `--profile backup`
-flag is needed. The `backup` service starts alongside `api`, `worker`, and `db`.
-
-The default schedule is **02:00 daily** (`BACKUP_SCHEDULE=0 2 * * *`). An initial
-backup runs at container start. Subsequent backups fire on the configured schedule
-(via cron, or a built-in sleep-loop when cron is unavailable in the image).
-
-To change the schedule, set `BACKUP_SCHEDULE` in `.env`:
-
-```
-BACKUP_SCHEDULE=0 3 * * *    # 03:00 daily — must be in "M H * * *" form
-```
+The `backup` service starts with the Compose stack and runs at container start
+and then once a day, at 02:00 UTC unless `BACKUP_SCHEDULE` sets another time. Settings, destinations, retention
+and offsite upload are documented in the
+[Backups & Restore guide](https://docs.getgeolens.com/guides/admin/backups/).
+This section keeps what that guide does not: the recovery limits above and the
+caveats below.
 
 ### What each backup cycle captures
 
-Each cycle produces three paired artifacts with matching timestamps:
-
-| Artifact | Format | What it contains |
-|---|---|---|
-| `<db>_<YYYYmmdd_HHMMSS>.dump` | `pg_dump -Fc` custom-format | Full database (schema + data), restorable via `pg_restore` |
-| `staging-<YYYYmmdd_HHMMSS>.tar.gz` | tar.gz | Contents of the `upload_staging` volume (source files, rasters, COGs) |
-| `globals-<YYYYmmdd_HHMMSS>.sql` | `pg_dumpall --globals-only` plain SQL | Cluster roles, their passwords, and cluster-wide grants |
-
-The staging archive is omitted silently when the `upload_staging` volume is absent
-or empty (fresh install with no uploaded datasets).
+Each cycle writes a `.dump` and a `globals-*.sql` with matching timestamps, plus
+a `staging-*.tar.gz` when the `upload_staging` volume has files. A fresh install
+with no uploads yet has no staging archive, and its backup is still complete. The
+guide's
+[Backup destinations](https://docs.getgeolens.com/guides/admin/backups/#backup-destinations)
+section lists the file names and formats.
 
 The globals dump is the piece a database-only `pg_dump` can never give back, and
-it is what makes the fresh-cluster role reconstruction in [§ 2](#2-restore--bundled-postgres-mode)
+it is what makes the fresh-cluster role reconstruction in [§ 2](#role-reconstruction-after-a-fresh-cluster-restore)
 work. It contains **role password verifiers**, so it is written mode `0600` and
 must keep the same protection as the dump itself wherever it is copied. A
 `pg_dumpall` failure fails the whole cycle: a backup set that cannot restore its
@@ -103,66 +97,42 @@ settings/provider replacement tool, not a backup.
 
 ### Retention
 
-Artifacts land at:
-- Daily: `backup_data` volume → `/backups/daily/`
-- Weekly (every Sunday): `backup_data` volume → `/backups/weekly/`
-
-Default retention: 7 daily, 4 weekly (set `BACKUP_RETENTION_DAILY` /
-`BACKUP_RETENTION_WEEKLY` in `.env` to override). The count applies to the
-`.dump` files, ordered by the timestamp in the filename; the paired
-`staging-*.tar.gz` and `globals-*.sql` artifacts are pruned when the dump they
-belong with ages out. Retention therefore evicts whole backup sets, and a
-companion artifact never outlives its dump — which matters because a cycle can
-produce a dump without a companion (an empty staging volume, or a failed
-`pg_dumpall`), and counting each kind separately would prune complete sets while
-leaving orphans behind.
-
-One exception: the **newest complete set** — a dump that still has its globals
-dump — is held back on top of the window, so a directory can hold `keep` + 1
-dumps. A run of `pg_dumpall` failures still produces valid database dumps each
-cycle, and without the exemption those would walk the last restorable-onto-a-
-fresh-cluster set out of retention while the healthcheck was already reporting
-the problem. The cost is one extra dump plus a few KB of SQL.
+Retention keeps the newest dump of each of the last `BACKUP_RETENTION_DAILY`
+days and `BACKUP_RETENTION_WEEKLY` ISO weeks, locally and, with offsite upload
+on, in the S3 `backups/daily/` and `backups/weekly/` prefixes. Companions go
+with their dump, and the newest complete set is always kept. So is the dump
+named in `/backups/.last-good-dump`, which also holds a sample of up to 100 of
+that dump's catalog record ids. A fully successful cycle moves the marker to
+its own dump only when at least half of those records are still in the
+database, so cycles over an emptied or re-created database cannot rotate the
+last real backup out, even after new uploads. Each such cycle logs a warning
+saying how many remain. The weekly tier and the offsite copy keep their newest
+dump at or before the marked one, since a weekday dump, or one taken while
+offsite upload was off, has no copy there. If you deleted most of the catalog
+on purpose, release the old dump by deleting the marker
+(`docker compose exec backup rm /backups/.last-good-dump`); the next cycle
+writes a new one. The guide's
+[Retention policy](https://docs.getgeolens.com/guides/admin/backups/#retention-policy)
+has the details.
 
 ### Offsite (S3) upload
 
 > **Warning — single-disk exposure.** By default the `backup_data` volume lives
 > on the same host (and usually the same disk) as the database volume. Losing
 > that disk loses the data **and every backup of it** in one event. Treat the
-> local dumps as a convenience tier only: enable the S3 offsite upload below,
-> or point `backup_data` at a different physical disk, before relying on this
+> local dumps as a convenience tier only: enable the S3 offsite upload, or
+> point `backup_data` at a different physical disk, before relying on this
 > for disaster recovery.
 
-Offsite upload is **opt-in**. To enable it, set in `.env`:
-
-```
-BACKUP_S3_ENABLED=true
-S3_ENDPOINT=https://s3.<region>.amazonaws.com
-S3_BUCKET=<your-bucket>
-S3_ACCESS_KEY_ID=<key-id>
-S3_REGION=us-east-1
-```
-
-Also set `S3_SECRET_ACCESS_KEY` to your access secret. See `.env.example` for all
-available S3 options including `S3_ADDRESSING_STYLE`. The backup uploader follows
-whatever scheme `S3_ENDPOINT` carries — use an `http://` endpoint for a
-plain-HTTP MinIO (`S3_ALLOW_HTTP` only affects the app's own object-storage
-client, not the backup uploader).
-
-The built-in uploader signs requests with **AWS Signature V4** (awscli), compatible
-with Cloudflare R2, modern AWS S3, and MinIO. A failed upload is logged as
-`ERROR: S3 upload failed for <key>` and fails the cycle (non-zero exit) **after**
-local retention pruning has run — the local dump is kept and pruned normally even
-when the offsite copy fails, so the failure is visible in container logs without
-sacrificing the local backup.
-
-The offsite copies get the **same retention** as the local ones —
-`BACKUP_RETENTION_DAILY` / `BACKUP_RETENTION_WEEKLY` daily and weekly sets,
-applied to the `backups/daily/` and `backups/weekly/` prefixes with the same
-pairing rule (a companion is pruned when the dump it belongs with ages out).
-There is no separate knob for offsite retention. A failure to list or delete
-objects for pruning is logged as an `ERROR` and fails the cycle the same way
-an upload failure does.
+Offsite upload is opt-in (`BACKUP_S3_ENABLED=true` plus the shared `S3_*`
+settings; see the guide's
+[Configuration](https://docs.getgeolens.com/guides/admin/backups/#configuration)
+table). A failed upload is logged as `ERROR: S3 upload failed for <key>`, and
+missing bucket or credential settings as `ERROR: BACKUP_S3_ENABLED=true but
+S3_BUCKET / S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY are not all set`. Either one
+fails the cycle (non-zero exit) **after** local retention pruning has run, so
+the local dump is kept and pruned normally and the failure shows in the
+container logs.
 
 ### Scope caveat
 
@@ -358,6 +328,10 @@ DATABASE_URL_OVERRIDE=postgresql://geolens_app:paste_generated_hex_here@db:5432/
 GEOLENS_MIGRATION_DB_ROLE=geolens
 MIGRATION_DATABASE_URL_OVERRIDE=postgresql://geolens:paste_existing_postgres_password_here@db:5432/geolens
 GEOLENS_API_RUN_MIGRATIONS=false
+#    Percent-encode every character except letters, digits and - . _ ~ in a
+#    password pasted into either URL (including $, which Compose interpolates);
+#    a hex password needs none. Keep the runtime password to the generated hex
+#    value: its raw copy in GEOLENS_RUNTIME_DB_PASSWORD is unquoted too.
 
 # 3. Stop writers. Recreate only db so it receives the new env and read-only
 #    reconciler mount; the named pgdata volume is preserved.
@@ -372,6 +346,13 @@ docker compose exec -T db /usr/local/bin/configure-runtime-db-role
 docker compose run --rm --no-deps migrate
 docker compose up -d
 ```
+
+Each password now appears twice in `.env`. When you rotate `POSTGRES_PASSWORD`,
+update `MIGRATION_DATABASE_URL_OVERRIDE` in the same edit. When you rotate the
+runtime password, update `GEOLENS_RUNTIME_DB_PASSWORD` and
+`DATABASE_URL_OVERRIDE` together, then rerun steps 3 and 4 and finish with the `docker compose up -d` from
+step 5 to restart API and worker. `exec` uses the environment the `db` container
+was created with, so step 3's recreate is what lets step 4 see the new password.
 
 If the chosen login already exists, the command refuses to modify it unless it
 has the durable GeoLens marker. This protects unrelated provider/admin roles
@@ -422,59 +403,35 @@ will not treat adoption as a collision override. Legacy `v1` markers are
 unscoped and therefore require the same one-time safe adoption as an unmarked
 dedicated login.
 
-Load the needed values into the verification shell and query through the
-runtime login. `scripts/env-value.sh` reads `.env` through the same
-get_env_value parser `restore.sh`/`check-env.sh` use, never by sourcing it —
-an operator-typed value can legally contain characters `.` would execute.
-`scripts/env-value.sh` is a subprocess a copy-pasted snippet like this one
-invokes and captures via `$(...)`, so it stays stdout-based — the
-`env_value_into` interface `restore.sh`/`check-env.sh`/`upgrade.sh` use
-internally only works within the SAME shell process that sourced
-`scripts/lib/common.sh`, which a subprocess call from a snippet like this
-one is not. Command substitution here strips a trailing newline from the
-captured value the same way it always does; that only matters if one of
-these specific values were ever deliberately set to end in one (unlikely
-for a password, role name, or database name, but worth knowing if a value
-here ever looks truncated by exactly one trailing character).
-
-`scripts/env-value.sh` exits 1 with no output when the key has no line in
-`.env` at all — including the ordinary case of a value supplied purely
-through the process environment and deliberately left out of `.env`
-(`GEOLENS_RUNTIME_DB_ROLE=managed_reader` exported in this shell, say). An
-unconditional `VAR="$(scripts/env-value.sh KEY)"` does not distinguish that
-from a real failure: the assignment still runs, on a helper exit of 1, to an
-EMPTY string — blanking whatever this shell already had for `VAR` — and
-under `set -e` (common in a copy-pasted troubleshooting session) it aborts
-the snippet outright instead. Guard the assignment on the helper's own exit
-status, the same way `restore.sh`/`check-env.sh`/`upgrade.sh` guard
-`env_value_into` internally (see the comment above `env_value_into`'s
-definition in `scripts/lib/common.sh`): assign the real variable only
-inside the `if`, never on the failure branch, so a key absent from `.env`
-leaves this shell's existing value — inherited or default — untouched.
-
-Each line below is its own subprocess (`scripts/env-value.sh` is invoked
-fresh each time, never sourced), so running them in sequence in this
-interactive shell cannot reproduce the ordering bug fixed in
-`scripts/lib/common.sh` (fix(#1778) round 20): that bug needed one script
-process to assign a value into its OWN shell via `env_value_into` and
-have a LATER resolution in that SAME process misread it as an inherited
-override. A plain `VAR="$_v"` assignment here, with no `export`, never
-reaches a later subprocess's environment at all — if a future snippet
-here ever needs `export VAR=...` between two of these calls, re-check it
-against that fix before relying on the values lining up:
+Verify the runtime login from inside the `db` container. Compose gives that
+service `GEOLENS_RUNTIME_DB_ROLE` and `GEOLENS_RUNTIME_DB_PASSWORD`, so the
+password is read from the container's own environment and never appears in a
+host command line or process listing:
 
 ```bash
-if _v="$(scripts/env-value.sh GEOLENS_RUNTIME_DB_PASSWORD)"; then GEOLENS_RUNTIME_DB_PASSWORD="$_v"; fi
-if _v="$(scripts/env-value.sh GEOLENS_RUNTIME_DB_ROLE)"; then GEOLENS_RUNTIME_DB_ROLE="$_v"; fi
-if _v="$(scripts/env-value.sh POSTGRES_DB)"; then POSTGRES_DB="$_v"; fi
-docker compose exec -T db env PGPASSWORD="$GEOLENS_RUNTIME_DB_PASSWORD" \
+docker compose exec -T db sh -c 'PGPASSWORD="$GEOLENS_RUNTIME_DB_PASSWORD" \
   psql -h 127.0.0.1 -U "$GEOLENS_RUNTIME_DB_ROLE" -d "$POSTGRES_DB" -c \
   "SELECT current_user, rolsuper, rolbypassrls, rolcreaterole,
           rolcreatedb, rolreplication
-     FROM pg_roles WHERE rolname = current_user;"
+     FROM pg_roles WHERE rolname = current_user;"'
 ```
 
-All five capability booleans must be `f`. Also confirm API and worker are
+All five capability booleans must be `f`. Then confirm the application
+connects as the runtime role. Once API and worker are up, every session other
+than this query's own should belong to the runtime role:
+
+```bash
+docker compose exec -T db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At' <<'SQL'
+SELECT usename, count(*) FROM pg_stat_activity
+ WHERE backend_type = 'client backend'
+   AND datname = current_database() GROUP BY 1;
+SQL
+```
+
+Expect the runtime role for API and worker. `POSTGRES_USER` should appear only
+for this `psql` session and any maintenance client that is running, such as a
+`pg_dump` from the `backup` service; a count above that, from a long-lived
+API or worker connection, means the adoption has not taken effect. Also confirm API and worker are
 healthy. To roll back the connection change, clear `GEOLENS_RUNTIME_DB_ROLE`,
 `GEOLENS_RUNTIME_DB_PASSWORD`, and `MIGRATION_DATABASE_URL_OVERRIDE`, restore
 the previous `DATABASE_URL_OVERRIDE`/migration-toggle values, then recreate API
@@ -540,6 +497,11 @@ above if the restored database name changed. A logical dump does not carry the
 database-level `PUBLIC CONNECT` revocation because GeoLens uses `--no-acl`; the
 mandatory post-restore reconciliation reapplies that boundary.
 
+A restored copy that points at live object storage runs its own sweeps
+against it. The story image sweep deletes objects under `stories/assets/` that
+the restored catalog doesn't name once they are a day old. Give a
+restore-test instance its own storage, or keep its worker stopped.
+
 ### Canonical restore entry point
 
 ```bash
@@ -578,17 +540,11 @@ mandatory post-restore reconciliation reapplies that boundary.
 **Never** use `psql < <dump>` on a custom-format (`-Fc`) dump file — it is binary,
 not plain SQL, and will fail.
 
-> **If `catalog.tenants` has rows, `restore.sh` is not the whole recipe.** Its
-> step 6 reconciles the single-tenant runtime role and the shared `data` schema;
-> it does not touch per-tenant schemas, per-tenant roles, or the two SECURITY
-> DEFINER provisioning functions, which the restore leaves owned by the restore
-> login with `EXECUTE` granted to `PUBLIC`. Step 7 then restarts `api` and
-> `worker`, so following this section alone puts traffic on a database in
-> exactly that state. Use the stop / restore / adopt sequence in the
-> role-reconstruction section immediately below instead, and run its dry run
-> afterwards as the check that nothing was left behind.
+> **If `catalog.tenants` has rows, `restore.sh` is not the whole recipe.**
+> Deployments with tenant isolation enabled follow the Cloud overlay's own
+> restore runbook instead of this section.
 
-### Multi-tenant role reconstruction after a fresh-cluster restore
+### Role reconstruction after a fresh-cluster restore
 
 PostgreSQL roles are cluster objects and are not included in a database-only
 `pg_dump`. A same-cluster restore normally retains the roles themselves — but
@@ -600,8 +556,8 @@ post-restore step.
 Nothing about roles travels inside a GeoLens dump: `scripts/backup-entrypoint.sh`
 writes it `--no-owner --no-acl` and `scripts/restore.sh` replays it `--no-owner`.
 A fresh cluster therefore needs both halves rebuilt — the role *definitions*
-(step 1) and the *ownership and grants* on restored tenant objects (step 2).
-Run both before starting API, worker, or tile traffic.
+(step 1) and the *ownership and grants* on restored objects (step 2).
+Step 1 comes before `restore.sh`, and step 2 is `restore.sh` itself.
 
 **Step 1 — put the roles on the new cluster.**
 
@@ -615,12 +571,11 @@ first (step 0 of [full restore](#step-by-step-full-restore-db--object-storage)
 extracts all three artifacts together), then replay it **before** `pg_restore`:
 
 ```bash
-# Load $POSTGRES_USER / $POSTGRES_DB via get_env_value (not shell-sourcing
-# .env — see the runtime-role verification note above for why, including
-# the trailing-newline caveat on command substitution here, and why the
-# assignment is guarded on the helper's own exit status rather than
-# unconditional — a key supplied only via the process environment and
-# absent from .env must not be blanked).
+# Load $POSTGRES_USER / $POSTGRES_DB through get_env_value, never by sourcing
+# .env (a value with backticks or $(...) would execute). The assignment is
+# guarded on the helper's exit status: it exits 1 for a key absent from .env,
+# and an unguarded assignment would blank a value supplied via the environment.
+# Command substitution strips one trailing newline from the value.
 if _v="$(scripts/env-value.sh POSTGRES_USER)"; then POSTGRES_USER="$_v"; fi
 if _v="$(scripts/env-value.sh POSTGRES_DB)"; then POSTGRES_DB="$_v"; fi
 
@@ -647,12 +602,12 @@ For managed/external Postgres there is no `db` container to exec into: drop the
 to `pg_dumpall`/`psql` directly.
 
 If no globals dump exists, create the five fixed NOLOGIN groups with the block
-below, and do it now rather than later. Adoption creates them too, but that is
-step 2d, and two things ahead of it need them already there: 0024's upgrade in
-2b runs `ALTER FUNCTION … OWNER TO geolens_tenant_provisioner`, and 2c grants
-memberships in all five. Skip this only when a globals replay has already put
-the roles back. The block is idempotent, needs CREATEROLE, and the attributes
-match what 0019 creates and validates:
+below, and do it now rather than later. Migration 0019 creates them in every
+tenancy mode, and 0024's upgrade runs `ALTER FUNCTION … OWNER TO
+geolens_tenant_provisioner`, so a dump whose schema is at 0019 through 0023
+cannot migrate to head on a cluster without them. Skip this only when a globals
+replay has already put the roles back. The block is idempotent, needs
+CREATEROLE, and the attributes match what 0019 creates and validates:
 
 ```sql
 DO $$
@@ -680,337 +635,30 @@ END
 $$;
 ```
 
-**Step 2 — restore the dump, then re-own its tenant objects.**
+**Step 2 — restore the dump.**
 
-Everything below runs through the Compose containers, because the bundled
-database listens on `127.0.0.1:${DB_PORT}` rather than a host socket and the
-Alembic config lives in `backend/`, not the repo root. Do **not** use
-`scripts/restore.sh` here — it restarts `api` and `worker` on exit, and nothing
-may serve traffic until 2b has finished. Managed/external Postgres: drop the
-`docker compose exec -T db` prefix and pass the provider's `-h`, `-p`, and `-U`
-instead.
-
-Keep `$POSTGRES_USER`/`$POSTGRES_DB` set in this shell (via
-`scripts/env-value.sh`, as in step 1) — they expand on the host, not in the
-container.
-The dump path is a host path; copy the dump out of the `backup_data` volume
-first, exactly as in "Step-by-step: full restore" below.
-
-**2a. Check the archive, stop the services, restore the dump.**
-
-`restore.sh` validates the archive, stops `api` and `worker`, restores, and
-restarts them on the way out; this recipe replaces it, so all of that is yours
-to do. Without the stop, traffic races a `--clean` restore and can reach the
-restore-owned SECURITY DEFINER functions during the window where `PUBLIC` can
-execute them. Nothing starts again until 2g is done.
-
-Validate the archive before anything destructive, exactly as `restore.sh` does:
-`--list` only reads the table of contents, which a truncated file still passes,
-so read every data block. A `--clean` restore that discovers the corruption
-halfway through has already dropped the database that was working.
+If `TILE_DATABASE_URL_OVERRIDE` names a separate tile login, admit it to the
+database first. `restore.sh` restarts `api` and `worker` when it exits, the
+reconciler revokes `PUBLIC CONNECT` in every path, and the database on a new
+cluster holds no named grant for that login. The revoke keeps explicit
+per-login grants, so this one survives the restore. The login itself comes back
+with the globals replay in step 1; without one, create it first as a plain
+`LOGIN` role with the password in `TILE_DATABASE_URL_OVERRIDE`. `ON_ERROR_STOP`
+makes a missing login fail here, before `restore.sh` starts the API. With
+`$POSTGRES_USER` and `$POSTGRES_DB` set as in step 1:
 
 ```bash
-docker compose exec -T db pg_restore -f /dev/null \
-  < ./restore/geolens_<timestamp>.dump
-```
-
-Then stop the services. That applies to managed/external Postgres too: the
-database is elsewhere, but `api` and `worker` are still the things that would
-write to it.
-
-Stop the backup service with them. A scheduled cycle landing mid-window dumps
-the half-restored database as the newest artifact — one that passes the
-validation above — and advances retention pruning against the copies you still
-need.
-
-```bash
-docker compose stop api worker backup
-
-docker compose exec -T db pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  --clean --if-exists --no-owner --no-acl < ./restore/geolens_<timestamp>.dump
-```
-
-**2b. Bring the restored schema to head.**
-
-A dump older than the running release restores an older schema, and adoption
-works only at head — it refuses on a boundary function that a later migration
-installed. `--no-deps` is what stops the `migrate` one-shot and the API
-entrypoint from doing this for you, so do it here, with the same override:
-
-A non-superuser migrator — a managed provider's admin, for instance — needs two
-privileges first, because 0024's upgrade transfers ownership of the boundary
-functions to `geolens_tenant_provisioner`, and PostgreSQL wants the incoming
-owner to hold `CREATE` on the schema and the caller to hold that owner's
-privileges. A superuser has both implicitly and can skip this. Grant them as the
-same admin identity that ran step 1's role block, and hand them back in 2g:
-
-```bash
-docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
-GRANT CREATE ON SCHEMA catalog TO geolens_tenant_provisioner;
-GRANT geolens_tenant_provisioner TO "<migrator-role>" WITH INHERIT TRUE, SET TRUE;
-SQL
-```
-
-No `ADMIN OPTION`: if the migrator is the same identity that ran step 1's block,
-PostgreSQL 16+ already gave it ADMIN there and refuses to grant ADMIN back to
-its own grantor. On PostgreSQL 13-15 drop the `WITH` clause — per-membership
-`INHERIT`/`SET` arrived in 16, and before that a membership simply carries the
-member's privileges.
-
-```bash
-docker compose run --rm --no-deps -e DATABASE_URL_OVERRIDE="<migrator-url>" \
-  migrate sh -c "uv run --no-dev alembic upgrade heads"
-```
-
-Skip the upgrade only if the dump came from the running release. Running it
-anyway is a no-op on a database already at head.
-
-**2c. Normalize the fixed-group memberships.**
-
-Run these whatever step 1 did, and run them before adoption. They are needed
-outright when the roles were rebuilt by hand, and still needed after a globals
-replay from a PostgreSQL 13-15 cluster: those dumps carry plain grants, which
-pick up the target server's defaults rather than the control inherit-only and
-writer/sandbox/tile SET-only shapes adoption requires. Adoption refuses a wrong
-shape rather than rewriting somebody else's grant, so leaving one here stops 2d
-before it starts. Re-issuing them is a no-op when they already match.
-
-First clear every membership row the replay restored, whatever grantor it
-recorded. Re-granting on top does not rewrite a restored row — on PostgreSQL
-16+ it adds a second row under your grantor and the old default-INHERIT/SET
-row survives to make 2d refuse the topology. This block is version-aware and
-safe to run on any supported release:
-
-```bash
-docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
-DO $$
-DECLARE m RECORD;
-BEGIN
-  FOR m IN SELECT granted.rolname AS granted_name,
-                  member.rolname AS member_name,
-                  grantor.rolname AS grantor_name
-           FROM pg_catalog.pg_auth_members AS am
-           JOIN pg_catalog.pg_roles AS granted ON granted.oid = am.roleid
-           JOIN pg_catalog.pg_roles AS member ON member.oid = am.member
-           LEFT JOIN pg_catalog.pg_roles AS grantor ON grantor.oid = am.grantor
-           WHERE granted.rolname IN ('geolens_tenant_control',
-                                     'geolens_tenant_writer',
-                                     'geolens_tenant_sandbox',
-                                     'geolens_tile_gateway')
-  LOOP
-    IF current_setting('server_version_num')::int >= 160000
-       AND m.grantor_name IS NOT NULL THEN
-      EXECUTE format('REVOKE %I FROM %I GRANTED BY %I',
-                     m.granted_name, m.member_name, m.grantor_name);
-    ELSE
-      EXECUTE format('REVOKE %I FROM %I', m.granted_name, m.member_name);
-    END IF;
-  END LOOP;
-END $$;
-SQL
-```
-
-Then issue the canonical grants — these are the ones `.env.example` documents
-alongside `GEOLENS_RUNTIME_DB_ROLE`; substitute your own login names, and
-never give the tile login any of the first three:
-
-```bash
-docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
-GRANT geolens_tenant_control TO "<runtime-login>" WITH INHERIT TRUE, SET FALSE;
-GRANT geolens_tenant_writer  TO "<runtime-login>" WITH INHERIT FALSE, SET TRUE;
-GRANT geolens_tenant_sandbox TO "<runtime-login>" WITH INHERIT FALSE, SET TRUE;
-GRANT geolens_tile_gateway   TO "<tile-login>"    WITH INHERIT FALSE, SET TRUE;
-SQL
-```
-
-That is the PostgreSQL 16+ form. On 13-15 there are no per-membership options,
-so drop every `WITH` clause. Leave the runtime login `INHERIT` there: it calls
-the provisioning functions directly and needs `geolens_tenant_control`'s
-`EXECUTE` to arrive by inheritance. What keeps the per-tenant roles behind a
-`SET ROLE` on those releases is the `NOINHERIT` attribute on the four fixed
-gateway roles, not anything about the login:
-
-```bash
-docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
-GRANT geolens_tenant_control TO "<runtime-login>";
-GRANT geolens_tenant_writer  TO "<runtime-login>";
-GRANT geolens_tenant_sandbox TO "<runtime-login>";
-GRANT geolens_tile_gateway   TO "<tile-login>";
-SQL
-```
-
-**2d. Adopt the restored tenant objects.**
-
-Replaying globals restores role definitions only. The restored tables, views,
-and sequences are all owned by whoever ran `pg_restore`, with no per-tenant
-grants on any of them, and the two SECURITY DEFINER functions that guard tenant
-provisioning come back owned by that same login. One command puts all of it back
-under the provisioning boundary:
-
-```bash
-docker compose run --rm --no-deps -e DATABASE_URL_OVERRIDE="<migrator-url>" \
-  migrate sh -c "uv run --no-dev python -m app.core.db.tenant_adoption --apply"
-```
-
-Run it before `api`, `worker`, or tile traffic starts. Both parts of the command
-shape matter: `api`'s entrypoint runs `alembic upgrade heads` of its own accord
-before it would execute your command
-(`backend/scripts/api-entrypoint.sh`), and `api` declares `depends_on: migrate`,
-so without `--no-deps` Compose starts the `migrate` one-shot with `.env`'s
-runtime credential rather than your override. The `migrate` service has
-`entrypoint: []` and depends only on a healthy `db`, so it does exactly what you
-ask and nothing else. The migrator credential is required: the least-privilege
-runtime login in `.env` is deliberately not allowed to do any of this.
-Managed/external Postgres uses the same command with `DATABASE_URL_OVERRIDE`
-pointed at the provider. A non-superuser migrator there needs `CREATEROLE`,
-ownership of the restored objects, and the privileges of
-`geolens_tenant_provisioner`, because PostgreSQL will not hand that role
-ownership of the boundary functions otherwise; the command prints the exact
-`GRANT` if it is missing.
-
-Drop `--apply` for a read-only report of what it would change. That form exits
-non-zero while anything is still pending, so it also works as a post-restore
-check.
-
-What it does, walking `catalog.tenants` with each tenant in its own transaction:
-
-- Creates the five fixed NOLOGIN cluster roles if they are missing, and refuses
-  on an unsafe existing topology — the same validation 0019 performs.
-- Re-owns `catalog.provision_tenant_data_schema` and
-  `catalog.deprovision_tenant_data_schema` to `geolens_tenant_provisioner`, and
-  takes back the `EXECUTE` that `PUBLIC` holds after a `--no-acl` restore.
-  PostgreSQL's default for a function carrying no ACL is `EXECUTE` to `PUBLIC`,
-  so until this runs both functions are SECURITY DEFINER, owned by the restoring
-  superuser, and callable by every login in the database. It never installs a
-  function body — the migrations own those, and adoption refuses if either
-  function is absent or is not the migration-installed shape.
-- Transfers the tenant schema to the provisioner, calls the guarded
-  provisioning function to recreate the reader/writer roles and their SET-only
-  gateway memberships, moves every restored relation, routine and type to the
-  per-tenant writer, and has that writer grant the paired reader `SELECT`.
-- Rewrites only the grants it made itself. A pre-existing anomaly — a membership
-  some third party granted, a default-privilege entry owned by a role it cannot
-  act as, a `SECURITY DEFINER` or untrusted-language routine in a tenant schema
-  — is reported with the exact statement to run and the role to run it as, and
-  that tenant is left for the next run. The automatic membership PostgreSQL
-  gives a role's creator is tolerated only for the login running adoption. On
-  any other login it is refused — `ADMIN` alone lets that login grant itself a
-  usable edge — and the report names the remedy: `DROP ROLE` the retired
-  login, or revoke the membership as its recorded grantor.
-
-The end state is the one migration 0019 produced. Idempotence is keyed on
-database state rather than on a marker or a timestamp: a tenant already in that
-shape issues no DDL at all, so re-running is safe and a run interrupted partway
-is resumed by running it again. A tenant that refuses is named in the report
-while the rest continue, and adopted tenants stay adopted.
-
-**What it does not do.** Reapply the runtime login grants from `.env.example`
-afterwards; those login credentials are deliberately not stored in the database
-dump. Enabling and FORCEing row-level security stays the API's job at boot
-(`apply_tenancy_rls`), and adoption does not turn it on for you. It does refuse
-to report a clean database while any boundary table on a control plane that has
-tenants is missing it, and while any table has row security enabled without
-`FORCE` — the table owner bypasses a policy that is not FORCEd. Which tables
-those are is read from the live insert-stamping triggers rather than from a list
-frozen into a migration, so a table that joined the boundary after 0018 is
-visible here, and a trigger left DISABLED by a restore is reported rather than
-counted. Object storage is a separate artifact; see step 0 of the full restore
-below.
-
-A dump carries row-security state, so a source cluster that was already
-enforcing it restores with it still on.
-
-**2e. Re-apply the runtime grants.**
-
-`--no-acl` drops them and this recipe does not run `scripts/restore.sh`, which
-is what normally re-applies them. The same privileged reconciler the bootstrap
-and restore paths use lives in the `db` container:
-
-```bash
-docker compose exec -T db /usr/local/bin/configure-runtime-db-role
-```
-
-The script is mounted into the bundled `db` container, so there is nothing to
-exec into on managed/external Postgres. A provider snapshot or PITR restore
-keeps its ACLs, so the grants come back with it and this step does not apply; a
-logical `pg_restore --no-acl` into a managed instance does not, and there the
-equivalent is to replay the grants from `.env.example` by hand — see the
-single-tenant runtime-role section above for exactly which ones.
-
-Then check it took, the way `restore.sh` does — a reader without schema access
-breaks every read-only consumer silently:
-
-```bash
-docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc \
-  "SELECT has_schema_privilege('geolens_reader', 'data', 'USAGE');"
-```
-
-**2f. Let the tile login connect.**
-
-Unconditional, and after 2e: that reconciler revokes `PUBLIC CONNECT`
-and grants it back to the current, migration and runtime roles only, in every
-path, so the tile login cannot reach the database at all after a restart without
-this — including when a globals replay restored everything else about it:
-
-```bash
-docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+docker compose exec -T db psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
   -v db="$POSTGRES_DB" <<'SQL'
 GRANT CONNECT ON DATABASE :"db" TO "<tile-login>";
 SQL
 ```
 
-**2g. Give the temporary privileges back.**
-
-Only if you granted them in 2b. Adoption manages its own borrow when it has to
-take one, and hands that back on its own; these two are yours, and left in place
-they are a standing `CREATE` on `catalog` for the provisioner and a membership
-that makes the next recovery refuse under a rotated migrator credential:
-
-```bash
-docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
-REVOKE CREATE ON SCHEMA catalog FROM geolens_tenant_provisioner;
-REVOKE geolens_tenant_provisioner FROM "<migrator-role>";
-SQL
-```
-
-Then start the services again:
-
-```bash
-docker compose start api worker backup
-```
-
-And verify by hand: the API login can `SET ROLE` to one tenant writer/reader,
-the tile login can set only that tenant reader, and neither login owns catalog
-RLS tables or a `data_t_*` schema. The backend re-checks the runtime login at
-boot (`assert_multi_tenant_runtime_role`) and refuses to start on an unsafe
-role, so a misconfigured restore fails loudly rather than serving cross-tenant
-data.
-
-#### Do not reach for `alembic downgrade 0016`
-
-Until this command existed, downgrading below 0019 and coming back up was the
-only way to reach that migration's adoption pass (fix(#998): an earlier revision
-of this section documented that downgrade as the recipe). It is still not a
-supported recovery path, and it is no longer necessary. It walks back through
-every migration between head and 0019, and several of them either refuse on data
-the current schema legitimately holds or discard state the re-upgrade cannot
-rebuild:
-
-| Migration | What its `downgrade()` does |
-|---|---|
-| 0030 | **Refuses** while any `catalog.records` row holds a MULTIPOLYGON `spatial_extent` — i.e. any antimeridian-crossing footprint, which the current schema exists to store |
-| 0029 | **Refuses** while any API key carries an expiry or any user's `key_epoch` has been bumped. Dropping `api_keys.expires_at` and both `key_epoch` columns would turn time-limited keys into permanent ones and un-revoke keys a `key_epoch` bump had invalidated; the error message lists the affected keys and the SQL that revokes them |
-| 0027 | **Refuses** while any dataset uses a `parquet`, `json`, `xlsx`, or `xls` source format — all currently supported |
-| 0022 | **Discards** `tenant_id` on `catalog.audit_logs` and `catalog.ingest_jobs`. The re-upgrade re-derives it from each row's live parent, so rows whose parent is gone lose tenant attribution permanently |
-| 0021, 0020 | **Refuse** when two tenants share a collection name, OAuth subject, or `datasets.table_name` — all legal under the current per-tenant scoping |
-
-The refusals are correct: forcing them would corrupt the restored data. And a
-failed downgrade is not recoverable in place. Several of these migrations do
-index work inside Alembic's `autocommit_block()` (0020, 0021 and 0022 among
-them), which commits the DDL preceding it, so a refusal at 0021 leaves you past
-0022's discards with no transaction to undo them — drop the database and start
-over from the dump. Step 2 above touches none of that: it runs forward, at head,
-and never moves the schema version.
+Then run `scripts/restore.sh` as in
+[Step-by-step: full restore](#step-by-step-full-restore-db--object-storage).
+Step 6 of the [canonical entry point](#canonical-restore-entry-point) rebuilds
+the grants and `data.*` ownership a restored dump lacks, and step 7 starts
+`api` and `worker` only after that succeeds.
 
 ### Step-by-step: full restore (DB + object storage)
 
@@ -1055,8 +703,9 @@ directory as the dump — here `./restore`). For the staging archive it prints t
 `docker run` line above with the real paths filled in; copy the printed command
 from the restore output rather than hand-editing it. For the globals dump it
 reports, **before** anything destructive runs, which roles the target cluster is
-missing — replay it first if that list is non-empty, following the role
-reconstruction procedure earlier in this section.
+missing — replay it first if that list is non-empty, following
+[Role reconstruction after a fresh-cluster restore](#role-reconstruction-after-a-fresh-cluster-restore)
+earlier in this section.
 
 ### Finding the dump to restore
 
@@ -1069,7 +718,7 @@ docker run --rm -v <project>_backup_data:/backups:ro alpine \
 # Validate a specific dump after copying it out of the volume (step 0 above).
 # Omit the filename to read stdin — the literal `-` alias was never documented
 # for pg_restore and PG 18 rejects it with `could not open input file "-"`,
-# which reads like a corrupt backup when the dump is fine (chore(#704)).
+# which reads like a corrupt backup when the dump is fine.
 docker compose exec -T db \
   pg_restore --list < ./restore/geolens_<YYYYmmdd_HHMMSS>.dump | head -20
 ```
@@ -1357,6 +1006,7 @@ What changes:
   | Vector datasets | **Yes, fully.** Features live in PostGIS. A lost object costs the original upload file and the quicklook thumbnail, not the data. |
   | Raster datasets, uploaded | **No.** A managed COG — anything ingested through GeoLens, plus VRT artifacts — lives only in your bucket. The catalog row comes back reading `published`, and every tile request then fails with a 500. Nothing in the catalog marks it broken. |
   | Raster datasets, by reference | **Yes**, as far as GeoLens is concerned. STAC and public-COG imports keep the upstream asset URL (`storage_backend="remote"`) and are served from it, so a restore recovers a working pointer — provided the upstream asset still exists, which is somebody else's retention policy, not yours. |
+  | Story images | **No.** Story rows come back, but the images live only in the bucket, so a lost object answers 404. |
 
   So protect the bucket *before* you need it — this is the step that has no
   GeoLens-side equivalent:
@@ -1398,7 +1048,7 @@ What changes:
   # written at the bucket root in every mode: the icon catalog
   # (catalog.map_icon_assets) has no tenant_id and no RLS policy, so one set
   # of icons serves every tenant and one copy of the bytes has to be readable
-  # from every tenant's request. Back it up once, restore it once (#1621).
+  # from every tenant's request. Back it up once, restore it once.
   PREFIX=rasters/<dataset-id>/     # from the catalog row you restored
   # Repeat for every prefix the restored database still references — the
   # managed layout, in full:
@@ -1546,6 +1196,11 @@ For production WAL management, use a purpose-built tool
 GeoLens exports Prometheus metrics out of the box. Reference scrape config, alert
 rules, and a Grafana dashboard ship in [`infra/monitoring/`](infra/monitoring/) —
 point your monitoring stack at them, or use them as a base for an existing one.
+The docs site covers the
+[metrics endpoint](https://docs.getgeolens.com/guides/admin/infrastructure/#metrics-endpoint)
+(series, scrape config, what is and is not exposed at the public edge) and the
+[health endpoint](https://docs.getgeolens.com/guides/admin/infrastructure/#health-endpoint)
+response.
 
 **Liveness checks must target `/api/health/live`; readiness checks
 `/api/health/ready`.** The three endpoints answer different questions and are
@@ -1585,27 +1240,23 @@ Two practical differences on top of that:
 Behind the bundled Nginx all three live under `/api/`. A bare `/health` or
 `/health/live` is not an API route there — the frontend SPA catch-all answers
 it with HTML `200`, which an uptime monitor will happily (and wrongly) accept.
-
-The bundled Compose stack already follows this split: the api service's
-healthcheck (and the `frontend` service's `depends_on: api: condition:
-service_healthy`) probe `/health/live` inside the container, so a cache or
-object-store outage no longer stops the UI from starting.
+The bundled Compose healthchecks already probe `/health/live` inside the
+container.
 
 ### Metrics & alerting (Prometheus / Grafana)
 
-Metrics are exposed on **two separate endpoints** — the API and the worker each
-run their own. The api service (only) runs multiple uvicorn workers in
-production and is scraped correctly under that fan-out because
-`docker-compose.yml`/`docker-compose.prod.yml` set `PROMETHEUS_MULTIPROC_DIR`
-for it by default (fix #1240 / #651); a bespoke deployment that runs the api
-image outside these compose files with `UVICORN_WORKERS>1` needs to set that
-same env var to a writable, container-local directory or every scrape reverts
-to seeing one arbitrary worker.
-
-| Source | On the Compose network | Host mapping | Exports |
-|---|---|---|---|
-| API | `http://api:8000/metrics` | `127.0.0.1:8001/metrics` | HTTP request rate / latency / errors, DB connection-pool gauges, tile-cache hit/miss |
-| Worker | `http://worker:8001/metrics` | internal-only | Procrastinate job-queue depth, active, completed, failed (per queue) |
+The API and the worker each serve their own `/metrics` endpoint
+(`http://api:8000/metrics` and `http://worker:8001/metrics` on the Compose
+network). Scrape the API directly, not through a proxy: its `/metrics`
+answers 404 to a request carrying `Forwarded`, `X-Forwarded-For` or
+`X-Real-IP`, as the bundled nginx and most reverse proxies send them. The api
+service runs multiple uvicorn workers in production and is
+scraped correctly under that fan-out because `docker-compose.yml` and
+`docker-compose.prod.yml` set `PROMETHEUS_MULTIPROC_DIR` for it by default. A
+bespoke deployment that runs the api image outside these compose files with
+`UVICORN_WORKERS>1` needs to set that same env var to a writable,
+container-local directory, or every scrape reverts to seeing one arbitrary
+worker.
 
 `infra/monitoring/prometheus.yml` already defines both scrape jobs
 (`geolens-api`, `geolens-worker`) and loads `alerts.yml` as a rule file. Run
@@ -1617,7 +1268,7 @@ docker run --rm -d --name geolens-prometheus \
   -p 127.0.0.1:9090:9090 \
   -v "$PWD/infra/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
   -v "$PWD/infra/monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro" \
-  prom/prometheus:v3.5.0   # or a newer pinned tag
+  prom/prometheus:v3.6.0   # or a newer pinned tag
 ```
 
 Then import `infra/monitoring/grafana-dashboard.json` into Grafana
@@ -1627,18 +1278,8 @@ Already running Prometheus/Grafana elsewhere? Copy the `scrape_configs` jobs and
 the `rule_files` entry into your own config and import the dashboard JSON — the
 targets just need network reach to `api:8000` and `worker:8001`.
 
-**Alert rules** (`infra/monitoring/alerts.yml`) — thresholds are tunable defaults:
-
-| Alert | Fires when | Severity |
-|---|---|---|
-| `GeoLensTargetDown` | API or worker unscrapeable for >2m | critical |
-| `GeoLensApiHigh5xxRate` | 5xx share of requests >5% over 5m | critical |
-| `GeoLensApiInteractiveLatencyP95` | interactive p95 ≥1s for 10m (tile and bulk-read handlers excluded) | warning |
-| `GeoLensApiBulkLatencyMean` | mean latency of a bulk read >5s for 10m | warning |
-| `GeoLensApiTileLatencyMean` | mean `/tiles/*` latency >2s for 10m | warning |
-| `GeoLensJobQueueBacklog` | any queue >100 jobs for 15m | warning |
-| `GeoLensJobFailures` | >5 job failures in 15m | warning |
-| `GeoLensDbPoolSaturated` | connection-pool overflow in use for >10m | warning |
+The alert rules and their thresholds, which are tunable defaults, are in
+[`infra/monitoring/alerts.yml`](infra/monitoring/alerts.yml).
 
 > Under an external pooler (`DB_USE_EXTERNAL_POOLER=true` → SQLAlchemy `NullPool`),
 > the `geolens_db_pool_*` gauges are not emitted and `GeoLensDbPoolSaturated`
@@ -1647,8 +1288,13 @@ targets just need network reach to `api:8000` and `worker:8001`.
 Feature and item collections, dataset exports and COG downloads return whatever
 the caller asked for — `?limit=2000` on a feature collection is roughly 10MB — so
 they get a mean-based bound of their own rather than counting toward the
-interactive percentile, the same treatment `/tiles/*` has had since #658.
+interactive percentile, the same treatment `/tiles/*` gets.
 `GeoLensApiBulkLatencyMean` reports which handler crossed the bound.
+
+A vector tile whose query runs past the tile pool's 10-second command timeout
+answers 503 without `Retry-After`, since a retry would repeat the same work, so
+a burst of slow tile queries shows up in `GeoLensApiHigh5xxRate`. A tile that
+can't get a pool connection in time still answers 429 with `Retry-After`.
 
 To check the rules after editing them (`prom/prometheus` ships `promtool`):
 
@@ -1660,8 +1306,8 @@ docker run --rm -v "$PWD/infra/monitoring:/w" --entrypoint promtool \
 ```
 
 `alerts.test.yml` replays each rule against synthetic series, including the
-traffic shape that made `GeoLensApiInteractiveLatencyP95` page three times in a
-week (#1517). A threshold changed without a matching expectation there fails the
+traffic shape that once made `GeoLensApiInteractiveLatencyP95` page three times
+in a week. A threshold changed without a matching expectation there fails the
 second command. CI runs both commands in the Monitoring Rules job, so you get
 the same answer on a PR that touches `infra/monitoring/`.
 
@@ -1670,12 +1316,10 @@ the same answer on a PR that touches `infra/monitoring/`.
 Each API worker samples its own RSS from `/proc/self/status` every 60 seconds
 and exports it as the Prometheus gauge `geolens_worker_rss_bytes` (labelled by
 `pid`) on the API `/metrics` endpoint. The api service runs in
-`prometheus_client` multiprocess mode (`PROMETHEUS_MULTIPROC_DIR`, fix #1240 /
-#651): every live worker's gauge is present in a single scrape, and HTTP
-request counters/histograms sum across workers instead of alternating between
-per-process values. Before this fix, a scrape only ever saw one worker, so
-successive scrapes could sawtooth between unrelated running totals and
-Prometheus read the downward steps as counter resets. The structured log
+`prometheus_client` multiprocess mode (`PROMETHEUS_MULTIPROC_DIR`): every live
+worker's gauge is present in a single scrape, and HTTP request
+counters/histograms sum across workers instead of alternating between
+per-process values. The structured log
 lines the RSS sampler writes remain useful as a secondary signal independent
 of scraping — a growth curve exists in `docker compose logs api` even if
 `/metrics` is never scraped:
@@ -1688,7 +1332,7 @@ of scraping — a growth curve exists in `docker compose logs api` even if
 A steadily climbing `rss_mb` — or the watermark WARNING — means one worker is
 heading for the container memory cap (`API_MEM_LIMIT`, default 2 GB). When it
 gets there, the cgroup OOM killer terminates that worker and drops its in-flight
-requests; the only trace outside these logs is host `dmesg` (#643).
+requests; the only trace outside these logs is host `dmesg`.
 
 The backstop is bounded worker recycling via `UVICORN_MAX_REQUESTS`: when it is
 set, the api command appends uvicorn's `--limit-max-requests` (wired in the
@@ -1811,6 +1455,26 @@ minutes = 26 hours, the default daily schedule plus slack). A container whose
 backups quietly stop succeeding therefore turns `unhealthy` roughly one missed
 cycle later, and `docker compose ps` shows it — no monitoring stack required.
 
+A cycle with `BACKUP_S3_ENABLED=true` also touches
+`/backups/.last-offsite-success`. Once that marker exists, the healthcheck
+holds it to the same `BACKUP_MAX_AGE_MINUTES`, even if offsite upload is later
+switched off. A compose override that drops the offsite settings, or an `.env`
+edit that loses them, then turns the service `unhealthy` instead of leaving it
+quietly local-only. The container also logs a startup warning when it finds the
+marker with offsite upload off. If you meant to turn offsite upload off, delete
+the marker:
+
+```bash
+docker compose exec backup rm /backups/.last-offsite-success
+```
+
+The trade-off: a deliberate switch-off also reads as `unhealthy`, about a day
+later, until you delete the marker. That is the price of catching an accidental
+one. An `unhealthy` backup service blocks nothing (no other service waits on
+it), and `scripts/upgrade.sh` lets it through while it is inside its start
+period. Installs that never enabled offsite upload have no marker and see no
+change.
+
 Tuning and edge behavior:
 
 - **Changed only the time of day?** `BACKUP_SCHEDULE` accepts a single fixed
@@ -1853,7 +1517,7 @@ catches those:
 docker compose logs backup | grep 'ERROR:'
 ```
 
-A few raw tool failures are not wrapped (for example the weekly `cp` copies in
+A few raw tool failures are not wrapped (for example `aws configure set` in
 the entrypoint) and surface only as the tool's own stderr, with no `ERROR:`
 marker. When a backup looks wrong but the grep comes back quiet, read the
 unfiltered `docker compose logs backup`.
@@ -1919,25 +1583,32 @@ always check the collector files.
 
 ## 5. Incident response — data loss
 
-Follow this ordered procedure to recover from data loss.
+Follow this ordered procedure to recover from data loss. Stop the backup
+service first, before you look at anything, and keep it stopped until the
+restored data checks out (step 2 says why):
+
+```bash
+docker compose stop backup
+```
 
 ### 1. Assess scope
 
 Determine what was lost:
 - Is the database intact? (`docker compose exec db psql -U geolens -c '\l'`)
 - Are uploaded source files (in `upload_staging`) missing?
-- What is the latest backup timestamp? (`docker compose exec backup sh -c 'ls -lt /backups/daily/*.dump' | head -5`)
+- What is the latest backup timestamp? (`docker run --rm -v <project>_backup_data:/backups:ro alpine sh -c 'ls -lt /backups/daily/*.dump' | head -5`, with your Compose project name from `docker volume ls` as `<project>`)
 
 ### 2. Select the newest valid dump
 
 ```bash
-# List all daily dumps in the backup_data volume, newest first
-docker compose exec backup sh -c 'ls -lt /backups/daily/*.dump'
+# List all daily dumps in the backup_data volume, newest first.
+# Replace <project> with your Compose project name (see `docker volume ls`).
+docker run --rm -v <project>_backup_data:/backups:ro \
+  alpine sh -c 'ls -lt /backups/daily/*.dump'
 
 # Copy the chosen dump and BOTH its paired artifacts out of the volume — the
 # globals dump included, or a fresh-cluster restore has no roles to replay and
 # restore.sh cannot report which ones are missing.
-# Replace <project> with your Compose project name (see `docker volume ls`).
 # umask 077: globals-*.sql holds role password verifiers.
 mkdir -p ./restore && chmod 700 ./restore
 docker run --rm \
@@ -1951,13 +1622,23 @@ docker run --rm \
 
 # Validate the candidate dump before restoring. Omit the filename to read
 # stdin: PG 18 rejects the literal `-` with `could not open input file "-"`,
-# which reads like a corrupt backup when the dump is fine (chore(#704)).
+# which reads like a corrupt backup when the dump is fine.
 # `-f /dev/null` reads every data block; `--list` alone would pass a dump
 # truncated after its table of contents.
 docker compose exec -T db \
   pg_restore -f /dev/null < ./restore/geolens_<YYYYmmdd_HHMMSS>.dump \
   && echo "candidate dump reads end-to-end"
 ```
+
+The backup service stays stopped because a day keeps only its newest dump. A
+scheduled run, or the dump every start of the container takes at once, would
+replace that day's good dump with a dump of the damaged or half-restored
+database, and could prune files while you copy them. Retention keeps the dump named
+in `/backups/.last-good-dump` until a database holding at least half of its
+sampled catalog records replaces it, but a half-restored database can reach
+that. `restore.sh` restarts only
+`api` and `worker`, so it leaves the backup service stopped. Copy out that day's
+whole backup set too if the one you plan to restore is older.
 
 If the daily dump is corrupt, fall back to a weekly backup under
 `/backups/weekly/`, or to a pre-upgrade dump under `backups/pre-upgrade/`.
@@ -2008,8 +1689,9 @@ stack to confirm the restore procedure from end to end before trusting the data.
   (`docker compose logs backup | grep 'S3 upload complete'`).
 - If the backup cycle missed the recovery window, review `BACKUP_SCHEDULE` and
   whether any `ERROR: pg_dump failed` entries appear in the logs for that period.
-- Re-enable the backup service if it was stopped during recovery:
-  `docker compose start backup`.
+- Re-enable the backup service once the restored data is verified:
+  `docker compose up -d backup`. Unlike `start`, it also recreates the container
+  after `--scale backup=0`, and it takes a dump as it starts.
 
 ---
 
@@ -2040,10 +1722,9 @@ docker compose stop api worker
 #    lands it outside the container, so there is no volume copy to make later
 #    and no <project> volume name to look up.
 #
-#    NOT into /backups/daily: that directory is under retention. An extra file
-#    there occupies a retention slot, so the next `prune_old_backups` pass —
-#    which keeps BACKUP_RETENTION_DAILY (7) `*.dump` files by mtime — deletes
-#    one more generation of real history than it otherwise would. ./backups/
+#    NOT into /backups/daily: that directory is under retention, which reads
+#    each dump's day from its filename and keeps only the newest dump per day,
+#    so an extra dump copied there can displace a real one. ./backups/
 #    is gitignored and `backups/pre-upgrade/` is where scripts/upgrade.sh
 #    already puts its rollback dump.
 #
@@ -2109,12 +1790,11 @@ docker compose pull   # or: docker compose build, if you build locally.
                       # backup cycle fails with "server version mismatch".
 #    `--scale backup=0` keeps the backup service DOWN for this step. It runs an
 #    initial dump the moment it starts, so starting it here would capture the
-#    freshly migrated but still EMPTY cluster, write it to /backups/daily as the
-#    newest dump, and prune one real generation to stay inside
-#    BACKUP_RETENTION_DAILY (7). Every retry of steps 2-3 would replace another
-#    generation of real history with an empty-cluster dump — and section 5 tells
-#    an incident responder to restore the newest dump, which would then be the
-#    empty one. Nothing depends_on backup, so scaling it to 0 is safe.
+#    freshly migrated but still EMPTY cluster, and write it to /backups/daily as
+#    the newest dump. Retention keeps one dump per day, so it would replace the
+#    real dump from the same day. Section 5 tells an incident responder to
+#    restore the newest dump, which would then be the empty one. Nothing
+#    depends_on backup, so scaling it to 0 is safe.
 docker compose up -d --wait --scale backup=0
 
 # 4. Restore the dump (canonical entry point: validates the file, stops
@@ -2123,13 +1803,8 @@ docker compose up -d --wait --scale backup=0
 #    If the shell that ran step 1 is gone, $DUMP is unset — pick the newest
 #    verified dump explicitly:
 #      ls -t ./backups/pre-upgrade/*.dump | head -1
-# If catalog.tenants has rows, restore.sh is not the whole recipe — it
-# restarts api and worker on a database whose tenant objects are still owned by
-# the restore login. Use §2's stop / restore / adopt sequence instead, and run
-#   docker compose run --rm --no-deps -e DATABASE_URL_OVERRIDE="<migrator-url>" \
-#     migrate sh -c "uv run --no-dev python -m app.core.db.tenant_adoption"
-# afterwards: without --apply it changes nothing and exits non-zero while
-# anything is still pending.
+# If catalog.tenants has rows, restore.sh is not the whole recipe: follow the
+# Cloud overlay's own restore runbook for this step instead.
 ./scripts/restore.sh "$DUMP"
 
 # 5. Bring the backup service up now that the cluster holds real data, and
@@ -2148,11 +1823,6 @@ docker compose up -d --wait
 docker compose exec db psql -U geolens -c 'select version();'
 curl -fsS http://localhost:8080/api/health
 ```
-
-Deployments with tenant isolation enabled: after the fresh-cluster restore,
-rebuild the tenant data-plane roles exactly as documented in the
-role-reconstruction subsection of section 2 before starting API, worker, or
-tile traffic.
 
 ### Managed / external Postgres mode
 
@@ -2266,24 +1936,37 @@ their own remediation in the error message; neither is auto-coerced.
 
 ## 8. Audit log retention
 
-`catalog.audit_logs` has no built-in expiry: every login, dataset mutation,
+`catalog.audit_logs` keeps every row by default: every login, dataset mutation,
 share change, and export is a permanent row (see
 `backend/app/modules/audit/router.py`'s module docstring, which already flags
-that the table can reach millions of rows on a busy instance). Community ships
-bounded CSV/JSON export
-(`GET /admin/audit-logs/export/{format}`, capped at 100,000 rows per request)
-but no automatic pruning — an operator who wants a retention window applies it
-out of band, with `scripts/audit_retention.sh`. That is deliberately an
-operator-run script rather than an in-app feature: an in-app pruning endpoint
-means a new destructive-write surface (Rule 1 of the Security pre-commit
-checklist, plus RBAC and rate-limit review for a delete-many endpoint), and a
-script an operator invokes deliberately is the smaller, auditable surface for a
-table whose entire purpose is being an audit trail.
+that the table can reach millions of rows on a busy instance). Two things keep
+it bounded:
+
+- Repeat dataset views collapse. A signed-in user opening the same dataset again
+  within 15 minutes of their last `dataset.view` row writes no new row, and
+  emits no event to any other audit sink either.
+- Admin Settings > General has an **Audit log retention (days)** field
+  (`audit_retention_days`). Empty, the default, keeps rows forever. A value of
+  90 or more makes the worker delete rows older than that every six hours, in
+  batches, and record one `audit.prune` event with the count and cutoff. Some
+  compliance regimes require at least a year of audit records, so the field
+  warns below 365 days. The prune deletes rows of every action and does not
+  archive them first, so export the window you care about before you set it.
+
+Community also ships bounded CSV/JSON export
+(`GET /admin/audit-logs/export/{format}`, capped at 100,000 rows per request).
+For archive-then-delete, or a window the setting cannot express, apply it out
+of band with `scripts/audit_retention.sh`. That script stays an operator-run
+tool rather than an endpoint: an in-app delete-many endpoint is a new
+destructive-write surface that needs access-control, RBAC and rate-limit
+review, and a script an operator invokes deliberately is
+the smaller, auditable surface for a table whose entire purpose is being an
+audit trail.
 
 ### Deciding on a window
 
-There is no default; pick a retention period your compliance posture
-requires (30/90/365 days are common). Whatever you pick, keep two things in
+The setting is off by default; pick a retention period your compliance posture
+requires (90/365 days are common). Whatever you pick, keep two things in
 mind:
 - `dataset.download_cog`, `feature.*`, and `dataset.view` rows are usually the
   bulk of the table on an active instance — high-frequency, low-value-per-row
@@ -2582,7 +2265,7 @@ lossless conversion.
 Under a lossy codec the uploaded file is the only copy of the original samples
 that will ever exist, so GeoLens keeps it.
 
-**A CRS override is not lossy** (behavior change, issue #1291).
+**A CRS override is not lossy** (a behavior change).
 Supplying an EPSG code at import time *assigns* that CRS: it relabels the raster
 where it already sits and leaves every pixel value and every corner coordinate
 alone. Only the meaning of those coordinates changes, which is the point — you
@@ -2860,7 +2543,7 @@ takes no writes and answers no API traffic.
 That outage is deliberate. Data migrations backfill and rewrite existing rows,
 and a one-shot backfill that runs while the previous release is still accepting
 writes silently misses every row written behind it. Alembic will not re-run the
-revision, so nothing repairs those rows later (#1467). Stopping the writers is
+revision, so nothing repairs those rows later. Stopping the writers is
 also what makes the pre-upgrade dump a snapshot with no lost writes: `pg_dump`
 does not block writers, so anything acknowledged while it runs would be missing
 from the file you would restore from.
@@ -3008,23 +2691,12 @@ supported rollback; see §7 for why.
 
 ### Upgrading past the header-auth job queue (v1.18.2)
 
-v1.18.0 and v1.18.1 dispatched a WFS or OGC API Features import that carried
-a Basic or named-header credential on a dedicated queue named
-`ingest-auth-v2`, so a worker from a release before v1.18.0 never dequeued a
-job it could not read. v1.18.2 stops producing on that queue (#1812): those
-jobs go on the default `ingest` queue again. The worker still subscribes to
-`ingest-auth-v2` for this one release, so anything a v1.18.0 or v1.18.1 API
-left queued there is drained by a v1.18.2 worker on its default queues. The
-release after v1.18.2 drops the name.
-
-Upgrade order:
-
-- From v1.18.0 or v1.18.1: upgrade the API and the worker together, as the
-  recipe above does, or the API first. Both of those workers read the header
-  line and listen on `ingest` as well, so nothing is stranded either way.
-- From a release before v1.18.0: upgrade the worker before or with the API. A
-  worker that old dequeues a header-line job from `ingest`, cannot parse the
-  line, and fails the import after spending its single-use credential.
+v1.18.0 and v1.18.1 sent a WFS or OGC API Features import that carried a Basic
+or named-header credential to a queue named `ingest-auth-v2`. Since v1.18.2 the
+API no longer enqueues there, but the default `WORKER_QUEUES` still lists the
+name so a worker drains what an older API left behind, and the worker logs a
+warning at startup when an override omits it. The upgrade order is in the
+[upgrade guide](https://docs.getgeolens.com/guides/quickstart/upgrade/#1182-header-auth-import-queue).
 
 Rows can still be stranded on `ingest-auth-v2` by a worker that never lists
 it: a rollback to a release before v1.18.0, or a `WORKER_QUEUES` override that
@@ -3049,7 +2721,7 @@ docker compose -f docker-compose.prod.yml exec -T db \
   "UPDATE catalog.procrastinate_jobs SET status = 'failed' WHERE queue_name = 'ingest-auth-v2' AND status = 'todo'"
 ```
 
-Three things worth knowing before you run the UPDATE or read back what it did:
+Three things to know before you run the UPDATE or read back what it did:
 
 - Procrastinate's own `status`-change trigger
   (`procrastinate_trigger_function_status_events_update_v1`, in the installed
@@ -3089,62 +2761,11 @@ import resubmits it.
 
 ---
 
-### Refresh-session migration 0061
+### Other version-specific notes
 
-Apply `0061_refresh_token_families` with all API processes stopped, then restart
-all of them on the new version. Mixed versions cannot preserve a family through
-rotations handled by an older process. Existing refresh rows receive independent
-family IDs: historical parent/child relationships were not stored and cannot be
-reconstructed. Their existing expiries are preserved. New password and OAuth
-logins create separate families; every rotation inherits its family's ID.
-
-A rotated token remains usable during the configured concurrency grace window
-(default 30 seconds). Reuse after grace revokes that family's refresh tokens,
-including concurrent rotation branches, only while the presented token is still
-within its original lifetime (default seven days). Naturally expired tokens
-return 401 without further revocation. Cleanup retains each hash through its
-original expiry plus one day; a continually active session does not retain its
-entire history indefinitely.
-
-`POST /api/auth/logout/session/` revokes one refresh family. Its existing access
-JWTs remain usable until their normal expiry; other devices and API keys survive.
-`POST /api/auth/logout/` retains the existing immediate account-wide access and
-refresh revocation. Password changes and administrator security resets also
-retain their existing account-wide revocation behavior. Browser recovery uses
-the family endpoint with a captured access JWT and no cookies, so discarding an
-older session cannot clear a newer login's cookie.
-
-Downgrading 0061 revokes spent refresh rows before discarding their rotation
-metadata. This prevents an older server from accepting them again until their
-original expiry; current unrotated successors remain usable.
-
-### Backfilling 3D Tiles extents
-
-A 3D Tiles dataset gets its extent from its root bounding volume. Tilesets
-published before GeoLens read `box` and `sphere` volumes have none, so search
-shows "No Extent" and the dataset has no footprint. After upgrading, record
-their extents from each stored `tileset.json`:
-
-```bash
-docker compose exec api /app/.venv/bin/python -m scripts.backfill_tileset_extents --dry-run
-docker compose exec api /app/.venv/bin/python -m scripts.backfill_tileset_extents
-```
-
-The API container's root filesystem is read-only, so `uv run` cannot create its
-cache there; call the baked virtualenv's Python directly, as above.
-Add `-f docker-compose.prod.yml` when that is the file your install runs.
-With `GEOLENS_TENANCY_MODE=multi_tenant`, run both commands once for each
-tenant, adding `--tenant <tenant id>`; without it the script exits 2 before
-reading anything. `SELECT id, slug FROM catalog.tenants;` lists the ids. The
-script reads and writes only 3D Tiles datasets with no extent, so a rerun is
-safe. Backfilled datasets show a new updated time, since each record gains an
-extent. It lists each dataset it updates, skips or fails, with the reason. Only a tileset
-in a local frame is skipped: it has no extent to record. It exits 1 when a
-dataset's tileset pointer or stored `tileset.json` is missing or unreadable.
-When every dataset fails, the API is usually not pointed at the storage that
-holds the tilesets; when one does, that dataset's catalog row or stored files
-are damaged. It exits 2 when it cannot start the way the worker does, for
-example when an overlay the install needs is not loaded.
+The refresh-session migration 0061 (1.20.0) and the 3D Tiles extent backfill
+(1.21.1) are covered in the
+[upgrade guide's version-specific notes](https://docs.getgeolens.com/guides/quickstart/upgrade/#version-specific-notes).
 
 ## 11. Secret rotation
 
@@ -3233,7 +2854,7 @@ Every access token, refresh token and session cookie stops verifying at once,
 so every signed-in user is signed out and has to sign in again. That is the
 point of the rotation, and it is immediate: there is no dual-key grace period.
 
-Four other things are keyed off the same secret and change with it. None
+Five other things are keyed off the same secret and change with it. None
 require action, but each is worth knowing before an incident call:
 
 - **Signed tile URLs** stop verifying unless `TILE_SIGNING_SECRET` is set,
@@ -3243,6 +2864,9 @@ require action, but each is worth knowing before an incident call:
   have to be re-requested.
 - **ArcGIS sign-in rate-limit counters** are keyed by a digest derived from the
   secret, so existing per-account lockout counters reset to zero.
+- **Password sign-in throttle counters and remembered browsers** reset the
+  same way. Every browser is unknown again until its next sign-in, which
+  matters only while an account is being throttled.
 - **Config import preview tokens** stop verifying. Re-run the preview.
 
 **If `SECRET_ENCRYPTION_KEY` is not set, this rotation also destroys every
@@ -3260,3 +2884,37 @@ rotation costs nothing.
 If you still have the old `JWT_SECRET_KEY`, the cheaper recovery is to put it
 back, set `SECRET_ENCRYPTION_KEY`, run `rotate_secrets.py`, and only then
 rotate the JWT secret again.
+
+---
+
+## 12. Password sign-in throttled for an account
+
+After 10 failed password sign-ins within an hour, an account refuses password
+sign-in from clients it doesn't know, with HTTP 429 and a `Retry-After`
+header, even when the password is right. The window slides, so it clears an
+hour after the failures stop. Each browser that has signed in to the account
+before has its own budget of 10 and keeps working. Each time a budget fills,
+the audit log gets one `user.login.throttled` row.
+
+Clients the account doesn't know include a new browser, a private window, an
+SPA served from a different origin than the API, and password sign-in from
+the CLI, the SDKs or scripts.
+
+If you're locked out, try these ways back in, in order:
+
+1. A browser you have signed in with before.
+2. A session that is still signed in, in any browser or in the CLI.
+3. SSO, if a provider is configured.
+4. An API key, for automation and the CLI (`geolens login --api-key`).
+5. Have a browser remembered from the host:
+
+   ```bash
+   docker compose exec api /app/.venv/bin/python -m scripts.trust_login_device <username>
+   ```
+
+   It prints a link that works once, within 10 minutes. Open it in the
+   browser to remember and press the button on the page; opening the link
+   alone changes nothing. The link only lets that browser try a password. It
+   doesn't sign anyone in. A browser remembers at most 5 accounts; one
+   already at that limit is refused, and the link still works in a private
+   window.

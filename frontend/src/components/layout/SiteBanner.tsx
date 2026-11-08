@@ -29,39 +29,44 @@ const COLOR_CLASSES: Record<string, string> = {
 
 const DISMISS_KEY = 'gl-site-banner-dismissed';
 
-// feat(#1662): make https:// URLs in admin-entered banner text
-// clickable. The text itself stays React-escaped; only the matched URL
-// becomes an anchor, so an admin cannot inject markup through the banner.
-// Trailing sentence punctuation stays outside the link.
-// Apostrophes are legitimate URL characters (/O'Reilly), so ' is NOT an
-// excluded body character; a single quote only acts as a delimiter when it
-// wraps the URL ('https://…'), handled by the paired-wrapper check below.
-// fix(#1662 review): a single greedy group with no trailing-group/lookahead
-// split — the earlier lazy-body + punctuation-group pair let the engine retry
-// every split point on adversarial runs (quadratic). The trail is peeled in
-// plain code below instead, which is linear by construction.
-const URL_RE = /https:\/\/[^\s<>"\u201C\u201D\u2018\u2019\u00AB\u00BB\u2013\u2014]+/gi;
+// Linkifies https:// URLs in admin-entered banner text. The text stays
+// React-escaped and only the matched URL becomes an anchor, so an admin cannot
+// inject markup. Trailing sentence punctuation stays outside the link.
+// Apostrophes are legitimate URL characters (/O'Reilly), so ' is not excluded
+// from the body; it delimits only when it wraps the URL ('https://…'), via the
+// paired-wrapper check below.
+// One greedy group, with the trail peeled in plain code: a lazy body plus a
+// punctuation group lets the engine retry every split point on adversarial
+// runs (quadratic).
+const URL_RE_SOURCE = String.raw`https:\/\/[^\s<>"\u201C\u201D\u2018\u2019\u00AB\u00BB\u2013\u2014]+`;
+// [label](https://…) is tried first at each position. The label needs a
+// visible character and cannot contain brackets and the target cannot contain parentheses, so a failed match gives
+// up at the next bracket and the scan stays linear.
+const LINK_RE_SOURCE = String.raw`\[(?=[^\[\]]*[^\s\[\]])([^\[\]]+)\]\((https:\/\/[^\s()<>"]+)\)`;
+const LINK_OR_URL_RE = new RegExp(`${LINK_RE_SOURCE}|${URL_RE_SOURCE}`, 'gi');
 const TRAIL_RE = /[.,;:!?)\]\u2026\u3002\u3001]+$/;
 
-// fix(#1662 review): the linkifier runs per visitor render on admin-entered
-// text with no schema length limit. Rather than proving every scan linear on
-// adversarial input, cap the work: a banner longer than this renders as plain
-// text (an announcement banner past 2,000 characters is broken UX regardless),
-// which bounds worst-case cost to a constant.
+// The linkifier runs per visitor render on admin text with no schema length
+// limit. Capping the work bounds the worst case to a constant: a longer banner
+// (broken UX anyway) renders as plain text.
 const LINKIFY_MAX_LENGTH = 2000;
 
 function renderBannerText(text: string) {
   if (text.length > LINKIFY_MAX_LENGTH) return [text];
-  const parts: Array<string | { url: string; trail: string }> = [];
+  const parts: Array<string | { url: string; trail: string; label?: string }> = [];
   let last = 0;
-  for (const m of text.matchAll(URL_RE)) {
-    // fix(#1662 review): a verbatim <…> span advances `last` past characters
-    // matchAll has not seen; a scheme inside the consumed span must not
-    // produce a second, overlapping link.
+  for (const m of text.matchAll(LINK_OR_URL_RE)) {
+    // A verbatim <…> span advances `last` past text matchAll has not seen; a
+    // scheme inside it must not produce a second, overlapping link.
     if (m.index! < last) continue;
-    // fix(#1662 review): only linkify at a token boundary — an https:// embedded
-    // inside another token (nothttps://…, or a URL nested in another URL's
-    // path) is not a link of its own.
+    if (m[1] !== undefined) {
+      if (m.index! > last) parts.push(text.slice(last, m.index));
+      parts.push({ url: m[2], trail: '', label: m[1] });
+      last = m.index! + m[0].length;
+      continue;
+    }
+    // Only at a token boundary: an https:// inside another token (nothttps://…
+    // or a URL nested in another URL's path) is not a link of its own.
     if (m.index! > 0 && !/[\s<>"'()[\]\u201C\u201D\u2018\u2019\u00AB\u00BB\u2013\u2014]/.test(text[m.index! - 1])) {
       continue;
     }
@@ -70,17 +75,15 @@ function renderBannerText(text: string) {
     const trailMatch = TRAIL_RE.exec(matched);
     let url = trailMatch ? matched.slice(0, trailMatch.index) : matched;
     let trail = trailMatch ? trailMatch[0] : '';
-    // fix(#1662 review): <https://…> is RFC 3986's own URL delimiting. Inside
-    // angle brackets the URL is taken VERBATIM — trailing punctuation like
-    // /wiki/Yahoo! stays in the href, and no wrapper/balance heuristics run.
-    // This is also the documented escape hatch: an admin who needs an exact
-    // URL that the heuristics would trim can always write <URL>.
-    // The regex may stop early inside <…> (excluded characters like dashes are
-    // allowed there), so the verbatim span runs to the closing bracket itself.
+    // <https://…> is RFC 3986's URL delimiting: inside angle brackets the URL
+    // is taken VERBATIM (trailing punctuation like /wiki/Yahoo! stays in the
+    // href, no heuristics run). It is also the escape hatch for an admin who
+    // needs an exact URL the heuristics would trim. The regex may stop early
+    // inside <…> (excluded characters are allowed there), so the span runs to
+    // the closing bracket itself.
     if (m.index! > 0 && text[m.index! - 1] === '<') {
-      // fix(#1662 review): bound the '>' search to the current whitespace-free
-      // token — an unclosed '<' must not scan the whole remaining text, or
-      // repeated unclosed spans would make the render quadratic.
+      // Bounded to the current whitespace-free token: an unclosed '<' must not
+      // scan the remaining text, or repeated ones make the render quadratic.
       const ws = text.slice(m.index!).search(/\s/);
       const tokenEnd = ws === -1 ? text.length : m.index! + ws;
       const closeInToken = text.slice(m.index!, tokenEnd).indexOf('>');
@@ -91,17 +94,14 @@ function renderBannerText(text: string) {
         continue;
       }
     }
-    // fix(#1662 review): 'https://…' wrapped in single quotes — the opening
-    // quote sits just before the match, so a trailing apostrophe is the
-    // closing wrapper, not part of the URL. Unpaired apostrophes stay in.
+    // With an opening quote just before the match, a trailing apostrophe is the
+    // closing wrapper; unpaired apostrophes stay in the URL.
     if (m.index! > 0 && text[m.index! - 1] === "'" && url.endsWith("'")) {
       url = url.slice(0, -1);
       trail = "'" + trail;
     }
-    // fix(#1662 review): a URL that legitimately ends in ')' or ']' — e.g. a
-    // Wikipedia path like /Function_(mathematics) — should keep as many
-    // closing brackets as it has unmatched opening ones of the same kind;
-    // only the excess is sentence punctuation or a wrapping delimiter.
+    // A URL like /Function_(mathematics) keeps as many closing brackets as it
+    // has unmatched opening ones; only the excess is punctuation or a wrapper.
     for (const [openCh, closeCh] of [
       ['(', ')'],
       ['[', ']'],
@@ -133,7 +133,7 @@ function renderBannerText(text: string) {
           rel="noopener noreferrer"
           className="underline underline-offset-2 hover:opacity-80"
         >
-          {p.url}
+          {p.label ?? p.url}
         </a>
         {p.trail}
       </span>
@@ -167,7 +167,7 @@ export function SiteBanner() {
     try {
       sessionStorage.setItem(DISMISS_KEY, text!);
     } catch {
-      // storage unavailable (privacy mode) — dismiss for this mount only
+      // Storage may be unavailable (privacy mode); dismiss for this mount only.
     }
     setDismissed(text!);
   }

@@ -1,7 +1,7 @@
-// fix(#755): wiring pin for the proactive tile-token refresh. Tile sigs are
+// Wiring pin for the proactive tile-token refresh. Tile sigs are
 // minted on 900 s `round_expiry()` boundaries, so a tab backgrounded for a few
 // minutes returns with an expired sig and MapLibre 403s every visible tile
-// before the reactive GUARD-03 / #621 handler heals the map. BuilderMap must
+// before the reactive token-recovery (#621) handler heals the map. BuilderMap must
 // kick the SAME throttled re-mint on the visible edge of `visibilitychange`.
 //
 // The hook's own semantics (skew window, hidden-edge no-op, unmount detach) are
@@ -134,7 +134,7 @@ vi.mock('@vis.gl/react-maplibre', async () => {
 const DATASET_ID = 'ds-uuid-755';
 
 function vectorToken(expSeconds: number): VectorTileToken {
-  return { kind: 'vector', sig: 'sig-755', exp: expSeconds, scope: 'parcels', expires_in: 900 };
+  return { kind: 'vector', sig: 'sig-755', exp: expSeconds, scope: 'parcels', expires_in: 900, tile_url_template: '' };
 }
 
 function makeVectorLayer(): MapLayerResponse {

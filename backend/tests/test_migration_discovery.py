@@ -5,12 +5,8 @@ runs migrations at import time and so cannot be imported as a normal module.
 Every test here compiles the REAL function out of that source (see
 ``_load_real_discover_fn``) and drives it with fake entry points.
 
-fix(#1665): there used to be a hand-written mirror of the function at the top of
-this file that four tests exercised instead. One of them asserted that a failing
-plugin is "swallowed ... without breaking discovery" — the behaviour that let a
-broken overlay produce a partial schema under a zero exit code. It stayed green
-across the fix because it pinned the copy, not the code. The mirror is gone;
-there is now one subject.
+A hand-written mirror would pin the copy rather than the code, and let a broken
+overlay produce a partial schema under a zero exit code.
 """
 
 from __future__ import annotations
@@ -26,7 +22,7 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# GAP-013 / #1665: _discover_migration_paths must distinguish "overlay not
+# #1665: _discover_migration_paths must distinguish "overlay not
 # installed" (silent, and the only class that continues — normal OSS) from
 # "overlay installed but broken" (raise, so the migration stops rather than
 # succeeding over an incomplete revision graph).
@@ -109,7 +105,7 @@ def test_real_discover_skips_nonexistent_dir():
 def test_real_discover_broken_overlay_beside_a_working_one_raises(tmp_path):
     """A broken overlay raises even when another overlay discovered paths.
 
-    fix(#1665): the GEOLENS_EDITION=enterprise guard further down env.py only
+    The GEOLENS_EDITION=enterprise guard further down env.py only
     fires when NO paths were discovered at all, so this mixed case slipped past
     it entirely — the migration ran with one overlay's chain silently absent.
     """
@@ -143,7 +139,7 @@ def test_real_discover_oss_install_is_silent(caplog):
 def test_real_discover_entry_point_that_cannot_import_raises():
     """An enumerated entry point whose module is missing is BROKEN, not absent.
 
-    fix(#1665, codex P1): this used to be read as "the overlay package is simply
+    This used to be read as "the overlay package is simply
     not installed" and skipped silently. But the entry point's presence already
     proves a distribution declared it, so the module failing to import means the
     install is broken — and a ModuleNotFoundError raised from INSIDE the
@@ -169,7 +165,7 @@ def test_real_discover_broken_overlay_raises():
     """Enterprise overlay present but broken must stop the migration.
 
     A non-import exception from ep.load() means the overlay IS installed but
-    fails to import. GAP-013 required this never be silently dropped; #1665
+    fails to import. That must never be silently dropped; #1665
     requires it RAISE rather than log-and-continue, because continuing left the
     overlay's revisions out of version_locations and let `upgrade heads` exit 0
     on a partial schema.
@@ -230,7 +226,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 # Files that invoke `alembic upgrade`. With the enterprise overlay installed the
 # revision graph forks into two heads (core 0003 + enterprise e002), so a bare
 # `alembic upgrade head` raises "Multiple head revisions are present" and the
-# stack never boots. Every invocation must use `heads` (plural). See BUG-001.
+# stack never boots. Every invocation must use `heads` (plural).
 _MIGRATION_INVOCATION_FILES = (
     "docker-compose.yml",
     "docker-compose.prod.yml",
@@ -243,7 +239,7 @@ _BARE_HEAD_RE = re.compile(r"alembic upgrade head(?!s)")
 
 
 def test_migration_invocations_use_heads_plural():
-    """Every `alembic upgrade` site uses `heads`, never bare `head` (BUG-001).
+    """Every `alembic upgrade` site uses `heads`, never bare `head`.
 
     Bare `head` is ambiguous once the enterprise overlay adds a second head and
     aborts the migrate one-shot, so api/worker never start. Robust in-container:

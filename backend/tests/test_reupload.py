@@ -47,7 +47,7 @@ async def test_reupload_commit_failure_cleans_owned_staged_file(tmp_path):
     port.validate_file_extension = MagicMock()
     port.validate_file_content = MagicMock()
     db = AsyncMock()
-    # fix(#1848): the first commit is the one that frees the pooled connection
+    # The first commit is the one that frees the pooled connection
     # before the upload. The failure under test is still the one after it.
     db.commit.side_effect = [None, RuntimeError("commit failed")]
     cleanup = AsyncMock()
@@ -86,7 +86,7 @@ async def test_reupload_commit_failure_cleans_owned_staged_file(tmp_path):
 
 @pytest.mark.anyio
 async def test_cleanup_uncommitted_reupload_source_reraises_cancellation():
-    """fix(#1435): a client disconnect during the storage delete must unwind the
+    """A client disconnect during the storage delete must unwind the
     caller, not be absorbed into a best-effort warning log.
 
     `_cleanup_uncommitted_reupload_source` is called both from the upload
@@ -242,7 +242,7 @@ def mock_ogrinfo_preview(mock_reupload_catalog_port):
             "sample_rows": [
                 {"name": "Test", "value": 3.14, "new_col": "hello"},
             ],
-            # GPKG-01 Phase 1058: single-layer default — all_layers is None
+            # single-layer default — all_layers is None
             "all_layers": None,
         }
         yield mock_preview
@@ -291,17 +291,19 @@ class TestReuploadUpload:
         job = result.scalar_one()
         assert job.dataset_id == dataset.id
         assert job.created_by == admin_id
-        # fix(#1848): the bind adds `staged_at`, which restarts the pending
+        # The bind adds `staged_at`, which restarts the pending
         # window. The two markers the job-binding gate reads are unchanged.
         assert job.user_metadata["reupload"] is True
         assert job.user_metadata["dataset_id"] == str(dataset.id)
         assert job.user_metadata["staged_at"]
         assert job.user_metadata["start_data_revision"] == dataset.data_revision
+        assert job.user_metadata["admitted_capability"] == "edit_metadata"
         assert set(job.user_metadata) == {
             "reupload",
             "dataset_id",
             "staged_at",
             "start_data_revision",
+            "admitted_capability",
         }
 
     async def test_reupload_stream_limit_error_leaves_a_reapable_job(
@@ -313,7 +315,7 @@ class TestReuploadUpload:
     ):
         """A streaming size rejection binds no upload to the job.
 
-        fix(#1848): the job row is committed before the stream so the pooled
+        The job row is committed before the stream so the pooled
         connection is not held across it, so a rejection now leaves the row
         rather than rolling it back. It stays `pending` with nothing bound,
         which is what `stale_pending_clauses` reaps on its one-hour policy.
@@ -352,7 +354,7 @@ class TestReuploadUpload:
     ):
         """A provider failure cannot orphan the staged source.
 
-        fix(#1848): the job row is committed before the upload now, so the
+        The job row is committed before the upload now, so the
         assertion that survives is about the SOURCE. The row itself stays
         `pending` with nothing bound, for the sweep to reap.
         """
@@ -512,7 +514,7 @@ class TestReuploadUpload:
         admin_auth_header: dict,
         test_db_session,
     ):
-        """feat(#1221): the record-type gate no longer refuses raster outright.
+        """The record-type gate no longer refuses raster outright.
 
         These bytes are not a TIFF, so the request still fails — but at the
         CONTENT check (422), not the record-type gate (400). That distinction
@@ -686,7 +688,7 @@ class TestReuploadPreview:
         test_db_session,
         mock_ogrinfo_preview,
     ):
-        """fix(#2043): the ceiling message survives this door, not the generic 422."""
+        """The ceiling message survives this door, not the generic 422."""
         from app.processing.ingest.ogr import IngestBudgetExceededError
 
         admin_id = await get_user_id(test_db_session, "admin")
@@ -736,7 +738,7 @@ class TestReuploadPreview:
         record_type: str,
         expected_status: int,
     ):
-        """fix(#2031): a table has no geometry to lose; a vector dataset does."""
+        """A table has no geometry to lose; a vector dataset does."""
         admin_id = await get_user_id(test_db_session, "admin")
         dataset = await _create_dataset(
             test_db_session, created_by=admin_id, record_type=record_type
@@ -1168,7 +1170,7 @@ class TestServiceReuploadPreview:
         assert any(col["name"] == "new_col" for col in diff["columns_added"])
         assert any(change["name"] == "value" for change in diff["type_changes"])
 
-        # feat(#1746 B2b): the GDAL source builder takes a bare token, which
+        # The GDAL source builder takes a bare token, which
         # only its ArcGIS branch reads; the preview takes the whole credential
         # and composes the header itself. For a WFS layer the token is None
         # here because the credential travels as a header instead.
@@ -1180,6 +1182,7 @@ class TestServiceReuploadPreview:
             token="secret-token",
             order_field=None,
             result_limit=5,
+            return_z=False,
         )
         mock_run_preview.assert_awaited_once_with(
             "WFS:https://example.com/wfs",
@@ -1261,7 +1264,7 @@ class TestServiceReuploadPreview:
     ):
         admin_id = await get_user_id(test_db_session, "admin")
         dataset = await _create_dataset(test_db_session, created_by=admin_id)
-        blocked_url = "http://127.0.0.1/internal"
+        blocked_url = "https://127.0.0.1/internal"
 
         with (
             patch(
@@ -1567,8 +1570,8 @@ class TestSchemaDiffComputation:
     def test_schema_diff_null_counts(self):
         """Null feature counts are UNKNOWN, and the delta says so.
 
-        fix(#1746 B2b review r24): this asserted a delta of 0, which is what
-        `(new or 0) - (old or 0)` produced and what the review called out: an
+        The test once asserted a delta of 0, which is what
+        `(new or 0) - (old or 0)` produced: an
         unknown count coerced to zero invents a delta the size of whichever
         side is known, and two unknowns read as "no change" rather than as
         "not known". The field is nullable now, and still required.
@@ -1626,7 +1629,7 @@ class TestSchemaDiffComputation:
 
 
 # ---------------------------------------------------------------------------
-# GPKG-01 Phase 1058: Multi-layer support tests
+# Multi-layer support tests
 # ---------------------------------------------------------------------------
 
 
@@ -1656,7 +1659,7 @@ async def _create_complete_ingest_job(
 
 
 class TestReuploadMultiLayer:
-    """GPKG-01 Phase 1058: multi-layer GPKG reupload tests."""
+    """Multi-layer GPKG reupload tests."""
 
     async def test_preview_returns_all_layers_for_multi_layer_source(
         self,
@@ -1891,7 +1894,7 @@ async def _spawn_then_explode(*args, on_spawn=None, **kwargs):
 
 class TestFailedServiceReuploadDatesTheContact:
     async def test_failed_fetch_still_stamps_last_checked_at(self, test_db_session):
-        """fix(#1271 review): last_checked_at means "last time GeoLens
+        """last_checked_at means "last time GeoLens
         contacted the origin at all", and a failed refresh contact counts —
         the probe already dates its failures for the same reason. The old
         data stays (the swap never ran), so only the timestamp moves. The
@@ -1959,7 +1962,7 @@ class TestFailedServiceReuploadDatesTheContact:
         assert job.status == "failed"
 
     async def test_failed_fetch_after_rebind_stamps_nothing(self, test_db_session):
-        """fix(#1271 review): if another reupload rebinds the origin while
+        """If another reupload rebinds the origin while
         the doomed fetch is running, the failed task must not stamp the OLD
         origin's contact onto the NEW binding — a file reupload would leave
         an upload with a contact time it cannot have, and uploads 409 the
@@ -2031,7 +2034,7 @@ class TestFailedServiceReuploadDatesTheContact:
     async def test_failed_fetch_of_a_replacement_url_stamps_nothing(
         self, test_db_session
     ):
-        """fix(#1271 review): a reupload may target a DIFFERENT URL than the
+        """A reupload may target a DIFFERENT URL than the
         stored binding — a replacement source for an upload dataset. A failed
         fetch of the candidate says nothing about the stored origin, so
         stamping it would date a contact the stored origin never had; for an
@@ -2086,7 +2089,7 @@ class TestFailedServiceReuploadDatesTheContact:
     async def test_failed_fetch_of_a_different_layer_stamps_nothing(
         self, test_db_session
     ):
-        """fix(#1271 review): same service base, different layer is still a
+        """Same service base, different layer is still a
         different origin — the stored layer was never contacted."""
         from app.platform.dataset_origin import set_dataset_origin
         from app.processing.ingest.tasks_reupload import reupload_service
@@ -2145,7 +2148,7 @@ class TestFailedServiceReuploadDatesTheContact:
         assert dataset.last_checked_at is None
 
     async def test_spawn_failure_withdraws_the_contact_claim(self, test_db_session):
-        """fix(#1271 review): an OSError from the subprocess launch means
+        """An OSError from the subprocess launch means
         ogr2ogr never spawned — nothing left the machine, so a matching
         binding must still not be stamped."""
         from app.platform.dataset_origin import set_dataset_origin
@@ -2207,7 +2210,7 @@ class TestFailedServiceReuploadDatesTheContact:
 
 class TestWorkerSsrfRefusalFinalizesTheRun:
     async def test_fetch_time_ssrf_failure_fails_job_and_run(self, test_db_session):
-        """fix(#1274 review): the worker-time SSRF check used to raise before
+        """The worker-time SSRF check used to raise before
         the failure handler's try began, leaving the pending run active — and
         the admission index then refused every further refresh for the
         dataset until the stale sweep, an hour of lockout for a URL that was
@@ -2281,7 +2284,7 @@ class TestSourcelessCommitDoesNotReserve:
     async def test_incomplete_presigned_commit_400s_without_a_run(
         self, client: AsyncClient, admin_auth_header, test_db_session
     ):
-        """fix(#1274 review): a presigned reupload whose upload never
+        """A presigned reupload whose upload never
         completed has file_path='' and no source_url. Committing it must 400
         BEFORE the run row reserves the dataset — creating the run first left
         an active reservation the sweep could not release while the job sat

@@ -172,7 +172,7 @@ class TestBootGuard:
         assert settings.secret_encryption_key is not None
 
     def test_blank_value_means_unset(self):
-        """A verbatim-template .env line reaches the app as "" (INST-01 class)."""
+        """A verbatim-template .env line reaches the app as "" (class)."""
         settings = _make_settings(
             secret_encryption_key="", secret_encryption_key_previous="   "
         )
@@ -197,7 +197,7 @@ class TestBootGuard:
         with pytest.raises(ValidationError, match="same value as JWT_SECRET_KEY"):
             _make_settings(jwt_secret_key=shared, secret_encryption_key=shared)
 
-    # fix(#1882): fixed values with explicit ids. A key generated here would be
+    # Fixed values with explicit ids. A key generated here would be
     # generated once per xdist worker, and pytest-xdist aborts the run when two
     # workers collect different test ids.
     @pytest.mark.parametrize(
@@ -223,7 +223,7 @@ class TestBootGuard:
             )
 
     def test_refuses_a_previous_key_equal_to_the_current_one(self):
-        """fix(#1882 audit): the chain would hold one key twice."""
+        """The chain would hold one key twice."""
         shared = _new_key()
         with pytest.raises(ValidationError, match="nothing is being rotated"):
             _make_settings(
@@ -460,7 +460,7 @@ class TestRotationScript:
     async def test_a_provider_saved_mid_sweep_is_not_overwritten(
         self, monkeypatch, test_db_session, secret_settings, empty_oauth_providers
     ):
-        """fix(#1882 codex r1): rotation serialises with provider writers.
+        """Rotation serialises with provider writers.
 
         The concurrent write is fired after the locking SELECT and before the
         first UPDATE, which is the window that used to lose it.
@@ -585,7 +585,7 @@ class TestRotationScript:
     async def test_a_failed_write_does_not_print_the_ciphertext(
         self, test_db_session, secret_settings, empty_oauth_providers
     ):
-        """fix(#1882 audit): the sweep's engine sets hide_parameters.
+        """The sweep's engine sets hide_parameters.
 
         A StatementError renders its bound parameters into the message, and
         the API's DB error handler logs that message. Bound here is the new

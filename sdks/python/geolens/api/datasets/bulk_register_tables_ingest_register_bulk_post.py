@@ -106,14 +106,14 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: BulkRegisterRequest,
 ) -> Response[BulkRegisterResponse | ProblemDetail]:
-    """Bulk Register Tables
+    """Register several PostGIS tables
 
      Bulk-register multiple existing PostGIS tables as datasets.
 
-    Each table is registered independently -- one failure does not block
-    others. Tables are processed in parallel via ``asyncio.gather`` with
-    a fresh session per task, which keeps transaction isolation while
-    removing the sequential per-table latency.
+    Administrators only. Each table is registered independently -- one
+    failure does not block others. Each table gets its own session, and at most
+    ``_BULK_REGISTER_CONCURRENCY`` run at once so one batch cannot drain the
+    shared connection pool.
 
     Args:
         body (BulkRegisterRequest):
@@ -142,14 +142,14 @@ def sync(
     client: AuthenticatedClient,
     body: BulkRegisterRequest,
 ) -> BulkRegisterResponse | ProblemDetail | None:
-    """Bulk Register Tables
+    """Register several PostGIS tables
 
      Bulk-register multiple existing PostGIS tables as datasets.
 
-    Each table is registered independently -- one failure does not block
-    others. Tables are processed in parallel via ``asyncio.gather`` with
-    a fresh session per task, which keeps transaction isolation while
-    removing the sequential per-table latency.
+    Administrators only. Each table is registered independently -- one
+    failure does not block others. Each table gets its own session, and at most
+    ``_BULK_REGISTER_CONCURRENCY`` run at once so one batch cannot drain the
+    shared connection pool.
 
     Args:
         body (BulkRegisterRequest):
@@ -173,14 +173,14 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: BulkRegisterRequest,
 ) -> Response[BulkRegisterResponse | ProblemDetail]:
-    """Bulk Register Tables
+    """Register several PostGIS tables
 
      Bulk-register multiple existing PostGIS tables as datasets.
 
-    Each table is registered independently -- one failure does not block
-    others. Tables are processed in parallel via ``asyncio.gather`` with
-    a fresh session per task, which keeps transaction isolation while
-    removing the sequential per-table latency.
+    Administrators only. Each table is registered independently -- one
+    failure does not block others. Each table gets its own session, and at most
+    ``_BULK_REGISTER_CONCURRENCY`` run at once so one batch cannot drain the
+    shared connection pool.
 
     Args:
         body (BulkRegisterRequest):
@@ -207,14 +207,14 @@ async def asyncio(
     client: AuthenticatedClient,
     body: BulkRegisterRequest,
 ) -> BulkRegisterResponse | ProblemDetail | None:
-    """Bulk Register Tables
+    """Register several PostGIS tables
 
      Bulk-register multiple existing PostGIS tables as datasets.
 
-    Each table is registered independently -- one failure does not block
-    others. Tables are processed in parallel via ``asyncio.gather`` with
-    a fresh session per task, which keeps transaction isolation while
-    removing the sequential per-table latency.
+    Administrators only. Each table is registered independently -- one
+    failure does not block others. Each table gets its own session, and at most
+    ``_BULK_REGISTER_CONCURRENCY`` run at once so one batch cannot drain the
+    shared connection pool.
 
     Args:
         body (BulkRegisterRequest):

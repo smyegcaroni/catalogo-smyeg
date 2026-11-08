@@ -189,7 +189,7 @@ describe('FilterPanel', () => {
   });
 });
 
-// fix(#1761 review round 4): the uncommitted date-range draft
+// The uncommitted date-range draft
 // (localDateFrom/localDateTo) used to survive an identity change, so
 // clicking the still-open popover's Apply afterward repopulated the
 // (now cleared) store and URL with the previous identity's typed dates.
@@ -228,7 +228,7 @@ describe('FilterPanel identity reset (fix #1761 review round 4)', () => {
     expect(getDateInputs()[0]).toHaveValue('');
   });
 
-  // fix(#1761 review round 4, sweep): spatialPanelOpen was originally
+  // spatialPanelOpen was originally
   // classified as a kept presentation preference, but it gates whether
   // SpatialFilterPanel is mounted, and that component holds its own
   // uncommitted pendingBbox/predicate draft — the same class of bug as the
@@ -262,7 +262,7 @@ describe('FilterPanel identity reset (fix #1761 review round 4)', () => {
     expect(useSearchStore.getState().spatialPanelOpen).toBe(false);
   });
 
-  // fix(#1778): the date-range and temporal-extent popovers paired a bare
+  // The date-range and temporal-extent popovers paired a bare
   // <label> (no htmlFor) with a sibling <Input>, so the two date fields in
   // each popover announced as unnamed. Both popovers are closed at mount
   // and portal to document.body, so the axe gate structurally cannot reach

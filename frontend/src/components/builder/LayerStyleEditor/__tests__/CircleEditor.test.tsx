@@ -28,6 +28,7 @@ function makeCircleLayer(overrides: Partial<MapLayerResponse> = {}): MapLayerRes
     display_name: 'Circle Layer',
     sort_order: 0,
     visible: true,
+    show_in_legend: true,
     opacity: 1,
     paint: { 'circle-color': '#ff0000', 'circle-radius': 5, 'circle-stroke-color': '#000', 'circle-stroke-width': 1 },
     layout: {},
@@ -207,11 +208,4 @@ describe('CircleEditor', () => {
     expect(screen.getByText('Styled by: value')).toBeInTheDocument();
   });
 
-  it('is a named export and a default export from CircleEditor.tsx', async () => {
-    const { CircleEditor: named } = await import('../CircleEditor');
-    const defaultExport = (await import('../CircleEditor')).default;
-    expect(named).toBeDefined();
-    expect(defaultExport).toBeDefined();
-    expect(named).toBe(defaultExport);
-  });
 });

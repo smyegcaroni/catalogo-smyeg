@@ -134,6 +134,13 @@ describe('buildClusterTileUrl', () => {
     );
   });
 
+  it('carries a CQL2 filter as an encoded filter param', () => {
+    const filter = JSON.stringify({ op: '=', args: [{ property: 'kind' }, 'a b'] });
+    const url = buildClusterTileUrl('my_table', null, 'https://tiles.example.com', null, { filter });
+
+    expect(new URL(url.replace('{z}/{x}/{y}', '0/0/0')).searchParams.get('filter')).toBe(filter);
+  });
+
   it('supports public or embed-token cluster tiles without signed params', () => {
     const url = buildClusterTileUrl('my_table', null, 'https://tiles.example.com', 'v1', {
       clusterRadius: 48,
@@ -145,7 +152,7 @@ describe('buildClusterTileUrl', () => {
     );
   });
 
-  // fix(#403): unclustered features on the server-cluster path are styled and
+  // Unclustered features on the server-cluster path are styled and
   // popup-inspected like plain vector features, so the cols= opt-in must ride
   // the cluster tile URL too (sorted + deduped for cache-key stability).
   it('appends normalized cols= so unclustered features carry attributes', () => {
@@ -170,14 +177,14 @@ describe('buildClusterTileUrl', () => {
 });
 
 // ---------------------------------------------------------------------------
-// fix(#394) VT-04: MVT source-layer ↔ tile-layer-name parity pin.
+// MVT source-layer ↔ tile-layer-name parity pin.
 // The source-layer literal is produced by three derivation sites that must
 // never drift, or the layer silently renders empty:
 //   1. backend `app/processing/tiles/service.py` (`layer_name = f"{schema}.{table}"`,
 //      single_tenant schema == "data", hosted schema == data_t_<tid>) — pinned by
 //      `backend/tests/test_mvt_audit_fixes.py::test_get_tile_layer_name_is_schema_qualified`;
 //   2. this helper (the ONLY frontend derivation — builder map-sync, viewer
-//      ViewerMap, and use-map-layers all import it as of fix(#394) VT-03);
+//      ViewerMap, and use-map-layers all import it);
 //   3. the exported style.json `_mvt_source_layer` (backend style_json.py).
 // Tile-config supplies the server-resolved hosted prefix to the frontend.
 // ---------------------------------------------------------------------------
@@ -217,10 +224,10 @@ describe('isMvtSourceLayerConfigReady', () => {
 });
 
 // ---------------------------------------------------------------------------
-// chore(#835): shared first-party/third-party classifier + transformRequest
-// builder. The three map surfaces (BuilderMap / ViewerMap / DatasetMap) had
-// drifted apart here — the viewer's missing raster Bearer (#819) was this
-// drift biting, so the header behavior is pinned below.
+// Shared first-party/third-party classifier + transformRequest
+// builder. The three map surfaces (BuilderMap / ViewerMap / DatasetMap) share
+// it so they cannot drift apart (e.g. a surface missing the raster Bearer),
+// and the header behavior is pinned below.
 // ---------------------------------------------------------------------------
 
 describe('isThirdPartyTileUrl', () => {
@@ -271,7 +278,7 @@ describe('buildTileTransformRequest', () => {
     });
   });
 
-  // fix(#1688 follow-up): transformRequest runs before MapLibre's protocol
+  // transformRequest runs before MapLibre's protocol
   // dispatch, so a pmtiles:// URL must pass through byte-identical or the
   // registered protocol handler never sees it.
   it('passes pmtiles:// URLs through unchanged with no headers', () => {
@@ -379,7 +386,7 @@ describe('buildTileTransformRequest', () => {
   });
 });
 
-// fix(#907) (codex P1): a raster descriptor does not change when the session
+// A raster descriptor does not change when the session
 // JWT rotates, so nothing in the token→setTiles plumbing retries the tiles that
 // 401'd while MapLibre raced the refresh. This is the explicit reload.
 describe('refreshRasterTileSources (fix #907)', () => {
@@ -427,5 +434,32 @@ describe('refreshRasterTileSources (fix #907)', () => {
 
     expect(refreshRasterTileSources(map)).toBe(1);
     expect(refreshTiles).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('cols_only', () => {
+  const token = { sig: 'abc', exp: 1, scope: 's' };
+
+  it('adds cols_only after cols on the plain tile URL', () => {
+    expect(buildSignedTileUrl('t', token, 'https://x.test', undefined, ['b', 'a'], true)).toBe(
+      'https://x.test/tiles/data.t/{z}/{x}/{y}.pbf?sig=abc&exp=1&scope=s&cols=a%2Cb&cols_only=true',
+    );
+  });
+
+  it('adds cols_only on the cluster tile URL', () => {
+    expect(buildClusterTileUrl('t', null, 'https://x.test', undefined, {}, ['a'], true)).toBe(
+      'https://x.test/tiles/clusters/data.t/{z}/{x}/{y}.pbf?cols=a&cols_only=true',
+    );
+  });
+
+  it('sends cols_only without cols so the tile carries nothing', () => {
+    expect(buildSignedTileUrl('t', null, 'https://x.test', undefined, [], true)).toBe(
+      'https://x.test/tiles/data.t/{z}/{x}/{y}.pbf?cols_only=true',
+    );
+  });
+
+  it('leaves the URL unchanged by default', () => {
+    expect(buildSignedTileUrl('t', null, 'https://x.test', undefined, ['a'])).not.toContain('cols_only');
+    expect(buildClusterTileUrl('t', null, 'https://x.test', undefined, {}, ['a'])).not.toContain('cols_only');
   });
 });

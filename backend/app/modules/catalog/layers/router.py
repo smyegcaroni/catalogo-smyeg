@@ -11,6 +11,7 @@ from app.modules.audit.service import AuditEvent, audit_emit
 from app.core.db.sqlstate import is_operational, sqlstate
 from app.core.identity import Identity
 from app.core.record_types import capabilities
+from app.core.upload_errors import refusal_detail
 from app.modules.auth.dependencies import require_permission
 from app.core.dependencies import get_db
 from app.modules.catalog.authorization import (
@@ -18,6 +19,7 @@ from app.modules.catalog.authorization import (
     require_dataset_editing_enabled,
 )
 from app.modules.catalog.datasets.domain.service import get_dataset
+from app.modules.catalog.features.retention import RetentionRefused
 from app.modules.catalog.layers.schemas import (
     AddColumnRequest,
     AlterColumnTypeRequest,
@@ -41,7 +43,7 @@ from app.standards.ogc.errors import ERROR_RESPONSES_WRITE
 
 
 async def _invalidate_tiles(table_name: str) -> None:
-    """fix(#458): column DDL changes the attribute set embedded in vector
+    """Column DDL changes the attribute set embedded in vector
     tiles, so purge cached tiles post-commit — same treatment as the
     feature-edit path (features/router.py) and the reupload swap."""
     tile_cache = get_tile_cache()
@@ -63,9 +65,8 @@ def _require_data_table(dataset) -> None:
 async def _raise_ddl_db_error(db: AsyncSession, exc: DBAPIError, action: str) -> None:
     """Roll back and map a DDL DB error to the right status. Never returns.
 
-    fix(#458): classify by SQLSTATE like the feature-write path — a bad
-    request is a 400, an outage a 503 — since add/rename/drop only pre-mapped
-    ValueError.
+    Classified by SQLSTATE like the feature-write path: a bad request is a
+    400, an outage a 503.
     """
     await db.rollback()
     if is_operational(exc):
@@ -73,14 +74,22 @@ async def _raise_ddl_db_error(db: AsyncSession, exc: DBAPIError, action: str) ->
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database temporarily unavailable.",
         )
-    # fix(#1847): the SQLSTATE goes to the log, not the response. Interpolating
-    # `exc.orig` published the driver exception and its message to the caller.
+    # Log the SQLSTATE only; `exc.orig` would expose the driver message to the
+    # caller.
     logger.warning(
         "layer.ddl failed", action=action, sqlstate=sqlstate(exc), exc_info=exc
     )
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=f"{action} failed: the database rejected the change.",
+    )
+
+
+async def _raise_retention_conflict(db: AsyncSession, exc: RetentionRefused) -> None:
+    """Roll back a column change retention still reads and refuse it. Never returns."""
+    await db.rollback()
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT, detail=refusal_detail(exc)
     )
 
 
@@ -93,6 +102,7 @@ layers_router = APIRouter(
     "/",
     response_model=CreateLayerResponse,
     status_code=status.HTTP_201_CREATED,
+    summary="Create an empty layer",
 )
 async def create_layer_endpoint(
     body: CreateLayerRequest,
@@ -147,6 +157,7 @@ async def create_layer_endpoint(
     "/{dataset_id}/columns/",
     response_model=ColumnListResponse,
     status_code=status.HTTP_201_CREATED,
+    summary="Add a column",
 )
 async def add_column_endpoint(
     dataset_id: uuid.UUID,
@@ -167,6 +178,8 @@ async def add_column_endpoint(
 
     try:
         columns = await add_column(db, dataset, body.column.name, body.column.type)
+    except RetentionRefused as exc:
+        await _raise_retention_conflict(db, exc)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -207,6 +220,7 @@ async def add_column_endpoint(
 @layers_router.patch(
     "/{dataset_id}/columns/{column_name}/name",
     response_model=ColumnListResponse,
+    summary="Rename a column",
 )
 async def rename_column_endpoint(
     dataset_id: uuid.UUID,
@@ -228,6 +242,8 @@ async def rename_column_endpoint(
 
     try:
         columns = await rename_column(db, dataset, column_name, body.new_name)
+    except RetentionRefused as exc:
+        await _raise_retention_conflict(db, exc)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -264,6 +280,7 @@ async def rename_column_endpoint(
 @layers_router.patch(
     "/{dataset_id}/columns/{column_name}/type",
     response_model=ColumnListResponse,
+    summary="Change a column's type",
 )
 async def alter_column_type_endpoint(
     dataset_id: uuid.UUID,
@@ -289,13 +306,15 @@ async def alter_column_type_endpoint(
 
     try:
         columns = await alter_column_type(db, dataset, column_name, body.new_type)
+    except RetentionRefused as exc:
+        await _raise_retention_conflict(db, exc)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         )
     except DBAPIError as exc:
-        # fix(#458): route through the shared classifier like add/rename/
+        # Route through the shared classifier like add/rename/
         # drop, so a lock timeout or connection failure during ALTER TYPE is a
         # 503, while cast failures ("abc" → integer) stay 400 with the message.
         await _raise_ddl_db_error(db, exc, "Type change")
@@ -328,6 +347,7 @@ async def alter_column_type_endpoint(
 @layers_router.delete(
     "/{dataset_id}/columns/{column_name}",
     response_model=ColumnListResponse,
+    summary="Drop a column",
 )
 async def drop_column_endpoint(
     dataset_id: uuid.UUID,
@@ -348,6 +368,8 @@ async def drop_column_endpoint(
 
     try:
         columns = await drop_column(db, dataset, column_name)
+    except RetentionRefused as exc:
+        await _raise_retention_conflict(db, exc)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -384,6 +406,7 @@ async def drop_column_endpoint(
 @layers_router.get(
     "/{dataset_id}/columns/{column_name}/references",
     response_model=ColumnReferencesResponse,
+    summary="Count maps that reference a column",
 )
 async def column_references_endpoint(
     dataset_id: uuid.UUID,

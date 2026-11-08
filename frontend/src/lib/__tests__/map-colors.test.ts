@@ -16,7 +16,8 @@ interface OklchColor {
 
 function lightThemeBlock(css: string): string {
   const withoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
-  const match = withoutComments.match(/:root\s*\{([^}]+)\}/);
+  // The light tokens are shared with the scoped `.light` class, so the selector list may continue after :root.
+  const match = withoutComments.match(/:root\s*(?:,\s*[^{]*)?\{([^}]+)\}/);
   if (!match) throw new Error('Could not find the :root light-theme token block in index.css');
   return match[1];
 }
@@ -85,7 +86,7 @@ describe('MAP_COLORS design-token parity', () => {
     expect(MAP_COLORS.default.stroke).toBe(oklchToSrgbHex(readOklchToken(root, '--primary-700')));
   });
 
-  it('keeps the globe export backdrop synchronized with --map-space (fix(#1479))', () => {
+  it('keeps the globe export backdrop synchronized with --map-space', () => {
     // Captures composite the WebGL canvas onto a 2D context, which cannot read
     // a CSS token, so the globe void's color exists twice. This pins the copy.
     expect(MAP_COLORS.exportImage.globeBackground).toBe(

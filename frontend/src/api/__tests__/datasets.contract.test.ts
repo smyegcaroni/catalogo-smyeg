@@ -1,5 +1,5 @@
 import { apiFetch } from '@/api/client';
-import { reuploadCommit, reuploadDataset, setTargetStatus } from '@/api/datasets';
+import { getDatasetRows, reuploadCommit, reuploadDataset, setTargetStatus } from '@/api/datasets';
 import type {
   ReuploadCommitResponse,
   ReuploadResponse,
@@ -13,8 +13,7 @@ vi.mock('@/api/client', () => ({
 
 const mockApiFetch = vi.mocked(apiFetch);
 
-// chore(#835): the single-step `updatePublicationStatus` rows were removed
-// with the function itself — the app talks only to the target-status endpoint.
+// The app talks only to the target-status endpoint.
 describe('dataset publication-status API contract', () => {
   beforeEach(() => vi.clearAllMocks());
 
@@ -40,7 +39,7 @@ describe('dataset publication-status API contract', () => {
   });
 });
 
-// fix(#1778): reuploadDataset sends a FormData body that can hold up to
+// The reuploadDataset FormData body can hold up to
 // upload_max_size_mb (500 MB) — it must not fall back to apiFetch's 30s
 // default timeout, or a large transfer aborts client-side before it finishes.
 describe('reuploadDataset timeout', () => {
@@ -63,8 +62,8 @@ describe('reuploadDataset timeout', () => {
   });
 });
 
-// fix(#1768): the commit body's expected-origin condition. `expected_origin_kind`
-// is optional server-side, and an ABSENT key is the pre-#1768 contract — so the
+// The commit body's expected-origin condition. `expected_origin_kind`
+// is optional server-side, and an ABSENT key means no origin check — so the
 // caller must omit it rather than send null when it has no captured origin.
 describe('reuploadCommit expected-origin condition', () => {
   beforeEach(() => vi.clearAllMocks());
@@ -132,5 +131,21 @@ describe('reuploadCommit review fingerprint', () => {
 
     const [, options] = mockApiFetch.mock.calls[0];
     expect(JSON.parse(String(options?.body))).not.toHaveProperty('review_fingerprint');
+  });
+});
+
+describe('dataset rows request', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('sends gid beside the other filters, and nothing when it is unset', async () => {
+    mockApiFetch.mockResolvedValue({});
+
+    await getDatasetRows('ds', { limit: 50, gid: 382, filters: { name: 'x' } });
+    const url = new URL(String(mockApiFetch.mock.calls[0][0]), 'http://x');
+    expect(url.searchParams.get('gid')).toBe('382');
+    expect(url.searchParams.get('filter[name]')).toBe('x');
+
+    await getDatasetRows('ds', { limit: 50 });
+    expect(String(mockApiFetch.mock.calls[1][0])).not.toContain('gid');
   });
 });

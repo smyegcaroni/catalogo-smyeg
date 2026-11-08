@@ -1,5 +1,5 @@
-// fix(#2033): useAdminJobs had no refetchInterval, so a retried job kept
-// showing its pre-retry status until the page was reloaded.
+// useAdminJobs needs a refetchInterval, otherwise a retried job keeps
+// showing its pre-retry status until the page is reloaded.
 import { renderHook, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createElement } from 'react';
@@ -12,7 +12,7 @@ vi.mock('@/api/admin', async (importOriginal) => {
   return { ...actual, listAdminJobs: (...args: unknown[]) => mockListAdminJobs(...args) };
 });
 
-function makeJob(status: string): AdminJobListResponse['jobs'][number] {
+function makeJob(status: 'pending' | 'running' | 'complete' | 'failed'): AdminJobListResponse['jobs'][number] {
   return {
     id: 'job-1',
     status,

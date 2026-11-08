@@ -173,7 +173,7 @@ describe('LayerTypeIcon style-hint memoization (GUARD-04)', () => {
     expect(next.reads()).toBeGreaterThan(0);
   });
 
-  // The exact regression GUARD-04 exists for: with a NULL layer.paint, keying
+  // The exact regression exists for: with a NULL layer.paint, keying
   // the memo on the local `paint`/`layout` fallbacks (fresh `{}` per render)
   // would recompute on EVERY render. Count layout reads for a LINE layer
   // (extractStyleHints falls through to layout['line-dasharray'] when paint
@@ -219,14 +219,14 @@ describe('patterned polygon swatch (fix #951)', () => {
       />,
     );
     expect(container.querySelector('.lucide-pentagon')).toBeNull();
-    // fix(#1288 codex): the pattern now lives on a nested span so its opacity
+    // The pattern now lives on a nested span so its opacity
     // can be dimmed independently of the border — assert on that inner span.
     const chip = container.firstElementChild!.firstElementChild as HTMLElement;
     expect(chip.style.backgroundImage).toContain('radial-gradient');
     expect(chip.style.color).toBe('rgb(255, 90, 95)');
   });
 
-  // fix(#914): same agreement requirement as the legend chip.
+  // Same agreement requirement as the legend chip.
   it('draws the pattern in the map tint when one is resolved', () => {
     const { container } = render(
       <ColorizedGeometryIcon
@@ -240,7 +240,7 @@ describe('patterned polygon swatch (fix #951)', () => {
     expect(chip.style.color).toBe('rgb(29, 78, 216)');
   });
 
-  // fix(#1288 codex): a partially-transparent patterned fill (fillOpacity < 1)
+  // A partially-transparent patterned fill (fillOpacity < 1)
   // must dim the pattern pixels without touching the border.
   it('applies fillOpacity to the pattern layer only, not the border', () => {
     const { container } = render(
@@ -282,9 +282,9 @@ describe('patterned polygon swatch (fix #951)', () => {
   });
 });
 
-// fix(#1288): a stroke-only polygon (fill-opacity: 0, visible outline) used to
-// render an invisible swatch — element-level opacity hid the outline along with
-// the fill it was meant to suppress. fillOpacity now lands on the SVG fill only.
+// A stroke-only polygon (fill-opacity: 0, visible outline) must not render an
+// invisible swatch: element-level opacity would hide the outline along with
+// the fill it is meant to suppress. fillOpacity lands on the SVG fill only.
 describe('stroke-only polygon swatch (fix #1288)', () => {
   it('renders a visible outline when fill-opacity is 0', () => {
     const { container } = render(
@@ -327,7 +327,7 @@ describe('stroke-only polygon swatch (fix #1288)', () => {
   });
 });
 
-// fix(#1494): a horizontal <line> has a zero-height bounding box, and the SVG
+// A horizontal <line> has a zero-height bounding box, and the SVG
 // spec disables rendering of any element painted by a bounding-box-united
 // gradient when either bbox dimension is zero. The line icon's gradient must
 // therefore declare userSpaceOnUse, or every multi-color line layer (banded

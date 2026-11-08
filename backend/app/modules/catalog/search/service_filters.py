@@ -16,7 +16,9 @@ from app.core.geo import (
     wrap_geometry_longitudes,
     wrapped_spatial_filter,
 )
+from app.core.identity import Identity
 from app.core.text import escape_ilike
+from app.modules.catalog.authorization import visible_extent_match
 from app.modules.catalog.collections.models import CollectionDataset
 from app.modules.catalog.datasets.domain.models import (
     Dataset,
@@ -100,7 +102,7 @@ def _build_text_filter(q: str):
         ),
     )
 
-    # T-1: catalog.immutable_unaccent (IMMUTABLE) matches the trigram GIN
+    # catalog.immutable_unaccent (IMMUTABLE) matches the trigram GIN
     # indexes; a plain func.unaccent() resolves to public.unaccent (STABLE)
     # via search_path and forces a seq scan instead.
     # escape_ilike() keeps user %, _, \ literal; escape="\\" on every .like()
@@ -258,11 +260,19 @@ def parse_ogc_datetime(datetime_str: str) -> tuple[date | None, date | None]:
         )
 
 
-def _apply_common_filters(stmt, filters: SearchFilters, *, skip_text: bool = False):
+def _apply_common_filters(
+    stmt,
+    filters: SearchFilters,
+    *,
+    user: Identity | None,
+    user_roles: set[str],
+    skip_text: bool = False,
+):
     """Apply the shared filter stack used by both search and facets.
 
     Pass ``skip_text=True`` when the caller already handles text search with
-    custom ranking (e.g. ``search_datasets``).
+    custom ranking (e.g. ``search_datasets``). Spatial filters match each
+    VRT by the extent ``user`` sees.
     """
     if not skip_text and filters.q and filters.q.strip():
         text_clause, _parts = _build_text_filter(filters.q)
@@ -272,14 +282,24 @@ def _apply_common_filters(stmt, filters: SearchFilters, *, skip_text: bool = Fal
             func.ST_SetSRID(func.ST_GeomFromGeoJSON(filters.geometry_geojson), 4326)
         )
         stmt = stmt.where(
-            wrapped_spatial_filter(Record, geom, filters.spatial_predicate)
+            wrapped_spatial_filter(
+                Record,
+                geom,
+                filters.spatial_predicate,
+                extent_match=lambda candidate, test: visible_extent_match(
+                    user, user_roles, test, record=candidate
+                ),
+            )
         )
     elif filters.bbox and len(filters.bbox) == 4:
+        bbox = filters.bbox
         stmt = stmt.where(
-            make_bbox_filter(
-                Record.spatial_extent,
-                filters.bbox,
-                predicate=filters.spatial_predicate,
+            visible_extent_match(
+                user,
+                user_roles,
+                lambda extent: make_bbox_filter(
+                    extent, bbox, predicate=filters.spatial_predicate
+                ),
             )
         )
     if filters.keywords:
@@ -303,11 +323,11 @@ def _apply_common_filters(stmt, filters: SearchFilters, *, skip_text: bool = Fal
         stmt = stmt.where(Record.source_organization == filters.source_organization)
     if filters.datetime_param:
         dt_start, dt_end = parse_ogc_datetime(filters.datetime_param)
-        # fix(#1778): a bare `.is_(None)` here matched every null-temporal
-        # record for ANY datetime filter. Fully null-temporal records now
-        # compare against created_at instead (mirrors stac/router.py's
-        # _apply_datetime_filter); one-bound-set records keep the existing
-        # open-ended reading on the other bound.
+        # Fully null-temporal records compare against created_at (mirrors
+        # stac/router.py's _apply_datetime_filter); a bare `.is_(None)` would
+        # match every null-temporal record for ANY datetime filter.
+        # One-bound-set records keep the open-ended reading on the other
+        # bound.
         null_temporal = Record.temporal_start.is_(None) & Record.temporal_end.is_(None)
         if dt_start is not None:
             stmt = stmt.where(

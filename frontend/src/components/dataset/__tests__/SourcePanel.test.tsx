@@ -30,6 +30,7 @@ function makeDataset(overrides: Partial<DatasetResponse> = {}): DatasetResponse 
     id: 'dataset-1',
     record_id: 'record-1',
     table_name: 'ds_parks',
+    has_generic_geometry: false,
     title: 'Parks',
     summary: null,
     srid: 4326,
@@ -127,7 +128,7 @@ beforeEach(() => {
   } as unknown as ReturnType<typeof useCancelRefreshJob>);
 });
 
-// feat(#1677): one active (running) run alongside a terminal one, for the
+// One active (running) run alongside a terminal one, for the
 // cancel-affordance tests below.
 function mockActiveAndTerminalRuns() {
   vi.mocked(useDatasetRefreshRuns).mockReturnValue({
@@ -236,12 +237,40 @@ describe('SourcePanel', () => {
     expect(screen.getByText('parks.geojson')).toBeInTheDocument();
     expect(screen.getByText('sha256:abc123')).toBeInTheDocument();
     expect(screen.getByText('1,234')).toBeInTheDocument();
-    expect(screen.getByText('Healthy')).toBeInTheDocument();
-    expect(screen.getByText('Fresh')).toBeInTheDocument();
-    expect(screen.getByText('No drift')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Source history' })).toBeInTheDocument();
     expect(screen.getByText(/parks-v2\.geojson/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Future source action' })).toBeInTheDocument();
+  });
+
+  it.each(['upload', 'created'] as const)('hides remote-source health fields and scheduled sync for a %s dataset', (origin) => {
+    render(<SourcePanel dataset={makeDataset({ origin, source_health: 'healthy' })} />);
+
+    expect(screen.getByText('Last refreshed')).toBeInTheDocument();
+    for (const label of ['Last checked', 'Health', 'Source freshness', 'Schema drift']) {
+      expect(screen.queryByText(label)).not.toBeInTheDocument();
+    }
+    expect(screen.queryByText('Healthy')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Loading scheduled sync')).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Scheduled sync' })).not.toBeInTheDocument();
+  });
+
+  it('shows remote-source health fields and the scheduled sync seam for a service source', () => {
+    render(
+      <SourcePanel
+        dataset={makeDataset({
+          origin: 'service',
+          source_health: 'healthy',
+          source_freshness: 'fresh',
+          schema_drift_status: 'none',
+        })}
+      />,
+    );
+
+    expect(screen.getByText('Last checked')).toBeInTheDocument();
+    expect(screen.getByText('Healthy')).toBeInTheDocument();
+    expect(screen.getByText('Fresh')).toBeInTheDocument();
+    expect(screen.getByText('No drift')).toBeInTheDocument();
+    expect(screen.getByLabelText('Loading scheduled sync')).toBeInTheDocument();
   });
 
   it('labels the pointer as a credential-free source URL', () => {
@@ -273,15 +302,12 @@ describe('SourcePanel', () => {
     expect(screen.getByText('Checked when the source is refreshed.')).toBeInTheDocument();
   });
 
-  it.each(['upload', 'service'] as const)(
-    'does not promise a health check for a %s source',
-    (origin) => {
-    render(<SourcePanel dataset={makeDataset({ source_health: 'unknown', origin })} />);
+  it('does not promise a health check for a service source', () => {
+    render(<SourcePanel dataset={makeDataset({ source_health: 'unknown', origin: 'service' })} />);
 
     expect(screen.getByText('Not checked')).toBeInTheDocument();
     expect(screen.queryByText('Checked when the source is refreshed.')).not.toBeInTheDocument();
-    },
-  );
+  });
 
   it('renders refresh run history distinctly from source version history', () => {
     vi.mocked(useDatasetRefreshRuns).mockReturnValue({
@@ -474,7 +500,7 @@ describe('SourcePanel', () => {
     });
   });
 
-  // feat(#1677): the one-click cancel affordance on the active run row.
+  // The one-click cancel affordance on the active run row.
   it('offers cancel only on the active run, for a manager, and fires the mutation', async () => {
     mockActiveAndTerminalRuns();
     const mutate = vi.fn();
@@ -640,6 +666,53 @@ describe('SourcePanel', () => {
     if (pointer) expect(screen.getByText(pointer)).toBeInTheDocument();
   });
 
+  describe('ArcGIS item link', () => {
+    const itemId = '0123456789abcdef0123456789abcdef';
+    const service = (extra: Record<string, unknown>) => makeDataset({
+      origin: 'service',
+      source_format: 'arcgis_featureserver',
+      origin_ref: { kind: 'service', service_type: 'arcgis_featureserver', url: 'https://services.arcgis.com/x/FeatureServer', ...extra },
+    });
+
+    it('links a service dataset to its portal item in a new tab', () => {
+      render(<SourcePanel dataset={service({ item_id: itemId, portal_url: 'https://org.maps.arcgis.com' })} />);
+
+      const link = screen.getByRole('link', { name: 'Open in ArcGIS opens in a new tab' });
+      expect(link).toHaveAttribute('href', `https://org.maps.arcgis.com/home/item.html?id=${itemId}`);
+      expect(link).toHaveAttribute('target', '_blank');
+      expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    });
+
+    it('links an uploaded file to its portal item', () => {
+      render(<SourcePanel dataset={makeDataset({
+        origin_ref: { kind: 'upload', filename: 'a.gpkg', item_id: itemId, portal_url: 'https://gis.example.org/portal/' },
+      })} />);
+
+      expect(screen.getByRole('link', { name: /Open in ArcGIS/ })).toHaveAttribute(
+        'href',
+        `https://gis.example.org/portal/home/item.html?id=${itemId}`,
+      );
+    });
+
+    it.each([
+      ['an insecure portal', { item_id: itemId, portal_url: 'http://org.maps.arcgis.com' }],
+      ['a script URL', { item_id: itemId, portal_url: 'javascript:alert(1)' }],
+      ['a malformed item id', { item_id: 'not-an-id', portal_url: 'https://org.maps.arcgis.com' }],
+      ['no portal URL', { item_id: itemId }],
+      ['no item id', { portal_url: 'https://org.maps.arcgis.com' }],
+    ])('shows no link for %s', (_name, extra) => {
+      render(<SourcePanel dataset={service(extra)} />);
+
+      expect(screen.queryByRole('link', { name: /Open in ArcGIS/ })).not.toBeInTheDocument();
+    });
+
+    it('shows no link when the reader was not sent the origin', () => {
+      render(<SourcePanel dataset={makeDataset({ origin: 'service', origin_ref: null })} />);
+
+      expect(screen.queryByRole('link', { name: /Open in ArcGIS/ })).not.toBeInTheDocument();
+    });
+  });
+
   it('shows only allowlisted, credential-free service pointer information', () => {
     const { container } = render(
       <SourcePanel
@@ -671,7 +744,7 @@ describe('SourcePanel', () => {
         'The source refused the request because it requires credentials this dataset does not carry.',
       ),
     ).toBeInTheDocument();
-    expect(screen.getByText('Drift detected')).toBeInTheDocument();
+    expect(screen.getByText('Columns changed at last refresh')).toBeInTheDocument();
     expect(screen.getByText('Overdue')).toBeInTheDocument();
     expect(container.innerHTML).not.toContain('password');
     expect(container.innerHTML).not.toContain('token=');
@@ -679,7 +752,7 @@ describe('SourcePanel', () => {
     expect(container.innerHTML).not.toContain('Bearer hidden');
   });
 
-  // fix(#1746): the panel renders null for a detail code it does not know, so
+  // The panel renders null for a detail code it does not know, so
   // a backend code with no entry here is invisible rather than obviously
   // broken. This is the assertion that notices.
   it('renders the auth_required detail rather than nothing', () => {
@@ -837,7 +910,7 @@ describe('SourcePanel', () => {
   });
 
   it('labels a VRT member whose own raster was replaced after the last build', () => {
-    // fix(#1290 review): `stale` is a real status the backend returns, and
+    // `stale` is a real status the backend returns, and
     // SourcePanel imports the HAND-MAINTAINED mirror in types/api.ts rather
     // than the generated types — so the mirror has to learn the value or the
     // UI cannot branch on it. The rendered label also proves the i18n key
@@ -897,7 +970,7 @@ describe('SourcePanel', () => {
     expect(screen.queryByText(/memberHealth\.stale/)).not.toBeInTheDocument();
   });
 
-  // fix(#2035): a stored 'internal_error' must read the same operator-facing
+  // A stored 'internal_error' must read the same operator-facing
   // sentence as the CLI (cli/geolens_cli/refresh.py), not the generic fallback.
   it('renders the CLI-matching sentence for a failed run stored as internal_error', () => {
     vi.mocked(useDatasetRefreshRuns).mockReturnValue({
@@ -1153,6 +1226,117 @@ describe('SourcePanel', () => {
       id: 'run-blocked',
       verificationPolicy: 'arcgis_id_set_v1',
     });
+  });
+
+  it('offers a blocked-run retry when the bound URL differs only by a trailing slash', () => {
+    const serviceUrl = 'https://services.example.com/arcgis/rest/services/Roads/FeatureServer';
+    vi.mocked(useDatasetRefreshRuns).mockReturnValue({
+      data: {
+        runs: [{
+          id: 'run-blocked',
+          dataset_id: 'dataset-1',
+          dataset_version_id: null,
+          ingest_job_id: 'job-1',
+          origin_kind: 'service',
+          trigger: 'scheduled',
+          status: 'blocked',
+          triggered_by: 'user-1',
+          triggered_by_username: 'jdoe',
+          started_at: '2026-08-05T00:00:00Z',
+          claimed_at: '2026-08-05T00:00:01Z',
+          finished_at: '2026-08-05T00:01:00Z',
+          feature_count_before: 1200,
+          feature_count_after: 0,
+          schema_diff: null,
+          verification: {
+            decision: 'blocked',
+            source_binding: { service_type: 'arcgis_featureserver', url: serviceUrl, layer_id: '0' },
+            source_count: 0,
+            fetched_count: 0,
+            count_status: 'matched',
+            identity_check: 'unavailable',
+            review_reasons: ['empty_result'],
+            review_fingerprint: 'fingerprint',
+            accepted_blocked_run_id: null,
+          },
+          error_code: 'review_required',
+          error_message: null,
+        }],
+        total: 1,
+      },
+      isLoading: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useDatasetRefreshRuns>);
+
+    render(
+      <SourcePanel
+        dataset={makeDataset({
+          origin: 'service',
+          origin_ref: {
+            kind: 'service',
+            service_type: 'arcgis_featureserver',
+            url: `${serviceUrl}/`,
+            layer_id: '0',
+          },
+        })}
+        canEdit
+        onAcceptBlockedRun={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Review and retry' })).toBeInTheDocument();
+  });
+
+  it.each([true, false])('says when a succeeded refresh found the data unchanged (%s)', (unchanged) => {
+    vi.mocked(useDatasetRefreshRuns).mockReturnValue({
+      data: {
+        runs: [{
+          id: 'run-unchanged',
+          dataset_id: 'dataset-1',
+          dataset_version_id: unchanged ? null : 'version-2',
+          ingest_job_id: 'job-1',
+          origin_kind: 'service',
+          trigger: 'cli',
+          status: 'succeeded',
+          triggered_by: 'user-1',
+          triggered_by_username: 'jdoe',
+          started_at: '2026-08-05T00:00:00Z',
+          claimed_at: '2026-08-05T00:00:01Z',
+          finished_at: '2026-08-05T00:01:00Z',
+          feature_count_before: 9,
+          feature_count_after: 9,
+          schema_diff: null,
+          verification: {
+            decision: 'allowed',
+            source_binding: { service_type: 'arcgis_featureserver', url: 'https://services.example.com/arcgis/rest/services/Roads/FeatureServer', layer_id: '0' },
+            source_count: 9,
+            fetched_count: 9,
+            count_status: 'matched',
+            identity_check: 'content_digest',
+            review_reasons: [],
+            review_fingerprint: null,
+            accepted_blocked_run_id: null,
+            data_unchanged: unchanged,
+          },
+          error_code: null,
+          error_message: null,
+        }],
+        total: 1,
+      },
+      isLoading: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useDatasetRefreshRuns>);
+
+    render(<SourcePanel dataset={makeDataset({ origin: 'service' })} canEdit />);
+
+    const notice = screen.queryByText(
+      'The data matched what the dataset already holds, so no new version was published.',
+    );
+    if (unchanged) {
+      expect(notice).toBeInTheDocument();
+    } else {
+      expect(notice).not.toBeInTheDocument();
+    }
   });
 
   it('disables blocked-run retry while a refresh is busy', () => {

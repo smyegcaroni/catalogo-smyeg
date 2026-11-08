@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.processing.embeddings.helpers import embedding_config_fingerprint
 
-# fix(#1546 review r3, codex P2): `generate_and_store_embedding` resolves its
+# `generate_and_store_embedding` resolves its
 # whole pin through ONE call now, so that call is the seam these unit tests
 # stub. Patching `EMBEDDING_MODEL` no longer reaches it, and patching the three
 # reads separately would rebuild in the test the very composition the fix
@@ -172,7 +172,7 @@ class TestGenerateAndStoreEmbedding:
 
         mock_existing = MagicMock()
         mock_existing.content_hash = expected_hash
-        # fix(#1546): an UNSTAMPED row. Semantic search still matches it on
+        # An UNSTAMPED row. Semantic search still matches it on
         # model name alone, so unchanged content is still a skip.
         mock_existing.config_fingerprint = None
 
@@ -201,7 +201,7 @@ class TestGenerateAndStoreEmbedding:
                 lineage=None,
             )
             assert result is False
-            # fix(#1546 review r3, codex P2): the configuration IS resolved now,
+            # The configuration IS resolved now,
             # before the row lookup, because the model this call writes and the
             # model it looks the row up by have to come from one verified read.
             # An earlier revision skipped the resolution on this path to keep it
@@ -237,7 +237,7 @@ class TestGenerateAndStoreEmbedding:
             ),
         ):
             mock_ai.get = AsyncMock(return_value=True)
-            # fix(#1546): this caller labels its own rows, so it now pins the
+            # This caller labels its own rows, so it pins the
             # configuration and calls the batch entry point directly rather
             # than letting the provider re-read the config for itself.
             mock_gen.return_value = [fake_vector]
@@ -256,7 +256,7 @@ class TestGenerateAndStoreEmbedding:
             assert isinstance(added_obj, RecordEmbedding)
             assert added_obj.record_id == record_id
             assert added_obj.model_name == "text-embedding-3-small"
-            # fix(#1546): the row names the configuration it was pinned to, not
+            # The row names the configuration it was pinned to, not
             # just the model. `EMBEDDING_DIMS` is unpatched here, so the width
             # comes from config the same way the production path reads it.
             assert added_obj.config_fingerprint == _FINGERPRINT
@@ -296,7 +296,7 @@ class TestGenerateAndStoreEmbedding:
             ),
         ):
             mock_ai.get = AsyncMock(return_value=True)
-            # fix(#1546): this caller labels its own rows, so it now pins the
+            # This caller labels its own rows, so it pins the
             # configuration and calls the batch entry point directly rather
             # than letting the provider re-read the config for itself.
             mock_gen.return_value = [fake_vector]
@@ -311,7 +311,7 @@ class TestGenerateAndStoreEmbedding:
             )
             session.add.assert_not_called()
             assert mock_existing.embedding == fake_vector
-            # fix(#1546): the row is keyed (record_id, model_name), so a
+            # The row is keyed (record_id, model_name), so a
             # configuration change that keeps the model lands on this UPDATE
             # branch. Leaving the old stamp would label the new vector with the
             # configuration of the one it replaced.
@@ -320,7 +320,7 @@ class TestGenerateAndStoreEmbedding:
 
     @pytest.mark.asyncio
     async def test_unchanged_content_still_re_embeds_a_foreign_stamped_row(self):
-        """fix(#1546): the content hash is no longer the whole skip decision.
+        """The content hash is not the whole skip decision.
 
         A row stamped by another configuration is invisible to semantic search,
         so leaving it in place because the text has not changed would report

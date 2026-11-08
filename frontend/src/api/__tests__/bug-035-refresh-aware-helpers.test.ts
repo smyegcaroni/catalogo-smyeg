@@ -1,4 +1,4 @@
-// BUG-035: AI stream + download/export helpers must use the refresh-aware
+// AI stream + download/export helpers must use the refresh-aware
 // fetch pipeline (proactive expiry refresh + 401→tryRefresh→retry) instead of a
 // bare fetch with a possibly-stale JWT. Pre-fix these helpers issued a raw
 // fetch() and hard-failed with a 401 when the token had expired during a long
@@ -78,7 +78,7 @@ describe('BUG-035: streamGenerateMap is refresh-aware', () => {
 
     await drain(streamGenerateMap({ prompt: 'p' }));
 
-    // fix(#1446): the second arg is the abort signal that lets a logout
+    // The second arg is the abort signal that lets a logout
     // abandon an in-flight refresh before its Set-Cookie can land.
     expect(mockRefresh).toHaveBeenCalledWith('r', expect.any(AbortSignal));
     // The stream request carried the refreshed token, not the stale one.

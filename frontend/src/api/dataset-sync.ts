@@ -13,7 +13,7 @@ export interface SyncSource {
   source_binding_fingerprint?: string;
 }
 
-export interface SyncCredentialMetadata {
+interface SyncCredentialMetadata {
   id: string;
   connector_name: 'arcgis_feature_server';
   allowed_origin: string;
@@ -63,7 +63,7 @@ export interface UpdateSyncAutomationRequest {
   cadence?: SyncCadence;
 }
 
-export interface SyncRunResponse {
+interface SyncRunResponse {
   occurrence_id: string;
   run_id: string;
   job_id: string;
@@ -84,14 +84,14 @@ export interface ReplaceSyncCredentialRequest {
 }
 
 export async function getDatasetSync(datasetId: string): Promise<SyncAutomation | null> {
-  return apiFetch<SyncAutomation | null>(`/datasets/${datasetId}/sync`, { expected404: true });
+  return apiFetch<SyncAutomation | null>(`/datasets/${encodeURIComponent(datasetId)}/sync`, { expected404: true });
 }
 
 export async function createDatasetSync(
   datasetId: string,
   request: CreateSyncAutomationRequest,
 ): Promise<SyncAutomation> {
-  return apiFetch<SyncAutomation>(`/datasets/${datasetId}/sync`, {
+  return apiFetch<SyncAutomation>(`/datasets/${encodeURIComponent(datasetId)}/sync`, {
     method: 'POST',
     body: JSON.stringify(request),
   });
@@ -101,28 +101,28 @@ export async function updateDatasetSync(
   datasetId: string,
   request: UpdateSyncAutomationRequest,
 ): Promise<SyncAutomation> {
-  return apiFetch<SyncAutomation>(`/datasets/${datasetId}/sync`, {
+  return apiFetch<SyncAutomation>(`/datasets/${encodeURIComponent(datasetId)}/sync`, {
     method: 'PATCH',
     body: JSON.stringify(request),
   });
 }
 
 export async function deleteDatasetSync(datasetId: string, revision: number): Promise<void> {
-  await apiFetch(`/datasets/${datasetId}/sync`, {
+  await apiFetch(`/datasets/${encodeURIComponent(datasetId)}/sync`, {
     method: 'DELETE',
     body: JSON.stringify({ revision }),
   });
 }
 
 export async function pauseDatasetSync(datasetId: string, revision: number): Promise<SyncAutomation> {
-  return apiFetch<SyncAutomation>(`/datasets/${datasetId}/sync/pause`, {
+  return apiFetch<SyncAutomation>(`/datasets/${encodeURIComponent(datasetId)}/sync/pause`, {
     method: 'POST',
     body: JSON.stringify({ revision }),
   });
 }
 
 export async function resumeDatasetSync(datasetId: string, revision: number): Promise<SyncAutomation> {
-  return apiFetch<SyncAutomation>(`/datasets/${datasetId}/sync/resume`, {
+  return apiFetch<SyncAutomation>(`/datasets/${encodeURIComponent(datasetId)}/sync/resume`, {
     method: 'POST',
     body: JSON.stringify({ revision }),
   });
@@ -132,7 +132,7 @@ export async function runDatasetSync(
   datasetId: string,
   revision?: number,
 ): Promise<SyncRunResponse> {
-  return apiFetch<SyncRunResponse>(`/datasets/${datasetId}/sync/run`, {
+  return apiFetch<SyncRunResponse>(`/datasets/${encodeURIComponent(datasetId)}/sync/run`, {
     method: 'POST',
     headers: { 'Idempotency-Key': randomId() },
     body: JSON.stringify(revision === undefined ? {} : { revision }),
@@ -159,12 +159,8 @@ export async function replaceSyncCredential(
   credentialId: string,
   request: ReplaceSyncCredentialRequest,
 ): Promise<SyncCredentialMetadata> {
-  return apiFetch<SyncCredentialMetadata>(`/sync/credentials/${credentialId}`, {
+  return apiFetch<SyncCredentialMetadata>(`/sync/credentials/${encodeURIComponent(credentialId)}`, {
     method: 'PUT',
     body: JSON.stringify(request),
   });
-}
-
-export async function deleteSyncCredential(credentialId: string): Promise<void> {
-  await apiFetch(`/sync/credentials/${credentialId}`, { method: 'DELETE' });
 }

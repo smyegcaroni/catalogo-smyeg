@@ -1,4 +1,4 @@
-/* eslint-disable jsx-a11y/no-static-element-interactions, jsx-a11y/no-noninteractive-tabindex -- Phase 1111 LINT-01: stack rows are composite focus targets with nested controls, so role="button"/listbox roles are intentionally avoided. */
+/* eslint-disable jsx-a11y/no-static-element-interactions, jsx-a11y/no-noninteractive-tabindex -- stack rows are composite focus targets with nested controls, so role="button"/listbox roles are intentionally avoided. */
 import { memo, useState, type KeyboardEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
@@ -16,6 +16,7 @@ import {
   MoreVertical,
   Pencil,
   Plus,
+  Table2,
   Trash2,
   Type,
 } from 'lucide-react';
@@ -34,7 +35,7 @@ import {
 import { LayerTypeIcon } from '@/components/map/layer-icons';
 import { legendFacts } from '@/components/map/legend-facts';
 import { isAnalysableLayer } from '@/components/builder/analysis-eligibility';
-import { getLayerCapabilities } from '@/lib/layer-capabilities';
+import { canOpenAttributeTable, getLayerCapabilities } from '@/lib/layer-capabilities';
 import { cn } from '@/lib/utils';
 import { semanticBadgeColors } from '@/lib/status-colors';
 import {
@@ -59,15 +60,18 @@ interface StackRowProps {
   onRemove: (id: string) => void;
   onRename: (layerId: string, newName: string | null) => void;
   onDuplicate: (id: string) => void;
-  // Phase 1201-01 (ENH-01/ENH-02): kebab authoring actions.
-  /** Frames the map to this layer's extent (ENH-01). */
+  // Kebab authoring actions.
+  /** Frames the map to this layer's extent. */
   onZoomToLayer?: (id: string) => void;
-  /** ux(#772): opens the Analysis panel prefilled with this layer. Rendered
+  /** Opens the Analysis panel prefilled with this layer. Rendered
    *  only for analysable (vector dataset) layers. */
   onAnalyzeLayer?: (id: string) => void;
-  /** Stashes this layer's geometry-compatible style in the session clipboard (ENH-02). */
+  /** Opens the read-only attribute-table drawer for this layer. Rendered
+   *  only for layers whose dataset carries a data table. */
+  onOpenAttributeTable?: (id: string) => void;
+  /** Stashes this layer's geometry-compatible style in the session clipboard. */
   onCopyStyle?: (id: string) => void;
-  /** Applies the clipboard style to this layer (ENH-02); disabled when !canPasteStyle. */
+  /** Applies the clipboard style to this layer; disabled when !canPasteStyle. */
   onPasteStyle?: (id: string) => void;
   /** True when a style is copied AND its geometry class matches THIS row's layer. */
   canPasteStyle?: boolean;
@@ -79,37 +83,39 @@ interface StackRowProps {
   onCreateGroupWithLayer?: (layerId: string) => void;
   /** Called when user selects "Move out of group" (layer is already in a group) */
   onMoveLayerOutOfGroup?: (layerId: string) => void;
-  /** Returns whether the move happened, so boundary no-ops stay silent
-   *  (codex(#794)); void is treated as moved for older callers. */
+  /** Returns whether the move happened, so boundary no-ops stay silent;
+   *  void is treated as moved for older callers. */
   onKeyboardReorder?: (layerId: string, direction: 'up' | 'down') => boolean | void;
-  /** fix(#759): routes reorder-mode announcements into the builder's shared
-   *  aria-live region — the pointer drag path announces pickup/position/drop
-   *  while this mode used to be completely silent. */
+  /**
+   * Routes reorder-mode announcements into the builder's shared aria-live
+   * region, as the pointer drag path does for pickup, position and drop.
+   */
   onAnnounce?: (text: string) => void;
   /** When non-null, the layer is inside a group — "Move out of group" replaces the sub-flow */
   parentGroupId?: string | null;
-  // Phase 1041: multi-selection props (POL-06, POL-07)
+  // Multi-selection props
   isMultiSelected?: boolean;
   isMultiSelectionActive?: boolean;
   onCmdClick?: (id: string) => void;
   onShiftClick?: (id: string) => void;
   onCheckboxClick?: (id: string) => void;
-  // Phase 1042 POL-15: entry animation — set true immediately after add, cleared after 200ms
+  // Entry animation — set true immediately after add, cleared after 200ms
   isFresh?: boolean;
-  // Phase 1199 STACK-01: "Copy N of M" duplicate disambiguation label, computed
+  // "Copy N of M" duplicate disambiguation label, computed
   // per-layer by UnifiedStackPanel from map-stack's shared helper. Null = not a
   // duplicate; render nothing.
   disambiguationLabel?: string | null;
-  /** fix(v1.6.0 audit): non-null when this row is the LAST child of the named
-   *  group — deleting it or moving it out also removes the group (#767 prune),
-   *  so the delete confirm says so and "Move out of group" gains a confirm. */
+  /**
+   * Non-null when this row is the LAST child of the named group: deleting it or
+   * moving it out also removes the group, so the delete confirm says so and
+   * "Move out of group" gains a confirm.
+   */
   dissolvesGroupName?: string | null;
-  // fix(#430 V-17): true when this layer's dataset would be silently filtered out
-  // for the map's audience (private/unpublished dataset on a public/shared
-  // map) — computed per-layer by UnifiedStackPanel via
-  // isLayerHiddenFromMapAudience.
+  // True when this layer's dataset would be silently filtered out for some of
+  // the map's audience. UnifiedStackPanel computes it from
+  // isLayerHiddenFromMapAudience and, on a restricted map, the server's answer.
   audienceHidden?: boolean;
-  // codex(#451): true when this DEM has its 2D relief overlay turned off
+  // True when this DEM has its 2D relief overlay turned off
   // (render_mode 'terrain') and is NOT the active 3D terrain source, so it
   // currently paints nothing even though its eye is on. Computed per-layer by
   // MapBuilderPage (needs terrain_config). Recoverable by re-enabling Hillshade
@@ -118,9 +124,6 @@ interface StackRowProps {
 }
 
 function TypeIcon({ layer }: { layer: MapLayerResponse }) {
-  // fix(#452): the icon logic (raster glyph chip + colorized vector icon) moved
-  // to the shared LayerTypeIcon so both legends render the same icons as the
-  // stack rows.
   return <LayerTypeIcon layer={layer} iconId={layer.id} />;
 }
 
@@ -136,6 +139,7 @@ export const StackRow = memo(function StackRow({
   onDuplicate,
   onZoomToLayer,
   onAnalyzeLayer,
+  onOpenAttributeTable,
   onCopyStyle,
   onPasteStyle,
   canPasteStyle = false,
@@ -159,17 +163,15 @@ export const StackRow = memo(function StackRow({
 }: StackRowProps) {
   const { t } = useTranslation('builder');
   const [confirmingDelete, setConfirmingDelete] = useState(false);
-  // fix(v1.6.0 audit): "Move out of group" on a group's LAST child dissolves
-  // the named group (#767 empty-group prune) — that deserves the same
-  // lightweight inline confirm the delete path already uses.
+  // "Move out of group" on a group's LAST child dissolves the named group,
+  // which deserves the same lightweight inline confirm the delete path uses.
   const [confirmingMoveOut, setConfirmingMoveOut] = useState(false);
   const [keyboardReorderActive, setKeyboardReorderActive] = useState(false);
   const kebabMenu = useKebabContextMenu();
 
   const displayName = layer.display_name ?? layer.dataset_name;
 
-  // builder-audit #338 STACK-03: shared inline-rename state machine (was duplicated
-  // verbatim with FolderGroupRow).
+  // Shared inline-rename state machine, also used by FolderGroupRow.
   const {
     editing,
     nameValue,
@@ -181,18 +183,16 @@ export const StackRow = memo(function StackRow({
   } = useInlineRename({
     value: displayName,
     onCommit: (next) => onRename(layer.id, next),
-    // a11y(v1.6.0 audit A7): commit/cancel unmount the focused input — hand
-    // focus back to the row, matching the delete-confirm's focus return.
+    // Commit/cancel unmount the focused input; hand focus back to the row,
+    // matching the delete-confirm's focus return.
     restoreFocus: () => document.getElementById(`stack-row-${layer.id}`)?.focus(),
   });
 
-  // Derived label indicator.
-  // LabelConfig has no `enabled` field; `column` being set is the sole signal.
-  // Heatmap suppresses label rendering on the map, so suppress the indicator
-  // too. Symbol mode does NOT suppress labels — it renders the text
-  // consolidated in the primary symbol layer (symbol-adapter symbolLayout),
-  // so the old renderMode !== 'symbol' clause was a false negative: a symbol
-  // point with labels showed text on the map but no badge. fix(#526 B-042)
+  // Derived label indicator. LabelConfig has no `enabled` field; `column` being
+  // set is the sole signal. Heatmap suppresses label rendering on the map, so
+  // suppress the indicator too. Symbol mode does NOT suppress labels: it
+  // renders the text consolidated in the primary symbol layer (symbol-adapter
+  // symbolLayout).
   const renderMode = (layer.style_config as Record<string, unknown> | null | undefined)?.render_mode as string | undefined;
   const hasLabels = !!layer.label_config?.column && renderMode !== 'heatmap';
 
@@ -211,11 +211,10 @@ export const StackRow = memo(function StackRow({
     if (isToggleKey) {
       e.preventDefault();
       e.stopPropagation();
-      // fix(#759): mirror the pointer path's pickup/drop announcements — this
-      // mode was completely silent while the shortcuts sheet advertised it.
-      // codex(#794 round 2): NOT the shared dragPickup string — its "Escape
-      // to cancel" describes the real drag path, where Escape reverts. Here
-      // every arrow applies immediately and Escape only exits the mode.
+      // Mirror the pointer path's pickup/drop announcements. NOT the shared
+      // dragPickup string: its "Escape to cancel" describes the real drag path,
+      // where Escape reverts, whereas here every arrow applies immediately and
+      // Escape only exits the mode.
       onAnnounce?.(
         keyboardReorderActive
           ? t('a11y.reorderDropped', {
@@ -235,9 +234,8 @@ export const StackRow = memo(function StackRow({
     if (e.key === 'Escape' && keyboardReorderActive) {
       e.preventDefault();
       e.stopPropagation();
-      // codex(#794 round 2): arrows have already applied their moves, so
-      // "Drop cancelled" would falsely promise a revert — Escape only exits
-      // the mode, exactly like Enter/Space.
+      // Arrows have already applied their moves, so "Drop cancelled" would
+      // falsely promise a revert; Escape only exits the mode, like Enter/Space.
       onAnnounce?.(
         t('a11y.reorderDropped', {
           defaultValue: '{{name}} dropped.',
@@ -253,8 +251,8 @@ export const StackRow = memo(function StackRow({
     e.stopPropagation();
     const direction = e.key === 'ArrowUp' ? 'up' : 'down';
     const moved = onKeyboardReorder?.(layer.id, direction);
-    // codex(#794): a boundary ArrowUp/Down is a no-op — announcing a move
-    // there gives screen-reader users false confirmation.
+    // A boundary ArrowUp/Down is a no-op; announcing a move there would give
+    // screen-reader users false confirmation.
     if (moved !== false) {
       onAnnounce?.(
         t(direction === 'up' ? 'a11y.reorderMovedUp' : 'a11y.reorderMovedDown', {
@@ -266,7 +264,7 @@ export const StackRow = memo(function StackRow({
     }
   }
 
-  // Phase 1041: modifier-aware click handler (POL-06)
+  // Modifier-aware click handler
   function handleRowClick(e: React.MouseEvent) {
     if (e.metaKey || e.ctrlKey) {
       e.preventDefault();
@@ -283,33 +281,33 @@ export const StackRow = memo(function StackRow({
 
   return (
     <>
-    {/* Phase 1041: visuallySelected is true for single-select focus OR multi-select membership */}
+    {/* visuallySelected is true for single-select focus OR multi-select membership */}
     <div
       id={`stack-row-${layer.id}`}
       data-selected={selected || isMultiSelected ? 'true' : undefined}
       aria-current={selected || isMultiSelected ? 'true' : undefined}
       tabIndex={0}
       className={cn(
-        // SP-14: explicit cursor-pointer + hover tint on the row body so hover
-        // affordance is discoverable across the whole row, not just child controls.
-        // builder-audit #338 STACK-04: shared grid template + state classes.
+        // Explicit cursor-pointer + hover tint on the row body so the hover
+        // affordance covers the whole row, not just child controls. Shared grid
+        // template + state classes.
         'group/row grid', STACK_ROW_GRID, 'gap-2 items-center py-2 px-2 cursor-pointer select-none',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset',
         // Row states — unified: either single-selection focus OR multi-selection shows primary tint
         rowStateClasses({ selected: selected || isMultiSelected, isDragging }),
-        // Phase 1042 POL-15: entry animation — animate-in/fade-in from tw-animate-css
+        // Entry animation — animate-in/fade-in from tw-animate-css
         isFresh && 'animate-in fade-in duration-[--motion-fast]',
       )}
       onClick={handleRowClick}
       onContextMenu={kebabMenu.onContextMenu}
       onKeyDown={(e) => {
         if (kebabMenu.handleContextMenuKey(e)) return;
-        // a11y(v1.6.0 audit A7, WCAG 2.1.1): only keys aimed at the row
-        // container itself belong to the row. Without this guard the
-        // Enter/Space preventDefault below cancelled native button activation
-        // on every descendant (eye toggle, kebab) and swallowed spaces typed
-        // into the rename input. Placed AFTER the context-menu branch so
-        // Shift+F10 still opens the kebab from a focused descendant.
+        // WCAG 2.1.1: only keys aimed at the row container itself belong to the
+        // row. Without this guard the Enter/Space preventDefault below would
+        // cancel native button activation on every descendant (eye toggle,
+        // kebab) and swallow spaces typed into the rename input. Placed AFTER
+        // the context-menu branch so Shift+F10 still opens the kebab from a
+        // focused descendant.
         if (e.target !== e.currentTarget) return;
         if (e.key === 'Enter') {
           e.preventDefault();
@@ -319,7 +317,7 @@ export const StackRow = memo(function StackRow({
           e.preventDefault();
           onCmdClick?.(layer.id); // Space = Cmd-click (toggles multi-selection)
         }
-        // fix(#788): Escape with the delete confirm pending dismisses the
+        // Escape with the delete confirm pending dismisses the
         // confirm (consumed) instead of falling through to ancestor Escape
         // handlers. The confirm handles its own Escape when focus is inside it;
         // this covers focus resting on the row.
@@ -331,7 +329,7 @@ export const StackRow = memo(function StackRow({
         }
       }}
     >
-      {/* Cell 1: Caret column — hidden span at rest; Checkbox during multi-selection mode (Phase 1041) */}
+      {/* Cell 1: Caret column — hidden span at rest; Checkbox during multi-selection mode */}
       {isMultiSelectionActive ? (
         <Checkbox
           className="h-3.5 w-3.5"
@@ -352,8 +350,8 @@ export const StackRow = memo(function StackRow({
         </span>
       )}
 
-      {/* Cell 2: Grip handle (builder-audit #338 STACK-04: shared DragGripButton).
-          Phase 1199 STACK-05: reveal the reorder grip on coarse-pointer/touch. */}
+      {/* Cell 2: Grip handle (shared DragGripButton).
+          Reveal the reorder grip on coarse-pointer/touch. */}
       <DragGripButton
         dragHandleProps={dragHandleProps}
         ariaLabel={t('stackRow.dragHandle', {
@@ -361,7 +359,7 @@ export const StackRow = memo(function StackRow({
           name: displayName,
         })}
         touchReveal
-        // codex(#794): dnd-kit drives aria-pressed=true through `attributes`
+        // dnd-kit drives aria-pressed=true through `attributes`
         // while its sortable is active; the explicit prop must not report
         // unpressed during a real pointer drag.
         ariaPressed={keyboardReorderActive || isDragging}
@@ -369,7 +367,7 @@ export const StackRow = memo(function StackRow({
         onBlur={() => setKeyboardReorderActive(false)}
       />
 
-      {/* Cell 3: Eye visibility toggle. SP-10: aria-pressed reflects the
+      {/* Cell 3: Eye visibility toggle. Aria-pressed reflects the
           current visible state so screen readers announce it as a toggle. */}
       <button
         type="button"
@@ -402,8 +400,7 @@ export const StackRow = memo(function StackRow({
           <input
             ref={inputRef}
             type="text"
-            // a11y(v1.6.0 audit A7): the input had no accessible name while
-            // FolderGroupRow's did — mirror that pattern.
+            // The input needs an accessible name; mirrors FolderGroupRow's.
             aria-label={t('stackRow.renameInputLabel', { defaultValue: 'Layer name' })}
             placeholder={t('stackRow.renameInputLabel', { defaultValue: 'Layer name' })}
             data-testid="stack-row-rename-input"
@@ -416,6 +413,7 @@ export const StackRow = memo(function StackRow({
         ) : (
           <div className="min-w-0 flex items-center gap-1">
             <span
+              title={displayName}
               className="truncate text-sm min-w-0"
               onDoubleClick={(e) => {
                 e.stopPropagation();
@@ -434,25 +432,24 @@ export const StackRow = memo(function StackRow({
                 <span className="sr-only">{t('stackRow.labelsIndicator', { column: layer.label_config!.column, defaultValue: 'Labels on: {{column}}' })}</span>
               </span>
             )}
-            {/* ux(#840): categorical subtitle — inline like the badges so the
-                row height never changes; max-w-[45%] per the fix(#434) cap. */}
+            {/* Categorical subtitle, inline like the badges so the row
+                height never changes. It gives up its width before the name. */}
             {categoricalSummary && (
               <span
                 title={categoricalSummary}
                 data-testid="stack-row-categories"
-                className="min-w-0 max-w-[45%] truncate text-2xs text-muted-foreground"
+                className="min-w-0 max-w-[45%] shrink-[1000] truncate text-2xs text-muted-foreground"
               >
                 {categoricalSummary}
               </span>
             )}
-            {/* Phase 1199 STACK-01: live duplicate-disambiguation badge. The label
-                ("Copy N of M") is data-driven so it is rendered verbatim; the
-                hover/sr-only text is wrapped in t() for parity hygiene. Mirrors
-                the warning-tone badge visual language used in the derived stack
-                (map-stack.ts layerBadges → tone 'warning'). */}
-            {/* fix(#434): badges were shrink-0 and starved the truncating title
-                span to ~2 chars at sidebar width. Cap each badge at 45% of the
-                row and truncate inside; the title=/tooltip keeps the full text
+            {/* Live duplicate-disambiguation badge. The label ("Copy N of M")
+                is data-driven so it is rendered verbatim; the hover/sr-only
+                text goes through t(). Mirrors the warning-tone badge in the
+                derived stack (map-stack.ts layerBadges). */}
+            {/* Badges are shrink-0 and would starve the truncating title span
+                to ~2 chars at sidebar width, so cap each at 45% of the row and
+                truncate inside; the title=/tooltip keeps the full text
                 discoverable. */}
             {disambiguationLabel && (
               <span
@@ -464,7 +461,7 @@ export const StackRow = memo(function StackRow({
                 <span className="sr-only">{t('stackRow.disambiguation', { label: disambiguationLabel, defaultValue: '{{label}}' })}</span>
               </span>
             )}
-            {/* fix(#430 V-17): audience-visibility mismatch — this layer's dataset
+            {/* Audience-visibility mismatch — this layer's dataset
                 would be silently filtered out for the map's public/shared
                 audience (e.g. a private dataset added to a public map). */}
             {audienceHidden && (
@@ -478,7 +475,7 @@ export const StackRow = memo(function StackRow({
                 </span>
               </span>
             )}
-            {/* codex(#451): DEM overlay off + not the terrain source → paints
+            {/* DEM overlay off + not the terrain source → paints
                 nothing despite the eye being on. Keep the row honest. */}
             {drawsNothing && (
               <span
@@ -503,7 +500,7 @@ export const StackRow = memo(function StackRow({
             <button
               type="button"
               data-kebab-trigger=""
-              // Phase 1199 STACK-05: reveal the kebab on coarse-pointer/touch.
+              // Reveal the kebab on coarse-pointer/touch.
               data-touch-reveal=""
               aria-label={t('stackRow.kebabTrigger', {
                 defaultValue: 'Layer options for {{name}}',
@@ -526,9 +523,8 @@ export const StackRow = memo(function StackRow({
             className="w-56"
             onCloseAutoFocus={handleMenuCloseAutoFocus}
           >
-            {/* Source info — read-only dataset metadata. Per v3 design,
-                Source is no longer a panel section; the layer-row (···) menu
-                is the right home for read-only layer-scoped info. */}
+            {/* Source info: read-only dataset metadata. The layer-row (···)
+                menu is the home for read-only layer-scoped info. */}
             {(() => {
               const caps = getLayerCapabilities(layer);
               const showSource =
@@ -586,12 +582,12 @@ export const StackRow = memo(function StackRow({
                 </>
               );
             })()}
-            {/* fix(#585): navigable follow-up to the Source block — the builder
-                previously had NO path to the dataset page (notably: the
-                audienceHidden badge warns about dataset visibility, which is
-                fixed THERE). New tab on purpose: in-place navigation would trip
-                the unsaved-changes guard, matching the "View as viewer"
-                precedent. A real <a> so middle-click/cmd-click work. */}
+            {/* Navigable follow-up to the Source block: a path from the builder
+                to the dataset page (where the audienceHidden badge's
+                dataset-visibility fix lives). New tab on purpose: in-place
+                navigation would trip the unsaved-changes guard, matching the
+                "View as viewer" precedent. A real <a> so middle-click/cmd-click
+                work. */}
             {layer.dataset_id && (
               <>
                 <DropdownMenuItem asChild data-testid="kebab-view-dataset">
@@ -616,9 +612,8 @@ export const StackRow = memo(function StackRow({
                 startRename();
               }}
             >
-              {/* fix(#585): every kebab item carries an icon — Zoom/Copy/Paste
-                  had them while Rename/Duplicate/Delete and the group flow
-                  didn't, which read as ragged. */}
+              {/* Every kebab item carries an icon so the menu doesn't read as
+                  ragged. */}
               <Pencil className="h-3.5 w-3.5 me-2" aria-hidden="true" />
               {t('stackRow.kebabRenameLayer', { defaultValue: 'Rename layer' })}
             </DropdownMenuItem>
@@ -630,7 +625,7 @@ export const StackRow = memo(function StackRow({
               <CopyPlus className="h-3.5 w-3.5 me-2" aria-hidden="true" />
               {t('stackRow.kebabDuplicate', { defaultValue: 'Duplicate' })}
             </DropdownMenuItem>
-            {/* Phase 1201-01 ENH-01/ENH-02: zoom-to-extent + copy/paste style.
+            {/* Zoom-to-extent + copy/paste style.
                 Paste is disabled when no compatible style is copied for this
                 row's geometry (canPasteStyle is computed per-row upstream). */}
             <DropdownMenuSeparator />
@@ -641,7 +636,7 @@ export const StackRow = memo(function StackRow({
               <Crosshair className="h-3.5 w-3.5 me-2" aria-hidden="true" />
               {t('stackRow.kebabZoomToLayer', { defaultValue: 'Zoom to layer' })}
             </DropdownMenuItem>
-            {/* ux(#772): jump straight into Analysis targeting this layer.
+            {/* Jump straight into Analysis targeting this layer.
                 Gated on the panel's own eligibility predicate so a raster or
                 DEM row doesn't offer an entry the panel would ignore. */}
             {onAnalyzeLayer && isAnalysableLayer(layer) && (
@@ -651,6 +646,19 @@ export const StackRow = memo(function StackRow({
               >
                 <FlaskConical className="h-3.5 w-3.5 me-2" aria-hidden="true" />
                 {t('stackRow.kebabAnalyzeLayer', { defaultValue: 'Analyze this layer' })}
+              </DropdownMenuItem>
+            )}
+            {/* Read-only data inspection, like Analyze: offered only where a
+                table makes sense (vector dataset with a data table), so a
+                raster, DEM or tileset row never opens a drawer the rows
+                endpoint would refuse. */}
+            {onOpenAttributeTable && canOpenAttributeTable(layer) && (
+              <DropdownMenuItem
+                data-testid="kebab-open-attribute-table"
+                onSelect={() => onOpenAttributeTable(layer.id)}
+              >
+                <Table2 className="h-3.5 w-3.5 me-2" aria-hidden="true" />
+                {t('stackRow.kebabAttributeTable', { defaultValue: 'Open attribute table' })}
               </DropdownMenuItem>
             )}
             <DropdownMenuItem
@@ -668,7 +676,7 @@ export const StackRow = memo(function StackRow({
               }}
             >
               <ClipboardPaste className="h-3.5 w-3.5 me-2" aria-hidden="true" />
-              {/* fix(#585): disabled items state their reason inline (tooltips
+              {/* Disabled items state their reason inline (tooltips
                   don't fire on disabled elements). */}
               <span className="flex flex-col items-start">
                 {t('stackRow.kebabPasteStyle', { defaultValue: 'Paste style' })}
@@ -692,9 +700,8 @@ export const StackRow = memo(function StackRow({
             <DropdownMenuSeparator />
             {parentGroupId ? (
               // Layer is already inside a group: show "Move out of group".
-              // fix(v1.6.0 audit): moving the LAST child out dissolves the
-              // named group — route through the inline confirm instead of
-              // destroying the group silently.
+              // Moving the LAST child out dissolves the named group, so route
+              // through the inline confirm instead of destroying it silently.
               <DropdownMenuItem
                 onSelect={() => {
                   if (dissolvesGroupName) setConfirmingMoveOut(true);
@@ -705,9 +712,8 @@ export const StackRow = memo(function StackRow({
                 {t('stackRow.kebabMoveOutOfGroup', { defaultValue: 'Move out of group' })}
               </DropdownMenuItem>
             ) : (
-              // fix(#585): submenu instead of a flat inline list — the group
-              // list grows unbounded with many groups and previously pushed
-              // Delete off-screen.
+              // Submenu instead of a flat inline list: the group list grows
+              // unbounded with many groups and would push Delete off-screen.
               <DropdownMenuSub>
                 <DropdownMenuSubTrigger data-testid="kebab-add-to-group">
                   <FolderPlus className="h-3.5 w-3.5 me-2" aria-hidden="true" />
@@ -739,12 +745,12 @@ export const StackRow = memo(function StackRow({
       </div>
     </div>
 
-    {/* fix(#585): shared inline confirm — appears below the row when kebab Delete is clicked */}
+    {/* Shared inline confirm — appears below the row when kebab Delete is clicked */}
     {confirmingDelete && (
       <InlineDeleteConfirm
         confirmId={`confirm-delete-${layer.id}`}
-        // fix(v1.6.0 audit): deleting a group's last child also removes the
-        // named group (#767 prune) — the confirm must promise the whole effect.
+        // Deleting a group's last child also removes the named group; the
+        // confirm must promise the whole effect.
         message={
           dissolvesGroupName
             ? t('layerEditor.confirmDelete.messageDissolvesGroup', {
@@ -762,15 +768,15 @@ export const StackRow = memo(function StackRow({
         }}
         onCancel={() => {
           setConfirmingDelete(false);
-          // fix(#788): the confirm owned focus (autofocused Cancel button), so
+          // The confirm owned focus (autofocused Cancel button), so
           // dismissing it must hand focus back to the row instead of <body>.
           document.getElementById(`stack-row-${layer.id}`)?.focus();
         }}
       />
     )}
 
-    {/* fix(v1.6.0 audit): confirm before "Move out of group" dissolves the
-        named group (last-child case) — same shared inline confirm as delete. */}
+    {/* Confirm before "Move out of group" dissolves the named group (last-child
+        case); same shared inline confirm as delete. */}
     {confirmingMoveOut && (
       <InlineDeleteConfirm
         confirmId={`confirm-move-out-${layer.id}`}
@@ -787,7 +793,7 @@ export const StackRow = memo(function StackRow({
         }}
         onCancel={() => {
           setConfirmingMoveOut(false);
-          // fix(#788): hand focus back to the row instead of <body>.
+          // Hand focus back to the row instead of <body>.
           document.getElementById(`stack-row-${layer.id}`)?.focus();
         }}
       />

@@ -1,8 +1,8 @@
-// fix(#645): if the shell is stale (heuristically cached pre-#622, or a tab
-// left open across a deploy), its hashed /assets/ script/CSS 404 and the app
+// If the shell is stale (heuristically cached before it was served no-cache,
+// or a tab left open across a deploy), its hashed /assets/ script/CSS 404 and the app
 // renders blank/unstyled with no recovery. Reload once so the no-cache shell
 // revalidates to the current build. External file, not inline — the page
-// ships a strict script-src 'self' CSP (SEC-020). Keep the latch key +
+// ships a strict script-src 'self' CSP. Keep the latch key +
 // window in sync with src/lib/stale-asset-reload.ts (the same guard for
 // lazy route chunks).
 (function () {
@@ -15,12 +15,11 @@
       if (tag !== 'SCRIPT' && tag !== 'LINK') return;
       var url = el.src || el.href || '';
       if (url.indexOf('/assets/') === -1) return;
-      // fix(#1515): the reload has to stay INSIDE the try. sessionStorage is not
-      // merely null in a storage-denied context, it throws — a sandboxed iframe
-      // without allow-same-origin has an opaque origin and reading the property
-      // raises SecurityError. Reloading from the catch ran unlatched: the shell
-      // reloaded, the asset failed again, and the frame re-requested at ~1000
-      // req/s on localhost. No latch, no reload.
+      // The reload has to stay INSIDE the try. sessionStorage throws in a
+      // storage-denied context (a sandboxed iframe without allow-same-origin has
+      // an opaque origin, so reading the property raises SecurityError).
+      // Reloading from the catch would run unlatched and loop at ~1000 req/s.
+      // No latch, no reload.
       try {
         var last = Number(sessionStorage.getItem('geolens-asset-reload-at') || 0);
         if (Date.now() - last < 30000) return;

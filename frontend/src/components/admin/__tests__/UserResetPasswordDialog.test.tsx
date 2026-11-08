@@ -31,6 +31,7 @@ const user: UserResponse = {
   is_active: true,
   status: 'active',
   last_login_at: null,
+  can_reset_password: true,
   created_at: '2026-01-01T00:00:00Z',
   roles: ['viewer'],
 };
@@ -122,7 +123,7 @@ describe('UserResetPasswordDialog', () => {
   });
 
   it('refuses every close path while the reset is in flight, then still succeeds', async () => {
-    // fix(#1715 codex r1 P2): a dismissal mid-request used to unmount the
+    // A dismissal mid-request used to unmount the
     // dialog while the backend went on to change the password and revoke the
     // account's credentials, so the operation vanished from the UI without
     // ever showing that it had happened. The request is not aborted, so the
@@ -180,7 +181,7 @@ describe('UserResetPasswordDialog', () => {
   });
 
   it('signs this session out after a successful self-reset', async () => {
-    // fix(#1715 codex r1 P2): the backend revoked the acting admin's own
+    // The backend revoked the acting admin's own
     // session, so leaving the token in place would keep the UI looking signed
     // in until some later request happened to 401.
     useAuthStore.setState({ user, token: 'stale-token' } as never);

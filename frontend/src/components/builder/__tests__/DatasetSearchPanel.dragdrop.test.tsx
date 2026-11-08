@@ -1,9 +1,9 @@
 /**
- * Phase 1040 Plan 04 — DatasetSearchPanel drag-drop contract tests.
+ * DatasetSearchPanel drag-drop contract tests.
  *
  * Verifies that:
  * 1. Dataset rows render a grip handle with aria-label "Drag into map"
- *    (fix(#430 V-11): reworded from "Drag to add to map" so it no longer
+ *    (reworded from "Drag to add to map" so it no longer
  *    substring-matches the row/details "Add to map" action buttons).
  * 2. useDraggable is called with ids namespaced as `catalog:{datasetId}` for dataset rows.
  *
@@ -11,8 +11,8 @@
  * the left-pane BasemapGroupRow + BasemapGroupEditorScene flyout — so the former
  * basemap-tab drag tests were removed when the tab was dropped.
  *
- * Per PATTERNS.md worker-exit risk note: file-level vi.mock for transitive deps
- * (sonner, react-router) are minimized. We spy on useDraggable at file scope so
+ * Transitive deps (sonner, react-router) are mocked at file level and kept
+ * minimal. We spy on useDraggable at file scope so
  * the spy is restored via vi.restoreAllMocks() in afterEach.
  */
 
@@ -56,6 +56,7 @@ function makeRecord(overrides: {
     type: 'Feature',
     id: overrides.id,
     geometry: null,
+    time: {},
     bbox: null,
     links: [],
     properties: {
@@ -67,11 +68,15 @@ function makeRecord(overrides: {
       updated: '2026-01-02T00:00:00Z',
       updated_by_display: null,
       never_edited: false,
+      themes: [],
+      time: {},
+      source_freshness: 'unknown',
+      source_health: 'unknown',
       crs: 'EPSG:4326',
       geometry_type: 'POLYGON',
       feature_count: 100,
-      contacts: null,
-      license: null,
+      contacts: [],
+      license: 'proprietary',
       source_organization: 'City GIS',
       quality_detail: null,
       record_status: 'published',

@@ -36,8 +36,8 @@ function fail(messages) {
 const failures = [];
 const errorMap = readFileSync(ERROR_MAP_PATH, 'utf8');
 
-// These were the two historical leak paths: unknown detail and dynamic quotas
-// were returned verbatim. Keep the check textual and obvious so a future
+// These are the two leak paths the guard covers: unknown detail and dynamic
+// quotas must never be returned verbatim. The check is textual and obvious so a
 // refactor cannot accidentally restore either behavior.
 if (/return\s+backendMessage\s*;/.test(errorMap)) {
   failures.push('error-map.ts returns unknown backendMessage verbatim');
@@ -120,6 +120,7 @@ if (exactMessages.size === 0) {
 const backendFiles = collectFiles(BACKEND_ROOT, '.py');
 let detailAssignments = 0;
 const staticDetails = new Set();
+const exceptionDefaults = new Set();
 for (const file of backendFiles) {
   const source = readFileSync(file, 'utf8');
   detailAssignments += [...source.matchAll(/\bdetail\s*=/g)].length;
@@ -128,7 +129,20 @@ for (const file of backendFiles) {
   )) {
     staticDetails.add(match[2]);
   }
+  for (const match of source.matchAll(
+    /\bmessage: str = (?:"([^\n"]{2,})"|'([^\n']{2,})')/g,
+  )) {
+    exceptionDefaults.add(match[1] ?? match[2]);
+  }
 }
+// Exception default messages reach `detail` through str(exc), so a literal
+// `detail=` scan never sees them; each must keep an exact mapping.
+for (const message of exceptionDefaults) {
+  if (!exactMessages.has(message)) {
+    failures.push(`exception default message has no exact mapping in error-map.ts: ${message}`);
+  }
+}
+
 if (detailAssignments === 0) {
   failures.push(
     'backend detail inventory found no assignments (check the configured path)',

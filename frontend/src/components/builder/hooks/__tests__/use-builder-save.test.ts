@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createElement, type ReactNode } from 'react';
+import { dashboardReadableTypes } from '@/components/widgets/registry';
 import { MAP_COLORS } from '@/lib/map-colors';
 import {
   EXPORT_CANVAS_MAX_AREA,
@@ -32,7 +33,9 @@ const mockEnabledPlugins = vi.hoisted(() => ({
   value: null as string[] | null | undefined,
 }));
 
-vi.mock('@/hooks/use-maps', () => ({
+vi.mock('@/hooks/use-maps', async (importOriginal) => ({
+  // The real query, whose getMap is the mock below.
+  mapDetailQuery: (await importOriginal<typeof import('@/hooks/use-maps')>()).mapDetailQuery,
   useUpdateMap: () => ({
     mutate: mockMutate,
     mutateAsync: mockUpdateMapMutateAsync,
@@ -54,7 +57,7 @@ vi.mock('@/hooks/use-settings', () => ({
 
 const mockUploadThumbnail = vi.fn((..._args: unknown[]) => Promise.resolve());
 const mockUploadOgImage = vi.fn((..._args: unknown[]) => Promise.resolve());
-// fix(#1778): the stale-diff recovery refetches the map to learn which layer
+// The stale-diff recovery refetches the map to learn which layer
 // ids the server still has.
 const mockGetMap = vi.fn();
 vi.mock('@/api/maps', () => ({
@@ -100,7 +103,7 @@ vi.mock('@/hooks/use-edition', () => ({
 /* ── Helpers ───────────────────────────────────────── */
 
 function createMockCanvas() {
-  // fix(#1479): the 2D context records its fills so the globe space backdrop
+  // The 2D context records its fills so the globe space backdrop
   // painted under a capture can be asserted, along with the order — a fill
   // after drawImage would erase the map instead of backing it.
   const fills: { style: string; rect: number[] }[] = [];
@@ -117,8 +120,8 @@ function createMockCanvas() {
     fill: vi.fn(),
     stroke: vi.fn(),
     createLinearGradient: vi.fn(() => ({ addColorStop: vi.fn() })),
-    // feat(#1486): the attribution overlay measures before it draws.
-    // fix(#1541 codex P1): length-proportional, not constant. A constant makes
+    // The attribution overlay measures before it draws.
+    // Length-proportional, not constant. A constant makes
     // every credit set "fit" on one line, so no test at this level could see a
     // wrap boundary — which is how the dropped credits went unnoticed here.
     // The fitter's own wrap arithmetic is exercised in
@@ -136,9 +139,9 @@ function createMockCanvas() {
   };
 }
 
-/** feat(#1486): the credits a default mock map declares, as separate sources
+/** The credits a default mock map declares, as separate sources
  *  (which is how a real style carries them), and the single line they render
- *  as once joined. fix(#1541 codex P2): the reader takes the structured list
+ *  as once joined. The reader takes the structured list
  *  and never re-splits the joined form, so the mock supplies the list. */
 export const MOCK_CREDITS = ['© OpenFreeMap', '© OpenStreetMap contributors'];
 export const MOCK_ATTRIBUTION = MOCK_CREDITS.join(' | ');
@@ -146,11 +149,11 @@ export const MOCK_ATTRIBUTION = MOCK_CREDITS.join(' | ');
 function createMockMap(
   overrides: { loaded?: boolean; globeSpace?: boolean; attribution?: string | null } = {},
 ) {
-  // fix(#1479): capture paths ask the container whether the space backdrop is
+  // Capture paths ask the container whether the space backdrop is
   // on screen. Every mock map has one; only an opted-in map is marked.
   const container = document.createElement('div');
   if (overrides.globeSpace) container.setAttribute('data-globe-space', 'true');
-  // feat(#1486): every real map declares credits on its sources and renders
+  // Every real map declares credits on its sources and renders
   // them in the attribution control, so the default mock carries both. Pass
   // `attribution: null` for the no-credit-available case.
   const attribution =
@@ -159,7 +162,7 @@ function createMockMap(
   if (attribution !== null) {
     const inner = document.createElement('div');
     inner.className = 'maplibregl-ctrl-attrib-inner';
-    // fix(#1541 codex P2 round 3): innerHTML, because MapLibre RENDERS the
+    // innerHTML, because MapLibre RENDERS the
     // credit HTML. Assigning it as text made an `<img alt="…">` credit read
     // back as its own markup, so a reader that could not see the alt still
     // found the provider name in the string — a mock artifact that made the
@@ -170,7 +173,7 @@ function createMockMap(
   return {
     getContainer: vi.fn(() => container),
     // The structured path the reader prefers: one source per credit, each
-    // referenced by a visible layer. fix(#1541 codex P1): the reader sorts
+    // referenced by a visible layer. The reader sorts
     // shown sources ahead of hidden ones, and a style whose sources no layer
     // references reads as all-hidden — a state no real map is in.
     getStyle: vi.fn(() => ({
@@ -193,7 +196,7 @@ function createMockMap(
   };
 }
 
-/** PERF-08 (Phase 274): doCapture and handleExportPNG now register
+/** doCapture and handleExportPNG now register
  *  `map.once('render', ...)` and call `map.triggerRepaint()` instead of
  *  reading the canvas synchronously. Tests must locate the registered
  *  render callback and invoke it to simulate the next render frame. */
@@ -225,13 +228,19 @@ function makeSaveState(overrides: Partial<SaveState> = {}): SaveState {
     localDescription: 'A test',
     legendTitle: null,
     dockNotes: '',
+    dashboard: { panel: 'right', widgets: [] },
+    savedDashboard: { panel: 'right', widgets: [] },
+    dashboardEdited: false,
     mapInstanceRef: { current: createMockMap() } as unknown as SaveState['mapInstanceRef'],
     setHasUnsavedChanges: vi.fn(),
     hasUnsavedChanges: false,
+    hasUnsavedEdits: false,
     hasThumbnail: true,
-    // fix(#392): the real MapBuilderPage owns this ref; tests that don't
+    // The real MapBuilderPage owns this ref; tests that don't
     // exercise the layer-create → save-baseline bridge get a plain no-op ref.
     saveBaselineSyncRef: { current: { add: () => {}, remove: () => {} } },
+    remapLayerIds: vi.fn(),
+    saveFence: { inFlight: () => false, begin: () => {}, settle: () => {} },
     ...overrides,
   };
 }
@@ -319,7 +328,7 @@ describe('reconcileLayerDiffWithServer (#1778)', () => {
     expect(out.removed).toBeUndefined();
   });
 
-  // fix(#1778 codex round 1): apply_layer_diff numbers the ids it is given from
+  // apply_layer_diff numbers the ids it is given from
   // 0 and appends every surviving layer the order omitted, so sending only the
   // locally known survivors would push a remotely added layer to the bottom.
   // Counterfactual: filtering instead of merging yields ['B', 'A'], which the
@@ -449,7 +458,7 @@ describe('buildLayerDiff', () => {
     ]);
   });
 
-  // fix(#805): the baseline used to be prepared WITHOUT groupMeta, so baseline
+  // The baseline used to be prepared WITHOUT groupMeta, so baseline
   // children lacked the folderGroupExpanded marker while current children
   // carried it — every save of an unchanged grouped map emitted a spurious
   // per-child style_config PATCH.
@@ -482,7 +491,7 @@ describe('buildLayerDiff', () => {
     expect(result.diff).toEqual({});
   });
 
-  // fix(#833): collapse state is persisted on children, so a collapse-only
+  // Collapse state is persisted on children, so a collapse-only
   // change MUST reach the diff — it used to be stamped identically on both
   // sides (the #805 fix over-corrected) and only persisted when another
   // style_config edit rode along in the same save.
@@ -528,7 +537,7 @@ describe('buildLayerDiff', () => {
     ]);
   });
 
-  // fix(#833 codex): collapse→save→expand→save round-trip. The post-save
+  // A collapse→save→expand→save round-trip. The post-save
   // baseline used to be a verbatim copy of localLayers, whose markers still
   // said "expanded" from load — so the collapse-save left a baseline the
   // following expand-save could not diff against, and reload restored the
@@ -640,7 +649,7 @@ describe('buildLayerDiff', () => {
     expect(result.diff).toEqual({});
   });
 
-  // fix(#430 V-01): P0 data-loss regression test. A raster layer's style_config is
+  // P0 data-loss regression test. A raster layer's style_config is
   // managed by RasterLayerControls, which never writes style_config at all —
   // so a raster layer's local `style_config` can be `null`/undefined even
   // when the server-side baseline has real data from an earlier session.
@@ -684,8 +693,8 @@ describe('buildLayerDiff', () => {
     expect(result.diff.updated).toEqual([{ id: 'vector-1', style_config: null }]);
   });
 
-  // fix(#767 B8): ungrouping a raster layer clears the folder-group markers,
-  // compacting its style_config to null. The V-01 unmanaged-field guard used
+  // Ungrouping a raster layer clears the folder-group markers,
+  // compacting its style_config to null. The unmanaged-field guard used
   // to swallow that null-out (rasters have no style editor), so no PATCH was
   // emitted and the group resurrected on reload. Folder-group markers are
   // managed for every layer type — the intentional clear must patch through.
@@ -744,7 +753,7 @@ describe('buildLayerDiff', () => {
 describe('useBuilderSave', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // SP-16: clear any pending debounced thumbnail captures from a prior test
+    // Clear any pending debounced thumbnail captures from a prior test
     // so module-level state doesn't bleed across cases.
     __resetThumbnailDebounceForTests();
     mockEnabledPlugins.value = null;
@@ -807,7 +816,7 @@ describe('useBuilderSave', () => {
     expect(state.setHasUnsavedChanges).toHaveBeenCalledWith(false);
   });
 
-  it('fix(#756): keeps the dirty flag when an edit lands while the save is in flight', async () => {
+  it('keeps the dirty flag when an edit lands while the save is in flight', async () => {
     // The added-layer PATCH is handleSave's first await; deferring it holds
     // the save in flight while the test lands an edit.
     let resolvePatch!: (v: unknown) => void;
@@ -877,7 +886,7 @@ describe('useBuilderSave', () => {
     expect(setHasUnsavedChanges).not.toHaveBeenCalledWith(false);
   });
 
-  it('fix(#756): still clears the dirty flag when nothing changed during the save', async () => {
+  it('still clears the dirty flag when nothing changed during the save', async () => {
     const setHasUnsavedChanges = vi.fn();
     const state = makeSaveState({
       localLayers: [makeLayer()],
@@ -924,7 +933,7 @@ describe('useBuilderSave', () => {
   });
 
   // A save that changes a layer (zoom range) AND terrain uses the normal split
-  // path: minimal layer PATCH + metadata PUT. HT-13 note: the overlay and
+  // path: minimal layer PATCH + metadata PUT. Note: the overlay and
   // terrain authorities are independent in the composable model, so a partial
   // persist is recoverable (not a contradiction) — no need to force the lossy
   // full-replacement PUT here.
@@ -1070,7 +1079,7 @@ describe('useBuilderSave', () => {
 
   it('falls back to full layer replacement when PATCH returns a structural error', async () => {
     mockPatchMapLayersMutateAsync.mockRejectedValueOnce(
-      // fix(#1778): 405 is now the only shape that escalates to a full PUT. A
+      // 405 is now the only shape that escalates to a full PUT. A
       // 400 with a diff-integrity detail is a conflict, covered separately below.
       new ApiError('Method Not Allowed', 405, 'Method Not Allowed'),
     );
@@ -1101,7 +1110,7 @@ describe('useBuilderSave', () => {
 
   it('omits virtual folder rows from full replacement fallback payloads', async () => {
     mockPatchMapLayersMutateAsync.mockRejectedValueOnce(
-      // fix(#1778): 405 is now the only shape that escalates to a full PUT. A
+      // 405 is now the only shape that escalates to a full PUT. A
       // 400 with a diff-integrity detail is a conflict, covered separately below.
       new ApiError('Method Not Allowed', 405, 'Method Not Allowed'),
     );
@@ -1143,7 +1152,7 @@ describe('useBuilderSave', () => {
   });
 
   // -------------------------------------------------------------------------
-  // fix(#1778): "a stale-diff 400 from PATCH /maps/{id}/layers is misread as
+  // "a stale-diff 400 from PATCH /maps/{id}/layers is misread as
   // 'endpoint unsupported' and escalated to a full PUT that overwrites the
   // server's layer set" (codebase audit 2026-08-30).
   //
@@ -1194,7 +1203,7 @@ describe('useBuilderSave', () => {
     expect(mockUpdateMapMutateAsync.mock.calls[0][0].data.layers).toBeUndefined();
   });
 
-  // fix(#1778 codex round 1 P2): the retry must not move a layer this session
+  // The retry must not move a layer this session
   // never saw. apply_layer_diff numbers the given ids from 0 and appends every
   // omitted survivor, so sending only [layer-b, layer-a] would leave the
   // remotely added layer-x at the bottom. Counterfactual: filter instead of
@@ -1315,7 +1324,7 @@ describe('useBuilderSave', () => {
     expect(result.current.saveStatus).toBe('failed');
   });
 
-  // fix(#1778 codex round 3 P1): 404 is the compatibility case the full PUT
+  // 404 is the compatibility case the full PUT
   // exists for. A backend predating PATCH /maps/{id}/layers answers 404 for the
   // unknown route, so narrowing "unsupported" to 405/501 alone would have made
   // every layer-edit save fail against such a deployment.
@@ -1339,7 +1348,9 @@ describe('useBuilderSave', () => {
       await result.current.handleSave();
     });
 
-    expect(mockGetMap).not.toHaveBeenCalled();
+    // No stale-diff recovery: the only read is the full PUT's read-back.
+    expect(mockPatchMapLayersMutateAsync).toHaveBeenCalledOnce();
+    expect(mockGetMap).toHaveBeenCalledOnce();
     expect(mockUpdateMapMutateAsync).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -1507,6 +1518,144 @@ describe('useBuilderSave', () => {
     );
     expect(mockUpdateMapMutateAsync).not.toHaveBeenCalled();
     expect(mockPatchMapLayersMutateAsync).not.toHaveBeenCalled();
+  });
+
+  describe('dashboard', () => {
+    const widgetLayer = () =>
+      makeLayer({
+        id: '0b7d2f4e-3c1a-4e8b-9f6d-5a2c7e1b9d34',
+        dataset_column_info: [
+          { name: 'kind', type: 'text' },
+          { name: 'area', type: 'double precision' },
+        ],
+      });
+    const barChart = (config: Record<string, unknown>) => ({
+      id: '6f1c3a52-8d1e-4a57-9b1f-2c4e7a9d0b11',
+      type: 'bar_chart',
+      v: 1,
+      title: '  Land use  ',
+      layer_id: '0b7d2f4e-3c1a-4e8b-9f6d-5a2c7e1b9d34',
+      scope: 'layer' as const,
+      config: { column: 'kind', stat: 'count', stat_column: null, limit: 10, ...config },
+    });
+
+    async function save(state: SaveState) {
+      const { result } = renderHook(() => useBuilderSave(state));
+      await act(async () => {
+        await result.current.handleSave();
+      });
+    }
+
+    it('sends the edited dashboard with the map metadata', async () => {
+      await save(
+        makeSaveState({
+          hasUnsavedChanges: true,
+          localLayers: [widgetLayer()],
+          dashboard: { panel: 'bottom', widgets: [barChart({})] },
+          savedDashboard: { panel: 'right', widgets: [] },
+          dashboardEdited: true,
+        }),
+      );
+
+      expect(mockUpdateMapMutateAsync.mock.calls[0][0].data.dashboard_config).toEqual({
+        version: 1,
+        readable: dashboardReadableTypes(),
+        panel: 'bottom',
+        widgets: [{ ...barChart({}), title: 'Land use' }],
+      });
+    });
+
+    it('leaves the dashboard out of a save that would not change it', async () => {
+      await save(
+        makeSaveState({
+          hasUnsavedChanges: true,
+          localLayers: [widgetLayer()],
+          dashboard: { panel: 'right', widgets: [{ ...barChart({}), title: 'Land use' }] },
+          savedDashboard: { panel: 'right', widgets: [{ ...barChart({}), title: 'Land use' }] },
+          dashboardEdited: false,
+        }),
+      );
+
+      expect(mockUpdateMapMutateAsync).toHaveBeenCalled();
+      expect(mockUpdateMapMutateAsync.mock.calls[0][0].data).not.toHaveProperty('dashboard_config');
+    });
+
+    it.each([
+      ['refused widgets', 422, { message: "Some dashboard widgets can't be saved on this map", widget_ids: ['x'] }],
+      ['too many widgets', 422, 'A dashboard holds at most 50 widgets'],
+      ['a dashboard from a newer GeoLens', 409, "This dashboard was saved by a newer version of GeoLens and can't be changed here."],
+    ])('says why the server refused %s', async (_label, status, detail) => {
+      const { toast } = await import('sonner');
+      mockUpdateMapMutateAsync.mockRejectedValueOnce(new ApiError('Localized reason', status, detail));
+      await save(
+        makeSaveState({
+          hasUnsavedChanges: true,
+          localLayers: [widgetLayer()],
+          dashboard: { panel: 'right', widgets: [barChart({})] },
+          savedDashboard: { panel: 'right', widgets: [] },
+          dashboardEdited: true,
+        }),
+      );
+
+      expect(toast.error).toHaveBeenCalledWith('Localized reason');
+      expect(toast.error).not.toHaveBeenCalledWith('toasts.saveFailed');
+    });
+
+    it('refuses to save a widget following the view of a layer without geometry', async () => {
+      const { toast } = await import('sonner');
+      await save(
+        makeSaveState({
+          hasUnsavedChanges: true,
+          localLayers: [{ ...widgetLayer(), dataset_geometry_type: null }],
+          dashboard: { panel: 'right', widgets: [{ ...barChart({}), scope: 'view' }] },
+          savedDashboard: { panel: 'right', widgets: [] },
+          dashboardEdited: true,
+        }),
+      );
+      expect(toast.error).toHaveBeenCalledWith(
+        'toasts.dashboardViewWithoutGeometry',
+        expect.objectContaining({ id: 'dashboard-widget-invalid' }),
+      );
+      expect(mockUpdateMapMutateAsync).not.toHaveBeenCalled();
+    });
+
+    it('keeps the generic message for a failure that isn\'t the dashboard\'s', async () => {
+      const { toast } = await import('sonner');
+      mockUpdateMapMutateAsync.mockRejectedValueOnce(new ApiError('Localized reason', 409, 'Some other conflict'));
+      await save(
+        makeSaveState({
+          hasUnsavedChanges: true,
+          localLayers: [widgetLayer()],
+          dashboard: { panel: 'right', widgets: [barChart({})] },
+          savedDashboard: { panel: 'right', widgets: [] },
+          dashboardEdited: true,
+        }),
+      );
+      expect(toast.error).toHaveBeenCalledWith('toasts.saveFailed');
+    });
+
+    it.each([
+      ['a column its layer lacks', { column: 'name' }],
+      ['a text column summed', { stat: 'sum', stat_column: 'kind' }],
+    ])('refuses to save a widget reading %s', async (_label, config) => {
+      const { toast } = await import('sonner');
+      await save(
+        makeSaveState({
+          hasUnsavedChanges: true,
+          localLayers: [widgetLayer()],
+          dashboard: { panel: 'right', widgets: [barChart(config)] },
+          savedDashboard: { panel: 'right', widgets: [] },
+          dashboardEdited: true,
+        }),
+      );
+
+      expect(toast.error).toHaveBeenCalledWith(
+        'toasts.dashboardWidgetInvalid',
+        expect.objectContaining({ id: 'dashboard-widget-invalid' }),
+      );
+      expect(mockUpdateMapMutateAsync).not.toHaveBeenCalled();
+      expect(mockPatchMapLayersMutateAsync).not.toHaveBeenCalled();
+    });
   });
 
   it('surfaces popupConfigInvalidNamed toast with fallback name when display_name is null (Test B)', async () => {
@@ -1714,7 +1863,7 @@ describe('useBuilderSave', () => {
       result.current.handleExportPNG();
     });
 
-    // PERF-08 (Phase 274): export now registers `once('render', ...)` and
+    // Export now registers `once('render', ...)` and
     // triggers a repaint instead of reading the canvas inline. Simulate the
     // render event firing so the canvas-read path runs.
     expect(mockMap.once).toHaveBeenCalledWith('render', expect.any(Function));
@@ -1832,11 +1981,11 @@ describe('useBuilderSave', () => {
     expect(result.current.blocker.state).toBe('unblocked');
   });
 
-  it('adds beforeunload listener when hasUnsavedChanges is true', () => {
+  it('adds beforeunload listener when hasUnsavedEdits is true', () => {
     const addSpy = vi.spyOn(window, 'addEventListener');
     const removeSpy = vi.spyOn(window, 'removeEventListener');
 
-    const state = makeSaveState({ hasUnsavedChanges: true });
+    const state = makeSaveState({ hasUnsavedChanges: true, hasUnsavedEdits: true });
     const { unmount } = renderHook(() => useBuilderSave(state));
 
     expect(addSpy).toHaveBeenCalledWith('beforeunload', expect.any(Function));
@@ -1849,10 +1998,10 @@ describe('useBuilderSave', () => {
     removeSpy.mockRestore();
   });
 
-  it('does not add beforeunload listener when hasUnsavedChanges is false', () => {
+  it('does not add beforeunload listener for a camera-only change', () => {
     const addSpy = vi.spyOn(window, 'addEventListener');
 
-    const state = makeSaveState({ hasUnsavedChanges: false });
+    const state = makeSaveState({ hasUnsavedChanges: true, hasUnsavedEdits: false });
     renderHook(() => useBuilderSave(state));
 
     const beforeUnloadCalls = addSpy.mock.calls.filter(
@@ -1896,7 +2045,7 @@ describe('useBuilderSave', () => {
     }
 
     it('captures immediately when map is already loaded', async () => {
-      // SP-16: captureThumbnail is now wrapped in a 500ms trailing
+      // captureThumbnail is now wrapped in a 500ms trailing
       // debounce; advance fake timers past the boundary to drive the
       // capture path that this test exercises.
       vi.useFakeTimers();
@@ -1908,7 +2057,7 @@ describe('useBuilderSave', () => {
 
       act(() => { vi.advanceTimersByTime(500); });
 
-      // PERF-08 (Phase 274): doCapture registers `once('render', ...)` then
+      // doCapture registers `once('render', ...)` then
       // calls triggerRepaint(); fire the render callback to simulate the
       // next animation frame.
       expect(mockMap.once).toHaveBeenCalledWith('render', expect.any(Function));
@@ -1923,7 +2072,7 @@ describe('useBuilderSave', () => {
     });
 
     it('defers capture via idle event when map is not loaded', async () => {
-      // SP-16: the 500ms debounce sits in front of whenMapIdle now;
+      // The 500ms debounce sits in front of whenMapIdle now;
       // advance past it to reach the idle-deferral path.
       vi.useFakeTimers();
       const mockMap = createMockMap({ loaded: false });
@@ -1935,7 +2084,7 @@ describe('useBuilderSave', () => {
       // Not captured yet
       expect(mockUploadThumbnail).not.toHaveBeenCalled();
 
-      // Simulate idle event — this registers `once('render', ...)` per PERF-08.
+      // Simulate idle event — this registers `once('render', ...)`.
       const idleCallback = mockMap.once.mock.calls.find(
         (c: unknown[]) => c[0] === 'idle',
       )![1] as () => void;
@@ -1957,7 +2106,7 @@ describe('useBuilderSave', () => {
       const mockMap = createMockMap({ loaded: false });
       await triggerSaveSuccess(mockMap);
 
-      // SP-16: clear the 500ms debounce first so the whenMapIdle safety
+      // Clear the 500ms debounce first so the whenMapIdle safety
       // timer (which fires at +3000ms after the debounce flushes) becomes
       // observable.
       act(() => { vi.advanceTimersByTime(500); });
@@ -1971,7 +2120,7 @@ describe('useBuilderSave', () => {
       expect(mockMap.once).toHaveBeenCalledWith('render', expect.any(Function));
       expect(mockMap.triggerRepaint).toHaveBeenCalled();
 
-      // Simulate the render frame (PERF-08).
+      // Simulate the render frame.
       await act(async () => { fireRenderCallback(mockMap); await Promise.resolve(); });
       expect(mockUploadThumbnail).toHaveBeenCalledTimes(1);
 
@@ -2351,13 +2500,13 @@ describe('useBuilderSave', () => {
       expect(mockUploadOgImage).toHaveBeenCalledOnce();
       expect(mockUploadOgImage).toHaveBeenCalledWith('map-1', expect.stringContaining('data:image/jpeg'));
 
-      // triggerRepaint MUST NOT be called a second time (Pitfall #5: one repaint only)
+      // triggerRepaint MUST NOT be called a second time (one repaint only)
       expect(mockMap.triggerRepaint).toHaveBeenCalledTimes(1);
 
       vi.useRealTimers();
     });
 
-    it('backs thumbnail and OG crops with the globe space color (fix(#1479))', async () => {
+    it('backs thumbnail and OG crops with the globe space color', async () => {
       // The WebGL canvas is transparent where a ray missed the planet, so a
       // crop with nothing under it hands the encoder alpha and the sphere
       // lands on whatever it substitutes — white for PNG, black for JPEG.
@@ -2392,7 +2541,7 @@ describe('useBuilderSave', () => {
       vi.useRealTimers();
     });
 
-    it('leaves mercator crops unpainted (fix(#1479))', async () => {
+    it('leaves mercator crops unpainted', async () => {
       // A mercator map fills its own canvas edge to edge, so a backdrop would
       // be dead paint and any color drift behind it would be invisible.
       vi.useFakeTimers();
@@ -2409,7 +2558,7 @@ describe('useBuilderSave', () => {
       act(() => { vi.advanceTimersByTime(500); });
       await act(async () => { fireRenderCallback(mockMap); await Promise.resolve(); });
 
-      // feat(#1486): names the backdrop rather than counting fills — the
+      // Names the backdrop rather than counting fills — the
       // attribution scrim is also a fillRect, and it is drawn on every crop.
       expect(
         canvases.some((c) =>
@@ -2421,7 +2570,7 @@ describe('useBuilderSave', () => {
       vi.useRealTimers();
     });
 
-    // feat(#1486): the crops composite from the WebGL canvas, so MapLibre's own
+    // The crops composite from the WebGL canvas, so MapLibre's own
     // attribution control — a DOM overlay — is invisible to them by
     // construction. The credit reaches a distributed image only if it is drawn
     // INTO the canvas, which is what these two assert.
@@ -2456,7 +2605,7 @@ describe('useBuilderSave', () => {
       vi.useRealTimers();
     });
 
-    // fix(#1541 codex P1): the sibling above uses a two-credit line that fits
+    // The sibling above uses a two-credit line that fits
     // whole, so it could never have caught `maxLines: 1`. This one drives the
     // same pipeline — crop, overlay, upload — with the five-credit load that
     // measurably lost two providers, and asserts at the crops rather than at
@@ -2513,7 +2662,7 @@ describe('useBuilderSave', () => {
       vi.useRealTimers();
     });
 
-    /* fix(#1541 codex P2 round 3): `BasemapEntry.attribution` permits HTML, so
+    /* `BasemapEntry.attribution` permits HTML, so
      * a provider may credit itself with a logo. Its alt text is not DOM text,
      * so the old `textContent` read skipped the source entirely and all three
      * images shipped uncredited while the interactive map visibly showed the
@@ -2594,12 +2743,12 @@ describe('useBuilderSave', () => {
       const mockMap = createMockMap({ loaded: false });
       await triggerSaveSuccess(mockMap);
 
-      // SP-16: advance past the 500ms trailing debounce so the
+      // Advance past the 500ms trailing debounce so the
       // whenMapIdle path runs and registers the idle listener.
       act(() => { vi.advanceTimersByTime(500); });
 
       // Simulate idle event fires quickly — this registers the render
-      // listener (PERF-08) but does not yet capture.
+      // listener but does not yet capture.
       const idleCallback = mockMap.once.mock.calls.find(
         (c: unknown[]) => c[0] === 'idle',
       )![1] as () => void;
@@ -2618,7 +2767,7 @@ describe('useBuilderSave', () => {
     });
   });
 
-  // SP-16: trailing 500ms debounce around the captureThumbnail entry point.
+  // Trailing 500ms debounce around the captureThumbnail entry point.
   // Two back-to-back saves (or save + maybeAutoCaptureThumbnail) within
   // 500ms must collapse into exactly one capture → one PUT /thumbnail/.
   describe('SP-16 — captureThumbnail trailing debounce', () => {
@@ -2704,7 +2853,7 @@ describe('useBuilderSave', () => {
   });
 
   describe('handleExportPNG (idle handling)', () => {
-    // fix(#1479): the spy is installed and restored by the hooks rather than
+    // The spy is installed and restored by the hooks rather than
     // inline, so a failing assertion cannot leave it in place — a leaked spy
     // becomes the next test's `origCreateElement` and recurses forever.
     const origCreateElement = document.createElement.bind(document);
@@ -2735,7 +2884,7 @@ describe('useBuilderSave', () => {
       expect(mockMap.once).toHaveBeenCalledWith('idle', expect.any(Function));
     });
 
-    it('paints the space color under the map band only (fix(#1479))', () => {
+    it('paints the space color under the map band only', () => {
       // The chrome bands keep the white fill: exportImage.text is #0a0a0a, so
       // darkening the whole sheet would take the title and legend with it.
       const mockMap = createMockMap({ loaded: true, globeSpace: true });
@@ -2764,7 +2913,7 @@ describe('useBuilderSave', () => {
         .toBeLessThan(sheet!.ctx.drawImage.mock.invocationCallOrder[0]);
     });
 
-    it('leaves a mercator export sheet white (fix(#1479))', () => {
+    it('leaves a mercator export sheet white', () => {
       const mockMap = createMockMap({ loaded: true });
       const state = makeSaveState({
         mapInstanceRef: { current: mockMap } as unknown as SaveState['mapInstanceRef'],
@@ -2819,7 +2968,7 @@ describe('useBuilderSave', () => {
       expect(mockMap.once).not.toHaveBeenCalledWith('idle', expect.any(Function));
 
       act(() => {
-        // CR-01 (Phase 1050-rev): waitForVisibleLayerSources now routes
+        // waitForVisibleLayerSources now routes
         // through `getSourceIdForLayer`, so non-cluster vector layers with
         // a `dataset_table_name` resolve to the deduped
         // `source-data-${table}` key, not the legacy `source-${layer.id}`.
@@ -2838,7 +2987,7 @@ describe('useBuilderSave', () => {
         idleCallback();
       });
 
-      // PERF-08 (Phase 274): idle alone schedules the render listener; the
+      // Idle alone schedules the render listener; the
       // render frame must fire to actually upload pixels.
       expect(mockMap.once).toHaveBeenCalledWith('render', expect.any(Function));
       expect(mockMap.triggerRepaint).toHaveBeenCalled();
@@ -2855,7 +3004,7 @@ describe('useBuilderSave', () => {
       createElementSpy.mockRestore();
     });
 
-    // SF-07 (Phase 1050-04): in Vite dev StrictMode (and any case where the
+    // In Vite dev StrictMode (and any case where the
     // ref-callback in MapBuilderPage fires twice for the same `map`), the
     // per-hook-instance `thumbCaptured` guard resets on remount, letting a
     // second auto-capture slip through after the first's debounce window has
@@ -2990,7 +3139,7 @@ describe('useBuilderSave', () => {
       });
     });
 
-    // CR-01 (Phase 1050-rev): regression — verify that the source-readiness
+    // Regression — verify that the source-readiness
     // poll resolves on the dedupe-aware key (`source-data-{dataset_table_name}`)
     // and the render frame fires WITHOUT advancing past the 5000 ms deadline.
     // Before the fix, `waitForVisibleLayerSources` polled `source-{layer.id}`
@@ -3049,7 +3198,7 @@ describe('useBuilderSave', () => {
       vi.useRealTimers();
     });
 
-    // POLISH-01 regression: new-map created via AddToMapButton has localLayers=[]
+    // Regression: new-map created via AddToMapButton has localLayers=[]
     // when maybeAutoCaptureThumbnail fires (the ?add_dataset effect adds the layer
     // later). Without pendingLayerAdd:true the current code takes the empty-layers
     // idle path and locks in a blank thumbnail. With the fix the first capture is
@@ -3144,7 +3293,7 @@ describe('useBuilderSave', () => {
 
         const mockMap = createMockMap({ loaded: true });
 
-        // No pendingLayerAdd: existing SF-05 behavior (idle path fires for empty map)
+        // No pendingLayerAdd: existing behavior (idle path fires for empty map)
         const state = makeSaveState({
           hasThumbnail: false,
           localLayers: [],
@@ -3161,7 +3310,7 @@ describe('useBuilderSave', () => {
         // Advance past debounce — the existing idle path should proceed as before
         act(() => { vi.advanceTimersByTime(500); });
 
-        // SF-05: whenMapIdle fires immediately (loaded:true) → doCapture registers
+        // whenMapIdle fires immediately (loaded:true) → doCapture registers
         // render listener; the idle-path branch is NOT deferred/blocked
         const renderCalls = mockMap.once.mock.calls.filter(
           (c: unknown[]) => c[0] === 'render',
@@ -3176,7 +3325,7 @@ describe('useBuilderSave', () => {
   });
 });
 
-/* ── SHARE-09: export PNG composition regression pins ── */
+/* ── export PNG composition regression pins ── */
 
 describe('SHARE-09 export PNG composition', () => {
   let fillTextSpy: ReturnType<typeof vi.fn>;
@@ -3190,7 +3339,7 @@ describe('SHARE-09 export PNG composition', () => {
    *  engine limits, exactly as a browser would. */
   let encodedBlobs: (Blob | null)[];
   let createElementSpy: ReturnType<typeof vi.spyOn>;
-  // feat(#1486): hoisted so a test can read the height the export reserved.
+  // Hoisted so a test can read the height the export reserved.
   let offscreenCanvas: {
     width: number;
     height: number;
@@ -3212,7 +3361,7 @@ describe('SHARE-09 export PNG composition', () => {
       if (typeof color !== 'string' || color === '') throw new SyntaxError('unparseable color');
     });
     createGradientSpy = vi.fn(() => ({ addColorStop: addColorStopSpy }));
-    // fix(#1541 codex P2 round 2): mimic the browser. A canvas past an engine's
+    // Mimic the browser. A canvas past an engine's
     // per-side or total-area limit is unusable with nothing raised to say so —
     // toBlob simply yields null and the export fails. A stub that always hands
     // back a blob lets a test assert a successful export from a canvas no
@@ -3242,7 +3391,7 @@ describe('SHARE-09 export PNG composition', () => {
       strokeRect: vi.fn(() => { strokeStyleAtStroke.push(ctx2d.strokeStyle); }),
       createLinearGradient: createGradientSpy,
       drawImage: vi.fn(),
-      // fix(#1541 codex P1): length-proportional, not a constant 120. A
+      // Length-proportional, not a constant 120. A
       // constant makes every string "fit" on one line, so it cannot exercise
       // the band's line growth — which is precisely how the two-line cap that
       // dropped credits went unnoticed here.
@@ -3332,7 +3481,7 @@ describe('SHARE-09 export PNG composition', () => {
     expect(fillRectSpy).toHaveBeenCalled();
   });
 
-  // fix(#769): the synthetic group:folder row is built by spreading the group's
+  // The synthetic group:folder row is built by spreading the group's
   // first child, so it inherits visible/show_in_legend — the export filter must
   // exclude it or the PNG ships a phantom legend row labeled with the group name.
   it('excludes folder-group rows from the exported legend (#769)', () => {
@@ -3604,7 +3753,7 @@ describe('SHARE-09 export PNG composition', () => {
     );
   });
 
-  /* feat(#1486): the exported PNG carries the map's credit line. */
+  /* The exported PNG carries the map's credit line. */
 
   it('draws the map credit in its own band (#1486)', () => {
     const mockMap = makeExportMap();
@@ -3652,7 +3801,7 @@ describe('SHARE-09 export PNG composition', () => {
     expect(texts.some((t) => /export\.poweredBy|Powered by GeoLens/.test(t))).toBe(false);
   });
 
-  // fix(#1541 codex P1): five real credits on a 1056px export used to lose two
+  // Five real credits on a 1056px export used to lose two
   // of them, the basemap's included, because the band was capped at two lines.
   // The canvas has no height constraint, so it grows instead.
   it('exports every credit for a credit-heavy map, growing the band (#1541)', () => {
@@ -3684,7 +3833,7 @@ describe('SHARE-09 export PNG composition', () => {
     expect(offscreenCanvas.height).toBeGreaterThan(600 + 12 + 2 * 16 + 12 + 32);
   });
 
-  /* fix(#1541 codex P2 round 2): the band's measured height is assigned
+  /* The band's measured height is assigned
    * straight to the export canvas, and #1541 review had ruled that growth
    * unlimited because the canvas is sized after the band is measured. Browsers
    * cap a canvas per side and by total area; past either one `toBlob` returns
@@ -3748,11 +3897,11 @@ describe('SHARE-09 export PNG composition', () => {
     expect(joined).not.toContain('…');
   });
 
-  /* fix(#1541 codex P2 round 4): the budget used to be a DESKTOP figure while
-   * the comment above it named iOS Safari's smaller one. codex's case, and the
-   * numbers here are iOS Safari's measured ceiling written out rather than read
-   * from the constant — the whole point is that the bound holds on the smallest
-   * engine, so a test that reads the constant would relax with it. */
+  /* The budget once was a DESKTOP figure while the comment above it named
+   * iOS Safari's smaller one. The numbers here are iOS Safari's measured
+   * ceiling written out rather than read from the constant: the bound has to
+   * hold on the smallest engine, so a test that reads the constant would
+   * relax with it. */
   it('keeps an iPad-sized export inside iOS Safari\'s ceiling (#1541)', async () => {
     const { toast } = await import('sonner');
     const IOS_MAX_AREA = 4096 * 4096; // 16,777,216

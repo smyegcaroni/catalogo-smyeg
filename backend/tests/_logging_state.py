@@ -1,18 +1,16 @@
 """Save and restore everything ``setup_logging()`` mutates.
 
-fix(#1064 codex r2): ``setup_logging()`` does not only touch the root logger.
+``setup_logging()`` does not only touch the root logger.
 Reading ``app/core/logging_config.py:283-304`` line by line, it clears root's
 handlers, then clears handlers and rewrites ``propagate`` on ``uvicorn``,
 ``uvicorn.error`` and ``uvicorn.access``. A teardown that restores only root
 leaves those three changed — measured, a caller's ``uvicorn.access`` goes in
 with ``propagate=True`` and comes back out with ``propagate=False``.
 
-fix(#1746 codex r5): the same function also sets ``httpx``/``httpcore`` to
-``WARNING`` (finding 1/13's fix), and that level survived every restore here
-until now for exactly the reason the paragraph above warns about: it was not
-on this list. A caller doing ``configured_logging()`` around a direct
-``setup_logging()`` call left both loggers pinned at ``WARNING`` for the rest
-of the worker.
+The same function also sets ``httpx``/``httpcore`` to
+``WARNING``, so they are on this list too. Without that, a caller doing
+``configured_logging()`` around a direct ``setup_logging()`` call would leave
+both loggers pinned at ``WARNING`` for the rest of the worker.
 
 Two earlier rounds of this same mistake are why the list is derived from the
 source rather than from memory. The first restored root but not the structlog
@@ -47,6 +45,8 @@ _MUTATED_LOGGERS = (
     "uvicorn.access",
     "httpx",
     "httpcore",
+    "httpx2",
+    "httpcore2",
 )
 
 
@@ -83,11 +83,11 @@ def preserved_logging_state() -> Iterator[None]:
 
 @contextlib.contextmanager
 def configured_logging(
-    *, json_logs: bool = True, log_level: str = "DEBUG", production: bool = False
+    *, json_logs: bool = True, log_level: str = "DEBUG"
 ) -> Iterator[None]:
     """``setup_logging()`` inside a preserved window, with the freeze disarmed.
 
-    fix(#1064 codex r4): use this rather than ``preserved_logging_state()``
+    Use this rather than ``preserved_logging_state()``
     directly whenever the window CALLS ``setup_logging()``. Restoring the
     config on exit is not enough on its own, because ``setup_logging()`` turns
     ``cache_logger_on_first_use`` ON, and a module-level logger that emits
@@ -112,6 +112,6 @@ def configured_logging(
     fails with ``--- Logging error ---`` instead of landing anywhere assertable.
     """
     with preserved_logging_state():
-        setup_logging(json_logs=json_logs, log_level=log_level, production=production)
+        setup_logging(json_logs=json_logs, log_level=log_level)
         structlog.configure(cache_logger_on_first_use=False)
         yield

@@ -17,6 +17,7 @@ import {
 import {
   LayoutDashboard,
   Users,
+  UsersRound,
   Briefcase,
   ScrollText,
   Link2,
@@ -42,10 +43,11 @@ import { useEdition } from '@/hooks/use-edition';
 import { useEnterpriseOnlyTabs } from '@/hooks/use-settings';
 import { usePermissions } from '@/hooks/use-permissions';
 import { useSettingsAdmin } from '@/hooks/use-settings-admin';
+import { useGroupAdmin } from '@/hooks/use-admin-groups';
 import { semanticBadgeColors } from '@/lib/status-colors';
 import type { Capability } from '@/lib/capabilities';
 
-// fix(#1185): the destructive recipe an alert badge needs, matching the
+// The destructive recipe an alert badge needs, matching the
 // `failed` pill in the jobs table (both come from `semanticBadgeColors`).
 // SidebarMenuBadge pins its color with `peer-hover/menu-button:` and
 // `peer-data-[active=true]/menu-button:` variants, so those prefixes have to
@@ -62,12 +64,10 @@ const overviewItems = [
   { labelKey: 'adminNav.overview', to: '/admin/overview', icon: LayoutDashboard, capability: 'manage_users' },
 ] as const;
 
-// fix(#1185): a badge that counts a PROBLEM rather than a total. Every other
-// Operations badge is a row count for the list behind it, so a bare failed-job
-// count read as a broken total (badge 3, list 200). An alert badge renders in
-// destructive colors, is spoken as "N failed jobs" instead of a naked number,
-// and rewrites the nav target to the matching filtered list so the number the
-// user clicked equals the number the list shows.
+// A badge that counts a PROBLEM rather than a total. It renders in destructive
+// colors, is spoken as "N failed jobs" instead of a naked number, and rewrites
+// the nav target to the matching filtered list so the number the user clicked
+// equals the number the list shows.
 type AlertBadge = {
   /** Query string appended to `to` while the badge is visible. */
   filter: string;
@@ -83,14 +83,16 @@ type OperationItem = {
   alertBadge?: AlertBadge;
   enterpriseOnly?: boolean;
   capability: Capability;
-  // fix(#1778): SAML calls the mode-aware /settings/oauth-providers/ API
-  // (manage_tenants in multi-tenant mode), not raw manage_settings, so its
-  // visibility must follow useSettingsAdmin() like the Settings group does.
-  settingsGated?: boolean;
+  // SAML calls the mode-aware /settings/oauth-providers/ API
+  // (manage_tenants in multi-tenant mode), not raw manage_settings, and groups
+  // switch to manage_tenants the same way, so visibility must follow the
+  // mode-aware hooks rather than `capability`.
+  gate?: 'settings' | 'groups';
 };
 
 const operationsItems: readonly OperationItem[] = [
   { labelKey: 'adminNav.users', to: '/admin/users', icon: Users, badgeKey: 'users', capability: 'manage_users' },
+  { labelKey: 'adminNav.groups', to: '/admin/groups', icon: UsersRound, capability: 'manage_users', gate: 'groups' },
   {
     labelKey: 'adminNav.jobs',
     to: '/admin/jobs',
@@ -101,24 +103,20 @@ const operationsItems: readonly OperationItem[] = [
   },
   { labelKey: 'adminNav.auditLog', to: '/admin/audit', icon: ScrollText, badgeKey: 'audit', capability: 'manage_settings' },
   { labelKey: 'adminNav.sharedMaps', to: '/admin/shared-maps', icon: Link2, badgeKey: 'sharedMaps', capability: 'manage_users' },
-  { labelKey: 'adminNav.saml', to: '/admin/saml', icon: Lock, enterpriseOnly: true, capability: 'manage_settings', settingsGated: true },
+  { labelKey: 'adminNav.saml', to: '/admin/saml', icon: Lock, enterpriseOnly: true, capability: 'manage_settings', gate: 'settings' },
 ];
 
-// Phase 279 ADMIN-03 (M-03): server-driven enterprise-tab list. Used as the
-// fallback when the /settings/enterprise-tabs/ endpoint is unreachable
-// (boot, network failure, transient API outage). Must stay in sync with the
-// backend `_ENTERPRISE_ONLY_TABS` frozenset in
+// Fallback for when /settings/enterprise-tabs/ is unreachable (boot, network
+// failure). Must match the backend `_ENTERPRISE_ONLY_TABS` frozenset in
 // `backend/app/modules/settings/router.py` so community sidebars never flash
-// forbidden tabs. The hook below is the canonical source — this fallback is
-// only the last-resort default during the brief window before the first
-// fetch completes (or during prolonged API failures).
+// forbidden tabs. The hook below is the canonical source.
 const FALLBACK_ENTERPRISE_ONLY_TABS: string[] = ['branding', 'appearance'];
 
-// Declarative settings-nav entries. The `tabKey` (when set) is the Settings
-// tab key the route corresponds to (e.g. '/admin/settings/appearance' →
-// 'appearance'); the enterpriseOnly flag is derived from the server-driven
-// set inside the component below. Entries without a tabKey (config-ops) are
-// not Settings tabs — they have a static enterpriseOnly flag.
+// Declarative settings-nav entries. `tabKey` (when set) is the Settings tab
+// key the route corresponds to (e.g. '/admin/settings/appearance' ->
+// 'appearance'); its enterpriseOnly flag is derived from the server-driven set
+// inside the component. Entries without a tabKey (config-ops) are not Settings
+// tabs and carry a static enterpriseOnly flag.
 type SettingsNavBaseItem = {
   labelKey: string;
   to: string;
@@ -149,7 +147,7 @@ const settingsItemsBase: readonly SettingsNavBaseItem[] = [
  * badges for Users / Published Maps / Audit Log plus a failed-jobs ALERT badge
  * (each capped at 999+), and visibility filtering for `enterpriseOnly` items
  * via the `useEdition` hook. See `AlertBadge` for why Jobs is styled and
- * linked differently from the total badges (#1185).
+ * linked differently from the total badges.
  */
 export function AdminSidebar() {
   const { pathname } = useLocation();
@@ -162,18 +160,18 @@ export function AdminSidebar() {
   const { data: auditLogCount } = useAuditLogCount(canManageSettings);
   const { data: publishedMapCount } = usePublishedMapCount(canManageUsers);
   const { isEnterprise } = useEdition();
-  // fix(#817): the /settings/* API (including /settings/enterprise-tabs/)
+  // The /settings/* API (including /settings/enterprise-tabs/)
   // flips to manage_tenants in multi-tenant mode — gate the Settings nav
   // group and its query on the mode-aware hook, not raw manage_settings.
   const canAdminSettings = useSettingsAdmin();
+  const canAdminGroups = useGroupAdmin();
   const { data: enterpriseTabsData } = useEnterpriseOnlyTabs({
     enabled: canAdminSettings,
   });
 
-  // Phase 279 ADMIN-03 (M-03): derive each Settings-tab's enterpriseOnly flag
-  // from the server-driven list. Falls back to the local default when the
-  // hook is loading or has errored so the sidebar still renders cleanly
-  // during boot/network failures (no flash of forbidden tabs in community).
+  // Derive each Settings tab's enterpriseOnly flag from the server-driven
+  // list, falling back to the local default while the hook loads or errors so
+  // community sidebars don't flash forbidden tabs.
   const enterpriseTabKeys = enterpriseTabsData?.tabs ?? FALLBACK_ENTERPRISE_ONLY_TABS;
   const settingsItems = settingsItemsBase.map(item => ({
     ...item,
@@ -183,13 +181,14 @@ export function AdminSidebar() {
         : item.enterpriseOnly ?? false,
   }));
 
+  const gates = { settings: canAdminSettings, groups: canAdminGroups };
   const visibleOverviewItems = overviewItems.filter(item => can(item.capability));
   const visibleSettingsItems = canAdminSettings
     ? settingsItems.filter(item => !item.enterpriseOnly || isEnterprise)
     : [];
   const visibleOperationsItems = operationsItems.filter(
     item =>
-      (item.settingsGated ? canAdminSettings : can(item.capability)) &&
+      (item.gate ? gates[item.gate] : can(item.capability)) &&
       (!item.enterpriseOnly || isEnterprise),
   );
 
@@ -200,15 +199,14 @@ export function AdminSidebar() {
     sharedMaps: publishedMapCount,
   };
 
-  // #347 (ADM-02): cap large counts at 999+ in the small sidebar badge.
+  // Cap large counts at 999+ in the small sidebar badge.
   const capBadge = (n: number) => (n > 999 ? '999+' : String(n));
 
   return (
     // top-14 + height calc keep the viewport-fixed sidebar below the sticky
     // h-14 navbar: without the offset the navbar buries the sidebar header and
-    // slides over the sidebar during macOS elastic overscroll.
-    // fix(#569): include env(safe-area-inset-top) so the sidebar header
-    // doesn't sit under the navbar by the inset on notched devices.
+    // slides over it during macOS elastic overscroll. env(safe-area-inset-top)
+    // keeps the header clear of the navbar on notched devices.
     <Sidebar
       collapsible="icon"
       variant="sidebar"
@@ -249,7 +247,7 @@ export function AdminSidebar() {
               {visibleOperationsItems.map(({ labelKey, to, icon: Icon, badgeKey, alertBadge }) => {
                 const count = badgeKey ? badgeCounts[badgeKey] : undefined;
                 const showBadge = count !== undefined && count > 0;
-                // fix(#1185): the alert treatment applies only while the badge
+                // The alert treatment applies only while the badge
                 // is actually showing. At zero there is nothing to alert about,
                 // so the row stays a plain link to the unfiltered list.
                 const alertLabel =
@@ -318,7 +316,7 @@ export function AdminSidebar() {
         <SidebarMenu>
           <SidebarMenuItem>
             <SidebarMenuButton asChild tooltip={t('adminNav.backToApp')}>
-              {/* CLEAN-N5: search workspace is "/" after landing page removal. */}
+              {/* The search workspace lives at "/". */}
               <Link to="/">
                 <ArrowLeft className="rtl-mirror" />
                 <span>{t('adminNav.backToApp')}</span>

@@ -5,6 +5,8 @@ import { sendChatMessage, streamChatMessage } from '@/api/maps';
 import { ApiError } from '@/api/client';
 import { ChatPanel, type LayerActions } from '../ChatPanel';
 import type { MapLayerResponse, StyleConfig } from '@/types/api';
+import { buildRenderAsPatch } from '../renderAs';
+import { DEFAULT_HEATMAP_PAINT } from '../layer-adapters/builder-defaults';
 
 // scrollIntoView is not available in jsdom
 Element.prototype.scrollIntoView = vi.fn();
@@ -31,6 +33,7 @@ function makeLayer(overrides: Partial<MapLayerResponse> = {}): MapLayerResponse 
     display_name: null,
     sort_order: 0,
     visible: true,
+    show_in_legend: true,
     opacity: 1,
     paint: {},
     layout: {},
@@ -39,7 +42,7 @@ function makeLayer(overrides: Partial<MapLayerResponse> = {}): MapLayerResponse 
   };
 }
 
-/** One overlay feature. feat(#1241 codex r1): overlay completeness is judged
+/** One overlay feature. Overlay completeness is judged
  *  against row_count, so a fixture's feature COUNT is now load-bearing. */
 function feature() {
   return { type: 'Feature', geometry: { type: 'Point', coordinates: [-73.9, 40.8] }, properties: {} };
@@ -57,6 +60,8 @@ function renderPanel(
     onAddDataset = vi.fn(),
     onRemove = vi.fn(),
     onOpacityChange,
+    onRenderAsChange,
+    getLayer,
     onRestoreLayers = vi.fn(),
     ...rest
   } = propOverrides;
@@ -70,6 +75,8 @@ function renderPanel(
     onRemove,
     onRestoreLayers,
     ...(onOpacityChange ? { onOpacityChange } : {}),
+    ...(onRenderAsChange ? { onRenderAsChange } : {}),
+    ...(getLayer ? { getLayer } : {}),
   };
   const props = {
     mapId: 'map-1',
@@ -98,7 +105,7 @@ describe('ChatPanel', () => {
     sessionStorage.clear();
   });
 
-  it('fix(#832): suggestion chip shows the plain layer name but inserts the raw mention payload', async () => {
+  it('suggestion chip shows the plain layer name but inserts the raw mention payload', async () => {
     const user = userEvent.setup();
     renderPanel({
       layers: [makeLayer({ display_name: 'Some Layer', dataset_geometry_type: 'Point' })],
@@ -115,7 +122,7 @@ describe('ChatPanel', () => {
     expect(input.value).toBe('Color "@[Some Layer]" using a field');
   });
 
-  it('fix(#832): a layer name containing "]" survives intact in the chip label (PR #853 review)', async () => {
+  it('a layer name containing "]" survives intact in the chip label', async () => {
     const user = userEvent.setup();
     renderPanel({
       layers: [makeLayer({ display_name: 'Zone A] B', dataset_geometry_type: 'Point' })],
@@ -170,7 +177,7 @@ describe('ChatPanel', () => {
     await typeAndSend(user, 'find features');
 
     await waitFor(() => {
-      // feat(#1241): the meta now always carries the prompt behind the result,
+      // The meta now always carries the prompt behind the result,
       // so a plain preview (no truncation, no analysis) can be saved as a
       // dataset with its question suggested as the name.
       expect(props.onQueryResult).toHaveBeenCalledWith(geojson, bbox, {
@@ -179,7 +186,7 @@ describe('ChatPanel', () => {
     });
   });
 
-  // fix(#1009): "the preview surface" throughout, not "the badge" — the builder
+  // "the preview surface" throughout, not "the badge" — the builder
   // path this panel feeds now renders the ephemeral stack row.
   it('forwards the truncation pair so the preview can disclose "N of TOTAL" (#674 audit)', async () => {
     const geojson = { type: 'FeatureCollection', features: [] };
@@ -210,7 +217,7 @@ describe('ChatPanel', () => {
     });
   });
 
-  // fix(#1076): a clip filters rows, so run_analysis reports no source total —
+  // A clip filters rows, so run_analysis reports no source total —
   // the flag arrives alone. Requiring a total dropped it here and a capped
   // clip preview reached the preview surface looking complete.
   it('forwards a cap that arrives without a total', async () => {
@@ -244,7 +251,7 @@ describe('ChatPanel', () => {
   // The other direction: an uncapped result must forward nothing, or the
   // preview discloses a truncation that did not happen.
   //
-  // feat(#1241 codex r1): the fixture holds one feature per matched row. The
+  // The fixture holds one feature per matched row. The
   // overlay is complete only when it carries every row the answer matched, and
   // the server never emits an empty FeatureCollection (_extract_geojson
   // returns None when no row is mappable), so a features:[] fixture with
@@ -276,7 +283,7 @@ describe('ChatPanel', () => {
     });
   });
 
-  // feat(#1241 codex r1): `truncated` is the SQL sandbox's row cap. When the
+  // `truncated` is the SQL sandbox's row cap. When the
   // model selects geometry itself the sandbox runs at its 1000-row default and
   // the server then slices the OVERLAY to its own 50-row budget, so a 300-row
   // answer arrives as a short FeatureCollection with the flag false. Believing
@@ -416,7 +423,7 @@ describe('ChatPanel', () => {
     expect(props.onClearPreview).not.toHaveBeenCalled();
   });
 
-  // fix(#527 B-054/C-06): NaN and inverted bboxes pass the range comparisons
+  // NaN and inverted bboxes pass the range comparisons
   // and throw in fitBounds downstream — both must be rejected.
   it.each([
     ['NaN bbox', [NaN, 40, -73, 41]],
@@ -487,7 +494,7 @@ describe('ChatPanel', () => {
     await typeAndSend(user, 'filter to parks');
 
     await waitFor(() => {
-      // builder-audit #338 P1-13: AI filters are validated + normalized through the shared
+      // AI filters are validated + normalized through the shared
       // filter contract before apply, so the legacy bare-field form is canonicalized.
       expect(props.onFilterChange).toHaveBeenCalledWith('layer-1', ['==', ['get', 'type'], 'park']);
     });
@@ -530,6 +537,33 @@ describe('ChatPanel', () => {
 
     await waitFor(() => {
       expect(props.onOpacityChange).toHaveBeenCalledWith('layer-1', 0.5);
+    });
+  });
+
+  it('set_opacity on a 3D extrusion also sets the extrusion opacity the layer draws with', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: { actions: [{ type: 'set_opacity', layer_id: 'layer-1', opacity: 0.5 }] },
+      };
+      yield { event: 'done', data: { explanation: 'Set opacity' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      onOpacityChange: vi.fn(),
+      layers: [makeLayer({
+        style_config: { builder: { heightColumn: 'height', extrusionOpacity: 0.92 } } as MapLayerResponse['style_config'],
+      })],
+    });
+    await typeAndSend(user, 'make the buildings 50% transparent');
+
+    await waitFor(() => {
+      expect(props.onStyleConfigChange).toHaveBeenCalledWith(
+        'layer-1',
+        { builder: { heightColumn: 'height', extrusionOpacity: 0.5 } },
+        expect.anything(),
+      );
     });
   });
 
@@ -610,6 +644,27 @@ describe('ChatPanel', () => {
     await typeAndSend(user, 'trigger a model error');
 
     expect(await screen.findByText('Something went wrong. Please try again.')).toBeInTheDocument();
+    expect(mockSendChat).not.toHaveBeenCalled();
+  });
+
+  it('a streamed model_requires_responses_api error explains that the model is unsupported', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'error',
+        data: { message: 'English server text', code: 'model_requires_responses_api' },
+      };
+    });
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'filter the parks');
+
+    expect(
+      await screen.findByText(
+        "This site's AI model needs the OpenAI Responses API. Ask an administrator to turn it on or choose a different model.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('English server text')).not.toBeInTheDocument();
     expect(mockSendChat).not.toHaveBeenCalled();
   });
 
@@ -712,6 +767,37 @@ describe('ChatPanel', () => {
       expect(props.onPaintChange).toHaveBeenCalledWith('layer-1', {
         'fill-opacity': 0.45,
         'fill-outline-color': '#111827',
+        'fill-color': '#ff0000',
+      });
+    });
+  });
+
+  it('drops fill-extrusion paint the 3D layer never reads and keeps the fill colour', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'set_style',
+              layer_id: 'layer-1',
+              paint: { 'fill-extrusion-opacity': 0.5, 'fill-color': '#ff0000' },
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Styled' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      layers: [makeLayer({ paint: { 'fill-opacity': 0.45 } })],
+    });
+    await typeAndSend(user, 'make the buildings red and see-through');
+
+    await waitFor(() => {
+      expect(props.onPaintChange).toHaveBeenCalledWith('layer-1', {
+        'fill-opacity': 0.45,
         'fill-color': '#ff0000',
       });
     });
@@ -901,7 +987,7 @@ describe('ChatPanel', () => {
       layers: [makeLayer({
         dataset_geometry_type: 'Point',
         paint: {},
-        // fix(#392): partial StyleConfig fixture — real runtime shape, cast only.
+        // Partial StyleConfig fixture — real runtime shape, cast only.
         style_config: { render_mode: 'heatmap' } as unknown as StyleConfig,
       })],
     });
@@ -912,7 +998,126 @@ describe('ChatPanel', () => {
     });
   });
 
-  it('fix(#392): set_data_driven_style falls back to the layer render_mode when the action omits it, keeping heatmap-* paint', async () => {
+  it('set_render_as then set_style in one turn tunes the new heatmap', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_render_as', layer_id: 'layer-1', render_as: 'heatmap' },
+            { type: 'set_style', layer_id: 'layer-1', paint: { 'heatmap-radius': 40 } },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Now a heatmap' } };
+    });
+    const layer = makeLayer({ dataset_geometry_type: 'Point', paint: { 'circle-color': '#2255aa' } });
+    let live = layer;
+    const onRenderAsChange = vi.fn((_id: string, renderAs: string) => {
+      const mutation = buildRenderAsPatch(live, renderAs as 'heatmap');
+      if (mutation) live = { ...live, ...mutation.patch } as MapLayerResponse;
+      return Boolean(mutation);
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({ layers: [layer], onRenderAsChange, getLayer: () => live });
+    await typeAndSend(user, 'show it as a heatmap with a bigger radius');
+
+    await waitFor(() => {
+      expect(props.onPaintChange).toHaveBeenCalledWith('layer-1', { ...DEFAULT_HEATMAP_PAINT, 'heatmap-radius': 40 });
+    });
+    expect(onRenderAsChange).toHaveBeenCalledWith('layer-1', 'heatmap', { heightColumn: undefined });
+  });
+
+  it('set_style on a symbol layer changes nothing', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: { actions: [{ type: 'set_style', layer_id: 'layer-1', paint: { 'circle-color': '#dc2626' } }] },
+      };
+      yield { event: 'done', data: { explanation: 'Tried' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      layers: [makeLayer({
+        dataset_geometry_type: 'Point',
+        // Partial StyleConfig fixture — real runtime shape, cast only.
+        style_config: { render_mode: 'symbol' } as unknown as StyleConfig,
+      })],
+    });
+    await typeAndSend(user, 'make the icons red');
+
+    await screen.findByText('Tried');
+    expect(props.onPaintChange).not.toHaveBeenCalled();
+  });
+
+  it('a second set_style in one turn builds on the first', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_style', layer_id: 'layer-1', paint: { 'circle-color': '#dc2626' } },
+            { type: 'set_style', layer_id: 'layer-1', paint: { 'circle-radius': 8 } },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Restyled' } };
+    });
+    let live = makeLayer({ dataset_geometry_type: 'Point', paint: {} });
+    const onPaintChange = vi.fn((_id: string, paint: Record<string, unknown>) => { live = { ...live, paint }; });
+
+    const user = userEvent.setup();
+    renderPanel({ layers: [live], onPaintChange, getLayer: () => live });
+    await typeAndSend(user, 'make it red and bigger');
+
+    await waitFor(() => {
+      expect(onPaintChange).toHaveBeenLastCalledWith('layer-1', { 'circle-color': '#dc2626', 'circle-radius': 8 });
+    });
+  });
+
+  it.each([
+    ['set_render_as', 'Changing render type...'],
+    ['future_tool', 'Server label'],
+  ])('shows the localized progress label for %s', async (tool, expected) => {
+    let release!: () => void;
+    const paused = new Promise<void>((resolve) => { release = resolve; });
+    mockStreamChat.mockImplementation(async function* () {
+      yield { event: 'tool_start', data: { type: 'tool_start', tool, label: 'Server label' } };
+      await paused;
+      yield { event: 'done', data: { explanation: 'Done' } };
+    });
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'switch it');
+
+    expect(await screen.findByText(expected)).toBeInTheDocument();
+    release();
+    await screen.findByText('Done');
+  });
+
+  it('a refused set_render_as is not counted as applied', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: { actions: [{ type: 'set_render_as', layer_id: 'layer-1', render_as: 'heatmap' }] },
+      };
+      yield { event: 'done', data: { explanation: 'Tried' } };
+    });
+    const onRenderAsChange = vi.fn(() => false);
+
+    const user = userEvent.setup();
+    renderPanel({ onRenderAsChange });
+    await typeAndSend(user, 'make the polygons a heatmap');
+
+    await screen.findByText('Tried');
+    expect(onRenderAsChange).toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /undo/i })).not.toBeInTheDocument();
+  });
+
+  it('set_data_driven_style falls back to the layer render_mode when the action omits it, keeping heatmap-* paint', async () => {
     const weightExpr = ['interpolate', ['linear'], ['get', 'magnitude'], 0, 0, 10, 1];
     // Action OMITS render_mode; the layer is already in heatmap mode. Without the
     // layer-render_mode fallback the heatmap-* keys are stripped as invalid-for-circle
@@ -941,14 +1146,14 @@ describe('ChatPanel', () => {
       layers: [makeLayer({
         dataset_geometry_type: 'Point',
         paint: {},
-        // fix(#392): partial StyleConfig fixture — real runtime shape, cast only.
+        // Partial StyleConfig fixture — real runtime shape, cast only.
         style_config: { render_mode: 'heatmap' } as unknown as StyleConfig,
       })],
     });
     await typeAndSend(user, 'restyle the heatmap by magnitude');
 
     await waitFor(() => {
-      // fix(#392): heatmap-* paint survives validation AND the fallback render_mode is
+      // heatmap-* paint survives validation AND the fallback render_mode is
       // carried into the persisted style_config (onStyleConfigChange replaces it), so the
       // layer stays a heatmap on save/reload instead of reverting to a circle.
       expect(props.onStyleConfigChange).toHaveBeenCalledWith(
@@ -959,7 +1164,7 @@ describe('ChatPanel', () => {
     });
   });
 
-  it('fix(#392): non-streaming fallback records only applied actions — a rejected action shows no "Applied"/Undo', async () => {
+  it('non-streaming fallback records only applied actions — a rejected action shows no "Applied"/Undo', async () => {
     // Stream throws generically (no actions applied) -> non-streaming fallback fires.
     // eslint-disable-next-line require-yield
     mockStreamChat.mockImplementation(async function* () {
@@ -1012,7 +1217,7 @@ describe('ChatPanel', () => {
     expect(screen.queryByText('Made it red')).not.toBeInTheDocument();
   });
 
-  it('fix(#392): set_style preserves builder _outline-* keys on a polygon (backend allowlist accepts them)', async () => {
+  it('set_style preserves builder _outline-* keys on a polygon (backend allowlist accepts them)', async () => {
     mockStreamChat.mockImplementation(async function* () {
       yield {
         event: 'actions',
@@ -1185,7 +1390,7 @@ describe('ChatPanel', () => {
     await typeAndSend(user, 'how many parks');
     expect(await screen.findByText('Here are your results')).toBeInTheDocument();
 
-    // STALE-01: the snapshot is reset at the start of every turn, so the query-only
+    // The snapshot is reset at the start of every turn, so the query-only
     // turn (which captures no snapshot) cannot leave a stale Undo button that would
     // revert the earlier, unrelated style edit.
     await waitFor(() => {
@@ -1223,7 +1428,7 @@ describe('ChatPanel', () => {
     await typeAndSend(user, 'filter');
     expect(await screen.findByText('Tried to filter')).toBeInTheDocument();
     expect(props.onFilterChange).not.toHaveBeenCalled();
-    // fix(#392): a rejected filter is intent, not effect — it must not inflate the applied count. (audit CH-07)
+    // A rejected filter is intent, not effect — it must not inflate the applied count.
     expect(screen.queryByText(/applied/i)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /undo/i })).not.toBeInTheDocument();
   });
@@ -1269,7 +1474,7 @@ describe('ChatPanel', () => {
     const props = renderPanel();
     await typeAndSend(user, 'remove the layer');
 
-    // Phase 1135 AI-01: remove_layer is a destructive action — it goes into the staging
+    // remove_layer is a destructive action — it goes into the staging
     // buffer and only dispatches after the user accepts. Accept it first.
     const acceptAll = await screen.findByRole('button', { name: /accept all/i });
     await user.click(acceptAll);
@@ -1310,6 +1515,30 @@ describe('ChatPanel', () => {
 
     // Stream interrupted message should appear
     expect(await screen.findByText(/interrupted/i)).toBeInTheDocument();
+  });
+
+  it.each([
+    { name: 'a 503 error event', event: { message: 'AI unavailable', status: 503 } },
+    { name: 'a model error event', event: { message: 'Tool loop exhausted' } },
+    { name: 'a network failure', event: null },
+  ])('makes no second request after a stream applied actions and then ended with $name', async ({ event }) => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: { actions: [{ type: 'set_style', layer_id: 'layer-1', paint: { 'fill-color': 'red' } }] },
+      };
+      if (!event) throw new TypeError('network error');
+      yield { event: 'error', data: event };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'style it red');
+
+    expect(await screen.findByText(/interrupted/i)).toBeInTheDocument();
+    expect(props.onPaintChange).toHaveBeenCalledTimes(1);
+    expect(mockSendChat).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('shows specific error when stream returns ApiError without fallback', async () => {
@@ -1934,7 +2163,7 @@ describe('ChatPanel — storage-denied contexts (#1536)', () => {
     sessionStorage.clear();
   });
 
-  // fix(#1536): cleanStaleLayerRefs read sessionStorage one line ABOVE the try
+  // cleanStaleLayerRefs read sessionStorage one line ABOVE the try
   // that wrapped the rest of it, and the property access is what raises
   // SecurityError in a sandboxed frame with an opaque origin. acceptAll
   // dispatches the staged batch in a bare for loop with no per-action catch

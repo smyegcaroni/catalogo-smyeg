@@ -1,4 +1,4 @@
-"""ISO-05: DB-privilege + GUC-survival verification (Phase 1208-04).
+"""DB-privilege + GUC-survival verification.
 
 Purpose (spike-grade)
 ---------------------
@@ -35,7 +35,7 @@ This finding is a DEPLOYMENT REQUIREMENT for multi_tenant:
   The production app's PRIMARY DB connection role must be a NON-superuser,
   NON-BYPASSRLS role so that FORCE RLS is effective on that role.  The
   ``geolens`` superuser role is NOT safe as the runtime role in multi_tenant.
-  Per-tenant reader roles narrowed in Phase 1209 extend this boundary further.
+  Per-tenant reader roles narrowed per tenant extend this boundary further.
 
 Pasted evidence (captured 2026-06-14 from test DB)
 ---------------------------------------------------
@@ -97,6 +97,14 @@ _RLS_TABLES = [
     "oauth_accounts",
     "audit_logs",
     "ingest_jobs",
+    "groups",
+    "group_members",
+    "dataset_group_grants",
+    "map_group_grants",
+    "stories",
+    "story_maps",
+    "story_assets",
+    "story_group_grants",
 ]
 
 # Roles under test (geolens_readonly may be absent in the test DB — handled via
@@ -112,7 +120,7 @@ _PROBE_ROLES = ["geolens_reader", "geolens_readonly"]
 async def _get_db_url() -> str:
     from app.core.config import settings
 
-    return settings.database_url
+    return settings.test_database_url
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +280,15 @@ class TestIso05RolePrivileges:
                                 'catalog.embed_tokens'::regclass,
                                 'catalog.oauth_accounts'::regclass,
                                 'catalog.audit_logs'::regclass,
-                                'catalog.ingest_jobs'::regclass
+                                'catalog.ingest_jobs'::regclass,
+                                'catalog.groups'::regclass,
+                                'catalog.group_members'::regclass,
+                                'catalog.dataset_group_grants'::regclass,
+                                'catalog.map_group_grants'::regclass,
+                                'catalog.stories'::regclass,
+                                'catalog.story_maps'::regclass,
+                                'catalog.story_assets'::regclass,
+                                'catalog.story_group_grants'::regclass
                             ])
                             ORDER BY c.relname
                             """

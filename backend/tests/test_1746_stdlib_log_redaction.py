@@ -1,10 +1,10 @@
-"""fix(#1746): stdlib log records must not leak service tokens (findings 1, 13).
+"""Stdlib log records must not leak service tokens.
 
 httpx (and its httpcore transport) logs the full outgoing request URL at INFO
 for every call, e.g. ``HTTP Request: GET <url>?f=json&token=<value> "HTTP/1.1
 200 OK"``. That line reaches every deployment's logs by default, because root
 defaults to INFO (``app.core.config``), and it fires twice per refresh on the
-credential-store path (finding 13). Procrastinate's worker separately logs
+credential-store path. Procrastinate's worker separately logs
 ``task_kwargs`` rendered by ``Job.call_string`` (pinned procrastinate 3.9.0,
 ``procrastinate/jobs.py``): ``", ".join(f"{key}={value!r}" ...)`` — a bare
 keyword-argument rendering, e.g.
@@ -20,10 +20,10 @@ root logger instead and read back what it actually received.
 
 ``tests/_logging_state.configured_logging()`` saves and restores every
 logger ``setup_logging()`` is documented to mutate — root, the three uvicorn
-loggers, and (as of fix #1746 codex r5) ``httpx``/``httpcore`` (see
+loggers, and ``httpx``/``httpcore`` (see
 ``_logging_state.py``'s own docstring). ``.disabled`` is outside that snapshot
-because ``setup_logging()`` never touches it; fix(#1755 item 8) removed the
-only thing that did, so this file no longer restores it either.
+because ``setup_logging()`` never touches it, so this file does not restore
+it either.
 """
 
 import base64
@@ -48,7 +48,7 @@ from app.core.url_redaction import URL_LIKE_RE
 from tests._logging_state import configured_logging
 
 _TOKEN = "SECRETTOKEN123"
-# fix(#1844): the throwaway credential the job-context tests below put on the
+# The throwaway credential the job-context tests below put on the
 # wire. Deliberately unmistakable filler rather than anything that reads like a
 # real credential, while still carrying every SHAPE the scrubber has to
 # recognise: a finished basic header line, the base64 blob inside it, and the
@@ -59,7 +59,7 @@ _BASIC_BLOB = base64.b64encode(f"{_BASIC_USER}:{_BASIC_SECRET}".encode()).decode
 _BASIC_LINE = f"Authorization: Basic {_BASIC_BLOB}"
 _CREDENTIAL_REF = "REF00000000000001"
 _ARCGIS_URL = f"https://services6.arcgis.com/x/FeatureServer/0?f=json&token={_TOKEN}"
-# fix(#1746 codex r11): an apostrophe in the URL PATH (not the token) stops
+# An apostrophe in the URL PATH (not the token) stops
 # URL_LIKE_RE's match before the query ever starts -- see _QUERY_TAIL_RE's
 # comment in logging_config.py.
 _APOSTROPHE_URL = f"https://example.com/it'works/FeatureServer/0?f=json&token={_TOKEN}"
@@ -93,16 +93,15 @@ def _emit_through_real_pipeline(
     exercised exactly as it runs in production rather than by calling the
     processor function directly.
 
-    fix(#1844): `extra` is passed straight through to the stdlib call.
-    Every test written for #1746 emitted a message and nothing else, which is
-    exactly why the P1-2 leak stayed green through that whole review: the
-    processor chain's `structlog.stdlib.ExtraAdder()` lifts a stdlib record's
-    `extra` mapping into the event dict, and no test here ever put anything
-    there. `json_logs` / `log_level` are exposed for the same reason -- the
+    `extra` is passed straight through to the stdlib call: the processor
+    chain's `structlog.stdlib.ExtraAdder()` lifts a stdlib record's `extra`
+    mapping into the event dict, so a test that emits only a message never
+    exercises that path. `json_logs` / `log_level` are exposed for the same
+    reason -- the
     worker's first job line is a DEBUG one, and the structured half of a
     record is far easier to assert on when the renderer emits JSON.
     """
-    with configured_logging(json_logs=json_logs, log_level=log_level, production=True):
+    with configured_logging(json_logs=json_logs, log_level=log_level):
         root = logging.getLogger()
         capture = _ListHandler()
         capture.setFormatter(root.handlers[0].formatter)
@@ -146,15 +145,15 @@ def test_httpx_info_request_line_never_reaches_the_handler():
 def test_httpx_warning_request_line_is_delivered_but_redacted():
     """A WARNING-or-above httpx record still reaches logs, minus the token.
 
-    Silencing httpx to WARNING (finding 1's primary fix) must not become the
+    Silencing httpx to WARNING (the primary fix) must not become the
     only defense — an httpx warning (e.g. a retry log) carries the same URL
     shape, so the event-string scrub is the backstop this test pins.
 
-    fix(#1746 codex r6): the query is now redacted WHOLE (`?<redacted>`)
+    The query is redacted WHOLE (`?<redacted>`)
     whenever it carries any credential, not just the token's value -- see
     `_redact_url_match()` for why a partial parse is not trustworthy enough
-    to leave the rest of the query in place. `"token="` itself no longer
-    survives here; the host and path do.
+    to leave the rest of the query in place. `"token="` itself does not
+    survive here; the host and path do.
     """
     message = f'HTTP Request: GET {_ARCGIS_URL} "HTTP/1.1 200 OK"'
     lines = _emit_through_real_pipeline("httpx", logging.WARNING, message)
@@ -168,13 +167,13 @@ def test_httpx_warning_request_line_is_delivered_but_redacted():
 
 
 def test_httpx_warning_userinfo_credential_is_redacted():
-    """Codex round 5 P1: a userinfo credential the whole-event gate missed.
+    """A userinfo credential the whole-event gate missed.
 
-    `has_url_credentials()` (round 2's gate, since replaced) parses the
+    `has_url_credentials()` (the original gate, since replaced) parses the
     WHOLE event as one URL, and a sentence like `HTTP Request: GET
     https://user:SECRET@host/path "HTTP/1.1 200 OK"` does not parse as a URL
     on its own -- the surrounding prose breaks `urlsplit`, so the gate
-    returned False and the credential went out untouched. Round 5 matches
+    returned False and the credential went out untouched. The fix matches
     `URL_LIKE_RE` first and redacts each matched URL individually, which
     finds the userinfo the whole-event parse missed.
     """
@@ -190,7 +189,7 @@ def test_httpx_warning_userinfo_credential_is_redacted():
 
 
 def test_httpx_warning_query_credential_with_hash_is_fully_redacted():
-    """Codex round 6 P1: an un-escaped `#` in a token value breaks the parse.
+    """An un-escaped `#` in a token value breaks the parse.
 
     The token/source validators only reject whitespace/control characters,
     so a value containing `#` is reachable. `urlsplit` reads `#` as the
@@ -215,7 +214,7 @@ def test_httpx_warning_query_credential_with_hash_is_fully_redacted():
 
 
 def test_httpx_warning_query_credential_with_ampersand_is_fully_redacted():
-    """Codex round 6 P1: an un-escaped `&` in a token value breaks the parse.
+    """An un-escaped `&` in a token value breaks the parse.
 
     `parse_qsl` reads an un-escaped `&` inside a token value as the START of
     a NEW query parameter -- a bare name with no `=`, which matches no
@@ -235,7 +234,7 @@ def test_httpx_warning_query_credential_with_ampersand_is_fully_redacted():
 
 
 def test_httpx_warning_query_without_a_credential_is_left_intact():
-    """The round 6 escalation must not fire for a query with no credential.
+    """The escalation must not fire for a query with no credential.
 
     `where=1%3D1` is a plain (non-credential) query parameter; nothing here
     should trip `query_has_credentials()`, so the query survives whole.
@@ -250,7 +249,7 @@ def test_httpx_warning_query_without_a_credential_is_left_intact():
 
 
 def test_httpx_warning_percent_encoded_reserved_chars_are_fully_redacted():
-    """Codex round 7: the OTHER half of the fix.
+    """The OTHER half of the fix.
 
     Once the ArcGIS adapter percent-encodes a token before concatenating it
     into a URL (`adapters/arcgis.py`, `quote(token, safe="")`), the raw
@@ -309,7 +308,7 @@ def test_procrastinate_worker_task_kwargs_token_is_redacted():
 
 
 def test_procrastinate_worker_token_with_escaped_quotes_is_redacted():
-    """Codex round 3 P1: a token containing both quote styles survives `repr()`.
+    """A token containing both quote styles survives `repr()`.
 
     `repr()` of a string with BOTH a single and a double quote in it picks
     one quote character as the delimiter and ESCAPES that character where it
@@ -346,12 +345,12 @@ def test_procrastinate_worker_token_with_escaped_quotes_is_redacted():
 
 
 def test_event_without_a_credential_url_is_never_mangled():
-    """Codex round 2 P2, mechanism updated in round 5.
+    """A message with no credential URL is left alone.
 
     `redact_url_credentials()`'s `_URLSPLIT_STRIPS` step deletes
     `\t`/`\r`/`\n` unconditionally -- correct for a string already known to
-    be URL-shaped, wrong for an arbitrary log `event`. Round 2 gated the
-    whole-event call on `has_url_credentials()`; round 5 replaced that with
+    be URL-shaped, wrong for an arbitrary log `event`. The old code gated the
+    whole-event call on `has_url_credentials()`; that was replaced with
     matching `URL_LIKE_RE` and redacting each match, which keeps this
     property for a different reason: a message with no URL-shaped substring
     at all has nothing for `URL_LIKE_RE` to match, so it is never handed to
@@ -369,9 +368,9 @@ def test_event_without_a_credential_url_is_never_mangled():
 def test_multiline_event_with_a_credential_url_still_gets_the_token_scrubbed():
     """A credential URL embedded in a multi-line message is still caught.
 
-    Round 2 accepted flattening the WHOLE message here, because the old
+    Accepted flattening the WHOLE message here, because the old
     whole-event gate could only call `redact_url_credentials()` on
-    everything or nothing. Round 5's per-`URL_LIKE_RE`-match redaction
+    everything or nothing. Per-`URL_LIKE_RE`-match redaction
     removes that trade-off entirely: `URL_LIKE_RE`'s character class already
     excludes whitespace, so the matched URL substring can never contain the
     leading `\n`, and text outside the match is never touched at all. Both
@@ -433,7 +432,7 @@ def test_redact_token_value_repr_handles_a_dict_repr_escaped_quote():
     ],
 )
 def test_setup_logging_derives_httpx_floor_from_root(log_level, expected_httpx_level):
-    """Codex round 8 P2: httpx's WARNING floor must track root, not override it.
+    """Httpx's WARNING floor must track root, not override it.
 
     A FIXED WARNING silently reverses itself the moment root is raised past
     it: `LOG_LEVEL=ERROR` at boot (`app.core.config`) previously left httpx
@@ -442,13 +441,13 @@ def test_setup_logging_derives_httpx_floor_from_root(log_level, expected_httpx_l
     point: root stricter than WARNING (ERROR here) raises httpx to match;
     root laxer than WARNING (INFO, DEBUG) leaves httpx pinned at WARNING.
     """
-    with configured_logging(json_logs=False, log_level=log_level, production=True):
-        assert logging.getLogger("httpx").level == expected_httpx_level
-        assert logging.getLogger("httpcore").level == expected_httpx_level
+    with configured_logging(json_logs=False, log_level=log_level):
+        for name in ("httpx", "httpcore", "httpx2", "httpcore2"):
+            assert logging.getLogger(name).level == expected_httpx_level, name
 
 
 def test_redact_token_value_repr_stays_linear_on_unterminated_input():
-    """Codex round 4 P2: the two value-body alternatives must not overlap.
+    """The two value-body alternatives must not overlap.
 
     `(?:\\.|.)*?` let `.` also match a backslash, so an unterminated
     `token='` followed by N backslashes had N different ways to split into
@@ -485,7 +484,7 @@ def _emit_exception_through_real_pipeline(exc: Exception) -> tuple[str, dict]:
     `exception` field, and `json_logs=True` so the captured line is parseable
     JSON rather than an ANSI-colored console line.
     """
-    with configured_logging(json_logs=True, log_level="INFO", production=True):
+    with configured_logging(json_logs=True, log_level="INFO"):
         root = logging.getLogger()
         capture = _ListHandler()
         capture.setFormatter(root.handlers[0].formatter)
@@ -502,7 +501,7 @@ def _emit_exception_through_real_pipeline(exc: Exception) -> tuple[str, dict]:
 
 
 def test_exception_field_url_credential_is_scrubbed():
-    """Codex round 9 P1: `format_exc_info` ran AFTER the redactor.
+    """Codex P1: `format_exc_info` ran AFTER the redactor.
 
     `_redact_sensitive_fields` only ever saw `event`; `format_exc_info` was
     appended to the chain AFTER it (only when `json_logs or production`), so
@@ -547,9 +546,9 @@ def _raise_with_secret_local() -> None:
 
 
 def test_dev_console_exception_is_scrubbed_and_has_no_locals():
-    """Codex round 10 P1: dev console mode leaked a token two different ways.
+    """Dev console mode leaked a token two different ways.
 
-    Round 9 only fixed the JSON/production path: `format_exc_info` stayed
+    An earlier fix covered only the JSON/production path: `format_exc_info` stayed
     conditional on `json_logs or production`, so in pure dev mode `exc_info`
     was still a raw tuple when `_redact_sensitive_fields` ran -- nothing to
     scrub yet -- and only got rendered afterward, by the console renderer,
@@ -561,7 +560,7 @@ def test_dev_console_exception_is_scrubbed_and_has_no_locals():
     `exception` exists, scrubbed, before ANY renderer runs), and dev's
     renderer is `plain_traceback`, which never touches locals at all.
     """
-    with configured_logging(json_logs=False, production=False, log_level="INFO"):
+    with configured_logging(json_logs=False, log_level="INFO"):
         root = logging.getLogger()
         capture = _ListHandler()
         capture.setFormatter(root.handlers[0].formatter)
@@ -584,7 +583,7 @@ def test_dev_console_exception_is_scrubbed_and_has_no_locals():
 
 
 def test_httpx_warning_apostrophe_in_url_path_still_redacts_the_query():
-    """Codex round 11 P1: URL_LIKE_RE's own match can hide the query from it.
+    """URL_LIKE_RE's own match can hide the query from it.
 
     `URL_LIKE_RE`'s character class excludes `'`/`"`/`<`/`>` and whitespace,
     so a base URL with an apostrophe in its PATH -- accepted by validators
@@ -709,15 +708,14 @@ _WORKER_JOB_RECORDS = (
     ids=[record[0] for record in _WORKER_JOB_RECORDS],
 )
 def test_worker_job_context_never_carries_a_credential(action, level, template):
-    """fix(#1844): the structured half of every worker job line.
+    """The structured half of every worker job line.
 
-    #1746 scrubbed the `event` STRING of exactly these three records and
-    stopped there, because `_redact_sensitive_fields` only looked at top-level
-    keys and no test in this file ever passed an `extra=`. The worker's
-    `extra["job"]` is `Job.log_context()`, which carries `task_kwargs`
-    verbatim AND a second rendered copy in `call_string`, so the credential
-    went out twice per line, at INFO, before the task body ran -- early enough
-    that nothing the task does about its own log context can help.
+    Scrubbing the `event` STRING of these three records is not enough: the
+    worker's `extra["job"]` is `Job.log_context()`, which carries
+    `task_kwargs` verbatim AND a second rendered copy in `call_string`, so an
+    unscrubbed credential goes out twice per line, at INFO, before the task
+    body runs -- early enough that nothing the task does about its own log
+    context can help.
     """
     job = _authenticated_service_job()
     extra = _worker_log_extra(job, action)
@@ -828,7 +826,7 @@ def test_nested_url_credential_in_an_extra_is_scrubbed():
     )
 
     assert _TOKEN not in line
-    # fix(#1844 audit round 1): compare the host EXACTLY, and the string as a
+    # Compare the host EXACTLY, and the string as a
     # whole, rather than asserting the hostname is a substring of the scrubbed
     # detail. `"services6.arcgis.com" in <text>` is satisfied by
     # `services6.arcgis.com.evil.test` too, so as an assertion about a URL it
@@ -856,7 +854,7 @@ def test_a_flat_record_is_left_alone_by_the_deep_walk():
         assert data[key] == value
 
 
-# fix(#1857 item 9): exercised through the real pipeline rather than by
+# Exercised through the real pipeline rather than by
 # calling redact_nested, because the processor decides whether to walk at all:
 # a shape can be walkable and still never be handed to the walk.
 
@@ -977,13 +975,13 @@ def test_a_cyclic_extra_terminates():
 
 
 def test_repr_scrub_covers_every_denylisted_name():
-    """fix(#1844 audit round 1): the key pass and the text pass must agree.
+    """The key pass and the text pass must agree.
 
     The first cut of the rendered-value scrub knew `token` and
     `credential_ref` -- 2 of the 14 denylisted names -- so the other 12 were
     redacted as keys and then emitted verbatim in the `call_string` rendering
     beside them. That is the same key-pass/text-pass asymmetry that produced
-    this PR's own finding, one level down. Pinning the two sets equal is what
+    the original leak, one level down. Pinning the two sets equal is what
     keeps adding a name to the denylist from covering only half a record.
     """
     assert set(_REDACTED_REPR_NAMES) == _SENSITIVE_FIELDS
@@ -1057,7 +1055,7 @@ def test_worker_job_context_is_redacted_in_the_console_renderer_too():
 
 
 def test_a_container_that_raises_costs_the_payload_and_not_the_line():
-    """fix(#1844 audit round 1): `extra` is third-party input all the way down.
+    """`extra` is third-party input all the way down.
 
     `redact_nested()` calls `.items()` on objects this module never built. A
     lazy Mapping that raises there would take the exception out through the

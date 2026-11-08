@@ -1,21 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Filesystem scan + format detection — pure local I/O, no HTTP.
 
-Hand-maintained — NOT regenerated. Detection is extension-only per
-CONTEXT.md D-15; the server re-validates content via puremagic on upload,
-so client-side spoofing is not a security concern. This module makes ZERO
-HTTP calls and therefore inherits OCCLI-06 trivially.
+Hand-maintained — NOT regenerated. Detection is extension-only; the server
+re-validates content via puremagic on upload, so client-side spoofing is not
+a security concern. This module makes ZERO HTTP calls.
 
 Allowlist is a subset of backend/app/processing/ingest/validation.py
 (the canonical EXTENSION_CONTENT_MAP). The server-side allowlist also
 includes .csv (with text-content fallback), .xls, .xlsx, and .zip; the
-CLI MVP intentionally excludes those per D-15:
+CLI MVP intentionally excludes those:
 - .csv: brittle without --csv flag (deferred lat/lon column detection)
 - .xls/.xlsx: not geospatial primaries
 - .zip: shapefile bundles handled via sidecar grouping on extracted .shp
-If a future server release adds new vector/raster primaries, mirror them
-here as well. FlatGeobuf, KML, and KMZ were mirrored that way; a zipped
-File Geodatabase was not, because it arrives as .zip.
+FlatGeobuf, KML, KMZ, and GeoParquet are included; a zipped File Geodatabase is not,
+because it arrives as .zip.
 """
 from __future__ import annotations
 
@@ -25,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
 
-VECTOR_EXTS = {".geojson", ".gpkg", ".shp", ".fgb", ".kml", ".kmz"}
+VECTOR_EXTS = {".geojson", ".gpkg", ".shp", ".fgb", ".kml", ".kmz", ".parquet"}
 RASTER_EXTS = {".tif", ".tiff"}
 # Single-file vector primaries that classify on extension alone: no sidecars
 # to group, no content peek to disambiguate. `_classify_group` maps each to
@@ -34,6 +32,7 @@ SINGLE_FILE_VECTOR_FORMATS = {
     ".fgb": "flatgeobuf",
     ".kml": "kml",
     ".kmz": "kmz",
+    ".parquet": "geoparquet",
 }
 # Extensions that start a dataset of their own, so they are never absorbed as
 # a sidecar of a same-named shapefile.
@@ -161,7 +160,7 @@ def _classify_group(
     exts: dict[str, Path],
     include_exts: Optional[set[str]],
 ) -> Iterator[ScanItem]:
-    # Shapefile grouping (D-18): one row for .shp, sidecars listed. Only real
+    # Shapefile grouping: one row for .shp, sidecars listed. Only real
     # sidecar extensions are absorbed; a same-named GeoJSON or GeoPackage is a
     # separate dataset and falls through to the loop below.
     shapefile_emitted = ".shp" in exts and (

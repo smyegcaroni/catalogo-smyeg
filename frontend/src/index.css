@@ -22,10 +22,9 @@
  * --text-2xl: 1.5rem   (24px)
  */
 
-:root {
-  /* Redesign: 10px → 8px base radius. Cards land at 8px, buttons/inputs at
-     6px — crisper, closer to the instrument-panel look the dataset stats
-     grid established, without going full square. */
+:root,
+.light {
+  /* Base radius: cards at 8px, buttons/inputs at 6px. */
   --radius: 0.5rem;
 
   /* ─ Primary scale (blue, hue ~250) ─ */
@@ -57,26 +56,21 @@
   --muted-foreground: oklch(0.45 0.005 250);
   --accent: oklch(0.97 0.003 85);
   --accent-foreground: oklch(0.205 0.005 250);
-  /* fix(#441): darkened from 0.577 like the semantic status colors below —
-   * DS-01's soft badge recipe puts text-destructive on a bg-destructive/10
-   * tint, which measured 3.89:1 at the stock value. Now 4.95:1 on the /10
-   * tint and 5.96:1 for white-on-solid (buttons). */
+  /* Darkened from 0.577: text-destructive on a bg-destructive/10 tint measured
+   * 3.89:1 at the stock value. Now 4.95:1 on the /10 tint and 5.96:1 for
+   * white-on-solid (buttons). */
   --destructive: oklch(0.50 0.245 27.325);
   --destructive-foreground: oklch(0.985 0 0);
-  /* fix(#438): A11Y-02 — measured contrast (OKLCH→sRGB→WCAG):
+  /* Measured contrast (OKLCH→sRGB→WCAG):
      --border 0.88 sits at ~1.4:1 against card/background. Decorative dividers
-     and card edges are not WCAG-1.4.11 "components", so this subtle hairline is
+     and card edges are not WCAG 1.4.11 "components", so this subtle hairline is
      kept intentionally for the instrument-panel look; darkening every card edge
-     to 3:1 is a design decision, not swept here. */
+     to 3:1 is a design decision. */
   --border: oklch(0.88 0.005 85);
   /* --input IS a 1.4.11 component (form-control boundary), so it is brought to
      ≥3:1: L 0.65 measures ~3.1:1 vs card and background. */
   --input: oklch(0.65 0.006 85);
-  /* Focus-ring color. fix(#438): DS-10 — the standard focus treatment is
-     `ring-2 ring-ring`. `ring-primary` was folded into `ring-ring` (same hue).
-     The residual `ring-1` width one-offs are a visible-weight change left for
-     a dedicated design pass, not swept here. (shadow-xs has since been mapped
-     through --elevation-xs; shadow-xl remains unmapped and unused.) */
+  /* Focus-ring color; the standard treatment is `ring-2 ring-ring`. */
   --ring: oklch(0.55 0.18 250);
 
   /* ─ Surface hierarchy (light mode — warm) ─ */
@@ -87,7 +81,7 @@
 
 
   /* ─ Map-native surface tones ─
-     fix(#438): DS-07 — intentionally scoped to the LoginPage brand panel's
+     Intentionally scoped to the LoginPage brand panel's
      wireframe-globe illustration, not general surfaces. Kept as their own
      tokens (rather than folded into --surface-*) so the illustration can be
      retuned without shifting app chrome. */
@@ -96,13 +90,11 @@
   --map-water:  oklch(0.85 0.02 220);
 
   /* ─ Globe space ─
-     feat(#1479): the void behind the sphere on globe-projection maps. Has no
-     dark-mode counterpart on purpose — space is the same dark in both themes,
-     and a light value is exactly what makes the globe read as a sticker on
-     white. Sits a little below the dark theme's --background (0.145) so the
-     void reads as deeper than the chrome around it instead of continuous with
-     it, and carries enough chroma to stay a night sky rather than a black
-     rectangle. */
+     The void behind the sphere on globe-projection maps. No dark-mode
+     counterpart on purpose: space is the same dark in both themes, and a light
+     value makes the globe read as a sticker on white. Below the dark theme's
+     --background (0.145) so the void reads deeper than the chrome, with enough
+     chroma to stay a night sky rather than a black rectangle. */
   --map-space: oklch(0.13 0.03 265);
 
   /* ─ Shadow tokens (light mode) ─ */
@@ -112,17 +104,14 @@
   --elevation-lg: 0 10px 15px -3px oklch(0 0 0 / 8%), 0 4px 6px -4px oklch(0 0 0 / 5%);
 
   /* ─ Semantic status colors ─
-   * #305: light fg darkened so text-warning/info/success clear WCAG AA
-   * (>=4.5:1) on card AND soft 10-percent-tint surfaces. Measured ratios:
-   * warning 6.01 and 5.05, info 5.41 and 4.54, success 5.5 and 4.64 (was
-   * 2.19, 4.07, 4.07).
+   * Light fg darkened so text-warning/info/success clear WCAG AA (>=4.5:1) on
+   * card AND soft 10-percent-tint surfaces. Measured ratios: warning 6.01 and
+   * 5.05, info 5.41 and 4.54, success 5.5 and 4.64.
    * --warning-foreground is DARK in BOTH themes and is reserved for text on a
-   * solid bg-warning fill. Never use it as standalone text on card or tint
-   * surfaces — in dark mode it composites to ~1:1 (illegible); use
-   * text-warning there instead. A source-scan test
-   * (warning-foreground-usage.test.ts) enforces this. No component renders a
-   * solid warning fill today; retune the light value (~2.4:1 on solid
-   * warning) before introducing one. */
+   * solid bg-warning fill; as standalone text in dark mode it composites to
+   * ~1:1 (warning-foreground-usage.test.ts enforces this). No component
+   * renders a solid warning fill today; retune the light value (~2.4:1 on
+   * solid warning) before introducing one. */
   --success: oklch(0.49 0.16 150);
   --success-foreground: oklch(0.985 0 0);
   --warning: oklch(0.50 0.13 68);
@@ -144,13 +133,12 @@
   --type-pointcloud: oklch(0.47 0.10 110);
   --type-pointcloud-bg: oklch(0.94 0.04 110);
 
-  /* fix(#438): synthetic-data badge, was a raw violet-* Tailwind palette (DS-01).
-     Distinct from --type-vrt: that hue marks a record type, this marks provenance. */
+  /* Synthetic-data badge. Distinct from --type-vrt: that hue marks a record
+     type, this marks provenance. */
   --synthetic: oklch(0.47 0.17 285);
   --synthetic-bg: oklch(0.94 0.04 285);
 
-  /* fix(#438): DS-05 — folder-group type icon, was an inline OKLCH amber with no
-     dark variant (the app's only theme-breaking inline color). */
+  /* Folder-group type icon. */
   --type-folder: oklch(0.45 0.10 80);
   --type-folder-bg: oklch(0.93 0.03 80);
 
@@ -164,19 +152,19 @@
   --code-function: oklch(0.78 0.13 220);
   --code-string: oklch(0.78 0.13 140);
   --code-number: oklch(0.8 0.14 70);
-  /* fix(#438): A11Y-11 — was 0.5 (~3.3:1 on --code-bg, below AA); 0.6 clears 4.5:1. */
+  /* L 0.5 measured ~3.3:1 on --code-bg, below AA; 0.6 clears 4.5:1. */
   --code-comment: oklch(0.6 0.008 250);
   --code-method-badge: oklch(0.75 0.14 155);
   --code-method-badge-bg: oklch(0.75 0.14 155 / 15%);
 
   /* ─ Data visualization categorical palette ─ */
   --viz-1: oklch(0.55 0.18 250);   /* blue */
-  --viz-2: oklch(0.70 0.17 55);    /* orange */
+  --viz-2: oklch(0.66 0.17 55);    /* orange */
   --viz-3: oklch(0.62 0.17 145);   /* green */
   --viz-4: oklch(0.55 0.18 310);   /* purple */
-  --viz-5: oklch(0.65 0.13 195);   /* teal */
+  --viz-5: oklch(0.63 0.13 195);   /* teal */
   --viz-6: oklch(0.65 0.20 5);     /* pink */
-  --viz-7: oklch(0.75 0.16 80);    /* amber */
+  --viz-7: oklch(0.65 0.16 80);    /* amber */
   --viz-8: oklch(0.50 0.18 280);   /* indigo */
 
   /* ─ Sidebar ─ */
@@ -189,7 +177,7 @@
   --sidebar-border: oklch(0.92 0.005 85);
   --sidebar-ring: oklch(0.55 0.18 250);
 
-  /* Phase 1042 AUD-08: motion timing tokens */
+  /* Motion timing tokens */
   --motion-fast: 150ms;
   --motion-base: 250ms;
 }
@@ -227,7 +215,7 @@
   --destructive: oklch(0.704 0.191 22.216);
   --destructive-foreground: oklch(0.25 0.05 22);
   --border: oklch(1 0 0 / 10%);
-  /* fix(#438): A11Y-02 — 15% white measured ~1.5:1; 38% reaches ~3.3:1 vs the
+  /* 15% white measured ~1.5:1; 38% reaches ~3.3:1 vs the
      dark card/surface-2, meeting WCAG 1.4.11 for form controls. */
   --input: oklch(1 0 0 / 38%);
   --ring: oklch(0.72 0.17 250);
@@ -409,8 +397,7 @@
   /* Typography: micro text (badges, readouts, chips) */
   --text-2xs: 0.625rem; /* 10px */
   --text-2xs--line-height: 0.875rem;
-  /* fix(#438): DS-02 — 11px was the single most-used arbitrary size (text-[11px]
-     ×97) and had no token. `text-mini` sits between 2xs (10px) and xs (12px). */
+  /* `text-mini` sits between 2xs (10px) and xs (12px). */
   --text-mini: 0.6875rem; /* 11px */
   --text-mini--line-height: 1rem;
 
@@ -454,11 +441,9 @@
   100% { background-position: 200% 0; }
 }
 
-/* ── Instrument Utilities ──────────────────────────────
-   The app-wide "survey instrument" label system. `.eyebrow` is the canonical
-   mono-caps section marker (same treatment as SECTION_EYEBROW on the dataset
-   page — kept in sync so the two tiers stay one system). `.readout` is for
-   measured values: counts, EPSG codes, coordinates, timestamps. */
+/* `.eyebrow` is the mono-caps section marker (same treatment as SECTION_EYEBROW
+   on the dataset page). `.readout` is for measured values: counts, EPSG codes,
+   coordinates, timestamps. */
 .eyebrow {
   font-family: var(--font-mono);
   font-size: 11px;
@@ -474,9 +459,8 @@
   letter-spacing: 0.02em;
 }
 
-/* Neatline tick rule — a map sheet's neatline: 1px baseline with survey
-   ticks rising from it every 16px. Used under page headers and panel
-   headers as the redesign's measuring-tape divider. Theme-aware via --border. */
+/* Neatline tick rule: 1px baseline with survey ticks every 16px, used under
+   page and panel headers. Theme-aware via --border. */
 .tick-rule {
   height: 5px;
   background-image:
@@ -507,11 +491,9 @@
   background-size: 16px 16px;
 }
 
-/* ── #305 standalone-page surface gradient ──────────────────
-   Subtle branded depth for full-page surfaces (login, public viewers). The
-   prior inline gradients wrapped OKLCH tokens in hsl() — invalid CSS that
-   computed to `none` (flat/sparse first impression). color-mix(in oklab, …)
-   resolves correctly in both light and dark. */
+/* Subtle branded depth for full-page surfaces (login, public viewers).
+   OKLCH tokens can't be wrapped in hsl(); color-mix(in oklab, …) works in
+   light and dark. */
 .app-surface-gradient {
   background-image:
     radial-gradient(circle at top, color-mix(in oklab, var(--primary) 10%, transparent), transparent 42%),
@@ -591,63 +573,48 @@ html [data-sonner-toaster][data-sonner-theme] {
   line-height: 14px;
 }
 
-/* ── BuilderMap NavigationControl offset (RESP-02-FOLLOWUP, Phase 1051) ───
- * In `BuilderMap.tsx` the NavigationControl is anchored `top-left` (post-W8
- * RESP-01 fix in commit 391459bb) and the `MapCoordReadout` pill sits at
- * `top-2 right-14` with showScale on. At the 800px viewport boundary the
- * map column compresses to ~316px wide and the pill's ~237px width stretches
- * leftward enough to invade the zoom-control's top-left zone, producing a
- * ~20×16 px overlap (MCP-measured 2026-05-18).
+/* BuilderMap NavigationControl offset. The NavigationControl is `top-left`
+ * and the `MapCoordReadout` pill sits at `top-2 right-14`; at an 800px
+ * viewport the map column is ~316px wide and the ~237px pill reaches the
+ * zoom control, overlapping ~20×16 px. A 32px top margin (default 10px) clears
+ * the pill's ~26px bottom edge at every supported width (6px gap at 800px).
  *
- * MapLibre's default `.maplibregl-ctrl-top-left` margin is 10px, putting the
- * control's top edge at ~10px from the container top — directly under the
- * pill's ~26px bottom edge once the pill widens horizontally past the
- * NavigationControl's left margin. Pushing the control's top margin to 32px
- * clears the pill at every supported width including 800px (6px gap).
- *
- * Scoped via the `data-builder-canvas="true"` marker on `BuilderMap`'s outer
- * wrapper so `ViewerMap` (NavigationControl `top-right`, no scale-segment) is
- * unaffected — the load-bearing `right-14` offset on `MapCoordReadout` keeps
- * its viewer-context collision contract intact.
+ * Scoped via `data-builder-canvas="true"` on `BuilderMap`'s outer wrapper so
+ * `ViewerMap` (NavigationControl `top-right`) is unaffected.
  */
 [data-builder-canvas="true"] .maplibregl-ctrl-top-left {
   margin-top: 32px;
 }
 
-/* ── BuilderMap coordinate-pill vs. MapToolbar offset ──────────────────────
- * The builder renders a centered MapToolbar (pan/measure/legend/JSON/keyboard)
- * at `top-3` (12px) + ~32px tall ≈ 44px bottom edge. The `MapCoordReadout`
- * pill sits at `top-2 right-14`; when the map column narrows (editor flyout
- * open), the right-anchored pill stretches leftward into the centered toolbar
- * band and — being z-10 over the toolbar's z-[5] — paints on top of it.
- * Drop the pill to `top-12` (48px) in the builder so it clears the toolbar,
- * matching the PluginHost top-band convention. Scoped via `data-builder-canvas`
- * so ViewerMap (no MapToolbar) keeps its `top-2` contract.
+/* BuilderMap coordinate pill vs. MapToolbar. The centered MapToolbar sits at
+ * `top-3` (12px) + ~32px tall ≈ 44px bottom edge. When the editor flyout
+ * narrows the map column, the right-anchored pill (`top-2 right-14`, z-10)
+ * stretches into the toolbar band and paints over it (z-[5]). Dropping it to
+ * `top-12` (48px) clears the toolbar, matching the PluginHost top-band
+ * convention. Scoped via `data-builder-canvas`; ViewerMap keeps `top-2`.
  */
 [data-builder-canvas="true"] [data-coord-readout="true"] {
-  top: 3rem; /* 48px — below the centered MapToolbar band */
+  top: 3rem;
 }
 
-/* ── Globe projection: the space behind the sphere ─────────────────────────
- * feat(#1479): nothing inside a MapLibre style can paint the void a globe
- * leaves around itself. The atmosphere pass added in #1473/#1474 returns
- * alpha 0 for rays that miss the planet, the canvas clears transparent, and
- * the style's `background` layer is drawn per tile so it stays clipped to the
- * sphere. What shows through is whatever is behind the canvas — the page — so
- * the treatment has to live on the map container.
+/* Globe projection: the space behind the sphere. Nothing inside a MapLibre
+ * style can paint the void around a globe: the atmosphere pass returns alpha 0
+ * for rays that miss the planet, the canvas clears transparent, and the
+ * style's `background` layer is clipped to the sphere. What shows through is
+ * the page, so the treatment lives on the map container.
  *
- * The marker is set by `applyMapBasemapAppearance` in `map-composition-sync`
- * whenever basemap_config.projection is `globe` and removed on mercator, so
- * the builder and the viewer both inherit it from the one place that already
- * owns projection state. Scoped to `.maplibregl-map` so the attribute can only
- * ever paint a map container.
+ * `applyMapBasemapAppearance` in `map-composition-sync` sets the marker when
+ * basemap_config.projection is `globe` and removes it on mercator.
  */
 .maplibregl-map[data-globe-space="true"] {
   background-color: var(--map-space);
 }
 
 /* ── MapLibre Popup Styling ─────────────────────────── */
-.maplibregl-popup-content {
+/* Scoped under .maplibregl-map so these rules outrank maplibre-gl.css, whose
+   lazily loaded chunk is injected after index.css and would otherwise win with
+   `background: #fff` (light popover text on a white card in dark mode). */
+.maplibregl-map .maplibregl-popup-content {
   background: var(--popover);
   color: var(--popover-foreground);
   box-shadow: var(--elevation-lg);
@@ -655,31 +622,31 @@ html [data-sonner-toaster][data-sonner-theme] {
 }
 
 /* Popup tip (arrow) — all four anchor directions */
-.maplibregl-popup-anchor-bottom .maplibregl-popup-tip {
+.maplibregl-map .maplibregl-popup-anchor-bottom .maplibregl-popup-tip {
   border-top-color: var(--popover);
 }
-.maplibregl-popup-anchor-top .maplibregl-popup-tip {
+.maplibregl-map .maplibregl-popup-anchor-top .maplibregl-popup-tip {
   border-bottom-color: var(--popover);
 }
-.maplibregl-popup-anchor-left .maplibregl-popup-tip {
+.maplibregl-map .maplibregl-popup-anchor-left .maplibregl-popup-tip {
   border-right-color: var(--popover);
 }
-.maplibregl-popup-anchor-right .maplibregl-popup-tip {
+.maplibregl-map .maplibregl-popup-anchor-right .maplibregl-popup-tip {
   border-left-color: var(--popover);
 }
-.maplibregl-popup-anchor-bottom-left .maplibregl-popup-tip,
-.maplibregl-popup-anchor-bottom-right .maplibregl-popup-tip {
+.maplibregl-map .maplibregl-popup-anchor-bottom-left .maplibregl-popup-tip,
+.maplibregl-map .maplibregl-popup-anchor-bottom-right .maplibregl-popup-tip {
   border-top-color: var(--popover);
 }
-.maplibregl-popup-anchor-top-left .maplibregl-popup-tip,
-.maplibregl-popup-anchor-top-right .maplibregl-popup-tip {
+.maplibregl-map .maplibregl-popup-anchor-top-left .maplibregl-popup-tip,
+.maplibregl-map .maplibregl-popup-anchor-top-right .maplibregl-popup-tip {
   border-bottom-color: var(--popover);
 }
 
 /* Popup close button — 32×32 visible (border-box, so the padding is inside
    that box); coarse pointers get a ≥44px hit target via the pointer-coarse
    rule further down. */
-.maplibregl-popup-close-button {
+.maplibregl-map .maplibregl-popup-close-button {
   color: var(--popover-foreground);
   font-size: 18px;
   width: 32px;
@@ -692,7 +659,7 @@ html [data-sonner-toaster][data-sonner-theme] {
   inset-inline-end: 2px;
   top: 2px;
 }
-.maplibregl-popup-close-button:hover {
+.maplibregl-map .maplibregl-popup-close-button:hover {
   background-color: var(--muted);
 }
 
@@ -711,61 +678,57 @@ html [data-sonner-toaster][data-sonner-theme] {
   }
 }
 
-/* ── Phase 1038 BSR-24 drag polish ───────────────────────────────────────── */
+/* ── drag polish ───────────────────────────────────────── */
 
-/* Phase 1038 BSR-24: DnD insertion line — 2px primary line at drop target */
-/* Phase 1042: bloom shadow + full radius (1040 carry-over) */
+/* DnD insertion line: 2px primary line with bloom shadow at the drop target */
 [data-dnd-over="true"] {
   border-top: 2px solid var(--primary);
   border-radius: 9999px;
   box-shadow: 0 0 0 2px oklch(0.55 0.18 250 / 25%);
 }
 
-/* Phase 1038 BSR-24: hide kebabs on non-dragging rows during drag */
+/* Hide kebabs on non-dragging rows during drag */
 .dragging-active [data-testid^="stack-row-"] [data-kebab-trigger] {
   opacity: 0 !important;
 }
 
-/* ── Phase 1040 cross-panel drag polish ──────────────────────────── */
+/* ── cross-panel drag polish ──────────────────────────── */
 
-/* Phase 1040 AUD-03: hide any .kebab element during catalog→stack drag */
+/* Hide any .kebab element during catalog→stack drag */
 .dragging-active .kebab {
   opacity: 0 !important;
 }
 
-/* Phase 1040: cursor-grabbing on html during any drag to prevent flicker */
+/* Cursor-grabbing on html during any drag to prevent flicker */
 html.dragging-active {
   cursor: grabbing !important;
 }
 
-/* Phase 1040: basemap group drop target — primary-50 tint + left rail */
+/* Basemap group drop target — primary-50 tint + left rail */
 [data-basemap-drop-target="true"] {
   background: var(--primary-50, oklch(0.97 0.02 250));
   box-shadow: inset 2px 0 0 var(--primary);
 }
 
-/* Phase 1040 POL-03: folder-group drop target — primary-50 tint + left rail */
+/* Folder-group drop target — primary-50 tint + left rail */
 [data-group-drop-target="true"] {
   background: var(--primary-50, oklch(0.97 0.02 250));
   box-shadow: inset 2px 0 0 var(--primary);
 }
 
-/* ── Phase 1199 STACK-05 coarse-pointer reveal ───────────────────────────── */
+/* ── coarse-pointer reveal ───────────────────────────── */
 
-/* On touch / hover:none devices the per-row kebabs and catalog drag grips have no
-   hover state to reveal them, so they stay at their opacity-0 rest state and become
-   unreachable. Force any control tagged data-touch-reveal to full opacity, scoped to
-   coarse pointers so fine-pointer desktop hover-reveal density is unchanged. */
+/* On touch / hover:none devices the per-row kebabs and catalog drag grips have
+   no hover state to reveal them. Force data-touch-reveal controls to full
+   opacity; scoped to coarse pointers so desktop hover-reveal is unchanged. */
 @media (hover: none), (pointer: coarse) {
   [data-touch-reveal] {
     opacity: 1 !important;
   }
 }
 
-/* ── #305 coarse-pointer tap targets ───────────────────────────
-   On touch devices ensure map controls and form fields reach a ~44px hit
-   target. Scoped to pointer:coarse so fine-pointer desktop density is
-   unchanged (mirrors the existing maplibre popup-close 44px treatment). */
+/* Coarse-pointer tap targets: map controls and form fields reach a ~44px hit
+   target; fine-pointer desktop density is unchanged. */
 @media (pointer: coarse) {
   .maplibregl-ctrl-group button,
   .maplibregl-popup-close-button {
@@ -780,34 +743,25 @@ html.dragging-active {
   }
 }
 
-/* Phase 1042: folder group-children wash when parent is drop target (1040 carry-over) */
-/* Use :has() to select the children container when a sibling carries data-group-drop-target.
-   The keyed outer wrapper div contains both FolderGroupRowWrapper (which bears the attribute)
-   and the folder-group-children div. :has() lets us style children from the common ancestor
-   without needing the attribute on the outer wrapper itself. */
+/* Folder group-children wash when parent is drop target */
+/* :has() styles the children container from the common ancestor of the
+   attribute-bearing FolderGroupRowWrapper and the folder-group-children div. */
 div:has(> [data-group-drop-target="true"]) > [id^="folder-group-children"] {
   background: oklch(0.97 0.02 250 / 60%);
   border-radius: var(--radius-md);
 }
 
-/* ── #305 notch / home-indicator safe-area padding ───────────
-   With viewport-fit=cover the page draws under the iOS notch and home
-   indicator, so full-bleed mobile chrome gets clipped. Pad those surfaces by
-   the relevant env(safe-area-inset-*) so controls clear the unsafe zone.
-   Gated on @supports so non-notch / desktop browsers are unaffected (env()
-   resolves to 0 there anyway, but the guard keeps the rules from applying at
-   all where they're not needed). */
+/* With viewport-fit=cover the page draws under the iOS notch and home
+   indicator; pad full-bleed mobile chrome by env(safe-area-inset-*). */
 @supports (padding: env(safe-area-inset-bottom)) {
   /* Bottom maplibre controls (attribution + zoom/scale) clear the home indicator. */
   .maplibregl-ctrl-bottom-right,
   .maplibregl-ctrl-bottom-left {
     padding-bottom: env(safe-area-inset-bottom);
   }
-  /* Mobile Sheet (shadcn) clears the notch on landscape — both edges, since a
-     right-anchored drawer (report wizard, builder/editor) hits the right notch
-     and a left-anchored one hits the left. env()-left/right are each non-zero
-     only on the side that actually has an unsafe area, so padding both sides is
-     side-correct. Content also clears the home indicator at the bottom. */
+  /* Mobile Sheet clears the notch on landscape on both edges, since drawers
+     anchor to either side; env() is non-zero only where there is an unsafe
+     area. Content also clears the home indicator. */
   [data-slot="sheet-content"] {
     padding-left: max(
       var(--sheet-padding-left, 0px),
@@ -822,6 +776,26 @@ div:has(> [data-group-drop-target="true"]) > [id^="folder-group-children"] {
       env(safe-area-inset-bottom)
     );
   }
+}
+
+/* macOS hides overlay scrollbars until hover; the floating chapter panel keeps one visible.
+   Chrome drops the ::-webkit-scrollbar styles once scrollbar-width is set, so the standard
+   properties serve only browsers without that pseudo-element. */
+@supports not selector(::-webkit-scrollbar) {
+  .story-floating-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--muted-foreground) transparent;
+  }
+}
+.story-floating-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+.story-floating-scroll::-webkit-scrollbar-thumb {
+  border-radius: 9999px;
+  background: var(--muted-foreground);
+}
+.story-floating-scroll::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 @media (hover: hover) {

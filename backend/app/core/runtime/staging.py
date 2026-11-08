@@ -16,13 +16,13 @@ import structlog
 log = structlog.get_logger()
 
 
-# ING-04 (P2-04): exports temp-dir sweep age threshold. Entries older than this
+# Exports temp-dir sweep age threshold. Entries older than this
 # are deleted on startup; matches worker stale-job recovery's
-# `JOB_TIMEOUT_SECONDS` (jobs/router.py) so an export surviving a rolling
+# `JOB_TIMEOUT_SECONDS` (platform/jobs/sweep.py) so an export surviving a rolling
 # restart at the job layer also keeps its on-disk staging artifact.
 EXPORTS_SWEEP_AGE_SECONDS = 3600  # 1 hour
 
-# fix(#1435): the periodic sweeper (inside _stale_jobs_sweeper)
+# The periodic sweeper (inside _stale_jobs_sweeper)
 # runs every few minutes, unlike the two boot-time callers. A directory's
 # mtime is set once at creation and not bumped by writes to files already
 # inside it, so reusing EXPORTS_SWEEP_AGE_SECONDS here would guarantee
@@ -32,14 +32,13 @@ EXPORTS_SWEEP_AGE_SECONDS = 3600  # 1 hour
 EXPORTS_PERIODIC_SWEEP_AGE_SECONDS = 4 * EXPORTS_SWEEP_AGE_SECONDS  # 4 hours
 
 
-# fix(#1532): `LocalStorageProvider.put`'s write-through scratch
-# pattern (`<name>.<32 hex>.tmp`). A SIGKILL/OOM/power loss skips the normal
-# cleanup and leaves residue under any prefix (COGs, originals, VRTs, map
-# assets); only the export cache used to know this pattern and only scanned
-# its own prefix, so everything else leaked.
+# `LocalStorageProvider.put`'s write-through scratch pattern
+# (`<name>.<32 hex>.tmp`). A SIGKILL/OOM/power loss skips the normal cleanup
+# and leaves residue under any prefix (COGs, originals, VRTs, map assets), not
+# only the export cache's.
 _LOCAL_TMP_RE = re.compile(r"\.[0-9a-f]{32}\.tmp$")
 
-# fix(#1746): the local extract of a protected OGC API
+# The local extract of a protected OGC API
 # collection. `materialise_oapif_items` removes it in `finally`/on exception,
 # but a SIGKILL/OOM skips both and leaks up to `MAX_BYTES` (2 GiB). Carries no
 # credential itself, but is data read with one.
@@ -54,8 +53,7 @@ _OAPIF_ITEMS_RE = re.compile(
 )
 
 # Every scratch name this codebase creates under the staging root. A new one
-# belongs HERE, in the same commit that starts writing it (the leak class r28
-# closed).
+# belongs HERE, in the same commit that starts writing it.
 #
 # NOT included: `gdal_auth_*.hdr` — lives on the container tmpfs under
 # `GDAL_HEADER_DIR`, never the staging root; `sweep_stale_gdal_header_files`
@@ -96,7 +94,7 @@ def sweep_orphaned_write_scratch(
     return removed
 
 
-# fix(#1532): when this process last walked the tree. Module-level
+# When this process last walked the tree. Module-level
 # and per-process, like `artifact_cache._last_sweep_at`; each replica bounds
 # only its own work.
 _last_scratch_sweep_at = 0.0
@@ -109,11 +107,11 @@ def sweep_orphaned_write_scratch_occasionally(
 ) -> int:
     """``sweep_orphaned_write_scratch``, at most once per horizon per process.
 
-    fix(#1532): unguarded, this rode the credential sweeper's 300s
-    cadence, so every replica did a full O(everything stored) recursive walk
-    every five minutes to find nothing eligible before the four-hour horizon.
-    The interval IS the horizon (from the same argument, so they can't drift
-    apart); worst-case retention is two horizons instead of one.
+    Guarded so replicas don't each do a full O(everything stored) recursive
+    walk on the credential sweeper's 300s cadence to find nothing eligible
+    before the four-hour horizon. The interval IS the horizon (from the same
+    argument, so they can't drift apart); worst-case retention is two horizons
+    instead of one.
     """
     global _last_scratch_sweep_at
     now = time.time()
@@ -129,7 +127,7 @@ def _latest_mtime(entry: Path) -> float:
     """The most recent mtime of ``entry`` itself, or (one level deep) any
     file directly inside it.
 
-    fix(#1435): a directory's own mtime is bumped only by
+    A directory's own mtime is bumped only by
     add/remove/rename of an entry, not by writes to an already-created file's
     contents, so an export dir's mtime freezes at creation while ogr2ogr keeps
     writing to its output file. Checking the contained file(s) too keeps a
@@ -140,7 +138,7 @@ def _latest_mtime(entry: Path) -> float:
         try:
             children = list(entry.iterdir())
         except OSError:
-            # fix(#1435): a directory that can't be listed (e.g.
+            # A directory that can't be listed (e.g.
             # root-owned residue from a UID change) must not crash
             # sweep_orphaned_exports — both boot-time callers run this
             # unguarded. Fall back to the entry's own mtime.
@@ -163,10 +161,9 @@ def sweep_orphaned_exports(
     Entries newer than the threshold are skipped (and logged) so an in-flight
     export survives a restart; older ones are removed.
 
-    fix(#435): the API lifespan used to delete every entry unconditionally,
-    which could truncate an export owned by a surviving sibling Uvicorn worker
-    sharing the staging volume. Both API and worker now call this age-aware
-    sweeper instead.
+    Deleting every entry unconditionally could truncate an export owned by a
+    surviving sibling Uvicorn worker sharing the staging volume, so both API
+    and worker call this age-aware sweeper.
 
     No cross-process lock: the age threshold, not mutual exclusion, is what
     protects in-flight exports, and the sweep tolerates losing a race.
@@ -193,7 +190,7 @@ def sweep_orphaned_exports(
         try:
             item_mtime = _latest_mtime(item)
         except OSError:
-            # fix(#1435): FileNotFoundError (raced cleanup) or
+            # FileNotFoundError (raced cleanup) or
             # PermissionError (unreadable residue) — skip rather than crash
             # the sweep and take down API/worker startup.
             continue
@@ -222,7 +219,7 @@ def sweep_orphaned_exports(
     return (deleted_count, skipped_count)
 
 
-# fix(#1746): the GDAL bearer-header tempfile ogr.py/preview.py write for a
+# The GDAL bearer-header tempfile ogr.py/preview.py write for a
 # WFS/OGC API preview/ingest (GDAL_HTTP_HEADER_FILE, 0600) is unlinked in
 # `finally`, but a SIGKILL/OOM on the subprocess skips that, leaking the
 # token-bearing file. Matched by exact prefix/suffix, mirroring
@@ -230,7 +227,7 @@ def sweep_orphaned_exports(
 _GDAL_AUTH_HEADER_PREFIX = "gdal_auth_"
 _GDAL_AUTH_HEADER_SUFFIX = ".hdr"
 
-# fix(#1746): the container tmpfs, deliberately NOT
+# The container tmpfs, deliberately NOT
 # `settings.upload_staging_dir`. Both api and worker mount /tmp as a 512m
 # tmpfs, so it's private, gone on restart, and never archived by
 # `scripts/backup-entrypoint.sh` (which tars the staging volume every cycle).
@@ -239,21 +236,21 @@ _GDAL_AUTH_HEADER_SUFFIX = ".hdr"
 GDAL_HEADER_DIR = Path("/tmp/gdal-auth")
 
 
-# feat(#1746) plan section 5 rule A. Measured on GDAL 3.10.3 and 3.13.0: on a
+# Measured on GDAL 3.10.3 and 3.13.0: on a
 # cross-host 302, libcurl under GDAL drops `Authorization` but forwards every
 # other header verbatim, so prefer `Authorization` framing wherever a
-# provider accepts it (a header-key credential IS forwarded cross-host with
-# no GDAL option to stop it; bounded operationally per AGENTS.md Rule 2).
+# provider accepts it (GDAL forwards a header-key credential cross-host, and
+# the egress proxy's origin pin refuses that hop).
 #
-# fix(#1746): IF_SAME_HOST, not NO — NO blocks forwarding after
+# IF_SAME_HOST, not NO — NO blocks forwarding after
 # ANY redirect, so a protected endpoint redirecting to its own canonical path
 # (e.g. adding a trailing slash) would 401. IF_SAME_HOST is also GDAL's
 # current default; set explicitly so a later default change can't silently
 # widen what the credential follows.
 #
-# NOT `GDAL_HTTP_FOLLOWLOCATION` (#937) — not a real GDAL option, never
-# stopped a redirect, must never be re-added anywhere. This IS a real option,
-# read by GDAL's /vsicurl and http drivers.
+# NOT `GDAL_HTTP_FOLLOWLOCATION`: not a real GDAL option, never stopped a
+# redirect, must never be re-added anywhere. This IS a real option, read by
+# GDAL's /vsicurl and http drivers.
 GDAL_HEADER_FILE_REDIRECT_ENV: dict[str, str] = {
     "CPL_VSIL_CURL_AUTHORIZATION_HEADER_ALLOWED_IF_REDIRECT": "IF_SAME_HOST",
 }

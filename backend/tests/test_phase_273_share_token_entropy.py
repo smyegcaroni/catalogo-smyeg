@@ -1,6 +1,6 @@
-"""SEC-10: Share-token entropy is 32 bytes (256 bits), parity with embed tokens.
+"""Share-token entropy is 32 bytes (256 bits), parity with embed tokens.
 
-Pins the v13.13 closure of L-60. Existing 16-byte tokens (already hashed in
+Existing 16-byte tokens (already hashed in
 the DB as sha256) continue to validate — the entropy bump applies only to
 newly generated tokens.
 """
@@ -40,6 +40,8 @@ async def _create_map(session, *, created_by: uuid.UUID) -> Map:
         name=f"SEC-10 Test Map {uuid.uuid4().hex[:6]}",
         description="share-token entropy test",
         created_by=created_by,
+        # Only a public map can be shared.
+        visibility="public",
     )
     session.add(map_obj)
     await session.flush()

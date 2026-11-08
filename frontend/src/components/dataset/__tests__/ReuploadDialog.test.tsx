@@ -11,7 +11,7 @@ import {
 import { useJobStatus, useUploadConfig } from '@/components/import/hooks/use-ingest';
 import { probeService } from '@/api/ingest';
 import { useRefreshSearchWhenQuicklookLands } from '@/components/dataset/hooks/use-quicklook-settled';
-import { getDataset } from '@/api/datasets';
+import { getDataset, getDatasetRefreshRuns } from '@/api/datasets';
 import { ApiError } from '@/api/client';
 import { queryKeys } from '@/lib/query-keys';
 import { changeTestLanguage } from '@/test/i18n';
@@ -55,6 +55,7 @@ vi.mock('@/api/ingest', () => ({
 vi.mock('@/api/datasets', () => ({
   reuploadPresigned: vi.fn(),
   getDataset: vi.fn(),
+  getDatasetRefreshRuns: vi.fn(),
 }));
 
 vi.mock('sonner', () => ({
@@ -84,6 +85,10 @@ function makeDataset(): DatasetResponse {
     id: 'dataset-1',
     record_id: 'record-1',
     table_name: 'roads',
+    source_health: 'unknown',
+    schema_drift_status: 'unknown',
+    source_freshness: 'unknown',
+    has_generic_geometry: false,
     title: 'Roads',
     summary: 'Road centerlines',
     srid: 4326,
@@ -157,6 +162,7 @@ function makeProbeResponse(): ProbeResponse {
         layer_type: 'vector',
         layer_id: 1,
         object_id_field: null,
+        importable: true,
         kind: 'vector' as const,
       },
       {
@@ -167,6 +173,7 @@ function makeProbeResponse(): ProbeResponse {
         layer_type: 'vector',
         layer_id: 2,
         object_id_field: null,
+        importable: true,
         kind: 'vector' as const,
       },
     ],
@@ -193,7 +200,7 @@ function makePreviewResponse(
       row_count_new: 42,
       row_count_delta: 2,
     },
-    // GPKG-01 Phase 1058: default single-layer — null means no layer-select step
+    // Default single-layer — null means no layer-select step
     all_layers: null,
     previous_source_layer: null,
     ...overrides,
@@ -375,7 +382,7 @@ describe('ReuploadDialog', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
-  // fix(#1746): this is a request-only service token, not a login credential,
+  // This is a request-only service token, not a login credential,
   // so it must opt every password manager out explicitly.
   it('opts every password manager out of the service token field', async () => {
     const user = userEvent.setup();
@@ -609,7 +616,7 @@ describe('ReuploadDialog', () => {
     ).toBeInTheDocument();
   });
 
-  // GPKG-02 Phase 1058: guard — service URL preview still uses service layer name, not file-path layer
+  // Guard — service URL preview still uses service layer name, not file-path layer
   it('service URL preview Layer: line uses service layer name (not file-path layer)', async () => {
     const user = userEvent.setup();
     servicePreviewMutateAsync.mockResolvedValueOnce(
@@ -631,7 +638,7 @@ describe('ReuploadDialog', () => {
     expect(screen.queryByText(/^File:/)).not.toBeInTheDocument();
   });
 
-  // fix(#1768): the commit carries the origin the dialog SAW when it staged
+  // The commit carries the origin the dialog SAW when it staged
   // the replacement, so the server can refuse a dataset rebound mid-flow
   // instead of severing the new binding on the swap.
   it('sends the origin it saw with a file-source commit', async () => {
@@ -723,12 +730,12 @@ describe('ReuploadDialog', () => {
     expect(commitMutateAsync.mock.calls[0][0].expectedOriginKind).toBe('upload');
   });
 
-  // fix(#1768 round 1): the refusal tells the user to start the replacement
+  // The refusal tells the user to start the replacement
   // again, and `handleRetry` clears the captured origin — but the origin is
   // re-captured from the `dataset` prop, which is served from the cache the
   // server just disagreed with. Without the invalidation the retry re-sends
   // the same stale kind and 409s forever.
-  // fix(#1822): "Try Again" stays disabled until the origin refetch lands.
+  // "Try Again" stays disabled until the origin refetch lands.
   it('keeps "Try Again" disabled until the origin refetch resolves, then enables it', async () => {
     const user = userEvent.setup();
     commitMutateAsync.mockRejectedValueOnce(
@@ -866,7 +873,7 @@ describe('ReuploadDialog', () => {
     expect(fetchQuery).not.toHaveBeenCalled();
   });
 
-  // fix(#1822 review P2): DatasetPage always renders ReuploadDialog and only
+  // DatasetPage always renders ReuploadDialog and only
   // toggles its `open` prop, so closing it does not unmount the component —
   // a refetch started before the close keeps running after resetState.
   it('ignores a stale refetch completion from before a reset (dialog closed mid-refetch)', async () => {
@@ -948,7 +955,7 @@ describe('ReuploadDialog', () => {
     expect(retryButton).toHaveTextContent('Try Again');
   });
 
-  // fix(#1822 review P2 round 2): retry stays disabled through an offline
+  // Retry stays disabled through an offline
   // pause. Real QueryClient/fetchQuery (no spy) to exercise TanStack
   // Query's own pause/resume.
   it('keeps "Try Again" disabled while offline, then enables it once reconnecting lets the fetch land', async () => {
@@ -1004,7 +1011,7 @@ describe('ReuploadDialog', () => {
     }
   });
 
-  // fix(#1822 review P2 round 3): a fetch already in flight for this key
+  // A fetch already in flight for this key
   // (e.g. window-focus) must not let its stale resolution govern retry.
   it('cancels an in-flight detail fetch first, so the recovery never resolves with the stale value', async () => {
     const user = userEvent.setup();
@@ -1066,7 +1073,7 @@ describe('ReuploadDialog', () => {
   });
 });
 
-// GPKG-01 Phase 1058: multi-layer file path tests
+// Multi-layer file path tests
 describe('ReuploadDialog file path multi-layer', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -1260,7 +1267,7 @@ describe('ReuploadDialog file path multi-layer', () => {
     expect(commitCall.layerName).toBe('buildings');
   });
 
-  // GPKG-02 Phase 1058: preview pane parity tests
+  // Preview pane parity tests
   it('renders Layer line in preview when selectedFileLayer is set', async () => {
     const user = userEvent.setup();
     // First preview: multi-layer, triggers selecting-file-layer step
@@ -1437,7 +1444,7 @@ describe('ReuploadDialog raster reupload', () => {
     } as unknown as ReturnType<typeof useJobStatus>);
   });
 
-  // codex(#1362 r1): raster has no service path — the backend refuses a
+  // Raster has no service path — the backend refuses a
   // raster service-preview outright, so the source selector must not offer it.
   it('shows only the File source option for raster datasets', () => {
     renderRasterDialog();
@@ -1518,7 +1525,7 @@ describe('ReuploadDialog raster reupload', () => {
     ).toBeInTheDocument();
   });
 
-  // codex(#1362 r1): the raster hero map's MapLibre source is added once and
+  // The raster hero map's MapLibre source is added once and
   // never re-added on prop change (the tile URL is a fixed per-dataset route,
   // not content-versioned), so the caller needs an explicit signal to remount
   // it once the replacement job completes.
@@ -1546,6 +1553,39 @@ describe('ReuploadDialog raster reupload', () => {
     await waitFor(() => {
       expect(onReplaceComplete).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it.each([
+    [true, 'Nothing changed'],
+    [false, 'Re-upload complete!'],
+  ])('reads a completed replacement whose data_unchanged is %s as "%s"', async (unchanged, title) => {
+    const user = userEvent.setup();
+    mockUseJobStatus.mockReturnValue({
+      data: { status: 'complete' },
+    } as unknown as ReturnType<typeof useJobStatus>);
+    vi.mocked(getDatasetRefreshRuns).mockResolvedValue({
+      runs: [{ ingest_job_id: 'raster-job', verification: { data_unchanged: unchanged } }],
+      total: 1,
+    } as unknown as Awaited<ReturnType<typeof getDatasetRefreshRuns>>);
+
+    render(<ReuploadDialog dataset={makeRasterDataset()} open onOpenChange={vi.fn()} />);
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    expect(await screen.findByText(title)).toBeInTheDocument();
+    // The header never claims an update the replacement didn't make.
+    const updated = screen.queryByText('The dataset has been updated successfully.');
+    if (unchanged) {
+      expect(updated).not.toBeInTheDocument();
+      expect(
+        screen.getByText('The re-upload finished without changing the dataset.'),
+      ).toBeInTheDocument();
+    } else {
+      expect(updated).toBeInTheDocument();
+    }
   });
 
   it('keeps watching for the new thumbnail when the job completes before its quicklook lands', async () => {
@@ -1615,7 +1655,7 @@ describe('ReuploadDialog raster reupload', () => {
     expect(onReplaceComplete).not.toHaveBeenCalled();
   });
 
-  // codex(#1362 r2): invalidateQueries only SCHEDULES a refetch — firing
+  // invalidateQueries only SCHEDULES a refetch, so firing
   // onReplaceComplete without waiting for it raced the remount against the
   // still-in-flight dataset-detail refetch, so a replacement with a
   // different extent could remount using the OLD bbox. Uses a real
@@ -1671,7 +1711,7 @@ describe('ReuploadDialog raster reupload', () => {
     });
   });
 
-  // codex(#1362 r3): the await above leaves the completion continuation in
+  // The await above leaves the completion continuation in
   // flight across renders — closing the dialog before it settles must not
   // let it apply setStep('complete')/onReplaceComplete on top of the reset
   // state (or, worse, on top of a second reupload started in the meantime).
@@ -1727,7 +1767,7 @@ describe('ReuploadDialog raster reupload', () => {
     expect(screen.getByTestId('reupload-source-selector')).toBeInTheDocument();
   });
 
-  // fix(#1953): ADR-002 Decision 3 stores `internal_error` in place of a
+  // Decision 3 stores `internal_error` in place of a
   // failure the server did not compose, so the dialog is the surface that
   // has to turn that code into something a reader understands.
   it('refetches the run history when a replacement is held for review', async () => {

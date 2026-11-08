@@ -1,4 +1,4 @@
-"""MIG-02 — startup schema-head skew guard.
+"""Startup schema-head skew guard.
 
 Refuse to boot when the database's applied migration heads do not match the
 heads the running image's migration scripts declare. Booting the API/worker
@@ -36,7 +36,6 @@ logger = structlog.stdlib.get_logger(__name__)
 #: target the same schema or it sees an empty/absent version table and
 #: wrongly reports "DB behind".
 _VERSION_TABLE_SCHEMA = "catalog"
-_VERSION_TABLE = "alembic_version"
 
 #: Resolves the backend root and alembic config/versions dir relative to this
 #: file, so the guard does not depend on the process CWD.
@@ -87,7 +86,7 @@ def _discover_extra_migration_paths() -> list[str]:
     return paths
 
 
-def _build_alembic_config() -> Config:
+def build_alembic_config() -> Config:
     """Build an alembic ``Config`` with overlay version dirs appended.
 
     Reuses the on-disk ``alembic.ini`` (so ``script_location`` etc. stay the
@@ -107,15 +106,9 @@ def _build_alembic_config() -> Config:
     return cfg
 
 
-def build_alembic_config() -> Config:
-    """Supported external entry point building the merged alembic ``Config``
-    (OSS base + installed overlay version dirs)."""
-    return _build_alembic_config()
-
-
 def get_script_heads() -> set[str]:
     """Return the set of head revisions the image's migration scripts declare."""
-    script = ScriptDirectory.from_config(_build_alembic_config())
+    script = ScriptDirectory.from_config(build_alembic_config())
     return set(script.get_heads())
 
 

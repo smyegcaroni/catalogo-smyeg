@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { NavLink } from 'react-router';
 import { JobList } from '../JobList';
 
-// fix(#1185): the admin sidebar's failed-jobs badge links to
+// The admin sidebar's failed-jobs badge links to
 // /admin/jobs?status=failed so the number the user clicked equals the number
 // the list shows. That only holds if JobList reads the status filter off the
 // URL, so these tests pin the read, the write-back, and the fallback for a
@@ -117,7 +117,7 @@ describe('JobList status filter from the URL (#1185)', () => {
   });
 });
 
-// fix(#1185 review): the sidebar badge advertises a count of ALL failed jobs.
+// The sidebar badge advertises a count of ALL failed jobs.
 // React Router keeps this instance mounted when the alert link only changes a
 // query param on the same route, so a search/user filter set earlier would
 // survive and narrow the list below the advertised number — the badge-vs-list

@@ -1,4 +1,4 @@
-"""fix(#435): the VRT source endpoints must not issue one query per member row.
+"""The VRT source endpoints must not issue one query per member row.
 
 `list_vrt_sources` and `get_vrt_status` used to call `get_dataset()` once per source
 link, so a 200-source VRT cost 200 round trips before it could return a page. The fix
@@ -7,7 +7,7 @@ query count so a future edit cannot silently reintroduce the N+1.
 
 The per-row `can_access_dataset()` call is intentionally NOT batched: only `restricted`
 targets reach the database from there, and a batch op on the permission seam would let
-a wrapping overlay's policy be skipped (SLOT-02). An admin caller short-circuits that
+a wrapping overlay's policy be skipped. An admin caller short-circuits that
 check with no query, so the count below reflects the batched member load alone.
 """
 
@@ -158,7 +158,7 @@ async def test_list_vrt_sources_query_count_is_flat(test_db_session) -> None:
 async def test_record_source_count_reports_the_served_member_set(
     test_db_session,
 ) -> None:
-    """fix(#1327): every surface counts the same members.
+    """Every surface counts the same members.
 
     The OGC record item used to take its ``source_count`` from the in-flight
     VrtGeneration. That was the post-mutation number back when add/remove wrote

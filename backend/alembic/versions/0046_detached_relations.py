@@ -1,6 +1,6 @@
 """Record a relation GeoLens released a claim on while it was still standing.
 
-fix(#1456 review round 1). 0045 stamped the freed relation's identity onto the
+0045 stamped the freed relation's identity onto the
 tombstone, which covers every delete that RELEASES a name. It does not cover
 the case #1456's window 1 is actually about: a detach that leaves the
 operator's table standing writes no tombstone at all, so the oid and the prior
@@ -28,7 +28,7 @@ Shape mirrors 0044 deliberately, including its reasoning:
   plus three ids.
 * No unique constraint. The same table can be registered and detached any
   number of times, and a duplicate must never be able to fail a delete.
-* ``tenant_id`` is the dormant TSEAM-01 shape: nullable, no FK, no RLS policy,
+* ``tenant_id`` is the dormant shape: nullable, no FK, no RLS policy,
   written from the deleted dataset's own column.
 * ``dataset_id`` and ``previous_owner_id`` carry no foreign keys. The dataset is
   deleted in the transaction that writes this row, and an FK to

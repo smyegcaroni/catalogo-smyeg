@@ -1,4 +1,6 @@
-"""Detector for unscoped finding markers in ``backend/app`` comments and docstrings.
+"""Detector for unscoped finding markers and provenance prefixes in
+``backend/app`` comments and docstrings, ``backend/openapi.json`` descriptions
+and the comments of the rest of the tracked tree outside tests.
 
 Stdlib only and importable without ``app.core.config``, so the pre-commit
 hook runs ``main()`` directly. AGENTS.md > Contracts and Comments.
@@ -10,25 +12,55 @@ import ast
 import io
 import json
 import re
+import subprocess
 import sys
 import tokenize
 from dataclasses import dataclass
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parents[1] / "app"
+REPO_ROOT = APP_ROOT.parents[1]
 
 # A coded finding id (`SEC-002`, `T-1214-17`, `PERF-N5`, `IA-P0-01`). The
 # numeric tail excludes `AUTO-GENERATED` and a `^[A-Z]+$` regex; the uppercase
 # segments exclude GHSA ids and `X-Esri-Authorization`.
 MARKER_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*-[A-Z]?[0-9]+[A-Z0-9]*\b")
 
-# An agent or tool name used as a comment tag. No general shape covers this
-# half, so it is a denylist and says so.
+# An agent or tool name used as a comment tag. No general shape covers it, so
+# it is a denylist. Like a provenance prefix, an anchor never scopes it.
 AGENT_TAG_RE = re.compile(r"(?i)\b(ponytail)\s*:")
 
-# What makes a marker scoped: an issue or PR number a reader can look up.
+# Internal-cadence and planning-note references, which MARKER_RE's hyphenated
+# shape cannot see. Two digits minimum, so a local "Phase 1: validate" step
+# label stays prose; a lettered lane or wave is a planning label either way.
+CADENCE_RE = re.compile(
+    r"\b(?:Phase|Pitfall|Milestone|Wave|Sprint|Lane)\s+#?\d{2,}\b"
+    r"|\b(?:Lane|Wave)\s+[A-H]\b"
+)
+
+# A private planning note by name: a quick-task id, a numbered
+# ``NNN-NN-NAME.md`` note, a ``*-PLAN.md`` or ``RESEARCH.md`` file, or a
+# ``*-FOLLOWUP`` note. Published docs (AGENTS.md, ADR-002.md) match none.
+PLANNING_NOTE_RE = re.compile(
+    r"\bquick-\d{6}\b|\b\d{2,4}-\d{2,4}-[A-Z][A-Z0-9-]*\.md\b"
+    r"|\b[\w-]*(?:PLAN|RESEARCH)\.md\b|\b[A-Z0-9][\w-]*-FOLLOWUP\b"
+)
+
+# A commit-style provenance prefix of any type (`fix(#1234):`, `sec(#88
+# review)`, `fix(site#86)`, `fix(review #1800 round 3)`), a code reviewer's
+# name, or a review round. Each carries its own history, so the anchor rule
+# below never applies. `Claude` is a product name here, so it is not listed.
+PROVENANCE_RE = re.compile(
+    r"\b[a-z][a-z0-9-]*\([^()\n]*#\d+[^()\n]*\)"
+    r"|\b(?:codex|coderabbit|copilot|chatgpt)\b|\bround\s*\d+\b|\breview\s+r\d+\b",
+    re.IGNORECASE,
+)
+
+# What makes a marker scoped: an issue, PR or advisory id a reader can look up.
 # Two digits minimum, so `Pitfall #5` and a `#1f2937` colour do not count.
-ANCHOR_RE = re.compile(r"#\d{2,6}\b|\bGH-\d{2,6}\b|\bCVE-\d{4}-\d{4,7}\b")
+ANCHOR_RE = re.compile(
+    r"#\d{2,6}\b|\bGH-\d{2,6}\b|\bCVE-\d{4}-\d{4,7}\b|\bPYSEC-\d{4}-\d+\b"
+)
 
 # Tokens carrying the marker SHAPE that name a published standard, so they
 # resolve for any reader. A literal list, not a prefix family: `ISO-8601` is
@@ -67,6 +99,20 @@ TECHNICAL_VOCABULARY = frozenset(
         "SI-4",
         # Arithmetic, not an id: "keys 0..N-1", "commit N-1 renames".
         "N-1",
+        # A committed, publicly readable design record (.github/ADR-002.md),
+        # as resolvable as a CVE id or a GH-NNNN issue.
+        "ADR-002",
+        # SPDX licence ids as MARKER_RE cuts them ("BSD-3-Clause" -> "BSD-3").
+        "BSD-2",
+        "BSD-3",
+        "CC0-1",
+        "MPL-2",
+        "OFL-1",
+        "PSF-2",
+        # Copernicus DEM product, a device pixel ratio, a Trivy check id.
+        "GLO-30",
+        "DPR-2",
+        "DS-0002",
     }
 )
 
@@ -86,7 +132,7 @@ class Unit:
 
 @dataclass(frozen=True)
 class Hit:
-    """A documentation line carrying finding markers with no anchor near it."""
+    """A documentation line carrying an unanchored marker or a provenance prefix."""
 
     module: str
     lineno: int
@@ -94,10 +140,7 @@ class Hit:
     markers: tuple[str, ...]
 
     def describe(self) -> str:
-        return (
-            f"{self.module}:{self.lineno} ({self.kind}) "
-            f"{', '.join(self.markers)} — no #issue anchor"
-        )
+        return f"{self.module}:{self.lineno} ({self.kind}) {', '.join(self.markers)}"
 
 
 # Legacy references are scoped within three lines. Plain explanations without
@@ -163,26 +206,37 @@ def markers_in(
 ) -> tuple[str, ...]:
     """Finding markers in one unit, vocabulary removed, sorted and deduped."""
     found = {t for t in MARKER_RE.findall(text) if t not in vocabulary}
-    found.update(m.group(1) for m in AGENT_TAG_RE.finditer(text))
+    found.update(CADENCE_RE.findall(text))
+    found.update(PLANNING_NOTE_RE.findall(text))
     return tuple(sorted(found))
+
+
+def _line_hits(
+    lines: list[str], markers=markers_in
+) -> list[tuple[int, tuple[str, ...]]]:
+    """``(offset, found)`` for each line with an unanchored marker, an agent tag
+    or a provenance prefix."""
+    anchored = [ANCHOR_RE.search(line) is not None for line in lines]
+    out = []
+    for offset, line in enumerate(lines):
+        found = markers(line)
+        low = max(0, offset - ANCHOR_WINDOW)
+        if found and any(anchored[low : offset + ANCHOR_WINDOW + 1]):
+            found = ()
+        found += tuple(m.group(1) for m in AGENT_TAG_RE.finditer(line))
+        found += tuple(PROVENANCE_RE.findall(line))
+        if found:
+            out.append((offset, found))
+    return out
 
 
 def scan_module(module: str, source: str) -> list[Hit]:
     """Unanchored marker-bearing lines in one module's documentation."""
-    hits = []
-    for unit in iter_units(source, module):
-        lines = unit.text.splitlines()
-        anchored = [ANCHOR_RE.search(line) is not None for line in lines]
-        for offset, line in enumerate(lines):
-            markers = markers_in(line)
-            if not markers:
-                continue
-            low = max(0, offset - ANCHOR_WINDOW)
-            high = offset + ANCHOR_WINDOW + 1
-            if any(anchored[low:high]):
-                continue
-            hits.append(Hit(module, unit.lineno + offset, unit.kind, markers))
-    return hits
+    return [
+        Hit(module, unit.lineno + offset, unit.kind, found)
+        for unit in iter_units(source, module)
+        for offset, found in _line_hits(unit.text.splitlines())
+    ]
 
 
 def scan_tree(app_root: Path = APP_ROOT) -> tuple[list[Hit], int, int]:
@@ -208,173 +262,6 @@ def scan_tree(app_root: Path = APP_ROOT) -> tuple[list[Hit], int, int]:
 MIN_SCANNED_MODULES = 350
 MIN_SCANNED_UNITS = 7000
 
-# The unanchored markers already on main, counted per MARKER and frozen per
-# module, EXACT in both directions. Residual: swapping one id for another on a
-# line already counted still passes; catching that needs a per-module multiset.
-UNANCHORED_MARKER_DEBT: dict[str, int] = {
-    "api/main.py": 27,
-    "api/middleware/body_limit.py": 7,
-    "api/middleware/logging.py": 2,
-    "api/middleware/security.py": 7,
-    "core/catalog_port.py": 1,
-    "core/config.py": 25,
-    "core/crs_uri.py": 4,
-    "core/db/rls.py": 5,
-    "core/db/schema_skew.py": 1,
-    "core/db/session.py": 2,
-    "core/db/tenant_schema.py": 3,
-    "core/db/tenant_session.py": 7,
-    "core/edition.py": 6,
-    "core/identity.py": 3,
-    "core/logging_config.py": 4,
-    "core/permissions.py": 2,
-    "core/persistent_config.py": 12,
-    "core/processing_port.py": 8,
-    "core/public_urls.py": 9,
-    "core/runtime/staging.py": 2,
-    "core/service_tokens.py": 2,
-    "core/tenancy.py": 1,
-    "modules/admin/backfill_jobs.py": 1,
-    "modules/admin/router.py": 15,
-    "modules/admin/schemas.py": 1,
-    "modules/admin/service.py": 8,
-    "modules/audit/events.py": 1,
-    "modules/audit/models.py": 2,
-    "modules/audit/router.py": 3,
-    "modules/audit/schemas.py": 3,
-    "modules/audit/service.py": 8,
-    "modules/auth/cookies.py": 1,
-    "modules/auth/domain_policy.py": 1,
-    "modules/auth/models.py": 10,
-    "modules/auth/oauth/encryption.py": 1,
-    "modules/auth/oauth/router.py": 15,
-    "modules/auth/oauth/schemas.py": 7,
-    "modules/auth/oauth/service.py": 25,
-    "modules/auth/password_policy.py": 1,
-    "modules/auth/permissions.py": 2,
-    "modules/auth/router.py": 66,
-    "modules/auth/schemas.py": 3,
-    "modules/auth/service.py": 8,
-    "modules/auth/verification.py": 3,
-    "modules/auth/verification_email.py": 1,
-    "modules/catalog/authorization.py": 1,
-    "modules/catalog/collections/models.py": 3,
-    "modules/catalog/collections/router.py": 2,
-    "modules/catalog/datasets/api/router.py": 3,
-    "modules/catalog/datasets/api/router_export.py": 10,
-    "modules/catalog/datasets/api/router_health.py": 2,
-    "modules/catalog/datasets/api/router_refresh.py": 2,
-    "modules/catalog/datasets/api/router_reupload.py": 11,
-    "modules/catalog/datasets/domain/_sql_safety.py": 1,
-    "modules/catalog/datasets/domain/models.py": 9,
-    "modules/catalog/datasets/domain/schemas.py": 3,
-    "modules/catalog/datasets/domain/service.py": 1,
-    "modules/catalog/datasets/domain/service_create.py": 1,
-    "modules/catalog/datasets/domain/source_freshness.py": 3,
-    "modules/catalog/maps/_router_helpers.py": 2,
-    "modules/catalog/maps/filter_grammar.py": 1,
-    "modules/catalog/maps/models.py": 5,
-    "modules/catalog/maps/schemas.py": 6,
-    "modules/catalog/maps/service_diff.py": 1,
-    "modules/catalog/maps/service_public.py": 5,
-    "modules/catalog/maps/style_json.py": 3,
-    "modules/catalog/search/cache.py": 2,
-    "modules/catalog/search/router.py": 6,
-    "modules/catalog/search/schemas.py": 1,
-    "modules/catalog/search/service_filters.py": 1,
-    "modules/catalog/sources/adapters/stac.py": 3,
-    "modules/catalog/sources/classify.py": 4,
-    "modules/catalog/sources/origin_probe.py": 2,
-    "modules/catalog/sources/preview.py": 3,
-    "modules/catalog/sources/probe.py": 7,
-    "modules/catalog/sources/router.py": 3,
-    "modules/catalog/sources/stac_resolve_asset_gate.py": 1,
-    "modules/catalog/sources/stac_resolve_taxonomy.py": 1,
-    "modules/catalog/validation/service.py": 2,
-    "modules/embed_tokens/admin_router.py": 5,
-    "modules/embed_tokens/models.py": 2,
-    "modules/embed_tokens/router.py": 2,
-    "modules/embed_tokens/service.py": 15,
-    "modules/embed_tokens/sharing.py": 1,
-    "modules/quota/schemas.py": 1,
-    "modules/settings/router.py": 22,
-    "modules/settings/router_public.py": 2,
-    "modules/settings/schemas.py": 1,
-    "modules/tenancy/models.py": 1,
-    "observability/health/service.py": 4,
-    "platform/assets/urls.py": 2,
-    "platform/cache/tile_cache.py": 6,
-    "platform/config_ops/router.py": 1,
-    "platform/config_ops/service.py": 1,
-    "platform/dataset_origin.py": 3,
-    "platform/domain_validation.py": 7,
-    "platform/extensions/__init__.py": 13,
-    "platform/extensions/bootstrap.py": 11,
-    "platform/extensions/defaults_catalog_port.py": 1,
-    "platform/extensions/defaults_extensions.py": 1,
-    "platform/extensions/protocols.py": 4,
-    "platform/jobs/heartbeat.py": 2,
-    "platform/jobs/models.py": 4,
-    "platform/jobs/router.py": 5,
-    "platform/jobs/schemas.py": 7,
-    "platform/jobs/worker.py": 5,
-    "platform/notifications/__init__.py": 5,
-    "platform/notifications/env_sink.py": 6,
-    "platform/notifications/events.py": 6,
-    "platform/notifications/smtp_channel.py": 5,
-    "platform/notifications/webhook_channel.py": 7,
-    "platform/refresh/credentials.py": 1,
-    "platform/refresh/models.py": 1,
-    "platform/security.py": 8,
-    "platform/service_auth.py": 1,
-    "platform/storage/azure.py": 2,
-    "platform/storage/local.py": 6,
-    "platform/storage/provider.py": 6,
-    "platform/storage/titiler_url.py": 3,
-    "processing/ai/chat_actions.py": 2,
-    "processing/ai/chat_validation.py": 1,
-    "processing/analysis/provenance.py": 2,
-    "processing/analysis/tasks.py": 2,
-    "processing/export/router.py": 1,
-    "processing/export/service.py": 3,
-    "processing/export/where_validator.py": 3,
-    "processing/ingest/manifest_service.py": 2,
-    "processing/ingest/metadata_extent.py": 1,
-    "processing/ingest/metadata_mercator.py": 2,
-    "processing/ingest/metadata_projection.py": 1,
-    "processing/ingest/ogr.py": 13,
-    "processing/ingest/presigned.py": 1,
-    "processing/ingest/router.py": 9,
-    "processing/ingest/schemas.py": 1,
-    "processing/ingest/tasks_common.py": 25,
-    "processing/ingest/tasks_postgis_refresh.py": 2,
-    "processing/ingest/tasks_raster.py": 32,
-    "processing/ingest/tasks_raster_common.py": 4,
-    "processing/ingest/tasks_raster_replace.py": 1,
-    "processing/ingest/tasks_reupload.py": 1,
-    "processing/ingest/tasks_stac_refresh.py": 4,
-    "processing/ingest/tasks_staging.py": 5,
-    "processing/ingest/tasks_vrt.py": 7,
-    "processing/ingest/url_fetch.py": 1,
-    "processing/ingest/validation.py": 3,
-    "processing/raster/cog.py": 2,
-    "processing/raster/models.py": 2,
-    "processing/raster/queries.py": 1,
-    "processing/raster/validation.py": 7,
-    "processing/raster/vrt.py": 2,
-    "processing/raster/vrt_rewrite.py": 5,
-    "processing/tiles/pool.py": 6,
-    "processing/tiles/router.py": 15,
-    "processing/tiles/service.py": 16,
-    "processing/tiles/signing.py": 5,
-    "standards/ogc/errors.py": 2,
-}
-
-
-def _debt(hits: list[Hit]) -> int:
-    """One marker is one unit of debt; two on a line are two."""
-    return sum(len(hit.markers) for hit in hits)
-
 
 def check(app_root: Path = APP_ROOT) -> list[str]:
     """Every way the tree violates the gate, as printable lines."""
@@ -392,32 +279,20 @@ def check(app_root: Path = APP_ROOT) -> list[str]:
             " — the scan is not seeing the documentation"
         )
 
-    by_module: dict[str, list[Hit]] = {}
-    for hit in hits:
-        by_module.setdefault(hit.module, []).append(hit)
+    return problems + _hit_report(hits)
 
-    for module, module_hits in sorted(by_module.items()):
-        allowed = UNANCHORED_MARKER_DEBT.get(module, 0)
-        if _debt(module_hits) <= allowed:
-            continue
-        problems.append(
-            f"{module}: {_debt(module_hits)} unanchored finding markers, "
-            f"{allowed} recorded. Remove unnecessary tags and keep the explanation. "
-            "Anchor only an essential reference, or — if it names a "
-            "published standard — add it to TECHNICAL_VOCABULARY:"
-        )
-        problems.extend(f"    {hit.describe()}" for hit in module_hits)
 
-    for module, allowed in sorted(UNANCHORED_MARKER_DEBT.items()):
-        found = _debt(by_module.get(module, []))
-        if found < allowed:
-            problems.append(
-                f"{module}: {found} unanchored finding markers, {allowed} "
-                f"recorded. Lower the UNANCHORED_MARKER_DEBT entry to {found}"
-                " (or delete it) in backend/tests/finding_markers.py."
-            )
-
-    return problems
+def _hit_report(hits: list[Hit]) -> list[str]:
+    if not hits:
+        return []
+    return [
+        f"{len(hits)} documentation lines carry unanchored finding markers, "
+        "agent tags or fix(#N)-style provenance prefixes. Remove unnecessary "
+        "tags and keep the explanation; provenance belongs in Git and the PR. "
+        "Anchor only an essential marker reference, or — if it names a "
+        "published standard — add it to TECHNICAL_VOCABULARY:",
+        *(f"    {hit.describe()}" for hit in hits),
+    ]
 
 
 # Field/Query ``description=``/``summary=`` strings are literals, not
@@ -434,20 +309,13 @@ _OPENAPI_TEXT_KEYS = frozenset({"description", "summary"})
 # empty.
 MIN_OPENAPI_DESCRIPTIONS = 3500
 
-# ADR-002 (.github/ADR-002.md) is a committed, publicly readable design
-# record, as resolvable as a CVE id or a GH-NNNN issue. Kept separate from
-# TECHNICAL_VOCABULARY, which also bounds the source-tree debt ledger above.
-_PUBLISHED_VOCABULARY = TECHNICAL_VOCABULARY | {"ADR-002"}
-
-# MARKER_RE requires a hyphen, so a bare internal-cadence reference — "Phase
-# 280", "Pitfall 11" — reaches openapi.json invisibly. Scoped to this scan
-# only, not the shared MARKER_RE, so the source-tree debt ledger is untouched.
+# Published text is held to more than source: a source comment may number
+# its own steps ("Phase 1: validate"), but in openapi.json any numbered phase
+# or pitfall is a planning reference.
 _CADENCE_RE = re.compile(r"\b(?:Phase|Pitfall|Milestone|Wave|Sprint|Lane)\s+#?\d+\b")
 
-# A private planning-doc filename: the literal ``CONTEXT.md`` or a numbered
-# ``NNN-NN-NAME.md`` note (see backend/app/processing/ingest/tasks_common.py
-# for the shape). A real published doc (AGENTS.md, ADR-002.md) has no digit
-# prefix, so this does not need to exempt them.
+# The literal ``CONTEXT.md`` too: published text has no reason to cite a repo
+# file, and the private planning notes share that name.
 _PLANNING_DOC_RE = re.compile(
     r"\bCONTEXT\.md\b|\b\d{2,4}-\d{2,4}-[A-Z][A-Z0-9-]*\.md\b"
 )
@@ -456,7 +324,7 @@ _PLANNING_DOC_RE = re.compile(
 def _openapi_markers(line: str) -> tuple[str, ...]:
     """Marker-shaped tokens in one description line: the shared detector's
     hyphenated shape, plus a bare reference it cannot see."""
-    found = set(markers_in(line, _PUBLISHED_VOCABULARY))
+    found = set(markers_in(line))
     found.update(_CADENCE_RE.findall(line))
     found.update(_PLANNING_DOC_RE.findall(line))
     return tuple(sorted(found))
@@ -482,20 +350,11 @@ def _openapi_descriptions(node: object, path: str = "$") -> list[tuple[str, str,
 def scan_openapi(spec: object) -> list[Hit]:
     """Unanchored marker-bearing lines in every ``description``/``summary``
     in ``spec``."""
-    hits: list[Hit] = []
-    for json_path, key, text in _openapi_descriptions(spec):
-        lines = text.splitlines()
-        anchored = [ANCHOR_RE.search(line) is not None for line in lines]
-        for offset, line in enumerate(lines):
-            markers = _openapi_markers(line)
-            if not markers:
-                continue
-            low = max(0, offset - ANCHOR_WINDOW)
-            high = offset + ANCHOR_WINDOW + 1
-            if any(anchored[low:high]):
-                continue
-            hits.append(Hit(json_path, offset + 1, f"openapi-{key}", markers))
-    return hits
+    return [
+        Hit(json_path, offset + 1, f"openapi-{key}", found)
+        for json_path, key, text in _openapi_descriptions(spec)
+        for offset, found in _line_hits(text.splitlines(), _openapi_markers)
+    ]
 
 
 def check_openapi(openapi_path: Path = OPENAPI_PATH) -> list[str]:
@@ -517,9 +376,10 @@ def check_openapi(openapi_path: Path = OPENAPI_PATH) -> list[str]:
     hits = scan_openapi(spec)
     if hits:
         problems.append(
-            f"{openapi_path} publishes finding markers with no #issue anchor —"
-            " an integrator reading the generated SDK docstring has nothing to"
-            " resolve them against. Rewrite the Field/Query description to"
+            f"{openapi_path} publishes finding markers with no #issue anchor, or"
+            " fix(#N)-style provenance prefixes — an integrator reading the"
+            " generated SDK docstring has nothing to resolve them against."
+            " Rewrite the Field/Query description to"
             " state the constraint itself, then run `make sdks`:"
         )
         problems.extend(f"    {hit.describe()}" for hit in hits)
@@ -527,13 +387,149 @@ def check_openapi(openapi_path: Path = OPENAPI_PATH) -> list[str]:
     return problems
 
 
+# The rest of the tracked tree: Python outside backend/app, configuration,
+# scripts, workflows and non-test frontend code. Tests may name what they
+# test, generated SDK code mirrors openapi.json, and Markdown is prose.
+_REPO_SKIP_RE = re.compile(
+    r"^backend/app/|(^|/)(tests?|__tests__|e2e)/|\.(test|spec)\.[cm]?[jt]sx?$"
+    r"|(^|/)(test_[^/]*|[^/]*_test|conftest)\.py$|^sdks/python/geolens/(api|models)/"
+    r"|^sdks/typescript/src/client/|api\.generated\.ts$"
+)
+
+
+@dataclass(frozen=True)
+class _Syntax:
+    """How one file type writes comments: a line-comment start, a block
+    comment's open and close, and the quotes that hide either."""
+
+    line: re.Pattern[str] | None
+    block: tuple[str, str] | None
+    quotes: str
+
+
+# A `#` starts a comment only at the start of a line or after whitespace.
+_C_STYLE = _Syntax(re.compile(r"//"), ("/*", "*/"), "'\"`")
+_COMMENT_SYNTAX: tuple[tuple[re.Pattern[str], _Syntax], ...] = (
+    (
+        re.compile(
+            r"\.(sh|ya?ml|toml|conf|ini|mako)$"
+            r"|(^|/)(Dockerfile[^/]*|Makefile|CODEOWNERS|\.env[^/]*\.example"
+            r"|\.(git|docker)ignore)$"
+        ),
+        _Syntax(re.compile(r"(?<!\S)#"), None, "'\""),
+    ),
+    (re.compile(r"\.([cm]?[jt]sx?|ql|jsonc)$"), _C_STYLE),
+    (re.compile(r"\.css$"), _Syntax(None, ("/*", "*/"), "'\"")),
+    (re.compile(r"\.sql$"), _Syntax(re.compile(r"--"), ("/*", "*/"), "'")),
+    (re.compile(r"\.(html|svg)$"), _Syntax(None, ("<!--", "-->"), "")),
+)
+
+
+def comment_lines(text: str, syntax: _Syntax) -> list[str]:
+    """Each line's comment text, "" where it has none. A block comment carries
+    across lines; a quoted string hides comment syntax within its line."""
+    out = []
+    close = None
+    for line in text.splitlines():
+        parts = []
+        quote = None
+        i = 0
+        while i < len(line):
+            if close:
+                j = line.find(close, i)
+                parts.append(line[i:] if j < 0 else line[i:j])
+                if j < 0:
+                    break
+                i, close = j + len(close), None
+                continue
+            char = line[i]
+            if quote:
+                if char == "\\":
+                    i += 1
+                elif char == quote:
+                    quote = None
+            elif char in syntax.quotes:
+                quote = char
+            elif syntax.block and line.startswith(syntax.block[0], i):
+                i += len(syntax.block[0])
+                close = syntax.block[1]
+                continue
+            elif syntax.line and (m := syntax.line.match(line, i)):
+                parts.append(line[m.end() :])
+                break
+            i += 1
+        out.append(" ".join(parts))
+    return out
+
+
+# `main` carries about 850 such files; a listing that silently comes back
+# short (a moved root, a narrowed pattern) must fail, not pass.
+MIN_REPO_FILES = 700
+
+
+def scan_comment_lines(path: str, text: str, syntax: _Syntax) -> list[Hit]:
+    """Unanchored marker-bearing comment lines in a file that is not Python."""
+    return [
+        Hit(path, offset + 1, "comment", found)
+        for offset, found in _line_hits(comment_lines(text, syntax))
+    ]
+
+
+def repo_files(root: Path = REPO_ROOT) -> list[tuple[str, _Syntax | None]]:
+    """Tracked files outside backend/app that the scan reads, each with its
+    comment syntax, or None for Python."""
+    try:
+        listing = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"], capture_output=True, check=True
+        ).stdout.decode()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise MarkerScanError(f"{root}: could not list tracked files: {exc}") from exc
+    out = []
+    for rel in listing.split("\0"):
+        if not rel or _REPO_SKIP_RE.search(rel):
+            continue
+        syntax = next((syn for kind, syn in _COMMENT_SYNTAX if kind.search(rel)), None)
+        if syntax is not None or rel.endswith(".py"):
+            out.append((rel, syntax))
+    return out
+
+
+def scan_repo(root: Path = REPO_ROOT) -> tuple[list[Hit], int]:
+    """Scan tracked files outside backend/app. Returns (hits, files scanned)."""
+    hits: list[Hit] = []
+    files = 0
+    for rel, syntax in repo_files(root):
+        try:
+            text = (root / rel).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise MarkerScanError(f"{rel}: could not read: {exc}") from exc
+        files += 1
+        if syntax is None:
+            hits.extend(scan_module(rel, text))
+        else:
+            hits.extend(scan_comment_lines(rel, text, syntax))
+    return hits, files
+
+
+def check_repo(root: Path = REPO_ROOT) -> list[str]:
+    """Every violation in tracked files outside backend/app, as printable lines."""
+    hits, files = scan_repo(root)
+    problems = []
+    if files < MIN_REPO_FILES:
+        problems.append(
+            f"scanned {files} tracked files outside backend/app, floor is"
+            f" {MIN_REPO_FILES} — the scan is not seeing the tree"
+        )
+    return problems + _hit_report(hits)
+
+
 def main() -> int:
     """Print every violation and return 1, or return 0 on a clean tree."""
-    problems = check() + check_openapi()
+    problems = check() + check_openapi() + check_repo()
     if not problems:
         return 0
     print(
-        "FAIL: unscoped finding markers in backend/app comments/docstrings or"
+        "FAIL: unscoped finding markers in comments/docstrings or"
         " backend/openapi.json descriptions"
     )
     for line in problems:

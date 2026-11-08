@@ -17,6 +17,7 @@ import { getGeometryTypeLabel } from '@/i18n/labels';
 import { ingestionStatusColors, syntheticBadgeColor } from '@/lib/status-colors';
 import { useQuicklook } from '@/components/maps/hooks/use-quicklook';
 import { queryKeys } from '@/lib/query-keys';
+import { distinctDescription } from '@/lib/text';
 import { getDataset } from '@/api/datasets';
 import type { OGCRecordResponse } from '@/types/api';
 
@@ -76,7 +77,7 @@ function buildCardSpecs(
     specs.push({ icon: Combine, label: capitalizeVrtType(properties.vrt_type) });
   }
 
-  if (isVrt && properties.source_count != null) {
+  if (isVrt && properties.source_count) {
     specs.push({ icon: FolderOpen, label: t('card.sourceCount', { count: properties.source_count, defaultValue: '{{count}} sources' }) });
   }
 
@@ -104,9 +105,8 @@ function buildAutoDescription(
   t: TFunction<'search'>,
   locale: string,
 ): string {
-  if (properties.description && properties.description.trim() !== '') {
-    return properties.description;
-  }
+  const description = distinctDescription(properties.title, properties.description);
+  if (description) return description;
   const recordType = properties.record_type ?? 'vector_dataset';
   switch (recordType) {
     case 'vector_dataset':
@@ -124,9 +124,11 @@ function buildAutoDescription(
         gsd: properties.gsd != null ? formatGsd(properties.gsd, { isGeographic: properties.crs_is_geographic, crs: properties.crs }, locale) : '',
       });
     case 'vrt_dataset':
+      // A zero count means the viewer can't read any member, not that the VRT is empty.
+      if (!properties.source_count) break;
       return t('card.autoDesc.vrt', {
         vrtType: properties.vrt_type ? capitalizeVrtType(properties.vrt_type) : '',
-        count: properties.source_count ?? 0,
+        count: properties.source_count,
       });
     case 'table':
       return t('card.autoDesc.table', { count: properties.feature_count ?? 0 });
@@ -145,15 +147,15 @@ export const SearchResultCard = memo(function SearchResultCard({ feature }: { fe
   const recordType = properties.record_type ?? 'vector_dataset';
   const isCollection = recordType === 'collection';
   const isTable = recordType === 'table';
+  const collectionDescription = isCollection ? distinctDescription(properties.title, properties.description) : undefined;
   const origin = datasetOrigin(properties);
   const linkPath = isCollection ? `/collections/${feature.id}` : `/datasets/${feature.id}`;
   const bbox = extractBbox(feature);
 
-  // Quicklook: useQuicklook solves the Bearer-JWT mismatch — <img src> requests
-  // do NOT carry the Authorization header, so private-dataset quicklooks 404'd
-  // anonymously. useQuicklook routes the fetch through apiFetchBlob (Bearer-
-  // attached) and returns a blob URL. SP-07 negative-cache: genuine file-missing
-  // 404s are cached in quicklook-cache.ts for the session so we skip re-fetching.
+  // <img src> requests carry no Authorization header, so private-dataset
+  // quicklooks would 404 anonymously. useQuicklook fetches through apiFetchBlob
+  // (Bearer attached) and returns a blob URL; genuine file-missing 404s are
+  // cached in quicklook-cache.ts for the session.
   const featureId = feature.id as string;
   const enableQuicklook = !isCollection && !isTable && Boolean(properties.has_quicklook);
   const { url: quicklookBlobUrl } = useQuicklook(
@@ -162,7 +164,6 @@ export const SearchResultCard = memo(function SearchResultCard({ feature }: { fe
     properties.quicklook_version ?? null,
   );
 
-  // Provenance (for non-collection types)
   const neverEditedLabel = t('card.neverEdited', { defaultValue: 'Never' });
   const noUpdateMetadataLabel = t('card.noUpdateMetadata', { defaultValue: 'No update metadata' });
 
@@ -194,12 +195,10 @@ export const SearchResultCard = memo(function SearchResultCard({ feature }: { fe
       .filter((keyword) => keyword !== '' && keyword !== 'synthetic' && keyword !== 'perf-seed') ?? []
     : [];
 
-  // Footer status badge — only for non-collection, non-published records
   const showStatusBadge = !isCollection && !!recordStatus && recordStatus !== 'published';
 
-  // fix(#438): PERF-04 — warm the dataset detail query on hover/focus so the
-  // navigation doesn't pay chunk + query serially after the click. Cheap:
-  // prefetchQuery is a no-op when the data is already fresh.
+  // Warms the detail query on hover/focus so navigation doesn't pay chunk and
+  // query serially; prefetchQuery is a no-op when the data is fresh.
   const prefetchDetail = () => {
     if (isCollection) return;
     queryClient.prefetchQuery({
@@ -236,9 +235,9 @@ export const SearchResultCard = memo(function SearchResultCard({ feature }: { fe
                 <h3 className="block text-base font-semibold leading-tight text-foreground transition-colors group-hover:text-primary line-clamp-1">
                   {properties.title}
                 </h3>
-                {properties.description && (
+                {collectionDescription && (
                   <p className="text-sm leading-5 text-muted-foreground line-clamp-1">
-                    {properties.description}
+                    {collectionDescription}
                   </p>
                 )}
               </div>
@@ -278,14 +277,14 @@ export const SearchResultCard = memo(function SearchResultCard({ feature }: { fe
 
                   {/* Specs row */}
                   {cardSpecs.length > 0 && (
-                    <div className="flex flex-wrap gap-x-3 gap-y-1" data-testid="dataset-card-specs">
+                    <div className="flex flex-wrap gap-y-1" data-testid="dataset-card-specs">
                       {cardSpecs.map((item, index) => (
                         <span key={item.label} className="inline-flex items-center gap-1 text-xs font-medium font-mono tracking-wide text-muted-foreground">
-                          {index > 0 && (
-                            <span className="me-1 text-muted-foreground/40">&middot;</span>
-                          )}
                           <item.icon className="size-3 shrink-0" aria-hidden="true" />
                           {item.label}
+                          {index < cardSpecs.length - 1 && (
+                            <span className="mx-1.5 text-muted-foreground/40" aria-hidden="true">&middot;</span>
+                          )}
                         </span>
                       ))}
                     </div>

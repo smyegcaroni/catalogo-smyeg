@@ -30,9 +30,7 @@
     "byVisibility": "Conjuntos de datos por visibilidad",
     "noDatasets": "Aún no hay conjuntos de datos",
     "errorLoading": "Error al cargar estadísticas: {{message}}",
-    "totalUsers": "Usuarios totales",
-    "usersByStatus": "Usuarios por estado",
-    "noUsers": "Sin usuarios aún"
+    "totalUsers": "Usuarios totales"
   },
   "users": {
     "title": "Usuarios",
@@ -226,7 +224,7 @@
     }
   },
   "audit": {
-    "title": "Registros de auditoría",
+    "title": "Registro de auditoría",
     "loading": "Cargando registros de auditoría...",
     "errorLoading": "Error al cargar registros de auditoría: {{message}}",
     "searchPlaceholder": "Usuario / Acción",
@@ -236,11 +234,6 @@
       "user": "Usuario",
       "allUsers": "Todos los usuarios",
       "allActions": "Todas las acciones",
-      "datasetView": "Vista de conjunto de datos",
-      "datasetExport": "Exportación de conjunto de datos",
-      "metadataEdit": "Edición de metadatos",
-      "datasetCreate": "Creación de conjunto de datos",
-      "datasetDelete": "Eliminación de conjunto de datos",
       "action": "Acción",
       "userId": "ID de usuario",
       "resourceType": "Tipo de recurso",
@@ -355,6 +348,8 @@
     "openaiKeyRequired": "OPENAI_API_KEY no está configurado. La generación de embeddings requiere una clave API compatible con OpenAI, incluso cuando se usa Anthropic para inferencia.",
     "keyConfigured": "configurada",
     "keyNotSet": "no configurada",
+    "claudePlatformConfigured": "Claude en {{platform}}: configurado",
+    "claudePlatformNotConfigured": "Claude en {{platform}}: sin configurar",
     "testConnection": "Probar conexión",
     "testing": "Probando…",
     "testConnectionDescription": "Realiza una llamada real a cada proveedor configurado para verificar las claves y la conectividad. Consume una pequeña cantidad de tokens del proveedor.",
@@ -391,6 +386,20 @@
     "scope": "Alcance",
     "scopeFull": "Acceso completo",
     "scopeReadOnly": "Solo lectura",
+    "scopePublish": "Publicar",
+    "scopePublishDescription": "Añade tus propios datos y mapas, edita los detalles de tus conjuntos de datos y reemplaza conjuntos de datos subidos, conservando sus versiones anteriores. No puede hacer nada público ni ampliar la visibilidad de un conjunto de datos, actualizar un mapa existente, reemplazar conjuntos de datos ráster ni vinculados a un servicio, elemento STAC o tabla, escribir entidades ni eliminar nada.",
+    "scopeDatasetWrite": "Un conjunto de datos",
+    "scopeDatasetAppend": "Un conjunto de datos, solo añadir",
+    "expiry": "Caduca",
+    "expiryOptions": {
+      "never": "Nunca caduca",
+      "30d": "30 días",
+      "90d": "90 días",
+      "1y": "1 año"
+    },
+    "expired": "Caducada",
+    "expiresOn": "Caduca el {{date}}",
+    "expiredOn": "Caducó el {{date}}",
     "creating": "Creando...",
     "createError": "Error al crear la clave",
     "loadingKeys": "Cargando claves...",
@@ -421,8 +430,9 @@
   },
   "apiKeyReveal": {
     "title": "Clave API creada",
-    "description": "Copie esta clave ahora. No se mostrará de nuevo.",
+    "description": "Copie esta clave ahora.",
     "warning": "Esta clave no se mostrará de nuevo. Asegúrese de copiarla ahora.",
+    "copy": "Copiar clave API",
     "done": "Listo"
   },
   "sharedMaps": {
@@ -485,8 +495,6 @@
     "tableLabel": "Tokens de inserción"
   },
   "settings": {
-    "copySPEntityId": "Copiar ID de entidad SP",
-    "copyAcsUrl": "Copiar URL ACS",
     "actions": {
       "discard": "Descartar cambios",
       "resetDefaults": "Restablecer valores predeterminados",
@@ -513,6 +521,7 @@
         "upload": "Subir conjuntos de datos",
         "create_layers": "Crear capas",
         "export": "Exportar datos",
+        "exportDescription": "Descargar archivos de conjuntos de datos y, junto con «Subir conjuntos de datos», guardar resultados de análisis como conjuntos de datos nuevos. Cualquiera puede descargar los conjuntos de datos públicos publicados, y quien pueda ver un conjunto de datos puede leer sus entidades mediante la API, las teselas del mapa y la tabla de atributos.",
         "edit_metadata": "Editar metadatos",
         "manage_collections": "Gestionar colecciones",
         "use_ai_chat": "Chat IA",
@@ -522,8 +531,6 @@
     },
     "general": {
       "title": "General",
-      "cardTitle": "Funcionalidades",
-      "cardDescription": "Habilitar o deshabilitar funcionalidades de la plataforma.",
       "registration": "Autoregistro",
       "registrationDescription": "Permite que las personas creen su propia cuenta, registrándose con contraseña o iniciando sesión con un proveedor SSO habilitado. Las cuentas SSO se activan al instante con el rol predeterminado del proveedor. Los registros con contraseña se activan tras verificar el correo (requiere SMTP) o, si no, tras la aprobación de un administrador.",
       "landingFirst": "Inicio de sesión como página de inicio",
@@ -531,7 +538,6 @@
       "aiFeatures": "Funciones de IA",
       "aiFeaturesDescription": "Habilitar funciones impulsadas por IA, incluyendo redacción de metadatos de conjuntos de datos (resúmenes, palabras clave, linaje, declaraciones de calidad), chat del constructor de mapas y generación de mapas con IA.",
       "saved": "Configuración guardada",
-      "saveFailed": "Error al guardar la configuración",
       "requireMetadata": "Requerir metadatos para publicar",
       "requireMetadataDescription": "Cuando está habilitado, los conjuntos de datos deben tener metadatos completos antes de poder publicarse.",
       "enableDatasetEditing": "Habilitar edición de conjuntos de datos",
@@ -541,7 +547,7 @@
       "bannerEnabled": "Activar banner del sitio",
       "bannerEnabledDescription": "Mostrar el banner de aviso a todos los visitantes. El texto del banner de abajo también debe estar configurado.",
       "bannerText": "Texto del banner del sitio",
-      "bannerTextDescription": "Banner de aviso mostrado a todos los visitantes en la parte superior de la aplicación. Déjelo vacío para no mostrar ningún banner.",
+      "bannerTextDescription": "Banner de aviso mostrado a todos los visitantes en la parte superior de la aplicación. Déjelo vacío para no mostrar ningún banner. Texto del enlace: [etiqueta](https://example.org).",
       "bannerColor": "Color del banner del sitio",
       "bannerColorDescription": "Color del banner de aviso.",
       "bannerColorWarning": "Advertencia (ámbar)",
@@ -557,7 +563,12 @@
       "privacyUrlDescription": "Se muestra como enlace en las páginas de inicio de sesión y registro. Déjalo vacío para ocultar el enlace. Debe ser una URL http(s) completa.",
       "logLevel": "Nivel de registro",
       "logJsonLabel": "Formato de registro (JSON)",
-      "logJsonDescription": "Registros de salida en formato JSON estructurado."
+      "logJsonDescription": "Registros de salida en formato JSON estructurado.",
+      "auditRetentionDays": "Retención del registro de auditoría (días)",
+      "auditRetentionDaysDescription": "Los registros de auditoría más antiguos que este número de días se eliminan automáticamente. Déjelo vacío para conservarlos siempre.",
+      "auditRetentionKeepForever": "Conservar siempre",
+      "auditRetentionInvalid": "Introduzca un número entero de días ({{min}} a {{max}}) o deje el campo vacío.",
+      "auditRetentionComplianceWarning": "Algunos regímenes de cumplimiento exigen conservar los registros de auditoría al menos {{days}} días."
     },
     "basemaps": {
       "title": "Mapas base",
@@ -580,8 +591,7 @@
       "apiKeyLabel": "Clave API",
       "apiKeyPlaceholder": "Opcional — requerida si la URL contiene {api_key}",
       "apiKeyHelp": "Use {api_key} en la URL del mosaico como marcador de posición. La clave se interpola en el servidor.",
-      "saved": "Mapas base guardados",
-      "saveFailed": "Error al guardar los mapas base"
+      "saved": "Mapas base guardados"
     },
     "mapDefaults": {
       "title": "Valores predeterminados del mapa",
@@ -591,9 +601,7 @@
       "longitude": "Longitud",
       "zoomLevel": "Nivel de zoom",
       "preview": "Vista previa",
-      "useCurrentView": "Usar vista actual",
-      "saved": "Valores predeterminados del mapa guardados",
-      "saveFailed": "Error al guardar los valores predeterminados del mapa"
+      "saved": "Valores predeterminados del mapa guardados"
     },
     "plugins": {
       "title": "Plugins de mapa",
@@ -621,8 +629,6 @@
     },
     "security": {
       "title": "Seguridad",
-      "cardTitle": "Límite de tasa de inicio de sesión",
-      "cardDescription": "Controla el número máximo de intentos de inicio de sesión por minuto por dirección IP.",
       "accessTokenExpire": "Duración del token de acceso (minutos)",
       "refreshTokenExpire": "Tiempo de inactividad de la sesión (días)",
       "loginRateLimitLabel": "Límite de tasa de inicio de sesión (por minuto)",
@@ -630,7 +636,6 @@
       "loginRateLimit": "Intentos de inicio de sesión por minuto",
       "loginRateLimitDescription": "Número máximo de solicitudes de inicio de sesión permitidas por minuto desde una única dirección IP (1–1000).",
       "saved": "Configuración de seguridad guardada",
-      "saveFailed": "Error al guardar la configuración de seguridad",
       "passwordLogin": "Permitir inicio de sesión con contraseña",
       "passwordLoginDescription": "Permite que los usuarios inicien sesión con usuario y contraseña. Desactivarlo obliga a usar un proveedor SSO, así que habilita uno antes. Los administradores aún pueden entrar con contraseña como acceso de emergencia.",
       "emailVerificationRequired": "Requerir verificación de correo",
@@ -656,7 +661,6 @@
       "unknownError": "Error desconocido"
     },
     "saved": "Configuración guardada",
-    "saveFailed": "Error al guardar la configuración",
     "resetDefaults": "Restablecer valores predeterminados",
     "tabs": {
       "general": "General",
@@ -671,14 +675,16 @@
     },
     "uploads": {
       "title": "Configuración de subida",
-      "cardTitle": "Límites de subida",
-      "cardDescription": "Configure el tamaño máximo de archivo y las extensiones permitidas.",
       "maxSizeMb": "Tamaño máximo de archivo (MB)",
       "maxSizeMbDescription": "Tamaño máximo en megabytes (1-10,000). Los cambios surten efecto en la siguiente subida.",
       "allowedExtensions": "Extensiones permitidas",
       "allowedExtensionsDescription": "Lista separada por comas de extensiones permitidas (ej. .zip,.gpkg,.geojson,.json,.csv,.tif,.tiff,.xlsx,.xls).",
       "tileCacheTtl": "TTL de caché de teselas (segundos)",
       "tileCacheTtlDescription": "Tiempo en segundos antes de que expiren las entradas de caché de teselas (0 = sin caché).",
+      "previousVersionsKept": "Versiones anteriores conservadas por conjunto de datos",
+      "previousVersionsKeptDescription": "Cuántas versiones reemplazadas de cada conjunto de datos se pueden restaurar, de 1 a 50. Al reducirlo, el almacenamiento se libera en el siguiente reemplazo o restauración de cada conjunto de datos.",
+      "invalidPreviousVersionsKept": "Introduzca un número entero de 1 a 50.",
+      "previousVersionsStorage": "Las versiones conservadas ocupan ahora {{size}}.",
       "perUserLimitsTitle": "Límites por usuario",
       "perUserLimitsDescription": "Límites aplicados a cada usuario al subir archivos. 0 = ilimitado.",
       "maxStoragePerUser": "Almacenamiento máximo por usuario",
@@ -689,8 +695,9 @@
       "invalidStorageQuantity": "Introduzca una cantidad equivalente a un número entero de bytes.",
       "maxDatasetsPerUser": "Conjuntos de datos máx. por usuario",
       "maxDatasetsPerUserDescription": "Número máximo de conjuntos de datos que cada usuario puede crear (0 = ilimitado).",
-      "saved": "Configuración de subida guardada",
-      "saveFailed": "Error al guardar la configuración de subida"
+      "maxStoryImageMbPerUser": "Almacenamiento máximo de imágenes de historias por usuario (MB)",
+      "maxStoryImageMbPerUserDescription": "El tamaño total de las imágenes que pueden contener las historias de un usuario, en megabytes (0 = ilimitado). Las imágenes ya guardadas se conservan; solo se rechazan las nuevas subidas y copias.",
+      "saved": "Configuración de subida guardada"
     },
     "oauth": {
       "title": "Proveedores OAuth",
@@ -799,6 +806,20 @@
       "registrationAdminConfirmDescription": "Todo registro con contraseña que verifique su correo se convertirá en administrador. Asegúrate de que es lo que quieres.",
       "signupAdminActivationDescription": "Después de este cambio, quienes se registren pueden convertirse en administradores sin que un administrador los apruebe. Asegúrate de que es lo que quieres.",
       "verificationNeedsRegistration": "Se aplica cuando el autorregistro está activado."
+    },
+    "storyFrames": {
+      "title": "Páginas incrustadas y vídeos en historias",
+      "description": "Sitios cuyas páginas y reproductores de vídeo pueden mostrar las historias en un marco. Los navegadores de los lectores los cargan directamente desde estos sitios. Sin sitios, los bloques de páginas incrustadas y vídeo están desactivados.",
+      "empty": "Todavía no hay sitios, así que los bloques de páginas incrustadas y vídeo están desactivados.",
+      "hostLabel": "Nombre de host del sitio",
+      "add": "Añadir sitio",
+      "invalid": "Introduce un nombre de host como media.example.org, sin https:// ni ruta. No se aceptan comodines.",
+      "duplicate": "Ese sitio ya está en la lista.",
+      "full": "La lista admite como máximo {{max}} sitios.",
+      "sameOrigin": "Conservar el origen del sitio",
+      "sameOriginHint": "Algunos reproductores de vídeo necesitan su propio origen para reproducir. El marco conserva ese origen adonde lo lleve el sitio, así que cualquier otro sitio aprobado que abra también lo recibe. Actívalo solo para un sitio en el que confíes con todos los sitios aprobados.",
+      "remove": "Quitar {{host}}",
+      "reloadHint": "Las páginas ya abiertas aplican la lista después de recargarlas."
     }
   },
   "infrastructure": {
@@ -809,17 +830,11 @@
     "tileCache": "Caché de teselas",
     "type": "Tipo",
     "status": "Estado",
-    "latency": "Latencia",
-    "ttl": "TTL",
     "cdn": "CDN",
-    "pooler": "Pooler",
-    "connected": "Conectado",
-    "disconnected": "Desconectado",
     "configured": "Configurado",
-    "notConfigured": "No configurado",
     "loading": "Cargando estado de infraestructura...",
     "errorLoading": "Error al cargar el estado de infraestructura",
-    "allOperational": "Todos los sistemas operativos",
+    "allOperational": "Todos los sistemas funcionan correctamente",
     "degraded": "Rendimiento degradado",
     "autoRefresh": "Se actualiza automáticamente cada 30s",
     "noCdn": "Sin CDN",
@@ -833,8 +848,7 @@
       "title": "SSO SAML",
       "description": "No disponible en esta compilación.",
       "heading": "SAML no está disponible",
-      "body": "Esta compilación de GeoLens admite cuentas locales y proveedores OAuth como Google, GitHub y OIDC genérico.",
-      "docsLink": "SAML no está disponible en esta compilación"
+      "body": "Esta compilación de GeoLens admite cuentas locales y proveedores OAuth como Google, GitHub y OIDC genérico."
     },
     "addProvider": "Añadir proveedor SAML",
     "loading": "Cargando proveedores SAML...",
@@ -894,5 +908,66 @@
   "sortable": {
     "sortAscending": "ordenar de forma ascendente",
     "sortDescending": "ordenar de forma descendente"
+  },
+  "groups": {
+    "title": "Grupos",
+    "listHeading": "Grupos para compartir",
+    "errorLoading": "No se pudieron cargar los grupos: {{message}}",
+    "nameLabel": "Nombre del grupo",
+    "actionsFor": "Acciones del grupo {{name}}",
+    "table": {
+      "name": "Nombre",
+      "members": "Miembros",
+      "created": "Creado",
+      "actions": "Acciones",
+      "manageMembers": "Miembros",
+      "memberCount_one": "{{count}} miembro",
+      "memberCount_other": "{{count}} miembros"
+    },
+    "empty": {
+      "title": "Aún no hay grupos",
+      "hint": "Cree un grupo, añada personas y comparta con él conjuntos de datos, mapas e historias."
+    },
+    "create": {
+      "button": "Crear grupo",
+      "title": "Crear grupo",
+      "description": "Los grupos permiten compartir conjuntos de datos, mapas e historias restringidos con un conjunto de personas."
+    },
+    "rename": {
+      "button": "Renombrar",
+      "title": "Renombrar grupo",
+      "description": "Elija un nombre nuevo para {{name}}."
+    },
+    "delete": {
+      "title": "¿Eliminar {{name}}?",
+      "description_one": "Este grupo tiene {{count}} miembro. Pierde de inmediato el acceso a los conjuntos de datos, mapas e historias compartidos con el grupo. Esta acción no se puede deshacer.",
+      "description_other": "Este grupo tiene {{count}} miembros. Pierden de inmediato el acceso a los conjuntos de datos, mapas e historias compartidos con el grupo. Esta acción no se puede deshacer.",
+      "deleting": "Eliminando..."
+    },
+    "members": {
+      "title": "Miembros de {{name}}",
+      "description": "Las personas de este grupo pueden abrir los conjuntos de datos, mapas e historias compartidos con él.",
+      "addLabel": "Añadir una persona",
+      "listHeading_one": "{{count}} miembro",
+      "listHeading_other": "{{count}} miembros",
+      "listLabel": "Miembros de {{name}}",
+      "removeLabel": "Quitar a {{name}} de {{group}}",
+      "empty": "Este grupo aún no tiene miembros.",
+      "added": "{{name}} añadido",
+      "removed": "{{name}} quitado",
+      "errorLoading": "No se pudieron cargar los miembros: {{message}}",
+      "needsUserManagement": "Añadir personas requiere permiso de gestión de usuarios. Aún puede ver y quitar miembros."
+    },
+    "picker": {
+      "placeholder": "Buscar por nombre de usuario",
+      "noMatches": "No hay personas que coincidan",
+      "results_one": "{{count}} persona disponible",
+      "results_other": "{{count}} personas disponibles"
+    },
+    "toasts": {
+      "created": "Grupo creado",
+      "renamed": "Grupo renombrado",
+      "deleted": "Grupo eliminado"
+    }
   }
 }

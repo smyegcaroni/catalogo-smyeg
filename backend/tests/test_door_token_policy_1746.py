@@ -1,25 +1,25 @@
-"""fix(#1746): every door judges a service token by the worker's policy.
+"""Every door judges a service token by the worker's policy.
 
-#1277 gave the REFRESH door the shared header-token policy from
+The REFRESH door applies the shared header-token policy from
 ``app.core.service_tokens``: a WFS or OGC API credential becomes an
 ``Authorization`` header line reaching libcurl through GDAL, so it is pinned to
 the base64url charset with a length floor, and a token outside that set is
 refused with 422 ``invalid_service_token`` before anything is staged.
 
-The other three doors were never widened to match, and each failed differently:
+The other three doors must match it, because each would fail differently:
 
-- **import commit** and **re-upload commit** went straight to
-  ``resolve_dispatch_credential``, so a token containing ``+`` or ``/`` was
-  answered 202, its single-use secret was consumed, and the job then failed
-  deterministically inside ogr2ogr's own charset check with the credential
-  already spent — a retry needs a new token, and the first one is gone.
-- **service preview** judged the same token by ``_validate_safe_token``
-  (printable, no whitespace), so a credential that could never import previewed
-  cleanly and the refusal arrived a screen later.
+- **import commit** and **re-upload commit** going straight to
+  ``resolve_dispatch_credential`` would answer 202 for a token containing ``+``
+  or ``/``, consume its single-use secret, and then fail deterministically
+  inside ogr2ogr's own charset check with the credential already spent — a
+  retry needs a new token, and the first one is gone.
+- **service preview** judging the same token by ``_validate_safe_token``
+  (printable, no whitespace) would preview cleanly a credential that could
+  never import, and the refusal would arrive a screen later.
 
 Each test asserts three things, because they can regress independently: the
 status and code, that the body carries the POLICY and not the credential, and
-that the door stopped before the side effect it used to perform.
+that the door stopped before the side effect it would otherwise perform.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ from tests.test_import_token_lease_1676 import (  # noqa: F401
     credential_backend,
 )
 
-# fix(#1746 codex r2): autouse where imported — keeps the bearer header file the
+# Autouse where imported — keeps the bearer header file the
 # preview tests below write out of the real /tmp/gdal-auth.
 from tests.test_ogr_subprocess_env import gdal_header_tmpdir  # noqa: F401
 
@@ -122,7 +122,7 @@ def _assert_policy_without_the_token(resp, secret: str) -> None:
 
 
 def _wfs_bearer(token: str) -> ServiceCredential:
-    """The bearer credential a WFS door hands the preview path (fix(#1746))."""
+    """The bearer credential a WFS door hands the preview path."""
     return ServiceCredential(
         method=CredentialMethod.BEARER, service_format="wfs", token=token
     )
@@ -164,7 +164,7 @@ class TestImportCommitDoor:
         test_db_session,
         credential_backend,  # noqa: F811
     ) -> None:
-        """fix(#1746 codex r1): the refusal must land before the metadata write.
+        """The refusal must land before the metadata write.
 
         ``commit_import`` writes ``service_auth_required`` into
         ``user_metadata`` and commits it BEFORE dispatching, and that key is a
@@ -442,7 +442,7 @@ class TestServicePreviewDoor:
     async def test_an_accepted_token_writes_its_header_file_to_the_tmpfs_dir(
         self, client: AsyncClient, monkeypatch, tmp_path
     ) -> None:
-        """fix(#1746) finding 16: the header file's directory is named, not inherited.
+        """The header file's directory is named, not inherited.
 
         The file holds an ``Authorization`` header line, and ``mkstemp`` with no
         ``dir=`` lands wherever ``tempfile.tempdir`` happens to point. That is
@@ -452,7 +452,7 @@ class TestServicePreviewDoor:
         present, since it silently declines to move ``tempfile.tempdir``
         otherwise.
 
-        fix(#1746 codex r2): and the named directory is ``gdal_header_dir()``,
+        And the named directory is ``gdal_header_dir()``,
         the container tmpfs — never ``upload_staging_dir``, which is a
         persistent volume ``scripts/backup-entrypoint.sh`` tars every cycle. A
         crash-orphaned bearer header on that volume can reach a backup.

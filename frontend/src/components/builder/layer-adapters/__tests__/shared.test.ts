@@ -1,7 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
-  syncLayerFilter,
-  setLayerProperty,
   syncOwnedLayoutProperties,
   syncOwnedPaintProperties,
   simplifyPaint,
@@ -13,106 +11,13 @@ import {
   getFeatureOpacity,
 } from '../shared';
 import type { LayoutPropertyName, PaintPropertyName } from '../shared';
-import type { FilterSpecification } from 'maplibre-gl';
 
-// fix(#846): the ownership options now carry the real MapLibre key unions, which is
+// The ownership options now carry the real MapLibre key unions, which is
 // accurate for every production caller (each passes a curated `as const` tuple). The
 // two tests below deliberately feed a builder-private `_`-prefixed key to prove the
 // runtime guards still drop it, so they assert past the narrowed type on purpose.
 const asPaintProperty = (key: string) => key as PaintPropertyName;
 const asLayoutProperty = (key: string) => key as LayoutPropertyName;
-
-function createMockMap(layerExists = true) {
-  const setFilterCalls: Array<[string, FilterSpecification | null | undefined]> = [];
-  return {
-    getLayer: vi.fn().mockReturnValue(layerExists ? { id: 'mock-layer' } : undefined),
-    setFilter: vi.fn().mockImplementation((id: string, filter: FilterSpecification | null | undefined) => {
-      setFilterCalls.push([id, filter]);
-    }),
-    _setFilterCalls: setFilterCalls,
-  };
-}
-
-describe('syncLayerFilter', () => {
-  it('Test 1: calls setFilter with the provided filter expression when non-empty', () => {
-    const map = createMockMap();
-    const filter: FilterSpecification = ['==', ['get', 'foo'], 1];
-    syncLayerFilter(map as unknown as import('maplibre-gl').Map, 'L', filter);
-    expect(map.setFilter).toHaveBeenCalledTimes(1);
-    expect(map.setFilter).toHaveBeenCalledWith('L', filter);
-  });
-
-  it('Test 2: calls setFilter with null when filter is null', () => {
-    const map = createMockMap();
-    syncLayerFilter(map as unknown as import('maplibre-gl').Map, 'L', null);
-    expect(map.setFilter).toHaveBeenCalledTimes(1);
-    expect(map.setFilter).toHaveBeenCalledWith('L', null);
-  });
-
-  it('Test 3: calls setFilter with null when filter is undefined', () => {
-    const map = createMockMap();
-    syncLayerFilter(map as unknown as import('maplibre-gl').Map, 'L', undefined);
-    expect(map.setFilter).toHaveBeenCalledTimes(1);
-    expect(map.setFilter).toHaveBeenCalledWith('L', null);
-  });
-
-  it('Test 4: calls setFilter with null when filter is an empty array', () => {
-    const map = createMockMap();
-    syncLayerFilter(map as unknown as import('maplibre-gl').Map, 'L', []);
-    expect(map.setFilter).toHaveBeenCalledTimes(1);
-    expect(map.setFilter).toHaveBeenCalledWith('L', null);
-  });
-
-  it('Test 5: is a no-op when the layer does not exist (does not throw)', () => {
-    const map = createMockMap(false);
-    expect(() => {
-      syncLayerFilter(map as unknown as import('maplibre-gl').Map, 'missing-layer', ['==', ['get', 'x'], 1]);
-    }).not.toThrow();
-    expect(map.setFilter).not.toHaveBeenCalled();
-  });
-});
-
-// --- setLayerProperty ---
-
-function createMockMapForSetLayerProperty() {
-  return {
-    setPaintProperty: vi.fn(),
-    setLayoutProperty: vi.fn(),
-  };
-}
-
-describe('setLayerProperty', () => {
-  it('Test 1: calls setPaintProperty exactly once with the given args (default kind=paint)', () => {
-    const map = createMockMapForSetLayerProperty();
-    setLayerProperty(map as unknown as import('maplibre-gl').Map, 'L', 'fill-color', '#ff0000');
-    expect(map.setPaintProperty).toHaveBeenCalledTimes(1);
-    expect(map.setPaintProperty).toHaveBeenCalledWith('L', 'fill-color', '#ff0000');
-    expect(map.setLayoutProperty).not.toHaveBeenCalled();
-  });
-
-  it('Test 2: calls setLayoutProperty when kind is layout', () => {
-    const map = createMockMapForSetLayerProperty();
-    setLayerProperty(map as unknown as import('maplibre-gl').Map, 'L', 'visibility', 'visible', 'layout');
-    expect(map.setLayoutProperty).toHaveBeenCalledTimes(1);
-    expect(map.setLayoutProperty).toHaveBeenCalledWith('L', 'visibility', 'visible');
-    expect(map.setPaintProperty).not.toHaveBeenCalled();
-  });
-
-  it('Test 3: catches and does NOT re-throw when setPaintProperty throws', () => {
-    const map = createMockMapForSetLayerProperty();
-    map.setPaintProperty.mockImplementation(() => { throw new Error('boom'); });
-    expect(() => {
-      setLayerProperty(map as unknown as import('maplibre-gl').Map, 'L', 'fill-opacity', 0.5);
-    }).not.toThrow();
-  });
-
-  it('Test 4: default kind is paint — omitting the 5th arg routes to setPaintProperty', () => {
-    const map = createMockMapForSetLayerProperty();
-    setLayerProperty(map as unknown as import('maplibre-gl').Map, 'L', 'line-width', 2);
-    expect(map.setPaintProperty).toHaveBeenCalledWith('L', 'line-width', 2);
-    expect(map.setLayoutProperty).not.toHaveBeenCalled();
-  });
-});
 
 function createMockMapForReconciler() {
   const paintState = new Map<string, unknown>();
@@ -364,7 +269,7 @@ describe('normalizeRasterBounds (ADAPT-01)', () => {
     expect(normalizeRasterBounds([1, 2, 3, 4, 5])).toBeUndefined();
   });
 
-  // fix(#903): a MapLibre source `bounds` takes one increasing box, so an
+  // A MapLibre source `bounds` takes one increasing box, so an
   // antimeridian-crossing pair matches no tile and the layer renders blank.
   it('widens a seam-crossing pair to the monotonic world span', () => {
     expect(normalizeRasterBounds([178.5, -20, -178.5, -15])).toEqual([-180, -20, 180, -15]);
@@ -424,7 +329,7 @@ describe('syncOwnedLayoutProperties', () => {
   });
 });
 
-// fix(#1625): the single branch point for the master-opacity split.
+// The single branch point for the master-opacity split.
 describe('applyMasterOpacity (#1625)', () => {
   const expr = ['step', ['zoom'], 0.2, 9, 0.7];
 
@@ -457,10 +362,10 @@ describe('applyMasterOpacity (#1625)', () => {
     expect(map.setPaintProperty.mock.calls).toEqual([['L', 'circle-opacity', 0.4]]);
   });
 
-  it('circle: an expression per-feature opacity is wrapped in ["*", expr, master]', () => {
+  it('circle: a zoom-stepped per-feature opacity has its outputs scaled by the master', () => {
     const map = { setPaintProperty: vi.fn() };
     applyMasterOpacity(map, 'L', { 'circle-opacity': expr }, 'circle', 0.5);
-    expect(map.setPaintProperty.mock.calls).toEqual([['L', 'circle-opacity', ['*', expr, 0.5]]]);
+    expect(map.setPaintProperty.mock.calls).toEqual([['L', 'circle-opacity', ['step', ['zoom'], 0.1, 9, 0.35]]]);
   });
 });
 
@@ -476,10 +381,12 @@ describe('getFeatureOpacity / getExpressionSafeOpacity', () => {
     expect(getFeatureOpacity({ 'fill-opacity': '0.5' }, 'fill')).toBe(0.3);
   });
 
-  it('getExpressionSafeOpacity multiplies a number and wraps an expression (skipping the wrap at master 1)', () => {
+  it('getExpressionSafeOpacity multiplies a number, scales a zoom step, and wraps a data expression (skipping both at master 1)', () => {
     const expr = ['step', ['zoom'], 0.2, 9, 0.7];
+    const byValue = ['get', 'opacity'];
     expect(getExpressionSafeOpacity({ 'circle-opacity': 0.8 }, 'circle', 0.5)).toBeCloseTo(0.4);
-    expect(getExpressionSafeOpacity({ 'circle-opacity': expr }, 'circle', 0.5)).toEqual(['*', expr, 0.5]);
+    expect(getExpressionSafeOpacity({ 'circle-opacity': expr }, 'circle', 0.5)).toEqual(['step', ['zoom'], 0.1, 9, 0.35]);
+    expect(getExpressionSafeOpacity({ 'circle-opacity': byValue }, 'circle', 0.5)).toEqual(['*', byValue, 0.5]);
     expect(getExpressionSafeOpacity({ 'circle-opacity': expr }, 'circle', 1)).toBe(expr);
     expect(getExpressionSafeOpacity({}, 'fill', 0.5)).toBeCloseTo(0.15);
   });

@@ -5,13 +5,12 @@ import type { DraggableAttributes, DraggableSyntheticListeners } from '@dnd-kit/
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
-// builder-audit #338 STACK-04: shared 6-cell grid template for every stack row
-// (StackRow, FolderGroupRow, BasemapGroupRow). Hoisted to one const so a
-// column-width change happens in a single place. SublayerRow keeps its own
-// 7-column variant (it carries an extra indicator/opacity cell).
+// Shared 6-cell grid template for every stack row (StackRow, FolderGroupRow,
+// BasemapGroupRow). SublayerRow keeps its own 7-column variant (an extra
+// indicator/opacity cell).
 export const STACK_ROW_GRID = 'grid-cols-[16px_14px_22px_22px_1fr_22px]';
 
-// fix(#585): right-click (and Shift+F10 / ContextMenu key) on a stack row opens
+// Right-click (and Shift+F10 / ContextMenu key) on a stack row opens
 // its existing kebab menu, so row actions are reachable without discovering the
 // hover-revealed kebab. Shared by StackRow, FolderGroupRow, and BasemapGroupRow:
 // spread the returned `open`/`onOpenChange` onto the row's <DropdownMenu>, wire
@@ -42,9 +41,8 @@ export interface DragHandleProps {
   setActivatorNodeRef: (node: HTMLButtonElement | null) => void;
 }
 
-// builder-audit #338 STACK-04: shared selected / hover / dragging tint block. All
-// three rows previously copy-pasted near-identical cn() expressions; the
-// `--surface-2` theme fallback variant is the superset and is used everywhere.
+// Shared selected / hover / dragging tint block for all three rows. The
+// `--surface-2` theme fallback variant is the superset.
 export function rowStateClasses({
   selected,
   isDragging = false,
@@ -70,7 +68,7 @@ interface DragGripButtonProps {
   touchReveal?: boolean;
   testId?: string;
   className?: string;
-  /** fix(#759): reflects a row-level keyboard-reorder mode on the grip, so
+  /** Reflects a row-level keyboard-reorder mode on the grip, so
    *  screen readers hear the armed/disarmed state of the toggle. */
   ariaPressed?: boolean;
   onClick?: (e: MouseEvent<HTMLButtonElement>) => void;
@@ -78,9 +76,8 @@ interface DragGripButtonProps {
   onBlur?: (e: FocusEvent<HTMLButtonElement>) => void;
 }
 
-// builder-audit #338 STACK-04: the grip <button> + its load-bearing dnd-kit warning
-// previously lived (copy-pasted) in StackRow, FolderGroupRow, and BasemapGroupRow.
-// Consolidated here so the warning is stated once and cannot drift.
+// The grip <button> and its load-bearing dnd-kit warning, stated once for
+// StackRow, FolderGroupRow and BasemapGroupRow.
 export function DragGripButton({
   dragHandleProps,
   ariaLabel,
@@ -100,9 +97,9 @@ export function DragGripButton({
       {...dragHandleProps.attributes}
       {...(listenersSuppressed ? {} : dragHandleProps.listeners)}
       aria-label={ariaLabel}
-      // Only override when the row drives a reorder mode — an unconditional
-      // undefined would erase the aria-pressed dnd-kit manages in
-      // `attributes` (the same later-prop-wins trap this file just fixed).
+      // Only override when the row drives a reorder mode: an unconditional
+      // undefined would erase the aria-pressed dnd-kit manages in `attributes`
+      // (the later-prop-wins trap described below).
       {...(ariaPressed !== undefined ? { 'aria-pressed': ariaPressed } : {})}
       data-testid={testId}
       {...(touchReveal ? { 'data-touch-reveal': '' } : {})}
@@ -112,23 +109,22 @@ export function DragGripButton({
         listenersSuppressed && 'cursor-not-allowed opacity-20',
         className,
       )}
-      // 2026-05-18 (builder-audit #338 STACK-04): do NOT add onPointerDown={stopPropagation}
-      // here — it overrides dnd-kit's PointerSensor activator (spread above) and breaks
-      // pointer drag entirely. onClick stopPropagation alone suppresses row selection on
+      // Do NOT add onPointerDown={stopPropagation} here: it overrides dnd-kit's
+      // PointerSensor activator (spread above) and breaks pointer drag
+      // entirely. onClick stopPropagation alone suppresses row selection on
       // grip click; pointer events do not trigger onClick handlers.
       onClick={onClick ?? ((e) => e.stopPropagation())}
-      // fix(#759): second occurrence of the props-after-listeners-spread trap
-      // (first: #525). A later JSX prop wins even when undefined, so an
-      // unconditional onKeyDown here destroyed the dnd-kit KeyboardSensor
-      // activator on EVERY row — folder and basemap groups, which pass no
-      // custom handler, were left pointer-only. Compose instead: the row's
-      // handler runs first, and the sensor only sees keys the row didn't
-      // claim (StackRow's fallback mode preventDefaults the keys it owns).
-      // codex(#794 round 3): a CLAIMED key must also stop bubbling — both the
-      // sensor's activator and the custom handlers preventDefault when they
-      // take a key, and the enclosing rows (folder multi-select, basemap
-      // select) handle the same Space/Enter without checking defaultPrevented,
-      // so a keyboard drag would simultaneously fire a conflicting row action.
+      // Later-prop-wins trap: a JSX prop after the listeners spread wins even
+      // when undefined, so an unconditional onKeyDown here would destroy the
+      // dnd-kit KeyboardSensor activator on EVERY row (folder and basemap
+      // groups pass no custom handler and would be pointer-only). Compose
+      // instead: the row's handler runs first, and the sensor only sees keys
+      // the row didn't claim (StackRow's fallback mode preventDefaults the keys
+      // it owns). A CLAIMED key must also stop bubbling: both the sensor's
+      // activator and the custom handlers preventDefault when they take a key,
+      // and the enclosing rows (folder multi-select, basemap select) handle the
+      // same Space/Enter without checking defaultPrevented, so a keyboard drag
+      // would also fire a conflicting row action.
       onKeyDown={(e) => {
         onKeyDown?.(e);
         if (!e.defaultPrevented && !listenersSuppressed) {
@@ -143,22 +139,19 @@ export function DragGripButton({
   );
 }
 
-// fix(#585): ONE inline delete-confirmation pattern for stack rows. StackRow
-// and FolderGroupRow previously rendered two visually different confirm boxes
-// for the same interaction; this is the single shared shape (destructive-tint
-// box, small buttons, cancel autofocused per AUD-09 so Enter dismisses rather
-// than destroys). BulkActionBar keeps its horizontal single-line variant — its
-// confirm lives INSIDE the fixed-height toolbar, not below a row.
-// ux(#777): the builder-wide destructive-confirm order is safe action first
-// (left), destructive action last (right) — the same Cancel-then-Action order
-// every ui/alert-dialog footer in the app renders. The DEM editor footer,
-// basemap-sublayer reset, and render-as confirms mount this component (with a
-// container-specific className) instead of hand-rolling their own.
+// ONE inline delete-confirmation pattern for stack rows (StackRow,
+// FolderGroupRow): destructive-tint box, small buttons, cancel autofocused so
+// Enter dismisses rather than destroys. BulkActionBar keeps its horizontal
+// single-line variant because its confirm lives INSIDE the fixed-height
+// toolbar, not below a row. The builder-wide destructive-confirm order is safe
+// action first (left), destructive last (right), as every ui/alert-dialog
+// footer renders. The DEM editor footer, basemap-sublayer reset and render-as
+// confirms mount this component (with a container-specific className).
 //
-// fix(#788): NOT an alertdialog — it is inline and non-modal (no aria-modal, no
-// focus trap), so claiming the role promised dismissal semantics it didn't
-// have. role="group" + role="alert" on the message announces the confirm when
-// it appears, and Escape cancels it here (consumed, so it cannot bubble on to
+// NOT an alertdialog: it is inline and non-modal (no aria-modal, no focus
+// trap), so that role would promise dismissal semantics it doesn't have.
+// role="group" + role="alert" on the message announces the confirm when it
+// appears, and Escape cancels it here (consumed, so it cannot bubble on to
 // ancestor Escape handlers while the confirm is pending).
 interface InlineDeleteConfirmProps {
   /** ids the aria-labelledby / message paragraph; must be unique per row. */
@@ -204,7 +197,7 @@ export function InlineDeleteConfirm({
           size="sm"
           variant="ghost"
           onClick={onCancel}
-          // eslint-disable-next-line jsx-a11y/no-autofocus -- focus on the safe action so Enter dismisses, not destroys (AUD-09)
+          // eslint-disable-next-line jsx-a11y/no-autofocus -- focus on the safe action so Enter dismisses, not destroys
           autoFocus
         >
           {cancelLabel}

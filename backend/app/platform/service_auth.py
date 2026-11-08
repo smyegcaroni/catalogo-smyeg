@@ -1,6 +1,6 @@
 """Which service credential methods this build can carry, and on what.
 
-feat(#1746). ``core/service_tokens.py`` says what a credential may LOOK
+``core/service_tokens.py`` says what a credential may LOOK
 like and how one header is composed from it. This module answers the
 narrower question every door has to answer before it writes anything: of
 the methods a caller can describe, which can the transport under this
@@ -19,7 +19,7 @@ import each other: ``modules/catalog`` for the probe/preview/re-upload/
 refresh doors, ``processing/ingest`` for the queue-time check, and
 ``platform/refresh`` for the dispatch decision. All of them may import here.
 
-Two entry points, split per plan D9. :func:`credential_or_422` judges the
+Two entry points. :func:`credential_or_422` judges the
 INPUTS and hands back the credential for a transport that composes its
 own header at the write site (the two probe adapters, two GDAL
 header-file writers) — the single-producer rule
@@ -36,11 +36,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.coded_errors import CodedValueError
+from app.core.config import canonical_service_host, settings
 from app.core.service_tokens import (
     BASIC_USERNAME_POLICY,
     CREDENTIAL_METHOD_POLICY,
@@ -69,9 +71,8 @@ UNSUPPORTED_AUTH_METHOD_POLICY = (
     "for a token and nothing else. Use a bearer token for it."
 )
 
-# fix(#1760): the request schema's rule, restated for callers that never
-# pass through it. Reuses `invalid_service_token` rather than minting a
-# code for a case that means what that one means.
+# The request schema's rule, restated for callers that never pass through
+# it, under the same `invalid_service_token` code.
 BLANK_BEARER_TOKEN_CODE = INVALID_SERVICE_TOKEN_CODE
 
 BLANK_BEARER_TOKEN_POLICY = (
@@ -111,7 +112,7 @@ def bearer_token_for_credential(credential: ServiceCredential | None) -> str | N
     ``""`` would send an anonymous request on behalf of someone who named
     a method. The request schema already refuses that shape, so this
     branch is unreachable over HTTP and exists for the in-process caller
-    of plan D2, which builds a :class:`ServiceCredential` directly.
+    that builds a :class:`ServiceCredential` directly.
     """
     if credential is None:
         return None
@@ -129,8 +130,8 @@ def bearer_token_for_credential(credential: ServiceCredential | None) -> str | N
 def credential_input_rejection(credential: ServiceCredential) -> str | None:
     """Why the values in *credential* cannot become a header, or None.
 
-    The door's half of plan 3.5: judge what the caller TYPED, letting
-    composition happen afterwards. A composed basic line contains a space
+    Judges what the caller TYPED, letting composition happen afterwards.
+    A composed basic line contains a space
     and a colon, so a validator applied to the line instead would reject
     the very thing it exists to protect — at the door or, worse, in the
     worker after the single-use credential has been spent.
@@ -145,9 +146,9 @@ def credential_input_rejection(credential: ServiceCredential) -> str | None:
     if method == CredentialMethod.BEARER:
         if not credential.token:
             return BLANK_BEARER_TOKEN_POLICY
-        # fix(#1764): through the builder's own rule, which picks the charset
-        # by service format. Applying the GDAL header-file charset here
-        # refused a STAC key holding `+` or `/` that the builder accepts.
+        # Through the builder's own rule, which picks the charset by service
+        # format; the GDAL header-file charset would refuse a STAC key holding
+        # `+` or `/` that the builder accepts.
         return bearer_token_rejection_reason(credential)
     if method == CredentialMethod.BASIC:
         for supplied in (credential.username, credential.password):
@@ -171,19 +172,16 @@ def service_carries_method(
 ) -> bool:
     """Whether a service of this KIND can present a credential of this METHOD.
 
-    fix(#1746): the one mapping, so the probe door and the probe itself
-    can't disagree about it. It had been expressed twice, differently: the
-    door inferred the service kind from URL text and refused there, while
-    `detect_service_type` refused the same methods after detection — a
-    WFS served from a path containing `FeatureServer` was refused a
-    credential it supports, before anything asked the service what it is.
+    The one mapping, so the probe door and the probe itself can't disagree.
+    Inferring the service kind from URL text instead would refuse a WFS
+    served from a path containing `FeatureServer` a credential it supports.
 
     Bearer travels either way: it fits a URL query and a header line.
     Basic and a named API key exist only as a header, so they need a
     service kind whose credential travels as one. Anything else is a
     method this build doesn't know how to send anywhere.
 
-    feat(#1764): the header-or-query question is
+    The header-or-query question is
     ``carries_credential_as_header_line``, not the GDAL header-file one —
     STAC carries all three methods and writes no header file.
     """
@@ -208,7 +206,7 @@ def credential_or_422(
     ``service_format`` is bound onto the returned credential rather than
     left to the caller to pass again, since it decides whether a header
     may be composed at all: ``build_credential_header`` reads it and
-    answers None outside ``HEADER_TRANSPORT_SERVICE_FORMATS``, plan D9's
+    answers None outside ``HEADER_TRANSPORT_SERVICE_FORMATS``, the
     ArcGIS invariant expressed as an allowlist.
     """
     if credential is None or credential.method == CredentialMethod.NONE:
@@ -230,34 +228,27 @@ def wire_credential(
 ) -> str | None:
     """The one string that crosses to the worker under the kwarg ``token``.
 
-    Plan D9. For the two header-auth formats that's a finished ASCII header
+    For the two header-auth formats that's a finished ASCII header
     line, composed here since the queue hop has no site to compose it
-    later; for ArcGIS it's the bare token, percent-encoded into the query
-    exactly as before. Validation happens first either way, so a
+    later; for ArcGIS it's the bare token, percent-encoded into the query.
+    Validation happens first either way, so a
     credential that can't work never reserves a run or burns a
     single-use stash.
 
     ``service_format`` defaults to the one already on the credential,
-    which is what an in-process caller of plan D2 sets when constructing
+    which is what an in-process caller sets when constructing
     one directly.
 
-    fix(#1840): the ArcGIS branch is selected by
-    ``requires_header_token_policy``, NOT by "the builder answered None".
-    Lane C2 taught ``build_credential_header`` to compose an
-    ``X-Esri-Authorization: Bearer`` header for ArcGIS (for GeoLens's own
-    httpx requests — a different transport) and that silently killed the
-    branch below: this handed the worker ``Authorization: Bearer <token>``
-    as ``token``, which ``build_gdal_source`` then percent-encoded into
-    ``&token=Authorization%3A+Bearer+...``, breaking every authenticated
-    ArcGIS ingest/refresh/reupload at the origin after the single-use
-    credential was already spent. This function asks whether the
-    credential becomes a header LINE — that's what
-    ``requires_header_token_policy``/``HEADER_AUTH_SERVICE_FORMATS``
-    answer; asking the builder was a proxy for it that stopped being
-    equivalent.
+    The ArcGIS branch is selected by ``carries_credential_as_header_line``,
+    NOT by "the builder answered None": ``build_credential_header`` composes
+    an ``X-Esri-Authorization: Bearer`` header for ArcGIS (for GeoLens's own
+    httpx requests, a different transport). Handed to the worker as
+    ``token``, that line would be percent-encoded by ``build_gdal_source``
+    into ``&token=Authorization%3A+Bearer+...`` and fail at the origin after
+    the single-use credential is spent.
 
-    feat(#1764): the predicate widened to
-    ``carries_credential_as_header_line`` so a STAC refresh crosses as a
+    That predicate is wider than ``requires_header_token_policy`` by
+    exactly STAC, so a STAC refresh crosses as a
     line too; its worker recovers the credential with
     ``credential_from_header_line`` and composes at each write site.
     """
@@ -295,12 +286,79 @@ def url_query_token(credential: ServiceCredential | None) -> str | None:
     return credential.token
 
 
+CREDENTIAL_OVER_HTTP_CODE = "credential_over_http"
+
+CREDENTIAL_OVER_HTTP_POLICY = (
+    "This service address uses plain HTTP, so GeoLens won't send a credential "
+    "to it. Use the service's https:// address, or ask an administrator to "
+    "list its host in SERVICE_CREDENTIALS_ALLOW_HTTP_HOSTS."
+)
+
+
+class CredentialOverHttpError(CodedValueError):
+    """A credential was about to be sent to an address that isn't https."""
+
+    field = "url"
+
+    def __init__(self) -> None:
+        super().__init__(CREDENTIAL_OVER_HTTP_CODE, CREDENTIAL_OVER_HTTP_POLICY)
+
+
+def _http_host_allowed(url: str) -> bool:
+    """Whether the operator listed *url*'s host, or host and port, for http."""
+    try:
+        parts = urlsplit(url)
+        host, port = canonical_service_host(parts.hostname or ""), parts.port or 80
+    except ValueError:
+        return False
+    return host is not None and any(
+        allowed == host and allowed_port in (None, port)
+        for allowed, allowed_port in settings.http_credential_hosts
+    )
+
+
+def refuse_credential_over_http(
+    url: str | None, credential: ServiceCredential | str | None
+) -> None:
+    """Raise :class:`CredentialOverHttpError` when *credential* would go to
+    *url* unencrypted.
+
+    *credential* is a :class:`ServiceCredential` or the string that carries
+    one (a token or a header line). Nothing is refused without both a URL and
+    a credential, and an http host listed in
+    ``SERVICE_CREDENTIALS_ALLOW_HTTP_HOSTS`` passes.
+    """
+    if isinstance(credential, ServiceCredential):
+        carries = credential.method != CredentialMethod.NONE
+    else:
+        carries = bool(credential)
+    if not url or not carries:
+        return
+    scheme = urlsplit(url).scheme.lower()
+    if scheme == "https" or (scheme == "http" and _http_host_allowed(url)):
+        return
+    raise CredentialOverHttpError
+
+
+def credential_over_http_or_422(
+    url: str | None, credential: ServiceCredential | str | None
+) -> None:
+    """:func:`refuse_credential_over_http` as a door's coded 422."""
+    try:
+        refuse_credential_over_http(url, credential)
+    except CredentialOverHttpError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": exc.code, "message": exc.message, "field": exc.field},
+        ) from None
+
+
 def custom_credential_header_name(
     credential: ServiceCredential | None,
 ) -> str | None:
     """The header name an httpx client must refuse to follow a redirect with.
 
-    Plan section 5 rule A, httpx half. ``Authorization`` needs nothing:
+    ``Authorization`` needs nothing:
     httpx drops it on a cross-origin redirect by itself. A name the
     SERVICE chose is forwarded verbatim, so ``make_safe_client`` must be
     told about it, and fails the hop closed rather than handing the key
@@ -323,15 +381,14 @@ def bearer_credential(token: str | None) -> ServiceCredential | None:
     return ServiceCredential(method=CredentialMethod.BEARER, token=token)
 
 
-# The request-side spelling of the same thing. feat(#1746): moved here
-# from `modules/catalog/sources/schemas.py`, unchanged, for the same
-# reason the gate above lives here — `processing/ingest` may not import
+# The request-side spelling of the same thing. It lives here for the same
+# reason the gate above does: `processing/ingest` may not import
 # `app.modules.catalog.*`. `sources/schemas.py` imports it back, so every
-# existing import path and the OpenAPI component name are unchanged.
+# import path and the OpenAPI component name stay the same.
 
 
 def _validate_safe_token(v: str | None) -> str | None:
-    """Reject control characters / whitespace in auth tokens (SEC-021).
+    """Reject control characters / whitespace in auth tokens.
 
     Tokens flow into a GDAL_HTTP_HEADER_FILE (WFS/OAPIF bearer) and into
     service query URLs (ArcGIS). A CR/LF or other control character could
@@ -355,8 +412,7 @@ def _validate_safe_token(v: str | None) -> str | None:
     return v
 
 
-# ---------------------------------------------------------------------------
-# feat(#1746): the structured `auth` object every service door accepts, and the
+# The structured `auth` object every service door accepts, and the
 # deprecated flat `token` that means the same thing for a bearer credential.
 #
 # One model, imported by the re-upload and refresh request models too, so
@@ -428,10 +484,10 @@ _SERVICE_AUTH_SHAPES: dict[str, tuple[frozenset[str], str]] = {
 def _names_a_credential(value: str | None) -> bool:
     """Whether *value* is a credential the caller actually supplied.
 
-    fix(#1760): an empty or whitespace-only string is not one. It used to
-    count as supplied, so ``{"method": "bearer", "token": ""}`` passed the
-    shape check, every downstream test being a truthiness test, so the
-    door contacted the origin with no credential at all — anonymous
+    An empty or whitespace-only string is not one. Counting it as
+    supplied would let ``{"method": "bearer", "token": ""}`` pass the
+    shape check, every downstream test being a truthiness test, and the
+    door would contact the origin with no credential at all: anonymous
     despite a named method, answering 401 in a way that reads like a
     broken service rather than a blank field.
 

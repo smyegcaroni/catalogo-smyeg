@@ -4,7 +4,6 @@ import { useRef } from 'react';
 import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 
 vi.mock('@/api/ingest', () => ({
-  uploadFile: vi.fn(),
   getJobStatus: vi.fn(),
   getJobStatusByDataset: vi.fn(),
   previewFile: vi.fn(),
@@ -18,9 +17,8 @@ vi.mock('@/api/ingest', () => ({
   createVrt: vi.fn(),
 }));
 
-import { uploadFile, getJobStatus, getJobStatusByDataset, discoverTables, getUploadConfig, createVrt } from '@/api/ingest';
+import { getJobStatus, getJobStatusByDataset, discoverTables, getUploadConfig, createVrt } from '@/api/ingest';
 import {
-  useUploadFile,
   useJobStatus,
   useDatasetJobStatus,
   useDiscoverTables,
@@ -32,7 +30,6 @@ import { queryKeys } from '@/lib/query-keys';
 import { useAuthStore } from '@/stores/auth-store';
 import { ApiError } from '@/api/client';
 
-const mockUploadFile = vi.mocked(uploadFile);
 const mockGetJobStatus = vi.mocked(getJobStatus);
 const mockGetJobStatusByDataset = vi.mocked(getJobStatusByDataset);
 const mockDiscoverTables = vi.mocked(discoverTables);
@@ -53,37 +50,10 @@ function renderWithClient<T>(factory: () => T): { result: { current: T }; qc: Qu
   return { result, qc: captured as QueryClient };
 }
 
-describe('useUploadFile', () => {
-  beforeEach(() => vi.clearAllMocks());
-
-  it('calls uploadFile on mutate', async () => {
-    const response = { job_id: 'j-1', filename: 'test.geojson' };
-    mockUploadFile.mockResolvedValueOnce(response as never);
-
-    const { result } = renderHook(() => useUploadFile());
-
-    const file = new File(['{}'], 'test.geojson', { type: 'application/json' });
-    await result.current.mutateAsync(file);
-
-    // Hook wraps uploadFile so TanStack's injected context isn't passed as
-    // the (onProgress) 2nd arg — uploadFile receives the file only.
-    expect(mockUploadFile).toHaveBeenCalledWith(file);
-  });
-
-  it('returns error state on upload failure', async () => {
-    mockUploadFile.mockRejectedValueOnce(new Error('Too large'));
-
-    const { result } = renderHook(() => useUploadFile());
-
-    const file = new File(['{}'], 'test.geojson');
-    await expect(result.current.mutateAsync(file)).rejects.toThrow('Too large');
-  });
-});
-
 describe('useJobStatus', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // fix(#762): the hook now gates on an auth token; these tests run as an
+    // The hook gates on an auth token; these tests run as an
     // authenticated user unless they say otherwise.
     useAuthStore.setState({ token: 'jwt-token', refreshToken: null, expiresAt: null, user: null });
   });
@@ -125,10 +95,10 @@ describe('useJobStatus', () => {
   });
 
   /**
-   * fix(#1556): the poll's terminal check is a DENYLIST, so a terminal status
+   * The poll's terminal check is a DENYLIST, so a terminal status
    * missing from it does not merely mis-render — it polls /jobs/{id} every 2s
-   * for the life of the tab. An abandoned presigned upload now settles
-   * 'cancelled', which was the missing one.
+   * for the life of the tab. An abandoned presigned upload settles
+   * 'cancelled', so it has to be in the set.
    */
   it('stops polling once a job settles cancelled', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -174,9 +144,9 @@ describe('useJobStatus', () => {
   });
 
   /**
-   * fix(#1778): before this, refetchInterval only checked
-   * query.state.data?.status, so a query stuck in isError (data stays
-   * undefined) polled /jobs/{id} every 2s for the life of the tab.
+   * refetchInterval must not rely on query.state.data?.status alone: a query
+   * stuck in isError (data stays undefined) would poll /jobs/{id} every 2s
+   * for the life of the tab.
    */
   it('stops polling once the status read settles a definitive 404', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -283,7 +253,7 @@ describe('useUploadConfig', () => {
 });
 
 /**
- * REMED-01 (ingest-audit P2-06): useCreateVrt must invalidate the
+ * useCreateVrt must invalidate the
  * jobStatus cache on success so any UI subscribed to the new job's
  * progress refetches immediately. VrtCreateResponse carries only
  * `job_id` (no `dataset_id`), so we invalidate jobStatus(job_id).

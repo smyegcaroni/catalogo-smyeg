@@ -1,4 +1,4 @@
-"""fix(#1778): every session the API opens needs a query deadline.
+"""Every session the API opens needs a query deadline.
 
 Nothing bounded statement execution on the engine the API uses.
 ``database_connect_args`` carries only the SSL branch and, behind an external
@@ -8,12 +8,12 @@ sets no ``statement_timeout`` either. Combined with uvicorn not cancelling a
 handler when its client disconnects, one pathological plan pinned a pool slot
 with no ceiling.
 
-fix(#1778 codex r2): the deadline is on the ENGINE, not on ``get_db``. Handlers
+The deadline is on the ENGINE, not on ``get_db``. Handlers
 open request-scoped sessions directly through ``async_session()`` in more than
 twenty modules -- ``GET /stac/collections`` runs three aggregates that way --
 so a per-dependency binding covered none of them.
 
-fix(#1778 codex r5): the statement is a ``SET LOCAL`` UTILITY statement, not
+The statement is a ``SET LOCAL`` UTILITY statement, not
 ``SELECT set_config(..., true)``. The two set the same GUC, but the SELECT form
 is a query and takes the transaction's first snapshot, after which Postgres
 refuses ``SET TRANSACTION ISOLATION LEVEL`` and ``SET TRANSACTION [NOT]
@@ -22,7 +22,7 @@ form -- the first-query restriction applies to ``transaction_read_only`` only
 when going read-only to read-write -- and both properties are pinned below
 against the live database rather than reasoned about.
 
-fix(#1778 codex r3): and it is issued as ``SET LOCAL`` at the start of every
+And it is issued as ``SET LOCAL`` at the start of every
 transaction, not as asyncpg ``server_settings``. ``server_settings`` travels in
 the startup packet, which standard PgBouncer rejects, so under the documented
 ``DB_USE_EXTERNAL_POOLER=true`` topology every API connection and API startup
@@ -91,7 +91,7 @@ def test_the_api_entrypoint_installs_it_on_the_engine():
     src = inspect.getsource(api_main.install_api_query_deadline)
     assert "install_api_statement_timeout(engine)" in src
     assert "from app.core.db import engine" in src, (
-        "fix(#909): the engine must be late-bound or the fixture's patch is lost"
+        "The engine must be late-bound or the fixture's patch is lost"
     )
 
     module_src = inspect.getsource(api_main)
@@ -120,7 +120,7 @@ def test_the_shared_engine_module_carries_no_session_default():
 
 
 def test_the_installer_sets_no_startup_parameter():
-    """fix(#1778 codex r3): the source must not reach for server_settings.
+    """The source must not reach for server_settings.
 
     Standard PgBouncer rejects an unknown startup parameter, so a
     `server_settings` entry fails every connection under the documented
@@ -133,9 +133,8 @@ def test_the_installer_sets_no_startup_parameter():
     assert "server_settings" not in code, (
         "the installer must not put anything in the startup packet"
     )
-    # And the mechanism it uses instead: SET LOCAL, with a bound value.
-    assert "set_config" in code
-    assert "true" in code, "set_config's is_local argument must be true"
+    # And the mechanism it uses instead: SET LOCAL inside each transaction.
+    assert "SET LOCAL statement_timeout" in code
 
 
 @pytest.mark.anyio
@@ -145,7 +144,7 @@ async def test_a_session_from_async_session_runs_under_the_deadline(
 ):
     """The pin: not get_db, a bare `async_session()` the way handlers open one.
 
-    fix(#1778 codex r3): run under both topologies, because they must behave
+    Run under both topologies, because they must behave
     the same. ``test_db_session`` is requested only so this module's DB gating
     applies.
     """
@@ -273,7 +272,7 @@ async def test_a_zero_setting_installs_nothing(test_db_session, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# fix(#1778 codex r5): what a begin-time hook may and may not consume
+# What a begin-time hook may and may not consume
 # ---------------------------------------------------------------------------
 
 

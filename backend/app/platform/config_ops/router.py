@@ -58,6 +58,7 @@ router = APIRouter(
             "content": {"application/json": {}},
         }
     },
+    summary="Export the configuration",
 )
 async def export_configuration(
     request: Request,
@@ -72,7 +73,7 @@ async def export_configuration(
     headers. Using ``response_class=JSONResponse`` is the correct way to
     document a download endpoint in OpenAPI.
     """
-    # Deferred (D-17): platform must not import product domains at module
+    # Deferred: platform must not import product domains at module
     # load time.
     from app.modules.audit.service import AuditEvent, audit_emit
 
@@ -91,12 +92,9 @@ async def export_configuration(
         ),
     )
     # Commit here so the audit record is durable before the payload ships.
-    #
-    # fix(#1491): deliberately not fail-closed — audit_emit() isolates each
-    # sink in a SAVEPOINT and suppresses failure, so a rejected audit row does
-    # not block the export (NIST AU-5(4) fail-closed is waived here; AU-5's
-    # alert requirement is still met by audit_emit()'s raise). The only
-    # audit_emit() call site that commits for durability.
+    # Deliberately not fail-closed: audit_emit() suppresses a rejected audit
+    # row, so it does not block the export (NIST AU-5(4)); AU-5's alert
+    # requirement is met by audit_emit()'s error log.
     await db.commit()
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -109,6 +107,7 @@ async def export_configuration(
     "/import/",
     response_model=ImportResult,
     responses={409: CONFLICT_RESPONSE, 503: CONFIG_APPLY_UNAVAILABLE_RESPONSE},
+    summary="Import a configuration",
 )
 async def import_configuration(
     data: ConfigImportRequest,
@@ -176,7 +175,11 @@ async def import_configuration(
     return result
 
 
-@router.post("/validate/", response_model=ConnectivityResult)
+@router.post(
+    "/validate/",
+    response_model=ConnectivityResult,
+    summary="Validate the configuration",
+)
 async def validate_configuration(
     user: Identity = Depends(require_config_operator),
     db: AsyncSession = Depends(get_db),
@@ -189,7 +192,9 @@ async def validate_configuration(
     return result
 
 
-@router.post("/dry-run/", response_model=DryRunResponse)
+@router.post(
+    "/dry-run/", response_model=DryRunResponse, summary="Preview a configuration import"
+)
 async def dry_run_configuration(
     data: ConfigImportRequest,
     mode: ImportMode = Query("merge"),

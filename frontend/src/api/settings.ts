@@ -12,7 +12,7 @@ export interface BasemapEntry {
   api_key?: string | null;
 }
 
-export interface MapDefaults {
+interface MapDefaults {
   center_lat: number;
   center_lng: number;
   zoom: number;
@@ -37,12 +37,12 @@ export interface SettingItem {
   default_value?: unknown;
 }
 
-export interface AllSettingsResponse {
+interface AllSettingsResponse {
   env_only: boolean;
   tabs: Record<string, SettingItem[]>;
 }
 
-export interface ConfigModeResponse {
+interface ConfigModeResponse {
   env_only: boolean;
 }
 
@@ -64,10 +64,10 @@ export async function getEnabledPlugins(): Promise<string[] | null> {
   return apiFetch<string[] | null>('/settings/enabled-plugins/');
 }
 
-export interface FeatureFlags {
+interface FeatureFlags {
   enable_dataset_editing: boolean;
   require_metadata_for_publish: boolean;
-  // feat(#1691): when true, only admins may set `visibility: public`.
+  // When true, only admins may set `visibility: public`.
   restrict_public_visibility: boolean;
 }
 
@@ -99,8 +99,11 @@ export async function getConfigMode(): Promise<ConfigModeResponse> {
   return apiFetch<ConfigModeResponse>('/settings/config-mode/');
 }
 
+export type ClaudePlatform = 'anthropic' | 'foundry' | 'bedrock' | 'vertex';
+
 export interface ApiKeyStatusResponse {
   anthropic_configured: boolean;
+  anthropic_platform: ClaudePlatform;
   openai_configured: boolean;
 }
 
@@ -108,10 +111,10 @@ export async function getApiKeyStatus(): Promise<ApiKeyStatusResponse> {
   return apiFetch<ApiKeyStatusResponse>('/settings/api-key-status/');
 }
 
-// --- Notification status + test-send (Phase 1229 Plan 03 / NOTIF-05 / NOTIF-06) ---
+// --- Notification status + test-send ---
 
-/** GET /settings/notifications/status/ — booleans only, no secrets (NOTIF-05). */
-export interface NotificationStatus {
+/** GET /settings/notifications/status/ — booleans only, no secrets. */
+interface NotificationStatus {
   notifications_enabled: boolean;
   smtp_configured: boolean;
   webhook_configured: boolean;
@@ -125,8 +128,8 @@ export interface NotificationTestChannelResult {
   error: string | null;
 }
 
-/** POST /settings/notifications/test/ response — always 200, even on channel failure (NOTIF-06). */
-export interface NotificationTestResponse {
+/** POST /settings/notifications/test/ response — always 200, even on channel failure. */
+interface NotificationTestResponse {
   sent: boolean;
   channels: NotificationTestChannelResult[];
   message: string;
@@ -142,15 +145,13 @@ export async function sendTestNotification(): Promise<NotificationTestResponse> 
   });
 }
 
-// --- Enterprise-tabs registry (Phase 279 ADMIN-03 / M-03) ---
+// --- Enterprise-tabs registry ---
 
-export interface EnterpriseTabsResponse {
+interface EnterpriseTabsResponse {
   tabs: string[];
 }
 
-// Phase 279 ADMIN-03 (M-03): Server-driven enterprise-only tab list. Used by
-// AdminSidebar to conditionally render Settings tabs without hardcoding the
-// enterpriseOnly flag in two places (frontend + backend). The backend
+// Server-driven enterprise-only tab list for AdminSidebar; the backend
 // _ENTERPRISE_ONLY_TABS frozenset is the canonical source.
 export async function getEnterpriseOnlyTabs(): Promise<EnterpriseTabsResponse> {
   return apiFetch<EnterpriseTabsResponse>('/settings/enterprise-tabs/');
@@ -158,7 +159,7 @@ export async function getEnterpriseOnlyTabs(): Promise<EnterpriseTabsResponse> {
 
 // --- Embedding dimension detection ---
 
-export interface DetectEmbeddingDimsResponse {
+interface DetectEmbeddingDimsResponse {
   dimensions: number;
 }
 
@@ -170,9 +171,9 @@ export async function detectEmbeddingDims(): Promise<DetectEmbeddingDimsResponse
 
 // --- Branding endpoints ---
 
-export interface BrandingConfig {
+interface BrandingConfig {
   show_badge: boolean;
-  /** PRIV-1: operator-configured privacy-policy URL, or null/absent when unset. */
+  /** Operator-configured privacy-policy URL, or null/absent when unset. */
   privacy_url?: string | null;
 }
 
@@ -185,10 +186,9 @@ export async function updateBranding(data: Partial<BrandingConfig>): Promise<voi
   // The registry key is dotted (`branding.show_badge` in persistent_config.py),
   // not `branding_show_badge` -- the underscore spelling 400s on every save.
   if (data.show_badge !== undefined) settings['branding.show_badge'] = data.show_badge;
-  // fix(#1778): updateBranding took Partial<BrandingConfig>, which typechecks
-  // for privacy_url, but only ever forwarded show_badge, silently dropping
-  // privacy_url -- a privacy_url-only call PUT an empty settings object and
-  // still reported success.
+  // updateBranding takes Partial<BrandingConfig>, so every field is forwarded:
+  // dropping privacy_url would make a privacy_url-only call PUT an empty
+  // settings object and still report success.
   if (data.privacy_url !== undefined) settings.privacy_url = data.privacy_url;
   await updateSettings(settings);
 }
@@ -247,14 +247,14 @@ export async function createOAuthProvider(data: OAuthProviderCreateData): Promis
 }
 
 export async function updateOAuthProvider(id: string, data: OAuthProviderUpdateData): Promise<OAuthProviderConfig> {
-  return apiFetch<OAuthProviderConfig>(`/settings/oauth-providers/${id}`, {
+  return apiFetch<OAuthProviderConfig>(`/settings/oauth-providers/${encodeURIComponent(id)}`, {
     method: 'PUT',
     body: JSON.stringify(data),
   });
 }
 
 export async function deleteOAuthProvider(id: string): Promise<void> {
-  return apiFetch<void>(`/settings/oauth-providers/${id}`, {
+  return apiFetch<void>(`/settings/oauth-providers/${encodeURIComponent(id)}`, {
     method: 'DELETE',
   });
 }

@@ -10,12 +10,14 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from app.core.geo import shown_extent
 from app.standards.distributions import (
     RASTER_TILES_DISTRIBUTION_TYPE,
     TILESET_DISTRIBUTION_TYPE,
     PublishedDistribution,
     published_distributions,
 )
+from app.standards.text import has_text, required_description
 
 if TYPE_CHECKING:
     from app.modules.catalog.datasets.domain.models import (
@@ -47,15 +49,17 @@ def record_to_dcat_us3(
     catalog_contact_email: str | None = None,
     lineage_summary: str | None = None,
     has_raster_asset: bool = False,
+    vrt_extents: Mapping[uuid.UUID, object | None] | None = None,
 ) -> dict:
     """Serialize a GeoLens dataset to the DCAT-US Schema v3.0 profile.
 
     ``lineage_summary`` arrives access-checked from the caller rather
-    than off the record — fix(#1103): an analysis output's lineage names
+    than off the record, since an analysis output's lineage names
     datasets an anonymous requester may not see. ``app_base_url`` is the
-    public APP base URL, where the raster tile template is served
-    (fix(#1469)). ``has_raster_asset`` gates the COG download distribution
-    the same way.
+    public APP base URL, where the raster tile template is served.
+    ``has_raster_asset`` gates the COG download distribution
+    the same way. A VRT shows only the extent
+    ``vrt_extents`` (``visible_vrt_extents``) holds for it.
     """
     record = dataset.record
     result: dict = {}
@@ -68,7 +72,7 @@ def record_to_dcat_us3(
     result["identifier"] = str(dataset.id)
     result["title"] = record.title
 
-    result["description"] = _required_description(record.title, record.summary)
+    result["description"] = required_description(record.title, record.summary)
 
     result["publisher"] = _organization(record)
 
@@ -101,10 +105,9 @@ def record_to_dcat_us3(
         result["accessRights"] = access_rights
 
     if record.usage_constraints is not None:
-        # DCAT-US 3.0 schema types `rights` as a list of statements (like
-        # `provenance`), not a bare string. Emitting a string previously made a
-        # record with usage_constraints fail JSON Schema validation — and under
-        # the filter-the-feed posture that silently dropped it from the catalog.
+        # DCAT-US 3.0 types `rights` as a list of statements (like `provenance`),
+        # not a bare string; a string fails JSON Schema validation and, under the
+        # filter-the-feed posture, silently drops the record from the catalog.
         result["rights"] = [record.usage_constraints]
 
     if lineage_summary is not None:
@@ -114,7 +117,9 @@ def record_to_dcat_us3(
     if temporal is not None:
         result["temporal"] = [temporal]
 
-    spatial = _spatial_to_dcat_us3(record)
+    spatial = _spatial_to_dcat_us3(
+        record, shown_extent(record, dataset.id, vrt_extents)
+    )
     if spatial is not None:
         result["spatial"] = spatial
 
@@ -134,6 +139,7 @@ def record_to_dcat_us3(
                 publisher=result["publisher"],
                 contacts=contacts,
                 license_value=record.license,
+                landing_iri=result["@id"],
             )
             for distribution in distributions
         ]
@@ -149,6 +155,7 @@ def catalog_to_dcat_us3(
     catalog_contact_email: str | None = None,
     lineage_by_record_id: Mapping[uuid.UUID, str | None] | None = None,
     has_raster_asset_by_id: Mapping[uuid.UUID, bool] | None = None,
+    vrt_extents: Mapping[uuid.UUID, object | None] | None = None,
 ) -> dict:
     """Serialize visible datasets to a DCAT-US 3.0 Catalog document.
 
@@ -169,6 +176,7 @@ def catalog_to_dcat_us3(
             catalog_contact_email=catalog_contact_email,
             lineage_summary=lineage.get(ds.record_id),
             has_raster_asset=raster_assets.get(ds.id, False),
+            vrt_extents=vrt_extents,
         )
         for ds in datasets
     ]
@@ -198,7 +206,7 @@ def dcat_us3_fallback_fields(
 ) -> tuple[str, ...]:
     """Return required fields supplied by deterministic profile fallbacks."""
     fields: list[str] = []
-    if not _has_text(dataset.record.summary):
+    if not has_text(dataset.record.summary):
         fields.append("description")
     has_record_contact = any(
         _contact_to_dcat_us3(contact) is not None for contact in dataset.record.contacts
@@ -234,7 +242,7 @@ def _contact_to_dcat_us3(contact: RecordContact) -> dict | None:
 
     name = contact.name or contact.organization
     email = _mailto(contact.email.strip())
-    if not _has_text(name) or _EMAIL_PATTERN.fullmatch(email) is None:
+    if not has_text(name) or _EMAIL_PATTERN.fullmatch(email) is None:
         return None
 
     result: dict = {
@@ -251,33 +259,32 @@ def _contact_to_dcat_us3(contact: RecordContact) -> dict | None:
     return _strip_empty(result)
 
 
-def _required_description(title: str, summary: str | None) -> str:
-    if _has_text(summary):
-        return summary.strip()
-    return title.strip() or "Untitled dataset"
-
-
-def _has_text(value: str | None) -> bool:
-    return bool(value and value.strip())
-
-
 def _distribution_to_dcat_us3(
     distribution: PublishedDistribution,
     *,
     publisher: dict,
     contacts: list[dict],
     license_value: str | None,
+    landing_iri: str,
 ) -> dict:
     url = distribution.url
+    # A URI template is not an IRI: point at the dataset and keep the template
+    # readable in the description.
+    is_template = "{" in url
+    access_url = landing_iri if is_template else url
+    description = distribution.description
+    if is_template:
+        note = f"Tile URL template: {url}"
+        description = f"{note} {description}" if description else note
     result: dict = {
         "@type": "Distribution",
-        "accessURL": url,
+        "accessURL": access_url,
     }
 
     if distribution.title is not None:
         result["title"] = distribution.title
-    if distribution.description is not None:
-        result["description"] = distribution.description
+    if description is not None:
+        result["description"] = description
     if distribution.distribution_type == "download":
         result["downloadURL"] = url
     if distribution.format is not None:
@@ -292,7 +299,8 @@ def _distribution_to_dcat_us3(
             {
                 "@type": "DataService",
                 "title": distribution.title or "GeoLens data service",
-                "endpointURL": [url],
+                "endpointURL": [access_url],
+                **({"description": description} if is_template else {}),
                 "publisher": publisher,
                 "contactPoint": contacts,
             }
@@ -313,18 +321,18 @@ def _temporal_to_dcat_us3(record: Record) -> dict | None:
     return result
 
 
-def _spatial_to_dcat_us3(record: Record) -> dict | None:
-    if record.spatial_extent is None:
+def _spatial_to_dcat_us3(record: Record, spatial_extent: object) -> dict | None:
+    if spatial_extent is None:
         return None
 
     from app.core.geo import extent_to_span_bbox
 
-    # fix(#892): the bbox below is a planar WKT ring, which cannot express
+    # The bbox below is a planar WKT ring, which cannot express
     # RFC 7946's west > east crossing bbox -- a ring built from one silently
     # becomes the complementary 340°. Take the monotonic span, so a seam-crossing
     # extent serializes over-broad (-180..180) but honest. extent_to_span_bbox
     # swallows geoalchemy/shapely parse failures and returns None (no spatial).
-    bounds = extent_to_span_bbox(record.spatial_extent)
+    bounds = extent_to_span_bbox(spatial_extent)
     if bounds is None:
         logger.debug(
             "DCAT-US spatial extent serialization failed", record_id=str(record.id)

@@ -25,7 +25,7 @@ from pydantic import ValidationError
 
 if TYPE_CHECKING:
     from app.platform.jobs.models import IngestJob
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.geo import unknown_srid_refusal
@@ -34,8 +34,13 @@ from app.core.async_io import (
     run_in_thread_draining,
     run_in_thread_draining_capture_cancel,
 )
-from app.modules.auth.dependencies import get_current_active_user, require_permission
+from app.modules.auth.dependencies import (
+    get_current_active_user,
+    require_mode_permission,
+    require_permission,
+)
 from app.core.config import settings
+from app.core.db import release_connection
 from app.core.db.tenant_session import defer_async_with_tenant
 from app.core.dependencies import get_db
 from app.core.pointcloud import POINTCLOUD_FILE_TYPE
@@ -104,6 +109,7 @@ from app.processing.ingest.service import (
     save_upload_file,
     validate_file_extension,
 )
+from app.processing.ingest.upload_limits import build_upload_config
 from app.processing.ingest.presigned import (
     abort_presigned_multipart_upload,
     admit_presigned_pointcloud,
@@ -122,6 +128,7 @@ from app.processing.ingest.pointcloud import (
     staged_pointcloud_metadata,
 )
 from app.processing.ingest.tasks import regenerate_vrt_staged
+from app.processing.ingest.vrt_admission import stage_vrt_regeneration
 from app.processing.ingest.tileset import (
     TILESET_UNPACKED_BYTES_FIELD,
     preview_staged_tileset,
@@ -141,19 +148,28 @@ from app.platform.jobs.defer_guard import (
     make_ingest_job_failed_rollback,
 )
 from app.platform.jobs import ledger
+from app.platform.dataset_origin import PORTAL_LINK_KEYS
+from app.platform.portal_link import (
+    PortalLink,
+    resolve_portal_link,
+)
 from app.core.persistent_config import (
-    UPLOAD_ALLOWED_EXTENSIONS,
     UPLOAD_MAX_SIZE_MB,
     get_allowed_extensions_list,
 )
-from app.modules.quota.service import check_upload_quota, get_user_quota_usage
+from app.modules.quota.service import check_upload_quota, remaining_dataset_quota
 from app.modules.quota.service import DatasetQuotaExceededError
 from app.processing.raster.validation import validate_sources_async
 from app.platform.service_auth import (
     credential_or_422,
     service_credential_from_request,
+    credential_over_http_or_422,
 )
 from app.platform.storage import get_storage
+from app.platform.upload_filenames import (
+    refuse_control_characters,
+    safe_upload_basename,
+)
 from app.platform.storage.titiler_url import resolve_current_storage_key
 from app.standards.ogc.errors import (
     BAD_GATEWAY_RESPONSE,
@@ -164,6 +180,15 @@ from app.standards.ogc.errors import (
 
 logger = structlog.get_logger(__name__)
 
+# Each bulk-register item holds a pooled connection while it runs.
+_BULK_REGISTER_CONCURRENCY = 4
+
+# A table in the data schema has no owner until it is registered, so only an
+# administrator may list, claim or alter one.
+require_table_registrar = require_mode_permission(
+    single_tenant="manage_settings", multi_tenant="manage_tenants"
+)
+
 router = APIRouter(
     prefix="/ingest",
     tags=["Datasets"],
@@ -172,10 +197,10 @@ router = APIRouter(
 
 
 def _fallback_allowed_extensions() -> list[str]:
-    """Allowed extensions when the persistent_config DB lookup fails (R-7).
+    """Allowed extensions when the persistent_config DB lookup fails.
 
-    fix(#1682): read from ``settings``, not a frozen literal, so this
-    fallback doesn't silently reject formats added since it was written.
+    Read from ``settings``, not a frozen literal, so the fallback accepts
+    every format the settings allow.
     """
     return list(settings.allowed_extensions_list)
 
@@ -195,21 +220,12 @@ def _reject_standalone_vrt(filename: str) -> None:
         )
 
 
-def _without_standalone_vrt(extensions: str) -> str:
-    """Keep legacy persistent config from advertising a disabled file type."""
-    return ",".join(
-        extension.strip()
-        for extension in extensions.split(",")
-        if extension.strip() and extension.strip().lower() != ".vrt"
-    )
-
-
 async def _get_allowed_extensions_safely(db: AsyncSession) -> list[str]:
-    """Load allowed upload extensions with a DB-failure fallback (R-7).
+    """Load allowed upload extensions with a DB-failure fallback.
 
-    A transient DB hiccup during config lookup previously crashed the
-    entire upload endpoint with a 500. Fall back to a safe default and
-    log the failure so operators can investigate without losing uploads.
+    A transient DB error during the lookup must not fail the upload
+    endpoint with a 500, so this falls back to the settings list and logs
+    the failure for operators.
     """
     try:
         return await get_allowed_extensions_list(db)
@@ -252,31 +268,14 @@ async def _refuse_upload(db: AsyncSession, filename: str, kind: str | None) -> N
     "/upload/config",
     response_model=UploadConfigResponse,
     responses={403: FORBIDDEN_RESPONSE},
+    summary="Get the upload configuration",
 )
 async def get_upload_config(
     user: Identity = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> UploadConfigResponse:
     """Return upload configuration including presigned upload availability."""
-    max_size_mb = await UPLOAD_MAX_SIZE_MB.get(db)
-    allowed_exts = _without_standalone_vrt(await UPLOAD_ALLOWED_EXTENSIONS.get(db))
-
-    # Advisory remaining-quota hint so the client can cap a batch at what the
-    # user can actually create. None when no count cap is set (unlimited).
-    usage = await get_user_quota_usage(db, user.id)
-    remaining = (
-        max(0, usage.count_cap - usage.dataset_count) if usage.count_cap > 0 else None
-    )
-
-    return UploadConfigResponse(
-        presigned_uploads=settings.storage_provider == "s3",
-        presigned_threshold_bytes=settings.presigned_multipart_threshold_mb
-        * 1024
-        * 1024,
-        max_file_size_bytes=max_size_mb * 1024 * 1024,
-        allowed_extensions=allowed_exts,
-        remaining_dataset_quota=remaining,
-    )
+    return await build_upload_config(db, await remaining_dataset_quota(db, user.id))
 
 
 @router.post(
@@ -287,6 +286,7 @@ async def get_upload_config(
         413: PAYLOAD_TOO_LARGE_RESPONSE,
         502: BAD_GATEWAY_RESPONSE,
     },
+    summary="Request a presigned upload",
 )
 async def request_presigned_upload(
     request: PresignedUploadRequest,
@@ -301,6 +301,8 @@ async def request_presigned_upload(
             detail="Presigned uploads only available in S3 mode",
         )
 
+    refuse_control_characters(request.filename)
+    staged_name = safe_upload_basename(request.filename)
     await _refuse_upload(db, request.filename, request.kind)
 
     # Reject files exceeding configured size limit at request time
@@ -325,10 +327,10 @@ async def request_presigned_upload(
 
     job = await create_ingest_job(db, request.filename, "", user.id)
     storage = get_storage()
-    s3_key = f"staging/{job.id}/{request.filename}"
+    s3_key = f"staging/{job.id}/{staged_name}"
     physical_s3_key = resolve_current_storage_key(s3_key)
     threshold = settings.presigned_multipart_threshold_mb * 1024 * 1024
-    # fix(#1235): gate only, return discarded — refuses a dead-lifetime job
+    # Gate only, return discarded — refuses a dead-lifetime job
     # before an upload id is initiated; each URL still computes its own
     # expiration inside the signing thread.
     require_signable_job_lifetime(job.created_at)
@@ -345,7 +347,7 @@ async def request_presigned_upload(
                 raise initiation_cancel
             num_parts = math.ceil(request.file_size / PART_SIZE)
             urls = [
-                # fix(#1235): each part's expiration is computed INSIDE the
+                # Each part's expiration is computed INSIDE the
                 # signing thread — see `sign_url_with_deadline` for why the
                 # two must stay adjacent.
                 await run_in_thread_draining(
@@ -366,7 +368,7 @@ async def request_presigned_upload(
                     upload_id=upload_id,
                     job_id=job.id,
                 )
-            # fix(#1235): an HTTPException here is the lifetime refusal and
+            # An HTTPException here is the lifetime refusal and
             # must survive as its own 409, not get remapped to "Storage
             # service unavailable" — the abort above already ran.
             if isinstance(exc, (asyncio.CancelledError, HTTPException)):
@@ -413,8 +415,8 @@ async def request_presigned_upload(
         except (
             Exception
         ) as exc:  # broad: S3/MinIO presign-put can throw varied SDK errors; map to 502
-            # fix(#1235): HTTPException passthrough here too — signing moved
-            # into the thread, so the lifetime refusal now raises through
+            # HTTPException passthrough here too — signing happens
+            # in the thread, so the lifetime refusal raises through
             # this path and must not become "Storage service unavailable".
             if isinstance(exc, HTTPException):
                 raise
@@ -445,6 +447,7 @@ async def request_presigned_upload(
         413: PAYLOAD_TOO_LARGE_RESPONSE,
         502: BAD_GATEWAY_RESPONSE,
     },
+    summary="Complete a presigned upload",
 )
 async def complete_presigned_upload(
     job_id: uuid.UUID,
@@ -464,7 +467,7 @@ async def complete_presigned_upload(
             detail="Job is not a presigned upload",
         )
 
-    # fix(#1213): an abandoned presigned upload is marked failed by the
+    # An abandoned presigned upload is marked failed by the
     # stale-pending reaper after an hour, the same hour its PUT URL stays
     # valid — this door can reach the terminal-job case without stamping it.
     require_completable_presigned_job(job, restart_hint="Start a new upload.")
@@ -473,7 +476,7 @@ async def complete_presigned_upload(
     s3_key = um["s3_key"]
     physical_s3_key = resolve_current_storage_key(s3_key)
 
-    # fix(#1202): skip assembly when it already happened — the staging object
+    # Skip assembly when it already happened — the staging object
     # exists IFF CompleteMultipartUpload succeeded, so its presence alone is a
     # sound record, and a retry can't re-call complete with a SPENT upload id.
     # The parts-required 400 is skipped with it: a retrying client has nothing
@@ -498,7 +501,7 @@ async def complete_presigned_upload(
                 [{"ETag": p.etag, "PartNumber": p.part_number} for p in request.parts],
             )
             if completion_cancel is not None:
-                # fix(#1233): do NOT delete the assembled object — its
+                # Do NOT delete the assembled object — its
                 # presence is the only record assembly succeeded (the upload
                 # id is spent); `should_assemble_multipart` relies on it for retries.
                 raise completion_cancel
@@ -520,7 +523,7 @@ async def complete_presigned_upload(
                 detail="Upload completion failed — the upload session may have expired. Please try again.",
             ) from exc
 
-    # fix(#1202): completion contract (exists check, size gate, drained
+    # Completion contract (exists check, size gate, drained
     # freeze, content validation) shared with the reupload door so the two
     # cannot drift — see the docstring for postconditions.
     frozen_key = await finalize_presigned_object(
@@ -546,16 +549,16 @@ async def complete_presigned_upload(
         await admit_presigned_pointcloud(storage, job, frozen_key=frozen_key)
 
     job.file_path = frozen_key
-    # fix(#1186): the presigned path never stamped file_type — on S3 every
-    # upload goes through it, so every GeoTIFF fell through to the vector
-    # branch (422 at preview, wrong commit dispatch).
+    # The presigned path must stamp file_type — on S3 every
+    # upload goes through it, so without it every GeoTIFF would fall through
+    # to the vector branch (422 at preview, wrong commit dispatch).
     _stamp_raster_metadata(job, job.source_filename)
     await db.commit()
 
-    # fix(#1202): delete AFTER commit, never before — deleting first left a
+    # Delete AFTER commit, never before — deleting first would leave a
     # failed commit with the staging object already gone and the frozen copy
     # orphaned. Swept later by reapers resolving the key via
-    # `owned_presigned_staging_key`; grep that name rather than trusting a list here.
+    # `owned_presigned_staging_key`.
     # S3 cannot revoke a presigned URL, so reaping is the only remedy; the purge
     # is a backstop that exempts the newest complete job.
     await _cleanup_saved_upload(s3_key, str(job.id))
@@ -591,14 +594,14 @@ def _stamp_raster_metadata(job: "IngestJob", filename: str | None) -> None:
     in ``queue_ingest_job`` — so every upload endpoint has to set it before
     the job is previewable or committable.
 
-    fix(#1186): this used to download the whole object and run
-    ``validate_raster_crs``, which is exactly why ``complete_presigned_upload``
-    never called it — presigned uploads exist for the multi-GB case, and the
-    completion request cannot afford a full-object download (preview downloads
-    the same object seconds later anyway). The only reader of the resulting
-    ``crs_missing`` flag is ``ingest_raster``, which has the raster's metadata
-    in hand and now derives the answer there. So the stamp costs no I/O and
-    both upload endpoints can afford it.
+    The stamp does no I/O. It does not download the object or run
+    ``validate_raster_crs``, which a presigned completion cannot afford:
+    presigned uploads exist for the multi-GB case, and preview downloads
+    the same object seconds later anyway. ``ingest_raster`` reads the
+    CRS from the raster's own metadata rather than from anything stamped
+    here, so nothing is lost by skipping the check. Both upload
+    endpoints can therefore afford the stamp, including a presigned
+    completion request.
     """
     job.user_metadata = raster_stamped_metadata(job.user_metadata, filename)
 
@@ -608,6 +611,7 @@ def _stamp_raster_metadata(job: "IngestJob", filename: str | None) -> None:
     response_model=UploadResponse,
     status_code=status.HTTP_201_CREATED,
     responses={413: PAYLOAD_TOO_LARGE_RESPONSE},
+    summary="Upload a file for staging",
 )
 async def upload_file(
     request: Request,
@@ -633,19 +637,19 @@ async def upload_file(
     try:
         await _refuse_upload(db, file.filename, kind)
 
-        # IA-P0-02: enforce max_file_size_bytes at HTTP entry. Symmetric
-        # with the presigned path's request-time check (:158-165).
+        # Enforce max_file_size_bytes at HTTP entry, as the presigned
+        # path does at request time.
         max_size_mb = await UPLOAD_MAX_SIZE_MB.get(db)
         max_size_bytes = max_size_mb * 1024 * 1024
 
-        # QUOTA-01/02: per-user quota check before any staging or job creation.
+        # Per-user quota check before any staging or job creation.
         incoming_bytes = file.size if file.size is not None else 0
         await check_upload_quota(db, user.id, incoming_bytes, request)
 
         job = await create_ingest_job(db, file.filename, "", user.id)
         job_id = job.id
         job_metadata = job.user_metadata
-        # fix(#1848): committed BEFORE the spooled body is staged, so no pooled
+        # Committed BEFORE the spooled body is staged, so no pooled
         # connection is held across the staging copy or put, the validation
         # download and the content sniff; a failed staging leaves it for the sweep.
         await db.commit()
@@ -678,7 +682,7 @@ async def upload_file(
                     db, user.id, kind_metadata[TILESET_UNPACKED_BYTES_FIELD], request
                 )
 
-            # fix(#1848): bind only while the row is still pending, stamping
+            # Bind only while the row is still pending, stamping
             # `staged_at` so the pending window restarts here rather than at
             # creation, which the upload itself has already spent.
             bound = await db.execute(
@@ -702,7 +706,7 @@ async def upload_file(
                     ),
                 )
         except BaseException:
-            # fix(#1848): the request owns the staged source until the bind
+            # The request owns the staged source until the bind
             # lands, so every failure before it deletes the file; the row
             # itself stays for the sweep or carries the refusal above.
             await _cleanup_saved_upload(saved_path, str(job_id))
@@ -716,8 +720,8 @@ async def upload_file(
             status="pending",
             message="File uploaded and ready for preview",
         )
-    # N4: HTTPException must be caught and re-raised BEFORE the bare
-    # `except Exception` below — otherwise a deliberate 4xx from a
+    # HTTPException must be caught and re-raised before the bare
+    # `except Exception` below, or a deliberate 4xx from a
     # downstream helper is rewritten as a generic 500.
     except HTTPException:
         raise
@@ -797,6 +801,7 @@ async def _preview_raster(
 @router.post(
     "/preview/{job_id}",
     response_model=StagedPreviewResponse,
+    summary="Preview a staged file",
 )
 async def preview_file(
     job_id: uuid.UUID,
@@ -817,7 +822,7 @@ async def preview_file(
     elevation range and size, read from its header and hierarchy.
     Only callable on jobs with status 'pending'.
     """
-    # fix(#823): layer_name reaches ogrinfo argv; 422 option-like values.
+    # layer_name reaches ogrinfo argv; 422 option-like values.
     reject_option_like_layer_name(layer_name)
 
     job = await get_job_or_404(db, job_id, user)
@@ -828,12 +833,14 @@ async def preview_file(
             detail="Job already processed",
         )
 
-    # Resolve S3 key to local file
+    # A presigned upload has no file until its completion lands.
     if not job.file_path:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Job has no associated file — upload must complete before preview",
         )
+    # Storage and GDAL can run for a long time; don't pin a pool slot meanwhile.
+    await release_connection(db)
     file_type = (job.user_metadata or {}).get("file_type")
     try:
         if file_type == TILESET_FILE_TYPE:
@@ -864,7 +871,7 @@ async def preview_file(
     try:
         info = await run_ogrinfo_preview(file_path, layer_name=layer_name)
     except IngestBudgetExceededError as exc:
-        # fix(#948): the ceiling message is server-authored and actionable —
+        # The ceiling message is server-authored and actionable —
         # falling through to the generic handler would call an oversized
         # file "malformed or unsupported" when it's merely too large.
         raise HTTPException(
@@ -872,9 +879,9 @@ async def preview_file(
             detail=refusal_detail(exc),
         )
     except UnsafeUploadError as exc:
-        # fix(#1846, GHSA-hrf5-v3cq-frx5): server-authored refusal naming
-        # what was blocked and what to upload instead — a presigned upload's
-        # first whole-file check, since the presign door only sees a header probe.
+        # A server-authored refusal naming what was blocked and what to upload
+        # instead: a presigned upload's first whole-file check, since the
+        # presign door only sees a header probe.
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=refusal_detail(exc),
@@ -892,7 +899,7 @@ async def preview_file(
         if downloaded_preview_path is not None:
             downloaded_preview_path.unlink(missing_ok=True)
 
-    # fix(CR-01): persist all_layers into job.user_metadata so the fan-out
+    # Persist all_layers into job.user_metadata so the fan-out
     # endpoint's layer-name validation has a non-empty set — otherwise
     # known_layer_names is empty and the 422 guard is a no-op for real uploads.
     if info.get("all_layers"):
@@ -949,6 +956,7 @@ def _pick_commit_subclass(job: "IngestJob") -> type[BaseCommitRequest]:
     response_model=CommitResponse,
     status_code=status.HTTP_202_ACCEPTED,
     responses={413: PAYLOAD_TOO_LARGE_RESPONSE},
+    summary="Commit a staged file for import",
 )
 async def commit_import(
     job_id: uuid.UUID,
@@ -972,7 +980,7 @@ async def commit_import(
         )
     observed_attempt_id = job.attempt_id
 
-    # IA-P0-03: re-validate job.source_url against SSRF rules at commit time
+    # Re-validate job.source_url against SSRF rules at commit time
     # — closes the preview→commit DNS-rebinding TOCTOU (default 60s job TTL).
     # Mirrors the per-hop redirect defense in `make_safe_client()`, which
     # closes the redirect-chain TOCTOU; this closes the first-hop TOCTOU.
@@ -992,21 +1000,21 @@ async def commit_import(
 
     # Re-validate the body against the subclass the job belongs to. Extras
     # from other subclasses are silently ignored (Pydantic default), so
-    # kitchen-sink bodies still commit cleanly (D-02).
+    # kitchen-sink bodies still commit cleanly.
     Subclass = _pick_commit_subclass(job)
     try:
         commit = Subclass.model_validate(request.model_dump())
     except ValidationError as e:
-        # fix(#1755, #1931): the only enforcement of the import-commit door's
-        # shared safe-token rule. The flat CommitRequest declares the cap the
-        # contract publishes; a charset rule has no JSON Schema spelling.
+        # The only enforcement of the import-commit door's shared safe-token
+        # rule. The flat CommitRequest declares the cap the contract publishes;
+        # a charset rule has no JSON Schema spelling.
         raise RequestValidationError(errors=e.errors())
 
-    # fix(#823): dash-guard + all_layers membership check for the commit's
+    # Dash-guard and all_layers membership check for the commit's
     # layer_name, which reaches the worker's ogr2ogr argv (see layer_guard).
     validate_commit_layer_name(job, getattr(commit, "layer_name", None))
 
-    # fix(#2032): an unassigned EPSG code committed and was then ignored.
+    # An unassigned EPSG code is refused rather than committed and ignored.
     srid_refusal = await unknown_srid_refusal(
         db, getattr(commit, "srid_override", None)
     )
@@ -1016,9 +1024,9 @@ async def commit_import(
             detail=srid_refusal,
         )
 
-    # feat(#1691): a non-admin may not commit a public dataset when
+    # A non-admin may not commit a public dataset when
     # restrict_public_visibility is on. Local import: processing/ must not
-    # import app.modules.catalog.* at module level (PROCESS-02/04).
+    # import app.modules.catalog.* at module level.
     from app.modules.catalog.authorization import check_public_visibility_allowed
 
     await check_public_visibility_allowed(db, user, commit.visibility)
@@ -1028,19 +1036,16 @@ async def commit_import(
         size = await staged_pointcloud_bytes(job.file_path)
         await check_upload_quota(db, user.id, size, None)
 
-    # Extract the credential only for service commits (ServiceCommitRequest is
-    # the only subclass carrying one). AUTH-04: never persisted.
-    #
-    # feat(#1746): the structured `auth` object is what the layers below
-    # take; the flat `token` is its deprecated bearer spelling, and a body that
-    # sets both is refused by the model rather than having one win by an
-    # ordering nobody wrote down. Same precedence rule, same conversion helper
-    # and same 422 codes as the other four doors.
+    # Only ServiceCommitRequest carries a credential; it is never persisted.
+    # The structured `auth` object is what the layers below take; the flat
+    # `token` is its deprecated bearer spelling, and the model refuses a body
+    # that sets both. Same conversion helper and 422 codes as the other doors.
     token = getattr(commit, "token", None)
     credential = credential_or_422(
         service_credential_from_request(getattr(commit, "auth", None), token),
         service_format=job_service_format(job),
     )
+    credential_over_http_or_422(job.source_url, credential)
 
     # Judge the credential and the store before the write below:
     # `service_auth_required` is a one-way door (`_replay_capability` refuses
@@ -1051,7 +1056,17 @@ async def commit_import(
     # and more sharply: user_metadata is durable JSONB, so a nested
     # credential object would land there in full. mode="json" serializes
     # datetime fields (temporal_start/temporal_end) as ISO strings.
-    commit_metadata = commit.model_dump(exclude={"token", "auth"}, mode="json")
+    link = (
+        resolve_portal_link(commit.item_id, commit.portal_url)
+        if isinstance(commit, VectorCommitRequest)
+        else PortalLink.unsupported(request.item_id, request.portal_url)
+    )
+    commit_metadata = {
+        **commit.model_dump(
+            exclude={"token", "auth", "item_id", "portal_url"}, mode="json"
+        ),
+        **link.fields,
+    }
     if credential is not None:
         # Persist only the fact that retry needs fresh credentials. The
         # credential remains request-only and is never written to JSONB.
@@ -1059,11 +1074,9 @@ async def commit_import(
     await admit_import_commit(db, job, observed_attempt_id, commit_metadata)
     staged_path = job.file_path
 
-    # Dispatch routing lives in the service layer (KISS-9).
-    # queue_ingest_job owns the orphan-guard: a defer failure flips the job
-    # to failed and raises 503 (RESILIENCE-2). The staged file is deleted
-    # only when that flip landed: a missed one means a worker owns the job
-    # and is reading it.
+    # queue_ingest_job owns the orphan guard: a defer failure flips the job to
+    # failed and raises 503. The staged file is deleted only when that flip
+    # landed; a missed one means a worker owns the job and is reading it.
     try:
         await queue_ingest_job(job, str(user.id), db=db, credential=credential)
     except DeferFailed as exc:
@@ -1078,6 +1091,7 @@ async def commit_import(
         job_id=job.id,
         status="pending",
         message="Import queued",
+        origin_link_loss=link.losses,
     )
 
 
@@ -1085,6 +1099,7 @@ async def commit_import(
     "/commit-fan-out/{job_id}",
     response_model=FanOutCommitResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    summary="Commit a staged file as one import per layer",
 )
 async def commit_fan_out(
     job_id: uuid.UUID,
@@ -1116,22 +1131,31 @@ async def commit_fan_out(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Job already processed (status='{job.status}')",
         )
-    # fix(#1709): the attempt id observed WITH the pending status above —
-    # the terminal CAS at the bottom is fenced on this pair, so a cancel (or
-    # any other writer) landing between here and there loses or wins cleanly.
+    # The attempt id observed with the pending status above: the terminal CAS
+    # is fenced on this pair, so a cancel (or any other writer) landing in
+    # between loses or wins cleanly.
     parent_attempt_id = job.attempt_id
 
-    # feat(#1691): fan-out jobs inherit the parent job's user_metadata, so a
-    # visibility seeded there (defense-in-depth — the request schema itself
-    # has no visibility field) goes through the same admin gate as a commit.
+    # Fan-out jobs inherit the parent's user_metadata, so a visibility seeded
+    # there (the request schema has no visibility field) goes through the same
+    # admin gate as a commit.
     from app.modules.catalog.authorization import check_public_visibility_allowed
 
     await check_public_visibility_allowed(
         db, user, (job.user_metadata or {}).get("visibility")
     )
 
-    # fix(#823): layer_name normalisation extracted to
-    # layer_guard.known_layer_names, shared with the single-layer commit endpoint.
+    # A retry after an all-failed dispatch replaces the link a first attempt
+    # left on the restored parent rather than adding to it.
+    link = resolve_portal_link(request.item_id, request.portal_url)
+    kept = {
+        key: value
+        for key, value in (job.user_metadata or {}).items()
+        if key not in PORTAL_LINK_KEYS
+    }
+    if {**kept, **link.fields} != (job.user_metadata or {}):
+        job.user_metadata = {**kept, **link.fields}
+
     known_layer_names = known_layer_names_for(job)
 
     unknown = [
@@ -1149,13 +1173,11 @@ async def commit_fan_out(
             },
         )
 
-    # fix(#1709): the terminal transition is the MUTEX for the whole
-    # dispatch — CASed and COMMITTED before the first child exists. The
-    # earlier shape (children first, CAS after) left a window where a
-    # cancel could commit mid-loop and let an already-deferred child
-    # complete before the post-loop cleanup's CAS refused it. With the flip
-    # first, a cancel either wins outright or arrives after the parent is
-    # terminal and gets 409, with every child individually cancellable.
+    # The terminal transition is the mutex for the whole dispatch, CASed and
+    # committed before the first child exists. Otherwise a cancel could commit
+    # mid-loop while an already-deferred child completes. With the flip first,
+    # a cancel either wins outright or arrives after the parent is terminal
+    # and gets 409, with every child individually cancellable.
     if not await claim_fan_out_parent(db, job, parent_attempt_id=parent_attempt_id):
         await db.rollback()
         await db.refresh(job)
@@ -1176,18 +1198,18 @@ async def commit_fan_out(
         result = await create_fan_out_jobs(job, layer, db)
         results.append(result)
 
-    # fix(CR-02): an all-failed dispatch (e.g. Procrastinate outage) must
-    # leave the parent retryable without a re-upload — a fenced CAS restore
-    # to `pending` that can only undo the flip THIS request wrote. Partial
-    # success keeps the parent `fanned_out`.
+    # An all-failed dispatch (e.g. a Procrastinate outage) leaves the parent
+    # retryable without a re-upload: a fenced CAS restore to `pending` that
+    # can only undo the flip this request wrote. Partial success keeps the
+    # parent `fanned_out`.
     queued_count = sum(1 for r in results if r.status == "queued")
     if queued_count == 0:
         restored = await restore_fan_out_parent_pending(
             db, job, parent_attempt_id=parent_attempt_id
         )
         if not restored:
-            # fix(#2016): the undo matched no row, so a third writer holds the
-            # parent terminal and this 202 hides it. Never silent again.
+            # The undo matched no row, so a third writer holds the parent
+            # terminal and this 202 hides it.
             logger.warning(
                 "fan_out_parent_restore_missed",
                 job_id=str(job.id),
@@ -1196,23 +1218,26 @@ async def commit_fan_out(
                 ),
             )
 
-    return FanOutCommitResponse(fan_out_id=job.id, results=results)
+    return FanOutCommitResponse(
+        fan_out_id=job.id, results=results, origin_link_loss=link.losses
+    )
 
 
 @router.post(
     "/register/",
     response_model=TableRegisterResponse,
     status_code=status.HTTP_201_CREATED,
+    summary="Register a PostGIS table",
 )
 async def register_table(
     request: RegisterRequest,
-    user: Identity = Depends(require_permission("upload")),
+    user: Identity = Depends(require_table_registrar),
     db: AsyncSession = Depends(get_db),
 ) -> TableRegisterResponse:
     """Register an existing PostGIS table as a dataset.
 
     Verifies the table exists, extracts metadata, and creates a
-    catalog entry.
+    catalog entry. Administrators only.
     """
     from app.modules.catalog.authorization import check_public_visibility_allowed
 
@@ -1250,6 +1275,7 @@ async def register_table(
 @router.get(
     "/discover/",
     response_model=DiscoverResponse,
+    summary="Discover unregistered PostGIS tables",
 )
 async def discover_tables(
     limit: int = Query(
@@ -1258,7 +1284,7 @@ async def discover_tables(
         le=5000,
         description="Maximum number of tables to return. Capped at 5000.",
     ),
-    user: Identity = Depends(require_permission("upload")),
+    user: Identity = Depends(require_table_registrar),
     db: AsyncSession = Depends(get_db),
 ) -> DiscoverResponse:
     """Discover unregistered tables in the data schema.
@@ -1267,6 +1293,7 @@ async def discover_tables(
     system tables. Includes geometry type, SRID, and estimated row count.
     Bounded by ``limit`` (default 1000, max 5000) so instances with
     thousands of orphan tables don't blow up the response payload.
+    Administrators only.
     """
     tables = await discover_unregistered_tables(db, limit=limit)
     return DiscoverResponse(tables=tables)
@@ -1276,33 +1303,36 @@ async def discover_tables(
     "/register/bulk/",
     response_model=BulkRegisterResponse,
     status_code=status.HTTP_201_CREATED,
+    summary="Register several PostGIS tables",
 )
 async def bulk_register_tables(
     request: BulkRegisterRequest,
-    user: Identity = Depends(require_permission("upload")),
+    user: Identity = Depends(require_table_registrar),
     db: AsyncSession = Depends(get_db),
 ) -> BulkRegisterResponse:
     """Bulk-register multiple existing PostGIS tables as datasets.
 
-    Each table is registered independently -- one failure does not block
-    others. Tables are processed in parallel via ``asyncio.gather`` with
-    a fresh session per task, which keeps transaction isolation while
-    removing the sequential per-table latency.
+    Administrators only. Each table is registered independently -- one
+    failure does not block others. Each table gets its own session, and at most
+    ``_BULK_REGISTER_CONCURRENCY`` run at once so one batch cannot drain the
+    shared connection pool.
     """
     from app.core.db import async_session
 
-    # feat(#1691): gate ONCE for the whole batch — any item requesting public
-    # visibility puts the request through the shared admin check before any
-    # table is registered (403, not a per-item error, so nothing partial runs).
+    # Gated once for the whole batch: any item requesting public visibility
+    # puts the request through the admin check before any table is registered
+    # (403, not a per-item error, so nothing partial runs).
     from app.modules.catalog.authorization import check_public_visibility_allowed
 
     if any(item.visibility == "public" for item in request.tables):
         await check_public_visibility_allowed(db, user, "public")
 
+    slots = asyncio.Semaphore(_BULK_REGISTER_CONCURRENCY)
+
     async def _register_one(
         table_req: BulkRegisterItem,
     ) -> BulkRegisterResult:
-        async with async_session() as task_db:
+        async with slots, async_session() as task_db:
             try:
                 reg_request = RegisterRequest(
                     table_name=table_req.table_name,
@@ -1336,6 +1366,7 @@ async def bulk_register_tables(
     "/vrt/create",
     response_model=VrtCreateResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    summary="Create a VRT dataset",
 )
 async def create_vrt(
     request: VrtCreateRequest,
@@ -1346,9 +1377,9 @@ async def create_vrt(
 
     Validates sources synchronously, then defers VRT assembly to an async task.
     Returns a job_id for polling. Validation + queuing logic lives in
-    ``ingest.service.create_vrt_job`` (K5 extraction).
+    ``ingest.service.create_vrt_job``.
     """
-    # feat(#1691): a non-admin may not create a public VRT dataset when the
+    # A non-admin may not create a public VRT dataset when the
     # restrict_public_visibility instance setting is on.
     from app.modules.catalog.authorization import check_public_visibility_allowed
 
@@ -1364,6 +1395,7 @@ async def create_vrt(
     "/vrt/{dataset_id}/sources/",
     response_model=VrtMutationResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    summary="Add a source to a VRT dataset",
 )
 async def add_vrt_source(
     dataset_id: uuid.UUID,
@@ -1378,17 +1410,42 @@ async def add_vrt_source(
     Returns 409 if the VRT is currently regenerating or the source is already linked.
     Returns 422 if the source is incompatible with existing sources.
     """
-    # fix(#1327): the resulting member set is STAGED on the VrtGeneration row;
-    # vrt_source_links is written by the regeneration task's own transaction
-    # that publishes the artifact. Comment, not docstring — the docstring is
-    # published OpenAPI text, so editing it would churn openapi.json and SDKs.
+    # The resulting member set is staged on the VrtGeneration row;
+    # vrt_source_links is written by the regeneration task's transaction that
+    # publishes the artifact.
     from app.platform.extensions import get_processing_port
-    from app.processing.raster.models import RasterAsset, VrtGeneration
-    from sqlalchemy import text
+    from app.processing.raster.models import RasterAsset
 
     _port = get_processing_port()
     Dataset = _port.get_dataset_orm_class()
     Record = _port.get_record_orm_class()
+
+    # Authorize both datasets before the type-filtered lookups, so an id the
+    # caller can't read answers 404 whatever its type.
+    from app.modules.catalog.authorization import (
+        check_dataset_access,
+        check_dataset_write_access,
+        check_vrt_members,
+        get_user_roles,
+        lock_dataset_rows_for_write,
+    )
+    from app.modules.catalog.datasets.domain.service import get_dataset
+
+    user_roles = await get_user_roles(db, user)
+    source_dataset = await get_dataset(db, request.source_dataset_id)
+    vrt_dataset = await get_dataset(db, dataset_id)
+    if source_dataset is None or vrt_dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
+        )
+    # The source only needs to be readable by the caller (it is being linked, not
+    # modified); the VRT itself is being mutated, so it requires owner-or-admin.
+    await check_dataset_access(
+        db, source_dataset, request.source_dataset_id, user, user_roles=user_roles
+    )
+    await check_dataset_write_access(
+        db, vrt_dataset, dataset_id, user, user_roles=user_roles
+    )
 
     vrt_result = await db.execute(
         select(RasterAsset)
@@ -1419,32 +1476,11 @@ async def add_vrt_source(
             detail=f"Source dataset {request.source_dataset_id} not found or not a raster dataset",
         )
 
-    # fix(SEC-C): authorize the new source before linking it into the VRT
-    # mosaic — compiled pixels can't be filtered at read time, and this runs
-    # BEFORE the duplicate-link check so a foreign source 404s, not a leaked
-    # 409. Defense-in-depth: also requires access to the parent VRT itself.
-    from app.modules.catalog.authorization import (
-        check_dataset_access,
-        check_dataset_write_access,
-        get_user_roles,
-    )
-    from app.modules.catalog.datasets.domain.service import get_dataset
+    await check_vrt_members(db, vrt_dataset, adding=request.source_dataset_id)
 
-    user_roles = await get_user_roles(db, user)
-    source_dataset = await get_dataset(db, request.source_dataset_id)
-    # The source only needs to be readable by the caller (it is being linked, not
-    # modified); the VRT itself is being mutated, so it requires owner-or-admin.
-    await check_dataset_access(
-        db, source_dataset, request.source_dataset_id, user, user_roles=user_roles
-    )
-    vrt_dataset = await get_dataset(db, dataset_id)
-    await check_dataset_write_access(
-        db, vrt_dataset, dataset_id, user, user_roles=user_roles
-    )
-
-    # SRC-05 / fix(#1955): admission, not a status read — the check and the
-    # flip below are one sequence, and only the lock inside makes it atomic.
-    # After the write check, so a caller who may not mutate cannot hold it.
+    # Admission, not a status read: the check and the flip are one sequence,
+    # and only the lock inside makes it atomic. After the write check, so a
+    # caller who may not mutate cannot hold it.
     if not await admit_vrt_mutation(db, dataset_id, vrt_asset):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1499,32 +1535,19 @@ async def add_vrt_source(
             detail=[e.model_dump(mode="json") for e in errors],
         )
 
-    # fix(#1327): STAGE the intended post-mutation member set on the
-    # generation rather than writing vrt_source_links here — that table is
-    # the catalog's statement about what's actually served, and
-    # regenerate_vrt applies the staged set in the same transaction that
-    # swaps the artifact. The full set is staged (not "add this id"), so
-    # applying it is an idempotent replace. Order IS position: read ORDER BY
-    # position above, new source appends — applying renumbers 0..n-1, closing gaps.
+    # Staged on the generation rather than written to vrt_source_links, which
+    # states what is served; regenerate_vrt applies the staged set in the
+    # transaction that swaps the artifact. The full set is staged, so applying
+    # it is an idempotent replace. Order is position: the new source appends,
+    # and applying renumbers 0..n-1.
     staged_source_ids = [str(sid) for sid in existing_source_ids] + [
         str(request.source_dataset_id)
     ]
 
-    generation = VrtGeneration(
-        vrt_dataset_id=dataset_id,
-        status="pending",
-        started_at=datetime.now(timezone.utc),
-        source_count=len(staged_source_ids),
-        staged_source_ids=staged_source_ids,
-        triggered_by=str(user.id),
+    await lock_dataset_rows_for_write(db, vrt_dataset, raster_asset_cls=RasterAsset)
+    job, generation = await stage_vrt_regeneration(
+        db, vrt_asset, dataset_id, staged_source_ids, user
     )
-    db.add(generation)
-    await db.flush()
-    vrt_asset.status = "regenerating"
-    vrt_asset.current_generation_id = generation.id
-
-    job = await create_ingest_job(db, "vrt_regenerate", "", user.id)
-    job.dataset_id = dataset_id
 
     # A queue outage fails the job below and releases the VRT with it before
     # the 503; otherwise the asset sits 'regenerating', 409-ing every mutation
@@ -1532,9 +1555,9 @@ async def add_vrt_source(
     await db.commit()
 
     async def _defer() -> None:
-        # fix(#1327): dispatch the STAGED task name, not the legacy one — a
-        # pre-#1327 worker lacks it and fails loudly (TaskNotFound) instead
-        # of silently rebuilding from live links and dropping this add.
+        # The staged task name: a worker that predates staged sets lacks it
+        # and fails loudly (TaskNotFound) instead of rebuilding from live
+        # links and dropping this add.
         await defer_async_with_tenant(
             regenerate_vrt_staged,
             job_id=str(job.id),
@@ -1544,17 +1567,15 @@ async def add_vrt_source(
             triggered_by=str(user.id),
         )
 
-    # fix(#1327): no link-table rollback needed — with the member set staged
-    # on the generation, an undispatched request never touched
-    # vrt_source_links, so nothing needs to be put back.
+    # An undispatched request never touched vrt_source_links, so nothing
+    # needs to be put back.
     rollback = make_ingest_job_failed_rollback(
         job, message_prefix="Failed to queue VRT regeneration"
     )
     await defer_with_orphan_guard(_defer, rollback=rollback, db=db, job=job)
 
-    # fix(#1327): "queued", not "added". The catalog's source list still
-    # describes the VRT being served; the addition becomes part of it when the
-    # regeneration publishes the artifact that contains it.
+    # "queued", not "added": the catalog's source list still describes the
+    # VRT being served until the regeneration publishes.
     return VrtMutationResponse(
         job_id=job.id, message="Source add queued, VRT regeneration started"
     )
@@ -1564,6 +1585,7 @@ async def add_vrt_source(
     "/vrt/{dataset_id}/sources/{source_dataset_id}/",
     response_model=VrtMutationResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    summary="Remove a source from a VRT dataset",
 )
 async def remove_vrt_source(
     dataset_id: uuid.UUID,
@@ -1578,13 +1600,10 @@ async def remove_vrt_source(
     Returns 422 if removing would leave fewer than 2 sources.
     Returns 404 if the source is not linked to the VRT.
     """
-    # fix(#1327): the post-removal member set is STAGED on the VrtGeneration
-    # row; vrt_source_links is written by the regeneration task in the same
-    # transaction that publishes the artifact without the removed member. Kept
-    # out of the docstring — see the note on add_vrt_source.
+    # The post-removal member set is staged on the VrtGeneration row, as in
+    # add_vrt_source.
     from app.platform.extensions import get_processing_port
-    from app.processing.raster.models import RasterAsset, VrtGeneration
-    from sqlalchemy import text
+    from app.processing.raster.models import RasterAsset
 
     _port = get_processing_port()
     Dataset = _port.get_dataset_orm_class()
@@ -1605,13 +1624,16 @@ async def remove_vrt_source(
 
     # Owner-or-admin: removing a source mutates the VRT composition. The
     # `upload` capability alone is not ownership.
-    from app.modules.catalog.authorization import check_dataset_write_access
+    from app.modules.catalog.authorization import (
+        check_dataset_write_access,
+        lock_dataset_rows_for_write,
+    )
     from app.modules.catalog.datasets.domain.service import get_dataset
 
     vrt_dataset = await get_dataset(db, dataset_id)
     await check_dataset_write_access(db, vrt_dataset, dataset_id, user)
 
-    # SRC-05 / fix(#1955): admission, not a status read — see add_vrt_source.
+    # Admission, not a status read — see add_vrt_source.
     if not await admit_vrt_mutation(db, dataset_id, vrt_asset):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1624,10 +1646,8 @@ async def remove_vrt_source(
             },
         )
 
-    # fix(#1327): read the current member set ONCE, in order — the count
-    # guard, the "is it linked" guard and the staged post-removal set are
-    # three questions about one set, and a single ordered read keeps them
-    # from disagreeing.
+    # Read once, in order: the count guard, the "is it linked" guard and the
+    # staged set ask about one set, so a single read keeps them consistent.
     links_result = await db.execute(
         text(
             "SELECT source_dataset_id FROM catalog.vrt_source_links "
@@ -1651,39 +1671,24 @@ async def remove_vrt_source(
             detail="Source not linked to this VRT",
         )
 
-    # fix(#1327): STAGE the post-removal member set on the generation rather
-    # than deleting the link row now — the link table keeps describing what's
-    # served until regenerate_vrt applies the staged set in the same
-    # transaction that publishes the artifact. Applying renumbers 0..n-1.
+    # Staged rather than deleting the link row now, as in add_vrt_source.
+    # Applying renumbers 0..n-1.
     staged_source_ids = [
         str(sid) for sid in existing_source_ids if sid != source_dataset_id
     ]
 
-    generation = VrtGeneration(
-        vrt_dataset_id=dataset_id,
-        status="pending",
-        started_at=datetime.now(timezone.utc),
-        source_count=len(staged_source_ids),
-        staged_source_ids=staged_source_ids,
-        triggered_by=str(user.id),
+    await lock_dataset_rows_for_write(db, vrt_dataset, raster_asset_cls=RasterAsset)
+    job, generation = await stage_vrt_regeneration(
+        db, vrt_asset, dataset_id, staged_source_ids, user
     )
-    db.add(generation)
-    await db.flush()
-    vrt_asset.status = "regenerating"
-    vrt_asset.current_generation_id = generation.id
 
-    job = await create_ingest_job(db, "vrt_regenerate", "", user.id)
-    job.dataset_id = dataset_id
-
-    # Commit + dispatch with orphan guard (Theme H) — a Procrastinate outage
-    # would otherwise leave the VRT 'regenerating' until sweep_stale_vrt_assets
-    # reconciled it, 409-ing every mutation; the rollback below releases it.
+    # Dispatch with the orphan guard: a Procrastinate outage would otherwise
+    # leave the VRT 'regenerating' until sweep_stale_vrt_assets reconciled it,
+    # 409-ing every mutation; the rollback below releases it.
     await db.commit()
 
     async def _defer() -> None:
-        # fix(#1327): staged task name, same reasoning as the add endpoint —
-        # a pre-#1327 worker must refuse this delivery rather than rebuild
-        # the composition it cannot see.
+        # The staged task name, as in add_vrt_source.
         await defer_async_with_tenant(
             regenerate_vrt_staged,
             job_id=str(job.id),
@@ -1693,15 +1698,14 @@ async def remove_vrt_source(
             triggered_by=str(user.id),
         )
 
-    # fix(#1327): nothing to re-insert — the link row was never deleted, and
-    # the post-removal set is staged on the generation until the artifact
-    # swap, so an undispatched request leaves the catalog untouched.
+    # The link row was never deleted, so an undispatched request leaves the
+    # catalog untouched.
     rollback = make_ingest_job_failed_rollback(
         job, message_prefix="Failed to queue VRT regeneration"
     )
     await defer_with_orphan_guard(_defer, rollback=rollback, db=db, job=job)
 
-    # fix(#1327): "queued", not "removed" — see the add endpoint's tail.
+    # "queued", not "removed", as in add_vrt_source.
     return VrtMutationResponse(
         job_id=job.id, message="Source removal queued, VRT regeneration started"
     )

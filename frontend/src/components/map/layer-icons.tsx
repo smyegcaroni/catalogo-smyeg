@@ -8,7 +8,7 @@ import { legendFacts, rampGradient } from './legend-facts';
 import type { LegendFacts, LegendRamp, LegendSwatch } from './legend-facts';
 
 /** Shape hints for the icon glyph. Its stroke, fill opacity and pattern come from the layer's legend swatch. */
-export interface StyleHints {
+interface StyleHints {
   dashPattern?: number[];    // line-dasharray (e.g., [4,2])
   opacity?: number;          // layer opacity (0-1)
   strokeWidth?: number;      // line-width raw value — map to SVG strokeWidth
@@ -62,7 +62,7 @@ interface IconSubProps {
   styleHints?: StyleHints;
   swatch?: LegendSwatch | null;
   ramp?: LegendRamp | null;
-  /** ux(#840): render multi-color fills as hard-stop bands instead of a smooth ramp. */
+  /** Render multi-color fills as hard-stop bands instead of a smooth ramp. */
   discrete?: boolean;
 }
 
@@ -79,8 +79,8 @@ export function isDiscreteColorStyle(facts: LegendFacts | null): boolean {
   return facts?.classes?.some((classes) => classes.mode === 'categorical') ?? false;
 }
 
-// ux(#840): bands inside the existing glyph, not separate chips — keeps the
-// geometry-type cue and the 22px row cell untouched. Cap at 4 bands; beyond
+// Bands inside the existing glyph, not separate chips, to keep the
+// geometry-type cue and the 22px row cell untouched. Capped at 4 bands: beyond
 // that 14px slivers are unreadable and the row subtitle carries the count.
 const MAX_DISCRETE_BANDS = 4;
 
@@ -234,7 +234,7 @@ export function ColorizedGeometryIcon({
   swatch?: LegendSwatch | null;
   /** A heatmap's colour ramp, drawn at its own stops. */
   ramp?: LegendRamp | null;
-  /** ux(#840): true for categorical styles — hard-stop bands instead of a smooth ramp. */
+  /** True for categorical styles — hard-stop bands instead of a smooth ramp. */
   discrete?: boolean;
 }) {
   if (layerType === 'vrt') return <Layers className="h-3.5 w-3.5 text-muted-foreground" />;
@@ -271,9 +271,9 @@ export function getLayerColors(facts: LegendFacts | null): string[] {
 }
 
 /**
- * fix(#452): shared glyph chip for raster-family layers. StackRow, the builder
+ * Shared glyph chip for raster-family layers. StackRow, the builder
  * LegendPlugin, and the viewer LayerLegend all render this one component so the
- * legend icon can never drift from the layer-stack icon again.
+ * legend icon can't drift from the layer-stack icon.
  */
 export function RasterGlyphChip({ glyph }: { glyph: string }) {
   return (
@@ -302,10 +302,10 @@ export type LayerTypeIconLayer = Pick<MapLayerResponse, 'dataset_geometry_type'>
   >;
 
 /**
- * fix(#452): single source of truth for a layer's type icon, shared by the
- * builder layer stack and BOTH legend surfaces (LegendPlugin, viewer
- * LayerLegend). Raster/VRT layers get the glyph chip (▦, DEM: ⛰/◬); vector
- * layers get the colorized geometry icon. Extracted from StackRow.TypeIcon.
+ * Single source of truth for a layer's type icon, shared by the builder layer
+ * stack and BOTH legend surfaces (LegendPlugin, viewer LayerLegend).
+ * Raster/VRT layers get the glyph chip (▦, DEM: ⛰/◬); vector layers get the
+ * colorized geometry icon.
  */
 export function LayerTypeIcon({ layer, iconId }: { layer: LayerTypeIconLayer; iconId: string }) {
   const caps = getLayerCapabilities({
@@ -319,7 +319,7 @@ export function LayerTypeIcon({ layer, iconId }: { layer: LayerTypeIconLayer; ic
   // above are fresh fallback objects on every render.
   const styleHints = useMemo(
     () => extractStyleHints(paint, layout, layer.dataset_geometry_type, layer.opacity, layer.style_config),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- deps are the exact fields read, not the fallback objects
     [layer.paint, layer.layout, layer.dataset_geometry_type, layer.opacity, layer.style_config],
   );
   const facts = useMemo(

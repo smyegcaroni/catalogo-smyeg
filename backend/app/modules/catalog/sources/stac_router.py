@@ -46,6 +46,7 @@ from app.modules.catalog.sources.adapters.stac import (
     list_stac_collections,
     search_stac_items,
 )
+from app.modules.catalog.sources.stac_resolve_asset_gate import _MAX_STORED_URI_CHARS
 from app.modules.catalog.sources.stac_next_page import (
     StacNextPage,
     issue_cursor,
@@ -66,7 +67,7 @@ from app.modules.catalog.sources.schemas import (
 )
 from app.core.service_tokens import STAC_SERVICE_FORMAT, ServiceCredential
 from app.platform.security import SSRFError, same_origin, validate_url_for_ssrf
-from app.platform.service_auth import credential_or_422
+from app.platform.service_auth import credential_or_422, credential_over_http_or_422
 
 
 logger = structlog.stdlib.get_logger(__name__)
@@ -99,25 +100,20 @@ def _data_asset_import_refusal(
     Format, length and credentials only: ``/import`` separately checks each
     asset's host, which this does not predict.
 
-    Search is the one place that can tell the caller before an item is
-    ticked, rather than after the whole batch 422s on submit — but only if
-    this predicts the SAME field in the SAME order: the field's own
-    ``max_length=4096`` (pydantic enforces this before any field_validator
-    runs), then ``HttpUrl(href)``, then ``has_url_credentials`` only once
-    ``HttpUrl`` has passed — exactly ``_validate_stac_http_url``'s own
-    order. A too-long, credentialed href is ``too_long``, not
-    ``credentials``: that is what ``HttpUrl`` raises on before the
-    credential check ever runs, and checking credentials first would
-    answer for input the real validator never reaches.
+    Search can tell the caller before an item is ticked, rather than after
+    the whole batch 422s on submit, only if this predicts the SAME field in
+    the SAME order: the field's ``max_length=4096`` (pydantic enforces it
+    before any field_validator runs), then ``HttpUrl(href)``, then
+    ``has_url_credentials`` once ``HttpUrl`` has passed, as in
+    ``_validate_stac_http_url``. So a too-long, credentialed href is
+    ``too_long``, not ``credentials``.
 
-    ``HttpUrl`` also enforces its OWN, tighter length ceiling internally,
-    independently of the field's 4096 cap, so an href in between comes
-    back as pydantic's ``url_too_long`` error rather than the field's
-    ``string_too_long`` one the length check above catches — read off the
-    raised error's type rather than hardcoding a second length, so this
-    keeps matching ``HttpUrl`` even if a future pydantic release changes
-    that ceiling. Any other ``HttpUrl`` failure — an unparseable
-    authority, a disallowed scheme — is ``not_http``.
+    ``HttpUrl`` also enforces a tighter length ceiling, so an href between
+    the two comes back as pydantic's ``url_too_long`` error. That is read off
+    the raised error's type rather than hardcoding a second length, so this
+    keeps matching ``HttpUrl`` if pydantic changes the ceiling. Any other
+    ``HttpUrl`` failure (an unparseable authority, a disallowed scheme) is
+    ``not_http``.
     """
     if href is None:
         return None
@@ -141,15 +137,22 @@ router = APIRouter(
 )
 
 
-# feat(#1764): the credential fields every STAC door that CONTACTS the
-# catalog accepts. `/import` takes neither: it contacts no catalog, so it
-# would be accepting a secret it then drops.
+# A code, not prose: the 200 response bypasses the client's error localization,
+# so the wizard translates it.
+_ITEM_IMPORT_FAILED_CODE = "import_failed"
+_ITEM_TOO_LONG_CODE = "too_long"
+
+# datasets.source_filename holds the item id.
+_MAX_STORED_ITEM_ID_CHARS = 500
+
 # Names the rule, never the href: this reaches a per-item result body.
 _OFF_ORIGIN_ITEM_HREF_MESSAGE = (
     "This item's own URL is on a different host than the STAC catalog it was "
     "imported from, so GeoLens will not record it as the item's address."
 )
 
+# Only the doors that CONTACT the catalog take a credential. `/import`
+# contacts none, so it would be accepting a secret it then drops.
 _STAC_TOKEN_DESCRIPTION = (
     "Optional auth token for a protected STAC catalog." + DEPRECATED_TOKEN_SUFFIX
 )
@@ -166,8 +169,8 @@ class StacConnectRequest(BaseModel):
         default=None, max_length=1000, description=_STAC_TOKEN_DESCRIPTION
     )
     _validate_token = field_validator("token")(_validate_safe_token)
-    # fix(#1760): auth is declared LAST on every request model — the generated
-    # SDK positions fields by declaration order, so an earlier insertion would
+    # Auth is declared LAST on every request model: the generated SDK
+    # positions fields by declaration order, so an earlier insertion would
     # shift an existing positional caller's argument into it.
     auth: ServiceAuthRequest | None = Field(
         default=None, description=SERVICE_AUTH_FIELD_DESCRIPTION
@@ -384,26 +387,25 @@ class StacImportItem(BaseModel):
     _validate_data_asset_href = field_validator("data_asset_href")(
         _validate_stac_http_url
     )
-    # feat(#1222): optional so an older client (or a catalog whose items
-    # carry no rel=self link) still imports; health probe then checks the
-    # asset alone.
+    # Optional so an older client (or a catalog whose items carry no rel=self
+    # link) still imports; the health probe then checks the asset alone.
     item_href: str | None = Field(
         default=None,
         max_length=4096,
         description="The item's own canonical URL, echoed from search results.",
     )
     _validate_item_href = field_validator("item_href")(_validate_optional_stac_http_url)
-    # feat(#1266): optional so an older client still imports; the first
-    # refresh then recovers the key by matching the stored href. Recording
-    # it at import closes the window where the href moves and the item has
-    # meanwhile gained a higher-priority asset.
+    # Optional so an older client still imports; the first refresh then
+    # recovers the key by matching the stored href. Recording it at import
+    # closes the window where the href moves and the item has meanwhile
+    # gained a higher-priority asset.
     data_asset_key: str | None = Field(
         default=None,
         max_length=MAX_ASSET_KEY_CHARS,
         description="The asset key on the item, echoed from search results.",
     )
-    # feat(#1692): optional for the same reason as the echoes above — the
-    # first refresh repairs the value from the live item document.
+    # Optional for the same reason as the echoes above; the first refresh
+    # repairs the value from the live item document.
     data_asset_type: str | None = Field(
         default=None,
         max_length=MAX_ASSET_MEDIA_TYPE_CHARS,
@@ -438,7 +440,7 @@ class StacImportRequest(BaseModel):
         default="private",
         description="Visibility for imported datasets.",
     )
-    # feat(#1764): a boolean, never the credential. Declared last, so no
+    # A boolean, never the credential. Declared last, so no
     # positional SDK caller shifts.
     catalog_auth_required: bool = Field(
         default=False,
@@ -473,18 +475,23 @@ def _stac_credential(
 ) -> ServiceCredential | None:
     """The credential this request may send to the catalog, or None.
 
-    feat(#1764): one door helper for all three STAC endpoints, so they cannot
-    judge the same credential three ways. ``credential_or_422`` binds the STAC
-    service format and raises the coded 422 for an input the rules refuse; the
-    header itself is composed later, at each write site.
+    One door helper for all three STAC endpoints, so they cannot judge the
+    same credential three ways. ``credential_or_422`` binds the STAC service
+    format and raises the coded 422 for an input the rules refuse, as does a
+    credential bound for a plain http catalog; the header itself is composed
+    later, at each write site.
     """
-    return credential_or_422(
+    credential = credential_or_422(
         service_credential_from_request(request.auth, request.token),
         service_format=STAC_SERVICE_FORMAT,
     )
+    credential_over_http_or_422(request.url, credential)
+    return credential
 
 
-@router.post("/connect", response_model=StacConnectResponse)
+@router.post(
+    "/connect", response_model=StacConnectResponse, summary="Connect to a STAC API"
+)
 async def stac_connect(
     request: StacConnectRequest,
     user: Identity = Depends(require_permission("create_layers")),
@@ -554,6 +561,7 @@ def _conformance_classes(value: object) -> list[str]:
     "/collections",
     response_model=StacCollectionsResponse,
     responses={502: BAD_GATEWAY_RESPONSE},
+    summary="List collections in a STAC API",
 )
 async def stac_collections(
     request: StacConnectRequest,
@@ -620,6 +628,7 @@ async def _validate_next_page_href(catalog_url: str, href: str) -> None:
     "/search",
     response_model=StacSearchResponse,
     responses={502: BAD_GATEWAY_RESPONSE},
+    summary="Search items in a STAC API",
 )
 async def stac_search(
     request: StacSearchRequest,
@@ -693,7 +702,11 @@ def _parse_date(iso_str: str | None) -> date | None:
         return None
 
 
-@router.post("/import", response_model=StacImportResponse)
+@router.post(
+    "/import",
+    response_model=StacImportResponse,
+    summary="Import STAC items as datasets",
+)
 async def stac_import(
     request: StacImportRequest,
     user: Identity = Depends(require_permission("create_layers")),
@@ -705,8 +718,8 @@ async def stac_import(
     remote COG asset URL. Titiler serves the tiles directly from the
     remote source — no file download required.
     """
-    # feat(#1691): a non-admin may not create public datasets when the
-    # restrict_public_visibility instance setting is on.
+    # A non-admin may not create public datasets when the
+    # restrict_public_visibility setting is on.
     await check_public_visibility_allowed(db, user, request.visibility)
 
     results: list[StacImportResult] = []
@@ -715,9 +728,9 @@ async def stac_import(
     skipped = 0
     errors = 0
 
-    # fix(#1286): keyed on origin_ref's asset_href (structured pointer), not
-    # origin_uri's string spelling, matching the service-preview guard in
-    # catalog/sources/router.py. source_url stays as fallback for rows
+    # Keyed on origin_ref's asset_href (structured pointer), not origin_uri's
+    # string spelling, matching the service-preview guard in
+    # catalog/sources/router.py. source_url is the fallback for rows
     # migration 0036 could not backfill and which are PATCHable.
     hrefs = [i.data_asset_href for i in request.items]
     existing_hrefs: set[str] = {
@@ -752,10 +765,21 @@ async def stac_import(
             )
             skipped += 1
             continue
-        # fix(#1764): the item pointer becomes the origin a later credentialed
-        # refresh anchors on, so it may not name a host other than the catalog
-        # the caller submitted. Search already drops such a link; this refuses
-        # it for a client that did not come from there.
+        if (
+            len(item.id) > _MAX_STORED_ITEM_ID_CHARS
+            or len(item.data_asset_href) > _MAX_STORED_URI_CHARS
+        ):
+            results.append(
+                StacImportResult(
+                    item_id=item.id, status="error", error=_ITEM_TOO_LONG_CODE
+                )
+            )
+            errors += 1
+            continue
+        # The item pointer becomes the origin a later credentialed refresh
+        # anchors on, so it may not name a host other than the catalog the
+        # caller submitted. Search already drops such a link; this refuses it
+        # for a client that did not come from there.
         if item.item_href is not None and not same_origin(request.url, item.item_href):
             logger.warning("STAC item self link is off the submitted origin")
             results.append(
@@ -799,10 +823,13 @@ async def stac_import(
         )
         cog_info_map = dict(cog_results)
 
-    # fix(#302): STAC import inserts Record rows directly (the 4th creation
-    # site besides the datasets façade / raster / VRT creators), so it must
-    # participate in the atomic count-cap reservation too.
-    from app.modules.quota.service import reserve_dataset_slot
+    # STAC import inserts Record rows directly, beside the datasets façade,
+    # raster and VRT creators, so it takes part in the atomic count-cap
+    # reservation too.
+    from app.modules.quota.service import (
+        DatasetQuotaExceededError,
+        reserve_dataset_slot,
+    )
 
     for item in importable:
         refusal = import_refusal(cog_info_map.get(item.data_asset_href))
@@ -819,9 +846,9 @@ async def stac_import(
                 spatial_extent = None
                 if item.bbox and len(item.bbox) >= 4:
                     w, s, e, n = item.bbox[:4]
-                    # fix(#884): RFC 7946 §5.2 mandates west > east for a bbox
-                    # crossing the antimeridian; bbox_to_extent_wkt splits
-                    # those at ±180 rather than building the wrong 340° ring.
+                    # RFC 7946 §5.2 mandates west > east for a bbox crossing
+                    # the antimeridian; bbox_to_extent_wkt splits those at
+                    # ±180 rather than building the wrong 340° ring.
                     spatial_extent = func.ST_GeomFromText(
                         bbox_to_extent_wkt(w, s, e, n), 4326
                     )
@@ -849,16 +876,15 @@ async def stac_import(
                     source_url=item.data_asset_href,
                     source_filename=item.id,
                     srid=item.epsg,
-                    # fix(#1218): Python value, not func.now() — a SQL
-                    # expression leaves the attribute expired and the next
-                    # read lazy-loads.
+                    # Python value, not func.now(): a SQL expression would
+                    # leave the attribute expired and the next read
+                    # lazy-loading.
                     last_refreshed_at=datetime.now(timezone.utc),
                 )
-                # feat(#1218): asset_href is also what the duplicate-source
-                # guard keys on (fix(#1286): origin_ref.asset_href), so
-                # writing it here keeps both in agreement by construction.
-                # feat(#1222): item_href is the only stored value that can
-                # answer "was this item withdrawn?" — a 200 on the asset href
+                # asset_href is also what the duplicate-source guard keys on
+                # (origin_ref.asset_href), so writing it here keeps both in
+                # agreement. item_href is the only stored value that can
+                # answer "was this item withdrawn?"; a 200 on the asset href
                 # says nothing about that.
                 set_dataset_origin(
                     dataset,
@@ -870,23 +896,22 @@ async def stac_import(
                     item_id=item.id,
                     collection_id=item.collection,
                     asset_key=item.data_asset_key,
-                    # feat(#1764): True or None, never False — the allowlist
-                    # drops a None, which is how "no credential" is spelled on
-                    # both origin kinds.
+                    # True or None, never False: the allowlist drops a None,
+                    # which is how "no credential" is spelled on both origin
+                    # kinds.
                     auth_required=True if request.catalog_auth_required else None,
                 )
-                # fix(#1271): info in hand means Titiler reached the COG;
-                # every failure shape stays NULL since a Titiler error is
-                # indistinguishable from local pre-fetch rejections without
-                # parsing its error bodies (see fetch_cog_info).
+                # Info in hand means Titiler reached the COG. Every failure
+                # shape stays NULL, since a Titiler error is indistinguishable
+                # from local pre-fetch rejections without parsing its error
+                # bodies (see fetch_cog_info).
                 ci = cog_info_map.get(item.data_asset_href)
                 if ci is not None:
                     dataset.last_checked_at = datetime.now(timezone.utc)
                 ci = ci or {}
-                # fix(#1334): mirrors the raster row's EPSG preference below —
-                # both come from the same probe and must agree, or OGC
-                # Records would publish two disagreeing CRS declarations for
-                # one dataset.
+                # Mirrors the raster row's EPSG preference below: both come
+                # from the same probe and must agree, or OGC Records would
+                # publish two disagreeing CRS declarations for one dataset.
                 reconciled_epsg = reconcile_epsg(ci, item.epsg)
                 dataset.srid = reconciled_epsg
                 db.add(dataset)
@@ -912,20 +937,20 @@ async def stac_import(
                     nodata=str(nodata_raw) if nodata_raw is not None else None,
                     band_info=ci.get("band_info"),
                     **crs_columns(ci),
-                    # fix(#1375): res_x/res_y/is_rotated come off /cog/stac's
-                    # proj:transform as one fact — written together or not at
-                    # all, since a probe with no transform must leave them at
-                    # column defaults rather than assert is_rotated=False.
+                    # res_x/res_y/is_rotated come off /cog/stac's
+                    # proj:transform as one fact, written together or not at
+                    # all: a probe with no transform must leave them at column
+                    # defaults rather than assert is_rotated=False.
                     **pixel_geometry,
                 )
                 db.add(raster_asset)
 
-                # feat(#1692): dataset_assets row so a generic STAC client
-                # (stac-browser, QGIS, rio-viz) can read pixels from a
-                # re-published item; the internal raster_tiles template
-                # renders only in GeoLens's own frontend. Roled `data` (tiles
-                # asset is `visual`). Refresh upserts the same row
-                # (_upsert_origin_data_asset) to backfill older imports.
+                # dataset_assets row so a generic STAC client (stac-browser,
+                # QGIS, rio-viz) can read pixels from a re-published item; the
+                # internal raster_tiles template renders only in GeoLens's own
+                # frontend. Roled `data` (the tiles asset is `visual`).
+                # Refresh upserts the same row (_upsert_origin_data_asset) to
+                # backfill older imports.
                 db.add(
                     get_catalog_port().dataset_asset_orm_class()(
                         dataset_id=dataset.id,
@@ -954,14 +979,20 @@ async def stac_import(
             )
             created += 1
 
-        except Exception as exc:  # broad: per-item STAC import is isolated; any failure is recorded per-item without aborting the batch
-            logger.warning("STAC item import failed", item_id=item.id, error=str(exc))
+        except DatasetQuotaExceededError as exc:
             results.append(
                 StacImportResult(item_id=item.id, status="error", error=str(exc))
             )
             errors += 1
+        except Exception:  # broad: per-item STAC import is isolated; any failure is recorded per-item without aborting the batch
+            logger.exception("STAC item import failed", item_id=item.id)
+            results.append(
+                StacImportResult(
+                    item_id=item.id, status="error", error=_ITEM_IMPORT_FAILED_CODE
+                )
+            )
+            errors += 1
 
-    # Audit log
     await audit_emit(
         db,
         AuditEvent(

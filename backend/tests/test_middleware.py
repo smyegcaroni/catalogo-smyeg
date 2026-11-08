@@ -11,10 +11,25 @@ from app.standards.ogc.errors import register_error_handlers
 
 @pytest.mark.anyio
 async def test_gzip_compression(client: AsyncClient):
-    """GET /health with Accept-Encoding: gzip returns Content-Encoding: gzip."""
-    resp = await client.get("/health", headers={"Accept-Encoding": "gzip"})
-    # Health may return 200 or 503 in test env -- we only care about compression
+    """A body over GZip's 256-byte minimum is compressed when gzip is accepted."""
+    identity = await client.get("/conformance", headers={"Accept-Encoding": "identity"})
+    assert len(identity.content) > 256, "precondition: above minimum_size"
+    resp = await client.get("/conformance", headers={"Accept-Encoding": "gzip"})
     assert resp.headers.get("content-encoding") == "gzip"
+    assert resp.json() == identity.json()
+
+
+@pytest.mark.anyio
+async def test_gzip_leaves_a_small_json_body_uncompressed(client: AsyncClient):
+    """minimum_size applies to ordinary responses, not only redirects.
+
+    The middleware layers inside GZip pass a single-message body through
+    unchanged, so a short JSON answer arrives whole and below the threshold.
+    """
+    resp = await client.get("/health", headers={"Accept-Encoding": "gzip"})
+    assert len(resp.content) < 256, "precondition: below minimum_size"
+    assert resp.headers.get("content-encoding") is None
+    assert resp.headers["content-length"] == str(len(resp.content))
 
 
 @pytest.mark.anyio
@@ -111,11 +126,12 @@ async def test_rate_limiting(client: AsyncClient):
 
 
 def test_lazy_route_handler_resolution_strips_root_path():
-    """fix(#747 Codex P2): rewrite-less ROOT_PATH deployments keep the /api
+    """rewrite-less ROOT_PATH deployments keep the /api
     prefix in scope['path']; the lazy-include fallback must strip root_path
     the way starlette's matcher does, or nested routes resolve to no handler
     and the global default rate limit silently stops applying to them."""
-    from app.api.main import _find_route_handler_with_lazy_includes, app
+    from app.api.main import app
+    from app.api.middleware.rate_limit import find_route_handler
 
     plain = {
         "type": "http",
@@ -131,17 +147,17 @@ def test_lazy_route_handler_resolution_strips_root_path():
         "root_path": "/api",
         "headers": [],
     }
-    assert _find_route_handler_with_lazy_includes(app.routes, plain) is not None
-    assert _find_route_handler_with_lazy_includes(
-        app.routes, prefixed
-    ) is _find_route_handler_with_lazy_includes(app.routes, plain)
+    assert find_route_handler(app.routes, plain) is not None
+    assert find_route_handler(app.routes, prefixed) is find_route_handler(
+        app.routes, plain
+    )
 
 
 @pytest.mark.anyio
 async def test_rate_limit_health_excluded(client: AsyncClient):
     """GET /health is not subject to the tight global default rate limit.
 
-    GAP-016: /health carries its own explicit @limiter.limit("60/minute")
+    /health carries its own explicit @limiter.limit("60/minute")
     instead of @limiter.exempt. A route-specific limit overrides the global
     default in slowapi, so a tight 2/second default never trips the Docker
     healthcheck / LB polling — exactly the property this test guards.

@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
-# Vite dev server image — runs as non-root `node` user (uid 1000) per INF-16.
-# Uses BuildKit npm cache mount per INF-09.
+# Vite dev server image — runs as non-root `node` user (uid 1000).
+# Uses a BuildKit npm cache mount.
 
-FROM node:26.10.0-alpine
+FROM node:26.12.1-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797
 
 WORKDIR /app
 

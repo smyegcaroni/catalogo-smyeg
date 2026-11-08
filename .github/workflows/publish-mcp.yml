@@ -5,9 +5,9 @@
 #   - push a `v*.*.*` tag → publish job queues behind the `publish` environment
 #     and pauses for required-reviewer approval (one click) before publishing.
 #   - workflow_dispatch → same gate; run from a tag ref, which any non-dry run
-#     now enforces: `gh workflow run publish-mcp.yml --ref vX.Y.Z`
+#     enforces: `gh workflow run publish-mcp.yml --ref vX.Y.Z`
 #
-# Recovering a half-finished release (fix(#1623)): PyPI refuses a re-upload of a
+# Recovering a half-finished release: PyPI refuses a re-upload of a
 # version it already has, so once `uv publish` succeeds there is no way back
 # through the PyPI half — `force_publish` overrides the pre-flight gate but
 # `uv publish` still fails on the duplicate. If the registry half is what broke,
@@ -69,19 +69,22 @@ jobs:
     if: ${{ !cancelled() && (needs.gate.result == 'success' || needs.gate.result == 'skipped') }}
     name: Publish geolens-mcp to PyPI
     runs-on: ubuntu-26.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         with:
           version: "0.10.2"
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
       # Every publishing run must come from a tag ref, and this is a hard failure
-      # rather than a skipped check (fix(#1623)): a manual dispatch defaults to the
+      # rather than a skipped check: a manual dispatch defaults to the
       # branch selected in the Actions UI, and the repo sits at the last released
       # version between bumps, so a branch run would happily publish that branch's
       # current server.json as metadata for an already-released PyPI artifact.
@@ -174,8 +177,8 @@ jobs:
       # `registry_only=true` (see the header) — the PyPI half cannot be replayed.
       #
       # The binary is pinned by release tag AND by the sha256 the release's own
-      # checksums.txt published for that asset, rather than tracking `latest`
-      # (fix(#1623)): this step runs in a job holding `id-token: write`, so a
+      # checksums.txt published for that asset, rather than tracking `latest`:
+      # this step runs in a job holding `id-token: write`, so a
       # swapped or compromised publisher build could mint OIDC tokens for this
       # workflow's identity. A moved `latest` also silently changes what an
       # old-tag re-run executes. Upgrading is a reviewed edit: bump the version,

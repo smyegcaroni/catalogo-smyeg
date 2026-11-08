@@ -1,4 +1,5 @@
 import { getClusterSourceStrategy, isClusterRenderMode, type ClusterSourceStrategyKind } from '@/components/builder/cluster-source';
+import { CLUSTER_STROKE_WIDTH, clusterColorSteps } from '@/components/builder/layer-adapters/cluster-adapter';
 import { resolveCirclePaint, resolvePointStroke } from '@/components/builder/layer-adapters/circle-adapter';
 import { resolveFillPaint, resolvePolygonStroke } from '@/components/builder/layer-adapters/fill-adapter';
 import { resolveHeatmapColor } from '@/components/builder/layer-adapters/heatmap-adapter';
@@ -10,6 +11,7 @@ import {
   resolveAdapterType,
 } from '@/components/builder/layer-adapters/shared';
 import type { LayerAdapter } from '@/components/builder/layer-adapters/types';
+import { nullGuardField } from '@/lib/maplibre-filter-utils';
 import { isDemTerrainVisualSuppressed } from '@/components/builder/map-sync';
 import { getColorProperty } from '@/lib/color-ramps';
 import { isNumericColumn } from '@/lib/column-utils';
@@ -23,7 +25,7 @@ import { parseStepOrInterpolate } from '@/lib/normalize-style-config';
 import type { StyleConfig } from '@/types/api';
 
 /** The saved-layer fields legend facts read. MapLayerResponse and SharedLayerResponse both satisfy it. */
-export interface LegendLayer {
+interface LegendLayer {
   display_name?: string | null;
   dataset_name?: string | null;
   layer_type?: string | null;
@@ -111,12 +113,21 @@ export interface LegendFacts {
    * Where a cluster layer's clusters come from: the browser over bounded GeoJSON,
    * the tile server, or nowhere when it draws single points. Null for other layers.
    */
-  cluster: { kind: ClusterSourceStrategyKind } | null;
+  cluster: {
+    kind: ClusterSourceStrategyKind;
+    /**
+     * The point counts that colour the cluster circles, as graduated colour classes drawn
+     * with the cluster circle's own swatch; null for one flat colour or no clusters.
+     */
+    steps: { classes: LegendClasses; swatch: LegendSwatch } | null;
+  } | null;
 }
 
 /** What the map drew a layer as, when the caller knows. */
 export interface DrawnLayer {
   drawsAs: LayerAdapter['type'];
+  /** A tile in view held more features than the server's cap, so it sent a sample. */
+  sampled?: boolean;
 }
 
 function nonBlank(value: unknown): string | null {
@@ -349,6 +360,8 @@ interface MatchClasses {
   input: unknown;
   arms: { values: (string | number)[]; color: string }[];
   fallback: string;
+  /** Whether a null guard sends null features to the fallback before the match reads them. */
+  guarded: boolean;
 }
 
 /** The values one `match` arm lists, one label or an array of them; null for anything else. */
@@ -375,7 +388,7 @@ function matchClasses(value: unknown): MatchClasses | null {
     if (values === null || typeof color !== 'string') return null;
     arms.push({ values, color });
   }
-  return { column, input: match[1], arms, fallback };
+  return { column, input: match[1], arms, fallback, guarded: match !== value };
 }
 
 /**
@@ -418,21 +431,28 @@ function isNumberAccessor(value: unknown, column: string): boolean {
 
 /**
  * The values a layer filter lets through on `column`, from an `==` or a literal
- * `in` on it, alone or inside `all`; null when the filter names none. On a numeric
- * column the number accessor reads a null as 0, so an equality with 0 lets nulls through.
+ * `in` on it, alone or inside `all`; null when the filter names none.
  */
-function filteredValues(filter: unknown, column: string, numeric: boolean): unknown[] | null {
+function filteredValues(
+  filter: unknown,
+  column: string,
+  numeric: boolean,
+  excludesNull = false,
+): unknown[] | null {
   if (!Array.isArray(filter)) return null;
   const [op, input, operand] = filter;
   if (op === 'all') {
+    // A `typeof` null check on the column keeps null out of every limit inside.
+    const guarded = excludesNull || filter.slice(1).some((entry) => nullGuardField(entry) === column);
     const limits = filter.slice(1)
-      .map((entry) => filteredValues(entry, column, numeric))
+      .map((entry) => filteredValues(entry, column, numeric, guarded))
       .filter((limit): limit is unknown[] => limit !== null);
     return limits.length > 0 ? limits.reduce((kept, limit) => kept.filter((value) => limit.includes(value))) : null;
   }
   if (filter.length !== 3) return null;
   if (numeric && op === '==' && typeof operand === 'number' && isNumberAccessor(input, column)) {
-    return operand === 0 ? [0, null] : [operand];
+    // MapLibre turns a null into 0 before any fallback, so a zero comparison admits null.
+    return operand === 0 && !excludesNull ? [0, null] : [operand];
   }
   if (getColumn(input) !== column) return null;
   if (op === '==' && isLiteral(operand)) return [operand];
@@ -706,7 +726,50 @@ function weightFor(layer: LegendLayer, kind: LayerAdapter['type']): LegendFacts[
 function clusterFor(layer: LegendLayer, kind: LayerAdapter['type']): LegendFacts['cluster'] {
   if (!isClusterRenderMode(layer)) return null;
   // A cluster layer the map drew as anything else is drawing its single points.
-  return { kind: kind === 'cluster' ? getClusterSourceStrategy(layer).kind : 'fallback' };
+  if (kind !== 'cluster') return { kind: 'fallback', steps: null };
+  const ramp = clusterColorSteps(getBuilderStyleConfig(layer).clusterColorRamp);
+  const steps = ramp && {
+    classes: {
+      mode: 'graduated' as const,
+      target: 'color' as const,
+      title: '',
+      items: ramp.colors.map((color) => ({ color })),
+      breaks: ramp.breaks,
+    },
+    swatch: {
+      fill: null,
+      fillOpacity: 1,
+      opacity: layer.opacity ?? 1,
+      stroke: { color: MAP_COLORS.cluster.stroke, width: CLUSTER_STROKE_WIDTH },
+      pattern: null,
+    },
+  };
+  return { kind: getClusterSourceStrategy(layer).kind, steps };
+}
+
+/**
+ * The colour the map's categorical paint gives each value of its column, read
+ * from the paint itself; null when the layer isn't coloured by a `match` on a
+ * column. A value no arm lists takes the fallback colour, as the map draws it.
+ */
+export function categoryColors(layer: LegendLayer): { column: string; colorOf: (value: unknown) => string | undefined } | null {
+  if (!legendFacts(layer)) return null;
+  const kind = drawsAs(layer);
+  if (!CLASSED_KINDS.has(kind)) return null;
+  const paint = layer.paint ?? {};
+  const match = matchClasses(drawnColor(paint, kind, inferGeometryType(paint, layer.dataset_geometry_type ?? layer.geometry_type)));
+  if (!match) return null;
+  return {
+    column: match.column,
+    colorOf: (value) => {
+      // A guarded null is drawn with the fallback, though the input may read it as 0.
+      const read = value === null && match.guarded ? null : readAsMatchInput(match.input, value);
+      if (read === undefined) return undefined;
+      const arm = read === null ? undefined : match.arms.find((entry) => entry.values.includes(read as string | number));
+      const color = arm?.color ?? match.fallback;
+      return isTransparentColor(color) ? undefined : color;
+    },
+  };
 }
 
 /**

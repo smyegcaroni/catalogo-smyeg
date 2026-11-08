@@ -3,6 +3,7 @@
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from psycopg.conninfo import conninfo_to_dict
 
 from app.core import config as config_module
 from app.core.config import MIN_SIGNABLE_JOB_LIFETIME_SECONDS, Settings
@@ -363,7 +364,7 @@ class TestProcrastinateConninfo:
         assert "sslmode=verify-full" in conninfo
 
     def test_override_includes_search_path(self):
-        # BUG-002: the override branch previously dropped the search_path
+        # The override branch previously dropped the search_path
         # option, so procrastinate could not resolve its unqualified objects on
         # managed Postgres (DATABASE_URL_OVERRIDE) and the job queue broke. The
         # override branch must mirror the default branch and pin the catalog
@@ -392,6 +393,35 @@ class TestProcrastinateConninfo:
             )
         )
         assert "host=/var/run/postgresql" in s.procrastinate_conninfo
+
+    @pytest.mark.parametrize(
+        "override", [None, "postgresql://u:p@pooler:6432/db"], ids=["composed", "url"]
+    )
+    def test_external_pooler_sends_no_startup_options(self, override):
+        # PgBouncer refuses the options startup parameter. The value is set but
+        # empty, so libpq doesn't fill it from PGOPTIONS either.
+        s = _make_settings(database_url_override=override, db_use_external_pooler=True)
+        assert conninfo_to_dict(s.procrastinate_conninfo)["options"] == ""
+
+    @pytest.mark.parametrize("pooler", [False, True], ids=["direct", "pooler"])
+    def test_caller_options_with_quote_and_backslash_round_trip(self, pooler):
+        s = _make_settings(
+            database_url_override=(
+                "postgresql://u:p@host/db?options=-c%20application_name%3Dit%27s%5Cx"
+            ),
+            db_use_external_pooler=pooler,
+        )
+        options = conninfo_to_dict(s.procrastinate_conninfo)["options"]
+        assert options.startswith("-c application_name=it's\\x")
+
+    def test_external_pooler_keeps_caller_options(self):
+        s = _make_settings(
+            database_url_override=(
+                "postgresql://u:p@host/db?options=-c%20statement_timeout%3D5000"
+            ),
+            db_use_external_pooler=True,
+        )
+        assert "options='-c statement_timeout=5000'" in s.procrastinate_conninfo
 
 
 class TestOgrConnectionString:
@@ -642,7 +672,7 @@ class TestSettingsConstraints:
             ("tile_pool_min_size", 0),
             ("tile_pool_max_size", 0),
             ("ingest_http_timeout_seconds", 0),
-            # fix(#1013): zero is the dangerous one for these two —
+            # Zero is the dangerous one for these two —
             # statement_timeout = '0' disables the timeout entirely rather than
             # erroring, so a zero accepted here would silently produce the
             # unbounded statement the budget exists to prevent.
@@ -652,7 +682,7 @@ class TestSettingsConstraints:
             ("analysis_registration_timeout_seconds", 0),
             ("analysis_registration_timeout_seconds", -1),
             ("analysis_registration_timeout_seconds", "not-a-number"),
-            # fix(#1012): 0 is a documented sentinel (leave work_mem alone),
+            # 0 is a documented sentinel (leave work_mem alone),
             # so only negatives are rejected.
             ("analysis_materialize_work_mem_mb", -1),
             ("ingest_jobs_retention_days", -1),
@@ -665,7 +695,7 @@ class TestSettingsConstraints:
             _make_settings(**{field: value})
 
     def test_undividable_work_mem_budget_is_refused_at_boot(self):
-        """fix(#1012 review): a budget too small to split into legal shares has
+        """A budget too small to split into legal shares has
         no honest run-time outcome.
 
         Issuing PostgreSQL's 64kB minimum exceeds the budget; skipping the
@@ -827,7 +857,7 @@ class TestJwtSecretLengthValidator:
         assert s.jwt_secret_key.get_secret_value() == long_key
 
     def test_known_bad_jwt_secret_rejected(self):
-        """Phase 268 H-28: .env.example default is exactly 32 chars but is a
+        """.env.example default is exactly 32 chars but is a
         public, version-controlled value. The validator must reject it."""
         with pytest.raises(Exception) as exc_info:
             _make_settings(jwt_secret_key="dev-only-change-me-in-production")
@@ -899,7 +929,7 @@ class TestLogLevelValidator:
 
 
 class TestPrivacyUrlValidator:
-    """PRIV-1: PRIVACY_URL is rendered as a raw <a href> on the login page,
+    """PRIVACY_URL is rendered as a raw <a href> on the login page,
     so an unsafe value must fail boot rather than reach the browser. This is
     the ONLY validation an ENV_ONLY_CONFIG deployment ever runs for it — the
     admin-write validator never sees an env-sourced value in that mode.
@@ -991,7 +1021,7 @@ class TestPrivacyUrlValidator:
         ],
     )
     def test_ulabel_and_alabel_forms_get_the_same_verdict(self, host, accepted):
-        """PRIV-1 (codex r7): a host's native Unicode (U-label) spelling and
+        """A host's native Unicode (U-label) spelling and
         its IDNA-encoded ("xn--...", A-label) spelling must always agree --
         which one the operator happened to type is never why one is
         accepted and the other rejected. Skips the A-form comparison for a
@@ -1095,7 +1125,7 @@ class TestSecretStrMasking:
 
 
 class TestPendingJobTimeoutBounds:
-    """fix(#1235 review r5, r6): both ends, enforced at config load.
+    """Both ends, enforced at config load.
 
     Each end had the same shape — a value the settings model accepted under
     which no upload could ever succeed, so the deployment booted clean and
@@ -1115,7 +1145,7 @@ class TestPendingJobTimeoutBounds:
         assert "pending_job_timeout_seconds" in str(excinfo.value)
 
     def test_a_timeout_at_the_signing_margin_is_refused(self):
-        """fix(#1235 review r6): the dead zone is excluded by the bound, not
+        """The dead zone is excluded by the bound, not
         discovered by the operator when every upload starts failing."""
         with pytest.raises(Exception) as excinfo:
             _make_settings(

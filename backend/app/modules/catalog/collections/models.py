@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -13,7 +14,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -51,7 +52,7 @@ class Collection(Base):
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("catalog.users.id", ondelete="SET NULL"), nullable=True
     )
-    # TSEAM-01 (Phase 1207): dormant tenant_id — nullable, no FK enforcement.
+    # Dormant tenant_id: nullable, no FK enforcement.
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
@@ -66,7 +67,7 @@ class Collection(Base):
 class CollectionDataset(Base):
     __tablename__ = "collection_datasets"
     __table_args__ = (
-        # T-3: trailing composite-PK FK; covering index added in migration 0001_baseline.
+        # Trailing composite-PK FK; covering index added in migration 0001_baseline.
         Index("ix_collection_datasets_dataset_id", "dataset_id"),
         Index(
             "ix_collection_datasets_added_by",
@@ -95,7 +96,7 @@ class DatasetVersion(Base):
     __tablename__ = "dataset_versions"
     __table_args__ = (
         UniqueConstraint("dataset_id", "version_number", name="uq_dataset_version"),
-        # DBM-10 covering index added in migration 0001_baseline.
+        # Covering index added in migration 0001_baseline.
         Index("ix_dataset_versions_dataset_id", "dataset_id"),
         Index(
             "ix_dataset_versions_uploaded_by",
@@ -118,6 +119,7 @@ class DatasetVersion(Base):
     srid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     geometry_type: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    column_info: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     # What a restore of this version puts back on the dataset.
     original_srid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_3d: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
@@ -129,4 +131,15 @@ class DatasetVersion(Base):
     )
     uploaded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+    # The table, in the dataset's data schema, that keeps this version's data
+    # after a replacement or restore replaced it. NULL: it is not kept.
+    kept_table: Mapped[str | None] = mapped_column(Text, nullable=True)
+    kept_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    kept_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # The kept data's own last_refreshed_at, which a restore reinstates.
+    kept_refreshed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )

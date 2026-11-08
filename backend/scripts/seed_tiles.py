@@ -33,11 +33,6 @@ _LAT_MAX = 85.0511
 _LAT_MIN = -85.0511
 
 
-# ---------------------------------------------------------------------------
-# Tile math (pure functions — testable without I/O)
-# ---------------------------------------------------------------------------
-
-
 def lng_to_tile_x(lng: float, z: int) -> int:
     """Convert a WGS84 longitude to a tile X index at zoom level z."""
     return int((lng + 180.0) / 360.0 * (1 << z))
@@ -112,13 +107,13 @@ def spec_bbox_to_tiles(
 ):
     """Yield (z, x, y) tuples for an RFC 7946 §5.2 bbox, which may cross ±180.
 
-    fix(#934): a two-ring antimeridian extent read naively via ST_XMin/ST_XMax
+    A two-ring antimeridian extent read naively via ST_XMin/ST_XMax
     is -180..180, so a narrow Pacific dataset seeded the whole world at every
     zoom. Read the extent through ``extent_to_bbox`` (west > east for a
     crossing extent) and seed each lobe as its own longitude range.
     """
     if west > east:
-        # fix(#934 codex r1): at low zooms both lobes can resolve to the same
+        # At low zooms both lobes can resolve to the same
         # tile column (z0 is a single tile for either lobe), so deduplicate —
         # otherwise the same cache key is seeded twice concurrently and the
         # dry-run/summary counts over-report.
@@ -132,10 +127,6 @@ def spec_bbox_to_tiles(
     else:
         yield from bbox_to_tiles(west, south, east, north, z=z)
 
-
-# ---------------------------------------------------------------------------
-# Dataset query
-# ---------------------------------------------------------------------------
 
 _DATASET_QUERY = """
     SELECT
@@ -167,11 +158,6 @@ class _DatasetChanged(Exception):
     """The dataset left the catalog or moved to another cache generation."""
 
 
-# ---------------------------------------------------------------------------
-# Main seeding logic
-# ---------------------------------------------------------------------------
-
-
 async def _seed_dataset(
     pool,
     cache,
@@ -191,7 +177,7 @@ async def _seed_dataset(
     Returns:
         (seeded_count, error_count)
     """
-    from app.processing.tiles.cache_key import tile_cache_key
+    from app.processing.tiles.cache_key import tile_cache_entry, tile_cache_key
 
     cache_key = tile_cache_key(
         table_name, dataset_id, publication_version, tile_cache_version, None
@@ -236,7 +222,7 @@ async def _seed_dataset(
                 additional_columns, cols_key = parse_cols_param(
                     None, columns, z, tile_columns=tile_columns
                 )
-                tile_data = await get_tile(
+                tile = await get_tile(
                     pool,
                     table_name,
                     z,
@@ -250,18 +236,18 @@ async def _seed_dataset(
                 # dataset id is never reissued, so a second look proves it still
                 # existed while its table was read.
                 await ensure_current()
-                if tile_data is None:
+                if tile is None:
                     await cache.set(
                         cache_key, z, x, y, b"", ttl=cache_ttl, cols_key=cols_key
                     )
                 else:
-                    compressed = gzip.compress(tile_data, compresslevel=6, mtime=0)
+                    compressed = gzip.compress(tile.mvt, compresslevel=6, mtime=0)
                     await cache.set(
                         cache_key,
                         z,
                         x,
                         y,
-                        compressed,
+                        tile_cache_entry(compressed, sampled=tile.sampled),
                         ttl=cache_ttl,
                         cols_key=cols_key,
                     )
@@ -417,7 +403,7 @@ async def main() -> None:
 
         cache_ttl = row["tile_cache_ttl"] or settings.tile_cache_ttl
 
-        # fix(#934): read the extent in spec form (west > east when it crosses
+        # Read the extent in spec form (west > east when it crosses
         # the antimeridian) so a Pacific dataset seeds its two lobes instead
         # of the whole world.
         from geoalchemy2.elements import WKBElement

@@ -4,38 +4,55 @@ No dependency on ``router.py``, so importing these back does not create a
 circular import.
 """
 
+import hashlib
 import uuid
 
-import structlog
-from fastapi import HTTPException, status
+from fastapi import HTTPException, Request, Response, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.geo import extent_to_bbox
 from app.core.identity import Identity
 from app.modules.auth.permissions import get_effective_permissions
-from app.modules.catalog.authorization import get_user_roles
+
+# check_map_access is re-exported for processing/ai, which reaches maps only
+# through this module.
+from app.modules.catalog.authorization import (
+    ANONYMOUS_MAP_VISIBILITIES,
+    apply_map_visibility_filter,
+    check_map_access as check_map_access,
+    get_user_roles,
+)
 from app.modules.catalog.maps.models import Map, MapLayer
 from app.modules.catalog.maps.schemas import (
     DatasetMetaKwargs,
     MapLayerResponse,
     MapResponse,
 )
-from app.modules.catalog.maps.service import LayerRow, validate_public_visibility
+from app.modules.catalog.maps.service import (
+    LayerRow,
+    bulk_check_dataset_access,
+    filter_layer_rows_by_dataset_visibility,
+    terrain_dataset_ids_visible_to,
+    validate_public_visibility,
+    with_attribute_display,
+)
 from app.modules.catalog.maps.sharing import can_read_every_map_dataset
+from app.modules.catalog.maps.dashboard import render_dashboard
 from app.modules.catalog.maps.style_json import project_terrain_config
-from app.platform.cache.scope import public_cache_control
 from app.platform.extensions import get_permission_extension
-
-logger = structlog.stdlib.get_logger(__name__)
+from app.platform.extensions.reader_theme import current_reader_theme
+from app.platform.http.ranges import stored_object_response
+from app.platform.storage.titiler_url import resolve_current_storage_key
 
 
 def _build_frame_ancestors(origins: list[str] | None) -> str:
     """Build a CSP frame-ancestors directive value from an allowed_origins list.
 
-    SEC-S08: two defense-in-depth filters on top of the schema-layer 422 at
+    Two defense-in-depth filters on top of the schema-layer 422 at
     create/update time, guarding any stale DB row that bypassed it — CRLF
     entries (would split the response header) and wildcard entries ('*' in
-    frame-ancestors disables clickjacking protection entirely, SHARE-06).
+    frame-ancestors disables clickjacking protection entirely).
     """
     if not origins:
         return "frame-ancestors 'self'"
@@ -59,6 +76,7 @@ def _meta_to_kwargs(meta) -> DatasetMetaKwargs:
             table_name="",
             extent=None,
             column_info=None,
+            tile_columns=None,
             feature_count=None,
             sample_values=None,
             record_type=None,
@@ -78,6 +96,7 @@ def _meta_to_kwargs(meta) -> DatasetMetaKwargs:
         table_name=meta.table_name,
         extent=meta.extent,
         column_info=meta.column_info,
+        tile_columns=meta.tile_columns,
         feature_count=meta.feature_count,
         sample_values=meta.sample_values,
         record_type=meta.record_type,
@@ -103,11 +122,12 @@ def _build_layer_response(
         dataset_name=meta.get("dataset_name", ""),
         dataset_geometry_type=meta.get("geometry_type"),
         dataset_table_name=meta.get("table_name", ""),
-        # fix(#1112): RFC 7946 §5.2 bbox (west > east on a crossing) — the
+        # RFC 7946 §5.2 bbox (west > east on a crossing) — the
         # builder fit paths unwrap it past 180, while normalizeRasterBounds
         # re-spans it at the source boundary (an inverted pair matches no tile).
         dataset_extent_bbox=extent_to_bbox(meta.get("extent")),
         dataset_column_info=meta.get("column_info"),
+        dataset_tile_columns=meta.get("tile_columns"),
         dataset_feature_count=meta.get("feature_count"),
         dataset_sample_values=meta.get("sample_values"),
         display_name=layer.display_name,
@@ -146,6 +166,7 @@ def _layers_from_tuples(layer_rows: list[LayerRow]) -> list[MapLayerResponse]:
                 table_name=row.table_name,
                 extent=row.spatial_extent,
                 column_info=row.column_info,
+                tile_columns=row.tile_columns,
                 feature_count=row.feature_count,
                 sample_values=row.sample_values,
                 record_type=row.record_type,
@@ -170,10 +191,6 @@ def _layer_history_name(layer: MapLayer, dataset_name: str | None = None) -> str
 
 def _layer_rows_by_id(layer_rows: list[LayerRow]) -> dict[uuid.UUID, LayerRow]:
     return {row.layer.id: row for row in layer_rows}
-
-
-def _visibility_value(value: object) -> str:
-    return getattr(value, "value", value)
 
 
 def _style_config_mentions_symbol(value: object) -> bool:
@@ -228,42 +245,17 @@ def _layer_patch_history_actions(patch: dict) -> list[tuple[str, str]]:
     return actions
 
 
-async def _check_map_read_access(
-    map_obj: Map,
-    user: Identity | None,
-    db: AsyncSession,
+async def _reject_non_public_datasets(
+    db: AsyncSession, map_obj: Map, reader: Identity
 ) -> None:
-    """Raise 404 if the user cannot read the map."""
-    if user is None:
-        if map_obj.visibility != "public":
-            logger.warning("map_read_denied map_id=%s user=anon", map_obj.id)
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Map not found",
-            )
-    else:
-        user_roles = await get_user_roles(db, user)
-        is_admin = "admin" in user_roles
-        is_owner = map_obj.created_by == user.id
-        is_internal = map_obj.visibility == "internal"
-        is_public = map_obj.visibility == "public"
-        if not (is_public or is_owner or is_admin or is_internal):
-            logger.warning("map_read_denied map_id=%s user_id=%s", map_obj.id, user.id)
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Map not found",
-            )
-
-
-async def _reject_non_public_datasets(db: AsyncSession, map_obj: Map) -> None:
-    """Raise 400 when a public map's layers include a non-public dataset.
+    """Raise 400 when a public map has a non-public dataset ``reader`` can read.
 
     Publishing runs the same check, but a map that is already public only
     meets it again when its layers change.
     """
     if map_obj.visibility != "public":
         return
-    non_public = await validate_public_visibility(db, map_obj.id)
+    non_public = await validate_public_visibility(db, map_obj.id, reader)
     if non_public:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -275,21 +267,52 @@ async def _reject_non_public_datasets(db: AsyncSession, map_obj: Map) -> None:
 
 
 async def _stored_image_cache_control(
-    db: AsyncSession, map_obj: Map, user: Identity | None, *, max_age: int
+    db: AsyncSession, map_obj: Map, user: Identity | None
 ) -> str | None:
     """Cache-Control for a map's stored thumbnail or OG image; None withholds it.
 
     A stored image can't leave out a layer the way live map responses do, so
     it goes only to a caller who can read every dataset the map draws. It is
-    publicly cacheable only when an anonymous caller could read them all too.
+    publicly cacheable only when an anonymous caller could read them all too,
+    and every use is revalidated, since narrowing a dataset withholds it.
     """
     if not await can_read_every_map_dataset(db, map_obj, user):
         return None
-    if map_obj.visibility == "public" and (
+    if map_obj.visibility in ANONYMOUS_MAP_VISIBILITIES and (
         user is None or await can_read_every_map_dataset(db, map_obj, None)
     ):
-        return public_cache_control(max_age)
+        return "public, no-cache"
     return "private, no-cache"
+
+
+async def _stored_images_readable(
+    db: AsyncSession, map_obj: Map, user: Identity | None
+) -> bool:
+    """Whether the image routes would serve ``user`` the map's stored images."""
+    if not (map_obj.thumbnail_uri or map_obj.og_image_uri):
+        return False
+    return await can_read_every_map_dataset(db, map_obj, user)
+
+
+async def _stored_image_response(
+    request: Request, storage_key: str, cache_control: str, missing: str
+) -> Response:
+    """A map's stored image, or a 304 decided from its key before reading it:
+    each upload is written once under its own key."""
+    from app.platform.storage.provider import get_storage
+
+    try:
+        return await stored_object_response(
+            request,
+            lambda: get_storage().get(resolve_current_storage_key(storage_key)),
+            etag='"' + hashlib.sha256(storage_key.encode()).hexdigest() + '"',
+            media_type="image/jpeg" if storage_key.endswith(".jpg") else "image/png",
+            cache_control=cache_control,
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=missing
+        ) from None
 
 
 async def _can_edit_map(
@@ -317,24 +340,37 @@ def _build_map_response(
     forked_from_name: str | None = None,
     created_by_username: str | None = None,
     *,
+    include_notes: bool,
     terrain_dataset_ids: set[str] | None = None,
+    stored_images_readable: bool = False,
 ) -> MapResponse:
     """Build the map response.
 
+    Notes are private to the map's owner and administrators, so pass
+    ``include_notes`` only for one of them.
+
+    The thumbnail and OG image URLs are set only with
+    ``stored_images_readable`` (see ``_stored_images_readable``).
+
     ``terrain_dataset_ids`` is for reads filtered by what the caller may see:
     the stored terrain binding then survives only when its DEM is one of those
-    ids, so a hidden DEM's id is not echoed.
+    ids, so a hidden DEM's id is not echoed. The dashboard keeps only the
+    widgets on ``layers``.
     """
     terrain_config = map_obj.terrain_config
     if terrain_dataset_ids is not None:
         terrain_config = project_terrain_config(terrain_config, terrain_dataset_ids)
-    thumbnail_url = f"/maps/{map_obj.id}/thumbnail/" if map_obj.thumbnail_uri else None
-    og_image_url = f"/maps/{map_obj.id}/og-image/" if map_obj.og_image_uri else None
+    thumbnail_url = og_image_url = None
+    if stored_images_readable:
+        if map_obj.thumbnail_uri:
+            thumbnail_url = f"/maps/{map_obj.id}/thumbnail/"
+        if map_obj.og_image_uri:
+            og_image_url = f"/maps/{map_obj.id}/og-image/"
     return MapResponse(
         id=map_obj.id,
         name=map_obj.name,
         description=map_obj.description,
-        notes=map_obj.notes,
+        notes=map_obj.notes if include_notes else None,
         center_lng=map_obj.center_lng,
         center_lat=map_obj.center_lat,
         zoom=map_obj.zoom,
@@ -342,8 +378,12 @@ def _build_map_response(
         pitch=map_obj.pitch,
         basemap_style=map_obj.basemap_style,
         show_basemap_labels=map_obj.show_basemap_labels,
+        show_attribute_table=map_obj.show_attribute_table,
         basemap_config=map_obj.basemap_config,
         terrain_config=terrain_config,
+        dashboard_config=render_dashboard(
+            map_obj.dashboard_config, [layer.id for layer in layers]
+        ),
         visibility=map_obj.visibility,
         thumbnail_url=thumbnail_url,
         og_image_url=og_image_url,
@@ -357,4 +397,91 @@ def _build_map_response(
         layer_count=len(layers),
         plugins=map_obj.plugins,
         legend_title=map_obj.legend_title,
+        reader_theme=current_reader_theme(),
+    )
+
+
+async def _readable_layers(
+    db: AsyncSession, layer_rows: list[LayerRow], user: Identity | None
+) -> list[MapLayerResponse]:
+    """The layers ``user`` may read, as map responses return them: each VRT's
+    extent as ``user`` sees it, and each column's current attribute display."""
+    visible_rows = await filter_layer_rows_by_dataset_visibility(db, layer_rows, user)
+    return _layers_from_tuples(await with_attribute_display(db, visible_rows))
+
+
+async def _visible_map_response(
+    db: AsyncSession,
+    map_obj: Map,
+    layer_rows: list[LayerRow],
+    user: Identity | None,
+    forked_from_name: str | None,
+    created_by_username: str | None,
+    *,
+    include_notes: bool,
+    roles: set[str] | None = None,
+) -> MapResponse:
+    """Build the map response from only the layers, terrain DEM and fork
+    source name ``user`` may read. ``roles`` are the caller's, when known.
+
+    Stored layers are untouched; this shapes the response only.
+    """
+    layers = await _readable_layers(db, layer_rows, user)
+    if forked_from_name is not None:
+        if roles is None:
+            roles = await get_user_roles(db, user) if user is not None else set()
+        source = select(Map.id).where(Map.id == map_obj.forked_from)
+        readable = apply_map_visibility_filter(
+            source, user.id if user is not None else None, "admin" in roles
+        )
+        if await db.scalar(readable) is None:
+            forked_from_name = None
+    return _build_map_response(
+        map_obj,
+        layers,
+        forked_from_name=forked_from_name,
+        created_by_username=created_by_username,
+        include_notes=include_notes,
+        terrain_dataset_ids=await terrain_dataset_ids_visible_to(
+            db, map_obj.terrain_config, [layer.dataset_id for layer in layers], user
+        ),
+        stored_images_readable=await _stored_images_readable(db, map_obj, user),
+    )
+
+
+async def _readable_terrain(
+    db: AsyncSession,
+    user: Identity,
+    terrain_config: object,
+    stored: object = None,
+    *,
+    refuse: bool = True,
+) -> object:
+    """Return ``terrain_config`` when ``user`` may bind its DEM.
+
+    The caller may bind a DEM it can read, or the one the map already binds.
+    Otherwise this answers 403, or returns None with ``refuse=False``. A DEM
+    that doesn't exist is treated the same way, so the answer doesn't tell the
+    caller whether a dataset it can't read exists.
+    """
+    if isinstance(terrain_config, dict):
+        dem_id = terrain_config.get("source_dataset_id")
+    else:
+        dem_id = getattr(terrain_config, "source_dataset_id", None)
+    stored_id = stored.get("source_dataset_id") if isinstance(stored, dict) else None
+    if dem_id is None or str(dem_id) == str(stored_id):
+        return terrain_config
+    try:
+        parsed = uuid.UUID(str(dem_id))
+    except ValueError:
+        parsed = None
+    if parsed is not None and parsed in await bulk_check_dataset_access(
+        db, [parsed], user, await get_user_roles(db, user)
+    ):
+        return terrain_config
+    if not refuse:
+        return None
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Cannot access the terrain dataset",
     )

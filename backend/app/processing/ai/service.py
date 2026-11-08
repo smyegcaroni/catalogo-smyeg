@@ -15,6 +15,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 
 from app.processing.ai.chat_constants import (
     TOOL_RESULT_PROTOCOL,
+    ramp_prompt_lines,
     sanitize_column_info,
     sanitize_dataset_value,
     sanitize_sample_values,
@@ -23,8 +24,9 @@ from app.processing.ai.constants import tool_label
 from app.platform.extensions import get_ai_provider
 from app.processing.ai.llm_loop import (
     ToolLoopExhaustedError,
+    ToolLoopResult,
     UserFacingAIError,
-    safe_stream_error_message,
+    stream_error_event,
     noop_tool_executor,
     resolve_provider,
 )
@@ -37,6 +39,7 @@ from app.processing.ai.tools import (
 )
 from typing import TYPE_CHECKING
 
+from app.core.db import release_connection
 from app.core.geo import extent_to_bbox, merge_bboxes, wrap_longitude
 from app.core.identity import Identity
 from app.processing.ai.token_usage import (
@@ -101,11 +104,7 @@ When a dataset has a column that is well-suited for thematic visualization, use 
   Use an "interpolate" expression: ["interpolate", ["linear"], ["get", "column_name"], min, "#startColor", max, "#endColor"]
 
 Available color ramps (use these hex values):
-- YlOrRd: #ffffb2, #fecc5c, #fd8d3c, #f03b20, #bd0026
-- Viridis: #440154, #3b528b, #21918c, #5ec962, #fde725
-- Blues: #eff3ff, #bdd7e7, #6baed6, #3182bd, #08519c
-- Cividis (colorblind-safe): #002051, #3b4f6b, #6d7e53, #b4a436, #fdca26
-- PuOr (colorblind-safe diverging): #e66101, #fdb863, #f7f7f7, #b2abd2, #5e3c99
+__RAMP_LIST__
 
 Apply data-driven styling ONLY if:
 - The user explicitly asks for a thematic, choropleth, or "color by X" map, OR
@@ -169,7 +168,7 @@ If no matching datasets exist after trying multiple search strategies, output an
 - If you are unsure which dataset best matches, explain your reasoning in the explanation field.
 - If no datasets match, suggest alternative search terms the user could try in the error message.
 
-"""
+""".replace("__RAMP_LIST__", ramp_prompt_lines(("YlOrRd", "Viridis", "Blues")))
 
 _DEFAULT_BASEMAP_INSTRUCTION = (
     "Choose from: positron (light, default), dark_matter (dark), voyager (colorful)."
@@ -286,9 +285,9 @@ async def _execute_search_tool(
                 sample[k] = v[:5] if isinstance(v, list) else v
             sample = sample or None
 
-        # Search includes other users' PUBLIC datasets, so an
-        # attacker's text here lands in a victim's model context, where the
-        # model holds query_data and every editing tool. Scrub like content.
+        # Search includes other users' PUBLIC datasets, so an attacker's text
+        # here lands in a victim's model context, where the model holds
+        # query_data and every editing tool. Scrub it like content.
         results.append(
             {
                 "id": str(ds.id),
@@ -300,7 +299,10 @@ async def _execute_search_tool(
                 ]
                 if ds.record.keywords
                 else None,
-                "extent_bbox": port.extract_bbox(ds),
+                # A VRT's stored extent covers members the user may not read.
+                "extent_bbox": None
+                if ds.record.record_type == "vrt_dataset"
+                else port.extract_bbox(ds),
                 "feature_count": ds.feature_count,
                 "column_info": sanitize_column_info(
                     ds.column_info[:20] if ds.column_info else None
@@ -326,13 +328,11 @@ async def _execute_get_dataset_details(
 
     dataset_id = tool_input.get("dataset_id")
 
-    # Validate UUID format
     try:
         uuid.UUID(str(dataset_id))
     except (ValueError, AttributeError):
         return {"error": "Invalid dataset_id format"}
 
-    # Apply RBAC visibility filter
     Record_orm = port.get_record_orm_class()
     DatasetGrant_orm = port.get_grant_orm_class()
     stmt = (
@@ -349,7 +349,7 @@ async def _execute_get_dataset_details(
     if ds is None:
         return {"error": "Dataset not found"}
 
-    # Cap column_info to 50 columns to bound token usage
+    # Bounds token usage.
     column_info = ds.column_info[:50] if ds.column_info else None
 
     sample = None
@@ -359,8 +359,8 @@ async def _execute_get_dataset_details(
             sample[k] = v[:5] if isinstance(v, list) else v
         sample = sample or None
 
-    # Same trust boundary as _execute_search_tool above — this tool
-    # reads any dataset the caller can see, including other users' public ones.
+    # Same trust boundary as _execute_search_tool: this tool reads any dataset
+    # the caller can see, including other users' public ones.
     return {
         "id": str(ds.id),
         "title": sanitize_dataset_value(ds.record.title),
@@ -369,6 +369,13 @@ async def _execute_get_dataset_details(
         "column_info": sanitize_column_info(column_info),
         "sample_values": sanitize_sample_values(sample),
     }
+
+
+def _finished_text(result: ToolLoopResult) -> str:
+    """The reply's text, refusing a reply that stopped before it finished."""
+    if result.truncated:
+        raise UserFacingAIError("The AI's reply was cut off. Try a shorter prompt.")
+    return result.text
 
 
 def _parse_map_spec(text: str) -> dict:
@@ -399,11 +406,9 @@ async def _retry_parse_map_spec(
         f"{raw_text}"
     )
 
-    # Dispatch via extension lookup; tools=[] + max_rounds=1 covers the
-    # no-tools single-round retry case naturally.
     provider_ext = get_ai_provider(provider)
 
-    # Single-round calls count toward the round budget.
+    await release_connection(session)
     async with usage_accounting(
         session, user_id=user_id, subsystem="map_generation", model=model
     ):
@@ -412,23 +417,20 @@ async def _retry_parse_map_spec(
             system_prompt="",
             user_message=extraction_prompt,
             tools=[],
-            # max_rounds=1 exits before any tool call; executor never runs.
             tool_executor=noop_tool_executor,
             max_rounds=1,
             max_tokens=1024,
             base_url=runtime_config.get("base_url"),
         )
-    # Retry/repair rounds spend real tokens -- record them
-    # or they bypass the daily AI budget.
+    # Retry rounds spend real tokens; unrecorded they bypass the daily budget.
     await record_token_usage(
-        session,
         user_id=user_id,
         subsystem="map_generation",
         model=model,
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
     )
-    retry_text = result.text
+    retry_text = _finished_text(result)
 
     return _parse_map_spec(retry_text)
 
@@ -445,10 +447,9 @@ async def _repair_map_spec(
 ) -> LLMMapSpec:
     """Run one repair round for schema-invalid specs.
 
-    Parse failures already get _retry_parse_map_spec; this is the sibling
-    for valid-JSON-wrong-shape output. Feed the pydantic errors back to the
-    model, bounded to a single attempt, then fail with a user-friendly
-    message instead of a raw ValidationError.
+    Sibling of _retry_parse_map_spec for valid-JSON-wrong-shape output. Feeds
+    the pydantic errors back to the model, bounded to a single attempt, then
+    fails with a user-friendly message instead of a raw ValidationError.
     """
     missing = [".".join(str(p) for p in e["loc"]) for e in validation_error.errors()]
     logger.warning(
@@ -465,7 +466,7 @@ async def _repair_map_spec(
     )
     provider_ext = get_ai_provider(provider)
 
-    # Single-round calls count toward the round budget.
+    await release_connection(session)
     async with usage_accounting(
         session, user_id=user_id, subsystem="map_generation", model=model
     ):
@@ -474,15 +475,13 @@ async def _repair_map_spec(
             system_prompt="",
             user_message=repair_prompt,
             tools=[],
-            # max_rounds=1 exits before any tool call; executor never runs.
             tool_executor=noop_tool_executor,
             max_rounds=1,
             max_tokens=1024,
             base_url=runtime_config.get("base_url"),
         )
-    # Repair-round tokens must count toward the daily cap.
+    # Repair-round tokens count toward the daily cap.
     await record_token_usage(
-        session,
         user_id=user_id,
         subsystem="map_generation",
         model=model,
@@ -490,7 +489,7 @@ async def _repair_map_spec(
         output_tokens=result.output_tokens,
     )
     try:
-        return LLMMapSpec(**_parse_map_spec(result.text))
+        return LLMMapSpec(**_parse_map_spec(_finished_text(result)))
     except (ValueError, ValidationError) as e:
         raise UserFacingAIError(
             "The AI couldn't produce a valid map for this prompt — try rephrasing it."
@@ -500,11 +499,11 @@ async def _repair_map_spec(
 def _snap_viewport_to_extent(spec: LLMMapSpec, extents: list[object]) -> None:
     """Pull an LLM viewport back to the layer data when it points elsewhere.
 
-    ``merge_bboxes`` folds per-dataset bboxes on the circle, so
-    datasets split across the antimeridian (e.g. Fiji at lon 179/-179) don't
-    union to -180..180 and snap the centre to lon 0, a quarter of the planet
-    from the data. The margin/centroid arithmetic needs a monotonic width, so
-    a crossing east is lifted past +180 before comparison. Mutates ``spec``.
+    ``merge_bboxes`` folds per-dataset bboxes on the circle, so datasets split
+    across the antimeridian (e.g. Fiji at lon 179/-179) don't union to
+    -180..180 and snap the centre to lon 0, far from the data. The margin and
+    centroid arithmetic needs a monotonic width, so a crossing east is lifted
+    past +180 before comparison. Mutates ``spec``.
     """
     merged = merge_bboxes(extent_to_bbox(ext) for ext in extents)
     if merged is None:
@@ -515,7 +514,7 @@ def _snap_viewport_to_extent(spec: LLMMapSpec, extents: list[object]) -> None:
         max_x += 360.0
         if center_lng < min_x:
             center_lng += 360.0
-    # Add a generous margin (50% of extent in each direction)
+    # Margin: 50% of the extent in each direction.
     dx = (max_x - min_x) * 0.5 or 1.0
     dy = (max_y - min_y) * 0.5 or 1.0
     if (
@@ -551,7 +550,6 @@ async def _validate_and_persist_map(
     """
     from app.modules.catalog.datasets.domain.models import Dataset as DatasetORM
 
-    # Validate basemap_style against configured basemaps
     if basemap_ids and spec.basemap_style not in basemap_ids:
         logger.warning(
             "LLM chose invalid basemap, falling back",
@@ -560,7 +558,6 @@ async def _validate_and_persist_map(
         )
         spec.basemap_style = basemap_ids[0]
 
-    # Validate all layer dataset IDs with RBAC visibility filter
     dataset_ids = [uuid.UUID(layer.dataset_id) for layer in spec.layers]
     Record_orm = port.get_record_orm_class()
     DatasetGrant_orm = port.get_grant_orm_class()
@@ -571,6 +568,7 @@ async def _validate_and_persist_map(
             Record_orm.title,
             Record_orm.spatial_extent,
             DatasetORM.table_name,
+            Record_orm.record_type,
         )
         .join(Record_orm, DatasetORM.record_id == Record_orm.id)
         .where(DatasetORM.id.in_(dataset_ids))
@@ -583,13 +581,13 @@ async def _validate_and_persist_map(
         str(row[0]): {
             "geometry_type": row[1],
             "title": row[2],
-            "spatial_extent": row[3],
+            # A VRT's stored extent covers members the user may not read.
+            "spatial_extent": None if row[5] == "vrt_dataset" else row[3],
             "table_name": row[4],
         }
         for row in ds_result.all()
     }
 
-    # Reject if any dataset is missing or unauthorized
     requested_ids = [layer.dataset_id for layer in spec.layers]
     missing = [did for did in requested_ids if did not in ds_info]
     if missing:
@@ -597,8 +595,7 @@ async def _validate_and_persist_map(
             f"Datasets not found or not accessible: {', '.join(missing)}"
         )
 
-    # Validate viewport coords against union of dataset bboxes
-    # If the LLM-generated center is far outside the data extent, snap to centroid
+    # A center far outside the union of dataset bboxes snaps to the centroid.
     try:
         _snap_viewport_to_extent(
             spec, [info.get("spatial_extent") for info in ds_info.values()]
@@ -606,9 +603,8 @@ async def _validate_and_persist_map(
     except Exception:  # broad: viewport validation is non-fatal context-builder; skip on any geometry/DB error
         logger.debug("Viewport validation skipped", exc_info=True)
 
-    # Replace LLM-invented choropleth breaks with DB-computed quantiles
-    # The LLM may generate step expressions with guessed break values;
-    # the chat path already uses get_column_stats() but map gen does not.
+    # The LLM may guess break values in step expressions; replace them with
+    # DB-computed quantiles.
     allowed_tables = {info["table_name"] for info in ds_info.values()}
     for layer in spec.layers:
         if not layer.paint:
@@ -626,8 +622,7 @@ async def _validate_and_persist_map(
                 and value[1][0] == "get"
             ):
                 column = value[1][1]
-                # Count color stops to determine class count
-                # step format: ["step", ["get", col], default_color, break1, color1, ...]
+                # ["step", ["get", col], default_color, break1, color1, ...]
                 n_breaks = (len(value) - 3) // 2
                 if n_breaks < 1:
                     continue
@@ -641,7 +636,7 @@ async def _validate_and_persist_map(
                     )
                     quantiles = stats.get("quantiles", [])
                     if quantiles and len(quantiles) >= n_breaks:
-                        # Replace break values in-place (positions 3, 5, 7...)
+                        # Break values sit at positions 3, 5, 7...
                         for i, brk in enumerate(quantiles[:n_breaks]):
                             layer.paint[prop][3 + i * 2] = brk
                         logger.info(
@@ -654,7 +649,6 @@ async def _validate_and_persist_map(
                         "Choropleth break replacement skipped", exc_info=True
                     )
 
-    # Build validated layer dicts before touching the DB
     layer_dicts = []
     for layer in spec.layers:
         info = ds_info[layer.dataset_id]
@@ -672,7 +666,7 @@ async def _validate_and_persist_map(
             }
         )
 
-    # Persist map + layers atomically via nested savepoint
+    # Map and layers persist atomically in a savepoint.
     async with session.begin_nested():
         map_obj = await port.create_map(
             session,
@@ -690,7 +684,7 @@ async def _validate_and_persist_map(
             layers=layer_dicts,
         )
 
-    # Derive dataset_names in spec.layers order (preserving duplicates)
+    # In spec.layers order, duplicates preserved.
     dataset_names = [ds_info[layer.dataset_id]["title"] for layer in spec.layers]
 
     return {
@@ -710,7 +704,7 @@ def _build_tool_executor(
 ) -> "Callable[[str, dict], Awaitable[dict]]":
     async def tool_executor(tool_name: str, tool_input: dict) -> dict:
         if tool_name == "search_datasets":
-            return {
+            result: dict = {
                 "results": await _execute_search_tool(
                     session,
                     user,
@@ -720,8 +714,8 @@ def _build_tool_executor(
                     port=port,
                 )
             }
-        if tool_name == "get_dataset_details":
-            return await _execute_get_dataset_details(
+        elif tool_name == "get_dataset_details":
+            result = await _execute_get_dataset_details(
                 session,
                 user,
                 user_roles,
@@ -729,7 +723,10 @@ def _build_tool_executor(
                 send_sample_values=send_sample_values,
                 port=port,
             )
-        return {"error": f"Unknown tool: {tool_name}"}
+        else:
+            result = {"error": f"Unknown tool: {tool_name}"}
+        await release_connection(session)
+        return result
 
     return tool_executor
 
@@ -756,6 +753,7 @@ async def generate_map_from_prompt(
     system_prompt = _build_map_system_prompt(language, basemap_ids=basemap_ids)
     tool_executor = _build_tool_executor(session, user, user_roles, send_samples, port)
 
+    await release_connection(session)
     try:
         async with usage_accounting(
             session, user_id=user.id, subsystem="map_generation", model=model
@@ -772,8 +770,7 @@ async def generate_map_from_prompt(
                 max_rounds=8,
             )
     except ToolLoopExhaustedError as exc:
-        # Accounting already happened inside the context manager; this only
-        # translates the failure for the caller.
+        # usage_accounting has already recorded the spend.
         raise UserFacingAIError(
             "Map generation required too many steps. Try a simpler prompt."
         ) from exc
@@ -785,7 +782,6 @@ async def generate_map_from_prompt(
     )
 
     await record_token_usage(
-        session,
         user_id=user.id,
         subsystem="map_generation",
         model=model,
@@ -793,13 +789,13 @@ async def generate_map_from_prompt(
         output_tokens=result.output_tokens,
     )
 
-    # Parse the map spec from LLM output, with one lightweight retry
+    text = _finished_text(result)
     try:
-        spec_dict = _parse_map_spec(result.text)
+        spec_dict = _parse_map_spec(text)
     except ValueError:
         logger.warning("Map spec parse failed, retrying extraction only")
         spec_dict = await _retry_parse_map_spec(
-            result.text,
+            text,
             provider,
             model,
             runtime_config,
@@ -807,7 +803,6 @@ async def generate_map_from_prompt(
             user_id=user.id,
         )
 
-    # Check for error response
     if "error" in spec_dict:
         raise UserFacingAIError(spec_dict["error"])
 
@@ -881,11 +876,12 @@ async def stream_generate_map(
             )
             return result
 
-        # Without this, an exhaustion, a timeout or a client
-        # disconnect (which cancels the task) bills the provider round but
-        # never reaches catalog.ai_token_usage. Covers all three: timeout
-        # counts arrive on __cause__; disconnect arrives as CancelledError,
-        # which `except Exception` would miss.
+        await release_connection(session)
+        # usage_accounting records the spend of an exhaustion, a timeout or a
+        # client disconnect, which would otherwise bill the provider but never
+        # reach catalog.ai_token_usage. Timeout counts arrive on __cause__;
+        # a disconnect arrives as CancelledError, which `except Exception`
+        # would miss.
         async with usage_accounting(
             session, user_id=user.id, subsystem="map_generation", model=model
         ):
@@ -901,7 +897,7 @@ async def stream_generate_map(
                     max_tokens=1024,
                     max_rounds=8,
                 ),
-                timeout=300.0,  # 5-minute hard cap on LLM tool loop
+                timeout=300.0,  # hard cap on the whole tool loop
             )
 
         logger.info(
@@ -910,11 +906,10 @@ async def stream_generate_map(
             output_tokens=result.output_tokens,
         )
 
-        # Record BEFORE any post-LLM yield, so a client disconnect
-        # during the tool-event replay below can't skip accounting -- the
-        # tokens are already spent once provider_ext.complete returns.
+        # Record BEFORE any post-LLM yield, so a client disconnect during the
+        # tool-event replay can't skip accounting: the tokens are already spent
+        # once provider_ext.complete returns.
         await record_token_usage(
-            session,
             user_id=user.id,
             subsystem="map_generation",
             model=model,
@@ -922,19 +917,18 @@ async def stream_generate_map(
             output_tokens=result.output_tokens,
         )
 
-        # Yield all collected tool events
         for evt in tool_events:
             yield evt
 
-        # Build the map
         yield {"type": "tool_start", "tool": "create_map", "label": "Building map..."}
 
+        text = _finished_text(result)
         try:
-            spec_dict = _parse_map_spec(result.text)
+            spec_dict = _parse_map_spec(text)
         except ValueError:
             logger.warning("Map spec parse failed, retrying extraction only")
             spec_dict = await _retry_parse_map_spec(
-                result.text,
+                text,
                 provider,
                 model,
                 runtime_config,
@@ -946,7 +940,6 @@ async def stream_generate_map(
             yield {"type": "error", "message": spec_dict["error"]}
             return
 
-        # One LLM repair round before surfacing a failure
         try:
             spec = LLMMapSpec(**spec_dict)
         except ValidationError as ve:
@@ -981,12 +974,11 @@ async def stream_generate_map(
             "message": "Map generation timed out. Try a simpler prompt.",
         }
     except Exception as e:  # broad: SSE generator must yield error event for any unhandled SDK/runtime exception
-        # A SQLAlchemy ProgrammingError carries the statement and
-        # bound params, an APIStatusError carries the provider response body
-        # and URL, and OpenAICredentialDestinationError names the configured
-        # endpoint -- str(e) must never reach the browser. The passthrough is
-        # a positive allowlist of ONE explicit type, not "any ValueError":
-        # that class is open, and a ValueError naming the endpoint belongs to
-        # it too.
+        # A SQLAlchemy ProgrammingError carries the statement and bound params,
+        # an APIStatusError the provider response body and URL, and
+        # OpenAICredentialDestinationError names the configured endpoint, so
+        # str(e) must never reach the browser. Only UserFacingAIError passes
+        # through, not "any ValueError": that class is open, and a ValueError
+        # naming the endpoint belongs to it too.
         logger.exception("Streaming map generation failed")
-        yield {"type": "error", "message": safe_stream_error_message(e)}
+        yield stream_error_event(e)

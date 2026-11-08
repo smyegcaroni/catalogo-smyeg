@@ -1,7 +1,6 @@
 """Community-edition ProcessingPort default.
 
-Split from the former single-module ``defaults.py`` (#836): this sub-module
-owns ``DefaultProcessingPort``, the processing->catalog delegation seam.
+``DefaultProcessingPort`` is the processing->catalog delegation seam.
 Import it via the ``app.platform.extensions.defaults`` facade, never from
 this sub-module.
 """
@@ -13,10 +12,8 @@ class DefaultProcessingPort:
     """Community-edition default: delegates every call to app.modules.catalog.*
     via deferred imports.
 
-    Each method does a deferred import into app.modules.catalog.* inside the
-    function body, keeping platform/extensions/ free of module-load-time
-    modules.* edges. Behavior is identical to the pre-split baseline — the
-    Port is the seam, not a re-implementation.
+    The deferred imports keep platform/extensions/ free of module-load-time
+    modules.* edges. The Port is the seam, not a re-implementation.
 
     create_dataset, get_dataset etc. delegate via the
     app.modules.catalog.datasets.domain.service FACADE, never the
@@ -26,8 +23,7 @@ class DefaultProcessingPort:
     async def get_dataset(self, session, dataset_id):  # type: ignore[no-untyped-def]
         # Explicit joinedload(Dataset.record) on the Port surface so callers
         # can rely on `dataset.record.<attr>` in async contexts without
-        # depending on the facade's implicit loading — protects callers
-        # from any future facade change that drops the joinedload.
+        # depending on the facade's implicit loading.
         from sqlalchemy import select
         from sqlalchemy.orm import joinedload
 
@@ -93,6 +89,16 @@ class DefaultProcessingPort:
 
         return await get_user_roles(session, user)
 
+    async def vrt_members_beyond_audience(self, session, member_ids, vrt):  # type: ignore[no-untyped-def]
+        from app.modules.catalog.authorization import vrt_members_beyond_audience
+
+        return await vrt_members_beyond_audience(session, member_ids, vrt)
+
+    async def vrts_beyond_member_audience(self, session, vrts):  # type: ignore[no-untyped-def]
+        from app.modules.catalog.authorization import vrts_beyond_member_audience
+
+        return await vrts_beyond_member_audience(session, vrts)
+
     async def run_analysis_preview(  # type: ignore[no-untyped-def]
         self,
         session,
@@ -112,7 +118,7 @@ class DefaultProcessingPort:
         can retry from). Callers own the dataset VISIBILITY check, for the
         mask dataset as much as the source — this port never checks it.
 
-        feat(#683): the mask's SHAPE and SIZE are checked here, so every
+        The mask's SHAPE and SIZE are checked here, so every
         port caller gets the rails the REST route applies. Unioning points
         or lines masks nothing meaningful; without the shape check the
         failure is an empty result the model reports as real. The size
@@ -243,29 +249,25 @@ class DefaultProcessingPort:
             .order_by(Record.created_at)
         )
         if not force:
-            # fix(#1506): "missing" means "has no vector THIS model can use",
-            # not "has no vector at all" — `record_embeddings` is keyed
-            # (record_id, model_name) and semantic search reads only
-            # active-model rows, so the old `RecordEmbedding.id IS NULL`
-            # predicate made Generate Missing a no-op after a model swap.
-            # The outer join went with it: NOT EXISTS correlates on its own,
-            # and the join only produced duplicate Records `.unique()`
-            # collapsed again.
+            # "missing" means "has no vector THIS model can use", not "has
+            # no vector at all": `record_embeddings` is keyed (record_id,
+            # model_name) and semantic search reads only active-model rows,
+            # so an `IS NULL` test would make Generate Missing a no-op after
+            # a model swap.
             model_name = await resolve_embedding_model_name(session)
             if model_name == UNKNOWN_EMBEDDING_MODEL:
-                # Fail closed, the OPPOSITE of what the sentinel does for
-                # #1503's read-only coverage stats: here it would select the
-                # whole catalog as missing and feed a run that embeds every
-                # record at provider-token cost, then fails to insert (rows
-                # are stamped from EMBEDDING_MODEL.get(), NOT NULL). Selecting
-                # nothing is the recoverable error.
+                # Fail closed, the OPPOSITE of what the sentinel does for the
+                # read-only coverage stats: here it would select the whole
+                # catalog and feed a run that embeds every record at
+                # provider-token cost, then fails to insert (rows are stamped
+                # from EMBEDDING_MODEL.get(), NOT NULL). Selecting nothing is
+                # the recoverable error.
                 structlog.stdlib.get_logger(__name__).warning(
                     "backfill_skipped_unresolved_embedding_model"
                 )
                 return []
-            # fix(#1546): "missing" narrows again, from "no vector THIS
-            # MODEL can use" to "no vector this CONFIGURATION can use". A
-            # model served from a different endpoint is a different vector
+            # "missing" narrows again, to "no vector this CONFIGURATION can
+            # use". A model served from a different endpoint is a different vector
             # space, so a row stamped with another configuration is as
             # unusable as a superseded model's row. An unstamped row still
             # counts as covering the record, so an upgrade doesn't turn the
@@ -387,7 +389,6 @@ class DefaultProcessingPort:
         visibility="private",
         ingestion=None,
     ):  # type: ignore[no-untyped-def]
-        # Delegates via facade — never service_create.py directly.
         from app.modules.catalog.datasets.domain.service import create_dataset
 
         return await create_dataset(
@@ -426,8 +427,6 @@ class DefaultProcessingPort:
     async def reconcile_distributions(  # type: ignore[no-untyped-def]
         self, session, dataset_id, record_id, table_name, geometry_type=None
     ):
-        # fix(#1314): the preservation policy for user-authored rows lives
-        # in the function's docstring, not here.
         from app.modules.catalog.records.service import reconcile_distributions
 
         return await reconcile_distributions(
@@ -446,6 +445,7 @@ class DefaultProcessingPort:
         result_offset=None,
         object_ids=None,
         force_arcgis_geojson=False,
+        return_z=False,
     ):  # type: ignore[no-untyped-def]
         from app.modules.catalog.sources.preview import build_gdal_source
 
@@ -460,6 +460,7 @@ class DefaultProcessingPort:
             result_offset=result_offset,
             object_ids=object_ids,
             force_arcgis_geojson=force_arcgis_geojson,
+            return_z=return_z,
         )
 
     async def fetch_arcgis_id_plan(
@@ -483,9 +484,9 @@ class DefaultProcessingPort:
             current_version=current_version,
         )
 
-    # ORM class helpers: returned by Port so processing/* callers can pass
-    # the concrete class to apply_visibility_filter without importing from
-    # app.modules.catalog.* at top-of-file (deferred-import discipline).
+    # ORM classes returned by the Port so processing/* callers can pass the
+    # concrete class to apply_visibility_filter without importing
+    # app.modules.catalog.*.
 
     def get_record_orm_class(self):  # type: ignore[no-untyped-def]
         from app.modules.catalog.datasets.domain.models import Record

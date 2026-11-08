@@ -16,14 +16,11 @@ from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession
 
 if TYPE_CHECKING:
+    # ``"Identity"`` stays quoted: a runtime import would be circular with
+    # app.core.identity.
     from app.core.identity import Identity
-
-    # Identity forward-reference quoting convention: use ``"Identity"`` for
-    # required params and ``"Identity | None"`` for optional ones. Both are
-    # quoted because the import only resolves under TYPE_CHECKING; a
-    # runtime import would create a circular dependency with
-    # app.core.identity. Keep this convention consistent across the file.
     from app.platform.audit import AuditEvent
+    from app.platform.extensions.reader_theme import ReaderTheme
     from app.processing.ai.llm_loop import (
         ActionCollector,
         ToolExecutor,
@@ -36,6 +33,10 @@ class BrandingExtension(Protocol):
     """Extension point for branding customization."""
 
     def get_branding_defaults(self) -> dict[str, object]: ...
+
+    def get_reader_theme(self) -> ReaderTheme | None:
+        """The theme for reader-facing story and dashboard pages, or None."""
+        ...
 
 
 @runtime_checkable
@@ -55,7 +56,8 @@ class AuditSink(Protocol):
     Enterprise overlays subscribe by appending instances to
     ``_extensions["audit_sinks"]`` in ``register_extensions(registry)`` via
     ``setdefault + append`` — overwriting the slot makes DefaultAuditSink
-    disappear and breaks AUDIT-05.
+    disappear and breaks the guarantee that every deployment writes at least
+    one audit sink.
     """
 
     async def emit(self, session: AsyncSession, event: "AuditEvent") -> None: ...
@@ -215,8 +217,7 @@ class DataServingExtension(Protocol):
 class AIProviderExtension(Protocol):
     """LLM provider dispatch table entry.
 
-    Replaces hardcoded ``if/elif provider == "anthropic"/"openai_compatible"``
-    dispatch in ``processing/ai/`` with name-keyed extension lookup. The
+    Name-keyed provider lookup for ``processing/ai/``. The
     registry slot ``_extensions["ai_providers"]`` is a
     ``dict[str, AIProviderExtension]`` — dict-shape, not list-shape, because
     dispatch fans out by name at request time.
@@ -311,8 +312,8 @@ class AIProviderExtension(Protocol):
     ) -> tuple[Any, int, int]:
         """Return ``(parsed_response_model, input_tokens, output_tokens)``.
 
-        Token counts feed per-user AI budget accounting (#402), so
-        metadata-assist calls count toward the cap like map/chat do.
+        Token counts feed per-user AI budget accounting, so metadata-assist
+        calls count toward the cap like map/chat do.
         """
         ...
 
@@ -332,9 +333,7 @@ class AIProviderExtension(Protocol):
 class EmbeddingProviderExtension(Protocol):
     """Embedding provider dispatch table entry.
 
-    Sibling of AIProviderExtension. Replaces the direct
-    ``from openai import OpenAI`` in processing/embeddings/helpers.py with
-    name-keyed extension lookup. Registry slot
+    Sibling of AIProviderExtension. Registry slot
     ``_extensions["embedding_providers"]`` is a
     ``dict[str, EmbeddingProviderExtension]``, dict-shape mirroring
     ``ai_providers``.
@@ -424,12 +423,12 @@ class PermissionExtension(Protocol):
     A singleton extension point for two governance chokepoints: capability
     checks in ``require_permission()`` and catalog visibility filtering in
     ``catalog/authorization.py``. Community mode uses
-    ``DefaultPermissionExtension`` to preserve the current role matrix,
-    admin overrides, and visibility rules. Enterprise overlays replace the
+    ``DefaultPermissionExtension`` for the role matrix, admin overrides, and
+    visibility rules. Enterprise overlays replace the
     singleton registry entry under ``"permission"`` to implement advanced
     RBAC, ABAC, or row-level filters without changing core.
 
-    **Wrap-don't-replace (SLOT-02):** an overlay needing additive behavior
+    **Wrap-don't-replace:** an overlay needing additive behavior
     MUST wrap the prior implementation retrieved via
     ``get_permission_extension()`` at construction time — never bare
     re-register the ``"permission"`` key (the slot-conflict guard rejects it).
@@ -441,11 +440,11 @@ class PermissionExtension(Protocol):
     the matrix is only what the database will store. An overlay may deny a
     stored grant or add one out-of-band — that's how a fleet operator gets
     ``manage_tenants`` at all. "The matrix cannot store X, so no caller has
-    X" is true of the table and false of the deployment (#1021).
+    X" is true of the table and false of the deployment.
 
-    **The three methods are one policy (#1068, EXTENSION_API_VERSION 4).**
+    **The three methods are one policy.**
     ``filter_visible`` and ``can_access_dataset`` are a pair — the same
-    rule asked of a list and of one row (#929/#930). ``record_audience`` is
+    rule asked of a list and of one row. ``record_audience`` is
     the third reading: the same rule asked about a whole audience, for a
     caller with no user to pass. An overlay that changes either of the
     first two and leaves this one on the community answer is reporting one
@@ -533,13 +532,13 @@ class WorkflowTransitionContext:
 class WorkflowExtension(Protocol):
     """Policy seam for dataset publication workflow transitions.
 
-    Community mode uses ``DefaultWorkflowExtension`` to preserve the
-    existing draft -> ready -> internal -> published lifecycle. Enterprise
+    Community mode uses ``DefaultWorkflowExtension`` for the
+    draft -> ready -> internal -> published lifecycle. Enterprise
     overlays can replace the singleton ``"workflow"`` registry slot to add
     approval states, block transitions, or observe transitions without
     changing catalog routes.
 
-    **Wrap-don't-replace (SLOT-02):** an overlay that needs to observe
+    **Wrap-don't-replace:** an overlay that needs to observe
     transitions while preserving existing behavior MUST wrap
     ``get_workflow_extension()`` at construction time — never bare
     re-register the ``"workflow"`` key.
@@ -608,7 +607,7 @@ class EntitlementPort(Protocol):
     fail-OPEN). The cloud overlay registers a real implementation backed
     by the ``tenant_entitlements`` table (webhook-synced from Stripe).
 
-    **Wrap-don't-replace (SLOT-02):** an overlay needing additive behavior
+    **Wrap-don't-replace:** an overlay needing additive behavior
     MUST wrap the prior implementation retrieved via
     ``get_entitlement_port()`` at construction time — never bare
     re-register the ``"entitlement"`` key (the slot-conflict guard rejects it).

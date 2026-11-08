@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { getServiceTypeLabel } from '@/i18n/labels';
 import { describeFailureReason } from '@/lib/failure-reason';
 import { Link } from 'react-router';
-import { AlertCircle, Loader2 } from 'lucide-react';
+import { AlertCircle, ExternalLink, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import {
   useCancelRefreshJob,
@@ -11,6 +11,7 @@ import {
   useDatasetVersions,
 } from '@/components/dataset/hooks/use-dataset';
 import { OriginBadge, datasetOrigin } from '@/components/dataset/OriginBadge';
+import { REFRESHABLE_ORIGINS } from '@/components/dataset/SourceRefreshAction';
 import { SourceSyncPanel } from '@/components/dataset/SourceSyncPanel';
 import { useVrtGenerations, useVrtSources, useVrtStatus } from '@/components/import/hooks/use-vrt';
 import { Badge } from '@/components/ui/badge';
@@ -25,6 +26,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import { stripTrailingSlashes } from '@/lib/dataset-access';
 import { formatDateTimeSmart, formatDateTimeUtc, formatNumber } from '@/lib/format';
 import {
   healthDotColors,
@@ -46,17 +48,16 @@ import type {
   VrtSourceHealth,
 } from '@/types/api';
 
-export interface SourcePanelProps {
+interface SourcePanelProps {
   dataset: DatasetResponse;
-  /** Injected by the caller (DetailPanel wires the #1285 "Refresh from
-   *  source" action here, gated on canEdit and a resolvable origin). The
-   *  read-only #1225 integration passed nothing. */
+  /** Injected by the caller (DetailPanel wires the "Refresh from source" action
+   *  here, gated on canEdit and a resolvable origin). A read-only integration
+   *  passes nothing. */
   actions?: ReactNode;
-  /** feat(#1677): the same owner-or-admin signal that gates the injected
-   *  refresh action, minus the origin gate — cancel rights are a superset
-   *  of refresh rights on this surface (a run can be in flight on a dataset
-   *  whose origin no longer resolves). Gates the Cancel button on the
-   *  active run row in the refresh history. */
+  /** The same owner-or-admin signal that gates the injected refresh action,
+   *  minus the origin gate: cancel rights are a superset of refresh rights here
+   *  (a run can be in flight on a dataset whose origin no longer resolves).
+   *  Gates the Cancel button on the active run row in the refresh history. */
   canEdit?: boolean;
   refreshBusy?: boolean;
   onAcceptBlockedRun?: (run: BlockedRunToAccept) => void;
@@ -84,8 +85,8 @@ type HealthDetail =
   | 'timeout'
   | 'network_error'
   | 'blocked_by_policy'
-  // fix(#1746): separate from 'unauthorized', whose copy says the source "now
-  // requires" access — wrong for a service that has been org-only all along.
+  // Separate from 'unauthorized', whose copy says the source "now
+  // requires" access — wrong for a service that is org-only throughout.
   | 'auth_required';
 
 const HEALTH_DETAILS = new Set<HealthDetail>([
@@ -121,7 +122,7 @@ const freshnessClasses: Record<SourceFreshness, string> = {
 
 const driftClasses: Record<SchemaDriftStatus, string> = {
   none: semanticBadgeColors.success,
-  drifted: semanticBadgeColors.destructive,
+  drifted: semanticBadgeColors.warning,
   unknown: 'border-border bg-muted text-muted-foreground',
 };
 
@@ -150,6 +151,18 @@ function safeHttpPointer(value: string | null): string | null {
   }
 }
 
+const ARCGIS_ITEM_ID = /^[0-9a-f]{32}$/;
+
+/** The portal's page for the item this dataset was built from, or null. */
+function arcgisItemUrl(dataset: DatasetResponse, origin: DatasetOrigin | null): string | null {
+  if (origin !== 'service' && origin !== 'upload') return null;
+  const ref = trustedRef(dataset, origin);
+  const itemId = refString(ref, 'item_id');
+  const portal = safeHttpPointer(refString(ref, 'portal_url'));
+  if (!itemId || !ARCGIS_ITEM_ID.test(itemId) || !portal?.startsWith('https://')) return null;
+  return `${portal.replace(/\/$/, '')}/home/item.html?id=${itemId}`;
+}
+
 function matchesCurrentServiceBinding(
   dataset: DatasetResponse,
   binding: Record<string, unknown>,
@@ -164,7 +177,12 @@ function matchesCurrentServiceBinding(
     && typeof binding.layer_id === 'string'
     && binding.layer_id === currentLayer
     && typeof binding.url === 'string'
-    && safeHttpPointer(binding.url) === currentUrl;
+    && sameServiceUrl(safeHttpPointer(binding.url), currentUrl);
+}
+
+// canonical_service_source_binding_fingerprint ignores a trailing slash too.
+function sameServiceUrl(a: string | null, b: string | null): boolean {
+  return (a && stripTrailingSlashes(a)) === (b && stripTrailingSlashes(b));
 }
 
 // A later published run replaced the data this held upload was measured
@@ -262,12 +280,25 @@ function SourceMetric({ label, children }: { label: string; children: ReactNode 
   );
 }
 
+function HistoryCard({ id, title, children }: { id: string; title: string; children: ReactNode }) {
+  return (
+    <section aria-labelledby={id}>
+      <Card>
+        <CardHeader>
+          <CardTitle level={2} id={id}>{title}</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">{children}</CardContent>
+      </Card>
+    </section>
+  );
+}
+
 function SourceHistory({ dataset }: { dataset: DatasetResponse }) {
   const { t, i18n } = useTranslation('dataset');
   const { data, isLoading, isError } = useDatasetVersions(dataset.id);
   const fetched = (data?.versions ?? []).filter((version) => version.dataset_id === dataset.id);
   const hasFirstVersion = fetched.some((version) => version.version_number === 1);
-  // fix(#1280): current fields cannot reconstruct mutable version-1 state.
+  // Current fields cannot reconstruct mutable version-1 state.
   const currentFieldsAreInitial = dataset.current_version === 1;
   const versions: DatasetVersionResponse[] = [
     ...fetched,
@@ -277,10 +308,10 @@ function SourceHistory({ dataset }: { dataset: DatasetResponse }) {
           dataset_id: dataset.id,
           version_number: 1,
           source_filename: currentFieldsAreInitial ? dataset.source_filename : null,
-          source_format: currentFieldsAreInitial ? dataset.source_format : null,
+          source_format: currentFieldsAreInitial ? (dataset.source_format ?? null) : null,
           feature_count: null,
-          srid: currentFieldsAreInitial ? dataset.srid : null,
-          geometry_type: currentFieldsAreInitial ? dataset.geometry_type : null,
+          srid: currentFieldsAreInitial ? (dataset.srid ?? null) : null,
+          geometry_type: currentFieldsAreInitial ? (dataset.geometry_type ?? null) : null,
           file_hash: null,
           uploaded_by: dataset.created_by,
           uploaded_at: dataset.created_at,
@@ -291,10 +322,7 @@ function SourceHistory({ dataset }: { dataset: DatasetResponse }) {
     .slice(0, 5);
 
   return (
-    <section aria-labelledby="source-history-heading" className="space-y-3">
-      <h2 id="source-history-heading" className="text-base font-semibold">
-        {t('sourcePanel.history.title')}
-      </h2>
+    <HistoryCard id="source-history-heading" title={t('sourcePanel.history.title')}>
       {isLoading ? (
         <div className="space-y-2" aria-label={t('sourcePanel.history.loading')}>
           <Skeleton className="h-14 w-full" />
@@ -329,15 +357,15 @@ function SourceHistory({ dataset }: { dataset: DatasetResponse }) {
           ))}
         </ol>
       )}
-    </section>
+    </HistoryCard>
   );
 }
 
 /**
- * Read-only history of refresh attempts (#1285), including failures — the
- * durable record `SourceRefreshAction` dispatches into via `POST .../refresh`
- * and that its dataset_busy gating reads back from. Visible to anyone who can
- * see the dataset at all; the backend redacts triggered_by/error detail for
+ * Read-only history of refresh attempts, including failures: the durable record
+ * `SourceRefreshAction` dispatches into via `POST .../refresh` and that its
+ * dataset_busy gating reads back from. Visible to anyone who can see the
+ * dataset at all; the backend redacts triggered_by/error detail for
  * non-owner, non-admin readers rather than hiding the section outright.
  */
 function RefreshRunHistory({
@@ -384,10 +412,7 @@ function RefreshRunHistory({
   }, [data, isFetching, limit, runs, skip, targetRunId]);
 
   return (
-    <section aria-labelledby="refresh-history-heading" className="space-y-3">
-      <h2 id="refresh-history-heading" className="text-base font-semibold">
-        {t('sourcePanel.refresh.history.title')}
-      </h2>
+    <HistoryCard id="refresh-history-heading" title={t('sourcePanel.refresh.history.title')}>
       {isLoading ? (
         <div className="space-y-2" aria-label={t('sourcePanel.refresh.history.loading')}>
           <Skeleton className="h-14 w-full" />
@@ -422,7 +447,7 @@ function RefreshRunHistory({
                     { defaultValue: run.status },
                   )}
                 </Badge>
-                {/* fix(#1325): run.origin_kind is the run's execution door,
+                {/* run.origin_kind is the run's execution door,
                     not the dataset's origin shown by the OriginBadge above —
                     the two can visibly disagree while work is in flight (see
                     the CHECK constraint comment in refresh/models.py for a
@@ -436,7 +461,7 @@ function RefreshRunHistory({
                 >
                   {t('sourcePanel.refresh.history.mechanismLabel', { mechanism: run.origin_kind })}
                 </Badge>
-                {/* feat(#1677): one-click cancel on the active run, Retry
+                {/* One-click cancel on the active run, Retry
                     parity — no confirm dialog; recoverable and data-safe
                     under the backend's no-swap fence. Keyed on the run's
                     ingest_job_id (absent on legacy rows, so gated on it). */}
@@ -521,6 +546,9 @@ function RefreshRunHistory({
                   {run.origin_kind !== 'upload' && run.verification.identity_check === 'unavailable' && (
                     <p>{t('sourcePanel.refresh.history.identityUnavailable')}</p>
                   )}
+                  {run.status === 'succeeded' && run.verification.data_unchanged && (
+                    <p>{t('sourcePanel.refresh.history.dataUnchanged')}</p>
+                  )}
                   {typeof run.verification.source_binding.url === 'string'
                     && safeHttpPointer(run.verification.source_binding.url) && (
                     <p className="break-all">
@@ -567,9 +595,7 @@ function RefreshRunHistory({
                           const sourcePolicy = run.verification?.source_binding.verification_policy;
                           const verificationPolicy = sourcePolicy === 'arcgis_id_set_v1'
                             ? sourcePolicy
-                            : run.verification?.verification_policy === 'arcgis_id_set_v1'
-                              ? run.verification.verification_policy
-                              : undefined;
+                            : undefined;
                           onAcceptBlockedRun(run.origin_kind === 'upload'
                             ? { id: run.id, upload: true }
                             : { id: run.id, verificationPolicy });
@@ -597,7 +623,7 @@ function RefreshRunHistory({
           {t('sourcePanel.refresh.history.loadMore')}
         </Button>
       )}
-    </section>
+    </HistoryCard>
   );
 }
 
@@ -733,7 +759,7 @@ function VrtSection({ dataset, isAuthenticated }: { dataset: DatasetResponse; is
                       })}
                     </Badge>
                   </TableCell>
-                  <TableCell>{formatDateTimeSmart(generation.started_at)}</TableCell>
+                  <TableCell>{formatDateTimeSmart(generation.started_at ?? null)}</TableCell>
                   <TableCell>
                     {generation.duration_seconds != null
                       ? `${generation.duration_seconds.toLocaleString(i18n.language, { maximumFractionDigits: 1 })}s`
@@ -770,6 +796,7 @@ export function SourcePanel({
   const isVrt = dataset.record_type === 'vrt_dataset';
   const origin = dataset.origin ?? datasetOrigin(dataset);
   const pointers = pointerFields(dataset, origin);
+  const itemUrl = arcgisItemUrl(dataset, origin);
   const health = dataset.source_health ?? 'unknown';
   const freshness = dataset.source_freshness ?? 'unknown';
   const drift = dataset.schema_drift_status ?? 'unknown';
@@ -782,6 +809,8 @@ export function SourcePanel({
     (health === 'unknown' && origin != null && HEALTH_CHECKED_ON_REFRESH.has(origin)
       ? t('sourcePanel.healthUnknownHint')
       : null);
+  // Health, freshness, drift and scheduled sync describe a remote source; an uploaded or drawn dataset has none.
+  const hasRemoteSource = origin != null && REFRESHABLE_ORIGINS.has(origin);
   const originKey = isVrt ? 'vrt' : origin ?? 'unknown';
   const storageKey = isVrt ? 'vrt' : origin ?? 'unknown';
 
@@ -825,30 +854,50 @@ export function SourcePanel({
             </dl>
           )}
 
+          {itemUrl && (
+            <a
+              href={itemUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 text-sm font-medium underline underline-offset-4"
+            >
+              {t('sourcePanel.openInArcgis')}
+              <ExternalLink className="size-3.5" aria-hidden="true" />
+              {' '}
+              <span className="sr-only">{t('sourcePanel.opensInNewTab')}</span>
+            </a>
+          )}
+
           <dl className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             <SourceMetric label={t('sourcePanel.lastRefreshed')}>
               {formatDateTimeSmart(dataset.last_refreshed_at ?? null)}
             </SourceMetric>
-            <SourceMetric label={t('sourcePanel.lastChecked')}>
-              {formatDateTimeSmart(dataset.last_checked_at ?? null)}
-            </SourceMetric>
+            {hasRemoteSource && (
+              <SourceMetric label={t('sourcePanel.lastChecked')}>
+                {formatDateTimeSmart(dataset.last_checked_at ?? null)}
+              </SourceMetric>
+            )}
             <SourceMetric label={t('sourcePanel.featureCount')}>
               {formatNumber(dataset.feature_count)}
             </SourceMetric>
-            <SourceMetric label={t('sourcePanel.health')}>
-              <StatusBadge kind="health" value={health} />
-              {healthNote && (
-                <span className="mt-1 block text-xs font-normal text-muted-foreground">
-                  {healthNote}
-                </span>
-              )}
-            </SourceMetric>
-            <SourceMetric label={t('sourcePanel.freshness')}>
-              <StatusBadge kind="freshness" value={freshness} />
-            </SourceMetric>
-            <SourceMetric label={t('sourcePanel.drift')}>
-              <StatusBadge kind="drift" value={drift} />
-            </SourceMetric>
+            {hasRemoteSource && (
+              <>
+              <SourceMetric label={t('sourcePanel.health')}>
+                <StatusBadge kind="health" value={health} />
+                {healthNote && (
+                  <span className="mt-1 block text-xs font-normal text-muted-foreground">
+                    {healthNote}
+                  </span>
+                )}
+              </SourceMetric>
+              <SourceMetric label={t('sourcePanel.freshness')}>
+                <StatusBadge kind="freshness" value={freshness} />
+              </SourceMetric>
+              <SourceMetric label={t('sourcePanel.drift')}>
+                <StatusBadge kind="drift" value={drift} />
+              </SourceMetric>
+              </>
+            )}
           </dl>
         </CardContent>
       </Card>
@@ -857,7 +906,9 @@ export function SourcePanel({
         <VrtSection dataset={dataset} isAuthenticated={isAuthenticated} />
       ) : (
         <>
-          <SourceSyncPanel dataset={dataset} canEdit={canEdit} onRunDispatched={onSyncRunDispatched} />
+          {hasRemoteSource && (
+            <SourceSyncPanel dataset={dataset} canEdit={canEdit} onRunDispatched={onSyncRunDispatched} />
+          )}
           <SourceHistory dataset={dataset} />
           {/* Gated the same way SourceRefreshAction is: no origin, nothing
               could ever have been refreshed, so no history to show. */}

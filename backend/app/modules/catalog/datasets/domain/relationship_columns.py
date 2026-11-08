@@ -11,18 +11,14 @@ from sqlalchemy.exc import DBAPIError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db.sqlstate import is_lock_conflict, sqlstate
+from app.modules.catalog.authorization import lock_dataset_rows_for_write
 from app.modules.catalog.datasets.domain.models import (
     AttributeMetadata,
     Dataset,
     DatasetRelationship,
-    Record,
 )
 from app.modules.catalog.features.service import feature_table_exists
-from app.platform.catalog_locks import (
-    REQUEST_LOCK_TIMEOUT,
-    CatalogLockConflict,
-    lock_catalog_rows,
-)
+from app.platform.catalog_locks import REQUEST_LOCK_TIMEOUT, CatalogLockConflict
 from app.platform.extensions import get_catalog_port
 
 
@@ -99,10 +95,10 @@ async def refresh_dropped_join_column(
     """Return the permanent error when the live table lacks the join column.
 
     A column dropped directly in the database stays in ``column_info``, so the
-    relationship list keeps reporting it healthy. The column is dropped from the stored
-    list only when ``may_repair`` says the caller may modify the dataset; a read alone
-    never writes the catalog. Returns ``None`` when the failure is not a
-    dropped join column.
+    relationship list keeps reporting it healthy. The column leaves the stored
+    list only when ``may_repair`` says the caller may modify the dataset; a
+    read alone never writes the catalog. Returns ``None`` when the failure is
+    not a dropped join column.
     """
     if join_column in _INTERNAL_COLUMNS:
         return None
@@ -134,21 +130,16 @@ async def refresh_dropped_join_column(
     error = column_missing_error(join_column)
     if may_repair is None or not await may_repair(dataset_id):
         return error
-    record_id = (
-        await session.execute(select(Dataset.record_id).where(Dataset.id == dataset_id))
-    ).scalar_one_or_none()
-    if record_id is None:
+    dataset = await session.get(Dataset, dataset_id)
+    if dataset is None:
         return error
     try:
-        await lock_catalog_rows(
-            session,
-            dataset_cls=Dataset,
-            record_cls=Record,
-            dataset_id=dataset_id,
-            record_id=record_id,
-        )
+        await lock_dataset_rows_for_write(session, dataset)
     except CatalogLockConflict:
         return None
+    except HTTPException:
+        await session.rollback()
+        return error
     # Only the confirmed-missing column leaves the stored list; other drift is
     # left to the paths that reconcile attribute metadata with the schema.
     stored = await session.scalar(

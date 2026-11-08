@@ -1,14 +1,12 @@
 """One definition of what a service credential may look like.
 
-fix(#1277): the API door and the worker's
-``_sanitize_authorization_token`` judged the same token differently — the
-door accepted anything printable, the worker pinned header tokens to
-base64url with an 8-char floor — so a token with ``+``/``/`` got a 202,
-burned its single-use credential, and failed only later in the background.
+The API door and the worker's ``_sanitize_authorization_token`` must judge a
+token identically: if the door accepts one the worker rejects, the request gets
+a 202, burns its single-use credential, and fails only later in the background.
 
 Not negotiable down: the token becomes an ``Authorization`` header line
 reaching libcurl through GDAL, so a disallowed character is a header-
-smuggling primitive (SEC-FU-04). Both the door and the worker enforce this
+smuggling primitive. Both the door and the worker enforce this
 module's policy, so the guarantee doesn't rest on a validator two processes
 away.
 
@@ -33,41 +31,36 @@ from enum import StrEnum
 # to ``GDAL_HTTP_HEADER_FILE``, and (c) checked by
 # ``assert_endpoints_stay_on_origin``. All three exclude ArcGIS.
 #
-# feat(#1764): the fourth question, "crossed to the worker as a finished
-# header LINE" (plan D9), is ``HEADER_LINE_SERVICE_FORMATS`` below.
+# The fourth question, "crossed to the worker as a finished header LINE", is
+# ``HEADER_LINE_SERVICE_FORMATS`` below.
 #
-# fix(#1840): (d) was missing here, producing a P1 —
-# ``wire_credential`` picked its branch by whether ``build_credential_header``
-# returned None, which stopped being equivalent once lane C2 added an ArcGIS
-# header for the httpx transport.
-#
-# fix(#1840): a consumer that decides by FORMAT must ask
-# ``requires_header_token_policy`` by name (``wire_credential``,
-# ``sources/router.py::_probe_credential_line``,
+# A consumer that decides by FORMAT must ask ``requires_header_token_policy``
+# by name (``wire_credential``, ``sources/router.py::_probe_credential_line``,
 # ``processing/ingest/ogr.py::_sanitize_authorization_token``), never infer
-# from the builder's answer. Three others safely branch on ``pair is not
-# None`` only because their caller already fences them to a WFS/OAPIF
-# source; un-fencing any of those needs the predicate added back.
+# from whether ``build_credential_header`` returns None: that stopped being
+# equivalent once ArcGIS got a header for the httpx transport. Three others
+# branch on ``pair is not None`` only because their caller already fences them
+# to a WFS/OAPIF source.
 HEADER_AUTH_SERVICE_FORMATS: frozenset[str] = frozenset({"wfs", "ogcapi_features"})
 
-# feat(C2): ArcGIS's own service format, spelled here (not imported from the
+# ArcGIS's own service format, spelled here (not imported from the
 # adapter) because ``core/`` may not import ``app.modules.*``; the adapter
 # re-exports this name.
 ARCGIS_SERVICE_FORMAT = "arcgis_featureserver"
 
-# feat(#1764): STAC's own service format, spelled here for the same reason.
+# STAC's own service format, spelled here for the same reason.
 # It matches ``datasets.source_format`` for a STAC-imported dataset, which is
 # what the refresh door reads before it composes anything.
 STAC_SERVICE_FORMAT = "stac"
 
-# feat(#1764): formats whose credential is a header LINE rather than a URL
-# query parameter, on every transport including the queue hop (plan D9). Also
+# Formats whose credential is a header LINE rather than a URL
+# query parameter, on every transport including the queue hop. Also
 # the question ``service_carries_method`` asks about basic and header-key.
 #
 # Wider than ``HEADER_AUTH_SERVICE_FORMATS`` by exactly STAC, whose reads are
 # httpx and never GDAL, so no STAC credential reaches the 0600 header file.
 #
-# fix(#1764): STAC DOES follow service-described endpoints (an item's self
+# STAC DOES follow service-described endpoints (an item's self
 # link, its asset hrefs); they are checked by
 # ``stac_resolve_identity.credential_for_read``, not by
 # ``assert_endpoints_stay_on_origin``, which asks a GDAL question.
@@ -75,11 +68,9 @@ HEADER_LINE_SERVICE_FORMATS: frozenset[str] = HEADER_AUTH_SERVICE_FORMATS | {
     STAC_SERVICE_FORMAT
 }
 
-# feat(C2): formats whose credential travels as an HTTP header on GeoLens's
-# OWN httpx requests — wider than the set above. ArcGIS Server has accepted a
-# bearer token in a header since 10.5.1, and hosted ArcGIS Online always has;
-# measured live 2026-09-04 against services6.arcgis.com (header and
-# ``?token=`` forms return identical counts, no Referer needed). Sent as
+# Formats whose credential travels as an HTTP header on GeoLens's OWN httpx
+# requests, wider than the set above. ArcGIS Server accepts a bearer token in
+# a header since 10.5.1, and hosted ArcGIS Online always has. Sent as
 # ``X-Esri-Authorization`` (see ``ESRI_AUTHORIZATION_HEADER`` for why not the
 # standard name) to keep the token out of the request URL, and so out of
 # httpx's INFO log line, proxy/load-balancer access logs, and echoed
@@ -94,8 +85,7 @@ HEADER_TRANSPORT_SERVICE_FORMATS: frozenset[str] = HEADER_LINE_SERVICE_FORMATS |
     ARCGIS_SERVICE_FORMAT
 }
 
-# SEC-FU-04 (sec-audit-20260519.md line 535, Phase 1063-03): JWT-shaped tokens
-# use the base64url charset (RFC 4648 §5) plus dot separators (RFC 7519 —
+# JWT-shaped tokens use the base64url charset (RFC 4648 §5) plus dot separators (RFC 7519 —
 # header.payload.signature). Restricting to this set prevents a token
 # containing CR/LF from smuggling extra HTTP headers into libcurl.
 HEADER_TOKEN_CHARSET: frozenset[str] = frozenset(
@@ -150,7 +140,7 @@ def requires_header_token_policy(source_format: str | None) -> bool:
 def carries_credential_as_header_line(source_format: str | None) -> bool:
     """Whether *source_format*'s credential is a header line, not a query key.
 
-    feat(#1764): the question a door asks before accepting a basic or
+    The question a door asks before accepting a basic or
     header-key credential, and the one ``wire_credential`` asks before
     composing the line that crosses the queue. Wider than
     :func:`requires_header_token_policy` by exactly STAC, whose credential is
@@ -162,7 +152,7 @@ def carries_credential_as_header_line(source_format: str | None) -> bool:
 def sends_credential_as_header(source_format: str | None) -> bool:
     """Whether *source_format*'s credential travels as an HTTP header.
 
-    feat(C2): the gate ``build_credential_header`` reads. Wider than
+    The gate ``build_credential_header`` reads. Wider than
     :func:`requires_header_token_policy` by exactly ArcGIS, whose token
     became an ``X-Esri-Authorization: Bearer`` header on the httpx path
     while staying a query parameter on the GDAL path.
@@ -170,7 +160,7 @@ def sends_credential_as_header(source_format: str | None) -> bool:
     return source_format in HEADER_TRANSPORT_SERVICE_FORMATS
 
 
-# fix(#1746): username/password and named API-key credentials for the two
+# username/password and named API-key credentials for the two
 # header-auth service formats, alongside the bearer token. The rules below
 # judge the INPUTS a caller typed; ``build_credential_header`` composes the
 # header afterward. That order matters: a composed Basic line contains a
@@ -194,7 +184,7 @@ HEADER_NAME_CHARSET: frozenset[str] = frozenset(
     string.ascii_letters + string.digits + "!#$%&'*+-.^_`|~"
 )
 
-# fix(#1746): a composed line's VALUE charset — the input charset plus a
+# A composed line's VALUE charset — the input charset plus a
 # space, since a value carries a scheme prefix (``Bearer <token>``, ``Basic
 # <blob>``). Still no line break, so it can't smuggle a second header.
 HEADER_LINE_VALUE_CHARSET: frozenset[str] = CREDENTIAL_INPUT_CHARSET | {" "}
@@ -208,11 +198,10 @@ HEADER_LINE_SEPARATOR = ": "
 # recognizes to decide that the stricter base64url charset applies.
 BEARER_SCHEME = "Bearer "
 
-# fix(#1840): the header ArcGIS's own bearer token travels under.
-# Esri documents this name because a deployment may consume the standard
-# one: ArcGIS Enterprise behind a Web Adaptor or web-tier auth (IWA/PKI in
-# IIS) answers 401/403 to `Authorization` before ArcGIS ever sees it. Hosted
-# ArcGIS Online accepts either (measured 2026-09-04). Safe on a cross-origin
+# The header ArcGIS's own bearer token travels under.
+# Esri documents this name because ArcGIS Enterprise behind a Web Adaptor or
+# web-tier auth (IWA/PKI in IIS) answers 401/403 to `Authorization` before
+# ArcGIS ever sees it. Hosted ArcGIS Online accepts either. Safe on a cross-origin
 # redirect: this name is in `_ALWAYS_CREDENTIAL_HEADERS`
 # (`app/platform/security.py`) and `_refuse_cross_origin_credential` refuses
 # such a hop rather than following it — louder than httpx's silent strip of
@@ -222,7 +211,7 @@ ESRI_AUTHORIZATION_HEADER = "X-Esri-Authorization"
 
 # Named for the same reason: the redactor recognizes it to know what follows
 # is base64 of a username and password, with a cleartext form an origin can
-# echo back (fix(#1746), core/url_redaction.py).
+# echo back (see core/url_redaction.py).
 BASIC_SCHEME = "Basic "
 
 # Header names a caller may not send a credential under. Compared
@@ -236,7 +225,7 @@ RESERVED_HEADER_NAMES: frozenset[str] = frozenset(
         "authorization",
         "x-esri-authorization",
         "accept",
-        # fix(#1770): `service_endpoints.py::credential_headers`
+        # `service_endpoints.py::credential_headers`
         # and `probe_bounds.py::bounded_probe_read` build headers as
         # `{name: value, "Accept-Encoding": "identity"}` — caller's pair
         # first, so a credential literally named `Accept-Encoding` was
@@ -377,7 +366,7 @@ def header_name_rejection_reason(name: str | None) -> str | None:
     return None
 
 
-# fix(#1770): the pattern-based redactors (`redact_exception_text`,
+# The pattern-based redactors (`redact_exception_text`,
 # `logging_config._scrub_text`) only catch a known query-param NAME or
 # userinfo — a reflected credential in the URL PATH or an unlisted query key
 # slipped through. This registry closes the class instead of each instance:
@@ -426,7 +415,7 @@ def _composes_a_header(
 
     Three refusals kept out of the builder so its body stays one branch per
     method: a format whose credential isn't a header, the ``none`` method,
-    and — feat(C2) — ArcGIS asked for a method it has no spelling for (basic
+    and ArcGIS asked for a method it has no spelling for (basic
     and header-key have no ArcGIS form; ``service_carries_method`` refuses
     them at every door, this is the second line of defense).
     """
@@ -442,7 +431,7 @@ def _composes_a_header(
 def bearer_token_rejection_reason(auth: ServiceCredential) -> str | None:
     """Why *auth*'s bearer token cannot become an Authorization value.
 
-    feat(C2): two charsets, chosen by service format. A WFS/OAPIF token
+    Two charsets, chosen by service format. A WFS/OAPIF token
     becomes a line in a 0600 file libcurl parses, so it's held to
     ``HEADER_TOKEN_CHARSET`` (base64url, CR/LF banned as smuggling). An
     ArcGIS token never reaches that file — percent-encoded into the URL
@@ -450,13 +439,11 @@ def bearer_token_rejection_reason(auth: ServiceCredential) -> str | None:
     VALUE (printable ASCII, no whitespace) instead: CR/LF still banned, only
     the collateral damage differs.
 
-    feat(#1764): the branch asks ``requires_header_token_policy`` rather than
+    The branch asks ``requires_header_token_policy`` rather than
     naming ArcGIS, so STAC takes the wider charset too — its credential is
     httpx-only, and httpx refuses a CR/LF header value itself.
 
-    fix(#1764): public, because the DOOR has to reach the same verdict this
-    builder will. Judging the door's bearer token by the GDAL charset alone
-    refused a STAC key holding ``+`` or ``/`` that the builder accepts.
+    Public because the DOOR has to reach the same verdict this builder will.
     """
     if not requires_header_token_policy(auth.service_format):
         # Rejects ``None`` on its own, unlike its header-token sibling, which
@@ -476,7 +463,7 @@ def build_credential_header(
     an unrecognised format degrades to no header (a loud 401) rather than a
     smuggled one.
 
-    feat(C2): ArcGIS is in that allowlist for its bearer token only — what's
+    ArcGIS is in that allowlist for its bearer token only — what's
     composed here is for GeoLens's own httpx requests; the GDAL path still
     percent-encodes the token into the URL and never reaches this function.
 
@@ -487,7 +474,7 @@ def build_credential_header(
     differently: the GDAL header file wants a line
     (``credential_header_line``), the probe adapters want a dict key.
 
-    fix(#1770): as the single producer, this is also the one
+    As the single producer, this is also the one
     place ``register_credential_secret`` is called — every branch that
     returns a pair registers it, so the exact-value redactors catch it
     wherever it's later reflected. ``test_credential_producer_structural.py``
@@ -562,9 +549,9 @@ def credential_header_line(pair: tuple[str, str]) -> str:
 def credential_from_header_line(
     line: str | None, *, service_format: str | None = None
 ) -> ServiceCredential | None:
-    """The credential a D9 wire line describes, or None if it describes none.
+    """The credential a wire line describes, or None if it describes none.
 
-    feat(#1764): the inverse of ``build_credential_header`` +
+    The inverse of ``build_credential_header`` +
     :func:`credential_header_line`, for the one hop that cannot compose at
     the write site. A WFS/OAPIF worker writes the line straight to the GDAL
     header file; a STAC worker issues httpx requests of its own, and every

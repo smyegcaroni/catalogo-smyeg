@@ -3,20 +3,29 @@
 import math
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainValidator,
+    StrictInt,
+    model_validator,
+)
 
 
 MAX_COORDINATE_TUPLES = 100_000
 MAX_COORDINATE_DEPTH = 8
 MAX_GEOMETRY_COLLECTION_MEMBERS = 1_000
 MAX_POSITION_DIMENSIONS = 4
+MAX_FEATURES_PER_BATCH = 1_000
 
 
 def inline_json_schema(model: type[BaseModel]) -> dict:
     """``model_json_schema()`` with local ``$defs`` inlined.
 
     Route ``responses=`` embed schemas verbatim in the exported OpenAPI doc,
-    where pydantic's ``#/$defs/...`` pointers dangle. fix(#569): only safe
+    where pydantic's ``#/$defs/...`` pointers dangle. Only safe
     for non-recursive models; a recursive one raises instead of looping.
     """
     schema = model.model_json_schema()
@@ -165,8 +174,7 @@ BoundedGeoJSONGeometryCollection = Annotated[
 ]
 
 
-# Discriminated by the Literal type on the collection variant; plain geometries
-# keep their exact prior wire shape.
+# Discriminated by the Literal type on the collection variant.
 GeoJSONGeometryLike = GeoJSONGeometryCollection | GeoJSONGeometry
 BoundedGeoJSONGeometryLike = BoundedGeoJSONGeometryCollection | BoundedGeoJSONGeometry
 
@@ -181,9 +189,8 @@ class GeoJSONFeature(BaseModel):
 
 
 # The tile routes treat `_v` as a freshness signal only when it is a stored
-# tile_cache_version or a record updated_at timestamp; a write's response
-# carries the version so its caller's next tile reload can use one of those
-# spellings instead of a client timestamp the routes would otherwise ignore.
+# tile_cache_version or a record updated_at timestamp, so a write's response
+# carries the version for the caller's next tile reload.
 TILE_CACHE_VERSION_DESCRIPTION = (
     "The dataset's tile_cache_version after this write committed. Send it "
     "as the tile routes' `_v` query parameter when reloading tiles, so a "
@@ -191,24 +198,23 @@ TILE_CACHE_VERSION_DESCRIPTION = (
     "dataset instead of serving that worker's own cached snapshot."
 )
 
-# A 204 response has no body to put the field above in, so the delete
-# endpoint (the one write that stays 204, for compatibility with existing
-# callers) carries the same value on this response header instead.
+# The delete endpoint answers 204 with no body, so it carries the version on
+# this header instead.
 TILE_CACHE_VERSION_HEADER = "X-GeoLens-Tile-Cache-Version"
 
 TABLE_ID_DESCRIPTION = (
     "Opaque id of the data table this feature was read from or written to. "
     "A reupload or an overwrite of the dataset's data replaces the table, and "
     "the replacement can reuse feature ids. Send it back as the `table_id` "
-    "query parameter of a PUT, PATCH or DELETE of this feature to have the "
-    "write refused if the table was replaced since."
+    "query parameter of a PUT, PATCH or DELETE of this feature, or of a batch "
+    "delete, to have the write refused if the table was replaced since."
 )
 
 
 class GeoJSONFeatureRead(GeoJSONFeature):
     """A GeoJSON Feature, plus the id of the table it was read from."""
 
-    # Same title as the base, so generated SDK model names stay as they were.
+    # Same title as the base, so the generated SDK model name is unchanged.
     model_config = ConfigDict(title="GeoJSONFeature")
 
     table_id: str | None = Field(default=None, description=TABLE_ID_DESCRIPTION)
@@ -217,11 +223,10 @@ class GeoJSONFeatureRead(GeoJSONFeature):
 class GeoJSONFeatureWrite(GeoJSONFeatureRead):
     """A written GeoJSON Feature, plus the dataset's committed tile version."""
 
-    # The inlined response schema's own "title" is what the SDK generators
-    # name this route's response model from (inline_json_schema() flattens
-    # $defs, so a $ref-based component name is not available to them). Kept
-    # at the pre-existing "GeoJSONFeature" so the additive field does not
-    # rename generated SDK classes out from under existing callers.
+    # The SDK generators name this route's response model from the inlined
+    # schema's "title" (inline_json_schema() flattens $defs, so no $ref
+    # component name exists). Keeping "GeoJSONFeature" leaves the generated
+    # class name unchanged.
     model_config = ConfigDict(title="GeoJSONFeature")
 
     tile_cache_version: int | None = Field(
@@ -281,6 +286,91 @@ class FeatureCreate(BaseModel):
     @classmethod
     def _no_nested_collections(cls, data: object) -> object:
         return _reject_nested_collections(data)
+
+
+class FeatureCollectionCreate(BaseModel):
+    """A GeoJSON FeatureCollection whose features are inserted together."""
+
+    type: Literal["FeatureCollection"]
+    features: list[FeatureCreate] = Field(
+        min_length=1,
+        max_length=MAX_FEATURES_PER_BATCH,
+        description=(
+            "Features to insert in one transaction, at most "
+            f"{MAX_FEATURES_PER_BATCH}. If any is refused, none is inserted."
+        ),
+    )
+
+
+class FeatureBatchDelete(BaseModel):
+    """The features a batch delete removes."""
+
+    # Strict: lax mode would read JSON true/false as gids 1 and 0.
+    gids: list[StrictInt] = Field(
+        min_length=1,
+        max_length=MAX_FEATURES_PER_BATCH,
+        description=(
+            f"Ids of the features to delete, at most {MAX_FEATURES_PER_BATCH}. "
+            "If any does not exist, none is deleted."
+        ),
+    )
+
+
+class FeatureBatchDeleted(BaseModel):
+    """The result of a batch delete."""
+
+    deleted: int = Field(description="Number of features deleted.")
+    tile_cache_version: int | None = Field(
+        default=None, description=TILE_CACHE_VERSION_DESCRIPTION
+    )
+
+
+def _feature_create_body(value: object) -> FeatureCreate | FeatureCollectionCreate:
+    """Validate as a collection only when the body says it is one.
+
+    A union would prefix every error location with the member it was tried
+    as, which would change the errors a single-feature body already gets.
+    """
+    if isinstance(value, (FeatureCreate, FeatureCollectionCreate)):
+        return value
+    if isinstance(value, dict) and value.get("type") == "FeatureCollection":
+        return FeatureCollectionCreate.model_validate(value)
+    return FeatureCreate.model_validate(value)
+
+
+FeatureCreateBody = Annotated[
+    FeatureCreate | FeatureCollectionCreate,
+    PlainValidator(
+        _feature_create_body,
+        json_schema_input_type=FeatureCreate | FeatureCollectionCreate,
+    ),
+]
+
+
+class GeoJSONFeatureCollectionWrite(BaseModel):
+    """The features a FeatureCollection create inserted, in request order."""
+
+    type: Literal["FeatureCollection"] = "FeatureCollection"
+    features: list[GeoJSONFeatureWrite]
+    table_id: str | None = Field(default=None, description=TABLE_ID_DESCRIPTION)
+    tile_cache_version: int | None = Field(
+        default=None, description=TILE_CACHE_VERSION_DESCRIPTION
+    )
+
+
+class GeoJSONFeatureDryRun(BaseModel):
+    """A feature as a create would store it, from a dry run that stored nothing."""
+
+    type: Literal["Feature"] = "Feature"
+    geometry: GeoJSONGeometryLike | None = None
+    properties: dict
+
+
+class GeoJSONFeatureCollectionDryRun(BaseModel):
+    """The features a FeatureCollection create would store, in request order."""
+
+    type: Literal["FeatureCollection"] = "FeatureCollection"
+    features: list[GeoJSONFeatureDryRun]
 
 
 class FeatureReplace(BaseModel):

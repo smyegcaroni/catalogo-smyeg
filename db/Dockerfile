@@ -3,15 +3,14 @@
 # (postgresql-18-pgvector), NOT compiled from source — same extension version
 # (0.8.x), a small/fast layer, and no build toolchain left in the final image.
 #
-# chore(#704): bumped from 17-3.5 (Debian bullseye, EOL 2026-08-31, frozen at
-# PG 17.5 / GEOS 3.9) to 18-3.6 (Debian trixie, GEOS 3.13 / PROJ 9.6 — measured
-# 1.5–2.3× on ST_Union/ST_Buffer/ST_MakeValid analysis paths; no 17-3.6 tag
-# exists upstream). Major-version bump: existing pgdata volumes need
-# pg_upgrade or dump/restore — see RUNBOOK.md.
+# Based on 18-3.6 (Debian trixie, GEOS 3.13 / PROJ 9.6; measured 1.5–2.3× over
+# the older GEOS 3.9 on ST_Union/ST_Buffer/ST_MakeValid analysis paths). Moving
+# an existing pgdata volume across a PostgreSQL major version needs pg_upgrade
+# or dump/restore — see RUNBOOK.md.
 #
 # The --platform=linux/amd64 pin is required: postgis/postgis:18-3.6 only
 # publishes an amd64 manifest (no arm64 variant), so arm64 hosts run this under
-# emulation. This is unchanged from the 17-3.5 image.
+# emulation.
 #
 # Expected build/runtime warnings (NOT bugs):
 #   - WARN: FromPlatformFlagConstDisallowed: FROM --platform flag should not use
@@ -24,7 +23,7 @@
 # scoped entry + rationale in .trivyignore.yaml). The official postgis/postgres
 # entrypoint runs as root only to initdb/chown on first boot, then drops to the
 # unprivileged `postgres` user via gosu for the server process.
-FROM --platform=linux/amd64 postgis/postgis:18-3.6
+FROM --platform=linux/amd64 postgis/postgis:18-3.6@sha256:e84455a058f60f06dd8c40e66a2c628b8fc113d9fca0896e1f308b25b897207f
 
 # pgvector for semantic-search embeddings, from the PGDG apt repository that the
 # official postgres/postgis base image already configures.

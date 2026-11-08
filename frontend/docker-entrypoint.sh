@@ -36,7 +36,7 @@ fi
 # (e.g. http://geolens-api.<namespace>.svc.cluster.local:8000) — a short
 # service name will NXDOMAIN. The Helm chart passes exactly that.
 API_UPSTREAM="${API_UPSTREAM:-http://api:8000}"
-# Codex P2 (#577): strip trailing slashes — a URI component in a variable
+# Strip trailing slashes — a URI component in a variable
 # proxy_pass replaces the rewritten request URI wholesale, so a value like
 # http://api:8000/ would proxy every /api, raster, and embed request to "/".
 while [ "${API_UPSTREAM%/}" != "$API_UPSTREAM" ]; do
@@ -50,10 +50,10 @@ case "$NGINX_RESOLVER" in
   \[*) ;;
   *:*:*) NGINX_RESOLVER="[$NGINX_RESOLVER]" ;;  # bare IPv6 nameserver → nginx bracket syntax
 esac
-# fix(#580): /api/ upload cap, matching the backend's UPLOAD_MAX_SIZE_MB.
+# /api/ upload cap, matching the backend's UPLOAD_MAX_SIZE_MB.
 # Deployment configs map that setting here with an "m" suffix; the default
-# preserves the previously hard-coded 500m. Guarded so an invalid value fails
-# fast at boot instead of crash-looping on an nginx config error.
+# is 500m. Guarded so an invalid value fails fast at boot instead of
+# crash-looping on an nginx config error.
 CLIENT_MAX_BODY_SIZE="${CLIENT_MAX_BODY_SIZE:-500m}"
 case "$CLIENT_MAX_BODY_SIZE" in
   *[!0-9kKmMgG]* | "" | [!0-9]*)
@@ -100,9 +100,23 @@ map \"\$remote_addr,\$realip_remote_addr\" \$geolens_vector_limit_key {
 }"
 fi
 
-export API_UPSTREAM NGINX_RESOLVER CLIENT_MAX_BODY_SIZE TRUSTED_PROXY_CONFIG
+# Extra script-src sources (for example an edge-injected analytics script) go
+# into a quoted add_header string, so only characters a source list needs are
+# accepted. Empty keeps script-src at 'self' and WebAssembly.
+CSP_SCRIPT_SRC_EXTRA="${CSP_SCRIPT_SRC_EXTRA:-}"
+case "$CSP_SCRIPT_SRC_EXTRA" in
+  *[!A-Za-z0-9:/._*"'"\ -]*)
+    echo "ERROR: CSP_SCRIPT_SRC_EXTRA may only contain letters, digits and : / . _ * ' - and spaces" >&2
+    exit 1
+    ;;
+esac
+if [ -n "$CSP_SCRIPT_SRC_EXTRA" ]; then
+  CSP_SCRIPT_SRC_EXTRA=" $CSP_SCRIPT_SRC_EXTRA"
+fi
+
+export API_UPSTREAM NGINX_RESOLVER CLIENT_MAX_BODY_SIZE TRUSTED_PROXY_CONFIG CSP_SCRIPT_SRC_EXTRA
 mkdir -p /tmp/geolens-nginx
-envsubst '$API_UPSTREAM $NGINX_RESOLVER $CLIENT_MAX_BODY_SIZE $TRUSTED_PROXY_CONFIG' \
+envsubst '$API_UPSTREAM $NGINX_RESOLVER $CLIENT_MAX_BODY_SIZE $TRUSTED_PROXY_CONFIG $CSP_SCRIPT_SRC_EXTRA' \
   < /opt/geolens/default.conf.template \
   > /tmp/geolens-nginx/default.conf
 

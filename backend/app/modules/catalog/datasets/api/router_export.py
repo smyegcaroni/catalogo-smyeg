@@ -21,6 +21,7 @@ from sqlalchemy.orm import joinedload, selectinload
 from app.modules.audit.service import AuditEvent, audit_emit
 from app.core.identity import Identity
 from app.modules.auth.dependencies import (
+    download_token_is_current,
     get_optional_user,
 )
 from app.modules.auth.models import User
@@ -31,6 +32,7 @@ from app.modules.catalog.authorization import (
     check_dataset_access_or_anonymous,
     get_user_roles,
     visible_lineage_summaries,
+    visible_vrt_extents,
 )
 from app.standards.dcat.service import (
     catalog_to_dcat,
@@ -51,6 +53,7 @@ from app.standards.geodcat_ap.service import (
     record_to_geodcat_ap,
 )
 from app.standards.geodcat_ap.validation import validate_geodcat_ap
+from app.modules.catalog.datasets.api.feed_response import serve_feed
 from app.modules.catalog.datasets.domain.models import (
     Dataset as DatasetModel,
     DatasetGrant,
@@ -131,7 +134,7 @@ def _dcat_content_language(document: object) -> str | None:
     return next(iter(languages)) if len(languages) == 1 else None
 
 
-# fix(#430): these anonymous feeds materialize every visible dataset into
+# These anonymous feeds materialize every visible dataset into
 # one in-memory JSON-LD doc with no cache -- a cheap memory/CPU amplifier
 # on a large catalog. Bounded at _DCAT_FEED_MAX_DATASETS; offset paging
 # lets a large-catalog harvester crawl past the first 10k instead of
@@ -259,7 +262,7 @@ async def _visible_lineage(
     datasets: list[DatasetModel],
     user: Identity | None,
 ) -> dict[uuid.UUID, str | None]:
-    """fix(#1103): access-checked ``dcterms:provenance`` for a page, in one query.
+    """Access-checked ``dcterms:provenance`` for a page, in one query.
 
     These feeds serve anonymous requesters, and an analysis output's lineage
     sentence names the titles of the datasets it was derived from — including a
@@ -271,6 +274,17 @@ async def _visible_lineage(
     return await visible_lineage_summaries(
         db, [ds.record for ds in datasets], user, user_roles
     )
+
+
+async def _visible_vrt_extents(
+    db: AsyncSession, datasets: list[DatasetModel], user: Identity | None
+) -> dict[uuid.UUID, object | None]:
+    """The requester's ``visible_vrt_extents`` for the VRTs among ``datasets``."""
+    vrt_ids = [ds.id for ds in datasets if ds.record.record_type == "vrt_dataset"]
+    if not vrt_ids:
+        return {}
+    user_roles = await get_user_roles(db, user) if user is not None else set()
+    return await visible_vrt_extents(db, vrt_ids, user, user_roles)
 
 
 async def _visible_record_lineage(
@@ -342,45 +356,91 @@ async def _get_dcat_dataset_for_export(
     return result.unique().scalar_one()
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — both trailing-slash and
+# Dual-shape decorator: both trailing-slash and
 # no-trailing-slash variants register against the same handler. Slash form
 # stays canonical (already in OpenAPI); no-slash is a hidden alias closing
 # the 404 regression introduced by redirect_slashes=False (api/main.py).
-@router.get("/dcat", response_class=JSONResponse, include_in_schema=False)
-@router.get("/dcat/", response_class=JSONResponse)
+_FeedInputs = tuple[
+    list[DatasetModel],
+    dict[uuid.UUID, str | None],
+    dict[uuid.UUID, bool],
+    dict[uuid.UUID, object | None],
+]
+
+
+async def _load_feed_inputs(
+    db: AsyncSession,
+    user: Identity | None,
+    limit: int = _DCAT_FEED_MAX_DATASETS,
+    offset: int = 0,
+) -> _FeedInputs:
+    """Everything a feed builder reads, loaded before leaving the session's loop."""
+    datasets = await _get_visible_dcat_datasets(db, user, limit=limit, offset=offset)
+    inputs = (
+        datasets,
+        await _visible_lineage(db, datasets, user),
+        await _dcat_raster_asset_presence(db, datasets),
+        await _visible_vrt_extents(db, datasets, user),
+    )
+    # Detached first, since a rollback expires attached instances; the render
+    # can then run without holding a pooled connection.
+    db.expunge_all()
+    await db.rollback()
+    return inputs
+
+
+@router.get(
+    "/dcat",
+    response_class=JSONResponse,
+    include_in_schema=False,
+    summary="Get the DCAT 3 catalog",
+)
+@router.get("/dcat/", response_class=JSONResponse, summary="Get the DCAT 3 catalog")
 async def get_dcat_catalog(
     request: Request,
     user: Identity | None = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
     limit: int = _FEED_LIMIT_Q,
     offset: int = _FEED_OFFSET_Q,
-) -> JSONResponse:
+) -> Response:
     """DCAT 3 JSON-LD catalog feed. Respects dataset visibility."""
-    datasets = await _get_visible_dcat_datasets(db, user, limit=limit, offset=offset)
-
     app_base_url, base_url = await get_public_urls(db, request=request)
     preferred_languages = parse_accept_languages(request)
-    catalog = catalog_to_dcat(
-        datasets,
-        base_url,
-        app_base_url=app_base_url,
-        preferred_languages=preferred_languages,
-        lineage_by_record_id=await _visible_lineage(db, datasets, user),
-        has_raster_asset_by_id=await _dcat_raster_asset_presence(db, datasets),
-    )
-    completeness = _catalog_completeness(
-        datasets,
-        catalog,
-        "dcat:dataset",
-        [dcat_fallback_fields(dataset, preferred_languages) for dataset in datasets],
-    )
-    return JSONResponse(
-        content=catalog,
-        media_type="application/ld+json",
-        headers={
+
+    def build(inputs: _FeedInputs) -> tuple[dict, dict[str, str]]:
+        datasets, lineage, has_asset, vrt_extents = inputs
+        catalog = catalog_to_dcat(
+            datasets,
+            base_url,
+            app_base_url=app_base_url,
+            preferred_languages=preferred_languages,
+            lineage_by_record_id=lineage,
+            has_raster_asset_by_id=has_asset,
+            vrt_extents=vrt_extents,
+        )
+        completeness = _catalog_completeness(
+            datasets,
+            catalog,
+            "dcat:dataset",
+            [dcat_fallback_fields(d, preferred_languages) for d in datasets],
+        )
+        return catalog, {
             **_language_headers(_dcat_content_language(catalog)),
             **_catalog_completeness_headers(completeness),
+        }
+
+    return await serve_feed(
+        "dcat",
+        user,
+        db,
+        {
+            "limit": limit,
+            "offset": offset,
+            "urls": [app_base_url, base_url],
+            "languages": preferred_languages,
         },
+        lambda: _load_feed_inputs(db, user, limit, offset),
+        build,
     )
 
 
@@ -388,42 +448,64 @@ async def get_dcat_catalog(
     "/dcat/validation",
     response_class=JSONResponse,
     include_in_schema=False,
+    summary="Validate the DCAT 3 catalog",
 )
-@router.get("/dcat/validation/", response_class=JSONResponse)
+@router.get(
+    "/dcat/validation/",
+    response_class=JSONResponse,
+    summary="Validate the DCAT 3 catalog",
+)
 async def validate_dcat3_catalog(
     request: Request,
     user: Identity | None = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
-) -> JSONResponse:
+) -> Response:
     """Validate the visible W3C DCAT 3 catalog feed."""
-    datasets = await _get_visible_dcat_datasets(db, user)
-
     app_base_url, base_url = await get_public_urls(db, request=request)
-    catalog = catalog_to_dcat(
-        datasets,
-        base_url,
-        app_base_url=app_base_url,
-        lineage_by_record_id=await _visible_lineage(db, datasets, user),
-        has_raster_asset_by_id=await _dcat_raster_asset_presence(db, datasets),
-    )
-    report = validate_dcat3(catalog, "Catalog")
-    report.update(
-        _catalog_completeness(
+
+    def build(inputs: _FeedInputs) -> tuple[dict, dict[str, str]]:
+        datasets, lineage, has_asset, vrt_extents = inputs
+        catalog = catalog_to_dcat(
             datasets,
-            catalog,
-            "dcat:dataset",
-            [dcat_fallback_fields(dataset) for dataset in datasets],
+            base_url,
+            app_base_url=app_base_url,
+            lineage_by_record_id=lineage,
+            has_raster_asset_by_id=has_asset,
+            vrt_extents=vrt_extents,
         )
+        report = validate_dcat3(catalog, "Catalog")
+        report.update(
+            _catalog_completeness(
+                datasets,
+                catalog,
+                "dcat:dataset",
+                [dcat_fallback_fields(d) for d in datasets],
+            )
+        )
+        return report, {}
+
+    return await serve_feed(
+        "dcat-validation",
+        user,
+        db,
+        {"urls": [app_base_url, base_url]},
+        lambda: _load_feed_inputs(db, user),
+        build,
+        media_type="application/json",
     )
 
-    return JSONResponse(content=report)
 
-
-@router.get("/dcat-us/3.0", response_class=JSONResponse, include_in_schema=False)
+@router.get(
+    "/dcat-us/3.0",
+    response_class=JSONResponse,
+    include_in_schema=False,
+    summary="Get the DCAT-US 3 catalog",
+)
 @router.get(
     "/dcat-us/3.0/",
     response_class=JSONResponse,
     responses={503: SERVICE_UNAVAILABLE_RESPONSE},
+    summary="Get the DCAT-US 3 catalog",
 )
 async def get_dcat_us3_catalog(
     request: Request,
@@ -431,33 +513,45 @@ async def get_dcat_us3_catalog(
     db: AsyncSession = Depends(get_db),
     limit: int = _FEED_LIMIT_Q,
     offset: int = _FEED_OFFSET_Q,
-) -> JSONResponse:
+) -> Response:
     """DCAT-US Schema v3.0 catalog feed. Respects dataset visibility."""
-    datasets = await _get_visible_dcat_datasets(db, user, limit=limit, offset=offset)
-
     app_base_url, base_url = await get_public_urls(db, request=request)
-    catalog = catalog_to_dcat_us3(
-        datasets,
-        base_url,
-        app_base_url=app_base_url,
-        catalog_contact_email=settings.dcat_contact_email,
-        lineage_by_record_id=await _visible_lineage(db, datasets, user),
-        has_raster_asset_by_id=await _dcat_raster_asset_presence(db, datasets),
-    )
-    fallback_fields = [
-        dcat_us3_fallback_fields(dataset, settings.dcat_contact_email)
-        for dataset in datasets
-    ]
-    completeness = _catalog_completeness(datasets, catalog, "dataset", fallback_fields)
-    _ensure_conformant_dcat_us3(catalog, "Catalog")
 
-    return JSONResponse(
-        content=catalog,
-        media_type="application/ld+json",
-        headers={
+    def build(inputs: _FeedInputs) -> tuple[dict, dict[str, str]]:
+        datasets, lineage, has_asset, vrt_extents = inputs
+        catalog = catalog_to_dcat_us3(
+            datasets,
+            base_url,
+            app_base_url=app_base_url,
+            catalog_contact_email=settings.dcat_contact_email,
+            lineage_by_record_id=lineage,
+            has_raster_asset_by_id=has_asset,
+            vrt_extents=vrt_extents,
+        )
+        fallback_fields = [
+            dcat_us3_fallback_fields(d, settings.dcat_contact_email) for d in datasets
+        ]
+        completeness = _catalog_completeness(
+            datasets, catalog, "dataset", fallback_fields
+        )
+        _ensure_conformant_dcat_us3(catalog, "Catalog")
+        return catalog, {
             "Content-Language": str(catalog.get("language") or "en"),
             **_catalog_completeness_headers(completeness),
+        }
+
+    return await serve_feed(
+        "dcat-us",
+        user,
+        db,
+        {
+            "limit": limit,
+            "offset": offset,
+            "urls": [app_base_url, base_url],
+            "contact": settings.dcat_contact_email,
         },
+        lambda: _load_feed_inputs(db, user, limit, offset),
+        build,
     )
 
 
@@ -465,66 +559,96 @@ async def get_dcat_us3_catalog(
     "/dcat-us/3.0/validation",
     response_class=JSONResponse,
     include_in_schema=False,
+    summary="Validate the DCAT-US 3 catalog",
 )
-@router.get("/dcat-us/3.0/validation/", response_class=JSONResponse)
+@router.get(
+    "/dcat-us/3.0/validation/",
+    response_class=JSONResponse,
+    summary="Validate the DCAT-US 3 catalog",
+)
 async def validate_dcat_us3_catalog(
     request: Request,
     user: Identity | None = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
-) -> JSONResponse:
+) -> Response:
     """Validate the visible DCAT-US Schema v3.0 catalog feed."""
-    datasets = await _get_visible_dcat_datasets(db, user)
-
     app_base_url, base_url = await get_public_urls(db, request=request)
-    catalog = catalog_to_dcat_us3(
-        datasets,
-        base_url,
-        app_base_url=app_base_url,
-        catalog_contact_email=settings.dcat_contact_email,
-        lineage_by_record_id=await _visible_lineage(db, datasets, user),
-        has_raster_asset_by_id=await _dcat_raster_asset_presence(db, datasets),
+
+    def build(inputs: _FeedInputs) -> tuple[dict, dict[str, str]]:
+        datasets, lineage, has_asset, vrt_extents = inputs
+        catalog = catalog_to_dcat_us3(
+            datasets,
+            base_url,
+            app_base_url=app_base_url,
+            catalog_contact_email=settings.dcat_contact_email,
+            lineage_by_record_id=lineage,
+            has_raster_asset_by_id=has_asset,
+            vrt_extents=vrt_extents,
+        )
+        report = validate_dcat_us3(catalog, "Catalog")
+        fallback_fields = [
+            dcat_us3_fallback_fields(d, settings.dcat_contact_email) for d in datasets
+        ]
+        report.update(
+            _catalog_completeness(datasets, catalog, "dataset", fallback_fields)
+        )
+        return report, {}
+
+    return await serve_feed(
+        "dcat-us-validation",
+        user,
+        db,
+        {"urls": [app_base_url, base_url], "contact": settings.dcat_contact_email},
+        lambda: _load_feed_inputs(db, user),
+        build,
+        media_type="application/json",
     )
-    report = validate_dcat_us3(catalog, "Catalog")
-    fallback_fields = [
-        dcat_us3_fallback_fields(dataset, settings.dcat_contact_email)
-        for dataset in datasets
-    ]
-    report.update(_catalog_completeness(datasets, catalog, "dataset", fallback_fields))
-
-    return JSONResponse(content=report)
 
 
-@router.get("/geodcat-ap", response_class=JSONResponse, include_in_schema=False)
-@router.get("/geodcat-ap/", response_class=JSONResponse)
+@router.get(
+    "/geodcat-ap",
+    response_class=JSONResponse,
+    include_in_schema=False,
+    summary="Get the GeoDCAT-AP catalog",
+)
+@router.get(
+    "/geodcat-ap/", response_class=JSONResponse, summary="Get the GeoDCAT-AP catalog"
+)
 async def get_geodcat_ap_catalog(
     request: Request,
     user: Identity | None = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
     limit: int = _FEED_LIMIT_Q,
     offset: int = _FEED_OFFSET_Q,
-) -> JSONResponse:
+) -> Response:
     """GeoDCAT-AP 2.0.0 catalog feed. Respects dataset visibility."""
-    datasets = await _get_visible_dcat_datasets(db, user, limit=limit, offset=offset)
-
     app_base_url, base_url = await get_public_urls(db, request=request)
-    catalog = catalog_to_geodcat_ap(
-        datasets,
-        base_url,
-        app_base_url=app_base_url,
-        lineage_by_record_id=await _visible_lineage(db, datasets, user),
-        has_raster_asset_by_id=await _dcat_raster_asset_presence(db, datasets),
-    )
-    completeness = _catalog_completeness(
-        datasets,
-        catalog,
-        "dcat:dataset",
-        [geodcat_ap_fallback_fields(dataset) for dataset in datasets],
-    )
 
-    return JSONResponse(
-        content=catalog,
-        media_type="application/ld+json",
-        headers=_catalog_completeness_headers(completeness),
+    def build(inputs: _FeedInputs) -> tuple[dict, dict[str, str]]:
+        datasets, lineage, has_asset, vrt_extents = inputs
+        catalog = catalog_to_geodcat_ap(
+            datasets,
+            base_url,
+            app_base_url=app_base_url,
+            lineage_by_record_id=lineage,
+            has_raster_asset_by_id=has_asset,
+            vrt_extents=vrt_extents,
+        )
+        completeness = _catalog_completeness(
+            datasets,
+            catalog,
+            "dcat:dataset",
+            [geodcat_ap_fallback_fields(d) for d in datasets],
+        )
+        return catalog, _catalog_completeness_headers(completeness)
+
+    return await serve_feed(
+        "geodcat-ap",
+        user,
+        db,
+        {"limit": limit, "offset": offset, "urls": [app_base_url, base_url]},
+        lambda: _load_feed_inputs(db, user, limit, offset),
+        build,
     )
 
 
@@ -532,43 +656,64 @@ async def get_geodcat_ap_catalog(
     "/geodcat-ap/validation",
     response_class=JSONResponse,
     include_in_schema=False,
+    summary="Validate the GeoDCAT-AP catalog",
 )
-@router.get("/geodcat-ap/validation/", response_class=JSONResponse)
+@router.get(
+    "/geodcat-ap/validation/",
+    response_class=JSONResponse,
+    summary="Validate the GeoDCAT-AP catalog",
+)
 async def validate_geodcat_ap_catalog(
     request: Request,
     user: Identity | None = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
-) -> JSONResponse:
+) -> Response:
     """Validate the visible GeoDCAT-AP 2.0.0 catalog feed."""
-    datasets = await _get_visible_dcat_datasets(db, user)
-
     app_base_url, base_url = await get_public_urls(db, request=request)
-    catalog = catalog_to_geodcat_ap(
-        datasets,
-        base_url,
-        app_base_url=app_base_url,
-        lineage_by_record_id=await _visible_lineage(db, datasets, user),
-        has_raster_asset_by_id=await _dcat_raster_asset_presence(db, datasets),
-    )
-    report = validate_geodcat_ap(catalog, "Catalog")
-    report.update(
-        _catalog_completeness(
-            datasets,
-            catalog,
-            "dcat:dataset",
-            [geodcat_ap_fallback_fields(dataset) for dataset in datasets],
-        )
-    )
 
-    return JSONResponse(content=report)
+    def build(inputs: _FeedInputs) -> tuple[dict, dict[str, str]]:
+        datasets, lineage, has_asset, vrt_extents = inputs
+        catalog = catalog_to_geodcat_ap(
+            datasets,
+            base_url,
+            app_base_url=app_base_url,
+            lineage_by_record_id=lineage,
+            has_raster_asset_by_id=has_asset,
+            vrt_extents=vrt_extents,
+        )
+        report = validate_geodcat_ap(catalog, "Catalog")
+        report.update(
+            _catalog_completeness(
+                datasets,
+                catalog,
+                "dcat:dataset",
+                [geodcat_ap_fallback_fields(d) for d in datasets],
+            )
+        )
+        return report, {}
+
+    return await serve_feed(
+        "geodcat-ap-validation",
+        user,
+        db,
+        {"urls": [app_base_url, base_url]},
+        lambda: _load_feed_inputs(db, user),
+        build,
+        media_type="application/json",
+    )
 
 
 @router.get(
     "/{dataset_id}/dcat/validation",
     response_class=JSONResponse,
     include_in_schema=False,
+    summary="Validate a dataset as DCAT 3",
 )
-@router.get("/{dataset_id}/dcat/validation/", response_class=JSONResponse)
+@router.get(
+    "/{dataset_id}/dcat/validation/",
+    response_class=JSONResponse,
+    summary="Validate a dataset as DCAT 3",
+)
 async def validate_dcat3_record(
     request: Request,
     dataset_id: uuid.UUID,
@@ -584,6 +729,7 @@ async def validate_dcat3_record(
         base_url,
         app_base_url=app_base_url,
         lineage_summary=await _visible_record_lineage(db, dataset, user),
+        vrt_extents=await _visible_vrt_extents(db, [dataset], user),
         has_raster_asset=await _dcat_dataset_has_raster_asset(db, dataset),
     )
     report = validate_dcat3(dcat, "Dataset")
@@ -598,7 +744,9 @@ async def validate_dcat3_record(
     return JSONResponse(content=report)
 
 
-@router.get("/{dataset_id}/dcat/", response_class=JSONResponse)
+@router.get(
+    "/{dataset_id}/dcat/", response_class=JSONResponse, summary="Get a DCAT 3 record"
+)
 async def get_dcat_record(
     request: Request,
     dataset_id: uuid.UUID,
@@ -616,6 +764,7 @@ async def get_dcat_record(
         app_base_url=app_base_url,
         preferred_languages=preferred_languages,
         lineage_summary=await _visible_record_lineage(db, dataset, user),
+        vrt_extents=await _visible_vrt_extents(db, [dataset], user),
         has_raster_asset=await _dcat_dataset_has_raster_asset(db, dataset),
     )
     fallback_fields = dcat_fallback_fields(dataset, preferred_languages)
@@ -633,8 +782,13 @@ async def get_dcat_record(
     "/{dataset_id}/dcat-us/3.0/validation",
     response_class=JSONResponse,
     include_in_schema=False,
+    summary="Validate a dataset as DCAT-US 3",
 )
-@router.get("/{dataset_id}/dcat-us/3.0/validation/", response_class=JSONResponse)
+@router.get(
+    "/{dataset_id}/dcat-us/3.0/validation/",
+    response_class=JSONResponse,
+    summary="Validate a dataset as DCAT-US 3",
+)
 async def validate_dcat_us3_record(
     request: Request,
     dataset_id: uuid.UUID,
@@ -651,6 +805,7 @@ async def validate_dcat_us3_record(
         app_base_url=app_base_url,
         catalog_contact_email=settings.dcat_contact_email,
         lineage_summary=await _visible_record_lineage(db, dataset, user),
+        vrt_extents=await _visible_vrt_extents(db, [dataset], user),
         has_raster_asset=await _dcat_dataset_has_raster_asset(db, dataset),
     )
     report = validate_dcat_us3(dcat, "Dataset")
@@ -666,12 +821,16 @@ async def validate_dcat_us3_record(
 
 
 @router.get(
-    "/{dataset_id}/dcat-us/3.0", response_class=JSONResponse, include_in_schema=False
+    "/{dataset_id}/dcat-us/3.0",
+    response_class=JSONResponse,
+    include_in_schema=False,
+    summary="Get a DCAT-US 3 record",
 )
 @router.get(
     "/{dataset_id}/dcat-us/3.0/",
     response_class=JSONResponse,
     responses={503: SERVICE_UNAVAILABLE_RESPONSE},
+    summary="Get a DCAT-US 3 record",
 )
 async def get_dcat_us3_record(
     request: Request,
@@ -689,6 +848,7 @@ async def get_dcat_us3_record(
         app_base_url=app_base_url,
         catalog_contact_email=settings.dcat_contact_email,
         lineage_summary=await _visible_record_lineage(db, dataset, user),
+        vrt_extents=await _visible_vrt_extents(db, [dataset], user),
         has_raster_asset=await _dcat_dataset_has_raster_asset(db, dataset),
     )
     fallback_fields = dcat_us3_fallback_fields(dataset, settings.dcat_contact_email)
@@ -708,8 +868,13 @@ async def get_dcat_us3_record(
     "/{dataset_id}/geodcat-ap/validation",
     response_class=JSONResponse,
     include_in_schema=False,
+    summary="Validate a dataset as GeoDCAT-AP",
 )
-@router.get("/{dataset_id}/geodcat-ap/validation/", response_class=JSONResponse)
+@router.get(
+    "/{dataset_id}/geodcat-ap/validation/",
+    response_class=JSONResponse,
+    summary="Validate a dataset as GeoDCAT-AP",
+)
 async def validate_geodcat_ap_record(
     request: Request,
     dataset_id: uuid.UUID,
@@ -725,6 +890,7 @@ async def validate_geodcat_ap_record(
         base_url,
         app_base_url=app_base_url,
         lineage_summary=await _visible_record_lineage(db, dataset, user),
+        vrt_extents=await _visible_vrt_extents(db, [dataset], user),
         has_raster_asset=await _dcat_dataset_has_raster_asset(db, dataset),
     )
     report = validate_geodcat_ap(geodcat, "Dataset")
@@ -740,9 +906,16 @@ async def validate_geodcat_ap_record(
 
 
 @router.get(
-    "/{dataset_id}/geodcat-ap", response_class=JSONResponse, include_in_schema=False
+    "/{dataset_id}/geodcat-ap",
+    response_class=JSONResponse,
+    include_in_schema=False,
+    summary="Get a GeoDCAT-AP record",
 )
-@router.get("/{dataset_id}/geodcat-ap/", response_class=JSONResponse)
+@router.get(
+    "/{dataset_id}/geodcat-ap/",
+    response_class=JSONResponse,
+    summary="Get a GeoDCAT-AP record",
+)
 async def get_geodcat_ap_record(
     request: Request,
     dataset_id: uuid.UUID,
@@ -758,6 +931,7 @@ async def get_geodcat_ap_record(
         base_url,
         app_base_url=app_base_url,
         lineage_summary=await _visible_record_lineage(db, dataset, user),
+        vrt_extents=await _visible_vrt_extents(db, [dataset], user),
         has_raster_asset=await _dcat_dataset_has_raster_asset(db, dataset),
     )
     fallback_fields = geodcat_ap_fallback_fields(dataset)
@@ -776,28 +950,20 @@ async def get_geodcat_ap_record(
 # COG download
 # ---------------------------------------------------------------------------
 
-# fix(#1528): a range can be most of a multi-GB COG, so it is read in bounded
-# pieces rather than buffered whole — the same reason the full-object path
-# streams via get_stream() (ING-03). fix(#1540): the chunk size that
-# used to live here belongs to the provider now, along with the loop that used
-# it; see the note where `_iter_storage_range` was.
+# A range can be most of a multi-GB COG, so it is read in bounded pieces rather
+# than buffered whole, as the full-object path streams via get_stream(). The
+# chunk size belongs to the provider.
 
-# fix(#1532): the byte-range parser moved to `app/platform/http/ranges.py`.
-# The export download at `processing/export/router.py` had to serve ranges off a
-# stored artifact too, and `processing/` may not import `modules/catalog/`, so
-# the choice was one parser in a shared home or two that agree until one is
-# fixed. Everything the seven review rounds settled — the case-insensitive unit,
-# the saturating digit guard, ignore-versus-416 — travelled with it, comments
-# included.
+# The byte-range parser lives in `app/platform/http/ranges.py`: the export
+# download at `processing/export/router.py` serves ranges off a stored artifact
+# too, and `processing/` may not import `modules/catalog/`.
 
 
-# fix(#1540): `_iter_storage_range` used to live here, looping
-# `storage.get_range` per chunk -- bounded memory, but a 5 GiB COG issued
-# 5,120 object-store requests serially while the rate limiter counted
-# one. Deleted rather than repaired: the bound belongs in the provider,
-# the only layer that can ask for a window once (`get_range_stream`, see
-# `platform/storage/provider.py`) -- a helper turning one range into N
-# reads has no correct chunk size, only less-wrong ones.
+# The range read is a single provider call (`get_range_stream`, see
+# `platform/storage/provider.py`), not a loop of `storage.get_range` per
+# chunk: a 5 GiB COG would issue 5,120 object-store requests serially while
+# the rate limiter counted one. The bound belongs in the provider, the only
+# layer that can ask for a window once.
 
 
 async def _resolve_download_user(
@@ -809,10 +975,10 @@ async def _resolve_download_user(
 
     Accepts standard auth (header JWT, API key) plus a ``token`` query
     param, but the query-param token MUST be a download-scoped JWT
-    (``typ='download'``, <=2-minute TTL), never a session JWT -- SEC-04:
+    (``typ='download'``, <=2-minute TTL), never a session JWT:
     a session JWT in a URL is leak-prone (browser history, logs, referer).
 
-    KNOWN-01: returns ``Identity | None``, not ``User``, since the mint
+    Returns ``Identity | None``, not ``User``, since the mint
     endpoint issues a no-sub download token for anonymous callers on
     public datasets and a VALID no-sub token is a valid auth signal.
     ``download_cog`` enforces public visibility when user is None.
@@ -828,14 +994,13 @@ async def _resolve_download_user(
     if user is not None:
         return user
 
-    # fix(#1693): check presence (`is not None`), not truthiness -- a bare
-    # `?token=` (empty value) is PRESENT-but-malformed (jwt.decode("")
-    # raises, caught below as 401), not ABSENT. `if qt:` treated it as
-    # absent and fell through to a silent anonymous success on a public
-    # dataset instead of the 401 every other malformed-token case raises.
+    # Check presence (`is not None`), not truthiness: a bare `?token=` (empty
+    # value) is PRESENT-but-malformed (jwt.decode("") raises, caught below as
+    # 401), not ABSENT, and must not fall through to anonymous success on a
+    # public dataset.
     qt = request.query_params.get("token")
     if qt is not None:
-        # WR-04 (Phase 1071 review): no audience claim is verified here because
+        # No audience claim is verified here because
         # the mint endpoint (auth/router.py) does not emit an `aud` claim in
         # download-token payloads. If a future change adds `aud` to minted tokens
         # for tenant isolation or scope restriction, this decode MUST also pass
@@ -843,7 +1008,9 @@ async def _resolve_download_user(
         # silently skipped and tokens with any or no audience are accepted.
         try:
             payload = jwt.decode(
-                qt, settings.jwt_secret_key.get_secret_value(), algorithms=["HS256"]
+                qt,
+                settings.jwt_secret_key.get_secret_value(),
+                algorithms=[settings.jwt_algorithm],
             )
         except jwt.PyJWTError:
             raise HTTPException(
@@ -866,7 +1033,7 @@ async def _resolve_download_user(
                     detail="Invalid or expired download token",
                 )
 
-        # fix(#1778): remember the credential's own deadline. The last hop of
+        # Remember the credential's own deadline. The last hop of
         # this route hands the caller a presigned bucket URL, and that URL has
         # to expire with the capability that authorized it rather than on a
         # flat hour of its own. Stashed rather than returned because the
@@ -874,7 +1041,7 @@ async def _resolve_download_user(
         # to None -- the anonymous public-dataset case still has a deadline.
         request.state.download_token_exp = payload.get("exp")
 
-        # Per SEC-04: enforce typ='download' on the query-param lane.
+        # Enforce typ='download' on the query-param lane.
         if payload.get("typ") != "download":
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -895,7 +1062,7 @@ async def _resolve_download_user(
         user_id = payload.get("sub")
         if user_id:
             # Sub-bearing authenticated download token: look up the user.
-            # CR-02 (Phase 1071 review): narrow the except to only guard the
+            # Narrow the except to only guard the
             # uuid.UUID() conversion, not the db.execute() call. A ValueError
             # from SQLAlchemy (ORM-contract violation) should bubble up rather
             # than being silently swallowed by a broad except ValueError: pass.
@@ -906,9 +1073,15 @@ async def _resolve_download_user(
             else:
                 result = await db.execute(select(User).where(User.id == user_uuid))
                 found = result.scalar_one_or_none()
-                if found and found.is_active and found.status == "active":
+                if (
+                    found
+                    and found.is_active
+                    and found.status == "active"
+                    and download_token_is_current(payload, found)
+                ):
                     return found
-            # Sub-bearing token whose user disappeared or is inactive — 401.
+            # Sub-bearing token whose user disappeared, is inactive, or has
+            # revoked their sessions since it was minted — 401.
             # This IS an invalid auth signal (a token was presented and its
             # sub claim does not resolve to a usable user), unlike the
             # no-token case below, so it stays a hard 401 rather than falling
@@ -918,7 +1091,7 @@ async def _resolve_download_user(
                 detail="Authentication required",
             )
         else:
-            # KNOWN-01: no-sub anonymous download token. Token is valid
+            # No-sub anonymous download token. Token is valid
             # (typ/scope/exp all passed); return None and let download_cog
             # enforce public-visibility as defense-in-depth.
             return None
@@ -931,11 +1104,11 @@ async def _resolve_download_user(
     return None
 
 
-# fix(#1528): HEAD alongside GET -- FastAPI's APIRoute doesn't add it the
-# way starlette's plain Route does, so this answered `405 allow: GET`,
-# refusing every client that probes before downloading (GDAL/QGIS
-# `/vsicurl/`, resumable downloaders). Same gap fix(#1513) closed for
-# the export route.
+# HEAD alongside GET -- FastAPI's APIRoute doesn't add it the
+# way starlette's plain Route does, so without it the route answers
+# `405 allow: GET`, refusing every client that probes before downloading
+# (GDAL/QGIS `/vsicurl/`, resumable downloaders). The export route adds
+# HEAD for the same reason.
 #
 # Stronger than the export route's HEAD: that route's length is
 # unknowable before a live conversion (omits Content-Length per RFC
@@ -945,11 +1118,15 @@ async def _resolve_download_user(
 #
 # include_in_schema=False: a derived route documents nothing the
 # canonical one doesn't, and publishing it would churn SDKs and the CLI.
-@router.head("/{dataset_id}/download/cog", include_in_schema=False)
+@router.head(
+    "/{dataset_id}/download/cog",
+    include_in_schema=False,
+    summary="Download a raster as a Cloud-Optimized GeoTIFF",
+)
 @router.get(
     "/{dataset_id}/download/cog",
     response_class=Response,
-    # fix(#1778): the ranged-download branch raises 412
+    # The ranged-download branch raises 412
     # on a failed If-Match; the published contract omitted it.
     responses={
         200: {"description": "The whole COG file", "content": _COG_BODY},
@@ -959,6 +1136,7 @@ async def _resolve_download_user(
         403: FORBIDDEN_RESPONSE,
         412: PRECONDITION_FAILED_RESPONSE,
     },
+    summary="Download a raster as a Cloud-Optimized GeoTIFF",
 )
 async def download_cog(
     dataset_id: uuid.UUID,
@@ -984,14 +1162,14 @@ async def download_cog(
     """
     # The docstring above is the published OpenAPI description for GET
     # only -- the HEAD route (include_in_schema=False) answers the s3
-    # backend from object metadata rather than redirecting (fix(#1540)),
+    # backend from object metadata rather than redirecting,
     # documented here instead to avoid an openapi.json/SDK/CLI churn for
     # prose about an operation the schema doesn't carry.
     #
     # Same reasoning: `user` may ALSO be None for a plain anonymous
-    # request with no auth signal at all, not only the KNOWN-01 no-sub
-    # token case above -- new with fix(#1693), which stopped 401ing an
-    # anonymous caller unconditionally.
+    # request with no auth signal at all, not only the no-sub
+    # token case above, since an anonymous caller is not 401ed
+    # unconditionally.
     from slugify import slugify
 
     # 1. Fetch dataset FIRST so we can branch visibility/permission on user-None.
@@ -1035,7 +1213,7 @@ async def download_cog(
     # 5. Build filename
     filename = f"{slugify(dataset.record.title)}.cog.tif"
 
-    # 5b. Conditional request. fix(#1540): the published ETag is only
+    # 5b. Conditional request. The published ETag is only
     # half a cache contract -- a revalidating client must be told
     # "unchanged" or it re-downloads a COG it already has. Runs before
     # the audit row (neither a 412 nor a 304 transfers bytes, so
@@ -1048,7 +1226,7 @@ async def download_cog(
     if _this_service_owns_the_bytes(raster_asset) and (
         request.headers.get("if-match") or request.headers.get("if-none-match")
     ):
-        # fix(#1540): stat BEFORE answering either precondition. RFC 9110
+        # Stat BEFORE answering either precondition. RFC 9110
         # §13.2.1 puts preconditions after existence, so a deleted
         # object's row would otherwise answer 404 unconditionally but 304
         # a validator -- the same URL disagreeing with itself. Size
@@ -1065,10 +1243,10 @@ async def download_cog(
         if not_modified is not None:
             return not_modified
 
-    # 6. Audit log. user_id may be None for anonymous downloads (KNOWN-01);
+    # 6. Audit log. user_id may be None for anonymous downloads;
     # audit_logs.user_id is nullable to match.
     #
-    # fix(#1528): not for HEAD -- nothing transfers, so a row for a probe
+    # Not for HEAD -- nothing transfers, so a row for a probe
     # would misreport who downloaded what, and every /vsicurl/ open
     # begins with one.
     #
@@ -1098,7 +1276,7 @@ async def download_cog(
     # precondition block may already have had to stat the object.
     if raster_asset.storage_backend == "remote":
         # STAC import: asset_uri is the original remote COG URL — redirect.
-        # SEC-06 / M-68: DNS records can change between import time (when
+        # DNS records can change between import time (when
         # validate_url_for_ssrf was last run) and now. Re-run the SSRF check
         # immediately before redirecting to defeat DNS-rebinding TOCTOU.
         # If the hostname now resolves to a private IP (cloud metadata,
@@ -1152,25 +1330,22 @@ async def download_cog(
 def _managed_key(raster_asset) -> str:
     """The physical storage key for an asset whose bytes this service owns.
 
-    One call site became three when the precondition block had to stat
-    the object before answering (fix(#1540)), crossing the tenant
-    namespace seam ``resolve_storage_key`` exists to own.
+    Centralized so every stat and read crosses the tenant namespace seam
+    through ``resolve_storage_key``.
     """
     return resolve_storage_key(
         raster_asset.asset_uri, tenant_id=current_tenant_var.get()
     )
 
 
-# fix(#1778): the presigned redirect used to be a flat 3600 seconds,
-# exchanging a 120s revocable capability (SEC-04) for an hour-long
-# bearer URL that authenticates nobody -- SigV4 is bound to neither
-# caller nor grant, so revoking access does nothing to it, and the URL
-# lands in browser history and access logs. Ceiling is the mint TTL's
-# order, not 30x it.
+# A flat hour would exchange a 120s revocable capability for a bearer URL
+# that authenticates nobody -- SigV4 is bound to neither caller nor grant,
+# so revoking access does nothing to it, and the URL lands in browser
+# history and access logs. Ceiling is the mint TTL's order, not 30x it.
 #
-# NO floor: an earlier 60s floor meant a token with one second left
-# still bought a minute of private-COG access, since `ExpiresIn` is
-# signing-relative and flooring mints a URL usable past the deadline.
+# NO floor: a 60s floor would let a token with one second left still buy a
+# minute of private-COG access, since `ExpiresIn` is signing-relative and
+# flooring mints a URL usable past the deadline.
 # The minimum is SigV4's own (`X-Amz-Expires` 1..604800); below that
 # it's 401 -- the credential expired between verification and redirect.
 _COG_PRESIGN_CEILING_SECONDS = 300
@@ -1300,8 +1475,8 @@ def _this_service_owns_the_bytes(raster_asset) -> bool:
     return raster_asset.storage_backend != "remote"
 
 
-# fix(#1532): `if_match_passes`, `_if_none_match_matches`,
-# `_without_weak_prefix` and `_cog_not_modified` moved to
+# `if_match_passes`, `_if_none_match_matches`,
+# `_without_weak_prefix` and `_cog_not_modified` live in
 # `app/platform/http/ranges.py`, since the export download (which can't
 # import this module) evaluates the same preconditions against the same
 # kind of strong ETag -- one implementation, not two that agree only
@@ -1309,7 +1484,7 @@ def _this_service_owns_the_bytes(raster_asset) -> bool:
 def _cog_etag(raster_asset) -> str | None:
     """The stored COG's own SHA-256, quoted as a STRONG entity-tag.
 
-    fix(#1540): a range response must say which version it's a slice of,
+    A range response must say which version it's a slice of,
     or a resumable client splices two -- a replacement swaps ``asset_uri``
     and ``sha256`` on the same row, so consecutive range GETs to one URL
     can silently assemble a prefix of the old COG and a suffix of the new.
@@ -1327,7 +1502,7 @@ def _cog_etag(raster_asset) -> str | None:
     return f'"{sha}"' if sha else None
 
 
-# fix(#1532): `range_bound_to_this_version` moved to
+# `range_bound_to_this_version` lives in
 # `app/platform/http/ranges.py` alongside the parser, since the export
 # download evaluates the identical If-Range precondition and can't import
 # this module.
@@ -1343,10 +1518,10 @@ async def _cog_object_size(
     returning the response, so a deferred raise would 500. The size is
     that same call's answer, so HEAD/GET get a real Content-Length.
 
-    fix(#1540): ONE ``size()``, not ``exists()`` then ``size()`` -- every
+    ONE ``size()``, not ``exists()`` then ``size()`` -- every
     provider normalizes a missing object to ``FileNotFoundError``, so
-    asking twice cost a second ``head_object`` per probe and opened a
-    window where a delete between the calls turned "merely gone" into a
+    asking twice costs a second ``head_object`` per probe and opens a
+    window where a delete between the calls turns "merely gone" into a
     503. Shared with the ``s3`` branch so HEAD answers identically
     whichever backend holds the bytes.
     """
@@ -1384,11 +1559,11 @@ async def _cog_size_once(
 ) -> int:
     """The object's size, stat'ing only if the caller has not already.
 
-    fix(#1540): the precondition block has to stat before it can
-    answer a 304 — a row whose bytes are gone must 404 whether or not the
-    client sent a validator. Handing that measurement down is what keeps the
-    single-stat property the double-stat round established: a conditional
-    request that goes on to transfer bytes still touches object metadata once.
+    The precondition block has to stat before it can answer a 304: a row whose
+    bytes are gone must 404 whether or not the client sent a validator.
+    Handing that measurement down keeps the single-stat property: a
+    conditional request that goes on to transfer bytes still touches object
+    metadata once.
     """
     if already_known is not None:
         return already_known

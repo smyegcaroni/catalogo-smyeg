@@ -8,7 +8,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-from typing import Any, Literal, NamedTuple, TypeVar
+from typing import Any, Literal, NamedTuple, NoReturn, TypeVar
 from urllib.parse import parse_qs, quote, urlencode
 
 import httpx
@@ -35,6 +35,7 @@ from app.core.record_types import RASTER_FAMILY_RECORD_TYPES, capabilities
 from app.core.tile_scope import (
     TILE_PUBLICATION_VERSION_PARAM,
     tile_template_params,
+    vector_tile_template,
 )
 from app.modules.auth.dependencies import (
     capability_declined,
@@ -52,20 +53,25 @@ from app.platform.cache.provider import (
 )
 from app.platform.cache.scope import is_publicly_cacheable, public_cache_control
 from app.platform.extensions import (
+    RecordAudienceQuery,
     get_billing_extensions,
     get_data_serving_extension,
+    get_permission_extension,
     get_processing_port,
 )
 from app.platform.service_endpoints import MAX_QUERY_FIELDS
 from app.platform.storage.titiler_url import build_titiler_cog_url
 from app.processing.tiles import remote_sources
 from app.processing.raster.models import RasterAsset
+from app.core.db import release_connection
 from app.core.db.tenant_schema import tenant_data_schema
 from app.core.db.tenant_session import current_tenant_var
 from app.core.tenancy import is_multi_tenant
-from app.processing.tiles.admission import tile_render_slot
+from app.processing.tiles.admission import raster_render_slot, tile_render_slot
+from app.processing.tiles import cluster_filter as cluster_filters
 from app.processing.tiles.cache_key import (
     generation_table_key as _generation_table_key,
+    tile_cache_entry,
     tile_cache_key,
 )
 from app.processing.tiles.pool import (
@@ -74,6 +80,7 @@ from app.processing.tiles.pool import (
     set_tenant_role_for_tile_request,
 )
 from app.processing.tiles.responses import (
+    _cached_tile_response,
     _empty_tile_headers as _empty_tile_headers,
     _if_none_match_satisfied as _if_none_match_satisfied,
     _serving_tile_headers,
@@ -81,6 +88,7 @@ from app.processing.tiles.responses import (
     _tile_headers as _tile_headers,
     _tile_response,
     tile_busy_error,
+    tile_unavailable_error,
 )
 from app.processing.tiles.service import (
     _TABLE_NAME_RE,
@@ -100,7 +108,11 @@ from app.processing.tiles.signing import (
     round_expiry,
     verify_tile_signature,
 )
-from app.standards.ogc.errors import ERROR_RESPONSES_PUBLIC, RATE_LIMIT_RESPONSE
+from app.standards.ogc.errors import (
+    ERROR_RESPONSES_PUBLIC,
+    FORBIDDEN_RESPONSE,
+    RATE_LIMIT_RESPONSE,
+)
 
 logger = structlog.stdlib.get_logger(__name__)
 
@@ -121,8 +133,7 @@ async def _emit_tile_usage_event(table_name: str) -> None:
     """Emit a tile-request usage event through the billing-import-free seam.
 
     Called after a successful vector or cluster tile serve in multi_tenant
-    mode. Best-effort: errors are logged and swallowed — a billing hook
-    failure must never fail a tile response.
+    mode. Best-effort: errors are logged and swallowed.
     """
     if not is_multi_tenant():
         return
@@ -157,8 +168,8 @@ async def _check_cold_rehydrate(
 
     Returns None on the hot path (not cold / not multi-tenant / overlay
     hydrates inline), or a 202 JSON Response when an async rehydrate was
-    enqueued. A cold-check failure is logged and returns None — it must
-    NEVER fail a tile response.
+    enqueued. A cold-check failure is logged and returns None; it must never
+    fail a tile response.
     """
     import json
 
@@ -173,9 +184,7 @@ async def _check_cold_rehydrate(
             table_name=table_name,
             tenant_id=tenant_id,
         )
-    except (
-        Exception
-    ):  # broad: cold-check failure must NEVER fail a tile response (T-1214-17)
+    except Exception:  # broad: cold-check failure must NEVER fail a tile response
         logger.warning(
             "cold_rehydrate_check_failed",
             table_name=table_name,
@@ -185,33 +194,47 @@ async def _check_cold_rehydrate(
         return None
 
     if result is None:
-        # Dataset resolved as hot by the overlay (non-cold record_status).
         return None
 
     if result.status == "warming":
-        # Over size gate: async rehydrate enqueued; inform the client to poll.
+        # Over the size gate: async rehydrate enqueued; the client polls.
         return Response(
             content=json.dumps({"status": "warming", "job_id": result.job_id}),
             status_code=202,
             media_type="application/json",
         )
 
-    # status='hydrated': sync rehydrate completed inline — proceed to serve the tile.
+    # status='hydrated': the sync rehydrate completed inline.
     return None
 
 
 router = APIRouter(prefix="/tiles", tags=["Tiles"], responses=ERROR_RESPONSES_PUBLIC)
 
-# `_TABLE_NAME_RE` is imported from tiles.service rather
-# than re-declared, so the SQL-injection-defense regex has exactly one definition.
-
-# fix(#1927) SEC-OBSV-01: `follow_redirects=True` holds while Titiler is
-# internal-only (no `ports:` in docker-compose.yml) and every URL here is
-# server-derived; otherwise this must move to `make_safe_client`.
+# `follow_redirects=True` is safe only while Titiler is internal-only (no
+# `ports:` in docker-compose.yml) and every URL here is server-derived;
+# otherwise this must move to `make_safe_client`.
 _titiler_client = httpx.AsyncClient(
     timeout=httpx.Timeout(30.0, connect=10.0),
+    # Idle keep-alive connections count toward Titiler's concurrency cap, so a
+    # process never holds more than its raster slots.
+    limits=httpx.Limits(
+        max_connections=settings.tile_pool_max_size,
+        max_keepalive_connections=settings.tile_pool_max_size,
+    ),
     follow_redirects=True,
 )
+_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+
+def _is_renderer_saturated(resp: httpx.Response) -> bool:
+    """True for uvicorn's concurrency-limit 503, which has a plain-text body.
+
+    Titiler's own 503s are JSON, so only the former means "busy, don't retry".
+    """
+    return resp.status_code == 503 and not resp.headers.get(
+        "content-type", ""
+    ).lower().startswith("application/json")
+
 
 # In-memory TTL cache for dataset metadata: one DB read per TTL, not per tile.
 _DATASET_CACHE_TTL = 60  # seconds
@@ -232,34 +255,35 @@ class _DatasetMeta(NamedTuple):
     geometry_type: str | None
     column_info: list
     tile_cache_ttl: int | None
-    # Phase 269 H-23: tile column allowlist (None / [] / list[str]).
+    # Tile column allowlist (None / [] / list[str]).
     tile_columns: list[str] | None
-    # fix(#1963): the signed scope binds this, so it is as stale as the
-    # `record_status` beside it and no staler.
+    # The signed scope binds this, so it is as stale as the `record_status`
+    # beside it and no staler.
     publication_version: int
     tile_cache_version: int
     updated_at: datetime
 
 
-# Bounded LRU so a long-lived tile worker cannot grow one entry per
-# distinct table_name forever; the per-entry TTL still bounds staleness.
+# Bounded LRU so a long-lived tile worker cannot grow one entry per distinct
+# table_name forever; the per-entry TTL still bounds staleness.
 _dataset_cache: LRUCache[str, tuple[float, _DatasetMeta]] = LRUCache(maxsize=256)
-# threading.Lock is safe here — cache reads/writes are synchronous, no await inside lock
+# A threading.Lock is safe: cache reads and writes are synchronous, with no
+# await inside the lock.
 _dataset_cache_lock = threading.Lock()
 
 
 def _evict_dataset_meta(table_name: str) -> None:
     """Drop every cached meta entry for a table name.
 
-    This cache decides authorization — visibility, record_status, and
-    created_by come from the snapshot, not a re-query. GH-1443 retires a
-    freed table name and `generate_table_name` collides against it, so a
-    surviving entry can only describe its own dataset; eviction buys
-    freshness, not the authorization boundary.
+    This cache decides authorization: visibility, record_status, and
+    created_by come from the snapshot, not a re-query. A freed table name is
+    retired and `generate_table_name` collides against it, so a surviving
+    entry can only describe its own dataset; eviction buys freshness, not the
+    authorization boundary.
 
-    Both key shapes are swept — bare ``table_name`` (single-tenant) and
-    ``{tid}:{table_name}`` (multi-tenant) — a process can hold entries from
-    before a mode transition.
+    Both key shapes are swept, bare ``table_name`` (single-tenant) and
+    ``{tid}:{table_name}`` (multi-tenant), since a process can hold entries
+    from before a mode transition.
     """
     suffix = f":{table_name}"
     with _dataset_cache_lock:
@@ -272,10 +296,10 @@ def _evict_dataset_meta(table_name: str) -> None:
 
 register_table_invalidation_listener(_evict_dataset_meta)
 
-# Short-TTL cache for raster dataset/asset metadata. The whole row is
-# cached INCLUDING visibility and record_status, so a dataset made private or
+# Short-TTL cache for raster dataset/asset metadata. The whole row is cached,
+# including visibility and record_status, so a dataset made private or
 # unpublished is still served anonymously for up to the TTL. Keep it short.
-_RASTER_META_CACHE_TTL = 60  # seconds — same TTL as the vector cache
+_RASTER_META_CACHE_TTL = 60  # seconds, the same TTL as the vector cache
 
 
 class _RasterMeta(NamedTuple):
@@ -295,14 +319,15 @@ class _RasterMeta(NamedTuple):
     band_info: list | None
     nodata: str | None
     tile_cache_version: int
-    # fix(#1963): the signed scope binds this, not `tile_cache_version` above.
+    # The signed scope binds this, not `tile_cache_version` above.
     publication_version: int
     member_sources: dict
+    # A mosaic that reaches someone one of its members hides from serves nobody.
+    members_beyond_audience: bool = False
 
 
-# Bounded LRU mirroring the vector `_dataset_cache`. An
-# unbounded dict here holds one `_RasterMeta` -- an asset_uri string and a
-# band_info list -- per distinct raster for the life of the worker.
+# Bounded LRU mirroring the vector `_dataset_cache`; an unbounded dict would
+# hold one `_RasterMeta` per distinct raster for the life of the worker.
 _raster_meta_cache: LRUCache[str, tuple[float, _RasterMeta]] = LRUCache(maxsize=256)
 _raster_meta_cache_lock = threading.Lock()
 
@@ -319,19 +344,24 @@ _DTYPE_MAX = {
 }
 
 _FLOAT_DTYPES = frozenset({"float32", "float64"})
+# Signed integers have negative values the 0..max dtype rescale would clip, but
+# only a single band gets the data range: multi-band signed imagery keeps the
+# dtype rescale.
+_SIGNED_INT_DTYPES = frozenset({"int8", "int16", "int32"})
 
-# Set by raster_auth_check when the default rescale for a float raster should
-# come from the data range; the tile proxy reads statistics so that work sits
-# behind the tile rate limit and is skipped when another stretch replaces it.
+# Set by raster_auth_check when the default rescale for a float or signed
+# integer raster should come from the data range; the tile proxy reads
+# statistics so that work sits behind the tile rate limit and is skipped when
+# another stretch replaces it.
 _DATA_RANGE_HEADER = "X-GeoLens-Data-Range-Default"
 
 _WEB_MERCATOR_EQUATOR_RESOLUTION_M = 156543.03392804097
 _DEFAULT_RASTER_MAXZOOM = 18
 _MAX_RASTER_MAXZOOM = 22
 
-# Issue #186: the canonical DEM nodata sentinel, for a DEM COG that declares
-# none. Under terrainrgb an undeclared fill of -9999 encodes as an extreme
-# elevation, spiking the DEM boundary; -9999 is below any real terrain.
+# The canonical DEM nodata sentinel, for a DEM COG that declares none. Under
+# terrainrgb an undeclared fill of -9999 encodes as an extreme elevation,
+# spiking the DEM boundary; -9999 is below any real terrain.
 _DEM_DEFAULT_NODATA = "-9999"
 
 
@@ -352,8 +382,7 @@ def _dem_nodata_param(recorded_nodata: str | None) -> str | None:
     if not math.isfinite(value):
         # NaN/inf nodata is handled by the COG's internal mask, not a query param.
         return None
-    # An integer literal when the value is integral (-9999, not -9999.0), which
-    # keeps the URL clean and matches the DEM convention.
+    # An integer literal when the value is integral (-9999, not -9999.0).
     if value.is_integer():
         return str(int(value))
     return repr(value)
@@ -410,9 +439,9 @@ def _native_resolution_meters(
     values: list[float] = []
 
     if res_x is not None or res_y is not None:
-        # fix(#939): "is this resolution in degrees?" is not an EPSG equality
+        # "is this resolution in degrees?" is not an EPSG equality
         # test -- 4269, 4258, 4979 and 9518 store degrees too, and reading those
-        # as metres pinned maxzoom to the cap (ETOPO got z22 instead of z7).
+        # as metres would pin maxzoom to the cap (ETOPO would get z22 instead of z7).
         facts = raster_crs_facts(asset)
         geographic = facts["crs_is_geographic"]
         if geographic:
@@ -461,14 +490,13 @@ def _titiler_render_params(band_count: int | None, dtype: str | None) -> str:
     parts: list[str] = []
     bc = band_count or 1
 
-    # Select up to 3 bands for RGB rendering (skip alpha/extra bands)
+    # Up to 3 bands for RGB rendering, skipping alpha/extra bands.
     if bc >= 3:
         parts.extend(["bidx=1", "bidx=2", "bidx=3"])
     elif bc == 2:
         parts.append("bidx=1")
-    # else single band — titiler handles it
+    # A single band needs no selection.
 
-    # Rescale non-uint8 data to 0-255
     dt = (dtype or "uint8").lower()
     if dt != "uint8":
         max_val = _DTYPE_MAX.get(dt, 65535)
@@ -480,18 +508,10 @@ def _titiler_render_params(band_count: int | None, dtype: str | None) -> str:
     return "&".join(parts)
 
 
-# Colormap / stretch allowlists.
-
-# 8 curated Titiler colormap names from the UI-SPEC. Validated against the
-# running Titiler instance (see 1140-RESEARCH.md Finding 5).
+# The curated Titiler colormap names, validated against the running Titiler.
 _ALLOWED_COLORMAPS: frozenset[str] = frozenset(
     {"gray", "viridis", "inferno", "plasma", "magma", "ylorrd", "bugn", "terrain"}
 )
-
-# Accepted stretch strategies. minmax (default) keeps the default rescale;
-# percentile/stddev compute a stats-based rescale from Titiler band statistics
-# (RASTER-STRETCH-01/02). Single-band scope; multi-band is Future RASTER-STRETCH-03.
-_ALLOWED_STRETCH: frozenset[str] = frozenset({"minmax", "percentile", "stddev"})
 
 # stddev stretch uses mean ± _STDDEV_SIGMA·σ, clamped to the band [min, max].
 _STDDEV_SIGMA = 2.0
@@ -552,8 +572,8 @@ async def _load_band_statistics(
     open_path: str, pmin: float, pmax: float
 ) -> list[dict] | None:
     cache_key = (open_path, pmin, pmax)
-    # Forward pmin/pmax as repeated p= params (e.g. p=5&p=95). Use integer
-    # representation for whole numbers to match Titiler's expected format.
+    # Titiler takes pmin/pmax as repeated p= params (p=5&p=95), with whole
+    # numbers as integers.
     pmin_str = str(int(pmin)) if pmin == int(pmin) else str(pmin)
     pmax_str = str(int(pmax)) if pmax == int(pmax) else str(pmax)
     stats_url = build_titiler_cog_url(
@@ -563,7 +583,8 @@ async def _load_band_statistics(
     )
     bands: list[dict] | None = None
     try:
-        resp = await _titiler_client.get(stats_url)
+        async with raster_render_slot():
+            resp = await _titiler_client.get(stats_url)
         if resp.status_code == 200:
             data = resp.json()
             if isinstance(data, dict) and data:
@@ -622,9 +643,8 @@ def _compute_stretch_rescale(
                 hi = min(hi, bmax)
         if lo is None or hi is None or not (lo < hi):
             continue
-        # Round to 4 dp — Titiler does not need full float precision and clean
-        # values keep the tile-URL cache key stable.
-        parts.append(f"rescale={round(lo, 4)},{round(hi, 4)}")
+        # A literal "+" in an exponent would be read as a space in the query.
+        parts.append(f"rescale={quote(str(lo))},{quote(str(hi))}")
     return parts
 
 
@@ -671,8 +691,8 @@ def _require_tile_tenant_context() -> str | None:
 def _cache_key_arg_values(request: Request, name: str) -> list[str]:
     """Every value nginx's ``$arg_<name>`` could resolve, in query order.
 
-    nginx matches an arg NAME case-insensitively and reads the FIRST
-    occurrence, while ``QueryParams.get()`` returns the LAST occurrence of an
+    nginx matches an arg name case-insensitively and reads the first
+    occurrence, while ``QueryParams.get()`` returns the last occurrence of an
     exact-case name. Both cache-key params are read through here so the edge
     and the api cannot disagree about which value keyed an entry.
     """
@@ -686,8 +706,8 @@ def _cache_key_arg_values(request: Request, name: str) -> list[str]:
 def _cache_key_version_mismatch(values: list[str], current: int) -> bool:
     """Whether a cache-key version param disagrees with the row it names.
 
-    An ABSENT param is not a mismatch: an unversioned client (a copied connect
-    URL) keys on the empty segment and keeps the old bounded staleness. A
+    An absent param is not a mismatch: an unversioned client (a copied connect
+    URL) keys on the empty segment and keeps the bounded staleness. A
     duplicated one is, since the two layers would read different occurrences.
     """
     return bool(values) and (len(values) != 1 or values[0] != str(current))
@@ -721,6 +741,7 @@ async def _read_raster_meta(
         text(
             f"""
             SELECT
+                r.id AS record_id,
                 r.visibility,
                 r.record_status,
                 r.created_by,
@@ -733,7 +754,11 @@ async def _read_raster_meta(
                 ra.band_info,
                 ra.nodata,
                 d.tile_cache_version,
-                d.publication_version, {remote_sources.MEMBER_SOURCES_COLUMN}
+                d.publication_version, {remote_sources.MEMBER_SOURCES_COLUMN},
+                ARRAY(
+                    SELECT vsl.source_dataset_id FROM catalog.vrt_source_links vsl
+                    WHERE vsl.vrt_dataset_id = d.id
+                ) AS member_ids
             FROM catalog.datasets d
             JOIN catalog.records r ON d.record_id = r.id
             LEFT JOIN catalog.raster_assets ra ON ra.dataset_id = d.id
@@ -759,6 +784,19 @@ async def _read_raster_meta(
             status_code=status.HTTP_404_NOT_FOUND, detail="No raster asset"
         )
 
+    members_beyond_audience = bool(row["member_ids"]) and bool(
+        await get_processing_port().vrt_members_beyond_audience(
+            db,
+            row["member_ids"],
+            RecordAudienceQuery(
+                dataset_id=dataset_id,
+                record_id=row["record_id"],
+                owner_id=row["created_by"],
+                visibility=row["visibility"],
+                record_status=row["record_status"],
+            ),
+        )
+    )
     return _RasterMeta(
         visibility=row["visibility"],
         record_status=row["record_status"],
@@ -774,6 +812,7 @@ async def _read_raster_meta(
         tile_cache_version=row["tile_cache_version"] or 1,
         publication_version=row["publication_version"] or 0,
         member_sources=row["member_sources"] or {},
+        members_beyond_audience=members_beyond_audience,
     )
 
 
@@ -784,7 +823,7 @@ async def _resolve_raster_meta(
 ) -> _RasterMeta:
     """Look up raster dataset/asset metadata with a short in-memory cache.
 
-    The cached snapshot INCLUDES the access-control fields, so a visibility
+    The cached snapshot includes the access-control fields, so a visibility
     or status change takes effect only after the entry expires, at most
     ``_RASTER_META_CACHE_TTL`` seconds. Multi-tenant cache keys carry the
     resolved tenant UUID and filter ``tenant_id`` explicitly; an unresolved
@@ -817,20 +856,20 @@ async def _resolve_raster_meta(
 def _tile_signature_authorizes(
     request: Request, dataset_id: uuid.UUID, publication_version: int
 ) -> bool:
-    """Whether the caller presented a VALID signed template for this dataset.
+    """Whether the caller presented a valid signed template for this dataset.
 
-    Mirror of the vector verify path — expected scope is recomputed through
-    the SAME ``tile_signature_scope`` helper the mint site uses, since a
+    Mirrors the vector verify path: the expected scope is recomputed through
+    the same ``tile_signature_scope`` helper the mint site uses, since a
     divergence is a silent authorization bypass, not a test failure. A raster
     dataset has no ``table_name``, so the dataset id is the resource string.
 
-    ``publication_version`` is the row's CURRENT counter, so a signature minted
-    before an unpublish or a move to private no longer matches (#1963).
+    ``publication_version`` is the row's current counter, so a signature
+    minted before an unpublish or a move to private no longer matches.
 
-    Returns a bool instead of raising: the signature is an ADDITIONAL way
-    in, never a restriction on a client that can send headers, so an absent
-    or invalid signature falls through to the other branches rather than
-    403ing a valid session whose 15-minute template has aged out.
+    Returns a bool instead of raising: the signature is an additional way in,
+    never a restriction on a client that can send headers, so an absent or
+    invalid signature falls through to the other branches rather than 403ing
+    a valid session whose 15-minute template has aged out.
     """
     from app.core.tile_scope import tile_signature_scope
 
@@ -847,6 +886,86 @@ def _tile_signature_authorizes(
     return verify_tile_signature(scope, exp, sig)
 
 
+def _raster_embed_token_refused() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN, detail="Invalid or expired embed token"
+    )
+
+
+async def _check_raster_reader(
+    db: AsyncSession,
+    dataset_id: uuid.UUID,
+    user: Identity,
+    facts: Any,
+    dataset: Any = None,
+) -> None:
+    """Raise 404 "Dataset not found" unless ``user`` may read the dataset.
+
+    ``facts`` carries ``visibility``, ``record_status`` and ``created_by``, from
+    the raster metadata snapshot or a dataset's record. ``dataset`` saves a
+    lookup when the caller already holds the row.
+    """
+    port = get_processing_port()
+    if facts.visibility != "public":
+        # Routed through the permission extension, not an inline policy mirror,
+        # so an overlay that denies the creator wins here as on the token path.
+        if dataset is None:
+            dataset = await port.get_dataset(db, dataset_id)
+        if dataset is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
+            )
+        await port.check_dataset_access(db, dataset, dataset_id, user)
+    elif facts.record_status != "published":
+        user_roles = await port.get_user_roles(db, user)
+        if "admin" not in user_roles and facts.created_by != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
+            )
+
+
+async def _refuse_unseen_raster_lookup(
+    request: Request,
+    dataset_id: uuid.UUID,
+    db: AsyncSession,
+    user: Identity | None,
+    exc: HTTPException,
+) -> None:
+    """Refuse a failed raster lookup as ``_resolve_raster_access`` refuses access.
+
+    A caller who could not read the dataset gets the answer a missing id gets,
+    so "Not a raster dataset" and "No raster asset" reach only a capability
+    for the id or a caller with read access. The checks run in the success
+    path's order: an embed token or a signature valid for the live row gets
+    ``exc`` whatever other credential the request carries. Returns when
+    ``exc`` may stand for the caller's own identity.
+    """
+    embed_token = request.headers.get("X-Embed-Token")
+    if embed_token:
+        if not await validate_embed_token_access(embed_token, dataset_id, db, request):
+            capability_declined(request, user, _raster_embed_token_refused())
+        raise exc
+    port = get_processing_port()
+    dataset = await port.get_dataset(db, dataset_id)
+    if dataset is not None and _tile_signature_authorizes(
+        request, dataset_id, dataset.publication_version
+    ):
+        raise exc
+    if user is None:
+        if dataset is None or not await get_permission_extension().can_access_dataset(
+            db, dataset, dataset_id, None, user_roles=set()
+        ):
+            _refuse_unseen_tile(request)
+        return
+    if dataset is None:
+        return
+    # The permission extension is asked about a public dataset too: what the
+    # lookup found is for readers only, whatever the tile routes serve.
+    await port.check_dataset_access(db, dataset, dataset_id, user)
+    if dataset.record.visibility == "public":
+        await _check_raster_reader(db, dataset_id, user, dataset.record, dataset)
+
+
 async def _resolve_raster_access(
     db: AsyncSession,
     dataset_id: uuid.UUID,
@@ -861,92 +980,62 @@ async def _resolve_raster_access(
     ``requested_version`` only reaches the metadata cache key, never an
     auth decision. Raises HTTPException on any auth or lookup failure.
     """
-    # Metadata comes from cache; auth checks always run per-request.
-    # fix(#1518): a 404 here precedes any capability evaluation, so the
-    # credential rule applies to the answer.
+    # Metadata comes from cache; auth checks always run per-request. A 404 here
+    # precedes any capability evaluation, so the credential rule applies to the
+    # answer.
     try:
         meta = await _resolve_raster_meta(db, dataset_id, requested_version)
     except HTTPException as exc:
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            await _refuse_unseen_raster_lookup(request, dataset_id, db, user, exc)
         capability_declined(request, user, exc)
 
-    visibility = meta.visibility
-    record_status = meta.record_status
-    created_by = meta.created_by
     storage_backend = meta.storage_backend
 
-    # Auth priority 1: embed token
+    # Auth priority 1: embed token.
     embed_token_header = request.headers.get("X-Embed-Token")
     if embed_token_header:
         is_valid = await validate_embed_token_access(
             embed_token_header, dataset_id, db, request
         )
         if not is_valid:
-            capability_declined(
-                request,
-                user,
-                HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Invalid or expired embed token",
-                ),
-            )
+            capability_declined(request, user, _raster_embed_token_refused())
     elif _tile_signature_authorizes(request, dataset_id, meta.publication_version):
-        # fix(#688) auth priority 2: a signed template, mirroring the vector
-        # path -- MapLibre attaches no header. Checked ahead of the visibility
-        # split, because the mint endpoint issues one for a draft too (r1).
+        # Auth priority 2: a signed template, as on the vector path, since
+        # MapLibre attaches no header. Checked ahead of the visibility split
+        # because the mint endpoint issues one for a draft too.
         pass
     else:
-        # fix(#1518): CAPABILITY obligation. Reaching this arm means NEITHER
-        # capability authorized the request, so what remains is decided by who
-        # is asking and an unresolvable credential earns the fail-closed 401.
+        # Neither capability authorized the request, so what remains is decided
+        # by who is asking, and an unresolvable credential earns the
+        # fail-closed 401.
         reject_unresolvable_credentials(request, user)
 
-        if visibility != "public":
-            # Auth priority 3: require authenticated user for non-public datasets
-            if user is None:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Authentication required",
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-
-            # fix(#929): routed through the permission extension rather than an
-            # inline policy mirror, so an overlay that deliberately denies the
-            # creator still wins here as it does on the token path.
-            port = get_processing_port()
-            dataset = await port.get_dataset(db, dataset_id)
-            if dataset is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
-                )
-            await port.check_dataset_access(db, dataset, dataset_id, user)
+        # Auth priority 3: the caller's own access. Anonymous callers read only
+        # public, published rasters; authenticated non-owners no unpublished one.
+        if user is None:
+            if meta.visibility != "public" or meta.record_status != "published":
+                _refuse_unseen_tile(request)
         else:
-            # Public dataset: still block non-published for unauthenticated users
-            if record_status != "published":
-                if user is None:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail="Dataset not found",
-                    )
-                # Authenticated non-owners cannot see unpublished
-                port = get_processing_port()
-                user_roles = await port.get_user_roles(db, user)
-                if "admin" not in user_roles and created_by != user.id:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail="Dataset not found",
-                    )
+            await _check_raster_reader(db, dataset_id, user, meta)
 
-    # fix(#1778): hand the API-pool connection back before the caller goes
-    # upstream, or a handful of concurrent tiles park the pool for three Titiler
-    # attempts at a 30s timeout. Read-only, so the rollback discards nothing.
+    if meta.members_beyond_audience:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A source of this mosaic is not visible to everyone who can see it",
+        )
+
+    # Hand the API-pool connection back before the caller goes upstream, or a
+    # handful of concurrent tiles park the pool for three Titiler attempts at a
+    # 30s timeout. Read-only, so the rollback discards nothing.
     await db.rollback()
 
     return meta, storage_backend
 
 
-# fix(#957): unpublished from the API contract, not deleted. The HANDLER is
-# load-bearing -- `raster_tile_proxy` calls it in-process and reads four
-# `X-GeoLens-*` headers off the Response it returns.
+# Excluded from the API contract, but the handler is load-bearing:
+# `raster_tile_proxy` calls it in-process and reads the `X-GeoLens-*` headers
+# off the Response it returns.
 @router.get("/raster-auth-check/", response_model=None, include_in_schema=False)
 @limiter.exempt
 async def raster_auth_check(
@@ -961,13 +1050,15 @@ async def raster_auth_check(
     ``X-GeoLens-*`` headers off the returned Response. Not part of the
     public API surface; kept mounted for the raster-RBAC tests.
 
-    Returns 200 with the open-path/cache-status headers, 401 if auth is
-    missing, 403 if the embed token is invalid, 404 if not found/not
-    raster/no asset, 409 for a mosaic naming a remote member.
+    Returns 200 with the open-path/cache-status headers, 401 if a supplied
+    credential did not resolve, 403 if the embed token or the signature
+    parameters did not authorize, 404 if not found/not raster/no asset or not
+    visible to the caller, 409 for a mosaic naming a remote member or reaching
+    anyone who cannot read one of its members.
     """
-    # fix(#1372): nginx keys on the FIRST occurrence of `v` and matches the
-    # name case-insensitively; `QueryParams.get()` returns the LAST occurrence
-    # of an exact-case name. Read once, because two decisions below use it.
+    # nginx keys on the first occurrence of `v` and matches the name
+    # case-insensitively; `QueryParams.get()` returns the last occurrence of an
+    # exact-case name. Read once, because two decisions below use it.
     v_values = _cache_key_arg_values(request, "v")
     meta, storage_backend = await _resolve_raster_access(
         db,
@@ -985,11 +1076,11 @@ async def raster_auth_check(
         if is_publicly_cacheable(meta.visibility, meta.record_status)
         else "private"
     )
-    # fix(#1372): a shared-cache entry may only be written under the
-    # CURRENT version, or a caller pre-warms the NEXT key with pre-replace
-    # bytes. So: exactly one case-insensitive `v`, or served no-store.
-    # fix(#2007): and on the publication version, or a mismatched `pv`
-    # pre-warms the key the next unpublish makes current.
+    # A shared-cache entry may only be written under the current version, or a
+    # caller pre-warms the next key with pre-replace bytes: exactly one
+    # case-insensitive `v`, or served no-store. The same holds for the
+    # publication version, or a mismatched `pv` pre-warms the key the next
+    # unpublish makes current.
     if cache_status == "public" and (
         _cache_key_version_mismatch(v_values, meta.tile_cache_version)
         or _cache_key_version_mismatch(
@@ -1000,16 +1091,16 @@ async def raster_auth_check(
         cache_status = "private"
     float_default_range = False
     if meta.is_dem:
-        # DEM terrain: terrainrgb with NO rescale, which encodes raw elevation
-        # into RGB. Issue #186: mask the nodata so fill pixels in edge tiles are
+        # DEM terrain: terrainrgb with no rescale, which encodes raw elevation
+        # into RGB. The nodata is masked so fill pixels in edge tiles are
         # transparent rather than an extreme elevation.
         render_params = "algorithm=terrainrgb"
         nodata_param = _dem_nodata_param(meta.nodata)
         if nodata_param is not None:
             render_params = f"{render_params}&nodata={nodata_param}"
     elif storage_backend == "remote" and meta.band_info:
-        # Remote STAC import with statistics — use actual data min/max
-        # for rescaling instead of fixed dtype max
+        # A remote STAC import with statistics rescales to the actual data
+        # min/max instead of the fixed dtype max.
         bi = meta.band_info
         bc = meta.band_count or 1
         parts: list[str] = []
@@ -1021,7 +1112,10 @@ async def raster_auth_check(
         render_params = "&".join(parts)
     else:
         render_params = _titiler_render_params(meta.band_count, meta.dtype)
-        float_default_range = (meta.dtype or "").lower() in _FLOAT_DTYPES
+        dtype = (meta.dtype or "").lower()
+        float_default_range = dtype in _FLOAT_DTYPES or (
+            dtype in _SIGNED_INT_DTYPES and (meta.band_count or 1) == 1
+        )
 
     return Response(
         status_code=status.HTTP_200_OK,
@@ -1045,8 +1139,18 @@ async def raster_auth_check(
             "image/jpeg",
             "image/webp",
             "image/tiff",
-        )
+        ),
+        403: {
+            **FORBIDDEN_RESPONSE,
+            "description": (
+                "Forbidden: the embed token or the signature parameters did not "
+                "authorize the request, or a multi-tenant request has no tenant "
+                "context"
+            ),
+        },
+        429: RATE_LIMIT_RESPONSE,
     },
+    summary="Get a raster tile",
 )
 @limiter.exempt
 async def raster_tile_proxy(
@@ -1103,9 +1207,10 @@ async def raster_tile_proxy(
     ``stretch`` chooses how pixel values map to the output range. ``minmax``
     keeps the range the dataset already implies: the recorded per-band minimum
     and maximum for a raster imported from a remote source that published
-    statistics, the data range read from band statistics for floating-point
-    data, a range derived from the data type for other integer data, and no
-    rescale parameter for 8-bit data, which needs none. ``percentile`` and
+    statistics, the data range read from band statistics for floating-point and
+    single-band signed integer data, a range derived from the data type for
+    other integer data, and no rescale parameter for 8-bit data, which needs
+    none. ``percentile`` and
     ``stddev`` instead derive a range from band statistics read at request
     time, for up to three bands. A digital elevation model ignores the
     parameter, and so does a request whose band statistics cannot be read,
@@ -1117,28 +1222,30 @@ async def raster_tile_proxy(
     default is used in place of the value sent.
 
     Responds 204 when the tile falls outside the raster, 400 for an
-    unsupported format, 401 when authentication is required, or when a request
-    that no capability authorized carried a credential which did not resolve,
-    403 when the embed token is invalid or expired
-    or a multi-tenant request arrives with no tenant context, 422 for an
-    out-of-range stretch parameter, and 503 when the renderer cannot be
-    reached. A different failure from the renderer is passed through with its
-    own status.
+    unsupported format, 401 when a request that no capability authorized
+    carried a credential which did not resolve, 403 when the embed token is
+    invalid or expired or a multi-tenant request arrives with no tenant
+    context, 422 for an out-of-range stretch parameter, 429 with
+    ``Retry-After`` when the per-process capacity for uncached raster renders
+    stays full for a short wait, and 503 when the renderer cannot be reached. A
+    different failure from the renderer is passed through with its own status.
 
     404 covers more than a missing dataset. A dataset that is unknown, is not a
     raster or has no image answers 404. Where no capability authorized the
-    request, so does a dataset the caller may not read: an authorization denial
-    on a non-public raster, and an unpublished raster asked for by a caller who
-    is neither its owner nor an admin. That is deliberate, so a refusal keeps a
-    dataset's existence undisclosed.
+    request, so does a dataset the caller may not read: a non-public raster
+    asked for anonymously or by a caller without access, and an unpublished
+    raster asked for by a caller who is neither its owner nor an admin. An
+    anonymous request whose signature parameters did not authorize gets 403
+    instead, for a missing dataset as for one it cannot see. Either way a
+    refusal never discloses that the dataset exists.
     """
-    # fix(#315): sanitize `{fmt}` before it reaches the Titiler URL. A proxy
-    # rewrite can URL-encode the query string into the PATH, so `{fmt}` arrives
-    # as "png?stretch=..." and the built URL carries two `?` (Titiler 422s).
+    # Sanitize `{fmt}` before it reaches the Titiler URL. A proxy rewrite can
+    # URL-encode the query string into the path, so `{fmt}` arrives as
+    # "png?stretch=..." and the built URL would carry two `?` (Titiler 422s).
     if "?" in fmt:
-        # Recover render params that arrived ONLY in the path, so styling is not
-        # silently dropped. fix(#1770): bounded, because `{fmt}` is
-        # attacker-reachable unauthenticated; a ValueError recovers nothing.
+        # Recover render params that arrived only in the path, so styling is not
+        # dropped. Bounded, because `{fmt}` is reachable unauthenticated; a
+        # ValueError recovers nothing.
         try:
             _buried = parse_qs(fmt.split("?", 1)[1], max_num_fields=MAX_QUERY_FIELDS)
         except ValueError:
@@ -1174,18 +1281,18 @@ async def raster_tile_proxy(
             detail=f"Unsupported tile format: {fmt!r}",
         )
 
-    # Effective bounds resolved ONCE, where activity is decided: an INACTIVE
-    # parameter's value is ALWAYS the absent default. fix(#1778): otherwise
-    # `?stretch=stddev&pmin=1e309` set eff_pmin=inf and 500'd on `int(pmin)`.
+    # Effective bounds are resolved once, where activity is decided: an
+    # inactive parameter's value is always the absent default. Otherwise
+    # `?stretch=stddev&pmin=1e309` sets eff_pmin=inf and 500s on `int(pmin)`.
     _pmin_pmax_active = stretch == "percentile"
     _sigma_active = stretch == "stddev"
     eff_pmin: float = pmin if (_pmin_pmax_active and pmin is not None) else 2.0
     eff_pmax: float = pmax if (_pmin_pmax_active and pmax is not None) else 98.0
     eff_sigma: float = sigma if (_sigma_active and sigma is not None) else _STDDEV_SIGMA
 
-    # Validated before any Titiler call, and only when the ACTIVE
-    # stretch mode reads the value, so a value nginx blanks from the cache key
-    # cannot turn a cached 200 into a 422. fix(#1778): isfinite explicitly.
+    # Validated before any Titiler call, and only when the active stretch mode
+    # reads the value, so a value nginx blanks from the cache key cannot turn a
+    # cached 200 into a 422.
     if stretch == "percentile" and (pmin is not None or pmax is not None):
         if (
             not math.isfinite(eff_pmin)
@@ -1214,21 +1321,21 @@ async def raster_tile_proxy(
         )
 
     render_params = auth_resp.headers.get("X-GeoLens-Render-Params", "")
-    # SEC-002: carry the dataset's public/private cache scope through to the tile
-    # response so private rasters are never stored by a shared cache. Default to
-    # "private" if the header is somehow absent (fail safe).
+    # Carries the dataset's public/private cache scope through to the tile
+    # response so private rasters are never stored by a shared cache; defaults
+    # to "private" if the header is absent.
     cache_status = auth_resp.headers.get("X-GeoLens-Cache-Status", "private")
 
-    # Read band_count from the auth response header (emitted by raster_auth_check).
-    # Absent / non-numeric → fall back to 1. Cap at 3 for Titiler RGB rendering.
+    # band_count comes from the auth response header (emitted by
+    # raster_auth_check); absent or non-numeric falls back to 1.
     _raw_band_count = auth_resp.headers.get("X-GeoLens-Band-Count", "1")
     try:
         band_count = int(_raw_band_count) if _raw_band_count else 1
     except (ValueError, TypeError):
         band_count = 1
 
-    # T-1140-01: belt-and-suspenders runtime allowlist check (Literal provides
-    # FastAPI-level validation; this guard catches any code path that bypasses it).
+    # The Literal validates at the FastAPI level; this catches any path that
+    # bypasses it.
     if colormap_name is not None and colormap_name not in _ALLOWED_COLORMAPS:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1250,9 +1357,10 @@ async def raster_tile_proxy(
         )
 
     # minmax keeps the default rescale already in render_params, except for a
-    # float raster, whose data range replaces the 0..1 dtype rescale;
-    # percentile/stddev override it from Titiler band statistics, one fragment
-    # per band up to three. Falls back to minmax when stats are missing.
+    # float or single-band signed integer raster, whose data range replaces the
+    # dtype rescale. percentile/stddev override it from Titiler band
+    # statistics, one fragment per band up to three, falling back to minmax
+    # when stats are missing.
     if stretch and stretch != "minmax" and not render_params.startswith("algorithm="):
         bands = await _fetch_band_statistics(open_path, eff_pmin, eff_pmax)
         n_bands = min(band_count or 1, 3)
@@ -1281,7 +1389,7 @@ async def raster_tile_proxy(
         if rescale_parts:
             render_params = _apply_stretch_rescale(render_params, rescale_parts)
         else:
-            # The 0..1 fallback must not outlive the statistics outage in a
+            # The dtype fallback must not outlive the statistics outage in a
             # shared cache.
             cache_status = "private"
 
@@ -1291,19 +1399,20 @@ async def raster_tile_proxy(
         raw_query_suffix=render_params or None,
     )
 
-    # Retry with exponential backoff. httpx.TimeoutException is a subclass
-    # of TransportError; caught explicitly for clarity and to avoid `resp is None`.
+    # Retry with exponential backoff.
     max_retries = 2
     resp: httpx.Response | None = None
     for attempt in range(max_retries + 1):
         try:
-            resp = await _titiler_client.get(titiler_url)
+            async with raster_render_slot():
+                resp = await _titiler_client.get(titiler_url)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
-            if attempt == max_retries:
-                # RES-6: log final failure with context before raising so
-                # operators can distinguish "titiler down" from normal activity.
+            # Once the request is sent, Titiler keeps rendering after we give
+            # up, so only a failure that never reached it is retried.
+            if attempt == max_retries or not isinstance(exc, _NOT_SENT_ERRORS):
+                # Lets operators tell "titiler down" from normal activity.
                 logger.warning(
-                    "Raster tile proxy exhausted retries",
+                    "Raster tile proxy could not get a tile from Titiler",
                     dataset_id=str(dataset_id),
                     z=z,
                     x=x,
@@ -1315,8 +1424,8 @@ async def raster_tile_proxy(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="Tile service unavailable",
                 )
-            # RES-N5: log transient failures at debug level so flaky upstream
-            # is observable in verbose logs without spamming production.
+            # Debug level: a flaky upstream is observable in verbose logs
+            # without spamming production.
             logger.debug(
                 "Raster tile proxy transient failure; retrying",
                 attempt=attempt,
@@ -1326,18 +1435,21 @@ async def raster_tile_proxy(
             await asyncio.sleep(0.5 * (2**attempt))
             continue
         else:
+            if _is_renderer_saturated(resp):
+                raise tile_busy_error()
             if resp.status_code in (500, 503) and attempt < max_retries:
                 logger.debug(
-                    "Raster tile proxy got 503; retrying",
+                    "Raster tile proxy got a retryable status; retrying",
                     attempt=attempt,
+                    status_code=resp.status_code,
                     dataset_id=str(dataset_id),
                 )
                 await asyncio.sleep(0.5 * (2**attempt))
                 continue
             break
 
-    # Safety guard: the loop above cannot leave `resp` unassigned today, but a
-    # future edit must produce a 503 rather than an AttributeError.
+    # The loop above cannot leave `resp` unassigned today; this keeps a future
+    # edit from raising an AttributeError instead of a 503.
     if resp is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1345,11 +1457,10 @@ async def raster_tile_proxy(
         )
 
     if resp.status_code == 404:
-        # Tile outside raster extent — empty response
+        # A tile outside the raster extent.
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     if resp.status_code != 200:
-        # RES-N2: log non-200 responses before converting to HTTPException so
-        # upstream titiler failures are diagnosable from logs alone.
+        # Logged so upstream titiler failures are diagnosable from logs alone.
         logger.warning(
             "Raster tile fetch returned non-200",
             dataset_id=str(dataset_id),
@@ -1360,9 +1471,9 @@ async def raster_tile_proxy(
         )
         raise HTTPException(status_code=resp.status_code, detail="Tile fetch failed")
 
-    # SEC-002: private/restricted rasters must never be retained by the shared
-    # nginx cache (its key carries no auth). Emit `no-store` so nginx skips
-    # caching (frontend/nginx.conf honors it); only public datasets are cacheable.
+    # Private/restricted rasters must never be retained by the shared nginx
+    # cache, whose key carries no auth. `no-store` makes nginx skip caching
+    # (frontend/nginx.conf honors it); only public datasets are cacheable.
     if cache_status == "public":
         cache_control = public_cache_control(3600)
     else:
@@ -1374,29 +1485,67 @@ async def raster_tile_proxy(
     )
 
 
+async def _refused_mosaics(db: AsyncSession, datasets: list["Any"]) -> set[uuid.UUID]:
+    """The VRTs among ``datasets`` whose tiles answer 409 because a member is
+    beyond their audience, decided for all of them in one port call."""
+    vrts = {ds.id: ds for ds in datasets if ds.record.record_type == "vrt_dataset"}
+    if not vrts:
+        return set()
+    rows = await db.execute(
+        text(
+            "SELECT vrt_dataset_id, array_agg(source_dataset_id) "
+            "FROM catalog.vrt_source_links "
+            "WHERE vrt_dataset_id = ANY(:ids) GROUP BY vrt_dataset_id"
+        ),
+        {"ids": list(vrts)},
+    )
+    members = dict(rows.tuples().all())
+    ids = [vrt_id for vrt_id in vrts if members.get(vrt_id)]
+    flags = await get_processing_port().vrts_beyond_member_audience(
+        db,
+        [
+            (
+                RecordAudienceQuery(
+                    dataset_id=vrt_id,
+                    record_id=vrts[vrt_id].record.id,
+                    owner_id=vrts[vrt_id].record.created_by,
+                    visibility=vrts[vrt_id].record.visibility,
+                    record_status=vrts[vrt_id].record.record_status,
+                ),
+                members[vrt_id],
+            )
+            for vrt_id in ids
+        ],
+    )
+    return {vrt_id for vrt_id, flag in zip(ids, flags, strict=True) if flag}
+
+
 def _build_tile_token_for_dataset(
     dataset: "Any",
     raster_asset: RasterAsset | None = None,
+    *,
+    withhold_bounds: bool = False,
 ) -> VectorTileToken | RasterTileToken | None:
     """Build a tile token response for a single already-authorized dataset.
 
-    Extracted so both the single-dataset and batch endpoints share the same
-    token-generation logic. Does NOT perform auth — caller must
-    ensure the dataset is visible to the current user. Returns None for a
-    record type that has no tiles.
+    Shared by the single-dataset and batch endpoints. Performs no auth: the
+    caller must ensure the dataset is visible to the current user. Returns None
+    for a record type that has no tiles. ``withhold_bounds`` leaves out the
+    bounds of a mosaic whose tiles are refused, which would locate a member
+    some readers of the mosaic cannot read.
     """
     tile_token = capabilities(dataset.record.record_type).tile_token
     if tile_token == "raster":
         bounds = None
         lon_span = None
-        if dataset.record.spatial_extent is not None:
-            # fix(#892): the SPAN, not the RFC 7946 spec bbox. These bounds feed
-            # the tile source's own bounds; a west > east pair would bound the
+        if dataset.record.spatial_extent is not None and not withhold_bounds:
+            # The span, not the RFC 7946 spec bbox: these bounds feed the tile
+            # source's own bounds, and a west > east pair would bound the
             # source to nothing. -180..180 is over-broad but never inverted.
             bounds = extent_to_span_bbox(dataset.record.spatial_extent)
-            # fix(#887): and the honest width alongside it -- without it a
-            # seam-crossing raster measures 360 degrees wide, understates its
-            # resolution 36x, and loses five zoom levels on zoom-in.
+            # The honest width alongside it: without it a seam-crossing raster
+            # measures 360 degrees wide, understates its resolution 36x, and
+            # loses five zoom levels on zoom-in.
             lon_span = extent_lon_span(dataset.record.spatial_extent)
             if bounds is None:
                 logger.warning(
@@ -1404,9 +1553,9 @@ def _build_tile_token_for_dataset(
                     dataset_id=str(dataset.id),
                 )
 
-        # fix(#688): sign the raster template too. A raster has no table_name,
-        # so the dataset id is the resource string, and it is tenant-bound.
-        # Mirrored byte for byte at the verify site in `_resolve_raster_access`.
+        # The raster template is signed too. A raster has no table_name, so the
+        # dataset id is the resource string, and it is tenant-bound. Mirrored
+        # byte for byte at the verify site in `_resolve_raster_access`.
         from app.core.tile_scope import tile_signature_scope
 
         raster_exp = round_expiry()
@@ -1415,9 +1564,9 @@ def _build_tile_token_for_dataset(
         )
         raster_sig = generate_tile_signature(raster_scope, raster_exp)
         tile_path = f"/raster-tiles/{dataset.id}/tiles/{{z}}/{{x}}/{{y}}.png"
-        # fix(#1372, #2007): `v` and `pv` ride outside the signature (which
-        # binds scope+exp only) and feed nginx's cache-key segments, so a
-        # replace or a publication transition rolls the shared tile cache.
+        # `v` and `pv` ride outside the signature (which binds scope+exp only)
+        # and feed nginx's cache-key segments, so a replace or a publication
+        # transition rolls the shared tile cache.
         query_params: dict[str, Any] = {
             "sig": raster_sig,
             "exp": raster_exp,
@@ -1464,6 +1613,14 @@ def _build_tile_token_for_dataset(
         exp=exp,
         scope=scope,
         expires_in=exp - int(time.time()),
+        tile_url_template=vector_tile_template(
+            dataset.table_name,
+            dataset.tile_cache_version,
+            dataset.publication_version,
+            {"sig": sig, "exp": exp, "scope": scope},
+        )
+        if dataset.geometry_type is not None
+        else None,
     )
 
 
@@ -1477,8 +1634,8 @@ async def _enforce_tile_token_access(
     """Status-aware access gate for the tile-token endpoints.
 
     Mirrors ``_resolve_raster_access`` so vector and raster token minting
-    deny identically:
-    - non-public + anonymous -> 401
+    deny identically, and every denial reads as a missing dataset:
+    - non-public + anonymous -> 404
     - non-public + authenticated -> full RBAC (404 if denied)
     - public + unpublished + non-owner -> 404 (closes the anon egress leak)
     - public + published -> allowed
@@ -1489,14 +1646,12 @@ async def _enforce_tile_token_access(
     if record.visibility != "public":
         if user is None:
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication required",
-                headers={"WWW-Authenticate": "Bearer"},
+                status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
             )
         await port.check_dataset_access(db, dataset, dataset_id, user)
         return
 
-    # Public dataset: still block non-published for non-owners (SEC-01).
+    # Public dataset: still block non-published for non-owners.
     if record.record_status != "published":
         if user is None:
             raise HTTPException(
@@ -1509,7 +1664,11 @@ async def _enforce_tile_token_access(
             )
 
 
-@router.get("/token/{dataset_id}/", response_model=VectorTileToken | RasterTileToken)
+@router.get(
+    "/token/{dataset_id}/",
+    response_model=VectorTileToken | RasterTileToken,
+    summary="Create a tile token",
+)
 @limiter.exempt
 async def get_tile_token(
     dataset_id: uuid.UUID,
@@ -1523,8 +1682,9 @@ async def get_tile_token(
 
     Both responses include a discriminated ``kind`` field.
 
-    Public datasets can be accessed without authentication.
-    Private/restricted datasets require authentication and RBAC checks.
+    A public, published dataset needs no authentication. Any other dataset
+    needs a caller with access to it, and answers 404 to everyone else,
+    anonymous callers included, exactly as an unknown dataset does.
     """
     from app.modules.catalog.datasets.domain.models import Dataset as DatasetORM
 
@@ -1550,7 +1710,11 @@ async def get_tile_token(
         )
         raster_asset = raster_asset_result.scalar_one_or_none()
 
-    token = _build_tile_token_for_dataset(dataset, raster_asset)
+    token = _build_tile_token_for_dataset(
+        dataset,
+        raster_asset,
+        withhold_bounds=dataset.id in await _refused_mosaics(db, [dataset]),
+    )
     if token is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=_NO_TILES_DETAIL
@@ -1558,7 +1722,11 @@ async def get_tile_token(
     return token
 
 
-@router.post("/tokens/", response_model=TileTokenBatchResponse)
+@router.post(
+    "/tokens/",
+    response_model=TileTokenBatchResponse,
+    summary="Create tile tokens for several datasets",
+)
 @limiter.exempt
 async def get_tile_tokens_batch(
     body: TileTokenBatchRequest,
@@ -1613,12 +1781,13 @@ async def get_tile_tokens_batch(
             asset.dataset_id: asset for asset in raster_asset_result.scalars().all()
         }
 
-    # fix(#1518): CAPABILITY obligation. This handler resolves many ids, so
-    # "did a capability authorize this request" is answerable only after the
-    # loop: the token authorizes a SCOPE, and the loop works out which ids.
+    # This handler resolves many ids, so "did a capability authorize this
+    # request" is answerable only after the loop: the token authorizes a scope,
+    # and the loop works out which ids.
     capability_authorized = False
 
     tokens: dict[str, VectorTileToken | RasterTileToken | dict] = {}
+    authorized = []
     for dataset_id in unique_ids:
         dataset = datasets_by_id.get(dataset_id)
         key = str(dataset_id)
@@ -1629,7 +1798,7 @@ async def get_tile_tokens_batch(
         try:
             await _enforce_tile_token_access(db, dataset, dataset_id, user, port)
         except HTTPException as exc:
-            # fix(#394) SH-04: embed-token capability fallback (fail-closed).
+            # Embed-token capability fallback (fail-closed).
             embed_ok = bool(embed_token) and await validate_embed_token_access(
                 embed_token, dataset_id, db, request
             )
@@ -1637,16 +1806,23 @@ async def get_tile_tokens_batch(
                 tokens[key] = {"error": exc.detail}
                 continue
             capability_authorized = True
+        tokens[key] = {}
+        authorized.append(dataset)
 
+    refused_mosaics = await _refused_mosaics(db, authorized)
+    for dataset in authorized:
         token = _build_tile_token_for_dataset(
             dataset,
             raster_assets_by_dataset_id.get(dataset.id),
+            withhold_bounds=dataset.id in refused_mosaics,
         )
-        tokens[key] = token if token is not None else {"error": _NO_TILES_DETAIL}
+        tokens[str(dataset.id)] = (
+            token if token is not None else {"error": _NO_TILES_DETAIL}
+        )
 
-    # fix(#1518): the flag above is only set on the FALLBACK arm, which a
-    # batch of public datasets never reaches, so the question is asked again
-    # here. Still the real validator against a real id, never header presence.
+    # The flag above is only set on the fallback arm, which a batch of public
+    # datasets never reaches, so the question is asked again here, still with
+    # the real validator against a real id, never header presence.
     if not capability_authorized and embed_token:
         for dataset_id in unique_ids:
             if await validate_embed_token_access(embed_token, dataset_id, db, request):
@@ -1655,7 +1831,7 @@ async def get_tile_tokens_batch(
 
     # No capability authorized any part of this batch, so the caller's own
     # credential is load-bearing: an unresolvable one gets the fail-closed 401
-    # rather than per-dataset errors reading like an empty catalog (#1518).
+    # rather than per-dataset errors reading like an empty catalog.
     if not capability_authorized:
         reject_unresolvable_credentials(request, user)
 
@@ -1692,7 +1868,7 @@ def _validate_tile_coordinates(z: int, x: int, y: int) -> None:
             status_code=status.HTTP_400_BAD_REQUEST, detail="Zoom level must be 0-22"
         )
 
-    max_tile = (1 << z) - 1  # 2^z - 1
+    max_tile = (1 << z) - 1
     if x < 0 or x > max_tile or y < 0 or y > max_tile:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1897,8 +2073,7 @@ async def _cached_snapshot(
                     cooldown = claimed_at + _FORCED_REREAD_INTERVAL - now
         if claimed is not None:
             return await _lead_reread(snapshots, key, claimed, read, now)
-        if not (db.new or db.dirty or db.deleted):
-            await db.commit()
+        await release_connection(db)
         if reread is None:
             await asyncio.sleep(cooldown)
         else:
@@ -1936,6 +2111,29 @@ async def _resolve_dataset_meta(
     )
 
 
+def _embed_token_refused() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Invalid or expired embed token, or dataset not in scope",
+    )
+
+
+def _refuse_unseen_tile(request: Request) -> NoReturn:
+    """Refuse an anonymous caller a dataset it cannot see, as for a missing one.
+
+    A non-public dataset, an unpublished one and a missing table or dataset id
+    all answer alike, so a refusal never confirms that the dataset exists.
+    Signature parameters that did not authorize get 403, the status map
+    clients re-mint a template on once it ages out; a request without them
+    gets 404.
+    """
+    if all(request.query_params.get(k) for k in ("sig", "exp", "scope")):
+        code, detail = status.HTTP_403_FORBIDDEN, "Invalid or expired signature"
+    else:
+        code, detail = status.HTTP_404_NOT_FOUND, "Dataset not found"
+    capability_declined(request, None, HTTPException(status_code=code, detail=detail))
+
+
 async def _resolve_dataset_meta_for_serving(
     request: Request,
     table_name: str,
@@ -1952,12 +2150,20 @@ async def _resolve_dataset_meta_for_serving(
 
     No capability can be skipped here: an embed token authorizes dataset
     IDs, and this exit is exactly the case where there is no id to authorize.
+    A missing table is refused as ``_authorize_vector_tile_request`` refuses
+    a dataset the same caller cannot see.
     """
     try:
         return await _resolve_dataset_meta(
             table_name, db, request.query_params.get(_CLIENT_STATE_PARAM)
         )
     except HTTPException as exc:
+        if exc.status_code != status.HTTP_404_NOT_FOUND:
+            capability_declined(request, user, exc)
+        if request.headers.get("X-Embed-Token"):
+            capability_declined(request, user, _embed_token_refused())
+        if user is None:
+            _refuse_unseen_tile(request)
         capability_declined(request, user, exc)
 
 
@@ -1984,16 +2190,16 @@ async def _assert_dataset_still_registered(
     anything below acts on the cached authorization.
     ``test_both_tile_endpoints_ask_before_they_act`` pins it.
 
-    Pins id AND table_name together — a liveness check, not an existence
+    Pins id and table_name together: a liveness check, not an existence
     check, so a surviving row repointed at a different relation can't
     authorize a read of the old name. Runs unconditionally, including on a
-    cache MISS, since threading cache-hit state through would let a caller
+    cache miss, since threading cache-hit state through would let a caller
     skip the check by getting that flag wrong.
 
     Scope: every caller reading a ``data``-schema relation off cached
-    authorization (vector + cluster, via ``_acquire_and_serve_tile``). The
-    raster proxy is NOT covered — it resolves to an object-storage asset,
-    with no relation to substitute.
+    authorization (vector and cluster, via ``_acquire_and_serve_tile``). The
+    raster proxy is not covered: it resolves to an object-storage asset, with
+    no relation to substitute.
     """
     from app.modules.catalog.datasets.domain.models import Dataset as DatasetORM
 
@@ -2008,9 +2214,9 @@ async def _assert_dataset_still_registered(
 
     registered = (await db.execute(stmt)).scalar_one_or_none()
 
-    # fix(#1451): hand the API-pool connection back before returning, or
-    # every tile the pool builds occupies one for its PostGIS query and gzip.
-    # Read-only, so the rollback discards nothing.
+    # Hand the API-pool connection back before returning, or every tile would
+    # occupy one through its PostGIS query and gzip. Read-only, so the rollback
+    # discards nothing.
     await db.rollback()
 
     if registered is not None:
@@ -2078,37 +2284,25 @@ async def _authorize_vector_tile_request(
             embed_token_header, meta.dataset_id, db, request
         )
         if not is_valid:
-            capability_declined(
-                request,
-                user,
-                HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Invalid or expired embed token, or dataset not in scope",
-                ),
-            )
+            capability_declined(request, user, _embed_token_refused())
         return "private"
 
     # The expected scope mirrors `_build_tile_token_for_dataset` through the
-    # shared helper: tenant-bound against cross-tenant replay, and bound to
-    # the publication counter so an unpublish or a move to private (#1963)
-    # retires outstanding signatures.
+    # shared helper: tenant-bound against cross-tenant replay, and bound to the
+    # publication counter so an unpublish or a move to private retires
+    # outstanding signatures.
     from app.core.tile_scope import tile_signature_scope
 
-    _expected_scope = (
-        tile_signature_scope(meta.table_name, meta.publication_version)
-        if sig and exp and scope
-        else None
-    )
     if (
         sig
         and exp
         and scope
-        and scope == _expected_scope
+        and scope == tile_signature_scope(meta.table_name, meta.publication_version)
         and verify_tile_signature(scope, exp, sig)
     ):
-        # fix(#1928): ahead of the visibility split, as on the raster route.
-        # Every minter gates a draft to its owner or an admin, so a signature
-        # for one delegates access its holder already had.
+        # Ahead of the visibility split, as on the raster route. Every minter
+        # gates a draft to its owner or an admin, so a signature for one
+        # delegates access its holder already had.
         return (
             "public"
             if is_publicly_cacheable(meta.visibility, meta.record_status)
@@ -2128,51 +2322,25 @@ async def _authorize_vector_tile_request(
                 )
             await port.check_dataset_access(db, dataset, meta.dataset_id, user)
             return "private"
-        if not sig or not exp or not scope:
-            capability_declined(
-                request,
-                user,
-                HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Signature required for non-public tiles",
-                ),
-            )
-        if scope != _expected_scope:
-            capability_declined(
-                request,
-                user,
-                HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN, detail="Scope mismatch"
-                ),
-            )
-        capability_declined(
-            request,
-            user,
-            HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Invalid or expired signature",
-            ),
-        )
+        _refuse_unseen_tile(request)
 
-    # fix(#1518): CAPABILITY obligation. Both capability arms above have
-    # declined, so everything from here is decided by WHO is asking and a
-    # supplied credential that failed to resolve gets the fail-closed 401.
+    # Both capability arms above have declined, so everything from here is
+    # decided by who is asking, and a supplied credential that failed to
+    # resolve gets the fail-closed 401.
     reject_unresolvable_credentials(request, user)
 
-    # Public dataset: still block non-published for unauthenticated users
+    # A public dataset that is not published is hidden from everyone but its
+    # owner or an admin.
     if meta.record_status != "published":
         if user is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
-            )
-        # Authenticated non-owners cannot see unpublished
+            _refuse_unseen_tile(request)
         port = get_processing_port()
         user_roles = await port.get_user_roles(db, user)
         if "admin" not in user_roles and meta.created_by != user.id:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
             )
-        # fix(#243): owner/admin previewing an UNPUBLISHED public dataset is
+        # An owner or admin previewing an unpublished public dataset is
         # authorized, but the tiles must not enter the shared (auth-less)
         # cache or they would replay to anonymous callers.
         return "private"
@@ -2210,14 +2378,16 @@ def _cluster_cache_table_key(
     tile_cache_version: int,
     cluster_radius: int,
     cluster_max_zoom: int,
+    filter_digest: str | None = None,
 ) -> str:
-    # fix(#868): the version tag pins the cluster SQL semantics. Bump it whenever
-    # _build_cluster_tile_query changes the emitted tile geometry/properties, or a
-    # deploy keeps serving stale cluster tiles until TTL expiry. v2 -> v3: #874.
+    # The version tag pins the cluster SQL semantics and the cache entry
+    # layout (cache_key.tile_cache_entry). Bump it whenever either changes, or
+    # a deploy keeps serving stale cluster tiles until TTL expiry.
     generation = _generation_table_key(
         table_name, dataset_id, publication_version, tile_cache_version
     )
-    return f"{generation}:cluster:v3:r{cluster_radius}:z{cluster_max_zoom}"
+    key = f"{generation}:cluster:v4:r{cluster_radius}:z{cluster_max_zoom}"
+    return f"{key}:f{filter_digest}" if filter_digest else key
 
 
 async def _acquire_and_serve_tile(
@@ -2242,11 +2412,12 @@ async def _acquire_and_serve_tile(
     """Shared acquire, bind-role, run-query, gzip, cache and respond core.
 
     Both the vector and cluster endpoints supply a ``query_callable`` (async
-    ``(pool, conn) -> bytes | None``) plus a cache key; this owns the
+    ``(pool, conn) -> RenderedTile | None``) plus a cache key; this owns the
     shared scaffold: bounded tile-pool acquire, a single-connection
     transaction with per-tenant role/search_path bind, error mapping
-    (timeout -> 429, broad Exception -> 503), empty-tile caching (-> 204),
-    gzip offload, cache write, usage event, and the ETag/304 response.
+    (pool acquire timeout -> 429, query timeout or broad Exception -> 503),
+    empty-tile caching (-> 204), gzip offload, cache write, usage event, and
+    the ETag/304 response.
 
     Callers own cache hits, tenant/global admission and cold rehydration.
     """
@@ -2264,18 +2435,38 @@ async def _acquire_and_serve_tile(
             detail="Tile service unavailable",
         )
 
+    # Releasing the connection can itself time out and replace the 503 below.
+    query_timed_out = False
     # SET LOCAL role and schema bindings must share the query transaction to
     # survive PgBouncer transaction pooling.
     try:
-        # fix(#1926): bounded, so an exhausted pool sheds through the 429 below
-        # rather than parking the request until the client gives up.
+        # Bounded, so an exhausted pool sheds through the 429 below rather
+        # than parking the request until the client gives up.
         async with pool.acquire(timeout=TILE_POOL_ACQUIRE_TIMEOUT_SECONDS) as tile_conn:
-            async with tile_conn.transaction():
-                # Bind per-tenant role + search_path BEFORE the tile query.
-                # No-op in single_tenant or when tid is None.
-                await set_tenant_role_for_tile_request(tile_conn, tid)
-                tile_data = await query_callable(pool, tile_conn)
+            try:
+                async with tile_conn.transaction():
+                    # Bound before the tile query; a no-op in single_tenant or
+                    # when tid is None.
+                    await set_tenant_role_for_tile_request(tile_conn, tid)
+                    tile = await query_callable(pool, tile_conn)
+            except asyncio.TimeoutError:
+                # A query that outruns the command timeout will again, so a
+                # retry hint would only repeat the work.
+                query_timed_out = True
+                logger.warning(
+                    "Tile query timeout",
+                    table_name=table_name,
+                    mode=mode,
+                    z=z,
+                    x=x,
+                    y=y,
+                )
+                raise tile_unavailable_error()
+    except HTTPException:
+        raise
     except asyncio.TimeoutError:
+        if query_timed_out:
+            raise tile_unavailable_error()
         logger.warning(
             "Tile pool acquire timeout",
             table_name=table_name,
@@ -2300,14 +2491,15 @@ async def _acquire_and_serve_tile(
             detail="Tile service unavailable",
         )
 
-    if tile_data is None:
-        # Cache empty tiles to avoid repeated PostGIS queries for sparse datasets.
+    if tile is None:
+        # Empty tiles are cached to avoid repeated PostGIS queries for sparse
+        # datasets.
         if tile_cache is not None:
             await tile_cache.set(
                 cache_key, z, x, y, b"", ttl=cache_ttl, cols_key=cols_cache_key
             )
-        # fix(#430) V-03: an empty tile reuses the tile's Cache-Control from
-        # base_headers, minus Content-Encoding, because a 204 has no body.
+        # Reuses the tile's Cache-Control, minus Content-Encoding, because a
+        # 204 has no body.
         return Response(
             status_code=status.HTTP_204_NO_CONTENT,
             headers={k: v for k, v in base_headers.items() if k != "Content-Encoding"},
@@ -2315,19 +2507,19 @@ async def _acquire_and_serve_tile(
 
     logger.debug(log_event, table_name=table_name, z=z, x=x, y=y, **(log_extra or {}))
 
-    # Emit the usage event through the billing-import-free seam.
     await _emit_tile_usage_event(table_name)
 
-    # PERF-005: gzip is CPU-bound — offload to a thread so the event loop isn't
+    # gzip is CPU-bound, so offload to a thread so the event loop isn't
     # stalled compressing wide low-zoom tiles. mtime=0 makes the gzip stream
-    # deterministic so the MVT-04 content-hash ETag is stable across requests.
-    compressed = await asyncio.to_thread(gzip.compress, tile_data, 6, mtime=0)
+    # deterministic so the content-hash ETag is stable across requests.
+    compressed = await asyncio.to_thread(gzip.compress, tile.mvt, 6, mtime=0)
     if tile_cache is not None:
+        entry = tile_cache_entry(compressed, sampled=tile.sampled)
         await tile_cache.set(
-            cache_key, z, x, y, compressed, ttl=cache_ttl, cols_key=cols_cache_key
+            cache_key, z, x, y, entry, ttl=cache_ttl, cols_key=cols_cache_key
         )
 
-    return _tile_response(request, compressed, base_headers)
+    return _tile_response(request, compressed, base_headers, sampled=tile.sampled)
 
 
 @router.get(
@@ -2337,6 +2529,7 @@ async def _acquire_and_serve_tile(
         200: binary_response("The vector tile", "application/vnd.mapbox-vector-tile"),
         429: RATE_LIMIT_RESPONSE,
     },
+    summary="Get a clustered vector tile",
 )
 @limiter.exempt
 async def cluster_tile_endpoint(
@@ -2349,8 +2542,13 @@ async def cluster_tile_endpoint(
     exp: int | None = None,
     scope: str | None = None,
     cols: str | None = None,
+    cols_only: bool = Query(
+        False,
+        description="Carry only the columns named by `cols`, at every zoom.",
+    ),
     cluster_radius: int = Query(48, ge=1, le=256),
     cluster_max_zoom: int = Query(14, ge=0, le=22),
+    layer_filter: str | None = Query(None, alias="filter", max_length=4096),
     db: AsyncSession = Depends(get_db),
     user: Identity | None = Depends(get_optional_user_fail_open),
 ) -> Response:
@@ -2363,11 +2561,12 @@ async def cluster_tile_endpoint(
     dataset needs valid signature parameters (``sig``, ``exp``, ``scope``), an
     embed token scoped to it, or an API key (``X-Api-Key`` header or
     ``api_key`` query parameter) or bearer token for a caller with access to
-    it. It answers 403 to a request carrying none of these and 404 to a caller
-    without access. A public dataset that is not yet published is readable by
-    its owner, by an admin, with an embed token, or with valid signature
-    parameters, and answers 404 to other callers, so a refusal keeps its
-    existence undisclosed. An unknown table is 404 too.
+    it. A public dataset that is not yet published is readable by its owner,
+    by an admin, with an embed token, or with valid signature parameters. A
+    caller who cannot see the dataset gets the answer an unknown table gets,
+    so a refusal never discloses that the table exists: 403 when an embed
+    token, or an anonymous request's signature parameters, did not authorize
+    it, and 404 otherwise.
 
     A request that no capability authorized and that carried a credential which
     did not resolve is refused with 401 rather than served as an anonymous
@@ -2376,7 +2575,10 @@ async def cluster_tile_endpoint(
 
     ``cluster_radius`` is a screen-pixel distance, the same units MapLibre's
     ``clusterRadius`` uses, and ``cluster_max_zoom`` is the last zoom at which
-    features are grouped. ``cols`` works as it does on the vector route, and
+    features are grouped. ``filter`` is an optional CQL2-JSON expression over
+    the dataset's attribute columns, as the OGC items ``filter`` takes; only the
+    points it keeps are clustered. An invalid expression responds 400. ``cols``
+    works as it does on the vector route, and
     the named columns are projected onto the unclustered features, so
     data-driven styling and popups keep working here too.
 
@@ -2384,12 +2586,15 @@ async def cluster_tile_endpoint(
     a malformed table path or an out-of-range tile coordinate.
 
     A tile holding no features answers 204, and a repeat request whose
-    ``If-None-Match`` matches answers 304. Where a deployment runs cold storage,
+    ``If-None-Match`` matches answers 304. When more than 100,000 points fall
+    in or next to the tile, or it would hold more than 50,000 features, it
+    holds a fixed sample and carries ``X-GeoLens-Tile-Sampled: true``. Where a deployment runs cold storage,
     a dataset still being restored answers 202 with a job id to poll. Requests
     answer 429 with ``Retry-After`` when the per-process capacity for uncached
-    renders is full, tile-pool acquisition times out, a tile query exceeds the
-    pool's per-command timeout, or the configured per-tenant concurrency limit
-    is exceeded. Any other failure serving the tile answers 503.
+    renders stays full for a short wait, tile-pool acquisition times out, or the
+    configured per-tenant concurrency limit is exceeded. A tile query that
+    exceeds the pool's per-command timeout answers 503 without ``Retry-After``
+    and is not cached, as does any other failure serving the tile.
     """
     table_name = _parse_vector_tile_table(table_path)
     _validate_tile_coordinates(z, x, y)
@@ -2404,27 +2609,29 @@ async def cluster_tile_endpoint(
         user=user,
     )
     cache_scope = _demote_prewarmed_cache_scope(request, meta, cache_scope)
-    # fix(#1518): after authorization, not before. "Not a point dataset"
-    # is a property of the RESOURCE, and it told an unauthorized caller that a
-    # private dataset exists and what geometry it holds.
+    # After authorization: "not a point dataset" is a property of the resource,
+    # and answering it earlier would tell an unauthorized caller that a private
+    # dataset exists and what geometry it holds.
     _ensure_clusterable_dataset(meta)
 
-    # fix(#1778): keyed on the effective projection, so `z`, the allowlist and
-    # the mode all reach it -- the cluster query emits its own
-    # `point_count`/`cluster_id`, so a `cols=` naming one changes nothing.
+    # Keyed on the effective projection, so `z`, the allowlist and the mode all
+    # reach it; the cluster query emits its own `point_count`/`cluster_id`, so
+    # a `cols=` naming one changes nothing.
     additional_columns, cols_cache_key = parse_cols_param(
         cols,
         meta.column_info,
         z,
         tile_columns=meta.tile_columns,
         mode="cluster",
+        cols_only=cols_only,
     )
+
+    filter_digest = cluster_filters.validated_digest(layer_filter)
 
     cache_ttl = meta.tile_cache_ttl or settings.tile_cache_ttl
 
-    # Prefix the cluster cache key with the tenant id in multi_tenant so
+    # In multi_tenant the cluster cache key is prefixed with the tenant id so
     # two tenants sharing a table_name never share cached cluster tiles.
-    # single_tenant: no prefix, byte-identical to pre-1209.
     _cluster_tid = _require_tile_tenant_context()
     _cluster_tenant_prefix = f"{_cluster_tid}:" if _cluster_tid is not None else ""
     _cluster_limiter, _cluster_cache_control = _get_tile_serving_controls(
@@ -2437,6 +2644,7 @@ async def cluster_tile_endpoint(
         tile_cache_version=meta.tile_cache_version,
         cluster_radius=cluster_radius,
         cluster_max_zoom=cluster_max_zoom,
+        filter_digest=filter_digest,
     )
 
     tile_cache = get_tile_cache()
@@ -2453,19 +2661,17 @@ async def cluster_tile_endpoint(
                         cache_ttl,
                         _cluster_cache_control,
                         empty=True,
-                    ),  # fix(#430) V-03
+                    ),
                 )
-            # MVT-04: cache hits also carry an ETag / honor If-None-Match.
-            return _tile_response(
+            return _cached_tile_response(
                 request,
                 cached,
                 _serving_tile_headers(cache_scope, cache_ttl, _cluster_cache_control),
             )
 
     tenant_sem = _cluster_limiter if is_multi_tenant() else None
-    if tenant_sem is not None:
-        # Authorization is complete; quota waits must not retain an API connection.
-        await db.rollback()
+    # Authorization is complete; admission waits must not retain an API connection.
+    await db.rollback()
     async with tile_render_slot(tenant_sem):
         # Recheck catalog registration before cold storage or rendering acts on
         # cached authorization; byte-cache hits need no database round trip.
@@ -2473,7 +2679,7 @@ async def cluster_tile_endpoint(
             db, dataset_id=meta.dataset_id, table_name=table_name, tid=_cluster_tid
         )
 
-        # Cold storage must be ready before querying, using the cached status.
+        # Cold storage must be ready before querying; uses the cached status.
         _cluster_cold_result = await _check_cold_rehydrate(
             table_name,
             meta.record_status,
@@ -2482,6 +2688,11 @@ async def cluster_tile_endpoint(
         if _cluster_cold_result is not None:
             return _cluster_cold_result
 
+        compiled_filter = await cluster_filters.compile_filter(
+            db, table_name, layer_filter, meta.tile_columns
+        )
+        if compiled_filter:
+            await db.rollback()
         tid = _require_tile_tenant_context()
         _schema = tenant_data_schema(tid)
 
@@ -2495,13 +2706,15 @@ async def cluster_tile_endpoint(
                 meta.column_info,
                 tile_columns=meta.tile_columns,
                 additional_columns=additional_columns,
+                cols_only=cols_only,
                 cluster_radius=cluster_radius,
                 cluster_max_zoom=cluster_max_zoom,
                 conn=conn,
                 schema=_schema,
+                filter_sql=compiled_filter.sql if compiled_filter else None,
+                filter_params=compiled_filter.params if compiled_filter else (),
             )
 
-        # The same tenant concurrency budget governs vector and cluster DB reads.
         return await _acquire_and_serve_tile(
             request=request,
             table_name=table_name,
@@ -2536,6 +2749,7 @@ async def cluster_tile_endpoint(
         200: binary_response("The vector tile", "application/vnd.mapbox-vector-tile"),
         429: RATE_LIMIT_RESPONSE,
     },
+    summary="Get a vector tile",
 )
 @limiter.exempt
 async def tile_endpoint(
@@ -2548,6 +2762,10 @@ async def tile_endpoint(
     exp: int | None = None,
     scope: str | None = None,
     cols: str | None = None,
+    cols_only: bool = Query(
+        False,
+        description="Carry only the columns named by `cols`, at every zoom.",
+    ),
     db: AsyncSession = Depends(get_db),
     user: Identity | None = Depends(get_optional_user_fail_open),
 ) -> Response:
@@ -2559,15 +2777,15 @@ async def tile_endpoint(
     dataset needs valid signature parameters (``sig``, ``exp``, ``scope``), an
     embed token scoped to it, or an API key (``X-Api-Key`` header or
     ``api_key`` query parameter) or bearer token for a caller with access to
-    it. It answers 403 to a request carrying none of these and 404 to a caller
-    without access. A tile served on the caller's credentials is marked
-    private, so no shared cache stores it, and a tile requested with
-    ``api_key`` in the query is never marked public. A public dataset that is
-    not yet published is readable by its owner, by an admin, with an embed
-    token, or with valid signature parameters, and answers 404 to other
-    callers, so a refusal keeps its existence undisclosed. An unknown table is
-    404 too, and so is a dataset without vector tiles, such as a raster, once
-    the caller is authorized to see it.
+    it. A tile served on the caller's credentials is marked private, so no
+    shared cache stores it, and a tile requested with ``api_key`` in the query
+    is never marked public. A public dataset that is not yet published is
+    readable by its owner, by an admin, with an embed token, or with valid
+    signature parameters. A caller who cannot see the dataset gets the answer
+    an unknown table gets, so a refusal never discloses that the table exists:
+    403 when an embed token, or an anonymous request's signature parameters,
+    did not authorize it, and 404 otherwise. A dataset without vector tiles,
+    such as a raster, is 404 once the caller is authorized to see it.
 
     A request that no capability authorized and that carried a credential which
     did not resolve is refused with 401 rather than served as an anonymous
@@ -2584,12 +2802,15 @@ async def tile_endpoint(
 
     A malformed table path or an out-of-range tile coordinate answers 400. A
     tile holding no features answers 204, and a repeat request whose
-    ``If-None-Match`` matches answers 304. Where a deployment runs cold storage,
+    ``If-None-Match`` matches answers 304. When the tile holds more than 50,000
+    features, it carries a fixed sample of them spread across the tile and
+    ``X-GeoLens-Tile-Sampled: true``. Where a deployment runs cold storage,
     a dataset still being restored answers 202 with a job id to poll. Requests
     answer 429 with ``Retry-After`` when the per-process capacity for uncached
-    renders is full, tile-pool acquisition times out, a tile query exceeds the
-    pool's per-command timeout, or the configured per-tenant concurrency limit
-    is exceeded. Any other failure serving the tile answers 503.
+    renders stays full for a short wait, tile-pool acquisition times out, or the
+    configured per-tenant concurrency limit is exceeded. A tile query that
+    exceeds the pool's per-command timeout answers 503 without ``Retry-After``
+    and is not cached, as does any other failure serving the tile.
     """
     table_name = _parse_vector_tile_table(table_path)
     _validate_tile_coordinates(z, x, y)
@@ -2610,11 +2831,11 @@ async def tile_endpoint(
 
     columns = meta.column_info
 
-    # fix(#1778): the cache key comes from the EFFECTIVE projection, not the
-    # request, so `z` and the allowlist have to reach it. At z >= 10 every valid
-    # subset collapses onto one entry.
+    # The cache key comes from the effective projection, not the request, so
+    # `z` and the allowlist have to reach it. At z >= 10 every valid subset
+    # collapses onto one entry.
     additional_columns, cols_cache_key = parse_cols_param(
-        cols, columns, z, tile_columns=meta.tile_columns
+        cols, columns, z, tile_columns=meta.tile_columns, cols_only=cols_only
     )
 
     cache_ttl = meta.tile_cache_ttl or settings.tile_cache_ttl
@@ -2638,7 +2859,7 @@ async def tile_endpoint(
         )
         if cached is not None:
             if len(cached) == 0:
-                # Empty sentinel — tile was previously confirmed empty
+                # The empty sentinel: the tile was confirmed empty earlier.
                 return Response(
                     status_code=status.HTTP_204_NO_CONTENT,
                     headers=_serving_tile_headers(
@@ -2646,19 +2867,17 @@ async def tile_endpoint(
                         cache_ttl,
                         _tile_cache_control,
                         empty=True,
-                    ),  # fix(#430) V-03
+                    ),
                 )
-            # MVT-04: cache hits also carry an ETag / honor If-None-Match.
-            return _tile_response(
+            return _cached_tile_response(
                 request,
                 cached,
                 _serving_tile_headers(cache_scope, cache_ttl, _tile_cache_control),
             )
 
     tenant_sem = _tile_serving_limiter if is_multi_tenant() else None
-    if tenant_sem is not None:
-        # Authorization is complete; quota waits must not retain an API connection.
-        await db.rollback()
+    # Authorization is complete; admission waits must not retain an API connection.
+    await db.rollback()
     async with tile_render_slot(tenant_sem):
         # Recheck catalog registration before cold storage or rendering acts on
         # cached authorization; byte-cache hits need no database round trip.
@@ -2667,7 +2886,7 @@ async def tile_endpoint(
         )
 
         # Cold-rehydrate seam, before the tile query, on the cached
-        # `record_status` (no extra round-trip on the hot path). A published or
+        # `record_status` (no extra round trip on the hot path). A published or
         # anon-shared dataset is hot, so a public map viewer never sees a 202.
         _cold_result = await _check_cold_rehydrate(
             table_name,
@@ -2698,6 +2917,7 @@ async def tile_endpoint(
                 columns,
                 tile_columns=meta.tile_columns,
                 additional_columns=additional_columns,
+                cols_only=cols_only,
                 conn=conn,
                 schema=_schema,
             )

@@ -24,6 +24,7 @@ from app.platform.jobs.models import (
     IngestJob,
 )
 from app.platform.jobs.sweep import settle_stale_jobs
+from app.platform.refresh.job_runs import stored_review_reasons
 from app.platform.refresh.models import DatasetRefreshRun
 from app.processing.ingest.manifest_schemas import (
     ManifestApplyEntryResult,
@@ -34,8 +35,8 @@ log = structlog.get_logger()
 
 MANIFEST_STAGE_DOWNLOADING = "downloading"
 
-# fix(#1814): names no id. The row this attempt owned is terminal, and the row
-# that replaced it belongs to a different request.
+# Names no id: the row this attempt owned is terminal, and the row that
+# replaced it belongs to a different request.
 RESERVATION_LOST_MESSAGE = (
     "Manifest dataset apply lost its reservation while the source was being "
     "staged; re-apply the manifest."
@@ -50,8 +51,8 @@ def downloading_stage_marker() -> dict[str, str]:
 async def lock_manifest_key(db: AsyncSession, key: str) -> None:
     """Serialize check-and-reserve for one manifest key.
 
-    fix(#1814): transaction-scoped and blocking. End the transaction before any
-    network I/O and before the next entry, or two manifests deadlock on two keys.
+    Transaction-scoped and blocking. End the transaction before any network
+    I/O and before the next entry, or two manifests deadlock on two keys.
     """
     await db.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
@@ -125,7 +126,7 @@ async def held_entry(
         job_id=job.id,
         dataset_id=run.dataset_id,
         run_id=run.id,
-        review_reasons=[str(r) for r in verification.get("review_reasons") or ()],
+        review_reasons=stored_review_reasons(verification),
         message=(
             "Manifest dataset entry is unchanged since its last apply, which "
             f"is blocked for review, so nothing was queued. Accept run {run.id} "
@@ -138,7 +139,7 @@ def _without_stage_marker():
     """The row's metadata with the downloading marker removed, as SQL.
 
     Written as a JSONB key removal rather than from the instance, because both
-    callers may hold an expired one (fix(#1814)).
+    callers may hold an expired one.
     """
     return IngestJob.user_metadata.op("-", return_type=JSONB)(
         MANIFEST_STAGE_METADATA_KEY
@@ -162,8 +163,8 @@ async def expire_stale_manifest_reservations(
     expiry and the running sweep cannot disagree about which rows are live or
     what a settled one says. Does not commit.
 
-    fix(#1814): settling rather than ignoring is what lets the staging bind's
-    fence catch a slow attempt whose reservation was replaced.
+    Settling rather than ignoring is what lets the staging bind's fence catch
+    a slow attempt whose reservation was replaced.
     """
     reservations = (
         await db.execute(
@@ -188,8 +189,8 @@ async def bind_reservation_to_staged_source(
 ) -> bool:
     """Fenced downloading -> staged transition. False means the row is not ours.
 
-    fix(#1814): ``staged_at`` is stamped here, so the pending sweep measures
-    from staging rather than from a creation that predates the download.
+    ``staged_at`` is stamped here, so the pending sweep measures from staging
+    rather than from a creation that predates the download.
     """
     now = now or datetime.now(timezone.utc)
     if not await ledger.stage(
@@ -205,8 +206,7 @@ async def bind_reservation_to_staged_source(
         require=(_still_downloading(),),
         mirror=job,
     ):
-        # fix(#2017): distinguishes a sweep reaping the row from a cancel,
-        # for the same job the CAS just missed on.
+        # Distinguishes a sweep reaping the row from a cancel.
         observed = (
             await db.execute(select(IngestJob.status).where(IngestJob.id == job.id))
         ).scalar_one_or_none()
@@ -244,8 +244,8 @@ async def staged_source_is_referenced(
 ) -> bool:
     """Does the committed row point at these staged bytes?
 
-    fix(#1814): raises rather than guessing. The caller's settlement wrapper
-    resets and retries, and keeps the bytes if neither attempt can read.
+    Raises rather than guessing. The caller's settlement wrapper resets and
+    retries, and keeps the bytes if neither attempt can read.
     """
     row = (
         await db.execute(select(IngestJob.file_path).where(IngestJob.id == job_id))

@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "geolens"
-version = "1.24.0"
+version = "1.30.0"
 description = "Auto-generated Python SDK for the GeoLens API. Typed clients with Bearer + API-key auth helpers."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
-authors = [{ name = "Carto Concepts, LLC", email = "noreply@getgeolens.com" }]
+authors = [{ name = "GeoLens contributors", email = "noreply@getgeolens.com" }]
 keywords = ["geolens", "geospatial", "openapi", "sdk"]
 classifiers = [
   "Development Status :: 4 - Beta",

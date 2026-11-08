@@ -1,31 +1,23 @@
 """Community-edition OpenAI-compatible AI provider defaults.
 
-Split from the former single-module ``defaults.py`` (#836): this sub-module
-owns ``DefaultOpenAICompatibleProvider`` and ``DefaultOpenAIEmbeddingProvider``.
-Import them via the ``app.platform.extensions.defaults`` facade, never from
-this sub-module.
+Import ``DefaultOpenAICompatibleProvider`` and
+``DefaultOpenAIEmbeddingProvider`` via the ``app.platform.extensions.defaults``
+facade, never from this sub-module.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 
-from app.platform.ai_tool_payloads import tool_result_content
-
 
 class DefaultOpenAICompatibleProvider:
     """Community-edition default: OpenAI-compatible tool-calling loop.
 
-    ``complete()`` is ``_loop_openai`` from ``app.processing.ai.llm_loop``
-    moved verbatim, with Anthropic→OpenAI tool format conversion applied
-    INTERNALLY at the top of the method — callers pass canonical Anthropic
-    shape; the provider converts on the way in.
+    Callers pass tools in the canonical Anthropic shape;
+    ``open_conversation`` converts them.
 
-    Class-level ``_clients`` dict cache keyed by ``base_url`` matches the
-    old module-level singleton.
-
-    All SDK and app-module imports happen INSIDE ``complete()``, never at
-    module load — deferred-import discipline.
+    All SDK and app-module imports happen INSIDE the methods, never at
+    module load.
     """
 
     _clients: dict = {}  # class-level cache: base_url -> AsyncOpenAI
@@ -45,12 +37,11 @@ class DefaultOpenAICompatibleProvider:
         base_url=None,
         temperature=0.5,
     ):
-        # Deferred imports (Phase 214 discipline)
         import json
         import time
 
         import structlog
-        from openai import AsyncOpenAI
+        from openai import AsyncOpenAI, Timeout
 
         from app.core.ai_credentials import bind_openai_credential_base_url
         from app.core.config import reveal, settings
@@ -63,8 +54,12 @@ class DefaultOpenAICompatibleProvider:
             ToolLoopExhaustedError,
             attach_token_usage,
             ToolLoopResult,
-            _LLM_TIMEOUT,
-            build_history_messages,
+            _LLM_CONNECT_TIMEOUT_SECONDS,
+            _LLM_TIMEOUT_SECONDS,
+        )
+        from app.processing.ai.openai_conversation import (
+            ResponsesError,
+            open_conversation,
         )
         from app.processing.ai.tool_call_parser import parse_xml_tool_calls
 
@@ -76,49 +71,43 @@ class DefaultOpenAICompatibleProvider:
         if not settings.openai_api_key:
             raise ValueError("OpenAI-compatible API key not configured")
 
-        # Anthropic-shape tools -> OpenAI function-format tools, mirroring
-        # tools.py's conversion.
-        tools_openai = [
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t["description"],
-                    "parameters": t["input_schema"],
-                },
-            }
-            for t in tools
-        ]
-
         effective_base_url = bind_openai_credential_base_url(
             base_url or settings.openai_base_url,
             purpose="chat",
         )
 
-        # Lazy class-level keyed-client cache
         if effective_base_url not in DefaultOpenAICompatibleProvider._clients:
             DefaultOpenAICompatibleProvider._clients[effective_base_url] = AsyncOpenAI(
                 api_key=reveal(settings.openai_api_key),
                 base_url=effective_base_url,
-                timeout=_LLM_TIMEOUT,
+                timeout=Timeout(
+                    _LLM_TIMEOUT_SECONDS, connect=_LLM_CONNECT_TIMEOUT_SECONDS
+                ),
                 max_retries=2,
             )
         client = DefaultOpenAICompatibleProvider._clients[effective_base_url]
 
-        messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(build_history_messages(history))
-        messages.append({"role": "user", "content": user_message})
+        conversation = open_conversation(
+            client,
+            base_url=effective_base_url,
+            model=model,
+            system_prompt=system_prompt,
+            history=history,
+            user_message=user_message,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
 
         collected_actions: list[dict] = []
         total_input = 0
         total_output = 0
-        # fix(#448): same runaway guards as the Anthropic complete() loop.
+        # Same runaway guards as the Anthropic complete() loop.
         deadline = time.monotonic() + MAX_STREAMING_WALL_CLOCK_SECONDS
 
-        # fix(#1778): EVERY exit from this loop carries the tokens already
-        # spent, not just the exhaustion raises — after round one the
-        # provider has been billed, so a later failure must still reach the
-        # daily quota.
+        # EVERY exit from this loop carries the tokens already spent: after
+        # round one the provider has billed, so a later failure must still
+        # reach the daily quota.
         try:
             for round_num in range(max_rounds):
                 if time.monotonic() > deadline:
@@ -133,42 +122,29 @@ class DefaultOpenAICompatibleProvider:
                         input_tokens=total_input,
                         output_tokens=total_output,
                     )
-                # OpenAI API rejects `tools=[]` similarly; omit when empty so
-                # no-tools paths work for OpenAI-compatible providers too.
-                create_kwargs: dict[str, object] = {
-                    "model": model,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                    "messages": messages,
-                }
-                if tools_openai:
-                    create_kwargs["tools"] = tools_openai
-                response = await client.chat.completions.create(**create_kwargs)
-
-                choice = response.choices[0]
-
-                # Track token usage
-                if response.usage:
-                    total_input += response.usage.prompt_tokens
-                    total_output += response.usage.completion_tokens
+                try:
+                    round_ = await conversation.complete()
+                except ResponsesError as exc:
+                    total_input += exc.input_tokens
+                    total_output += exc.output_tokens
+                    raise
+                total_input += round_.input_tokens
+                total_output += round_.output_tokens
 
                 log.info(
                     "LLM round",
                     provider="openai",
                     round=round_num + 1,
-                    finish_reason=choice.finish_reason,
-                    input_tokens=response.usage.prompt_tokens if response.usage else 0,
-                    output_tokens=response.usage.completion_tokens
-                    if response.usage
-                    else 0,
+                    finish_reason=round_.finish_reason,
+                    input_tokens=round_.input_tokens,
+                    output_tokens=round_.output_tokens,
                 )
 
-                if choice.finish_reason == "stop":
-                    text = choice.message.content or ""
+                if round_.finish_reason == "stop":
+                    text = round_.text
                     parsed_calls, cleaned_text = parse_xml_tool_calls(text)
 
                     if parsed_calls:
-                        # Execute parsed XML tool calls
                         for fn_name, fn_args in parsed_calls:
                             log.info(
                                 "Parsed XML tool call", tool=fn_name, input=fn_args
@@ -193,23 +169,22 @@ class DefaultOpenAICompatibleProvider:
                         output_tokens=total_output,
                     )
 
-                if choice.finish_reason == "tool_calls":
-                    messages.append(choice.message)
-
-                    for tool_call in choice.message.tool_calls:
-                        fn_name = tool_call.function.name
+                if round_.finish_reason == "tool_calls":
+                    results = []
+                    for tool_call in round_.tool_calls:
+                        fn_name = tool_call.name
                         try:
-                            fn_args = json.loads(tool_call.function.arguments)
+                            fn_args = json.loads(tool_call.arguments)
                         except json.JSONDecodeError:
                             try:
                                 fn_args, _ = json.JSONDecoder().raw_decode(
-                                    tool_call.function.arguments
+                                    tool_call.arguments
                                 )
                             except (json.JSONDecodeError, ValueError):
                                 log.warning(
                                     "Unparseable tool arguments",
                                     tool=fn_name,
-                                    args=tool_call.function.arguments,
+                                    args=tool_call.arguments,
                                 )
                                 continue
                         log.info("Tool call", tool=fn_name, input=fn_args)
@@ -221,19 +196,13 @@ class DefaultOpenAICompatibleProvider:
                             if action:
                                 collected_actions.append(action)
 
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                # fix(#1778): fenced, not bare JSON.
-                                "content": tool_result_content(result),
-                            }
-                        )
+                        results.append((tool_call, result))
+                    conversation.add_tool_results(round_, results)
                     continue
 
-                # Unexpected finish reason
                 return ToolLoopResult(
-                    text=choice.message.content or "",
+                    text=round_.text,
+                    truncated=True,
                     actions=collected_actions,
                     input_tokens=total_input,
                     output_tokens=total_output,
@@ -252,8 +221,7 @@ class DefaultOpenAICompatibleProvider:
             attach_token_usage(exc, total_input, total_output)
             raise
 
-    # fix(#1590): explicit keyword-only signature, matching
-    # AIProviderExtension.stream exactly, instead of a bare **kwargs shim.
+    # Explicit keyword-only signature matching AIProviderExtension.stream.
     async def stream(  # type: ignore[no-untyped-def]
         self,
         *,
@@ -271,11 +239,9 @@ class DefaultOpenAICompatibleProvider:
     ):
         raise NotImplementedError(
             "DefaultOpenAICompatibleProvider.stream() not implemented in "
-            "community edition; use complete() (Phase 226 D-03)."
+            "community edition; use complete()."
         )
 
-    # fix(#1590): explicit keyword-only signature, matching
-    # AIProviderExtension.stream_chat_events exactly.
     async def stream_chat_events(  # type: ignore[no-untyped-def]
         self,
         *,
@@ -312,6 +278,7 @@ class DefaultOpenAICompatibleProvider:
             model=model,
             history=history,
             client=get_openai_client(resolved_base_url),
+            base_url=resolved_base_url,
             port=port,
             map_id=map_id,
             tools=tools,
@@ -335,6 +302,7 @@ class DefaultOpenAICompatibleProvider:
         from app.core.ai_credentials import bind_openai_credential_base_url
         from app.core.config import settings
         from app.processing.ai.llm_loop import get_openai_client
+        from app.processing.ai.openai_conversation import structured_completion
 
         effective_base_url = bind_openai_credential_base_url(
             base_url or settings.openai_base_url,
@@ -349,25 +317,15 @@ class DefaultOpenAICompatibleProvider:
             response_model=response_model.__name__,
         )
 
-        response = await client.beta.chat.completions.parse(
+        return await structured_completion(
+            client,
+            base_url=effective_base_url,
             model=model,
+            system_prompt=system_prompt,
+            user_message=user_message,
+            response_model=response_model,
             max_tokens=max_tokens,
             temperature=temperature,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            response_format=response_model,
-        )
-
-        parsed = response.choices[0].message.parsed
-        if parsed is None:
-            raise ValueError("OpenAI returned no parsed response")
-        usage = response.usage
-        return (
-            parsed,
-            usage.prompt_tokens if usage else 0,
-            usage.completion_tokens if usage else 0,
         )
 
     async def resolve_runtime_config(  # type: ignore[no-untyped-def]
@@ -390,17 +348,7 @@ class DefaultOpenAICompatibleProvider:
 class DefaultOpenAIEmbeddingProvider:
     """Community-edition default: OpenAI-compatible embeddings.
 
-    A Protocol-typed provider class, absorbing the former sync
-    ``build_openai_client()`` / ``resolve_embedding_base_url()`` helpers and
-    ``service.py``'s retry/backoff loop (max 2 attempts, 2.0s backoff+jitter).
-
-    Class-level ``_clients`` dict cache keyed by ``base_url`` mirrors
-    ``DefaultOpenAICompatibleProvider._clients``. Lifetime is process-scoped
-    (registered as a singleton in
-    ``_extensions["embedding_providers"]["openai_compatible"]``).
-
-    ``AsyncOpenAI`` replaces the former sync ``OpenAI`` + ``asyncio.to_thread``,
-    matching ``DefaultOpenAICompatibleProvider``'s chat-completions path.
+    Class-level ``_clients`` dict cache keyed by ``base_url``, process-scoped.
 
     All SDK and app-module imports happen INSIDE ``embed()`` /
     ``resolve_runtime_config()``, never at module load.
@@ -417,13 +365,11 @@ class DefaultOpenAIEmbeddingProvider:
         base_url: str | None = None,
         timeout: float | None = None,
     ) -> list[list[float]]:
-        # Deferred imports (Phase 214 discipline)
         import asyncio
         import random
 
-        import httpx
         import structlog
-        from openai import AsyncOpenAI
+        from openai import AsyncOpenAI, Timeout
 
         from app.core.ai_credentials import bind_openai_credential_base_url
         from app.core.config import reveal, settings
@@ -441,25 +387,21 @@ class DefaultOpenAIEmbeddingProvider:
             purpose="embedding",
         )
 
-        # Lazy class-level keyed-client cache (mirrors defaults.py:684-692)
         if effective_base_url not in DefaultOpenAIEmbeddingProvider._clients:
             DefaultOpenAIEmbeddingProvider._clients[effective_base_url] = AsyncOpenAI(
                 api_key=reveal(settings.openai_api_key),
                 base_url=effective_base_url,
-                timeout=httpx.Timeout(60.0, connect=10.0),
+                timeout=Timeout(60.0, connect=10.0),
                 max_retries=2,
             )
         client = DefaultOpenAIEmbeddingProvider._clients[effective_base_url]
 
-        # Retry loop: max 2 attempts, 2.0s backoff with up to 30% jitter,
-        # asyncio.wait_for per call.
         max_attempts = 2
         backoff = 2.0
         last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):
             try:
-                # dimensions=None must NOT be passed to the SDK — build
-                # kwargs conditionally.
+                # dimensions=None must NOT be passed to the SDK.
                 kwargs: dict[str, object] = {"model": model, "input": texts}
                 if dimensions is not None:
                     kwargs["dimensions"] = dimensions

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fix(#1778 round 19, P2 class): the LOCAL half of retention pruning had the
+# The LOCAL half of retention pruning had the
 # same "env-derived value fed through a line-oriented tool" shape as the S3
 # half (see test-backup-s3-retention-newline-safety.sh), reached a different
 # way: dump_listing (renamed dump_listing_arrays) used to build its listing
@@ -15,7 +15,7 @@
 # re-split a record on a newline that was never meant to be a record
 # boundary.
 #
-# Measured against the actual pre-round-19 `dump_listing`/`prune_old_backups`
+# Measured against the actual earlier `dump_listing`/`prune_old_backups`
 # on this exact fixture (not assumed): find's line-splitting happens to break
 # the compound name into a real leading fragment (with the true directory
 # prefix) and a bogus TRAILING fragment with no directory prefix at all, so
@@ -77,18 +77,20 @@ die() {
     exit 1
 }
 
-# --- Extract the five functions under test ---
+# --- Extract the functions under test ---
 HARNESS="${WORKDIR}/harness.sh"
 {
     echo 'set -euo pipefail'
     awk '/^log\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT"
     awk '/^dump_listing_arrays\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT"
     awk '/^newest_complete_ts\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT"
+    awk '/^backup_period_key\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT"
+    awk '/^mark_retained\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT"
     awk '/^prune_old_backups\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT"
     awk '/^prune_orphaned_companions\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT"
 } > "$HARNESS"
 
-for fn in log dump_listing_arrays newest_complete_ts prune_old_backups prune_orphaned_companions; do
+for fn in log dump_listing_arrays newest_complete_ts backup_period_key mark_retained prune_old_backups prune_orphaned_companions; do
     grep -q "^${fn}() {" "$HARNESS" \
         && check "extracted ${fn}() from the shipped script" "ok" \
         || check "extracted ${fn}() from the shipped script — not found in harness" "fail"
@@ -125,7 +127,7 @@ set -euo pipefail
 . "$1"
 dump_listing_arrays "$2"
 printf "DL_COUNT=%s\n" "${#DL_TS[@]}"
-prune_old_backups "$2" "$3"
+prune_old_backups "$2" "$3" day
 prune_orphaned_companions "$2"
 ' _ "$HARNESS" "$DIR" 1 > "${WORKDIR}/run.log" 2>&1 \
     || { cat "${WORKDIR}/run.log" >&2; die "the extracted retention pipeline exited non-zero against the fixture"; }

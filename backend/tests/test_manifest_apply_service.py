@@ -234,7 +234,7 @@ class TestManifestApplyHelpers:
         assert "draft, ready, internal, published" in message
 
     def test_publication_intent_follows_an_overlay_defined_status_order(self):
-        """fix(#1201): the allowed set is the live extension's, not a frozen one.
+        """The allowed set is the live extension's, not a frozen one.
 
         Both directions matter. `review` is not a community status and has to
         pass while the overlay defines it; `internal` IS a community status
@@ -273,14 +273,15 @@ class TestManifestApplyHelpers:
             ("./data/poi.kml", "poi.kml", ".kml"),
             ("./data/poi.kmz", "poi.kmz", ".kmz"),
             ("./data/parcels.zip", "parcels.zip", ".zip"),
+            ("./data/parcels.parquet", "parcels.parquet", ".parquet"),
         ],
     )
     def test_source_filename_and_extension_derivation_tier1_formats(
         self, uri: str, expected_filename: str, expected_extension: str
     ):
-        """fix(#1683): FlatGeobuf, KML, KMZ, and zipped-FileGDB manifest
+        """FlatGeobuf, KML, KMZ, and zipped-FileGDB manifest
         sources derive the same filename/extension as any other vector
-        source — the tier-1 upload formats added in #1682."""
+        source — the tier-1 upload formats."""
         source = ManifestSource(type="vector", uri=uri)
 
         assert derive_source_filename(source) == expected_filename
@@ -289,15 +290,19 @@ class TestManifestApplyHelpers:
     @pytest.mark.anyio
     @pytest.mark.parametrize(
         "uri",
-        ["./data/trails.fgb", "./data/poi.kml", "./data/poi.kmz"],
+        [
+            "./data/trails.fgb",
+            "./data/poi.kml",
+            "./data/poi.kmz",
+            "./data/parcels.parquet",
+        ],
     )
     async def test_classify_manifest_source_accepts_tier1_vector_formats(
         self, uri: str
     ):
-        """fix(#1683): these formats used to be rejected by
-        `MANIFEST_SOURCE_EXTENSIONS` before ever reaching ingest, even
-        though the upload door has accepted the identical bytes since
-        #1682."""
+        """These formats must not be rejected by
+        `MANIFEST_SOURCE_EXTENSIONS` before reaching ingest, since the
+        upload door accepts the identical bytes."""
         source = ManifestSource(type="vector", uri=uri)
 
         prepared = await classify_manifest_source(source)
@@ -385,7 +390,7 @@ class TestManifestApplyHelpers:
 
     @pytest.mark.anyio
     async def test_storage_seed_key_under_staging_prefix_is_rejected(self, monkeypatch):
-        """fix(#1216): `staging/` object keys are system-owned transient
+        """`staging/` object keys are system-owned transient
         presigned-upload storage — the ingest tail reaps them at terminal
         job status, so an operator-declared manifest source under that
         prefix would be deleted. Declaration must refuse the key."""
@@ -421,7 +426,7 @@ class TestManifestApplyHelpers:
         assert prepared.file_path == "operator/roads.geojson"
 
     def test_dotdot_traversal_rejected_at_schema_layer(self):
-        """Phase 268 H-29: ManifestSource must reject any URI containing
+        """ManifestSource must reject any URI containing
         a `..` path segment. The Pydantic validator catches it before any
         ingest classification runs."""
         for unsafe in (
@@ -445,7 +450,7 @@ class TestManifestApplyHelpers:
     async def test_classify_manifest_source_rejects_paths_outside_staging_dir(
         self, monkeypatch
     ):
-        """Phase 268 H-29: defense-in-depth — even if the regex/validator
+        """Defense-in-depth — even if the regex/validator
         is bypassed somehow, classify_manifest_source must refuse paths
         whose resolved form escapes upload_staging_dir."""
         # Construct a ManifestSource directly bypassing validation by
@@ -681,6 +686,45 @@ class TestManifestApplyService:
         assert job.user_metadata["record_status"] == "ready"
         assert job.user_metadata["srid_override"] == 4326
 
+    async def test_new_geoparquet_entry_queues_a_valid_job(
+        self, test_db_session, clean_tables
+    ):
+        import pyarrow.parquet as pq
+        from shapely.geometry import Point
+
+        from app.core.config import settings
+        from app.processing.export.parquet import build_geoparquet_table
+        from app.processing.ingest.validation import validate_file_content
+
+        staged = Path(settings.upload_staging_dir) / "tests/fixtures/ingest/pts.parquet"
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        table = build_geoparquet_table(
+            [Point(0, 0).wkb, Point(1, 1).wkb], {"name": ["a", "b"]}, ["name"]
+        )
+        pq.write_table(table, staged)
+        user = await _admin_user(test_db_session)
+        request = _request(
+            _manifest_dataset(
+                key="manifest-create-geoparquet",
+                uri="tests/fixtures/ingest/pts.parquet",
+            )
+        )
+
+        with patch(
+            "app.processing.ingest.manifest_service.queue_ingest_job",
+            new=AsyncMock(),
+        ) as queue:
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        assert response.accepted is True
+        assert response.results[0].action == "create"
+        queue.assert_awaited_once()
+        job = await test_db_session.get(IngestJob, response.results[0].job_id)
+        assert job.source_filename.endswith(".parquet")
+        validate_file_content(job.file_path, job.source_filename)
+
     async def test_new_raster_entry_sets_raster_queue_metadata(
         self, test_db_session, clean_tables
     ):
@@ -751,7 +795,7 @@ class TestManifestApplyService:
         assert result.dataset_id == dataset.id
         queue.assert_not_awaited()
         # gh#1736: the message must not claim the source was checked, only
-        # that the manifest entry itself is unchanged. gh#1773 codex r4:
+        # that the manifest entry itself is unchanged. gh#1773:
         # this is the vector branch, which does have a working checksum
         # recovery path -- see test_completed_raster_fingerprint_skip_does_
         # not_promise_checksum_recovery for the raster branch, which does not.
@@ -761,7 +805,7 @@ class TestManifestApplyService:
     async def test_completed_raster_fingerprint_skip_does_not_promise_checksum_recovery(
         self, test_db_session, clean_tables
     ):
-        """gh#1773 codex r4: bumping checksum on a raster_cog entry does move
+        """gh#1773: bumping checksum on a raster_cog entry does move
         the fingerprint and reclassify skip_complete as update, but
         _validate_existing_dataset_update then rejects a raster update
         outright ("Manifest raster updates are not supported"). Naming
@@ -809,7 +853,7 @@ class TestManifestApplyService:
     async def test_changed_raster_checksum_errors_instead_of_skipping(
         self, test_db_session, clean_tables
     ):
-        """gh#1773 codex r5: fresh evidence from the round-4 docs fix itself.
+        """gh#1773: fresh evidence from the docs fix itself.
         The README/Field/CLI-schema text said a raster entry with a changed
         checksum "still classifies as skip, not update" -- but
         _classify_dataset does not look at source type, so a changed
@@ -1263,9 +1307,9 @@ class TestManifestApplyService:
         assert quota_check.await_args.args[1] == user_id
         assert quota_check.await_args.args[2] == 4096
         queue.assert_not_awaited()
-        # fix(#1814): the reservation is inserted before the download, so a
+        # The reservation is inserted before the download, so a
         # denial after it leaves that row settled rather than leaving none.
-        # fix(#1984): scoped to this key, not order-dependent on a lone row.
+        # Scoped to this key, not order-dependent on a lone row.
         reservation = (
             await test_db_session.execute(
                 select(IngestJob).where(
@@ -1322,7 +1366,7 @@ class TestManifestApplyService:
     async def test_downloaded_http_source_is_removed_if_staging_bind_fails(
         self, test_db_session, clean_tables, tmp_path
     ):
-        """fix(#1814): the row is durable before the download now, so the write
+        """The row is durable before the download, so the write
         that can still fail is the one binding the staged path to it. The
         downloaded bytes belong to that attempt and must not outlive it."""
         user = await _admin_user(test_db_session)
@@ -1367,7 +1411,7 @@ class TestManifestApplyService:
         assert "database unavailable" in response.results[0].message
         assert not staged.exists()
         queue.assert_not_awaited()
-        # fix(#1984): scoped to this key, not order-dependent on a lone row.
+        # Scoped to this key, not order-dependent on a lone row.
         reservation = (
             await test_db_session.execute(
                 select(IngestJob).where(
@@ -1519,7 +1563,7 @@ class TestManifestDryRun:
     async def test_dry_run_reports_an_intent_the_extension_does_not_define(
         self, test_db_session, clean_tables
     ):
-        """fix(#1201): dry_run is how an operator validates a manifest.
+        """dry_run is how an operator validates a manifest.
 
         The intent check therefore has to run before the dry-run early
         return, or the branch built for validation is the one branch that
@@ -1548,7 +1592,7 @@ class TestManifestDryRun:
     async def test_dry_run_reports_a_crs_the_database_does_not_know(
         self, test_db_session, clean_tables
     ):
-        """fix(#2032): the manifest's spelling of srid_override, refused before staging."""
+        """The manifest's spelling of srid_override, refused before staging."""
         user = await _admin_user(test_db_session)
         request = _request(
             _manifest_dataset(key="manifest-dry-crs", crs="EPSG:99999"),
@@ -1652,7 +1696,7 @@ class TestManifestMetadataPropagation:
     async def test_vector_finalize_applies_license_organization_and_tags(
         self, test_db_session, clean_tables
     ):
-        """fix(#2039): the ledger's other three metadata fields reach the record."""
+        """The ledger's other three metadata fields reach the record."""
         from app.modules.catalog.datasets.domain.models import RecordKeyword
         from app.processing.ingest.tasks_common import IngestContext, _finalize_ingest
 
@@ -1722,7 +1766,7 @@ class TestManifestMetadataPropagation:
     async def test_manifest_tags_are_not_reinserted_on_a_reapply(
         self, test_db_session, clean_tables
     ):
-        """fix(#2039): uq_record_keyword would fail the whole swap transaction."""
+        """uq_record_keyword would fail the whole swap transaction."""
         from app.modules.catalog.datasets.domain.models import RecordKeyword
         from app.processing.ingest.tasks_common import apply_manifest_record_metadata
 
@@ -1746,7 +1790,7 @@ class TestManifestMetadataPropagation:
     async def test_manifest_tags_dedupe_only_against_theme_keywords(
         self, test_db_session, clean_tables
     ):
-        """fix(#2039 review): `uq_record_keyword` is per keyword_type, case-sensitive."""
+        """`uq_record_keyword` is per keyword_type, case-sensitive."""
         from app.modules.catalog.datasets.domain.models import RecordKeyword
         from app.processing.ingest.tasks_common import apply_manifest_record_metadata
 
@@ -1760,7 +1804,7 @@ class TestManifestMetadataPropagation:
                 RecordKeyword(
                     record_id=dataset.record.id, keyword="Transit", keyword_type="theme"
                 ),
-                # fix(#2039 review): `uq_record_keyword` COALESCEs this to '',
+                # `uq_record_keyword` COALESCEs this to '',
                 # so the row collides with the NULL the read-back would write.
                 RecordKeyword(
                     record_id=dataset.record.id,

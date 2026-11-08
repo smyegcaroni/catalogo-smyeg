@@ -26,7 +26,7 @@ export interface GeoJSONFeature {
  * dataset instead of serving that worker's own cached snapshot. Absent
  * from a server that predates this field.
  */
-export interface GeoJSONFeatureWrite extends GeoJSONFeature {
+interface GeoJSONFeatureWrite extends GeoJSONFeature {
   tile_cache_version?: number | null;
 }
 
@@ -35,7 +35,7 @@ export interface GeoJSONFeatureWrite extends GeoJSONFeature {
  * the same name. The delete endpoint stays 204 (compatibility with existing
  * callers), so this rides a response header rather than a JSON body.
  */
-export interface FeatureDeleteResult {
+interface FeatureDeleteResult {
   tile_cache_version?: number | null;
 }
 
@@ -57,7 +57,7 @@ export async function createFeature(
     headers['Idempotency-Key'] = idempotencyKey;
     if (attempt !== undefined) headers['Idempotency-Attempt'] = String(attempt);
   }
-  return apiFetch<GeoJSONFeatureWrite>(`/datasets/${datasetId}/features/`, {
+  return apiFetch<GeoJSONFeatureWrite>(`/datasets/${encodeURIComponent(datasetId)}/features/`, {
     method: 'POST',
     headers: Object.keys(headers).length > 0 ? headers : undefined,
     body: JSON.stringify({ geometry, properties: properties ?? {} }),
@@ -68,11 +68,11 @@ export async function getFeature(
   datasetId: string,
   gid: number,
 ): Promise<GeoJSONFeature> {
-  return apiFetch<GeoJSONFeature>(`/datasets/${datasetId}/features/${gid}`);
+  return apiFetch<GeoJSONFeature>(`/datasets/${encodeURIComponent(datasetId)}/features/${encodeURIComponent(gid)}`);
 }
 
 function featurePath(datasetId: string, gid: number, tableId?: string | null): string {
-  const path = `/datasets/${datasetId}/features/${gid}`;
+  const path = `/datasets/${encodeURIComponent(datasetId)}/features/${encodeURIComponent(gid)}`;
   return tableId ? `${path}?table_id=${encodeURIComponent(tableId)}` : path;
 }
 
@@ -106,4 +106,26 @@ export async function deleteFeature(
   // tile_cache_version null; the caller falls back to a timestamp.
   const parsed = version != null ? Number(version) : NaN;
   return { tile_cache_version: Number.isFinite(parsed) ? parsed : null };
+}
+
+interface FeatureBatchDeleteResult {
+  deleted: number;
+  tile_cache_version?: number | null;
+}
+
+/**
+ * Delete features by gid in one request. Either all of them are deleted or
+ * none is: a gid that doesn't exist fails with 404 `feature_not_found`, and a
+ * `tableId` whose table was replaced fails with 409 `dataset_replaced`.
+ */
+export async function deleteFeatures(
+  datasetId: string,
+  gids: number[],
+  tableId?: string | null,
+): Promise<FeatureBatchDeleteResult> {
+  const path = `/datasets/${encodeURIComponent(datasetId)}/features/delete/`;
+  return apiFetch<FeatureBatchDeleteResult>(
+    tableId ? `${path}?table_id=${encodeURIComponent(tableId)}` : path,
+    { method: 'POST', body: JSON.stringify({ gids }) },
+  );
 }

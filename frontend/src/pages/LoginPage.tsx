@@ -17,6 +17,7 @@ import { useDocumentTitle } from '@/hooks/use-document-title';
 import { useBranding } from '@/hooks/use-settings';
 import { useEdition } from '@/hooks/use-edition';
 import { isSafeHttpUrl } from '@/lib/safe-http-url';
+import { postSignInPath } from '@/lib/post-sign-in-path';
 import { writeSessionStorage } from '@/lib/storage';
 import catalogBackground from '@/assets/fondo-catalogo.jpg';
 import catalogVideo from '@/assets/video-login.mp4';
@@ -90,9 +91,7 @@ export function LoginPage() {
 
   if (token) {
     const from = (location.state as { from?: string } | null)?.from;
-    // The root route is the canonical search workspace.
-    const target = from && from.startsWith('/') ? from : '/';
-    return <Navigate to={target} replace />;
+    return <Navigate to={postSignInPath(from)} replace />;
   }
 
   if (configLoading) {
@@ -224,10 +223,8 @@ export function LoginPage() {
             <p role="alert" className="mb-4 text-sm text-destructive">{t('authConfig.loadFailed')}</p>
           )}
 
-          {/* In SSO-only mode, hide the password form without a flash when
-              password_login_enabled is explicitly false. Config is already
-              resolved here (configLoading shows the LoadingState above). Treat an
-              absent field (older servers) and a config error as true. */}
+          {/* Config is resolved here, so the SSO-only password form hides
+              without a flash when password_login_enabled is explicitly false. */}
           {showPasswordForm ? (
             <>
               <LoginForm signupOpen={showSignup} />
@@ -256,9 +253,8 @@ export function LoginPage() {
             </div>
           )}
 
-          {/* Adaptive OAuth: 0 → renders nothing; 1 → labeled; 2-3 → icon row.
-              The divider only belongs above the buttons when a password form
-              sits above it. */}
+          {/* Adaptive OAuth: 0 → nothing; 1 → labeled; 2-3 → icon row. The
+              divider shows only when a password form sits above. */}
           <div className="mt-5">
             <OAuthButtons showDivider={showPasswordForm} />
           </div>
@@ -279,8 +275,7 @@ export function LoginPage() {
             </p>
           )}
 
-          {/* Show signup when allow_signup is true;
-              fall back to registration_enabled for older servers. */}
+          {/* showSignup falls back to registration_enabled on older servers. */}
           {showSignup && (
             <p className="mt-3 text-center text-sm text-muted-foreground">
               {t('needAccount')}{' '}
@@ -295,8 +290,8 @@ export function LoginPage() {
             <p className="mb-2.5 text-xs text-muted-foreground">
               {t('browseCatalogHelper')}
             </p>
-            {/* Sets gl-guest-browse to suppress the landing-first
-                redirect for the rest of the session before navigating to /. */}
+            {/* Sets gl-guest-browse to suppress the landing-first redirect for
+                the session before navigating to /. */}
             <Button
               variant="outline"
               className="h-10 w-full gap-1.5 font-semibold"

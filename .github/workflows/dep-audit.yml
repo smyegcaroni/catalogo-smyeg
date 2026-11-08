@@ -1,8 +1,7 @@
 name: Dependency audit
 
-# Added 2026-06-02 (dep-audit). Fails PRs on high/critical CVEs and strong
-# copyleft; runs Trivy OS-CVE scans the local audit could not (trivy is not on
-# dev machines). Weekly cron catches newly-disclosed CVEs in unchanged deps.
+# Fails PRs on high/critical CVEs and strong copyleft; runs Trivy OS-CVE
+# scans (trivy is not on dev machines). Weekly cron catches newly-disclosed CVEs in unchanged deps.
 on:
   pull_request:
     branches: [main]
@@ -20,22 +19,24 @@ jobs:
   python-audit:
     name: Python audit (uv)
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: backend
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         with:
           version: "0.11.11"
           enable-cache: true
           cache-dependency-glob: "backend/uv.lock"
       - name: Verify lockfile in sync
         run: uv lock --check
-      # fix(#889): mcp/ is the other project with its own uv.lock, and it had no
-      # full-lock gate at all — which is why it silently lagged two releases
-      # while the backend lock's drift eventually surfaced. `make version-check`
-      # (#877) asserts only the version FIELDS in both locks; this catches
+      # mcp/ is the other project with its own uv.lock and needs its own
+      # full-lock gate, or its lock can lag silently. `make version-check`
+      # asserts only the version FIELDS in both locks; this catches
       # dependency-tree drift.
       - name: Verify lockfile in sync — MCP server
         working-directory: mcp
@@ -48,10 +49,10 @@ jobs:
         run: uv run --with pip-licenses pip-licenses --fail-on="GPL-3.0-only;GPL-3.0;GPL-2.0;AGPL-3.0;SSPL-1.0;BSL-1.1"
 
       # Extend the BLOCKING license gate to the CLI + Python SDK (same allowlist).
-      # fix(#932): unlike the backend and MCP gates above, these two run against
+      # Unlike the backend and MCP gates above, these two run against
       # an UNLOCKED resolution — cli/ and sdks/python/ deliberately gitignore
-      # uv.lock (cli/.gitignore, sdks/python/.gitignore) and have never
-      # committed one, so each run audits whatever resolves that day. That is
+      # uv.lock (cli/.gitignore, sdks/python/.gitignore) and don't
+      # commit one, so each run audits whatever resolves that day. That is
       # acceptable for a copyleft block, but it is not a pinned-tree audit.
       - name: License gate — CLI (block strong/network copyleft)
         working-directory: cli
@@ -64,13 +65,16 @@ jobs:
   js-audit:
     name: JS audit (${{ matrix.directory }})
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         directory: [".", "frontend", "sdks/typescript"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: "24" # CI tooling runner (LTS); build image is node 26
           cache: "npm"
@@ -96,12 +100,15 @@ jobs:
   resolve-docker-audit-matrix:
     name: Resolve docker-audit image pins
     runs-on: ubuntu-26.04
+    timeout-minutes: 5
     outputs:
       include: ${{ steps.matrix.outputs.include }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      # fix(#1983): node/python/nginx are Dockerfile FROM tags Dependabot
-      # bumps; deriving them here (not a second literal copy) is the single
+        with:
+          persist-credentials: false
+      # node/python/nginx are Dockerfile FROM tags Dependabot
+      # bumps; deriving them here (not a second literal copy) keeps a single
       # source of truth, so this matrix can't drift behind the Dockerfile.
       - name: Derive matrix from Dockerfile FROM tags
         id: matrix
@@ -124,6 +131,7 @@ jobs:
     name: Docker image scan (Trivy)
     needs: resolve-docker-audit-matrix
     runs-on: ubuntu-26.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -143,6 +151,8 @@ jobs:
         include: ${{ fromJson(needs.resolve-docker-audit-matrix.outputs.include) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       # Scope is CRITICAL (not HIGH): these scan UPSTREAM base images, whose HIGH
       # OS-CVE count churns with every Debian/Alpine disclosure independent of our
       # code — gating on HIGH would red the build on upstream timing. The built
@@ -151,6 +161,12 @@ jobs:
       # the gate quiet for CVEs with no upstream fix. Per-image `enforce` above
       # decides gate-vs-report. Transient Docker Hub i/o timeouts are not CVEs —
       # rerun the job.
+      # The action takes a single YAML ignore file, so the base-image-only
+      # entries are merged into a copy of the shared policy.
+      - name: Merge the base-image suppressions
+        run: |
+          awk 'FNR == NR { extra = extra $0 "\n"; next } { print } /^vulnerabilities:$/ { printf "%s", extra }' \
+            .trivyignore.base.yaml .trivyignore.yaml > trivyignore.base-scan.yaml
       - name: Trivy scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
@@ -160,9 +176,10 @@ jobs:
           exit-code: ${{ matrix.enforce }}
           ignore-unfixed: true
           # Scoped, justified CVE suppressions only (see .trivyignore.yaml's
-          # `vulnerabilities:` section). Trivy <0.71 does not auto-detect the YAML
-          # ignore file, so point at it explicitly.
-          trivyignores: ".trivyignore.yaml"
+          # `vulnerabilities:` section, plus .trivyignore.base.yaml for these
+          # upstream scans). Trivy <0.71 does not auto-detect the YAML ignore
+          # file, so point at it explicitly.
+          trivyignores: "trivyignore.base-scan.yaml"
 
   python-system-audit:
     name: Python OS layer scan (Trivy)
@@ -170,6 +187,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # Both backend builder and runtime inherit this exact OS layer. No cache
       # ensures a successful scan includes the current Debian security packages.
       - name: Build the shared patched Python OS layer
@@ -187,8 +206,11 @@ jobs:
   iac-scan:
     name: IaC config scan (Trivy)
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       # Enforcing gate: Trivy config mode auto-detects Dockerfiles,
       # docker-compose*.yml, and nginx config at the repo root; fails the job on
       # any CRITICAL or HIGH misconfiguration finding. ignore-unfixed is inert for

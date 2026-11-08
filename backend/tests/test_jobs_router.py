@@ -15,7 +15,9 @@ if TYPE_CHECKING:
 
 from app.platform.jobs.models import IngestJob, commit_attempted_marker
 
-from tests.factories import get_user_id
+from tests.factories import create_user, get_user_id
+from tests.test_api_key_publish_scope import _mint
+from tests.test_api_key_scope_875 import _remove_keys_minted_by_the_test  # noqa: F401
 
 
 async def _create_job(
@@ -57,6 +59,39 @@ async def _create_job(
 
 
 class TestGetJobStatus:
+    async def test_publish_key_cannot_distinguish_another_users_job_from_unknown(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        _, owner_id = await create_user(client, admin_auth_header, "editor")
+        job = await _create_job(
+            test_db_session, created_by=uuid.UUID(owner_id), status="pending"
+        )
+        publish = await _mint(client, admin_auth_header, "publish")
+
+        unreadable = await client.get(f"/jobs/{job.id}", headers=publish)
+        unknown = await client.get(f"/jobs/{uuid.uuid4()}", headers=publish)
+
+        assert unreadable.status_code == unknown.status_code == 404
+        assert (
+            unreadable.json()["detail"] == unknown.json()["detail"] == "Job not found"
+        )
+
+    @pytest.mark.parametrize("role", ["editor", "viewer"])
+    async def test_unreadable_job_is_indistinguishable_from_unknown(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session, role
+    ):
+        headers, _ = await create_user(client, admin_auth_header, role)
+        admin_id = await get_user_id(test_db_session, "admin")
+        job = await _create_job(test_db_session, created_by=admin_id)
+
+        unreadable = await client.get(f"/jobs/{job.id}", headers=headers)
+        unknown = await client.get(f"/jobs/{uuid.uuid4()}", headers=headers)
+
+        assert unreadable.status_code == unknown.status_code == 404
+        assert (
+            unreadable.json()["detail"] == unknown.json()["detail"] == "Job not found"
+        )
+
     async def test_get_job_status_as_creator(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ):
@@ -118,7 +153,7 @@ class TestGetJobStatus:
         editor_auth_header: dict,
         test_db_session,
     ):
-        """GET /jobs/{id} as non-creator non-admin returns 403."""
+        """GET /jobs/{id} as non-creator non-admin returns 404."""
         admin_id = await get_user_id(test_db_session, "admin")
         job = await _create_job(test_db_session, created_by=admin_id)
 
@@ -129,7 +164,8 @@ class TestGetJobStatus:
         ) as denial_telemetry:
             resp = await client.get(f"/jobs/{job.id}", headers=editor_auth_header)
 
-        assert resp.status_code == 403
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Job not found"
         denial_telemetry.assert_called_once()
         assert denial_telemetry.call_args.args[2] == "manage_users"
         assert denial_telemetry.call_args.kwargs == {"resource_type": "ingest_job"}
@@ -149,7 +185,8 @@ class TestGetJobStatus:
         with patch("app.modules.auth.dependencies.log") as denial_log:
             response = await client.get(f"/jobs/{job.id}", headers=editor_auth_header)
 
-        assert response.status_code == 403
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Job not found"
         denial_log.warning.assert_called_once()
         fields = denial_log.warning.call_args.kwargs
         assert fields["path"] == "/jobs/{job_id}"
@@ -229,7 +266,7 @@ class TestGetJobStatus:
     async def test_get_job_auto_fails_analysis_job_at_materialize_lease(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ):
-        """fix(#691): an analysis job's lease is the short materialize window.
+        """An analysis job's lease is the short materialize window.
 
         The route the frontend polls flips a hard-killed worker's analysis
         job to failed within ANALYSIS_MATERIALIZE_LEASE_SECONDS (not the
@@ -311,7 +348,7 @@ class TestGetJobStatus:
             test_db_session,
             created_by=admin_id,
             status="pending",
-            # fix(#1744): the row this test is about is one whose dispatch was
+            # The row this test is about is one whose dispatch was
             # attempted and never landed. An unstamped pending row is an
             # upload nobody committed, which the poll settles `cancelled`.
             user_metadata=commit_attempted_marker(),
@@ -380,7 +417,7 @@ class TestGetJobStatus:
     async def test_get_job_surfaces_mercator_clip_warning(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ):
-        """fix(#888): the Mercator-clamp drop count reaches the job status API.
+        """The Mercator-clamp drop count reaches the job status API.
 
         Built through the real producer chain (clip accounting ->
         ``_append_mercator_clip_warning`` -> ``user_metadata``) rather than a
@@ -408,15 +445,39 @@ class TestGetJobStatus:
         assert len(data["warnings"]) == 1
         assert data["warnings"][0] == {
             "kind": "mercator_clip",
-            # fix(#906): `clip_skipped` is an additive detail field with a
-            # False default, so a stored pre-#906 warning still validates and
-            # serializes with the flag present and clear.
+            # `clip_skipped` and `polar_only` are additive detail fields with a
+            # False default, so a stored warning without them still validates and
+            # serializes with the flags present and clear.
             "details": {
                 "dropped_features": 12,
                 "clipped_features": 3,
                 "clip_skipped": False,
+                "polar_only": False,
             },
         }
+
+    async def test_get_job_surfaces_a_polar_only_clip(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        from app.processing.ingest.tasks_common import _append_mercator_clip_warning
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        job = await _create_job(test_db_session, created_by=admin_id, status="complete")
+        job.user_metadata = {"title": "World countries"}
+        _append_mercator_clip_warning(
+            job,
+            {
+                "shifted_longitudes": False,
+                "dropped_features": 1,
+                "clipped_features": 2,
+                "polar_only": True,
+            },
+        )
+        await test_db_session.commit()
+
+        resp = await client.get(f"/jobs/{job.id}", headers=admin_auth_header)
+
+        assert resp.json()["warnings"][0]["details"]["polar_only"] is True
 
     async def test_get_job_surfaces_archive_failed(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
@@ -516,7 +577,7 @@ class TestGetJobStatus:
     async def test_get_job_drops_unknown_warning_kind(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ):
-        """TYPE-2: unknown warning ``kind`` values are dropped, not proxied.
+        """Unknown warning ``kind`` values are dropped, not proxied.
 
         Regression for the contract-drift scenario: if a future task emits a
         warning kind the Pydantic union does not recognize, ``JobStatusResponse``
@@ -552,7 +613,7 @@ class TestGetJobStatus:
     async def test_get_job_drops_unknown_temporal_parse_error_keys(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ):
-        """TYPE-3: ``temporal_parse_errors`` keys are narrowed to the contract set.
+        """``temporal_parse_errors`` keys are narrowed to the contract set.
 
         An upstream bug that emits ``temporal_created`` (unknown key) must not
         make the whole response fail Pydantic ``Literal`` validation — the
@@ -581,7 +642,7 @@ class TestGetJobStatus:
     async def test_job_status_includes_progress_fields_default_none(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ):
-        """REMED-02 / P2-07: new progress fields default to None when never written.
+        """New progress fields default to None when never written.
 
         Pre-existing jobs (or any job before workers populate the new columns)
         must continue to validate as JobStatusResponse — the three new fields
@@ -600,7 +661,7 @@ class TestGetJobStatus:
     async def test_job_status_returns_written_progress_values(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ):
-        """REMED-02 / P2-07: worker-written progress values surface via the API."""
+        """Worker-written progress values surface via the API."""
         admin_id = await get_user_id(test_db_session, "admin")
         job = await _create_job(test_db_session, created_by=admin_id, status="running")
 
@@ -624,12 +685,12 @@ class TestGetJobStatus:
 
 
 # ---------------------------------------------------------------------------
-# REMED-02 / P2-07: Pydantic contract bounds for new progress fields
+# Pydantic contract bounds for new progress fields
 # ---------------------------------------------------------------------------
 
 
 def test_job_status_response_rejects_out_of_range_progress():
-    """REMED-02 / P2-07: ``progress`` field rejects values outside [0.0, 1.0]."""
+    """``progress`` field rejects values outside [0.0, 1.0]."""
     from pydantic import ValidationError
 
     from app.platform.jobs.schemas import JobStatusResponse
@@ -831,7 +892,7 @@ class TestGetJobStatusByDataset:
         assert resp.status_code == 404
 
     # ------------------------------------------------------------------
-    # fix(#1860): who sees the job DETAIL, as opposed to who sees that a
+    # Who sees the job DETAIL, as opposed to who sees that a
     # job exists. The dataset gate is a visibility check and admits any
     # signed-in reader of a public or internal dataset, so these three cases
     # pin the disclosure decision separately from it: a stranger, the job's
@@ -1039,6 +1100,59 @@ class TestGetJobStatusByDataset:
 
 
 class TestRetryJob:
+    async def test_publish_key_cannot_retry_another_users_job_with_public_metadata(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """A non-owner's publish key gets 404 when user_metadata sets visibility public."""
+        _, owner_id = await create_user(client, admin_auth_header, "editor")
+        job = await _create_job(
+            test_db_session,
+            created_by=uuid.UUID(owner_id),
+            status="failed",
+            user_metadata={"visibility": "public"},
+        )
+        publish = await _mint(client, admin_auth_header, "publish")
+
+        resp = await client.post(f"/jobs/{job.id}/retry", headers=publish)
+
+        assert resp.status_code == 404, resp.text
+        assert resp.json()["detail"] == "Job not found"
+
+    async def test_publish_key_cannot_distinguish_another_users_job_from_unknown(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        _, owner_id = await create_user(client, admin_auth_header, "editor")
+        job = await _create_job(
+            test_db_session, created_by=uuid.UUID(owner_id), status="failed"
+        )
+        publish = await _mint(client, admin_auth_header, "publish")
+
+        unreadable = await client.post(f"/jobs/{job.id}/retry", headers=publish)
+        unknown = await client.post(f"/jobs/{uuid.uuid4()}/retry", headers=publish)
+
+        assert unreadable.status_code == unknown.status_code == 404
+        assert (
+            unreadable.json()["detail"] == unknown.json()["detail"] == "Job not found"
+        )
+
+    async def test_unreadable_job_is_indistinguishable_from_unknown(
+        self, client: AsyncClient, editor_auth_header: dict, test_db_session
+    ):
+        admin_id = await get_user_id(test_db_session, "admin")
+        job = await _create_job(test_db_session, created_by=admin_id, status="failed")
+
+        unreadable = await client.post(
+            f"/jobs/{job.id}/retry", headers=editor_auth_header
+        )
+        unknown = await client.post(
+            f"/jobs/{uuid.uuid4()}/retry", headers=editor_auth_header
+        )
+
+        assert unreadable.status_code == unknown.status_code == 404
+        assert (
+            unreadable.json()["detail"] == unknown.json()["detail"] == "Job not found"
+        )
+
     async def test_retry_not_found(self, client: AsyncClient, admin_auth_header: dict):
         """POST /jobs/{random_uuid}/retry returns 404."""
         resp = await client.post(
@@ -1096,7 +1210,8 @@ class TestRetryJob:
                 f"/jobs/{job.id}/retry", headers=editor_auth_header
             )
 
-        assert response.status_code == 403
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Job not found"
         denial_telemetry.assert_called_once()
         assert denial_telemetry.call_args.args[2] == "manage_users"
         assert denial_telemetry.call_args.kwargs == {"resource_type": "ingest_job"}
@@ -1341,7 +1456,7 @@ class TestCleanupStaleJobs:
         )
         operation_id = completed["details"]["operation_id"]
         details = dict(completed["details"])
-        # fix(#1556): the audit detail carries one count the published response
+        # The audit detail carries one count the published response
         # model does not. `pending_cancelled` reaches this JSONB blob (and the
         # multi-tenant fleet totals) so an operator can see that a pass settled
         # abandoned uploads rather than failing anything; StaleCleanupResponse
@@ -1426,7 +1541,7 @@ class TestCleanupStaleJobs:
         monkeypatch.setattr(audit_service, "audit_emit_durable", record_durable)
         monkeypatch.setattr(jobs_router, "fail_stale_jobs", cleanup)
         monkeypatch.setattr(jobs_router, "_reap_committed_staged_paths", reap)
-        # fix(#1202 review r8): the post-expiry staging sweep runs beside the
+        # The post-expiry staging sweep runs beside the
         # reaper on this path; stub it out so the fake session is not queried.
         monkeypatch.setattr(
             jobs_router,
@@ -1515,7 +1630,7 @@ class TestCleanupStaleJobs:
         monkeypatch.setattr(audit_service, "audit_emit_durable", fail_durable)
         monkeypatch.setattr(jobs_router, "fail_stale_jobs", cleanup)
         monkeypatch.setattr(jobs_router, "_reap_committed_staged_paths", reap)
-        # fix(#1202 review r8): the post-expiry staging sweep runs beside the
+        # The post-expiry staging sweep runs beside the
         # reaper on this path; stub it out so the fake session is not queried.
         monkeypatch.setattr(
             jobs_router,

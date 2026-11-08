@@ -14,7 +14,7 @@ import { FILL_PATTERN_IMAGES, tintedFillPattern } from './fill-pattern-images';
 import { fillPatternTint } from '@/lib/fill-pattern-preview';
 import { addDescribedLayer, writeDescribedLayer, writeDescribedVisibility } from '../layer-writer';
 import { labelLayerId, withLabelCompanion } from '../label-layer-utils';
-// builder-audit #338 DRY-06: extrusion min-zoom (14) and opacity cap (0.85) come from the
+// Extrusion min-zoom (14) and opacity cap (0.85) come from the
 // single builder-defaults source of truth (shared with renderAs + backend mirror).
 import { DEFAULT_EXTRUSION_MIN_ZOOM, DEFAULT_EXTRUSION_OPACITY_CAP, FULL_ZOOM_RANGE } from './builder-defaults';
 
@@ -30,16 +30,15 @@ export const FILL_OWNED_PAINT_PROPERTIES = [
   'fill-translate-anchor',
   'fill-layer-opacity',
 ] as const;
-// fix(#1625): the outline is a line layer with no per-feature opacity of its own, so
+// The outline is a line layer with no per-feature opacity of its own, so
 // the master slider rides on `line-layer-opacity` here too — shared polygon edges
 // are drawn once per polygon and double-darkened under `line-opacity`. Registered
 // here because `syncOwnedPaintProperties` only reconciles keys in this set: an
 // unregistered key is written once by addLayers and never updated again.
 export const OUTLINE_OWNED_PAINT_PROPERTIES = ['line-color', 'line-width', 'line-layer-opacity'] as const;
-// builder-audit #338 SPEC-11: 3D extrusion authoring is a DELIBERATE single-purpose subset
-// (column height only). fill-extrusion-base is intentionally fixed to 0 and
-// fill-extrusion-pattern / -translate / -translate-anchor are intentionally NOT authored;
-// this is column-height extrusion, not a general fill-extrusion editor.
+// 3D extrusion authoring is a deliberate subset: column height only.
+// fill-extrusion-base is fixed to 0, and fill-extrusion-pattern, -translate
+// and -translate-anchor are not authored.
 export const EXTRUSION_OWNED_PAINT_PROPERTIES = [
   'fill-extrusion-height',
   'fill-extrusion-base',
@@ -64,9 +63,9 @@ function buildHeightExpression(heightColumn: string, heightScale: number): FillE
 }
 
 /**
- * fix(#910, codex P2): the colour the extrusion companion draws in.
+ * The colour the extrusion companion draws in.
  *
- * The companion has no pattern of its own (SPEC-11) and colours from `fill-color`,
+ * The companion has no pattern of its own and colours from `fill-color`,
  * which is absent while a pattern owns the fill — so it falls back to the stash, or
  * it silently reverts to default blue.
  *
@@ -83,8 +82,7 @@ function resolveExtrusionFillColor(
   builder: { fillColorSaved?: string },
 ): FillExtrusionColor {
   const painted = rawPaint['fill-color'];
-  // The single cast lives here, after the check, replacing the two `as string`
-  // assertions the call sites used to make on values that were never checked at all.
+  // The single cast lives here, after the check.
   if (typeof painted === 'string' || Array.isArray(painted)) return painted as FillExtrusionColor;
   return typeof builder.fillColorSaved === 'string'
     ? builder.fillColorSaved
@@ -137,7 +135,7 @@ export function resolveFillPaint(paint: Record<string, unknown>): Record<string,
     : { 'fill-color': MAP_COLORS.default.fill, 'fill-opacity': MAP_COLORS.default.fillOpacity };
 }
 
-export interface PolygonStroke {
+interface PolygonStroke {
   disabled: boolean;
   /** The outline colour the style sets, if any. */
   authoredColor: string | undefined;
@@ -155,7 +153,12 @@ export function resolvePolygonStroke(
   paint: Record<string, unknown>,
   builder: NonNullable<StyleConfig['builder']>,
 ): PolygonStroke {
-  const color = builder.outlineColor ?? paint['_outline-color'] ?? paint['outline-color'];
+  const nativeOutline = paint['fill-outline-color'];
+  const color =
+    builder.outlineColor ??
+    paint['_outline-color'] ??
+    paint['outline-color'] ??
+    (typeof nativeOutline === 'string' ? nativeOutline : undefined);
   const width = builder.outlineWidth ?? paint['_outline-width'] ?? paint['outline-width'];
   const authoredColor = typeof color === 'string' ? color : undefined;
   return {
@@ -180,7 +183,9 @@ function fillPaint(input: AdapterLayerInput, stroke: PolygonStroke): Record<stri
     ...Object.fromEntries(expressions),
     'fill-opacity': getFeatureOpacity(paint, 'fill'),
     'fill-layer-opacity': input.opacity ?? 1,
-    'fill-outline-color': stroke.disabled ? MAP_COLORS.transparent : (stroke.authoredColor ?? MAP_COLORS.transparent),
+    // The native outline is always one pixel wide, so a zero-width stroke hides it too.
+    'fill-outline-color':
+      stroke.disabled || stroke.width === 0 ? MAP_COLORS.transparent : (stroke.authoredColor ?? MAP_COLORS.transparent),
   };
 }
 

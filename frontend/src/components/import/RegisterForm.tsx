@@ -16,11 +16,9 @@ import { getGeometryTypeLabel } from '@/i18n/labels';
 import { formatNumber } from '@/lib/format';
 import { describeFailureReason } from '@/lib/failure-reason';
 
-// fix(#927/#929): `restricted` is not offered at import time — a non-admin
-// owner who picked it lost access to their own dataset, and grants have no
-// write path. The type goes with the option, so nothing keeps typechecking
-// against a value the picker cannot produce.
-type DatasetVisibilityChoice = 'private' | 'public';
+// `restricted` is not offered at import time: a non-admin owner who picked it
+// would lock themselves out, and the dataset Access tab owns group sharing.
+type DatasetVisibilityChoice = 'private' | 'internal' | 'public';
 
 // The schema discovery scans for unregistered tables.
 const DISCOVERY_SCHEMA = 'data';
@@ -94,7 +92,6 @@ export function RegisterForm() {
     queryClient.invalidateQueries({ queryKey: queryKeys.ingest.discoverTables });
   }
 
-  // ── Results view ──
   if (results) {
     const successes = results.filter((r) => r.status === 'success');
     const errors = results.filter((r) => r.status === 'error');
@@ -142,7 +139,6 @@ export function RegisterForm() {
     );
   }
 
-  // ── Loading ──
   if (isLoading) {
     return (
       <div className="flex items-center justify-center rounded-xl border border-border bg-card py-12">
@@ -154,18 +150,16 @@ export function RegisterForm() {
     );
   }
 
-  // ── Error ──
   if (discoverError) {
     return (
       <div className="rounded-xl border border-border bg-card p-6">
-        <p className="text-sm text-destructive">
+        <p role="alert" className="text-sm text-destructive">
           {t('register.discoverFailed')}
         </p>
       </div>
     );
   }
 
-  // ── Empty ──
   if (tablesEmpty) {
     const allRegistered = (datasetCountHint ?? 0) > 0;
     return (
@@ -190,7 +184,6 @@ export function RegisterForm() {
     );
   }
 
-  // ── Two-panel layout ──
   return (
     <div className="grid min-h-[420px] overflow-hidden rounded-xl border border-border bg-card md:grid-cols-[280px_1fr]">
       {/* Left sidebar */}
@@ -258,7 +251,6 @@ export function RegisterForm() {
   );
 }
 
-/* ── Table detail panel ───────────────────────────────── */
 
 function TableDetail({
   table,
@@ -274,7 +266,7 @@ function TableDetail({
   isPending: boolean;
 }) {
   const { t } = useTranslation('import');
-  // feat(#1691): hide the Public option when the restrict_public_visibility
+  // Hide the Public option when the restrict_public_visibility
   // instance setting caps non-admins at non-public (server enforces via 403).
   const canSetPublic = useCanSetPublicVisibility();
   const refusal = table.refusal_reason ?? null;
@@ -308,14 +300,14 @@ function TableDetail({
       </dl>
 
       {refusal && (
-        <p id={refusalId} className="max-w-lg text-xs text-destructive">
+        <p id={refusalId} role="alert" className="max-w-lg text-xs text-destructive">
           {REFUSAL_CODES.has(refusal) ? t(`register.refusal.${refusal}`) : refusal}
         </p>
       )}
 
       {/* Actions */}
       <fieldset disabled={isPending} className="flex items-center gap-3 flex-wrap mt-5 disabled:opacity-60">
-        {/* fix(#438): DS-08 — native <select> → themed ui/select. */}
+        {/* Native <select> → themed ui/select. */}
         <Select
           value={visibility}
           onValueChange={(v) => onVisibilityChange(v as DatasetVisibilityChoice)}
@@ -325,6 +317,7 @@ function TableDetail({
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="private">{t('register.visibilityPrivate')}</SelectItem>
+            <SelectItem value="internal">{t('register.visibilityInternal')}</SelectItem>
             {canSetPublic && (
               <SelectItem value="public">{t('register.visibilityPublic')}</SelectItem>
             )}

@@ -22,6 +22,7 @@ import pytest
 from jsonschema import Draft202012Validator, FormatChecker
 
 from geolens_cli import arcgis_inventory as inventory
+from geolens_cli import arcgis_portal
 from geolens_cli import arcgis_report
 from geolens_cli.main import app
 
@@ -44,6 +45,7 @@ from .arcgis_fake import (
     EMPTY_GROUPS,
     FOLDER,
     HYDRANTS,
+    inventory_report,
     NO_RELATED,
     ORG_ID,
     PORTAL,
@@ -405,6 +407,75 @@ def test_no_groups_makes_no_group_requests(run):
     assert [s for s in portal.seen if s.path.endswith("/groups")] == []
     assert {r["groups"] for r in report["items"]} == {None}
     assert _read_errors(report) == []
+    assert "groups" not in report
+
+
+def _member_routes(role: str = "org_admin") -> dict[str, Any]:
+    portal_self = load("portal_self.json")
+    portal_self["user"]["role"] = role
+    return portal_routes(
+        {
+            "portals/self": portal_self,
+            f"content/items/{A1}/groups": {
+                "admin": [],
+                "member": [
+                    {"id": "g1", "title": "Planning", "access": "org"},
+                    {"id": "g2", "title": "Inspectors", "access": "private"},
+                ],
+                "other": [{"id": "g3", "title": "Partners", "access": "public"}],
+            },
+            "community/groups/g1": {"id": "g1", "hiddenMembers": False},
+            "community/groups/g1/users": {
+                "owner": "lead",
+                "admins": ["lead", "deputy"],
+                "users": ["staff_a", "staff_b"],
+            },
+            "community/groups/g2": {"id": "g2", "hiddenMembers": True},
+            "community/groups/g2/users": {"owner": "boss", "admins": [], "users": []},
+            "community/groups/g3": (403, {"error": {"code": 403}}),
+        }
+    )
+
+
+def test_the_members_of_every_shared_group_are_read(run):
+    result, _ = run(FakePortal(_member_routes()), "--scope", "org")
+    report = _report(result)
+
+    Draft202012Validator(
+        arcgis_report.inventory_schema(), format_checker=FormatChecker()
+    ).validate(report)
+    groups = {g["id"]: g for g in report["groups"]}
+    assert groups["g1"]["members"] == ["deputy", "lead", "staff_a", "staff_b"]
+    # An org admin is shown every member, hidden or not.
+    assert groups["g2"]["members"] == ["boss"]
+    assert groups["g3"]["members"] is None
+    assert groups["g3"]["members_unread"]
+    assert _read_errors(report) == []
+
+
+def test_a_group_member_read_failure_is_reported_but_fails_no_item(run):
+    routes = _member_routes()
+    routes["community/groups/g3"] = (404, {"error": {"code": 404}})
+    result, _ = run(FakePortal(routes), "--scope", "org")
+    report = _report(result)
+
+    assert [(e["item_id"], e["phase"]) for e in _read_errors(report)] == [
+        ("g3", "group_members")
+    ]
+    # Only the fixture's broken web map counts.
+    assert report["counts"]["failed"] == len(
+        {e["item_id"] for e in report["errors"] if e["phase"] == "item_data"}
+    )
+
+
+def test_hidden_members_are_unknown_to_anyone_but_an_org_admin(run):
+    result, _ = run(FakePortal(_member_routes("org_user")), "--scope", "org")
+    groups = {g["id"]: g for g in _report(result)["groups"]}
+
+    # The portal answers with the owner alone, which isn't the membership.
+    assert groups["g2"]["members"] is None
+    assert "hides its members" in groups["g2"]["members_unread"]
+    assert groups["g1"]["members"] == ["deputy", "lead", "staff_a", "staff_b"]
 
 
 def test_failed_item_read_keeps_the_search_result_fields(run):
@@ -1023,7 +1094,7 @@ def test_each_unresolved_item_is_read_once(run):
 
 
 def test_secret_named_keys_are_replaced_at_any_depth():
-    redact = inventory.Redactor()
+    redact = arcgis_portal.Redactor()
     redact.add("hunter22")
     data = {
         "a": {
@@ -1032,7 +1103,7 @@ def test_secret_named_keys_are_replaced_at_any_depth():
         "list": [{"credentials": {"user": "u"}}, {"token": None}],
         "token": "t",
     }
-    cleaned = inventory.redact_json(data, redact)
+    cleaned = arcgis_portal.redact_json(data, redact)
     assert cleaned["a"]["b"]["c"] == {
         "apiKey": "[REDACTED]",
         "Client_Secret": "[REDACTED]",
@@ -1050,7 +1121,7 @@ def test_redact_json_survives_nesting_deeper_than_the_recursion_limit():
         node["n"] = {}
         node = node["n"]
     node["password"] = "p"
-    cleaned = inventory.redact_json(data, inventory.Redactor())
+    cleaned = arcgis_portal.redact_json(data, arcgis_portal.Redactor())
     for _ in range(5000):
         cleaned = cleaned["n"]
     assert cleaned == {"password": "[REDACTED]"}
@@ -1121,6 +1192,33 @@ def test_read_all_item_data_scans_other_items_for_item_ids(run):
     assert _rows(report)[item]["dependencies_status"] == "parsed"
 
 
+def test_read_all_item_data_scans_array_rooted_data(run):
+    item = "7f" * 16
+    # A bytes body: a list route would be read as replies served in turn.
+    data = json.dumps([{"itemId": B1}, [{"webmap": A1}]]).encode()
+    routes = _one_item(item, "Solution", data=(200, data))
+    result, _ = run(
+        FakePortal(routes), "--scope", "org", "--read-all-item-data", "--strict"
+    )
+    assert result.exit_code == 0, result.output
+    report = _report(result)
+    assert _links(report, item) == {
+        (B1, "referenced_item", None),
+        (A1, "referenced_item", None),
+    }
+    assert _rows(report)[item]["dependencies_status"] == "parsed"
+
+
+def test_array_rooted_app_data_is_still_a_read_failure(run):
+    item = "7f" * 16
+    data = json.dumps([{"itemId": B1}]).encode()
+    routes = _one_item(item, "Dashboard", data=(200, data))
+    result, _ = run(FakePortal(routes), "--scope", "org", "--read-all-item-data")
+    report = _report(result)
+    assert _rows(report)[item]["dependencies_status"] == "error"
+    assert "did not return a JSON object" in report["errors"][0]["message"]
+
+
 def test_read_all_item_data_tolerates_files_and_missing_data(run):
     item = "7f" * 16
     routes = _one_item(item, "CSV", data=(200, b"a,b\n1,2\n"))
@@ -1153,6 +1251,87 @@ def test_read_all_item_data_does_not_report_a_file_download_as_an_error(
     assert report["errors"] == []
     assert _rows(report)[item]["dependencies_status"] == status
     assert [s for s in portal.seen if s.url.startswith(download)] == []
+
+
+def test_a_notebook_data_redirect_on_the_portal_host_is_followed(run):
+    item = "7f" * 16
+    target = f"{PORTAL}/sharing/rest/content/items/{item}/data/notebook"
+    notebook = {"map": {"itemId": A1}}
+    routes = _one_item(item, "Notebook", data=(302, {}, {"Location": target}))
+    routes[f"content/items/{item}/data/notebook"] = notebook
+    portal = FakePortal(routes)
+
+    result, _ = run(portal, "--scope", "org", "--strict")
+
+    assert result.exit_code == 0
+    report = _report(result)
+
+    assert report["errors"] == []
+    assert _rows(report)[item]["dependencies_status"] == "parsed"
+    assert (A1, "app_web_map", None) in _links(report, item)
+    hop = portal.requests_to(f"content/items/{item}/data/notebook")
+    assert len(hop) == 1
+
+
+def test_a_notebook_data_redirect_chain_stops_after_one_hop(run):
+    item = "7f" * 16
+    hop = f"{PORTAL}/sharing/rest/content/items/{item}/data/notebook"
+    routes = _one_item(item, "Notebook", data=(302, {}, {"Location": hop}))
+    routes[f"content/items/{item}/data/notebook"] = (302, {}, {"Location": hop})
+    portal = FakePortal(routes)
+
+    result, _ = run(portal, "--scope", "org", "--strict")
+
+    assert _rows(_report(result))[item]["dependencies_status"] == "error"
+    assert len(portal.requests_to(f"content/items/{item}/data")) == 1
+    assert len(portal.requests_to(f"content/items/{item}/data/notebook")) == 1
+
+
+def test_a_notebook_data_redirect_to_another_host_is_still_refused(run):
+    item = "7f" * 16
+    elsewhere = f"https://other.example.com/sharing/rest/content/items/{item}/data"
+    routes = _one_item(item, "Notebook", data=(302, {}, {"Location": elsewhere}))
+    portal = FakePortal(routes)
+
+    result, _ = run(portal, "--scope", "org", "--strict")
+
+    report = _report(result)
+    assert _rows(report)[item]["dependencies_status"] == "error"
+    assert [e["item_id"] for e in report["errors"]] == [item]
+    assert [
+        s for s in portal.seen if urlsplit(s.url).hostname == "other.example.com"
+    ] == []
+
+
+@pytest.mark.parametrize(
+    ("root", "location", "followed"),
+    [
+        (
+            "https://portal.example.com:7443/arcgis",
+            "https://portal.example.com/x",
+            False,
+        ),
+        (
+            "https://portal.example.com/arcgis",
+            "https://portal.example.com:7443/x",
+            False,
+        ),
+        (
+            "https://portal.example.com:7443/arcgis",
+            "https://portal.example.com:7443/x",
+            True,
+        ),
+        ("https://portal.example.com/arcgis", "https://portal.example.com:443/x", True),
+    ],
+)
+def test_a_followed_redirect_keeps_the_portal_host_and_effective_port(
+    root, location, followed
+):
+    client = arcgis_portal.PortalClient(root, redact=str, opener=FakePortal({}))
+
+    target = client._same_host_target(f"{root}/sharing/rest/x", location)
+
+    assert (target is not None) is followed
 
 
 def test_a_web_map_data_redirect_is_an_item_error_without_portal_advice(run):
@@ -1308,7 +1487,7 @@ def test_listing_failure_after_retries_keeps_earlier_pages(run):
     assert report["complete"] is False
     assert report["counts"]["total"] == 8
     assert _rows(report)[B1]["dependencies_status"] == "not_fetched"
-    assert [s for s in sleeps if s > inventory.MIN_REQUEST_INTERVAL + 1e-6] == [
+    assert [s for s in sleeps if s > arcgis_portal.MIN_REQUEST_INTERVAL + 1e-6] == [
         0.5,
         1.0,
     ]
@@ -1329,7 +1508,7 @@ def test_requests_are_spaced_out(run):
     result, sleeps = run(FakePortal(portal_routes()), "--scope", "org")
     assert result.exit_code == 0
     assert sleeps and all(
-        s == pytest.approx(inventory.MIN_REQUEST_INTERVAL) for s in sleeps
+        s == pytest.approx(arcgis_portal.MIN_REQUEST_INTERVAL) for s in sleeps
     )
 
 
@@ -1444,7 +1623,7 @@ def test_anonymous_org_scope_lists_without_credentials(run):
     assert result.exit_code == 0, result.output
     assert _report(result)["auth"]["mode"] == "anonymous"
     assert all(
-        inventory.ESRI_AUTHORIZATION_HEADER.lower() not in s.headers
+        arcgis_portal.ESRI_AUTHORIZATION_HEADER.lower() not in s.headers
         for s in portal.seen
     )
 
@@ -1495,7 +1674,7 @@ def test_http_portal_needs_the_explicit_flag(run, runner, monkeypatch):
 
 def test_oversized_item_data_is_an_error_row(run):
     """A /data body past the 8 MiB cap is refused as an item error."""
-    huge = b'{"pad": "' + b"x" * inventory.MAX_RESPONSE_BYTES + b'"}'
+    huge = b'{"pad": "' + b"x" * arcgis_portal.MAX_RESPONSE_BYTES + b'"}'
     routes = portal_routes({item_data_path(B1): (200, huge)})
     result, _ = run(FakePortal(routes), "--scope", "org")
     assert result.exit_code == 0, result.output
@@ -1578,10 +1757,10 @@ def test_dependency_collection_does_not_retain_item_configurations():
         }
     )
     routes.update({item_data_path(i): (200, payload) for i in ids})
-    client = inventory.PortalClient(
+    client = arcgis_portal.PortalClient(
         PORTAL,
         opener=FakePortal(routes),
-        redact=inventory.Redactor(),
+        redact=arcgis_portal.Redactor(),
         token=TOKEN,
         sleep=lambda seconds: None,
     )
@@ -1677,25 +1856,25 @@ class _TricklingResponse:
 
 def test_trickling_response_is_cut_off_at_the_deadline(monkeypatch):
     """A server trickling bytes under the socket timeout still hits the request deadline."""
-    monkeypatch.setattr(inventory, "GET_ATTEMPTS", 1)
+    monkeypatch.setattr(arcgis_portal, "GET_ATTEMPTS", 1)
     clock = FakeClock()
 
     class Opener:
         def open(self, request, timeout=None):
             return _TricklingResponse(clock)
 
-    client = inventory.PortalClient(
+    client = arcgis_portal.PortalClient(
         PORTAL,
         opener=Opener(),
-        redact=inventory.Redactor(),
+        redact=arcgis_portal.Redactor(),
         sleep=clock.sleep,
         clock=clock,
     )
     began = clock.now
-    with pytest.raises(inventory.PortalError, match="took longer") as caught:
+    with pytest.raises(arcgis_portal.PortalError, match="took longer") as caught:
         client.get_json("portals/self")
     assert caught.value.kind == "network"
-    assert clock.now - began <= inventory.REQUEST_DEADLINE + 3.0
+    assert clock.now - began <= arcgis_portal.REQUEST_DEADLINE + 3.0
 
 
 class _StallingPortal(http.server.BaseHTTPRequestHandler):
@@ -1715,22 +1894,22 @@ class _StallingPortal(http.server.BaseHTTPRequestHandler):
 
 def test_stalled_body_read_is_bounded_by_the_remaining_deadline(monkeypatch):
     """A body that stops arriving times out at the deadline, not the longer socket timeout."""
-    monkeypatch.setattr(inventory, "GET_ATTEMPTS", 1)
-    monkeypatch.setattr(inventory, "REQUEST_DEADLINE", 0.5)
-    monkeypatch.setattr(inventory, "SOCKET_TIMEOUT", 5.0)
+    monkeypatch.setattr(arcgis_portal, "GET_ATTEMPTS", 1)
+    monkeypatch.setattr(arcgis_portal, "REQUEST_DEADLINE", 0.5)
+    monkeypatch.setattr(arcgis_portal, "SOCKET_TIMEOUT", 5.0)
     monkeypatch.setenv("NO_PROXY", "*")
     _StallingPortal.release = threading.Event()
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _StallingPortal)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        client = inventory.PortalClient(
+        client = arcgis_portal.PortalClient(
             f"http://127.0.0.1:{server.server_address[1]}/portal",
             opener=inventory.build_opener(),
-            redact=inventory.Redactor(),
+            redact=arcgis_portal.Redactor(),
             sleep=lambda seconds: None,
         )
         began = time.monotonic()
-        with pytest.raises(inventory.PortalError):
+        with pytest.raises(arcgis_portal.PortalError):
             client.get_json("portals/self")
         assert time.monotonic() - began < 2.5
     finally:
@@ -1763,7 +1942,11 @@ def test_token_ignored_in_the_header_but_read_from_the_form_proceeds(run):
     portal = FakePortal(portal_routes({"portals/self": self_info}))
     result, _ = run(portal, "--scope", "org")
     assert result.exit_code == 0, result.output
-    assert _report(result)["auth"] == {"mode": "token", "user": USER}
+    assert _report(result)["auth"] == {
+        "mode": "token",
+        "user": USER,
+        "role": "org_admin",
+    }
     assert all(s.method == "POST" for s in portal.seen[1:])
 
 
@@ -1963,9 +2146,9 @@ def test_trickled_headers_and_chunk_framing_stop_at_the_deadline(
     monkeypatch, request, prefix, scheme
 ):
     """A response trickled anywhere, over HTTP or TLS, gives up at the request deadline."""
-    monkeypatch.setattr(inventory, "GET_ATTEMPTS", 1)
-    monkeypatch.setattr(inventory, "REQUEST_DEADLINE", 0.5)
-    monkeypatch.setattr(inventory, "SOCKET_TIMEOUT", 5.0)
+    monkeypatch.setattr(arcgis_portal, "GET_ATTEMPTS", 1)
+    monkeypatch.setattr(arcgis_portal, "REQUEST_DEADLINE", 0.5)
+    monkeypatch.setattr(arcgis_portal, "SOCKET_TIMEOUT", 5.0)
     monkeypatch.setenv("NO_PROXY", "*")
     handler = type(
         "Handler", (_TricklingPortal,), {"prefix": prefix, "release": threading.Event()}
@@ -1977,14 +2160,14 @@ def test_trickled_headers_and_chunk_framing_stop_at_the_deadline(
         server.socket = server_context.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        client = inventory.PortalClient(
+        client = arcgis_portal.PortalClient(
             f"{scheme}://127.0.0.1:{server.server_address[1]}/portal",
             opener=inventory.build_opener(context=client_context),
-            redact=inventory.Redactor(),
+            redact=arcgis_portal.Redactor(),
             sleep=lambda seconds: None,
         )
         began = time.monotonic()
-        with pytest.raises(inventory.PortalError, match="took longer than 0.5 s"):
+        with pytest.raises(arcgis_portal.PortalError, match="took longer than 0.5 s"):
             client.get_json("portals/self")
         assert time.monotonic() - began < 1.5
     finally:
@@ -2046,13 +2229,13 @@ def test_retry_after_http_date_is_honoured_and_clamped(run):
     )
     result, sleeps = run(FakePortal(routes))
     assert result.exit_code == 0, result.output
-    assert inventory.MAX_RETRY_AFTER in sleeps
+    assert arcgis_portal.MAX_RETRY_AFTER in sleeps
 
 
 @pytest.mark.parametrize(("offset", "expected"), [(10, 10.0), (-30, 0.0)])
 def test_retry_after_http_date_gives_the_time_until_that_date(offset, expected):
     """An HTTP-date Retry-After becomes the seconds until that date, never negative."""
-    wait = inventory._retry_after({"Retry-After": _http_date(offset)})
+    wait = arcgis_portal._retry_after({"Retry-After": _http_date(offset)})
     assert wait == pytest.approx(expected, abs=1.5)
 
 
@@ -2211,7 +2394,7 @@ def test_unknown_hosting_renders_as_unknown(run):
 
 def test_failed_item_reads_do_not_retain_their_responses(monkeypatch):
     """Peak memory stays flat when many items fail with oversized responses."""
-    monkeypatch.setattr(inventory, "MAX_RESPONSE_BYTES", 1024 * 1024)
+    monkeypatch.setattr(arcgis_portal, "MAX_RESPONSE_BYTES", 1024 * 1024)
     oversized = b"x" * (2 * 1024 * 1024)
     ids = [f"{n:032x}" for n in range(30)]
     rows = [
@@ -2241,10 +2424,10 @@ def test_failed_item_reads_do_not_retain_their_responses(monkeypatch):
         routes[f"content/items/{row['id']}"] = row
         routes[f"content/items/{row['id']}/groups"] = EMPTY_GROUPS
         routes[f"content/items/{row['id']}/relatedItems"] = NO_RELATED
-    client = inventory.PortalClient(
+    client = arcgis_portal.PortalClient(
         PORTAL,
         opener=FakePortal(routes),
-        redact=inventory.Redactor(),
+        redact=arcgis_portal.Redactor(),
         token=TOKEN,
         sleep=lambda seconds: None,
     )
@@ -2314,7 +2497,9 @@ def test_registered_group_layer_keeps_its_own_reference(run):
     ],
 )
 def test_sidecar_strings_lose_url_embedded_credentials(raw, gone):
-    cleaned = inventory.redact_json({"layers": [{"url": raw}]}, inventory.Redactor())
+    cleaned = arcgis_portal.redact_json(
+        {"layers": [{"url": raw}]}, arcgis_portal.Redactor()
+    )
     assert gone not in json.dumps(cleaned)
     assert "s.example" in json.dumps(cleaned)
 
@@ -2343,12 +2528,12 @@ def test_enterprise_foreign_hosts_are_not_called_internal(url, expected):
         "kind": "enterprise",
         "org_id": None,
     }
-    assert inventory._external_by_url(url, portal) is expected
+    assert inventory.external_by_url(url, portal) is expected
 
 
 def test_credentials_in_object_keys_are_scrubbed():
-    cleaned = inventory.redact_json(
-        {"https://s.example/q?apiKey=abc123KEY": 1}, inventory.Redactor()
+    cleaned = arcgis_portal.redact_json(
+        {"https://s.example/q?apiKey=abc123KEY": 1}, arcgis_portal.Redactor()
     )
     assert "abc123KEY" not in json.dumps(cleaned)
 
@@ -2364,7 +2549,7 @@ def test_web_scene_without_a_base_map_is_a_read_failure(run):
 
 
 def test_compound_credential_keys_are_replaced():
-    cleaned = inventory.redact_json(
+    cleaned = arcgis_portal.redact_json(
         {
             "a": {
                 "accessToken": "t1",
@@ -2373,7 +2558,7 @@ def test_compound_credential_keys_are_replaced():
                 "title": "ok",
             }
         },
-        inventory.Redactor(),
+        arcgis_portal.Redactor(),
     )
     assert cleaned == {
         "a": {
@@ -2405,8 +2590,8 @@ def test_read_all_does_not_hide_a_failed_related_read(run):
 
 
 def test_private_key_fields_are_replaced():
-    cleaned = inventory.redact_json(
-        {"privateKey": "k", "passphrase": "p"}, inventory.Redactor()
+    cleaned = arcgis_portal.redact_json(
+        {"privateKey": "k", "passphrase": "p"}, arcgis_portal.Redactor()
     )
     assert cleaned == {"privateKey": "[REDACTED]", "passphrase": "[REDACTED]"}
 
@@ -2440,9 +2625,9 @@ def test_read_all_keeps_a_view_with_a_good_parent_parsed(run):
 
 
 def test_authorization_fields_are_replaced():
-    cleaned = inventory.redact_json(
+    cleaned = arcgis_portal.redact_json(
         {"headers": {"Authorization": "Bearer x", "X-Bearer": "y"}},
-        inventory.Redactor(),
+        arcgis_portal.Redactor(),
     )
     assert cleaned == {
         "headers": {"Authorization": "[REDACTED]", "X-Bearer": "[REDACTED]"}
@@ -2549,10 +2734,10 @@ def test_storymap_web_map_resource_without_an_item_is_an_error(run):
 
 
 def test_keys_that_scrub_to_the_same_text_keep_both_values():
-    redact = inventory.Redactor()
+    redact = arcgis_portal.Redactor()
     redact.add("aaaa1111")
     redact.add("bbbb2222")
-    cleaned = inventory.redact_json({"k-aaaa1111": 1, "k-bbbb2222": 2}, redact)
+    cleaned = arcgis_portal.redact_json({"k-aaaa1111": 1, "k-bbbb2222": 2}, redact)
     assert sorted(cleaned.values()) == [1, 2]
 
 
@@ -2579,7 +2764,7 @@ def test_keys_that_scrub_to_the_same_text_keep_both_values():
     ],
 )
 def test_credential_names_are_replaced_in_keys_and_url_parameters(name):
-    cleaned = inventory.redact_json(
+    cleaned = arcgis_portal.redact_json(
         {
             "a": {
                 "b": {
@@ -2590,7 +2775,7 @@ def test_credential_names_are_replaced_in_keys_and_url_parameters(name):
                 }
             }
         },
-        inventory.Redactor(),
+        arcgis_portal.Redactor(),
     )
     assert "leak-value" not in json.dumps(cleaned)
 
@@ -2613,12 +2798,12 @@ def test_ordinary_names_survive(name):
         "a": {"b": {"c": {name: "kept-value"}}},
         "u": f"https://s.example/q?{name}=kept-value",
     }
-    cleaned = inventory.redact_json(data, inventory.Redactor())
+    cleaned = arcgis_portal.redact_json(data, arcgis_portal.Redactor())
     assert cleaned == data
 
 
 def test_redactor_keeps_what_follows_a_credential_value():
-    redact = inventory.Redactor()
+    redact = arcgis_portal.Redactor()
     assert redact("https://s.example/q?token=abc;f=json#top") == (
         "https://s.example/q?token=[REDACTED];f=json#top"
     )
@@ -2630,7 +2815,7 @@ def test_url_shaped_keys_are_scrubbed_but_keep_their_subtree():
         "https://x.example/plain": {"layers": [3]},
         "token": {"layers": [4]},
     }
-    cleaned = inventory.redact_json(data, inventory.Redactor())
+    cleaned = arcgis_portal.redact_json(data, arcgis_portal.Redactor())
     assert cleaned == {
         "https://x.example/?token=[REDACTED]": {"layers": [1, 2]},
         "https://x.example/plain": {"layers": [3]},
@@ -2659,7 +2844,7 @@ def test_assignment_shaped_keys_are_scrubbed_and_their_subtrees_kept():
         "plain": {"n": 4},
         "token": {"n": 5},
     }
-    cleaned = inventory.redact_json(data, inventory.Redactor())
+    cleaned = arcgis_portal.redact_json(data, arcgis_portal.Redactor())
     assert "abc123KEY" not in json.dumps(cleaned)
     assert cleaned == {
         "token=[REDACTED]": {"n": 1},
@@ -2746,10 +2931,54 @@ def _nested(value):
         ('prefix {"clientSecret": "abc123KEY"} suffix', "abc123KEY"),
         ('{"nested": "{\\"apiKey\\": \\"abc123KEY\\"}"}', "abc123KEY"),
         ("a=1&secret=abc123KEY", "abc123KEY"),
+        ("https://s.example/q?token=abc123KEY&f=json", "abc123KEY"),
+        ("https://s.example/q?api-key=abc123KEY&layer=2", "abc123KEY"),
+        ("https://s.example/q?api-key=abc123KEY#frag", "abc123KEY"),
+        ("https://s.example/q?authorization=Bearer%20abc123KEY&m=1", "abc123KEY"),
+        ("https://s.example/q?authorization=Bearer abc123KEY&m=1", "abc123KEY"),
+        (
+            "https://s.example/q?authorization=Negotiate abc123KEYabc&m=1",
+            "abc123KEYabc",
+        ),
+        (
+            "https://s.example/q?api-key=firstKEY123&cookie=sessionSECRET456",
+            "sessionSECRET456",
+        ),
+        (
+            'https://s.example/q?authorization=Digest u="x", response="deadbeefSECRET123"&m=1',
+            "deadbeefSECRET123",
+        ),
+        ("Token Abcdefghijkl", "Abcdefghijkl"),
+        ("Token abcdefghijkl!secret", "secret"),
+        ("https://s.example/q?" + "api-key=Kx9&" * 3000, "Kx9"),
+        ("https://s.example/q?cookie=sid=abc123KEY;theme=dark", "theme=dark"),
+        (
+            'https://s.example/q?authorization=Digest uri="/d;p=x", response="deadbeefSECRET123"&m=1',
+            "deadbeefSECRET123",
+        ),
+        (
+            "https://s.example/q?cookie=sid=abc123KEY; session=sessionSECRET456&f=json",
+            "sessionSECRET456",
+        ),
+        (
+            'https://s.example/q?authorization=Digest uri="/d?x=1&y=2", response="deadbeefSECRET123"&m=1',
+            "deadbeefSECRET123",
+        ),
+        (
+            'https://s.example/q?authorization=Digest uri="/d?x=\\"a&b\\"", response="deadbeefSECRET123"&m=1',
+            "deadbeefSECRET123",
+        ),
+        (
+            'https://s.example/q?cookie=sid="a&b"; session=sessionSECRET456&f=json',
+            "sessionSECRET456",
+        ),
+        ("https://s.example/q?author%69zation=Token abcdefghijkl&m=1", "abcdefghijkl"),
+        ("Authorization: Bearer abc.def", "abc.def"),
+        ("Authorization: Basic configuration", "configuration"),
     ],
 )
 def test_string_scrubber_masks_each_credential_shape(raw, gone):
-    cleaned = inventory.redact_json(_nested(raw), inventory.Redactor())
+    cleaned = arcgis_portal.redact_json(_nested(raw), arcgis_portal.Redactor())
     assert gone not in json.dumps(cleaned)
 
 
@@ -2760,6 +2989,8 @@ def test_string_scrubber_masks_each_credential_shape(raw, gone):
         "Bearer tokens",
         "Bearer tokens are described elsewhere",
         "Token ring network",
+        "Basic configuration options",
+        "Token authentication required",
         "authorization of the county board",
         "eyJ is a prefix",
         "keywords=parcels&title=Roads",
@@ -2768,14 +2999,110 @@ def test_string_scrubber_masks_each_credential_shape(raw, gone):
     ],
 )
 def test_string_scrubber_keeps_ordinary_text(raw):
-    cleaned = inventory.redact_json(_nested(raw), inventory.Redactor())
+    cleaned = arcgis_portal.redact_json(_nested(raw), arcgis_portal.Redactor())
     kept = cleaned["a"]["b"]["c"]["note"]
     assert json.loads(kept) == json.loads(raw) if raw.startswith("{") else kept == raw
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "https://s.example/q?api-key=abc123KEY&layer=2",
+            "https://s.example/q?api-key=[REDACTED]&layer=2",
+        ),
+        (
+            "https://s.example/q?authorization=Bearer%20abc123KEY&mode=edit",
+            "https://s.example/q?authorization=[REDACTED]&mode=edit",
+        ),
+        (
+            "https://s.example/q?api-key=abc123KEY;layer=2",
+            "https://s.example/q?api-key=[REDACTED];layer=2",
+        ),
+        (
+            "https://s.example/q?authorization=Bearer abc123KEY\nkeep=this",
+            "https://s.example/q?authorization=[REDACTED]\nkeep=this",
+        ),
+        (
+            "https://s.example/q?f=json;api-key=abc123KEY;layer=2",
+            "https://s.example/q?f=json;api-key=[REDACTED];layer=2",
+        ),
+        (
+            "https://s.example/q?authorization=Bearer abc123KEY;layer=2",
+            "https://s.example/q?authorization=[REDACTED];layer=2",
+        ),
+        (
+            "https://s.example/q?api-key=abc123KEY#frag",
+            "https://s.example/q?api-key=[REDACTED]#frag",
+        ),
+    ],
+)
+def test_url_header_parameter_masks_only_its_value(raw, expected):
+    cleaned = arcgis_portal.redact_json(_nested(raw), arcgis_portal.Redactor())
+    assert cleaned["a"]["b"]["c"]["note"] == expected
+
+
+def test_scheme_token_masking_stops_before_markup():
+    raw = "<p>Use Token abc123KEYabc</p><p>Next field</p>"
+    cleaned = arcgis_portal.redact_json(_nested(raw), arcgis_portal.Redactor())
+    assert cleaned["a"]["b"]["c"]["note"] == (
+        "<p>Use Token [REDACTED]</p><p>Next field</p>"
+    )
+
+
+def test_scheme_token_masking_stops_before_markdown_link_end():
+    raw = "[Token abc123KEYabc](https://example.com/docs)"
+    cleaned = arcgis_portal.redact_json(_nested(raw), arcgis_portal.Redactor())
+    assert (
+        cleaned["a"]["b"]["c"]["note"] == "[Token [REDACTED]](https://example.com/docs)"
+    )
+
+
+def test_scheme_token_masking_stops_at_a_comma():
+    cleaned = arcgis_portal.redact_json(
+        _nested("Token abc123KEYabc,field=value"), arcgis_portal.Redactor()
+    )
+    assert cleaned["a"]["b"]["c"]["note"] == "Token [REDACTED],field=value"
+
+
+@pytest.mark.parametrize(
+    "tail", ["&layer=2", "?mode=edit", "#frag", "` then", "} x", "|status=active"]
+)
+def test_scheme_token_masking_stops_at_url_separators(tail):
+    cleaned = arcgis_portal.redact_json(
+        _nested("Token abc123KEYabc" + tail), arcgis_portal.Redactor()
+    )
+    assert cleaned["a"]["b"]["c"]["note"] == "Token [REDACTED]" + tail
+
+
+@pytest.mark.parametrize("name", ["authorization", "cookie"])
+@pytest.mark.parametrize("quote", ['"', "'"])
+@pytest.mark.parametrize("end", ["", "\nkeep=this"])
+def test_unterminated_quote_ending_in_a_backslash_is_masked(name, quote, end):
+    raw = f"https://s.example/q?{name}=Digest {quote}AAAA1111\\{end}"
+    cleaned = arcgis_portal.redact_json(_nested(raw), arcgis_portal.Redactor())
+    assert "AAAA1111" not in json.dumps(cleaned)
+
+
+@pytest.mark.parametrize("name", ["authorization", "cookie"])
+def test_header_parameter_scan_is_linear_on_quote_runs(name):
+    raw = f"https://s.example/q?{name}=" + '\\"' * 30000 + "&x=1"
+    started = time.perf_counter()
+    arcgis_portal.redact_json(_nested(raw), arcgis_portal.Redactor())
+    assert time.perf_counter() - started < 1
+
+
+def test_prose_with_many_scheme_words_scrubs_in_linear_time():
+    raw = "Basic configuration " * 10000
+    started = time.perf_counter()
+    cleaned = arcgis_portal.redact_json(_nested(raw), arcgis_portal.Redactor())
+    assert time.perf_counter() - started < 1
+    assert cleaned["a"]["b"]["c"]["note"] == raw
+
+
 def test_json_text_inside_a_string_keeps_its_structure():
     raw = json.dumps({"layers": [{"id": 1, "token": "abc123KEY"}], "title": "T"})
-    cleaned = inventory.redact_json({"cfg": raw}, inventory.Redactor())
+    cleaned = arcgis_portal.redact_json({"cfg": raw}, arcgis_portal.Redactor())
     assert json.loads(cleaned["cfg"]) == {
         "layers": [{"id": 1, "token": "[REDACTED]"}],
         "title": "T",
@@ -2783,8 +3110,30 @@ def test_json_text_inside_a_string_keeps_its_structure():
 
 
 def test_custom_parameters_objects_are_replaced_by_key_name():
-    cleaned = inventory.redact_json(
+    cleaned = arcgis_portal.redact_json(
         {"a": {"b": {"customParameters": {"token": "abc123KEY"}}}},
-        inventory.Redactor(),
+        arcgis_portal.Redactor(),
     )
     assert cleaned == {"a": {"b": {"customParameters": "[REDACTED]"}}}
+
+
+def test_markdown_header_says_a_non_admin_inventory_lists_only_shared_items():
+    report = inventory_report()
+    report["auth"]["role"] = "org_user"
+    report["groups"] = [
+        {"id": "g1", "title": "Hidden team", "members": [], "members_unread": "hidden"}
+    ]
+
+    markdown = arcgis_report.render_markdown(report)
+
+    assert "only items that account can see are listed" in markdown
+    assert "Groups whose members could not be read (1): Hidden team" in markdown
+    report["auth"]["role"] = "org_admin"
+    assert "only items shared with" not in arcgis_report.render_markdown(report)
+
+
+def test_markdown_header_flags_a_sign_in_with_no_role():
+    report = inventory_report()
+    report["auth"].pop("role", None)
+
+    assert "role-less sign-in" in arcgis_report.render_markdown(report)

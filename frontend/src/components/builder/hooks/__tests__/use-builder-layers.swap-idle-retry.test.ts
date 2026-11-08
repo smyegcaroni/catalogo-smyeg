@@ -1,5 +1,5 @@
 /**
- * BUG-018 regression: swapLayerOnMap idle-retry during style transitions.
+ * Regression: swapLayerOnMap idle-retry during style transitions.
  *
  * Pre-fix: swapLayerOnMap did `if (!map || !map.isStyleLoaded()) return;`
  * which silently dropped render-mode switches while the style was transitioning.
@@ -57,7 +57,7 @@ function renderBuilderLayersHook(
   const removeLayerMutation = {
     mutate: vi.fn(),
   } as unknown as Parameters<typeof useBuilderLayers>[4];
-  // fix(#392): 6th positional param bridging into useBuilderSave's Save-diff baseline.
+  // 6th positional param bridging into useBuilderSave's Save-diff baseline.
   const saveBaselineSyncRef = { current: { add: () => {}, remove: () => {} } } as unknown as Parameters<typeof useBuilderLayers>[5];
   return renderHook(() =>
     useBuilderLayers(
@@ -146,7 +146,7 @@ function makeLoadedMapStub(existingLayerIds: string[] = []): MaplibreMap {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — BUG-018
+// Tests
 // ---------------------------------------------------------------------------
 
 describe('swapLayerOnMap — idle-retry during style transition (BUG-018)', () => {
@@ -167,7 +167,7 @@ describe('swapLayerOnMap — idle-retry during style transition (BUG-018)', () =
       result.current.handleRenderAsChange(LAYER_ID, 'heatmap');
     });
 
-    // once('idle', ...) must have been registered (BUG-018 fix)
+    // once('idle', ...) must have been registered
     expect(mapStub.once).toHaveBeenCalledWith('idle', expect.any(Function));
     // No immediate swap — addLayer NOT called yet (deferred to idle)
     expect(mapStub.addLayer).not.toHaveBeenCalled();
@@ -235,5 +235,27 @@ describe('swapLayerOnMap — idle-retry during style transition (BUG-018)', () =
       (args: unknown[]) => args[0] === 'idle',
     );
     expect(idleCalls).toHaveLength(1);
+  });
+
+  it('a retry left by an earlier switch stands down after a newer one', () => {
+    const layer = makeLayer({ dataset_feature_count: 100 });
+    const mapData = makeBuilderMap([layer]);
+    const mapStub = makeTransitioningMapStub([`layer-${LAYER_ID}`]);
+    const mapRef = { current: mapStub as unknown as MaplibreMap } as React.RefObject<MaplibreMap | null>;
+
+    const { result } = renderBuilderLayersHook(mapData, mapRef);
+
+    act(() => {
+      result.current.handleRenderAsChange(LAYER_ID, 'heatmap');
+    });
+    act(() => {
+      result.current.handleRenderAsChange(LAYER_ID, 'cluster');
+    });
+    act(() => {
+      mapStub._fireIdle();
+    });
+
+    // The reactive sync owns the cluster drawing; the stale heatmap swap must not redraw over it.
+    expect(mapStub.addLayer).not.toHaveBeenCalled();
   });
 });

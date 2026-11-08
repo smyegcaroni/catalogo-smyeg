@@ -19,7 +19,8 @@ from app.processing.ai.metadata_schemas import (
     QualityStatementDraftResponse,
     SummaryDraftResponse,
 )
-from app.core.config import settings
+from app.core.ai_credentials import anthropic_configured
+from app.core.db import release_connection
 from app.core.geo import extent_to_bbox
 from app.core.identity import Identity
 from app.platform.cache import tenant_cache_key
@@ -31,15 +32,15 @@ from app.core.persistent_config import (
     llm_model_default,
 )
 from app.processing.ai.service import _should_send_sample_values
-from app.processing.ai.token_usage import record_token_usage
+from app.processing.ai.token_usage import record_token_usage, usage_accounting
 
 if TYPE_CHECKING:
     from app.core.processing_port import ProcessingPort
 
 logger = structlog.stdlib.get_logger(__name__)
 
-# In-memory TTL caches for metadata AI (avoids redundant DB queries when
-# a user clicks Summary, Keywords, Lineage in quick succession).
+# In-memory TTL cache for metadata AI, so a user clicking Summary, Keywords and
+# Lineage in quick succession doesn't repeat the DB queries.
 _CACHE_TTL = 60.0  # seconds
 _dataset_context_cache: dict[str, tuple[float, str]] = {}
 
@@ -70,7 +71,6 @@ async def _build_dataset_context(
     import uuid as _uuid
 
     send_samples = await _should_send_sample_values(session)
-    # Check TTL cache
     now = time.monotonic()
     cache_key = tenant_cache_key(f"{dataset_id}:samples={send_samples}")
     cached = _dataset_context_cache.get(cache_key)
@@ -117,7 +117,9 @@ async def _build_dataset_context(
     if record.source_organization:
         parts.append(f"Source organization: {record.source_organization}")
 
-    if record.spatial_extent is not None:
+    # Left out for a VRT: its stored extent covers members a requester may not
+    # read, and this context is cached for every requester.
+    if record.spatial_extent is not None and record.record_type != "vrt_dataset":
         bounds = extent_to_bbox(record.spatial_extent)
         if bounds is None:
             logger.debug("Failed to parse spatial bounds for AI context")
@@ -127,16 +129,14 @@ async def _build_dataset_context(
     if record.access_constraints:
         parts.append(f"Access constraints: {record.access_constraints}")
 
-    # Column info
     if dataset.column_info:
         col_strs = []
         for col in dataset.column_info[:30]:
             col_strs.append(f"  - {col.get('name', '?')}: {col.get('type', '?')}")
         parts.append("Columns:\n" + "\n".join(col_strs))
 
-    # Column null + cardinality stats (cap at 20 non-geometry columns).
-    # Best-effort: missing/erroring tables degrade silently (the LLM just
-    # gets a less-grounded summary, not a request failure).
+    # Null and cardinality stats for up to 20 non-geometry columns. A missing
+    # or erroring table degrades to a less-grounded summary, not a failure.
     if dataset.column_info and dataset.table_name:
         non_geom_cols = [
             c.get("name", "")
@@ -168,7 +168,7 @@ async def _build_dataset_context(
                     )
                 parts.append("Column statistics:\n" + "\n".join(lines))
 
-    # Sample values (truncated at value level to avoid mid-JSON cuts)
+    # Capped at 10 columns x 5 values before json.dumps, so JSON is never cut.
     if send_samples and dataset.sample_values:
         truncated_samples = {}
         for col, vals in list(dataset.sample_values.items())[:10]:
@@ -176,12 +176,10 @@ async def _build_dataset_context(
         sample_str = json.dumps(truncated_samples, default=str)
         parts.append(f"Sample values: {sample_str}")
 
-    # Existing keywords
     if record.keywords:
         kw_list = [kw.keyword for kw in record.keywords]
         parts.append(f"Existing keywords: {', '.join(kw_list)}")
 
-    # Attribute metadata (current only, max 20)
     current_attrs = [a for a in dataset.attributes if a.is_current][:20]
     if current_attrs:
         attr_strs = []
@@ -190,7 +188,6 @@ async def _build_dataset_context(
             attr_strs.append(f"  - {attr.field_name} ({attr.data_type or '?'}){desc}")
         parts.append("Attribute metadata:\n" + "\n".join(attr_strs))
 
-    # Quality metrics (computed)
     if hasattr(dataset, "quality_detail") and dataset.quality_detail:
         qd = json.dumps(dataset.quality_detail, default=str)
         if len(qd) > 1000:
@@ -200,18 +197,16 @@ async def _build_dataset_context(
     if hasattr(dataset, "quality_statement") and dataset.quality_statement:
         parts.append(f"Current quality statement: {dataset.quality_statement}")
 
-    # Temporal extent
     if record.temporal_start:
         parts.append(f"Temporal start: {record.temporal_start}")
     if record.temporal_end:
         parts.append(f"Temporal end: {record.temporal_end}")
 
-    # Record type
     if hasattr(record, "record_type") and record.record_type:
         parts.append(f"Record type: {record.record_type}")
 
     result = "\n".join(parts)
-    # Store in cache (cap at 20 entries)
+    # Cache holds at most 20 entries; evict the oldest.
     if len(_dataset_context_cache) >= 20:
         oldest_key = min(
             _dataset_context_cache, key=lambda k: _dataset_context_cache[k][0]
@@ -236,9 +231,9 @@ async def _get_related_keywords_from_embeddings(
     empty list on no embedding or any error. Not cached, because the result
     depends on the caller's visibility.
 
-    Both the dataset lookup and keyword aggregation route through the Port
-    surface so processing/* carries no ``app.modules.catalog`` ORM import;
-    Enterprise overlays can intercept both calls.
+    The dataset lookup and keyword aggregation go through the Port, so
+    processing/* carries no ``app.modules.catalog`` ORM import and overlays
+    can intercept both calls.
     """
     import uuid as _uuid
 
@@ -280,15 +275,13 @@ async def _generate_structured(
     """Generate structured output through the configured AI provider.
 
     Records token usage (subsystem ``metadata``) so metadata-assist calls count
-    toward the per-user daily budget — otherwise the cap is bypassable through
-    the four ``/ai/metadata/*`` endpoints (fix(#402)).
+    toward the per-user daily budget; otherwise the cap is bypassable through
+    the four ``/ai/metadata/*`` endpoints.
     """
-
-    # Resolve provider and model from PersistentConfig
     provider = (
         await LLM_PROVIDER.get(db)
         if db is not None
-        else ("anthropic" if settings.anthropic_api_key else "openai_compatible")
+        else ("anthropic" if anthropic_configured() else "openai_compatible")
     )
     provider_ext = get_ai_provider(provider)
     runtime_config = (
@@ -299,17 +292,19 @@ async def _generate_structured(
         if db is not None
         else llm_model_default(provider, light=True)
     )
-    result, input_tokens, output_tokens = await provider_ext.structured_complete(
-        model=model,
-        system_prompt=system,
-        user_message=prompt,
-        response_model=response_model,
-        base_url=runtime_config.get("base_url"),
-        max_tokens=1024,
-        temperature=0.3,
-    )
+    if db is not None:
+        await release_connection(db)
+    async with usage_accounting(db, user_id=user_id, subsystem="metadata", model=model):
+        result, input_tokens, output_tokens = await provider_ext.structured_complete(
+            model=model,
+            system_prompt=system,
+            user_message=prompt,
+            response_model=response_model,
+            base_url=runtime_config.get("base_url"),
+            max_tokens=1024,
+            temperature=0.3,
+        )
     await record_token_usage(
-        db,
         user_id=user_id,
         subsystem="metadata",
         model=model,
@@ -321,17 +316,29 @@ async def _generate_structured(
 
 SUMMARY_SYSTEM = (
     "You are a geospatial metadata specialist following ISO 19115 conventions. "
-    "Generate a concise, informative abstract for this dataset. The summary should "
-    "describe what the dataset contains, its geographic scope (use the bounding box "
-    "to describe the coverage area in human terms if you can confidently identify "
-    "the region; otherwise describe it using the coordinate values directly), "
-    "temporal scope if apparent, intended audience, and potential uses. "
-    "Write 2-4 sentences.\n\n"
+    "Write a concise abstract for this dataset in 2-4 sentences, using only what "
+    "the metadata below supports: the title, filename, geometry type, feature "
+    "count, columns, column statistics, sample values, extent and temporal "
+    "fields.\n\n"
+    "- Describe what the features are and the attributes they carry.\n"
+    "- Describe the geographic scope from the extent. Name the area in human "
+    "terms when the coordinates or sample values clearly identify it; otherwise "
+    "give the coordinate ranges.\n"
+    "- State a time period only when temporal fields, date columns or sample "
+    "values show one. Otherwise say nothing about time.\n"
+    "- Do not name a publisher, maintainer or source agency, or describe an "
+    "intended audience, unless the metadata states it.\n"
+    "- You may add one sentence on likely uses. End that sentence with "
+    '"(inferred)" so a reviewer can tell it from the facts. If you respond in '
+    "another language, translate the marker.\n\n"
     "Example:\n"
-    "Input: Municipal boundaries, 42,000 features, bounding box: -124.8, 24.4, -66.9, 49.4.\n"
-    "Output: Municipal boundary polygons covering the contiguous United States with "
-    "approximately 42,000 features. Contains administrative boundaries suitable for "
-    "jurisdiction-based analysis, service area delineation, and regional planning."
+    "Input: Title: Municipal Boundaries. Geometry type: MultiPolygon. Feature "
+    "count: 42000. Columns: name, state_fips, population. Extent: longitude "
+    "-124.8 to -66.9, latitude 24.4 to 49.4.\n"
+    "Output: Municipal boundary polygons covering the contiguous United States, "
+    "with about 42,000 features carrying a name, a state FIPS code and a "
+    "population count. Likely uses include jurisdiction-based analysis and "
+    "regional planning (inferred)."
 )
 
 KEYWORD_SYSTEM = (
@@ -351,14 +358,18 @@ KEYWORD_SYSTEM = (
     "- All other free-text keywords (themes not in the ISO list, places, "
     "temporal): return in lowercase (e.g., 'national parks', 'united states', "
     "'2024').\n\n"
+    "## Grounding\n"
+    "- Place keywords: only places the extent, title, filename or sample values "
+    "identify.\n"
+    "- Temporal keywords: only a period that temporal fields, date columns or "
+    "sample values show. With no such evidence, suggest none.\n\n"
     "Example:\n"
-    "Input: National Parks polygons, US extent, established dates, acreage.\n"
+    "Input: National Parks polygons, US extent, acreage, no date columns.\n"
     'Output: [{"keyword": "environment", "keyword_type": "theme"}, '
     '{"keyword": "planningCadastre", "keyword_type": "theme"}, '
     '{"keyword": "protected areas", "keyword_type": "theme"}, '
     '{"keyword": "national parks", "keyword_type": "theme"}, '
-    '{"keyword": "united states", "keyword_type": "place"}, '
-    '{"keyword": "2024", "keyword_type": "temporal"}]'
+    '{"keyword": "united states", "keyword_type": "place"}]'
 )
 
 LINEAGE_SYSTEM = (
@@ -414,8 +425,8 @@ async def generate_summary_draft(
     from app.processing.ai.chat_service import lang_name
 
     context = await _build_dataset_context(session, dataset_id, port=port)
-    # Strip existing summary so the LLM re-derives from data instead of
-    # paraphrasing what's already there (mirrors quality_statement strip).
+    # Strip the existing summary so the LLM derives from data instead of
+    # paraphrasing it.
     context = "\n".join(
         line for line in context.split("\n") if not line.startswith("Current summary:")
     )
@@ -478,8 +489,8 @@ async def generate_lineage_draft(
     from app.processing.ai.chat_service import lang_name
 
     context = await _build_dataset_context(session, dataset_id, port=port)
-    # Strip existing lineage so the LLM re-derives from SRID/format deltas
-    # instead of paraphrasing what's already there.
+    # Strip the existing lineage so the LLM derives from SRID/format deltas
+    # instead of paraphrasing it.
     context = "\n".join(
         line for line in context.split("\n") if not line.startswith("Current lineage:")
     )
@@ -503,7 +514,7 @@ async def generate_quality_statement_draft(
     from app.processing.ai.chat_service import lang_name
 
     context = await _build_dataset_context(session, dataset_id, port=port)
-    # Strip existing quality statement to force derivation from metrics, not paraphrasing
+    # Strip the existing statement so it derives from metrics, not paraphrase.
     context_lines = [
         line
         for line in context.split("\n")

@@ -29,16 +29,16 @@ import {
   FALLBACK_BASEMAP_STYLE_URL_DARK,
 } from '@/lib/basemap-utils';
 import { MAP_COLORS } from '@/lib/map-colors';
-import { normalizeBboxLongitudes } from '@/lib/bbox';
+import { normalizeBboxLongitudes, toFitBounds, type Bbox } from '@/lib/bbox';
 import { randomId } from '@/lib/random-id';
 import 'maplibre-gl/dist/maplibre-gl.css';
-// feat(#846): wires maplibre v6's worker URL. Side-effect import, kept out of
-// main.tsx so map-vendor stays out of the eager entry graph (fix(#1624)).
+// Wires maplibre v6's worker URL. Side-effect import, kept out of
+// main.tsx so map-vendor stays out of the eager entry graph.
 import '@/lib/maplibre-worker';
 
 type DrawMode = 'rectangle' | 'polygon';
 
-// Persist viewport across component unmount/remount
+// Module-level so the viewport survives unmount/remount.
 let savedViewport = { longitude: 0, latitude: 20, zoom: 1 };
 
 interface SpatialFilterPanelProps {
@@ -52,10 +52,9 @@ interface SpatialFilterPanelProps {
 }
 
 /**
- * Bridge between GeoJSON.Feature<Polygon> and the store's feature type.
- * The store uses a branded/extended GeoJSON type that is structurally
- * compatible but nominally distinct — an explicit cast is required here.
- * A runtime check would be pointless since the shape is guaranteed by the caller.
+ * Bridge between GeoJSON.Feature<Polygon> and the store's feature type, which
+ * is structurally compatible but nominally distinct. The caller guarantees the
+ * shape, so a cast replaces a runtime check.
  */
 function toStoreFeature(feature: GeoJSON.Feature<GeoJSON.Polygon>): GeoJSONStoreFeatures {
   return feature as unknown as GeoJSONStoreFeatures;
@@ -94,8 +93,9 @@ function ringFeature(ring: number[][], id: string): GeoJSONStoreFeatures {
  * rejects it, which needs a registered mode and an id).
  */
 function addRectangle(td: TerraDraw, bbox: string): Array<string | number> {
-  const ids = bboxToRings(bbox).map(() => randomId());
-  const results = td.addFeatures(bboxToRings(bbox).map((ring, i) => ringFeature(ring, ids[i])));
+  const rings = bboxToRings(bbox);
+  const ids = rings.map(() => randomId());
+  const results = td.addFeatures(rings.map((ring, i) => ringFeature(ring, ids[i])));
   return results.every((r) => r.valid) ? ids : [];
 }
 
@@ -117,8 +117,7 @@ function addPolygon(td: TerraDraw, polygon: GeoJSON.Polygon): Array<string | num
 }
 
 function fitToBbox(map: MaplibreMap | null, bbox: string) {
-  const [minX, minY, maxX, maxY] = bbox.split(',').map(Number);
-  map?.fitBounds([[minX, minY], [maxX < minX ? maxX + 360 : maxX, maxY]], { padding: 40, duration: 0 });
+  map?.fitBounds(toFitBounds(bbox.split(',').map(Number) as Bbox), { padding: 40, duration: 0 });
 }
 
 function hasArea(coords: number[][]): boolean {
@@ -199,16 +198,13 @@ export function SpatialFilterPanel({
     [initialBbox, storedPolygon],
   );
 
-  // Restore drawn feature when panel reopens
   useEffect(() => {
     if (!open) return;
 
     const td = drawRef.current;
     if (!td) return;
 
-    // If we have a drawn feature ID, it's already on the map from Terra Draw state
     if (drawnFeatureIdRef.current != null) {
-      // Feature should still be in Terra Draw's store
       const feature = td.getSnapshotFeature(drawnFeatureIdRef.current);
       if (feature) {
         // A seam box is drawn as two halves; the first alone is not the area.
@@ -218,11 +214,9 @@ export function SpatialFilterPanel({
         }
         return;
       }
-      // Feature was lost, clear ref
       drawnFeatureIdRef.current = null;
     }
 
-    // Restore from initialBbox if no drawn feature
     if (initialBbox && !drawnFeatureIdRef.current) {
       try {
         restoreStoredArea(td, mapRef.current);
@@ -241,7 +235,6 @@ export function SpatialFilterPanel({
       const td = drawRef.current;
       if (!td) return;
 
-      // Clear existing drawn feature
       if (drawnFeatureIdRef.current != null) {
         try {
           td.removeFeatures([drawnFeatureIdRef.current, ...extraDrawnIdsRef.current]);
@@ -325,7 +318,6 @@ export function SpatialFilterPanel({
 
       restoredPolygonRef.current = null;
 
-      // Remove previous feature if exists
       if (drawnFeatureIdRef.current != null && drawnFeatureIdRef.current !== id) {
         try {
           td.removeFeatures([drawnFeatureIdRef.current, ...extraDrawnIdsRef.current]);
@@ -370,7 +362,6 @@ export function SpatialFilterPanel({
         drawRef.current = next;
       });
 
-      // Restore initial bbox after Terra Draw is ready
       if (initialBbox) {
         try {
           restoreStoredArea(td, map);
@@ -382,7 +373,6 @@ export function SpatialFilterPanel({
     [createDraw, initialBbox, restoreStoredArea],
   );
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
       try {

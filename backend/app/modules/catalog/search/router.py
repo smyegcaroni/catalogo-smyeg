@@ -1,6 +1,5 @@
 """Search and OGC API Records endpoints."""
 
-import asyncio
 import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -28,7 +27,9 @@ from app.modules.catalog.authorization import (
     check_dataset_access_or_anonymous,
     get_user_roles,
     visible_lineage_summaries,
+    visible_extent_column,
     visible_lineage_summary,
+    visible_vrt_extents,
     visible_vrt_source_counts,
 )
 from app.modules.catalog.datasets.domain.models import (
@@ -49,7 +50,7 @@ from app.standards.ogc.utils import (
     parse_accept_languages,
 )
 from app.standards.ogc.errors import BAD_REQUEST_RESPONSE, ERROR_RESPONSES_PUBLIC
-from app.core.geo import extent_to_bbox, rollup_bbox, rollup_bbox_columns
+from app.core.geo import extent_to_bbox, rollup_bbox, rollup_bbox_columns, shown_extent
 from app.core.public_urls import get_public_api_url, get_public_app_url
 from app.core.tile_scope import tile_template_query
 from app.modules.catalog.search.schemas import (
@@ -126,7 +127,7 @@ async def _build_raster_assets(
     user_roles: set[str],
 ) -> dict | None:
     """Fetch raster metadata for a single dataset (column list lives in
-    app/processing/raster/queries.py — KISS-6).
+    app/processing/raster/queries.py).
 
     For VRT datasets, also counts the source rasters the served VRT is made of
     that the caller may read.
@@ -135,7 +136,7 @@ async def _build_raster_assets(
     if meta is None:
         return None
 
-    # fix(#1327): count the LIVE member links (datasets/domain/service_query.py),
+    # Count the LIVE member links (datasets/domain/service_query.py),
     # not the in-flight VrtGeneration.source_count — the link write happens at
     # the artifact swap, so the generation's own count can lag what is served.
     if meta.get("vrt_type") is not None:
@@ -143,7 +144,7 @@ async def _build_raster_assets(
             await visible_vrt_source_counts(db, [dataset_id], user, user_roles)
         )[dataset_id]
 
-    # fix(#1327): current_generation_id must not reach a caller.
+    # current_generation_id must not reach a caller.
     meta.pop("current_generation_id", None)
     return meta
 
@@ -162,7 +163,7 @@ async def _handle_search(
 ) -> OGCFeatureCollectionResponse:
     """Parse parameters, run search, and return OGC FeatureCollection."""
     public_api_url = await get_public_api_url(db, request=request)
-    # fix(#315): raster/VRT raster_tiles assets are served at the
+    # Raster/VRT raster_tiles assets are served at the
     # public APP origin (/raster-tiles/...), not the /api origin.
     public_app_url = await get_public_app_url(db, request=request)
     preferred_languages = parse_accept_languages(request)
@@ -198,14 +199,15 @@ async def _handle_search(
 
     cache_key: str | None = None
     if search_cache.is_anon_cacheable(user):
-        # Only read semantic flag when caching is applicable — authed callers skip both reads.
+        # The semantic flag is read only when caching applies; authed callers
+        # skip both reads.
         semantic_enabled_for_key = await SEMANTIC_SEARCH_ENABLED.get(db)
         cache_key = search_cache.build_cache_key(
             endpoint="search",
             filters=filters,
             user_roles=user_roles,
             public_api_url=public_api_url,
-            # fix(#315): raster_tiles asset hrefs depend on the app origin, so it
+            # raster_tiles asset hrefs depend on the app origin, so it
             # must be in the key (multi-origin deploys sharing one API host).
             public_app_url=public_app_url,
             semantic_enabled=semantic_enabled_for_key,
@@ -241,9 +243,15 @@ async def _handle_search(
         extent_geojson_map,
     ) = await _bulk_fetch_dataset_metadata(db, datasets, user, user_roles)
 
-    # fix(#1103): one visibility query for the page, not one per row.
+    # One visibility query for the page, not one per row.
     lineage = await visible_lineage_summaries(
         db, [d.record for d in datasets], user, user_roles
+    )
+    vrt_extents = await visible_vrt_extents(
+        db,
+        [d.id for d in datasets if d.record.record_type == "vrt_dataset"],
+        user,
+        user_roles,
     )
 
     features = [
@@ -256,6 +264,7 @@ async def _handle_search(
             public_app_url=public_app_url,
             preferred_languages=preferred_languages,
             lineage_summary=lineage[d.record_id],
+            vrt_extents=vrt_extents,
         )
         for d in datasets
     ]
@@ -283,8 +292,8 @@ async def _handle_search(
         and (collection_type_requested or collection_ids is not None)
     )
 
-    # fix(#315): retain the five-item page-0 augmentation for native text search.
-    # fix(#475): explicit Records collection filters participate in the combined
+    # Retain the five-item page-0 augmentation for native text search.
+    # Explicit Records collection filters participate in the combined
     # dataset-first result set, including its count and pagination.
     page0_collection_cap = 5
 
@@ -328,7 +337,6 @@ async def _handle_search(
         for coll in coll_results:
             features.append(collection_search_feature(coll, public_api_url))
 
-    # Build pagination links
     active_params = params.active_pagination_params()
     if extra_pagination_params:
         active_params.update(extra_pagination_params)
@@ -374,7 +382,6 @@ async def _handle_search(
             )
         )
 
-    # Previous link: not on first page
     if params.offset > 0:
         links.append(
             OGCRecordLink(
@@ -395,7 +402,7 @@ async def _handle_search(
         timeStamp=datetime.now(timezone.utc)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z"),
-        # fix(#315): stable across pages; fix(#475): explicitly selected
+        # Stable across pages; explicitly selected
         # collections are counted and paginated with datasets.
         numberMatched=total + collection_total,
         numberMatchedAllTypes=matched_all_types,
@@ -420,7 +427,7 @@ def _resolve_filter_lang(
     """Resolve and validate ``filter-lang``, shared by both search handlers.
 
     Reads the raw query param, not ``params.cql2_filter_lang`` (unbindable
-    via ``collection_items``'s bare ``Depends()``, fix(#1671)). Stays ``str``
+    via ``collection_items``'s bare ``Depends()``). Stays ``str``
     so an invalid value 400s instead of FastAPI's 422; an empty value counts
     as "not supplied".
     """
@@ -437,12 +444,12 @@ search_router.include_router(saved_search_router)
 
 
 def _semantic_search_rate_limit(_request: Request | None = None) -> str:
-    """SEC-S11: per-IP rate limit for semantic search endpoints (caps OpenAI embedding cost)."""
+    """Per-IP rate limit for semantic search endpoints (caps OpenAI embedding cost)."""
     return f"{get_cached_semantic_search_rate_limit()}/minute"
 
 
 def _semantic_search_query_already_claimed(request: Request) -> bool:
-    """fix(#1903): true when the OTHER search route already claimed this query.
+    """True when the OTHER search route already claimed this query.
 
     Never creates a claim: this runs before the limiter's own admit/reject
     check, so a request the bucket rejects must not seed one. A non-exempt
@@ -453,8 +460,8 @@ def _semantic_search_query_already_claimed(request: Request) -> bool:
     query_text = request.query_params.get("q")
     if not query_text:
         return False
-    # fix(#1903): the route's own identity, not a path substring test --
-    # stable even if a future route in this scope shares the "facets" text.
+    # The route's own identity, not a path substring test, which a future
+    # route sharing the "facets" text would break.
     route = request.scope["route"].name
     client_key = get_remote_address(request)
     if consume_paired_query_claim(client_key, query_text, route):
@@ -464,7 +471,7 @@ def _semantic_search_query_already_claimed(request: Request) -> bool:
 
 
 def _finalize_semantic_search_claim(request: Request) -> None:
-    """fix(#1903): record this request's claim once it is known to be admitted.
+    """Record this request's claim once it is known to be admitted.
 
     Call at the very top of a search handler -- reaching that point already
     proves the rate limit let the request through. A no-op when the gate
@@ -475,18 +482,22 @@ def _finalize_semantic_search_claim(request: Request) -> None:
         record_paired_query_claim(*pending)
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — slash form is canonical
-# (in OpenAPI); no-slash is a hidden alias closing the 404 regression from
-# redirect_slashes=False (api/main.py).
+# The slash form is canonical (in OpenAPI); the no-slash alias is hidden and
+# covers redirect_slashes=False (api/main.py).
 @search_router.get(
-    "/facets", response_model=FacetCountResponse, include_in_schema=False
+    "/facets",
+    response_model=FacetCountResponse,
+    include_in_schema=False,
+    summary="Get search facet counts",
 )
-@search_router.get("/facets/", response_model=FacetCountResponse)
-# fix(#1855): facets embed the query, so both routes draw on ONE SEC-S11
-# bucket. fix(#1903): no override_defaults -- this limit_value is callable,
-# so SlowAPIMiddleware already charges the global default unconditionally
-# for it (test_semantic_search_rate_limit_1778.py); adding it here would
-# only double that charge.
+@search_router.get(
+    "/facets/", response_model=FacetCountResponse, summary="Get search facet counts"
+)
+# Facets embed the query, so both routes draw on one semantic-search bucket. No
+# override_defaults: this limit_value is callable, so the global rate-limit
+# middleware already charges the global default for it
+# (test_global_rate_limit_async_2936.py), and adding it here would double the
+# charge.
 @limiter.shared_limit(
     _semantic_search_rate_limit,
     scope="semantic_search",
@@ -568,19 +579,21 @@ async def search_facets_endpoint(
     return result
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see /facets above.
+# Slash and no-slash paths, as for /facets above.
 @search_router.get(
     "/datasets",
     response_model=OGCFeatureCollectionResponse,
     include_in_schema=False,
+    summary="Search datasets",
 )
 @search_router.get(
     "/datasets/",
     response_model=OGCFeatureCollectionResponse,
     responses={400: BAD_REQUEST_RESPONSE},
+    summary="Search datasets",
 )
-# fix(#1903): the facets route's callable-limit note above applies here
-# symmetrically -- this route can be the SECOND of the pair too.
+# The facets route's callable-limit note above applies here too: this route
+# can be the second of the pair.
 @limiter.shared_limit(
     _semantic_search_rate_limit,
     scope="semantic_search",
@@ -638,12 +651,12 @@ async def _build_collection_metadata(
     else:
         user_roles = set()
 
-    # fix(#886): rollup_bbox_columns aggregates in two longitude domains so a
+    # rollup_bbox_columns aggregates in two longitude domains so a
     # catalog with records either side of the antimeridian keeps the narrower
     # range instead of folding to a global bbox.
     extent_stmt = (
         select(
-            *rollup_bbox_columns(Record.spatial_extent),
+            *rollup_bbox_columns(visible_extent_column(user, user_roles)),
             func.min(Record.temporal_start).label("temporal_start"),
             func.max(Record.temporal_end).label("temporal_end"),
         )
@@ -792,13 +805,18 @@ def _build_collection_links(public_api_url: str) -> list[dict]:
     ]
 
 
-# ROUTE-01 (Phase 1092): canonical form is "" (no-slash); trailing-slash is
-# a hidden alias, preventing the 307 + http://api:8000 Location-header leak
-# from redirect_slashes=False (api/main.py; mirrors catalog/maps/router.py).
+# Canonical form is "" (no slash); the trailing-slash alias is hidden and
+# prevents the 307 + http://api:8000 Location-header leak from
+# redirect_slashes=False (api/main.py; mirrors catalog/maps/router.py).
 @collections_router.get(
-    "/", response_model=OGCCollectionsResponse, include_in_schema=False
+    "/",
+    response_model=OGCCollectionsResponse,
+    include_in_schema=False,
+    summary="List OGC collections",
 )
-@collections_router.get("", response_model=OGCCollectionsResponse)
+@collections_router.get(
+    "", response_model=OGCCollectionsResponse, summary="List OGC collections"
+)
 async def list_collections(
     request: Request,
     response: Response,
@@ -813,8 +831,8 @@ async def list_collections(
 ) -> OGCCollectionsResponse:
     """List available OGC collections (catalog + per-dataset feature collections)."""
     public_api_url = await get_public_api_url(db, request=request)
-    # Raster tiles are served at the public APP origin (/raster-tiles/...), not
-    # the /api origin (which has no such route). fix(#315)
+    # Raster tiles are served at the public app origin (/raster-tiles/...);
+    # the /api origin has no such route.
     public_app_url = await get_public_app_url(db, request=request)
 
     catalog_collection = await _build_collection_metadata(db, user, public_api_url)
@@ -841,22 +859,28 @@ async def list_collections(
     count_stmt = select(func.count()).select_from(ds_base.subquery())
     total_datasets = (await db.execute(count_stmt)).scalar_one()
 
-    # fix(#1778): no ORDER BY meant OFFSET/LIMIT paging had no defined row
-    # order -- add a deterministic tiebreaker before paging, matching the
-    # STAC peer routers.
+    # Without an ORDER BY, OFFSET/LIMIT paging has no defined row order; the
+    # deterministic tiebreaker matches the STAC peer routers.
     ds_stmt = ds_base.order_by(Record.created_at.desc(), Dataset.id.desc())
     ds_stmt = ds_stmt.offset(offset).limit(limit)
     ds_result = await db.execute(ds_stmt)
     datasets = ds_result.scalars().unique().all()
 
+    vrt_extents = await visible_vrt_extents(
+        db,
+        [d.id for d in datasets if d.record.record_type == "vrt_dataset"],
+        user,
+        user_roles,
+    )
     dataset_collections = []
     for ds in datasets:
         extent = {}
-        if ds.record.spatial_extent is not None:
-            # fix(#892): OGC bbox convention needs west > east across a seam;
+        spatial_extent = shown_extent(ds.record, ds.id, vrt_extents)
+        if spatial_extent is not None:
+            # OGC bbox convention needs west > east across a seam;
             # extent_to_bbox returns None on a parse failure, which degrades
             # to no spatial extent.
-            bbox = extent_to_bbox(ds.record.spatial_extent)
+            bbox = extent_to_bbox(spatial_extent)
             if bbox is None:
                 logger.warning("Failed to serialize OGC bbox extent")
             else:
@@ -878,7 +902,7 @@ async def list_collections(
                 ]
             }
 
-        # fix(#315): raster/VRT have no feature table -> mirror the detail
+        # Raster/VRT have no feature table -> mirror the detail
         # endpoint (coverage, no rel=items, add rel=tiles) so crawlers skip
         # the dead /items and still find the data.
         item_type = capabilities(ds.record.record_type).ogc_item_type
@@ -906,8 +930,8 @@ async def list_collections(
                 }
             )
         else:
-            # fix(#1372, #2007): versioned like every rendered template so a
-            # refetching client stops sharing the unversioned cache entry.
+            # Versioned like every rendered template, so a refetching client
+            # stops sharing the unversioned cache entry.
             raster_tiles_path = f"/raster-tiles/{ds.id}/tiles/{{z}}/{{x}}/{{y}}.png" + (
                 tile_template_query(ds.tile_cache_version, ds.publication_version)
             )
@@ -998,7 +1022,11 @@ async def list_collections(
     return result
 
 
-@collections_router.get("/datasets", response_model=OGCCollectionMetadataResponse)
+@collections_router.get(
+    "/datasets",
+    response_model=OGCCollectionMetadataResponse,
+    summary="Get the datasets collection",
+)
 async def get_collection_metadata(
     request: Request,
     user: Identity | None = Depends(get_optional_user),
@@ -1010,7 +1038,11 @@ async def get_collection_metadata(
     return OGCCollectionMetadataResponse(**result)
 
 
-@collections_router.get("/datasets/queryables", response_class=JSONResponse)
+@collections_router.get(
+    "/datasets/queryables",
+    response_class=JSONResponse,
+    summary="Get the datasets collection queryables",
+)
 async def get_queryables(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -1023,7 +1055,11 @@ async def get_queryables(
     )
 
 
-@collections_router.get("/datasets/schema", response_class=JSONResponse)
+@collections_router.get(
+    "/datasets/schema",
+    response_class=JSONResponse,
+    summary="Get the catalog record schema",
+)
 async def get_record_schema(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -1036,7 +1072,11 @@ async def get_record_schema(
     )
 
 
-@collections_router.get("/datasets/sortables", response_class=JSONResponse)
+@collections_router.get(
+    "/datasets/sortables",
+    response_class=JSONResponse,
+    summary="Get the datasets collection sortables",
+)
 async def get_sortables(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -1089,13 +1129,14 @@ async def get_sortables(
         },
         **ERROR_RESPONSES_PUBLIC,
     },
+    summary="List catalog records",
 )
 async def collection_items(
     request: Request,
-    # NOT ``Annotated[SearchQueryParams, Query()]`` (used by search_datasets_endpoint):
-    # alongside the five OGC params below, that form collapses to a single
-    # scalar named ``params`` — worse than defect #1666. The published
-    # contract is corrected in ``_repair_depends_bound_query_model``.
+    # Not ``Annotated[SearchQueryParams, Query()]`` (as in
+    # search_datasets_endpoint): alongside the five OGC params below, that form
+    # collapses to a single scalar named ``params``. The published contract is
+    # corrected in ``_repair_depends_bound_query_model``.
     params: SearchQueryParams = Depends(),
     type_param: list[str] = Query(
         default_factory=list,
@@ -1175,13 +1216,12 @@ async def collection_items(
         overrides["sort_by"] = parsed[0]
         overrides["sort_desc"] = parsed[1]
 
-    # `keywords` and hyphenated `filter-lang` don't bind through the `Depends()`
-    # model (pydantic can't name a `filter-lang` param; `list[str]` reads as a
-    # body), so both are read from the raw query string here instead.
+    # `keywords` and hyphenated `filter-lang` don't bind through the
+    # `Depends()` model (pydantic can't name a `filter-lang` param; `list[str]`
+    # reads as a body), so both are read from the raw query string.
     raw_keywords = request.query_params.getlist("keywords")
     if raw_keywords:
-        # Query string wins over any `params.keywords` FastAPI bound from a
-        # GET body via `Depends()`.
+        # Query string wins over any `params.keywords` bound via `Depends()`.
         overrides["keywords"] = raw_keywords
 
     effective_params = params.model_copy(update=overrides) if overrides else params
@@ -1227,6 +1267,7 @@ async def collection_items(
         },
         **ERROR_RESPONSES_PUBLIC,
     },
+    summary="Get a catalog record",
 )
 async def get_collection_item(
     record_id: uuid.UUID,
@@ -1269,8 +1310,8 @@ async def get_collection_item(
             "description": da.description,
         }
         for da in await get_catalog_port().get_dataset_assets(db, record_id)
-        # fix(#1290): filtered where FETCHED so internal keys never enter a
-        # payload structure at all, independent of the downstream builder.
+        # Filtered where fetched, so internal keys never enter the payload
+        # whatever the downstream builder does.
         if is_public_asset_key(da.key)
     ]
 
@@ -1290,7 +1331,7 @@ async def get_collection_item(
             item_raster_meta = None
 
     public_api_url = await get_public_api_url(db, request=request)
-    # fix(#315): raster_tiles asset href uses the public APP origin.
+    # raster_tiles asset href uses the public APP origin.
     public_app_url = await get_public_app_url(db, request=request)
     content = dataset_to_ogc_record(
         dataset,
@@ -1299,10 +1340,13 @@ async def get_collection_item(
         raster_meta=item_raster_meta,
         public_app_url=public_app_url,
         preferred_languages=parse_accept_languages(request),
-        # fix(#1103): the datasets this one was derived from are checked on
+        # The datasets this one was derived from are checked on
         # their own, separately from the requester's check above.
         lineage_summary=await visible_lineage_summary(
             db, dataset.record, user, user_roles
+        ),
+        vrt_extents=await visible_vrt_extents(
+            db, [record_id] if rec_type == "vrt_dataset" else [], user, user_roles
         ),
     )
     return JSONResponse(
@@ -1328,88 +1372,41 @@ async def _bulk_fetch_dataset_metadata(
     """Bulk-fetch the three pre-render maps used by dataset_to_ogc_record.
 
     Needs materialized ``datasets`` (not just IDs) for
-    ``d.record.record_type``. PERF-02: STAC assets and GeoJSON extents run
-    concurrently on fresh sessions (AsyncSession isn't concurrency-safe);
-    raster meta + VRT source_count stay sequential, since the VRT step
-    mutates raster_meta in place. Per-block exceptions degrade to empty.
+    ``d.record.record_type``. Every lookup runs sequentially on ``db``: a
+    nested ``async_session()`` per lookup would take extra pool connections
+    while this request already holds one, and concurrent searches then wait
+    on each other until the pool timeout.
     """
     all_dataset_ids = [d.id for d in datasets]
 
-    async def _block_stac() -> dict[str, list[dict]]:
-        stac_assets: dict[str, list[dict]] = {}
-        if not all_dataset_ids:
-            return stac_assets
-        try:
-            from app.core.db import async_session
-
-            async with async_session() as inner_db:
-                for da in await get_catalog_port().list_dataset_assets(
-                    inner_db, all_dataset_ids
-                ):
-                    # fix(#1290): same boundary as the item endpoint above.
-                    if not is_public_asset_key(da.key):
-                        continue
-                    ds_key = str(da.dataset_id)
-                    stac_assets.setdefault(ds_key, []).append(
-                        {
-                            "key": da.key,
-                            "href": da.href,
-                            "media_type": da.media_type,
-                            "roles": da.roles,
-                            "title": da.title,
-                            "description": da.description,
-                        }
-                    )
-        except Exception:  # broad: bulk STAC asset fetch — degrade to empty so other enrichment can still run
-            logger.warning(
-                "search_bulk_fetch_stac_assets_failed",
-                dataset_count=len(all_dataset_ids),
-                exc_info=True,
+    stac_assets_by_dataset: dict[str, list[dict]] = {}
+    extent_geojson_map: dict[str, str | None] = {}
+    if all_dataset_ids:
+        for da in await get_catalog_port().list_dataset_assets(db, all_dataset_ids):
+            # Same boundary as the item endpoint above.
+            if not is_public_asset_key(da.key):
+                continue
+            stac_assets_by_dataset.setdefault(str(da.dataset_id), []).append(
+                {
+                    "key": da.key,
+                    "href": da.href,
+                    "media_type": da.media_type,
+                    "roles": da.roles,
+                    "title": da.title,
+                    "description": da.description,
+                }
             )
-            return {}
-        return stac_assets
-
-    async def _block_extents() -> dict[str, str | None]:
-        extents: dict[str, str | None] = {}
-        if not all_dataset_ids:
-            return extents
-        try:
-            from app.core.db import async_session
-
-            async with async_session() as inner_db:
-                geojson_stmt = (
-                    select(
-                        Dataset.id,
-                        func.ST_AsGeoJSON(Record.spatial_extent, 6).label("geojson"),
-                    )
-                    .join(Record, Dataset.record_id == Record.id)
-                    .where(Dataset.id.in_(all_dataset_ids))
-                )
-                for _row in (await inner_db.execute(geojson_stmt)).all():
-                    extents[str(_row.id)] = _row.geojson
-        except Exception:  # broad: bulk GeoJSON extent fetch — degrade to empty so search response still ships
-            logger.warning(
-                "search_bulk_fetch_geojson_extents_failed",
-                dataset_count=len(all_dataset_ids),
-                exc_info=True,
+        geojson_stmt = (
+            select(
+                Dataset.id,
+                func.ST_AsGeoJSON(Record.spatial_extent, 6).label("geojson"),
             )
-            return {}
-        return extents
+            .join(Record, Dataset.record_id == Record.id)
+            .where(Dataset.id.in_(all_dataset_ids))
+        )
+        for row in (await db.execute(geojson_stmt)).all():
+            extent_geojson_map[str(row.id)] = row.geojson
 
-    # return_exceptions=True keeps one block's failure from cancelling the
-    # other; non-dict results coerce back to empty dicts as the fallback.
-    stac_result, extent_result = await asyncio.gather(
-        _block_stac(), _block_extents(), return_exceptions=True
-    )
-    stac_assets_by_dataset: dict[str, list[dict]] = (
-        stac_result if isinstance(stac_result, dict) else {}
-    )
-    extent_geojson_map: dict[str, str | None] = (
-        extent_result if isinstance(extent_result, dict) else {}
-    )
-
-    # Order is load-bearing: VRT source_count mutates raster_meta in place,
-    # so they MUST stay serialized (reusing `db` now the gather is done).
     raster_meta: dict[str, dict] = {}
     raster_ids = [
         d.id
@@ -1429,7 +1426,7 @@ async def _bulk_fetch_dataset_metadata(
             )
             raster_meta = {}
 
-        # Block 3 — VRT source_count (mutates raster_meta IN PLACE)
+        # VRT source_count (mutates raster_meta in place)
         if raster_meta:
             try:
                 vrt_dataset_ids = [

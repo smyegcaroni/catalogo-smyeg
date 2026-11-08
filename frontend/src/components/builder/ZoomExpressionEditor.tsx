@@ -34,7 +34,7 @@ interface ZoomExpressionEditorProps {
 const MAX_STOPS = 6;
 const DEFAULT_ZOOM_GAP = 4;
 
-// builder-audit #338 DRY-03: isFiniteNumber imported from zoom-expressions (single copy).
+// isFiniteNumber imported from zoom-expressions (single copy).
 
 function formatDisplayValue(value: number, format?: NumericFormat): string {
   if (format === 'percent') {
@@ -86,12 +86,11 @@ export function ZoomExpressionEditor({
   onChange,
 }: ZoomExpressionEditorProps) {
   const { t } = useTranslation('builder');
-  // fix(#922): the sync effect below re-seeds `draft` whenever `parsed` changes
-  // identity, and invalid drafts are never emitted — so a re-hydration that
-  // replaces the paint array with an equal one (save, render-mode switch, style
-  // paste) silently reverted a half-typed stop. Key the memo on the SERIALIZED
-  // value so an unchanged expression keeps its identity. Same family as the
-  // applyLayerUpdate stale-ref clobber.
+  // The sync effect below re-seeds `draft` whenever `parsed` changes identity,
+  // and invalid drafts are never emitted, so a re-hydration that replaces the
+  // paint array with an equal one (save, render-mode switch, style paste) would
+  // revert a half-typed stop. Key the memo on the serialized value so an
+  // unchanged expression keeps its identity.
   const valueKey = JSON.stringify(value ?? null);
   // eslint-disable-next-line react-hooks/exhaustive-deps -- valueKey IS value, by content
   const parsed = useMemo(() => parseZoomExpression(value), [valueKey]);
@@ -138,12 +137,11 @@ export function ZoomExpressionEditor({
   }
 
   function updateStop(index: number, patch: Partial<{ zoom: number; value: number }>) {
-    // fix(#526 B-043): clamp manually-typed stop values to the property's
-    // range — the <Input min/max> attributes are advisory only, and
-    // validateZoomExpressionDraft checks finiteness/zoom order but never the
-    // value range, so out-of-spec paint (circle-radius 0, negative
-    // line-width, opacity > 1) reached MapLibre. addStop already clamps;
-    // typing was the inconsistent path.
+    // Clamp manually typed stop values to the property's range: the <Input
+    // min/max> attributes are advisory, and validateZoomExpressionDraft checks
+    // finiteness and zoom order but not the value range, so out-of-spec paint
+    // (circle-radius 0, negative line-width, opacity > 1) would reach MapLibre.
+    // addStop already clamps.
     const clamped =
       patch.value !== undefined && isFiniteNumber(patch.value)
         ? { ...patch, value: clampValue(patch.value, min, max) }
@@ -275,7 +273,7 @@ export function ZoomExpressionEditor({
                 step={step}
                 value={numericInputValue(draft.baseValue)}
                 onChange={(event) => {
-                  // fix(#526 B-043): same manual-typing clamp as updateStop.
+                  // Same manual-typing clamp as updateStop.
                   const raw = event.currentTarget.valueAsNumber;
                   emitDraft({
                     ...draft,

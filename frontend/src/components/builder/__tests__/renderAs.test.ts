@@ -1,3 +1,4 @@
+import { MAP_COLORS } from '@/lib/map-colors';
 import { describe, expect, it } from 'vitest';
 import {
   RENDER_AS_WRITABLE_FIELDS,
@@ -7,12 +8,11 @@ import {
   getCurrentRenderAs,
   getRenderAsOptions,
   getRendererCapabilities,
-  getRendererCapability,
   getRenderAsSource,
   hasCustomizedRenderAsStyle,
-  isSupportedRenderAsId,
 } from '../renderAs';
 import type { MapLayerResponse, StyleConfig } from '@/types/api';
+import { DEFAULT_CIRCLE_PAINT } from '../layer-adapters/builder-defaults';
 
 function layer(overrides: Partial<MapLayerResponse> = {}): MapLayerResponse {
   return {
@@ -105,11 +105,11 @@ describe('renderAs view model', () => {
   it('exposes line arrow as a renderer capability for line layers', () => {
     const line = layer({ dataset_geometry_type: 'MULTILINESTRING' });
     const capabilities = getRendererCapabilities(line);
-    const arrow = getRendererCapability('arrow', line);
+    const arrow = capabilities.find((entry) => entry.id === 'arrow');
 
     expect(RENDERER_CAPABILITIES.length).toBeGreaterThan(0);
     expect(capabilities.map((entry) => entry.id)).toEqual(['line', 'arrow']);
-    // builder-audit #338 ADAPT-07: RendererCapability is trimmed to {id,label,source,
+    // RendererCapability is trimmed to {id,label,source,
     // requiresClusterSource}; assert the surviving consumed fields only (no inert
     // backend/companionLayers/viewerSupport/styleJsonSupport/writableFields metadata).
     expect(arrow).toMatchObject({ id: 'arrow', label: 'Arrow', source: 'vector-line' });
@@ -118,7 +118,7 @@ describe('renderAs view model', () => {
 
   it('exposes point cluster as a cluster-source-gated capability for bounded point layers', () => {
     const point = layer({ dataset_geometry_type: 'POINT', dataset_feature_count: 100 });
-    const cluster = getRendererCapability('cluster', point);
+    const cluster = getRendererCapabilities(point).find((entry) => entry.id === 'cluster');
 
     expect(getRendererCapabilities(point).map((entry) => entry.id)).toEqual(['point', 'symbol', 'heatmap', 'cluster']);
     expect(cluster).toMatchObject({
@@ -200,10 +200,11 @@ describe('renderAs view model', () => {
   });
 
   it('does not expose punted v1002 renderers', () => {
+    const supportedIds = RENDERER_CAPABILITIES.map((entry) => entry.id);
     for (const renderer of UNSUPPORTED_V1002_RENDERERS) {
-      expect(isSupportedRenderAsId(renderer)).toBe(false);
+      expect(supportedIds).not.toContain(renderer);
     }
-    expect(isSupportedRenderAsId('cluster')).toBe(true);
+    expect(supportedIds).toContain('cluster');
 
     const allOptionIds = [
       ...optionIds(layer({ dataset_geometry_type: 'POINT' })),
@@ -220,6 +221,30 @@ describe('renderAs view model', () => {
     expect(RENDER_AS_WRITABLE_FIELDS).toEqual(['layer_type', 'style_config', 'paint', 'layout']);
     expect(RENDER_AS_WRITABLE_FIELDS).not.toContain('is_3d');
     expect(JSON.stringify(getRenderAsOptions(layer({ is_3d: true })))).not.toContain('is_3d');
+  });
+
+  it('reapplying 3D to a legacy layer keeps its _height_column as the builder height column', () => {
+    const legacy = layer({
+      dataset_geometry_type: 'POLYGON',
+      paint: { 'fill-color': '#336699', _height_column: 'height_m' },
+    });
+
+    const mutation = buildRenderAsPatch(legacy, 'extrusion-3d');
+
+    expect(mutation?.patch.style_config?.builder?.heightColumn).toBe('height_m');
+    expect(mutation?.patch.paint).not.toHaveProperty('_height_column');
+  });
+
+  it('leaving 3D drops the legacy _height_column paint key so the layer is no longer 3D', () => {
+    const legacy = layer({
+      dataset_geometry_type: 'POLYGON',
+      paint: { 'fill-color': '#336699', _height_column: 'height_m' },
+    });
+    expect(getCurrentRenderAs(legacy)).toBe('extrusion-3d');
+
+    const mutation = buildRenderAsPatch(legacy, 'fill');
+
+    expect(mutation?.patch.paint).not.toHaveProperty('_height_column');
   });
 
   it('builds point renderAs patches using only existing writable fields', () => {
@@ -253,12 +278,13 @@ describe('renderAs view model', () => {
         builder: expect.objectContaining({
           clusterRadius: 48,
           clusterMaxZoom: 14,
-          clusterColor: '#2255aa',
           clusterTextColor: '#ffffff',
           clusterTextSize: 12,
         }),
       }),
     }));
+    // Unset, so the bubbles keep following the point colour.
+    expect(mutation?.patch.style_config?.builder).not.toHaveProperty('clusterColor');
     for (const key of Object.keys(mutation?.patch ?? {})) {
       expect(RENDER_AS_WRITABLE_FIELDS).toContain(key);
     }
@@ -270,6 +296,72 @@ describe('renderAs view model', () => {
         }),
       }),
     );
+  });
+
+  it('keeps the circle paint when leaving cluster for points', () => {
+    const circlePaint = { 'circle-color': ['match', ['get', 'ada'], 1, '#16a34a', '#6b7280'], 'circle-radius': 5 };
+    const clustered = layer({
+      dataset_geometry_type: 'POINT',
+      dataset_feature_count: 100,
+      paint: circlePaint,
+      style_config: { render_mode: 'cluster' } as StyleConfig,
+    });
+
+    expect(buildRenderAsPatch(clustered, 'point')?.patch.paint).toEqual(circlePaint);
+  });
+
+  it('enters symbols from cluster with the live circle paint, not a stale stash', () => {
+    const clustered = layer({
+      dataset_geometry_type: 'POINT',
+      dataset_feature_count: 100,
+      paint: { 'circle-color': '#dc2626' },
+      style_config: { render_mode: 'cluster', savedCirclePaint: { 'circle-color': '#2255aa' } } as StyleConfig,
+    });
+
+    const mutation = buildRenderAsPatch(clustered, 'symbol');
+
+    expect(mutation?.patch.paint).toEqual({ 'circle-color': '#dc2626' });
+    expect(mutation?.patch.style_config?.savedCirclePaint).toEqual({ 'circle-color': '#dc2626' });
+  });
+
+  it('treats an empty circle stash as none when leaving a heatmap', () => {
+    const heatmap = layer({
+      dataset_geometry_type: 'POINT',
+      dataset_feature_count: 100,
+      paint: { 'heatmap-radius': 30 },
+      style_config: { render_mode: 'heatmap', savedCirclePaint: {} } as StyleConfig,
+    });
+
+    expect(buildRenderAsPatch(heatmap, 'symbol')?.patch.paint).toEqual(DEFAULT_CIRCLE_PAINT);
+    expect(buildRenderAsPatch(heatmap, 'cluster')?.patch.paint).toEqual(DEFAULT_CIRCLE_PAINT);
+  });
+
+  it.each(['symbol', 'cluster'] as const)('keeps a tuned heatmap for a return trip through %s', (target) => {
+    const tuned = { 'heatmap-radius': 45, 'heatmap-intensity': 2 };
+    const heatmap = layer({
+      dataset_geometry_type: 'POINT',
+      dataset_feature_count: 100,
+      paint: tuned,
+      style_config: { render_mode: 'heatmap', savedCirclePaint: { 'circle-color': '#2255aa' } } as StyleConfig,
+    });
+
+    const away = buildRenderAsPatch(heatmap, target);
+    expect(away?.patch.style_config?.heatmapPaint).toEqual(tuned);
+    const back = buildRenderAsPatch({ ...heatmap, ...away?.patch } as MapLayerResponse, 'heatmap');
+    expect(back?.patch.paint).toEqual(tuned);
+  });
+
+  it('enters cluster from heatmap with the stashed circle paint', () => {
+    const heatmap = layer({
+      dataset_geometry_type: 'POINT',
+      dataset_feature_count: 100,
+      paint: { 'heatmap-radius': 30 },
+      style_config: { render_mode: 'heatmap', savedCirclePaint: { 'circle-color': '#2255aa' } } as StyleConfig,
+    });
+
+    expect(buildRenderAsPatch(heatmap, 'cluster')?.patch.paint).toEqual({ 'circle-color': '#2255aa' });
+    // The stash only belongs to heatmap mode.
+    expect(buildRenderAsPatch(heatmap, 'cluster')?.patch.style_config).not.toHaveProperty('savedCirclePaint');
   });
 
   it('builds polygon fill, stroke, and 3D extrusion patches without is_3d', () => {
@@ -310,12 +402,13 @@ describe('renderAs view model', () => {
       style_config: expect.objectContaining({
         render_mode: 'arrow',
         builder: expect.objectContaining({
-          arrowColor: '#2255aa',
           arrowSize: 14,
           arrowSpacing: 80,
         }),
       }),
     }));
+    // Unset, so the arrows keep following the line colour.
+    expect(mutation?.patch.style_config?.builder).not.toHaveProperty('arrowColor');
     for (const key of Object.keys(mutation?.patch ?? {})) {
       expect(RENDER_AS_WRITABLE_FIELDS).toContain(key);
     }
@@ -379,7 +472,7 @@ describe('renderAs view model', () => {
   });
 });
 
-// fix(#430 codex): a user-chosen heightColumn is destructible extrusion state —
+// A user-chosen heightColumn is destructible extrusion state —
 // diverging from the auto-pick default must trigger the render-as confirm.
 describe('hasCustomizedRenderAsStyle — extrusion heightColumn', () => {
   const columns = [
@@ -419,7 +512,7 @@ describe('hasCustomizedRenderAsStyle — extrusion heightColumn', () => {
   });
 });
 
-// fix(#430 codex r3): symbol-only settings (iconOffset, category mapping) are
+// Symbol-only settings (iconOffset, category mapping) are
 // destructible too — leaving symbol mode drops style_config.symbol wholesale.
 describe('hasCustomizedRenderAsStyle — symbol-only settings', () => {
   const symbolLayer = (symbol: Record<string, unknown>) => layer({
@@ -480,6 +573,14 @@ describe('hasCustomizedRenderAsStyle — arrow color (fix #430 codex r17)', () =
       arrowLayer({ arrowColor: '#ff5500' }, { 'line-color': '#ff5500' }),
     )).toBe(false);
     expect(hasCustomizedRenderAsStyle(arrowLayer({}))).toBe(false);
+  });
+
+  it('an arrowColor picked over a data-driven line colour counts, even if it equals the default', () => {
+    const expression = ['match', ['get', 'kind'], 'a', '#ff0000', '#00ff00'];
+    expect(hasCustomizedRenderAsStyle(
+      arrowLayer({ arrowColor: MAP_COLORS.default.fill }, { 'line-color': expression }),
+    )).toBe(true);
+    expect(hasCustomizedRenderAsStyle(arrowLayer({}, { 'line-color': expression }))).toBe(false);
   });
 
   it('an arrowColor diverging from the seed counts', () => {

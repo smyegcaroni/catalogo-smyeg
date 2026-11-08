@@ -1,18 +1,15 @@
-// fix(#890): the viewer used to refresh tile tokens by a hand-rolled
-// `useState` + `setTimeout` loop while the builder and dataset preview used
-// TanStack Query — two opposite policies for one problem. Chrome throttles a
-// hidden tab's timers but still FIRES them, so the viewer's refresh could land
-// while hidden and push a fresh tile URL at a paused map (the dropped-`setTiles`
-// hazard from fix(#584)), while the TanStack surfaces did nothing at all until
-// the tab returned.
+// The viewer refreshes tile tokens through TanStack Query, like the builder
+// and dataset preview. A hand-rolled `useState` + `setTimeout` loop would be a
+// different policy: Chrome throttles a hidden tab's timers but still FIRES
+// them, so the refresh could land while hidden and push a fresh tile URL at a
+// paused map (MapLibre drops a `setTiles` reload while the source's
+// TileManager is paused).
 //
-// The viewer is now on the same TanStack path, so these specs pin the unified
-// policy rather than the deleted timer machinery (the fix(#831) single-retry-timer
-// and fix(#850) late-rejection specs went with it — TanStack owns scheduling and
-// cancellation now):
+// These specs pin the unified policy; TanStack owns scheduling and
+// cancellation:
 //   1. a HIDDEN tab performs zero refreshes (refetchIntervalInBackground: false)
 //   2. a VISIBLE tab refreshes at 80% of the shortest vector TTL
-//   3. the tab-return edge re-mints through the fix(#755) visible-edge hook
+//   3. the tab-return edge re-mints through the visible-edge hook
 //   4. a failed mint keeps retrying, and surfaces the token-error toast
 import { act, renderHook, waitFor } from '@/test/test-utils';
 import { getTileTokensBatch } from '@/api/tiles';
@@ -51,6 +48,7 @@ function batchResponse(expOffsetSeconds = 900) {
         exp: Math.floor(Date.now() / 1000) + expOffsetSeconds,
         scope: 'dataset-1',
         expires_in: TTL_SECONDS,
+        tile_url_template: '',
       },
     },
   };
@@ -124,7 +122,7 @@ describe('useViewerTokens refresh policy (fix #890)', () => {
     expect(mockedGetTileTokensBatch).toHaveBeenCalledTimes(2);
   });
 
-  it('re-mints on the visible edge when the sig has expired (the fix(#755) hook path)', async () => {
+  it('re-mints on the visible edge when the sig has expired (the hook path)', async () => {
     // An already-expired sig, i.e. the tab-return case the burst came from.
     mockedGetTileTokensBatch.mockResolvedValue(batchResponse(-60));
     const { result } = renderHook(() => {

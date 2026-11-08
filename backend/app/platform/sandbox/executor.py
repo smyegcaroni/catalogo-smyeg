@@ -14,9 +14,10 @@ import structlog
 import sqlglot
 from sqlglot import exp
 from sqlalchemy import BindParameter, text
-from sqlalchemy.exc import DataError, InternalError
+from sqlalchemy.exc import DataError, DBAPIError, InternalError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
+from app.core.db.sqlstate import is_operational
 from app.core.db.tenant_schema import tenant_data_schema, tenant_reader_role
 from app.core.db.tenant_session import current_tenant_var
 from app.core.tenancy import is_multi_tenant
@@ -52,7 +53,7 @@ _FLAT_ARRAY_TYPES_SQL = (
 
 # Single-tenant restricted execution role (migration 0007 + init-db.sh).
 # Module-level so tests can point it at a nonexistent role to exercise both
-# the legacy best-effort fallback and the feat(#565) fail-closed binding.
+# the legacy best-effort fallback and the fail-closed binding.
 _SINGLE_TENANT_READER_ROLE = "geolens_reader"
 
 
@@ -66,7 +67,7 @@ def _is_logical_data_schema(identifier: exp.Identifier) -> bool:
 def _logical_data_span(identifier: exp.Identifier, sql: str) -> tuple[int, int]:
     """Source offsets of one logical ``data`` schema qualifier in ``sql``.
 
-    fix(#1892): the slice must spell exactly what sqlglot parsed. An absent or
+    The slice must spell exactly what sqlglot parsed. An absent or
     shifted offset would move an unrelated span, so it fails closed instead.
     """
     start = identifier.meta.get("start")
@@ -92,12 +93,12 @@ def _rewrite_logical_data_schema(sql: str, physical_schema: str) -> str:
     other real-table schema; multi-tenant storage is per-tenant, so execution
     translates the logical name after validation.
 
-    fix(#1892): only the schema identifier spans of the ORIGINAL text are
-    replaced, right to left. Serializing the parsed tree instead re-rendered
-    the whole statement, which is why the pgvector cosine operator (sqlglot
-    parses ``<=>`` as NullSafeEQ) needed a sentinel swap; every other byte now
-    reaches PostgreSQL as the caller wrote it, as it already does in
-    single-tenant.
+    Only the schema identifier spans of the ORIGINAL text are
+    replaced, right to left, so every other byte reaches PostgreSQL as the
+    caller wrote it, as in single-tenant. Serializing the parsed tree would
+    re-render the whole statement, and sqlglot parses the pgvector cosine
+    operator ``<=>`` as NullSafeEQ, so the output would drift from the
+    query that was validated.
 
     ``physical_schema`` comes from :func:`tenant_data_schema`, which accepts
     only a normalized UUID-derived identifier in multi-tenant mode.
@@ -110,7 +111,7 @@ def _rewrite_logical_data_schema(sql: str, physical_schema: str) -> str:
         # both tokenize and parse failures).
         raise SandboxError("invalid_query", "Invalid SQL syntax") from exc
 
-    # fix(#1892): `parse`, not `parse_one`, which reports a second statement as
+    # `parse`, not `parse_one`, which reports a second statement as
     # one Block and would rewrite a caller-supplied `a; b` in both halves.
     statements = [statement for statement in statements if statement is not None]
     if len(statements) != 1:
@@ -227,6 +228,7 @@ async def _column_weights(
     parsed and described, never planned or run. Returns None when describing
     fails, leaving the statement itself to report the error.
     """
+    # codeql[py/sql-injection] running a whole statement is the sandbox's job; callers pass validate_sql output or server-built SQL, and this only describes it inside execute_safe's READ ONLY transaction
     statement = text(sql).bindparams(*binds).compile(dialect=conn.dialect).string
     try:
         async with conn.begin_nested():
@@ -269,6 +271,7 @@ async def _execute_limited(
         )
     result = await conn.execute(
         text(
+            # codeql[py/sql-injection] running a whole statement is the sandbox's job; callers pass validate_sql output or server-built SQL, run in a READ ONLY transaction under statement_timeout
             _limited_sql(sql, fetch_limit, max_result_bytes, token, weights)
         ).bindparams(*binds)
     )
@@ -354,14 +357,14 @@ async def execute_safe(
                             "query_busy",
                             "Another data query is already running for this user",
                         )
-                # Defense-in-depth: use the restricted reader role if available.
-                # Multi-tenant uses the per-tenant reader role (per-tenant
-                # schema access only); single-tenant uses "geolens_reader"
-                # (guaranteed by migration 0007 + init-db.sh, unlike
-                # "geolens_readonly" which lives only in a migration that may
-                # be squashed). Multi-tenant never falls back to a global
-                # role. Role name derives from validated-UUID
-                # current_tenant_var, so it's safe to interpolate.
+                # Defense-in-depth: run as a restricted reader role.
+                # Multi-tenant uses the per-tenant reader role (its own schema
+                # only) and never falls back to a global role; single-tenant
+                # uses "geolens_reader" (created by migration 0007 and
+                # init-db.sh, unlike "geolens_readonly", which only a
+                # squashable migration creates). The role name derives from
+                # the validated-UUID current_tenant_var, so it is safe to
+                # interpolate.
                 if multi_tenant:
                     # tenant_reader_role validates the UUID before building
                     # the identifier.
@@ -417,7 +420,6 @@ async def execute_safe(
     except Exception as exc:  # broad: varied DB errors; classify in handler
         _handle_execution_error(exc, sql, token)
 
-    # Convert rows to list-of-lists
     rows = [list(row) for row in all_rows]
     truncated = len(rows) > row_limit
     if truncated:
@@ -478,5 +480,19 @@ def _handle_execution_error(exc: Exception, sql: str, token: str | None = None) 
             "query_data_error", "The query failed while processing this data"
         ) from exc
 
-    # All other DB errors
+    raise_if_unavailable(exc)
     raise SandboxError("query_failed", "Query failed") from exc
+
+
+def raise_if_unavailable(exc: Exception) -> None:
+    """Raise ``query_unavailable`` when the database, not the query, failed.
+
+    asyncpg raises a refused or reset connection as a bare ``ConnectionError``,
+    outside SQLAlchemy's ``DBAPIError`` wrapping.
+    """
+    if isinstance(exc, ConnectionError) or (
+        isinstance(exc, DBAPIError) and is_operational(exc)
+    ):
+        raise SandboxError(
+            "query_unavailable", "The database is busy. Try again in a moment."
+        ) from exc

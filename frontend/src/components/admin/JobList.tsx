@@ -6,7 +6,7 @@ import { describeFailureReason } from '@/lib/failure-reason';
 import { Link, useLocation, useSearchParams } from 'react-router';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useAdminJobs, useCancelAdminJob, useRetryAdminJob, useUserNames } from '@/hooks/use-admin';
-import { formatDate } from '@/lib/format';
+import { formatDateTimeSmart } from '@/lib/format';
 import { paginationRange } from '@/lib/pagination';
 import { jobStatusColors, semanticBadgeColors } from '@/lib/status-colors';
 import type { AdminJobResponse } from '@/types/api';
@@ -104,21 +104,19 @@ function formatDuration(startedAt: string | null, completedAt: string | null): s
 
 export function JobList() {
   const { t } = useTranslation('admin');
-  // fix(#1185): the admin sidebar's failed-jobs badge links here as
+  // The admin sidebar's failed-jobs badge links here as
   // /admin/jobs?status=failed so the number the user clicked equals the number
-  // the list shows. Status therefore lives in the URL rather than in component
-  // state — that also makes a filtered view bookmarkable and the back button
-  // work. An unrecognized value falls back to "all statuses" instead of being
-  // forwarded to the API.
+  // the list shows. Status therefore lives in the URL rather than component
+  // state, which also makes a filtered view bookmarkable. An unrecognized
+  // value falls back to "all statuses" instead of being forwarded to the API.
   const [searchParams, setSearchParams] = useSearchParams();
   const { key: locationKey } = useLocation();
   const statusParam = searchParams.get('status') ?? '';
   const status = STATUS_OPTIONS.some((opt) => opt.value === statusParam) ? statusParam : '';
   // Set just before this component writes the status param itself, so the
-  // effect below can tell an in-component dropdown change from an external
-  // navigation. Always cleared by that effect, because a `replace: true`
-  // write still produces a new location key (measured) — so the effect is
-  // guaranteed to run and the flag cannot go stale.
+  // effect below can tell a dropdown change from an external navigation. That
+  // effect always clears it: a `replace: true` write still produces a new
+  // location key, so the effect runs and the flag cannot go stale.
   const isSelfWrite = useRef(false);
   const setStatus = useCallback(
     (next: string) => {
@@ -135,12 +133,11 @@ export function JobList() {
     [setSearchParams],
   );
   // Sort lives in the URL alongside status, so a sorted view is shareable.
-  // Sort clicks REPLACE the history entry rather than pushing — deliberately,
-  // per the #1200 review: pushing would make five header clicks cost five Back
-  // presses to leave the page, and it matches this component's own
-  // replace-on-refinement pattern (#1185). The trade is that Back leaves the
-  // page instead of stepping through orderings. An unrecognised ?sort= falls
-  // back to the default rather than erroring; the API refuses it independently.
+  // Sort clicks REPLACE the history entry: pushing would make five header
+  // clicks cost five Back presses to leave the page, and it matches this
+  // component's replace-on-refinement pattern. The trade is that Back leaves
+  // the page instead of stepping through orderings. An unrecognised ?sort=
+  // falls back to the default; the API refuses it independently.
   const sortField = parseSortField(searchParams.get('sort'));
   const sortOrder = parseSortOrder(searchParams.get('order'));
 
@@ -149,25 +146,22 @@ export function JobList() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
 
-  // fix(#1185 review): arriving here from OUTSIDE this component — the sidebar
-  // alert badge, a bookmark, the back button — must show the count the badge
-  // advertised. React Router keeps this instance mounted for the same route,
-  // so user/search/page would survive the navigation and silently narrow the
-  // list below that number (status=failed AND user=alice AND skip=75 can
-  // render zero rows while the badge says 3). That is the badge-vs-list
-  // mismatch #1185 exists to remove, arriving through a second door.
+  // Arriving from OUTSIDE this component (the sidebar alert badge, a
+  // bookmark, the back button) must show the count the badge advertised. React
+  // Router keeps this instance mounted for the same route, so user/search/page
+  // would survive the navigation and silently narrow the list below that
+  // number (status=failed AND user=alice AND skip=75 can render zero rows
+  // while the badge says 3).
   //
-  // Keyed on `location.key`, NOT on the status value. Re-clicking the alert
-  // while already at ?status=failed navigates to an identical URL, so a
-  // value-keyed effect never fires and the stale filters survive — the same
-  // defect one position over. `location.key` changes on every navigation
-  // including a same-URL one (measured: 6g37p9up -> 25bb8de4).
+  // Keyed on `location.key`, not the status value: re-clicking the alert while
+  // already at ?status=failed navigates to an identical URL, so a value-keyed
+  // effect never fires, but `location.key` changes on every navigation.
   //
-  // A dropdown change is deliberately exempt, since combining status with an
-  // existing user or search filter is the point of the dropdown. Its own
-  // `replace: true` write also produces a new key (measured), so this effect
-  // always runs afterwards and always clears the flag — it cannot go stale
-  // and swallow the next external navigation.
+  // A dropdown change is exempt, since combining status with an existing user
+  // or search filter is the point of the dropdown. Its own `replace: true`
+  // write also produces a new key, so this effect always runs afterwards and
+  // clears the flag; it cannot go stale and swallow the next external
+  // navigation.
   useEffect(() => {
     if (isSelfWrite.current) {
       isSelfWrite.current = false;
@@ -183,7 +177,7 @@ export function JobList() {
     // the Created column already renders as the active descending sort, so
     // clicking it must flip to ascending rather than re-assert descending.
     const next = sortField === field && sortOrder === 'asc' ? 'desc' : 'asc';
-    // fix(#1204): sorting is a refinement of the current view, so it takes the
+    // Sorting is a refinement of the current view, so it takes the
     // same self-write exemption the status dropdown does. Without the flag the
     // effect above would read this write as an external navigation and clear
     // the user's search and user filters on every header click.
@@ -447,7 +441,7 @@ export function JobList() {
                           </Button>
                         </TableCell>
                         <TableCell className="whitespace-nowrap">
-                          {formatDate(job.created_at)}
+                          {formatDateTimeSmart(job.created_at)}
                         </TableCell>
                         <TableCell>
                           {job.username ?? '-'}
@@ -528,7 +522,7 @@ export function JobList() {
                                   {retryAdminJob.isPending ? t('jobs.retrying') : t('jobs.retry')}
                                 </Button>
                               )}
-                              {/* feat(#1677): one-click cancel on active
+                              {/* One-click cancel on active
                                   rows, Retry parity — no confirm dialog;
                                   the action is recoverable and data-safe
                                   under the backend's no-swap fence. */}

@@ -19,18 +19,19 @@ import { installStaleAssetReload } from '@/lib/stale-asset-reload';
 import { wireAuthCacheReset } from '@/lib/auth-cache-reset';
 import { restoreSessionBeforeRender, wireSessionSync } from '@/lib/session-sync';
 import { ReportProblemHost } from '@/components/report/ReportProblemHost';
+import { preloadMatchedRoutes } from '@/lib/route-preload';
 import { appRoutes } from './App';
 import './index.css';
 
 // NOTE: maplibre's worker URL is wired in `@/lib/maplibre-worker`, imported by
 // the map surfaces themselves. It must NOT be imported here — that puts
-// map-vendor in the eager entry graph for every route (fix(#1624)).
+// map-vendor in the eager entry graph for every route.
 
 // Start capturing console/network/error signal at app load so the in-app
 // problem reporter has history ready the moment a user opens it.
 initReportCapture();
 
-// fix(#645): self-heal tabs whose lazy route chunks vanished behind a deploy.
+// Self-heal tabs whose lazy route chunks vanished behind a deploy.
 installStaleAssetReload();
 
 function reportQueryKey(key: unknown): string | undefined {
@@ -70,7 +71,7 @@ const queryClient = new QueryClient({
   }),
 });
 
-// fix(#430 codex r6): evict every cached query when the signed-in identity
+// Evict every cached query when the signed-in identity
 // changes so one user's cached rows never render for the next (see module doc).
 wireAuthCacheReset(queryClient);
 wireSessionSync();
@@ -79,17 +80,17 @@ const router = createBrowserRouter(createRoutesFromElements(appRoutes));
 
 // Cache the React root on the container so a Vite HMR re-exec of this entry
 // module reuses it instead of calling createRoot() twice on the same node
-// (MAPS-01 / #122). Type-only; erased at runtime.
+// (#122). Type-only; erased at runtime.
 interface RootContainer extends HTMLElement { __glRoot?: Root }
 
-// fix(#438): PERF-01 — awaiting initializeI18n() before the first render blocks
-// non-English first paint on the locale chunk (en is bundled, so it is
-// unaffected). This is a deliberate no-FOUC trade-off: rendering before the
-// bundle resolves would flash raw keys. Upgrade path: render en immediately and
-// background-swap the locale, or ship a static skeleton in index.html.
+// Awaiting initializeI18n() before the first render delays non-English first
+// paint on the locale chunk (en is bundled), a deliberate trade against flashing
+// raw keys.
 async function bootstrap() {
   // The access token lives in memory, so a reload recovers it before the first
   // render; otherwise every signed-in route would redirect to /login first.
+  // Fetch the current route's chunk while the refresh call is in flight.
+  preloadMatchedRoutes(router.routes, window.location);
   await Promise.all([initializeI18n(), restoreSessionBeforeRender()]);
 
   const container = document.getElementById('root')! as RootContainer;

@@ -9,7 +9,7 @@ identical bug, packing ``(None, str(self.file).encode(), 'text/plain')``
 instead of a real file) and ``refresh.py``'s job poller and ProblemDetail
 parsing, rather than re-implementing either.
 
-gh#1739: the only supported way to replace an uploaded dataset's data from a
+This is the only supported way to replace an uploaded dataset's data from a
 local file. A dataset whose data comes from a server-stored source binding
 is refreshed with ``geolens refresh`` instead; that endpoint pulls from the
 stored origin and takes no file.
@@ -27,9 +27,7 @@ from . import publish as _publish
 from ._sdk_helpers import EXIT_AUTH, EXIT_GENERIC, EXIT_SERVER, call_sdk, long_request_timeout
 from .refresh import _problem_detail, review_reason_sentence
 
-#: Upload returns 201 Created (ReuploadResponse). Cited:
-#: sdks/python/geolens/api/datasets_reupload/
-#:   reupload_dataset_datasets_dataset_id_reupload_post.py
+#: Upload returns 201 Created (ReuploadResponse).
 UPLOAD_OK_STATUS = 201
 
 #: Preview returns 200 OK (ReuploadPreviewResponse).
@@ -54,19 +52,14 @@ class ReplaceRequestError(Exception):
     code: str | None = None
 
 
-# ---------------------------------------------------------------------------
-# Multipart upload (same workaround as publish.upload_file)
-# ---------------------------------------------------------------------------
-
-
 def upload_file(client: Any, dataset_id: UUID, path: Path) -> Any:
     """Upload a replacement file via the SDK-owned httpx client.
 
     The multipart payload is built directly on the SDK's httpx client so the
-    file streams from disk. OCCLI-06: the client comes from
+    file streams from disk. The client comes from
     ``client.get_httpx_client()``, never a direct ``httpx`` construction.
 
-    fix(#1778 review round 5): the backend saves and validates the
+    The backend saves and validates the
     replacement before responding, so a large file posted through
     AppState.sdk()'s plain 30s-bound client could time out. Wrapped in
     ``long_request_timeout()`` — the same extended, restored bound
@@ -88,11 +81,6 @@ def upload_file(client: Any, dataset_id: UUID, path: Path) -> Any:
         headers=raw.headers,
         parsed=parsed,
     )
-
-
-# ---------------------------------------------------------------------------
-# Dataset pre-fetch (origin and record_type gates, checked before upload)
-# ---------------------------------------------------------------------------
 
 
 def fetch_dataset(client: Any, dataset_id: UUID) -> Any:
@@ -169,21 +157,16 @@ def origin_refusal_message(origin: Optional[str]) -> Optional[str]:
 def captured_origin_kind(dataset: Any) -> Optional[str]:
     """The origin kind to assert at commit, or None to assert nothing.
 
-    fix(#1768): normalizes what the generated model can hand back — a kind,
+    Normalizes what the generated model can hand back — a kind,
     ``None``, or the SDK's ``UNSET`` sentinel for a reader the server redacts
     the field from — down to "a kind this CLI recognizes, or nothing". A kind
     the server added after this build is deliberately dropped rather than
     forwarded: the server would 422 a value its own enum does not carry, and
-    turning a stale CLI into a hard failure is worse than leaving the flow at
-    its pre-#1768 behaviour.
+    turning a stale CLI into a hard failure is worse than skipping the origin
+    check.
     """
     origin = getattr(dataset, "origin", None)
     return origin if origin in KNOWN_ORIGIN_KINDS else None
-
-
-# ---------------------------------------------------------------------------
-# Request builders
-# ---------------------------------------------------------------------------
 
 
 def _build_model(model: Any, kwargs: dict[str, Any], needs: str) -> Any:
@@ -224,13 +207,16 @@ def build_commit_request(
     srid_override: Optional[int],
     expected_origin_kind: Optional[str] = None,
     review_fingerprint: Optional[str] = None,
+    expected_data_revision: Optional[int] = None,
 ) -> Any:
     """Build a ReuploadCommitRequest. No ``token``; replace is file-only.
 
     ``review_fingerprint`` is the preview's, sent only after a person
     confirmed that preview; it acknowledges the reasons the preview listed.
+    ``expected_data_revision`` is the dataset's data revision the caller
+    checked, so an edit after that check stops the replacement for review.
 
-    fix(#1768): ``expected_origin_kind`` is the origin ``origin_refusal_message``
+    ``expected_origin_kind`` is the origin ``origin_refusal_message``
     above read and allowed, sent back so the commit door can refuse if it is no
     longer the dataset's origin. Everything between that read and this request
     — the upload, the preview, the confirmation prompt — is a window in which a
@@ -238,8 +224,8 @@ def build_commit_request(
     swap this commit queues would rebind it to ``upload`` and sever it. An
     origin the CLI could not classify (``None``, or a kind the server added
     after this build) is left UNSET rather than guessed: the server treats an
-    absent value as "no condition", which is the pre-#1768 behaviour and the
-    right answer when the client has no captured origin to assert.
+    absent value as "no condition", which is the right answer when the client
+    has no captured origin to assert.
     """
     from geolens.models.reupload_commit_request import ReuploadCommitRequest
     from geolens.types import UNSET
@@ -253,12 +239,9 @@ def build_commit_request(
     }
     if review_fingerprint:
         kwargs["review_fingerprint"] = review_fingerprint
+    if expected_data_revision is not None:
+        kwargs["expected_data_revision"] = expected_data_revision
     return _build_model(ReuploadCommitRequest, kwargs, "confirming a reviewed replacement")
-
-
-# ---------------------------------------------------------------------------
-# Preview inspection
-# ---------------------------------------------------------------------------
 
 
 def layer_summaries(preview: Any) -> list[dict[str, Any]]:
@@ -283,15 +266,6 @@ def layer_summaries(preview: Any) -> list[dict[str, Any]]:
             }
         )
     return summaries
-
-
-def is_multi_layer(preview: Any) -> bool:
-    """True when the source file has more than one layer.
-
-    The backend only populates ``all_layers`` when the file has more than
-    one layer, so a non-empty list is itself the multi-layer signal.
-    """
-    return len(layer_summaries(preview)) > 0
 
 
 def _set(value: Any) -> Any:
@@ -380,10 +354,6 @@ def multi_layer_refusal_message(layers: list[dict[str, Any]]) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Error mapping
-# ---------------------------------------------------------------------------
-
 _REFUSAL_MESSAGES: dict[str, str] = {
     # The reverse of refresh.py's `refresh_not_applicable`: this dataset's
     # data comes from a server-stored source binding, not an upload, so a
@@ -392,7 +362,7 @@ _REFUSAL_MESSAGES: dict[str, str] = {
         "This dataset's data comes from a remote service origin, not an "
         "upload. Run `geolens refresh <dataset-id>` to update it instead."
     ),
-    # fix(#1768): the commit door found a different origin than the one the
+    # The commit door found a different origin than the one the
     # Stage 0 read allowed. Nothing was queued and nothing was severed; the
     # user has to look at the dataset again before deciding, which is why this
     # does not suggest re-running the same command.

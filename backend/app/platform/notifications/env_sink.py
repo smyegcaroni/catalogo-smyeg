@@ -1,4 +1,4 @@
-"""Environment-driven NotificationSink that routes to configured channels (NOTIF-04).
+"""Environment-driven NotificationSink that routes to configured channels.
 
 ``EnvConfiguredNotificationSink`` reads ``app_settings`` at ``deliver()``
 time and dispatches to whichever channels are configured: SMTP
@@ -6,13 +6,13 @@ time and dispatches to whichever channels are configured: SMTP
 when ``notification_webhook_url`` is set). If disabled or nothing is
 configured, ``deliver()`` returns silently.
 
-Fail-safe rules (NOTIF-04/T-1229-07): each channel runs in its own
+Fail-safe rules: each channel runs in its own
 try/except so one failure can't block another; partial success (>=1
 channel) counts as success; if ALL attempted channels fail, raises
 ``NotificationDeliveryError`` with a secret-free summary — the ``notify()``
 facade's own try/except still keeps this off any request path. Error
-strings carry only ``type(exc).__name__``, never a raw secret or body
-(T-1229-04). ``deliver_channels()`` reports each channel's outcome, so a
+strings carry only ``type(exc).__name__``, never a raw secret or body.
+``deliver_channels()`` reports each channel's outcome, so a
 caller can resend to the channels that failed alone.
 
 ``register_builtin_notification_sinks()`` appends it to the default fan-out.
@@ -34,8 +34,7 @@ class NotificationDeliveryError(Exception):
     """Raised by EnvConfiguredNotificationSink when every attempted channel failed.
 
     The message contains only channel names and exception type names —
-    never SMTP passwords, webhook secrets, or notification body text
-    (T-1229-04 mitigation).
+    never SMTP passwords, webhook secrets, or notification body text.
     """
 
 
@@ -58,7 +57,7 @@ class EnvConfiguredNotificationSink:
         delivered, failures = await self.deliver_channels(notification)
         if failures and not delivered:
             # All channels failed: raise a secret-free error. notify()'s own
-            # try/except keeps this off any request path (NOTIF-04).
+            # try/except keeps this off any request path.
             raise NotificationDeliveryError(
                 f"All {len(failures)} channel(s) failed: "
                 + ", ".join(f"{name}: {error}" for name, error in failures)
@@ -73,21 +72,18 @@ class EnvConfiguredNotificationSink:
         name and the exception's type name. Never raises. A name no channel
         is configured under sends nothing.
         """
-        # Deferred import of settings (Phase 214) — not paid at module load.
         from app.core.config import settings as app_settings
 
         # Master toggle: notifications_enabled=False ⇒ no channels attempted.
         if not app_settings.notifications_enabled:
             return [], []
 
-        # Build the list of configured channels in a deterministic order.
         channels: list[tuple[str, object]] = []
         if app_settings.smtp_host:
             channels.append(("smtp", send_email))
         if app_settings.notification_webhook_url:
             channels.append(("webhook", post_webhook))
 
-        # Fan-out with per-channel isolation.
         successes: list[str] = []
         failures: list[tuple[str, str]] = []
 
@@ -102,7 +98,7 @@ class EnvConfiguredNotificationSink:
                     channel=name,
                     event_type=getattr(notification, "event_type", "unknown"),
                 )
-            except Exception as exc:  # noqa: BLE001 — per-channel isolation
+            except Exception as exc:  # broad: per-channel isolation
                 # Safe error string: type name only — never the exception
                 # message (which may echo the SMTP password or webhook URL).
                 safe_msg = type(exc).__name__

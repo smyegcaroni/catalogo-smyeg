@@ -102,9 +102,9 @@ describe('LegendClassesList', () => {
   });
 });
 
-// fix(#951): MapLibre draws a fill-pattern INSTEAD of the fill, so a solid chip
-// described a colour that appeared nowhere on the map.
-// fix(#1288 codex): the fill/pattern now lives on a nested div, split from the
+// MapLibre draws a fill-pattern INSTEAD of the fill, so a solid chip
+// would describe a colour that appears nowhere on the map.
+// The fill/pattern lives on a nested div, split from the
 // border, so fillOpacity can dim one without the other — assertions below read
 // the inner div for fill/pattern styling and the outer for border/opacity.
 describe('GeometrySwatch — patterned polygons', () => {
@@ -123,7 +123,7 @@ describe('GeometrySwatch — patterned polygons', () => {
     expect(fill.style.color).toBe('rgb(255, 90, 95)');
   });
 
-  // fix(#914): the map tints the pattern with the layer's fill colour, which for a
+  // The map tints the pattern with the layer's fill colour, which for a
   // patterned layer lives in the fillColorSaved stash rather than in paint — so the
   // chip has to draw that colour, not whatever its own `color` fell back to.
   it('draws the pattern in the colour the map tints it with, not the chip colour', () => {
@@ -152,7 +152,7 @@ describe('GeometrySwatch — patterned polygons', () => {
     expect(fill.style.backgroundColor).toBe('rgb(255, 90, 95)');
   });
 
-  // fix(#1288 codex): a partially-transparent pattern must dim independently of
+  // A partially-transparent pattern must dim independently of
   // the border, and for ANY color format — not just 6-digit hex — since opacity
   // is applied via plain CSS opacity on the fill layer, not string parsing.
   it('applies fillOpacity to the pattern layer only, not the border', () => {
@@ -171,8 +171,8 @@ describe('GeometrySwatch — patterned polygons', () => {
   });
 });
 
-// fix(#1288): a stroke-only polygon (fillOpacity: 0) used to render at
-// container-level opacity 0 — invisible, even though it has a visible outline.
+// A stroke-only polygon (fillOpacity: 0) must not render at container-level
+// opacity 0, which would hide its visible outline.
 describe('GeometrySwatch — stroke-only polygons (fix #1288)', () => {
   it('renders a transparent fill inside a fully opaque border', () => {
     const { container } = render(
@@ -190,7 +190,7 @@ describe('GeometrySwatch — stroke-only polygons (fix #1288)', () => {
     expect(fill.style.opacity).toBe('0');
   });
 
-  // fix(#1288 codex): #f00 (3-digit hex) is a valid CSS color the alpha-blend
+  // #f00 (3-digit hex) is a valid CSS color the alpha-blend
   // helper used to silently ignore — plain opacity on the fill layer handles it
   // (and every other CSS color syntax) with no format-specific parsing.
   it('dims a fill given in a non-6-digit-hex color format', () => {

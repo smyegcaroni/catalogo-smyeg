@@ -1,5 +1,5 @@
-"""The one lock order for the (datasets, records) row pair (#1847), and the
-per-dataset admission lock VRT regeneration serialises on (#1955).
+"""The one lock order for the (datasets, records) row pair, and the
+per-dataset admission lock VRT regeneration serialises on.
 
 Lives in ``platform/`` because ``processing/`` may not import
 ``app.modules.catalog``: worker callers pass the mapped classes the port hands
@@ -9,7 +9,7 @@ them, and both the catalog and the ingest router reach the VRT admission here.
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -39,7 +39,7 @@ _USE_REQUEST_DEFAULT: Any = object()
 CATALOG_LOCK_CONFLICT_CODE = "catalog_lock_conflict"
 
 
-# fix(#1937, #1938): an expired budget and a lost deadlock end an acquisition
+# An expired budget and a lost deadlock end an acquisition
 # alike, and the two send an operator looking for different things.
 _CONFLICT_REPORTS = {
     "55P03": (
@@ -66,8 +66,7 @@ def lock_conflict_report(
     """The log event, operator hint and SQLSTATE for a failed acquisition.
 
     The event is ``<event_prefix>_lock_timeout``, ``<event_prefix>_deadlock``
-    or ``<event_prefix>_lock_failed``. One definition, because a per-site copy
-    is a per-site drift.
+    or ``<event_prefix>_lock_failed``.
     """
     cause = conflict.__cause__
     code = sqlstate(cause) if isinstance(cause, DBAPIError) else None
@@ -75,7 +74,7 @@ def lock_conflict_report(
     return f"{event_prefix}_{suffix}", hint, code
 
 
-# fix(#1847, #1890): true from the SET LOCAL until the transaction that ran it
+# True from the SET LOCAL until the transaction that ran it
 # commits, so the boundary handler answers 409 only for a wait inside it.
 catalog_timeout_installed: ContextVar[bool] = ContextVar(
     "catalog_timeout_installed", default=False
@@ -295,7 +294,7 @@ async def bump_publication_version_atomic(
 ) -> int | None:
     """Roll ``publication_version`` in the database and return the new value.
 
-    The counter a signed tile scope binds (#1963). Same write-time evaluation
+    The counter a signed tile scope binds. Same write-time evaluation
     as :func:`bump_tile_cache_version_atomic`, and a separate counter on
     purpose: this one rolls only when a publication-status or visibility
     transition changes who may read the dataset, so an ordinary edit does not
@@ -320,13 +319,92 @@ async def bump_publication_version_on(
     Sets the instance attribute to the returned value without marking it
     dirty, mirroring :func:`bump_tile_cache_version_on`. The one spelling for
     a request handler, whose instance was loaded before it waited for the row.
+
+    Also rolls every VRT that links the dataset: a VRT serves its members'
+    pixels, so its signed templates and shared-cache keys must not outlive a
+    change to who may read one of them.
     """
     version = await bump_publication_version_atomic(
         session, dataset_cls=type(dataset), dataset_id=dataset.id
     )
+    await session.execute(
+        text(
+            "UPDATE catalog.datasets "
+            "SET publication_version = coalesce(publication_version, 0) + 1 "
+            "WHERE id IN (SELECT vrt_dataset_id FROM catalog.vrt_source_links "
+            "WHERE source_dataset_id = :dataset_id)"
+        ),
+        {"dataset_id": dataset.id},
+    )
     if version is not None:
         set_committed_value(dataset, "publication_version", version)
     return version
+
+
+async def bump_publication_versions_for_owner(
+    session: AsyncSession, owner_id: uuid.UUID
+) -> None:
+    """Roll ``publication_version`` on every dataset ``owner_id`` owns and on
+    every VRT linking one, before the owner is deleted.
+
+    Deleting the owner clears ``created_by`` through the foreign key, which
+    moves who may read those datasets without passing
+    :func:`bump_publication_version_on`.
+    """
+    await session.execute(
+        text(
+            "UPDATE catalog.datasets d "
+            "SET publication_version = coalesce(d.publication_version, 0) + 1 "
+            "WHERE d.id IN ("
+            "SELECT owned.id FROM catalog.datasets owned "
+            "JOIN catalog.records r ON r.id = owned.record_id "
+            "WHERE r.created_by = :owner_id "
+            "UNION SELECT vsl.vrt_dataset_id FROM catalog.vrt_source_links vsl "
+            "JOIN catalog.datasets s ON s.id = vsl.source_dataset_id "
+            "JOIN catalog.records sr ON sr.id = s.record_id "
+            "WHERE sr.created_by = :owner_id)"
+        ),
+        {"owner_id": owner_id},
+    )
+
+
+async def bump_publication_versions(
+    session: AsyncSession, dataset_ids: Sequence[uuid.UUID]
+) -> None:
+    """Roll ``publication_version`` on ``dataset_ids`` and on every VRT linking
+    one, for a change that moves who may read them without writing their rows.
+    """
+    await session.execute(
+        text(
+            "UPDATE catalog.datasets "
+            "SET publication_version = coalesce(publication_version, 0) + 1 "
+            "WHERE id IN (SELECT unnest(CAST(:ids AS uuid[])) "
+            "UNION SELECT vrt_dataset_id FROM catalog.vrt_source_links "
+            "WHERE source_dataset_id = ANY(CAST(:ids AS uuid[])))"
+        ),
+        {"ids": list(dataset_ids)},
+    )
+
+
+async def bump_publication_versions_for_member(
+    session: AsyncSession, user_id: uuid.UUID
+) -> None:
+    """:func:`bump_publication_versions` on every dataset granted to a group
+    ``user_id`` is in, before the account is deleted or deactivated, so tile
+    URLs it signed stop validating."""
+    granted = await session.scalars(
+        text(
+            "SELECT DISTINCT grant_row.dataset_id "
+            "FROM catalog.dataset_group_grants grant_row "
+            "JOIN catalog.group_members member "
+            "ON member.group_id = grant_row.group_id "
+            "WHERE member.user_id = :user_id"
+        ),
+        {"user_id": user_id},
+    )
+    dataset_ids = list(granted)
+    if dataset_ids:
+        await bump_publication_versions(session, dataset_ids)
 
 
 async def bump_tile_cache_version_on(session: AsyncSession, dataset: Any) -> int | None:
@@ -383,7 +461,7 @@ async def admit_vrt_mutation(
 ) -> bool:
     """Admit one VRT-mutating dispatch per dataset, or refuse this one.
 
-    fix(#1955): ADR-002 Decision 5b's partial unique index does not reach VRT
+    The partial unique index from ADR-002 Decision 5b does not reach VRT
     regeneration, and the three doors that dispatch one read the asset status,
     check it and flip it as three statements. The lock comes FIRST and the
     status is re-read under it: read before the lock, the loser's snapshot

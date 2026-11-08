@@ -1,6 +1,6 @@
 import { apiFetch } from './client';
 
-export interface SavedSearch {
+interface SavedSearch {
   id: string;
   name: string;
   params: Record<string, string>;
@@ -23,5 +23,5 @@ export async function createSavedSearch(data: {
 }
 
 export async function deleteSavedSearch(id: string): Promise<void> {
-  await apiFetch<void>(`/search/saved/${id}`, { method: 'DELETE' });
+  await apiFetch<void>(`/search/saved/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }

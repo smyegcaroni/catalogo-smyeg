@@ -1,37 +1,16 @@
 import { apiFetch } from './client';
 import type {
   VrtSourceListResponse,
-  VrtMutationResponse,
   VrtStatusResponse,
   VrtGenerationListResponse,
 } from '@/types/api';
 
 export async function listVrtSources(datasetId: string): Promise<VrtSourceListResponse> {
-  return apiFetch<VrtSourceListResponse>(`/datasets/${datasetId}/vrt-sources/`);
-}
-
-export async function addVrtSource(
-  datasetId: string,
-  sourceDatasetId: string,
-): Promise<VrtMutationResponse> {
-  return apiFetch<VrtMutationResponse>(`/ingest/vrt/${datasetId}/sources/`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ source_dataset_id: sourceDatasetId }),
-  });
-}
-
-export async function removeVrtSource(
-  datasetId: string,
-  sourceDatasetId: string,
-): Promise<VrtMutationResponse> {
-  return apiFetch<VrtMutationResponse>(`/ingest/vrt/${datasetId}/sources/${sourceDatasetId}/`, {
-    method: 'DELETE',
-  });
+  return apiFetch<VrtSourceListResponse>(`/datasets/${encodeURIComponent(datasetId)}/vrt-sources/`);
 }
 
 export async function getVrtStatus(datasetId: string): Promise<VrtStatusResponse> {
-  return apiFetch<VrtStatusResponse>(`/datasets/${datasetId}/vrt/status/`);
+  return apiFetch<VrtStatusResponse>(`/datasets/${encodeURIComponent(datasetId)}/vrt/status/`);
 }
 
 export async function getVrtGenerations(
@@ -43,12 +22,6 @@ export async function getVrtGenerations(
   if (params?.offset) qs.set('offset', String(params.offset));
   const query = qs.toString();
   return apiFetch<VrtGenerationListResponse>(
-    `/datasets/${datasetId}/vrt/generations/${query ? `?${query}` : ''}`,
+    `/datasets/${encodeURIComponent(datasetId)}/vrt/generations/${query ? `?${query}` : ''}`,
   );
-}
-
-export async function regenerateVrt(datasetId: string): Promise<VrtMutationResponse> {
-  return apiFetch<VrtMutationResponse>(`/datasets/${datasetId}/vrt/regenerate/`, {
-    method: 'POST',
-  });
 }

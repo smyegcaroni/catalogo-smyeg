@@ -17,7 +17,6 @@ import { formatBytes, formatNumber } from '@/lib/format';
 import { useReportDialog } from '@/lib/report';
 import type { FileEntry, CommitImportRequest, FilePreviewResponse } from '@/types/api';
 
-/* ── Report CTA (upload/commit failure rows) ─────────── */
 
 /**
  * Inline nudge on a failed staged file toward the in-app problem reporter.
@@ -42,7 +41,6 @@ function ReportProblemButton() {
   );
 }
 
-/* ── Detection panel (expanded row) ──────────────────── */
 
 function DetectionPanel({ entry }: { entry: FileEntry }) {
   const { t } = useTranslation('import');
@@ -167,7 +165,6 @@ function DetectionPanel({ entry }: { entry: FileEntry }) {
   );
 }
 
-/* ── Metadata form wrapper ───────────────────────────── */
 
 function ReviewFormBlock({
   entry,
@@ -218,7 +215,6 @@ function ReviewFormBlock({
   );
 }
 
-/* ── Main list ───────────────────────────────────────── */
 
 interface BulkReviewListProps {
   entries: FileEntry[];
@@ -227,7 +223,7 @@ interface BulkReviewListProps {
   onCommitAllAsVrt?: () => void;
   onRemove: (entryId: string) => void;
   onSheetChange?: (entryId: string, layerName: string) => void;
-  // GPKG-03 Phase 1058: optional fan-out prop — single-layer-only consumers can omit
+  // Optional fan-out prop — single-layer-only consumers can omit
   onIngestAllLayers?: (entryId: string) => void;
   isCommitting: boolean;
 }
@@ -326,13 +322,14 @@ export function BulkReviewList({
     });
   }
 
-  function formatLayerOption(layer: { name: string; feature_count: number; field_count: number }) {
+  function formatLayerOption(layer: { name: string; feature_count?: number | null; field_count?: number | null }) {
+    // GDAL can't always count a layer; an unknown count reads as unavailable, not as zero.
     const rows = t('bulk.rowCount', {
-      count: layer.feature_count,
+      count: layer.feature_count ?? 0,
       value: formatNumber(layer.feature_count),
     });
     const columns = t('bulk.columnCount', {
-      count: layer.field_count,
+      count: layer.field_count ?? 0,
       value: formatNumber(layer.field_count),
     });
 
@@ -456,11 +453,11 @@ export function BulkReviewList({
                         <Label htmlFor={`sheet-${entry.id}`}>
                           {t(isSpreadsheetExt(ext) ? 'bulk.sheetLabel' : 'bulk.layerLabel')}
                         </Label>
-                        {/* fix(#438): DS-08 — native <select> → themed ui/select. */}
-                        {/* fix(#1778): mirrors UrlImportForm.tsx's handleLayerChange
-                            guard (#1708 r24): the layer picker stayed live during a
-                            commit, so changing it re-enabled the commit button
-                            against a request that could not be recalled. */}
+                        {/* Native <select> → themed ui/select. */}
+                        {/* Mirrors UrlImportForm.tsx's handleLayerChange
+                            guard: a layer picker left live during a commit
+                            would re-enable the commit button against a
+                            request that cannot be recalled. */}
                         <Select
                           value={entry.previewData.layer_name}
                           onValueChange={(v) => onSheetChange?.(entry.id, v)}
@@ -480,7 +477,7 @@ export function BulkReviewList({
                       </div>
                     )}
 
-                  {/* GPKG-03 Phase 1058: "Ingest all layers" button for multi-layer files */}
+                  {/* "Ingest all layers" button for multi-layer files */}
                   {isFilePreview(entry.previewData) &&
                     entry.previewData.layers &&
                     entry.previewData.layers.length > 1 &&
@@ -510,24 +507,26 @@ export function BulkReviewList({
                     />
                   )}
 
-                  {entry.status === 'commit-failed' && entry.error && (
+                  {isExpanded && entry.status === 'commit-failed' && entry.error && (
                     <div className="mt-2 space-y-1.5">
-                      <p className="text-sm text-destructive">{entry.error}</p>
+                      <p role="alert" className="text-sm text-destructive">{entry.error}</p>
                       <ReportProblemButton />
                     </div>
                   )}
                 </div>
               )}
 
-              {/* Non-expanded error. Guarded on `canExpand` (always false for
-                  upload-failed), not just `isExpanded`: `expandedId` seeds
-                  from entries[0], so when the FIRST — or sole — staged file
-                  fails upload, isExpanded is true for it despite canExpand
-                  being false, and `!isExpanded` alone hid the error and this
-                  CTA for exactly the single-file-upload-fails case. */}
-              {!(isExpanded && canExpand) && entry.status === 'upload-failed' && entry.error && (
+              {/* Error for a row whose details are not showing: collapsed
+                  commit-failed rows keep theirs `hidden`, so the alert lives
+                  here to be announced. The `canExpand` guard (always false for
+                  upload-failed) matters because `expandedId` seeds from
+                  entries[0]: a sole file failing upload is "expanded" yet has
+                  no details panel, and `!isExpanded` alone hid its error. */}
+              {!(isExpanded && canExpand) &&
+                (entry.status === 'upload-failed' || entry.status === 'commit-failed') &&
+                entry.error && (
                 <div className="space-y-1.5 px-4 pb-3">
-                  <p className="text-sm text-destructive">{entry.error}</p>
+                  <p role="alert" className="text-sm text-destructive">{entry.error}</p>
                   <ReportProblemButton />
                 </div>
               )}

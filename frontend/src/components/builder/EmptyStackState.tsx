@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
 import { Check, Loader2, MapPin, Plus, Search } from 'lucide-react';
@@ -7,18 +7,14 @@ import { queryKeys } from '@/lib/query-keys';
 import { cn } from '@/lib/utils';
 import { SUGGESTED_DATASETS, type SuggestedDataset } from './suggested-datasets';
 
-export interface EmptyStackStateProps {
+interface EmptyStackStateProps {
   onOpenAddData: (initialQuery?: string) => void;
   onAddDataset: (datasetId: string) => void;
 }
 
-// AUD-02: shared eyebrow class string — single source of truth for 10px uppercase label
+// Shared eyebrow class string — single source of truth for 10px uppercase label
 // imported by UnifiedStackPanel for the basemap-dock BASEMAP eyebrow label
 export const eyebrowClassName = 'block text-2xs font-semibold tracking-wide text-muted-foreground uppercase px-1';
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 function formatCompactNumber(n: number, locale: string): string {
   return new Intl.NumberFormat(locale, {
@@ -30,10 +26,6 @@ function formatCompactNumber(n: number, locale: string): string {
 function isRasterType(recordType: SuggestedDataset['record_type']): boolean {
   return recordType === 'raster_dataset' || recordType === 'vrt_dataset';
 }
-
-// ---------------------------------------------------------------------------
-// SuggestCard — inner component for a single hand-curated suggestion
-// ---------------------------------------------------------------------------
 
 interface SuggestCardProps {
   suggestion: SuggestedDataset;
@@ -56,12 +48,12 @@ function SuggestCard({ suggestion, onOpenAddData, addingId, addedIds, onDirectAd
     enabled: idIsRealUuid,
   });
 
-  // Hide cards whose ID is a placeholder or whose fetch errored
+  // Hide cards whose ID is a placeholder or whose fetch errored.
   if (!idIsRealUuid) return null;
   if (isError) return null;
-  // While loading the first time (no data yet) we only hide if explicitly errored.
-  // If data is undefined but not errored, show optimistically (availability not yet confirmed).
-  // Cards that actually 404 set isError=true, so this is the correct guard.
+  // While loading the first time (no data yet) hide only if explicitly errored;
+  // if data is undefined but not errored, show optimistically. Cards that
+  // actually 404 set isError=true, so this is the correct guard.
 
   const isAdding = addingId === suggestion.id;
   const isAdded = addedIds.has(suggestion.id);
@@ -154,12 +146,9 @@ function SuggestCard({ suggestion, onOpenAddData, addingId, addedIds, onDirectAd
   );
 }
 
-// ---------------------------------------------------------------------------
-// EmptyStackState — main export
-// ---------------------------------------------------------------------------
-
 export function EmptyStackState({ onOpenAddData, onAddDataset }: EmptyStackStateProps) {
   const { t } = useTranslation('builder');
+  const searchHintId = useId();
   const [inlineQuery, setInlineQuery] = useState('');
   const [addingId, setAddingId] = useState<string | null>(null);
   const [addedIds, setAddedIds] = useState<Set<string>>(() => new Set());
@@ -201,13 +190,13 @@ export function EmptyStackState({ onOpenAddData, onAddDataset }: EmptyStackState
     >
       {/* Prompt */}
       <div className="text-center">
-        {/* fix(#438): A11Y-05 — was <h4>, which skipped h2/h3 under the builder's
-            new <h1>. Styling is unchanged; only the level moves onto the outline. */}
+        {/* The heading level follows the builder's <h1> outline (an <h4> would
+            skip h2/h3). */}
         <h2 className="text-sm font-semibold">
           {t('unifiedStack.emptyHeading', { defaultValue: 'Add your first layer' })}
         </h2>
         <p className="text-xs text-muted-foreground mt-1">
-          {/* fix(#780): stock installs ship SUGGESTED_DATASETS=[] — the copy must
+          {/* Stock installs ship SUGGESTED_DATASETS=[] — the copy must
               not point at a starter list (or an Upload button) that isn't there. */}
           {t('unifiedStack.emptyBody', { defaultValue: 'Search the catalog to find datasets for your map.' })}
         </p>
@@ -236,19 +225,22 @@ export function EmptyStackState({ onOpenAddData, onAddDataset }: EmptyStackState
           <Search className="h-4 w-4" aria-hidden="true" />
         </button>
         <input
-          // fix(v1.6.0 audit D12): type="search" gives the searchbox role
-          // natively plus the browser's built-in Escape-clear, instead of the
-          // hand-rolled role="searchbox" on a plain text input. The manual
-          // Escape handler stays for engines (and jsdom) without native clear.
+          // type="search" gives the searchbox role natively plus the browser's
+          // built-in Escape-clear. The manual Escape handler stays for engines
+          // (and jsdom) without native clear.
           type="search"
           aria-label={t('unifiedStack.emptySearchInput', { defaultValue: 'Search datasets to add' })}
           placeholder={t('unifiedStack.emptySearchPlaceholder', { defaultValue: 'Search datasets, URLs, or files…' })}
           value={inlineQuery}
           onChange={(e) => setInlineQuery(e.target.value)}
           onKeyDown={handleSearchKeyDown}
+          aria-describedby={searchHintId}
           className="flex-1 bg-transparent border-0 outline-none text-sm"
         />
       </div>
+      <p id={searchHintId} className="px-1 text-xs text-muted-foreground">
+        {t('unifiedStack.emptySearchHint', { defaultValue: 'Press Enter to search' })}
+      </p>
 
       {/* Suggested section — or starter-help fallback when SUGGESTED_DATASETS is empty */}
       {SUGGESTED_DATASETS.length > 0 ? (
@@ -276,7 +268,7 @@ export function EmptyStackState({ onOpenAddData, onAddDataset }: EmptyStackState
         <div className="flex flex-col items-center gap-3 px-4 py-4 text-center">
           <MapPin className="h-8 w-8 text-muted-foreground" aria-hidden="true" />
           <p className="text-sm text-muted-foreground">
-            {/* fix(#780): name the control that actually exists on this surface —
+            {/* Name the control that actually exists on this surface —
                 the header's "Add data" button — not the modal-internal Upload. */}
             {t('unifiedStack.emptyHelpBody', { defaultValue: 'Search the catalog to find datasets, or use the Add data button to add your own.' })}
           </p>

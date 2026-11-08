@@ -1,19 +1,20 @@
-"""fix(#888): clip_to_mercator_bounds must not lose data silently.
+"""clip_to_mercator_bounds must not lose data silently.
 
-Two distinct silent-data-loss paths used to run through the same function:
+Two distinct silent-data-loss paths run through the same function:
 
 1. A source in the 0..360 Pacific longitude convention (common in ocean and
-   climate data) had everything east of lon 180 intersected away. The user saw
-   a *successful* ingest with half the features missing and no message.
-2. Valid polar geometry was clamped to ±85.06° and, for anything beyond that,
+   climate data) would have everything east of lon 180 intersected away. The
+   user would see a *successful* ingest with half the features missing and no
+   message.
+2. Valid polar geometry is clamped to ±85.06° and, for anything beyond that,
    silently reduced to an empty geometry. The clamp itself is intentional (the
-   product serves Web Mercator tiles), but the user was never told, so the
-   real failure only showed up three steps later as "Analysis produced no
+   product serves Web Mercator tiles), but the user has to be told, or the
+   real failure only shows up three steps later as "Analysis produced no
    features to save".
 
-The 0..360 guard is deliberately four conditions wide. #883 established that a
-single-condition guard on this class of problem is a coin flip, so the near
-misses are pinned here: a dataset ending exactly at lon 180, a dataset that
+The 0..360 guard is deliberately four conditions wide. A single-condition
+guard on this class of problem is a coin flip, so the near misses are pinned
+here: a dataset ending exactly at lon 180, a dataset that
 spans 0..200, a dataset spanning -10..170, a projected CRS whose X happens to
 land between 180 and 360, and a dataset whose X runs past 360.
 """
@@ -183,14 +184,13 @@ class TestZeroTo360Shift(_FixtureTable):
         """A Pacific-crossing 0..360 source keeps all its data AND its extent.
 
         A 150..250 source lands half on each side of the antimeridian, which is
-        correct per-feature and is the trade #888 makes deliberately: the old
-        behaviour destroyed everything past lon 180 instead.
+        correct per-feature and is the deliberate trade against destroying
+        everything past lon 180.
 
-        fix(#934): this used to pin the *cost* — a bare ``ST_Extent`` over the
-        shifted result read -170..170, a 340 deg bbox for a 100 deg source,
-        which the producer sites stored verbatim. The producers now emit the
-        two-ring seam form, so this is where #899 and #934 meet: ``get_extent``
-        over the shifted table reports the honest 150..-110 footprint.
+        A bare ``ST_Extent`` over the shifted result would read -170..170, a
+        340 deg bbox for a 100 deg source. The producers emit the two-ring seam
+        form instead, so ``get_extent`` over the shifted table reports the
+        honest 150..-110 footprint.
         """
         await _seed_points(
             test_db_session,
@@ -307,7 +307,7 @@ class TestZeroTo360GuardNearMisses(_FixtureTable):
     async def test_grads_based_geographic_crs_is_not_shifted(self, test_db_session):
         """Guard condition 1b: a geographic CRS in grads is not degree-based.
 
-        fix(#899 codex r1): EPSG:4807 (NTF Paris) and 13 more SRIDs in a stock
+        EPSG:4807 (NTF Paris) and 13 more SRIDs in a stock
         ``spatial_ref_sys`` are ``GEOGCS`` with ``UNIT["grad"]``, where a full
         circle is 400. Translating one of those by -360 would move a valid
         feature to a wrong place, so the prefix test alone is not enough.
@@ -438,7 +438,11 @@ class TestClipAccounting(_FixtureTable):
 
         assert warning == {
             "kind": "mercator_clip",
-            "details": {"dropped_features": 1, "clipped_features": 0},
+            "details": {
+                "dropped_features": 1,
+                "clipped_features": 0,
+                "polar_only": True,
+            },
         }
 
     async def test_partial_clip_is_counted_separately_from_a_drop(
@@ -464,7 +468,11 @@ class TestClipAccounting(_FixtureTable):
         assert float(ymax) == pytest.approx(85.06)
         assert make_mercator_clip_warning(counts) == {
             "kind": "mercator_clip",
-            "details": {"dropped_features": 0, "clipped_features": 1},
+            "details": {
+                "dropped_features": 0,
+                "clipped_features": 1,
+                "polar_only": True,
+            },
         }
 
     async def test_a_measured_line_crossing_the_envelope_is_refused(
@@ -542,6 +550,7 @@ class TestClipAccounting(_FixtureTable):
             "shifted_longitudes": False,
             "dropped_features": 1,
             "clipped_features": 0,
+            "polar_only": True,
         }
         is_empty = await test_db_session.scalar(
             text(f"SELECT ST_IsEmpty(geom) FROM data.{TABLE}")
@@ -603,12 +612,12 @@ class TestClipAccounting(_FixtureTable):
 
 
 # ---------------------------------------------------------------------------
-# 3b. fix(#906): degenerate-envelope skip for narrow-validity CRSs
+# 3b. Degenerate-envelope skip for narrow-validity CRSs
 # ---------------------------------------------------------------------------
 
 
 class TestDegenerateEnvelopeSkip(_FixtureTable):
-    """fix(#906): ST_Transform of the global safe envelope collapses for
+    """ST_Transform of the global safe envelope collapses for
     narrow-validity CRSs (4415 of 8500 stock SRIDs measure zero-area or
     collapsed, 108 more error), and the clip's intersection would then empty
     the whole table with a *successful* ingest. The guard skips the clip and
@@ -682,7 +691,7 @@ class TestDegenerateEnvelopeSkip(_FixtureTable):
         }
 
     async def test_data_wider_than_the_envelope_is_still_clipped(self, test_db_session):
-        """fix(#906 codex r1): a 3857 table with a feature genuinely beyond
+        """A 3857 table with a feature genuinely beyond
         ±20 037 508 m is WIDER than its correctly transformed envelope. The
         degeneracy floor must be absolute (envelope size), never relative to
         the data extent, or exactly the geometry this routine exists to trim
@@ -704,7 +713,7 @@ class TestDegenerateEnvelopeSkip(_FixtureTable):
     async def test_compound_geographic_crs_polar_clip_is_unchanged(
         self, test_db_session
     ):
-        """fix(#906 codex r2): EPSG:5498 (NAD83 + NAVD88 height) is a
+        """EPSG:5498 (NAD83 + NAVD88 height) is a
         COMPD_CS whose horizontal axes are degrees. The floor's geographic
         test must see through the compound prefix, or its valid
         360x170-degree envelope trips the 1000-unit floor and every ingest in
@@ -739,7 +748,7 @@ class TestDegenerateEnvelopeSkip(_FixtureTable):
         """Ordering constraint from the issue: skipping the clip must still
         leave the 0..360 shift applied. No real degree-geographic CRS
         degenerates, so the probe is forced True to pin the ordering."""
-        # fix(#1042): patched on metadata_mercator, not on the metadata façade
+        # Patched on metadata_mercator, not on the metadata façade
         # that re-exports it. `clip_to_mercator_bounds` resolves this name from
         # its own module globals, so a patch on the façade would bind a name
         # nothing reads and the probe would still run for real.
@@ -821,7 +830,7 @@ class TestMercatorClipWarningProducer:
         assert parsed.details.clipped_features == 1
 
     def test_warns_when_clip_was_skipped(self):
-        """fix(#906): a skipped clip lost nothing but must not be silent."""
+        """A skipped clip lost nothing but must not be silent."""
         warning = make_mercator_clip_warning(
             {
                 "shifted_longitudes": False,
@@ -847,7 +856,11 @@ class TestMercatorClipWarningProducer:
         parsed = MercatorClipWarning.model_validate(
             {
                 "kind": "mercator_clip",
-                "details": {"dropped_features": 1, "clipped_features": 0},
+                "details": {
+                    "dropped_features": 1,
+                    "clipped_features": 0,
+                    "polar_only": True,
+                },
             }
         )
         assert parsed.details.clip_skipped is False
@@ -900,3 +913,50 @@ class TestAppendMercatorClipWarning:
         _append_mercator_clip_warning(job, None)
 
         assert job.user_metadata == {}
+
+
+class TestPolarOnlyClassification(_FixtureTable):
+    async def test_data_reaching_only_the_poles_is_polar_only(self, test_db_session):
+        await _seed_wkt(
+            test_db_session,
+            ["POLYGON((-180 -90, 180 -90, 180 -60, -180 -60, -180 -90))"],
+            "Polygon",
+        )
+
+        counts = await clip_to_mercator_bounds(test_db_session, TABLE)
+
+        assert counts is not None and counts.get("polar_only") is True
+
+    async def test_swapped_axes_are_not_polar_only(self, test_db_session):
+        """Latitudes past 90 can only be longitudes in the wrong column."""
+        await _seed_points(test_db_session, [(40.7, -74.0), (45.0, 120.0)])
+
+        counts = await clip_to_mercator_bounds(test_db_session, TABLE)
+
+        assert counts is not None and counts["dropped_features"] > 0
+        assert "polar_only" not in counts
+        warning = make_mercator_clip_warning(counts)
+        assert warning is not None and "polar_only" not in warning["details"]
+
+    async def test_one_out_of_range_geometry_among_polar_ones_is_not_polar_only(
+        self, test_db_session
+    ):
+        await _seed_points(test_db_session, [(0.0, -89.95), (400.0, 10.0)])
+
+        counts = await clip_to_mercator_bounds(test_db_session, TABLE)
+
+        assert counts is not None and "polar_only" not in counts
+
+    async def test_a_non_4326_source_never_claims_polar_only(self, test_db_session):
+        await _seed_points(test_db_session, [(10.0, -89.95)], srid=4979)
+
+        counts = await clip_to_mercator_bounds(test_db_session, TABLE)
+
+        assert counts is not None and "polar_only" not in counts
+
+    async def test_an_in_bounds_dataset_is_not_marked(self, test_db_session):
+        await _seed_points(test_db_session, [(-73.985, 40.748)])
+
+        counts = await clip_to_mercator_bounds(test_db_session, TABLE)
+
+        assert counts is not None and "polar_only" not in counts

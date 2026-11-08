@@ -17,14 +17,14 @@ from app.platform.jobs.models import IngestJob
 
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 
-# fix(#691): lease shared by the materialize cap (router_analysis.py) and the
-# job-status auto-fail (platform/jobs/router.py), so API and poller agree. 10x
+# Lease shared by the materialize cap (router_analysis.py) and the
+# job-status auto-fail (platform/jobs/sweep.py), so API and poller agree. 10x
 # the renewal interval so one missed renewal can't admit a second concurrent CTAS.
 ANALYSIS_MATERIALIZE_LEASE_SECONDS = 300.0
 
 
-# fix(#1858): shared by the code that MAKES these names and the code that
-# RECOGNISES them. Narrow: `parcels_staging` is a legitimate user title.
+# Shared by the code that MAKES these names and the code that RECOGNISES
+# them. Narrow: `parcels_staging` is a legitimate user title.
 # POSIX syntax so Postgres `~` and Python `re` agree (test_staging_table_names_1858.py).
 ATTEMPT_STAGING_NAME_PATTERN = r"_staging_[0-9a-f]{32}$"
 
@@ -48,14 +48,22 @@ def is_attempt_scoped_staging_table(table_name: str) -> bool:
 
 
 # POSIX syntax, like the staging pattern, so discovery's `~` and Python agree.
-PREVIOUS_VERSION_NAME_PATTERN = r"_previous_[0-9a-f]{32}$"
+# The version number is optional: a version kept before datasets kept several
+# has none.
+PREVIOUS_VERSION_NAME_PATTERN = r"_previous_([0-9]+_)?[0-9a-f]{32}$"
 
 _PREVIOUS_VERSION_NAME_RE = re.compile(PREVIOUS_VERSION_NAME_PATTERN)
 
 
-def previous_version_table(base_table: str, dataset_id: uuid.UUID) -> str:
-    """Return the name of the table holding a dataset's previous data."""
-    suffix = f"_previous_{dataset_id.hex}"
+def previous_version_table(
+    base_table: str, dataset_id: uuid.UUID, version_number: int
+) -> str:
+    """Return the name of the table that keeps one previous version of a dataset.
+
+    The number precedes the id so the 58 characters a primary key's name
+    keeps (``rename_pkey_to_match_table``) differ between versions.
+    """
+    suffix = f"_previous_{version_number}_{dataset_id.hex}"
     return f"{base_table[: 63 - len(suffix)]}{suffix}"
 
 
@@ -109,14 +117,14 @@ async def resolve_ingest_job_attempt(
     return None
 
 
-# fix(#1950): the budget an attempt-fenced failure write spends on its own
-# ingest_jobs row. A long holder is a LATER attempt's phase bracket, whose id
+# The budget an attempt-fenced failure write spends on its own ingest_jobs
+# row. A long holder is a LATER attempt's phase bracket, whose id
 # the fence no longer matches, so no wait starts and a wait past this is stuck.
 JOB_ERROR_WRITE_TIMEOUT_MS = 10_000
 
 
-# fix(#1950): the two SQLSTATEs the budget itself produces — statement_timeout
-# and lock_timeout. Any other DBAPIError out of the failure write is a database
+# The two SQLSTATEs the budget itself produces: statement_timeout and
+# lock_timeout. Any other DBAPIError out of the failure write is a database
 # problem, reported under the sibling event rather than as an expiry.
 ERROR_WRITE_EXPIRY_CODES = ("57014", "55P03")
 
@@ -156,8 +164,8 @@ async def arm_job_error_write_budget(
     rollback on that session: ``SET LOCAL`` dies with the transaction, so an
     arm placed before a rollback or a commit is gone by the next statement.
 
-    fix(#1957 codex r4): ``budget_ms`` is for a caller that already sits under
-    an outer deadline. The shared budget is the default, not a floor.
+    ``budget_ms`` is for a caller that already sits under an outer deadline.
+    The shared budget is the default, not a floor.
     """
     # Resolved here, not as a default: the module global is what a test
     # patches, and a default argument would freeze it at import.
@@ -213,8 +221,8 @@ async def write_job_failure_for_attempt(
     it from a failure path where a raise would replace the cause with a lock
     timeout.
 
-    fix(#1957): ``None`` is not a fence miss. A caller that treats it as one
-    drops cleanup that belongs to an attempt still owning the job row. On
+    ``None`` is not a fence miss. A caller that treats it as one drops
+    cleanup that belongs to an attempt still owning the job row. On
     ``None`` the row stays ``running`` for the stale sweep to settle.
 
     Issue it AFTER any rollback on *session*: ``SET LOCAL`` dies with the
@@ -278,7 +286,7 @@ async def resolve_ingest_attempt_or_skip(
 ) -> tuple[uuid.UUID, uuid.UUID] | None:
     """Parse the job id and resolve its delivery token, or signal a skip.
 
-    fix(#836): returns ``(job_uuid, attempt_uuid)``, or ``None`` when a
+    Returns ``(job_uuid, attempt_uuid)``, or ``None`` when a
     tokenless legacy delivery could not adopt the pending job — the caller
     must return without touching the row.
     """
@@ -303,10 +311,10 @@ async def claim_job_attempt_and_start_heartbeat(
 ) -> "asyncio.Task[None] | None":
     """Claim the pending attempt, commit, and start the lease heartbeat.
 
-    fix(#836): rolls back and returns ``None`` when the caller no longer owns
+    Rolls back and returns ``None`` when the caller no longer owns
     the attempt. When ``job``/``current_step`` are given, stamps the first
     progress step in the same commit so polling sees a fresh signal on its
-    first poll after pickup (REMED-02 / ingest-audit P2-07).
+    first poll after pickup.
     """
     if not await ledger.claim(session, job_uuid, attempt_uuid):
         await session.rollback()

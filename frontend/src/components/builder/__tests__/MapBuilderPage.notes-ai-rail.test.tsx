@@ -48,10 +48,11 @@ vi.mock('@/hooks/use-maps', () => ({
   useRemoveLayer: () => ({}),
   useExportMapStyleJson: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useImportMapStyleJson: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useLayersHiddenFromMapGroups: () => new Set(),
 }));
 
 vi.mock('@/hooks/use-ai-availability', () => ({
-  // Plan 03 (Phase 1135) replaced the plain-text disabled state with AIDisabledState
+  // The plain-text disabled state was replaced by AIDisabledState
   // which branches on `reason`. Provide reason='env_disabled' so the structured
   // disabled state renders "AI is disabled" (rail.aiDisabledTitle) instead of a spinner.
   useAIAvailability: () => ({ isAIAvailable: false, reason: 'env_disabled', isLoading: false }),
@@ -93,6 +94,7 @@ vi.mock('@/components/builder/hooks/use-builder-dialogs', () => ({
 
 vi.mock('@/components/builder/hooks/use-builder-layers', () => ({
   useBuilderLayers: () => ({
+    dashboard: { panel: 'right', widgets: [] },
     localLayers: [],
     localName: 'Operations Map',
     setLocalName: vi.fn(),
@@ -138,7 +140,6 @@ vi.mock('@/components/builder/hooks/use-builder-layers', () => ({
     handleAiRemoveLayer: vi.fn(),
     handleQueryResult: vi.fn(),
     handleDismissEphemeral: vi.fn(),
-    handleRenderModeChange: vi.fn(),
     chatLayerActions: {
       onFilterChange: vi.fn(),
       onPaintChange: vi.fn(),
@@ -239,7 +240,7 @@ describe('MapBuilderPage notes migration and AI rail polish', () => {
 
     await user.click(aiButton);
 
-    // Plan 03 (Phase 1135): AIDisabledState renders reason-specific titles.
+    // AIDisabledState renders reason-specific titles.
     // With reason='env_disabled' the title key is 'rail.aiDisabledTitle'.
     expect(screen.getByText('rail.aiDisabledTitle')).toBeInTheDocument();
   });

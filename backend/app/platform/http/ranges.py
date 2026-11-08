@@ -1,13 +1,15 @@
 """One implementation of RFC 9110 byte-range parsing, shared by every route
 that serves ranges off a stored object.
 
-fix(#1532): lives here because ``processing/`` may not import
+Lives here because ``processing/`` may not import
 ``modules/catalog/``, and both need the identical parser.
 """
 
 import re
+from collections.abc import Awaitable, Callable
 
 from fastapi import status
+from starlette.requests import Request
 from starlette.responses import Response
 
 # bytes=FIRST-LAST | bytes=FIRST- | bytes=-SUFFIX. `[0-9]` not `\d`: Python's
@@ -32,8 +34,8 @@ _RANGE_SPEC_RE = re.compile(r"^(?:([0-9]+)-([0-9]*)|-([0-9]+))$")
 # NOT a 200 with the whole object — a client resuming one tile would splice it.
 RANGE_UNSATISFIABLE = "unsatisfiable"
 
-# fix(#1540): saturated at this many digits before reaching int().
-# CPython refuses to convert a literal longer than
+# Saturated at this many digits before reaching int(). CPython refuses to
+# convert a literal longer than
 # sys.get_int_max_str_digits() (4300 default) — an unbounded `int(group)` on a
 # 4301-digit value (fits an 8 KiB header) would be a 500. Saturating instead of
 # rejecting keeps the RFC answer (416, or a clamp) rather than a 200 with the
@@ -134,9 +136,8 @@ def range_bound_to_this_version(if_range: str | None, etag: str | None) -> bool:
     ``W/"..."`` (never matches strong comparison), or when there is no
     validator to compare against. An absent ``If-Range`` returns True.
 
-    fix(#1532): shared with the export route under ``processing/``,
-    which needs the identical evaluation — reimplementing it there is how the
-    two would drift.
+    Shared with the export route under ``processing/``, which needs the
+    identical evaluation.
     """
     if if_range is None:
         return True
@@ -196,7 +197,7 @@ def not_modified_response(etag: str | None) -> Response:
     client revalidating before a resume does not have to re-probe. No body or
     ``Content-Length``: starlette's ``init_headers`` already omits both for 304.
 
-    fix(#1554): ``etag`` may be None, matching what the 200 for a row with no
+    ``etag`` may be None, matching what the 200 for a row with no
     stored digest would send. Minting one here would wrongly authorize a resume
     ``range_bound_to_this_version`` refuses on exactly those rows.
     """
@@ -204,3 +205,23 @@ def not_modified_response(etag: str | None) -> Response:
     if etag is not None:
         headers["ETag"] = etag
     return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+
+
+async def stored_object_response(
+    request: Request,
+    read: Callable[[], Awaitable[bytes]],
+    *,
+    etag: str,
+    media_type: str,
+    cache_control: str,
+) -> Response:
+    """A stored object, or a 304 without calling ``read`` when the caller's
+    copy matches ``etag``.
+
+    ``etag`` must change whenever the object can, so derive it from something
+    that names one version, such as a key that is written only once.
+    """
+    headers = {"Cache-Control": cache_control, "ETag": etag}
+    if if_none_match_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    return Response(content=await read(), media_type=media_type, headers=headers)

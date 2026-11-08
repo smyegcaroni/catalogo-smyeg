@@ -13,9 +13,9 @@ import type { TileToken } from '@/api/tiles';
 /**
  * The reveal-gate predicate ViewerMap uses: terrain is EXPECTED (worth holding
  * the veil for) only when the config is enabled AND a terrain-capable DEM
- * rendering resolves AND that rendering is saved visible — the same conditions
+ * rendering resolves AND that rendering is saved visible, the same conditions
  * useViewerTerrain applies before draping the mesh. A pure export so a
- * regression here (which degrades to a silent 4s veil) stays unit-testable.
+ * regression (a silent 4s veil) stays unit-testable.
  */
 export function isViewerTerrainExpected(
   layers: SharedLayerResponse[],
@@ -44,24 +44,24 @@ export function useViewerTerrain({
   terrainConfig?: MapTerrainConfig | null;
   tokenMap?: Map<string, TileToken>;
   /**
-   * fix(#452): the bound DEM's LIVE visibility from the viewer legend's eye
-   * toggle (ViewerMap resolves it from visibleLayers). The saved `visible`
-   * check below covers maps saved with a hidden DEM (HT-12), but the legend
-   * toggle is a client-side override the saved flag never reflects — without
-   * this the mesh stayed extruded after the viewer hid the DEM live.
+   * The bound DEM's LIVE visibility from the viewer legend's eye toggle
+   * (ViewerMap resolves it from visibleLayers). The saved `visible` check below
+   * covers maps saved with a hidden DEM, but the legend toggle is a client-side
+   * override the saved flag never reflects; without this the mesh stays
+   * extruded after the viewer hides the DEM live.
    */
   demLayerLiveVisible?: boolean;
 }) {
   const [terrainReady, setTerrainReady] = useState(false);
 
-  // fix(HT-12): resolve through the SAME shared resolver the builder uses
+  // Resolve through the SAME shared resolver the builder uses
   // (deterministic duplicate semantics included) instead of a local find.
   const terrainLayer = useMemo(
     () => resolveTerrainSourceLayer(layers, terrainConfig) ?? null,
     [layers, terrainConfig],
   );
 
-  // fix(#451): whether the shared payload carries ANY rendering of the bound
+  // Whether the shared payload carries ANY rendering of the bound
   // dataset. Distinguishes "row filtered out / metadata not loaded" (terrain
   // may still seed from the raster token — the share-token embed of a private
   // DEM dataset depends on this) from "rows exist but none is a visible
@@ -80,10 +80,10 @@ export function useViewerTerrain({
       setTerrainReady(false);
       return;
     }
-    // fix(#454): same hole as BuilderMap.applyTerrainConfig — a one-shot idle
-    // deferral (reseedTerrainOnStyleLoad) landing mid style-transition used to
-    // no-op silently and leave the mesh flat until an unrelated dep changed.
-    // Re-arm on the next idle instead; double-applies are idempotent.
+    // Same as BuilderMap.applyTerrainConfig: a one-shot idle deferral
+    // (reseedTerrainOnStyleLoad) landing mid style-transition would no-op and
+    // leave the mesh flat until an unrelated dep changed. Re-arm on the next
+    // idle; double-applies are idempotent.
     if (!map.isStyleLoaded()) {
       setTerrainReady(false);
       map.once('idle', apply);
@@ -101,26 +101,25 @@ export function useViewerTerrain({
     const terrainTileUrl = terrainToken?.kind === 'raster'
       ? terrainToken.tile_url
       : currentTerrainLayer?.tile_url;
-    // fix(HT-12): honor the bound DEM layer's saved visibility the same way the
-    // builder does (BuilderMap applyTerrainConfig: effectiveTerrainEnabled =
-    // enabled && demLayerVisible). Previously the viewer (and embeds, which
-    // reuse this hook) rendered terrain from a hidden DEM row, so a saved map
-    // could show no terrain in the builder and active terrain in the viewer.
-    // fix(#451): when the payload DOES carry rows for the bound dataset but
-    // none resolves as a terrain-capable DEM (legacy/corrupt binding), the mesh
-    // must stay off — the reveal gate and legend already say "no terrain" in
-    // that state. When it carries NO rows (filtered private dataset in a
-    // share-token embed, or metadata still loading), keep seeding from the
-    // raster token as before.
-    // fix(#452): AND the live legend-toggle state, so hiding the DEM in the
-    // viewer flattens the mesh just like the builder's eye toggle does.
+    // Honor the bound DEM layer's saved visibility as the builder does
+    // (BuilderMap applyTerrainConfig: effectiveTerrainEnabled = enabled &&
+    // demLayerVisible); the viewer (and embeds, which reuse this hook) must not
+    // render terrain from a hidden DEM row, or a saved map could show no terrain
+    // in the builder and active terrain in the viewer.
+    // When the payload carries rows for the bound dataset but none resolves as a
+    // terrain-capable DEM (legacy/corrupt binding), the mesh stays off, as the
+    // reveal gate and legend already say "no terrain". When it carries NO rows
+    // (filtered private dataset in a share-token embed, or metadata still
+    // loading), keep seeding from the raster token.
+    // AND the live legend-toggle state, so hiding the DEM in the viewer flattens
+    // the mesh like the builder's eye toggle.
     const demLayerVisible = (currentTerrainLayer
       ? currentTerrainLayer.visible !== false
       : !currentBoundDatasetHasRows) && currentLiveVisible;
     if (!currentTerrainConfig?.enabled || !terrainDatasetId || !terrainTileUrl || !demLayerVisible) {
       map.setTerrain(null);
       setTerrainReady(false);
-      // #186 (b): terrain off → clear the small-DEM warning dedupe.
+      // Terrain off: clear the small-DEM warning dedupe.
       resetSmallDemWarning(map);
       return;
     }
@@ -139,21 +138,20 @@ export function useViewerTerrain({
     });
     setTerrainReady(true);
 
-    // #186 (b): warn once per enable when the DEM covers only a small slice of
-    // the viewport. demBounds come from the raster token (the only bounds source
-    // available here; SharedLayerResponse carries no bounds). When the terrain is
-    // driven by a non-raster token (no bounds), the guard simply no-ops.
+    // Warn once per enable when the DEM covers only a small slice of the
+    // viewport. demBounds come from the raster token (the only bounds source
+    // here; SharedLayerResponse carries no bounds); a non-raster token has none,
+    // so the guard no-ops.
     //
-    // fix(#1128): BuilderMap switched to the layer's `dataset_extent_bbox`,
-    // because the token span cannot distinguish a seam-crossing DEM from a
-    // global one. This site deliberately did NOT follow: `SharedLayerResponse`
-    // has no extent field, and adding one would buy nothing — `audience:
-    // 'viewer'` below suppresses the toast before `demBounds` is read (#430
-    // V-06), so there is no under-warning here to fix.
+    // BuilderMap uses the layer's `dataset_extent_bbox`, because the token span
+    // can't distinguish a seam-crossing DEM from a global one. This site doesn't:
+    // `SharedLayerResponse` has no extent field, and `audience: 'viewer'` below
+    // suppresses the toast before `demBounds` is read, so there is no
+    // under-warning to fix.
     const demBounds = terrainToken?.kind === 'raster' ? terrainToken.bounds : null;
     resetSmallDemWarning(map, terrainDatasetId);
-    // fix(#430 V-06): suppress the builder-oriented small-DEM advice toast for viewers —
-    // "zoom in" / "drape over Copernicus GLO-30" isn't actionable read-only.
+    // Suppress the builder-oriented small-DEM advice toast for viewers:
+    // "zoom in" / "use a wider DEM" isn't actionable read-only.
     maybeWarnSmallDemCoverage({
       map,
       demBounds,

@@ -1,4 +1,4 @@
-"""SEC-025 regression tests: fail-closed function allowlist for LLM SQL.
+"""Regression tests: fail-closed function allowlist for LLM SQL.
 
 These tests verify that the sandbox rejects server-introspection functions
 (which were previously allowed under the fail-open denylist) while still
@@ -20,22 +20,26 @@ import pytest
 
 from app.platform.sandbox import validator as _validator
 from app.platform.sandbox.schemas import SandboxError
-from app.platform.sandbox.validator import _MAX_BUFFER_MATCH_ATTEMPTS, validate_sql
+from app.platform.sandbox.validator import (
+    _MAX_BUFFER_MATCH_ATTEMPTS,
+    check_table_access,
+    validate_sql,
+)
+from app.processing.ai.query_router import _QUERY_BLOCKED_FUNCTIONS
 
 
 @contextlib.contextmanager
 def _recording_validator_logger():
     """Collect the validator's structured rejection events, immune to caching.
 
-    fix(#1024): `structlog.testing.capture_logs()` observes the GLOBAL
+    `structlog.testing.capture_logs()` observes the GLOBAL
     structlog configuration, so what it sees depends on what else ran earlier
     in the same xdist worker rather than on the code under test. Under `-n 4`
     it started yielding `[]` here while the rejection itself still happened,
     which turned main red. The same file passes run alone, and two failing
     runs disagreed on how many of the three broke.
 
-    fix(#1064 codex r3): the trigger IS now pinned down, and this paragraph
-    used to say it was not. It is a CONJUNCTION, which is why five separate
+    The trigger is a CONJUNCTION, which is why five separate
     reproduction attempts came back empty — each had one half:
 
         `cache_logger_on_first_use=True` is in force
@@ -68,7 +72,7 @@ def _recording_validator_logger():
     `setup_logging()` turns it on. Use `configured_logging()` from
     `tests/_logging_state.py`, which owns both steps; its sibling
     `preserved_logging_state()` only snapshots and restores, so composing that
-    one with `setup_logging()` by hand leaves the freeze armed (#1064 codex r4).
+    one with `setup_logging()` by hand leaves the freeze armed.
     """
     events: list[dict] = []
 
@@ -153,14 +157,14 @@ def _assert_allows(sql: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# SEC-025-REJECT: introspection / server-metadata functions must be rejected
+# Introspection / server-metadata functions must be rejected
 # ---------------------------------------------------------------------------
 
 
 class TestIntrospectionFunctionsRejected:
     """Unlisted server-introspection functions must raise SandboxError.
 
-    These are the acceptance-criteria queries from the SEC-025 plan.
+    These are the acceptance-criteria queries.
     Pre-fix: all PASSED (not in small denylist). Post-fix: all REJECTED.
     """
 
@@ -212,7 +216,7 @@ class TestIntrospectionFunctionsRejected:
 class TestNiladicKeywordFunctionsRejected:
     """PostgreSQL's parenless identity keywords must be rejected too.
 
-    fix(#1778): the SEC-025 allowlist is driven by one
+    The allowlist is driven by one
     ``stmt.find_all(exp.Func)`` walk, and sqlglot 30.17.0 gives only some of
     PostgreSQL's SQLValueFunction keywords a Func subclass. Measured before the
     fix, ``user``, ``current_role`` and ``system_user`` parsed as ``exp.Column``
@@ -260,7 +264,7 @@ class TestNiladicKeywordFunctionsRejected:
 
 
 # ---------------------------------------------------------------------------
-# SEC-025-ALLOW: legitimate AI-generated queries must still pass
+# Legitimate AI-generated queries must still pass
 # ---------------------------------------------------------------------------
 
 
@@ -343,6 +347,25 @@ class TestLegitimateQueriesAllowed:
 
     def test_allows_st_x_y(self):
         _assert_allows("SELECT ST_X(geom_4326), ST_Y(geom_4326) FROM data.pts")
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT count(*) FROM data.parcels WHERE NOT ST_IsValid(geom_4326)",
+            "SELECT ST_GeometryType(geom_4326), count(*) FROM data.parcels GROUP BY 1",
+            "SELECT name FROM data.cities "
+            "WHERE ST_Intersects(geom_4326, ST_MakeEnvelope(-75, 40, -73, 41, 4326))",
+            "SELECT ST_AsText(geom_4326) FROM data.cities LIMIT 5",
+            "SELECT max(ST_NPoints(geom_4326)) FROM data.roads",
+            "SELECT ST_GeomFromText('POINT(-74 40.7)', 4326)",
+            'SELECT ST_GeomFromGeoJSON(\'{"type":"Point","coordinates":[0,0]}\')',
+            "SELECT ST_Area(geography(geom_4326)) FROM data.parcels",
+            "SELECT ST_Area(geometry(ST_Buffer(geom_4326::geography, 10))) "
+            "FROM data.cities",
+        ],
+    )
+    def test_allows_data_qa_spatial_functions(self, sql):
+        _assert_allows(sql)
 
     # -- pg_trgm --------------------------------------------------------------
 
@@ -644,8 +667,8 @@ class TestExistsSubqueryAllowed:
         _assert_rejects_function(
             "SELECT name FROM data.t AS a "
             "WHERE EXISTS (SELECT 1 FROM data.u AS b "
-            "WHERE ST_MakeEnvelope(0, 0, 1, 1, 4326) IS NOT NULL)",
-            "st_makeenvelope",
+            "WHERE ST_GeneratePoints(b.geom, 10) IS NOT NULL)",
+            "st_generatepoints",
         )
 
     def test_rejects_recursive_cte_inside_exists(self):
@@ -656,6 +679,117 @@ class TestExistsSubqueryAllowed:
             "SELECT 1 UNION ALL SELECT n + 1 FROM bomb WHERE n < 1000000000"
             ") SELECT n FROM bomb)",
             expected_message="Recursive queries are not allowed",
+        )
+
+
+class TestBoundingBoxOperatorAllowed:
+    """sqlglot parses `&&` as ArrayOverlaps, a Func node, so the walk used to
+    refuse it as a function called array_overlaps. It is an operator; both
+    operands are still walked and every table still access-checked."""
+
+    def test_allows_bbox_overlap(self):
+        _assert_allows(
+            "SELECT a.name FROM data.parcels a, data.zones b "
+            "WHERE a.geom_4326 && b.geom_4326"
+        )
+
+    def test_allows_bbox_overlap_with_envelope(self):
+        _assert_allows(
+            "SELECT count(*) FROM data.parcels "
+            "WHERE geom_4326 && ST_MakeEnvelope(-75, 40, -73, 41, 4326)"
+        )
+
+    def test_rejects_blocked_function_in_left_operand(self):
+        _assert_rejects_function(
+            "SELECT 1 FROM data.parcels WHERE pg_sleep(1) && geom_4326", "pg_sleep"
+        )
+
+    def test_rejects_unlisted_function_in_right_operand(self):
+        _assert_rejects_function(
+            "SELECT 1 FROM data.parcels "
+            "WHERE geom_4326 && ST_GeneratePoints(geom_4326, 1000000)",
+            "st_generatepoints",
+        )
+
+    @pytest.mark.parametrize(
+        "operand",
+        [
+            "(SELECT geom_4326 FROM data.secret_zones LIMIT 1)",
+            "(SELECT NULL::geometry FROM pg_catalog.pg_authid LIMIT 1)",
+        ],
+    )
+    def test_table_in_an_operand_is_still_access_checked(self, operand):
+        result = validate_sql(
+            f"SELECT 1 FROM data.parcels WHERE geom_4326 && {operand}"
+        )
+        with pytest.raises(SandboxError) as exc_info:
+            check_table_access(result.tables, {"parcels"}, result.cte_names)
+        assert exc_info.value.category == "table_not_accessible"
+
+
+class TestRefusalNamesTheFunction:
+    """The refusal names the function as the caller wrote it, so an agent can
+    rewrite the query instead of guessing."""
+
+    @pytest.mark.parametrize(
+        ("sql", "blocked", "expected"),
+        [
+            (
+                "SELECT ST_Dump(geom_4326) FROM data.cities",
+                None,
+                "Query uses a disallowed spatial function: st_dump",
+            ),
+            (
+                "SELECT version()",
+                None,
+                "Query uses a disallowed function: version",
+            ),
+            (
+                "SELECT pg_catalog.pg_sleep(1)",
+                None,
+                "Query uses a disallowed function: pg_sleep",
+            ),
+            (
+                "SELECT current_role",
+                None,
+                "Query uses a disallowed function: current_role",
+            ),
+            # sqlglot renames these (pad, group_concat); the caller's
+            # spelling is what comes back.
+            (
+                "SELECT lpad(name, 5) FROM data.cities",
+                _QUERY_BLOCKED_FUNCTIONS,
+                "Query uses a disallowed function: lpad",
+            ),
+            (
+                "SELECT string_agg(name, ',') FROM data.cities",
+                _QUERY_BLOCKED_FUNCTIONS,
+                "Query uses a disallowed function: string_agg",
+            ),
+        ],
+    )
+    def test_names_the_refused_function(self, sql, blocked, expected):
+        with pytest.raises(SandboxError) as exc_info:
+            validate_sql(sql, extra_blocked_functions=blocked)
+        assert exc_info.value.user_message == expected
+
+    def test_caps_a_long_caller_supplied_name(self):
+        name = "f" * 200
+        _assert_rejects(
+            f"SELECT {name}(1)",
+            expected_message=f"Query uses a disallowed function: {'f' * 63}",
+        )
+
+    def test_does_not_echo_a_name_that_is_not_an_identifier(self):
+        _assert_rejects(
+            'SELECT "drop table; x"(1)',
+            expected_message="Query uses a disallowed function",
+        )
+
+    def test_does_not_echo_a_quoted_name(self):
+        _assert_rejects(
+            'SELECT "WeirdName"(1)',
+            expected_message="Query uses a disallowed function",
         )
 
 
@@ -670,12 +804,9 @@ class TestResourceAmplificationRejected:
         )
 
     def test_rejects_unknown_postgis_function(self):
-        _assert_rejects("SELECT ST_MakeEnvelope(0, 0, 1, 1, 4326)")
-        # fix(#1001): ST_GeneratePoints is the attacker-chosen-cardinality
-        # generator the allowlist comment cites. Kept alongside ST_MakeEnvelope
-        # rather than replacing it: #1001 admits the buffer's machinery only
-        # inside the rendered template, so ST_MakeEnvelope on its own is still
-        # an unknown spatial function and both belong here.
+        # The buffer's machinery is admitted only inside the rendered
+        # template, so ST_XMin on its own is still an unknown spatial function.
+        _assert_rejects("SELECT ST_XMin(geom_4326) FROM data.cities")
         _assert_rejects("SELECT ST_GeneratePoints(geom_4326, 100) FROM data.cities")
 
     def test_rejects_oversized_generate_series(self):
@@ -742,7 +873,7 @@ class TestResourceAmplificationRejected:
         _assert_rejects(sql)
 
     def test_rejects_table_scanning_unary_st_collect_however_aliased(self):
-        """fix(#935 codex r2, restored by #1001): the canonical buffer's unary
+        """The canonical buffer's unary
         ST_Collect is admitted by whole-template match, not by a per-call
         exception. Hiding a table scan one derived level down — or borrowing
         the renderer's own alias names — must not slip past."""
@@ -752,7 +883,7 @@ class TestResourceAmplificationRejected:
         )
 
     def test_rejects_tiny_or_dynamic_segmentize_length(self):
-        """fix(#935 codex r2, restored by #1001): ST_Segmentize's max-edge
+        """ST_Segmentize's max-edge
         argument controls vertex amplification. Outside the rendered template
         the function is not allowlisted at all, so no argument saves it."""
         _assert_rejects("SELECT ST_Segmentize(geom_4326, 1e-100) FROM data.cities")
@@ -763,7 +894,7 @@ class TestResourceAmplificationRejected:
         )
 
     def test_rejects_table_scanning_st_dump(self):
-        """fix(#935 codex r3, restored by #1001): ST_Dump over a table is the
+        """ST_Dump over a table is the
         UNNEST row-amplification class."""
         _assert_rejects(
             "SELECT COUNT(*) FROM data.cities c "
@@ -776,7 +907,7 @@ class TestResourceAmplificationRejected:
 
 
 # ---------------------------------------------------------------------------
-# fix(#1001): the canonical geodesic buffer
+# The canonical geodesic buffer
 # ---------------------------------------------------------------------------
 
 
@@ -820,13 +951,13 @@ def _unlisted_names_in_canonical_buffer() -> set[str]:
 
 
 class TestCanonicalGeodesicBufferAdmitted:
-    """fix(#1001): every metric buffer on the NL->SQL surface is
+    """Every metric buffer on the NL->SQL surface is
     render_geodesic_buffer's output, and the fail-closed allowlist refused it —
     every buffer question in the surface was dead. The functions it needs are
     admitted only inside a subtree that re-renders to exactly the same AST,
     never per call.
 
-    fix(#1589): the model no longer types that output. It writes a
+    The model no longer types that output. It writes a
     geolens_buffer() marker and processing/ai/buffer_marker.py expands it
     before validation, so what arrives here is unchanged and so is this."""
 
@@ -989,7 +1120,7 @@ class TestCanonicalBufferExemptionIsScoped:
         ],
     )
     def test_rejects_an_unbounded_buffer_input(self, label, geom):
-        """fix(#1001 codex r1): matching the template is not sufficient. The
+        """Matching the template is not sufficient. The
         scaffold's cost is a function of its INPUT's planar span, so the input
         has to be a stored geometry rather than one the caller manufactured."""
         rendered = (
@@ -1002,7 +1133,7 @@ class TestCanonicalBufferExemptionIsScoped:
     @pytest.mark.parametrize(
         ("label", "sql_template"),
         [
-            # fix(#1001 codex r2): a bare column is not enough on its own. An
+            # A bare column is not enough on its own. An
             # alias launders the projected geometry back in, and the
             # ST_Transform sits OUTSIDE the exempt subtree so it clears the
             # allowlist on its own.
@@ -1071,7 +1202,7 @@ class TestCanonicalBufferExemptionIsScoped:
         )
 
     def test_rejects_a_bare_top_level_column(self):
-        """fix(#1001 codex r4): documented limit. The scaffold interposes its
+        """Documented limit. The scaffold interposes its
         own `(SELECT ... OFFSET 0) AS _pb` scope between the column and the
         real FROM, so deciding whether a bare name belongs to `_pb` or to the
         outer table needs the table's column list. The prompt teaches the
@@ -1095,7 +1226,7 @@ class TestCanonicalBufferExemptionIsScoped:
         ],
     )
     def test_rejects_a_positional_column_alias_list(self, label, prefix, source):
-        """fix(#1001 codex r4): `AS s(gid, name, geom_4326)` binds the NAME
+        """`AS s(gid, name, geom_4326)` binds the NAME
         geom_4326 to whatever the third physical column is, which may be a
         projected geom. Deciding that needs the table's real column order,
         which the validator does not have."""
@@ -1107,7 +1238,7 @@ class TestCanonicalBufferExemptionIsScoped:
         )
 
     def test_an_unrelated_nested_alias_does_not_refuse_the_buffer(self):
-        """fix(#1001 codex r4): binding resolution is lexical. A nested query
+        """Binding resolution is lexical. A nested query
         that happens to reuse an alias must not make the outer binding look
         ambiguous — before this, adding `(SELECT count(*) FROM data.cities s)`
         as a sibling projection refused a buffer that was fine."""
@@ -1118,7 +1249,7 @@ class TestCanonicalBufferExemptionIsScoped:
         )
 
     def test_rejects_an_alias_shadowing_a_safe_cte(self):
-        """fix(#1001 codex r3): `FROM bad AS x` binds x to `bad`, whatever a
+        """`FROM bad AS x` binds x to `bad`, whatever a
         CTE literally named x also defines. Resolving through CTE definitions
         instead of through the from/join reference read the safe one."""
         _assert_rejects(
@@ -1161,7 +1292,7 @@ class TestCanonicalBufferExemptionIsScoped:
     def test_rejects_a_base_column_that_is_not_the_managed_4326_column(
         self, label, sql
     ):
-        """fix(#1001 codex r3): reaching a base table is not enough. Ingest
+        """Reaching a base table is not enough. Ingest
         keeps a dataset's ORIGINAL `geom` in whatever CRS it arrived in and
         adds `geom_4326` alongside, so a Web Mercator `s.geom` has a
         40-million-unit span and drives the scaffold exactly like a
@@ -1178,7 +1309,7 @@ class TestCanonicalBufferExemptionIsScoped:
     def test_follows_a_two_hop_pass_through(self):
         """Sibling CTEs are in scope for each other, so lineage crosses them.
 
-        fix(#1001 codex r4): the earlier resolver stopped at one hop and
+        The earlier resolver stopped at one hop and
         refused this; walking WITH clauses outward from the scope that binds
         the reference is what makes it resolve.
         """

@@ -1,4 +1,4 @@
-"""fix(#1315): the Procrastinate worker gets a live MVT tile cache.
+"""The Procrastinate worker gets a live MVT tile cache.
 
 ``invalidate_tile_cache_for_table()`` resolves its provider through the
 ``get_tile_cache()`` singleton, and that singleton used to be set only by the
@@ -6,11 +6,11 @@ API lifespan.  The worker is a separate process, so ``get_tile_cache()``
 returned ``None`` there and every post-swap MVT purge -- both reupload paths
 and the PostGIS refresh -- was a silent no-op.  Stale tiles kept being served
 for up to ``tile_cache_ttl`` after every re-upload, which is exactly what
-fix(#394) B-019/VT-01 added the purge to prevent.
+the purge added in #394 exists to prevent.
 
 The fix moves ``init_tile_cache()`` into the shared ``bootstrap()`` so both
 entrypoints take it from one place.  The worker deliberately does NOT take the
-PERF-01 in-memory fallback: it never reads tiles, so a per-process LRU there
+in-memory fallback: it never reads tiles, so a per-process LRU there
 holds nothing, and purging it would evict nothing while logging that it had
 succeeded -- the current no-op with extra steps.  With ``REDIS_URL`` unset the
 worker leaves the singleton unset and says why at boot.
@@ -132,7 +132,7 @@ def test_worker_bootstrap_initializes_redis_backed_tile_cache(
     asyncio.run(bootstrap(app=None))
 
     assert isinstance(cache_provider.get_tile_cache(), TileCacheProvider), (
-        "fix(#1315): the worker must end bootstrap with the Redis-backed tile "
+        "The worker must end bootstrap with the Redis-backed tile "
         "cache live, or every post-swap MVT purge is a silent no-op."
     )
 
@@ -159,7 +159,7 @@ def test_api_bootstrap_initializes_redis_backed_tile_cache(
 def test_api_bootstrap_keeps_in_memory_fallback_without_redis(
     bootstrappable, restore_tile_cache, monkeypatch
 ):
-    """PERF-01 is unchanged for the API: no REDIS_URL still gets the LRU.
+    """The API is unchanged: no REDIS_URL still gets the LRU.
 
     The API both writes and reads tiles in one process, so a process-local
     cache is a real cache there.
@@ -319,7 +319,7 @@ async def test_worker_purge_evicts_tiles_another_process_cached(
     await invalidate_tile_cache_for_table(swapped)
 
     assert await api_cache.get(swapped, 3, 1, 2) is None, (
-        "fix(#1315): the worker's post-swap purge must evict the tiles the API "
+        "The worker's post-swap purge must evict the tiles the API "
         "process cached for the swapped table"
     )
     assert await api_cache.get(untouched, 3, 1, 2) == b"other-dataset-mvt", (
@@ -402,7 +402,7 @@ def test_bootstrap_initializes_the_tile_cache():
     from app.platform.extensions import bootstrap as bootstrap_module
 
     assert "init_tile_cache(" in inspect.getsource(bootstrap_module.bootstrap), (
-        "fix(#1315): bootstrap() must own init_tile_cache() so the API and the "
+        "bootstrap() must own init_tile_cache() so the API and the "
         "worker cannot drift into different tile-cache states again."
     )
 
@@ -417,6 +417,6 @@ def test_api_lifespan_does_not_init_the_tile_cache_directly():
     from app.api import main as main_module
 
     assert "init_tile_cache(" not in inspect.getsource(main_module.lifespan), (
-        "WORK-01 / fix(#1315): the lifespan must not call init_tile_cache() "
+        "The lifespan must not call init_tile_cache() "
         "directly -- bootstrap() is the single source of truth."
     )

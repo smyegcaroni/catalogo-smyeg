@@ -104,17 +104,16 @@ interface ViewerChatPanelProps {
  * Read-only "Ask AI" for the public map viewer.
  *
  * The builder's full ChatPanel is reachable only to `can_edit` users; signed-in
- * viewers land on PublicMapViewerPage with no AI affordance. PR #339 made the
- * backend chat path serve view-only callers a read-only toolbox (`query_data`,
- * plus `run_analysis` since M4 — both SELECT-only), so this surfaces that path:
- * a question goes to `/ai/chat/stream/`, the streamed answer renders inline, and
- * a `show_query_result` flies the map to the matched features (shared
- * `useEphemeralLayers` overlay) + shows a compact table. A `run_analysis`
- * preview arrives as the same action carrying only geojson+bbox, so it draws the
- * overlay and skips the table.
+ * viewers get no AI affordance there. The backend chat path serves view-only
+ * callers a read-only toolbox (`query_data` and `run_analysis`, both
+ * SELECT-only); this surfaces it: a question goes to `/ai/chat/stream/`, the
+ * streamed answer renders inline, and a `show_query_result` flies the map to the
+ * matched features (shared `useEphemeralLayers` overlay) and shows a compact
+ * table. A `run_analysis` preview arrives as the same action carrying only
+ * geojson+bbox, so it draws the overlay and skips the table.
  *
  * Self-gates on `useAIAvailability` (token + `use_ai_chat` + AI configured), so
- * anonymous or unpermitted viewers render nothing. No edit actions are applied —
+ * anonymous or unpermitted viewers render nothing. No edit actions are applied;
  * non-query actions are ignored defensively.
  */
 export function ViewerChatPanel({ mapId, layers, mapInstanceRef }: ViewerChatPanelProps) {
@@ -148,9 +147,9 @@ export function ViewerChatPanel({ mapId, layers, mapInstanceRef }: ViewerChatPan
   const applyQueryResult = useCallback((action: ChatAction): QueryResult | undefined => {
     const geojson = action.geojson;
     if (!geojson) {
-      // fix(#676): the winning result has no geometry (empty analysis,
-      // attribute-only query) — clear the single-slot overlay instead of
-      // leaving the previous turn's features and badge on the map.
+      // The winning result has no geometry (empty analysis, attribute-only
+      // query): clear the single-slot overlay instead of leaving the previous
+      // turn's features and badge on the map.
       handleDismissEphemeral();
     }
     if (
@@ -160,31 +159,26 @@ export function ViewerChatPanel({ mapId, layers, mapInstanceRef }: ViewerChatPan
       geojson.type === 'FeatureCollection' &&
       Array.isArray(action.bbox) &&
       action.bbox.length === 4 &&
-      // fix(#527 B-054/C-06): Number.isFinite + non-inverted — NaN/inverted
-      // bounds pass the range comparisons and throw in fitBounds.
+      // Number.isFinite + non-inverted: NaN/inverted bounds pass the range
+      // comparisons and throw in fitBounds.
       action.bbox.every((n: unknown) => Number.isFinite(n))
     ) {
       const [minX, minY, maxX, maxY] = action.bbox as [number, number, number, number];
       if (!(minX < -180 || minY < -90 || maxX > 180 || maxY > 90 || minX > maxX || minY > maxY)) {
-        // fix(#674 audit): forward the truncation pair so the badge discloses
-        // "N of TOTAL" rather than presenting a capped overlay as complete.
+        // Forward the truncation pair so the badge discloses "N of TOTAL" rather
+        // than presenting a capped overlay as complete.
         //
-        // fix(#1076): and forward it without a total too. A clip filters rows,
-        // so the server reports none for it — requiring one dropped the
-        // disclosure and a capped clip read as complete. This surface matters
-        // most of the two: an embed or a shared link lands here.
+        // Forward it without a total too. A clip filters rows, so the server
+        // reports none for it; requiring one would drop the disclosure and a
+        // capped clip would read as complete. This surface matters most: an
+        // embed or a shared link lands here.
         //
-        // The producer half is #1071; until it lands this branch is correct and
-        // simply not yet reachable for a clip.
-        //
-        // feat(#1241 codex r1): `truncated` is the SQL row cap, not a statement
-        // about the overlay — the server clips the FeatureCollection to its own
-        // render budget after it, so a 300-row answer arrives as 50 features
-        // with the flag false. chatOverlayCompleteness catches that too. The
-        // builder needs it for the save guard; this surface needs it for the
-        // same reason it needed #674: the badge must not call a clipped
-        // overlay complete.
-        const preview = geojson as GeoJSON.FeatureCollection;
+        // `truncated` is the SQL row cap, not a statement about the overlay: the
+        // server clips the FeatureCollection to its own render budget after it,
+        // so a 300-row answer arrives as 50 features with the flag false.
+        // chatOverlayCompleteness catches that too, so the badge never calls a
+        // clipped overlay complete.
+        const preview = geojson;
         handleQueryResult(
           preview,
           [minX, minY, maxX, maxY],
@@ -217,6 +211,7 @@ export function ViewerChatPanel({ mapId, layers, mapInstanceRef }: ViewerChatPan
     abortRef.current = controller;
     let streamed = '';
     let queryResult: QueryResult | undefined;
+    let modelUnsupported = false;
     try {
       for await (const { event, data } of streamChatMessage(mapId, userMsg, layers, i18n.language, history, controller.signal)) {
         if (event === 'token') {
@@ -224,10 +219,10 @@ export function ViewerChatPanel({ mapId, layers, mapInstanceRef }: ViewerChatPan
           setStreamingText(streamed);
         } else if (event === 'actions') {
           // Read-only: only show_query_result is acted on; any edit action is
-          // ignored. feat(#534): apply only the LAST query result — an earlier
-          // spatial result may be superseded by a sanity-check retry, and a
-          // per-action apply would leave the flyover describing a different
-          // result than the table (matches the builder's winning-action rule).
+          // ignored. Apply only the LAST query result: an earlier spatial result
+          // may be superseded by a sanity-check retry, and a per-action apply
+          // would leave the flyover describing a different result than the table
+          // (the builder's winning-action rule).
           const results = getChatActions(data.actions).filter(
             (a) => a.type === 'show_query_result',
           );
@@ -245,6 +240,7 @@ export function ViewerChatPanel({ mapId, layers, mapInstanceRef }: ViewerChatPan
           if (typeof data.status === 'number') {
             throw new ApiError(typeof data.message === 'string' ? data.message : '', data.status);
           }
+          if (data.code === 'model_requires_responses_api') modelUnsupported = true;
           throw new Error(typeof data.message === 'string' ? data.message : '');
         }
       }
@@ -257,7 +253,12 @@ export function ViewerChatPanel({ mapId, layers, mapInstanceRef }: ViewerChatPan
       } else {
         setMessages((prev) => [
           ...prev,
-          { id: randomId(), role: 'error', content: t('viewer.ai.error'), retryMessage: userMsg },
+          {
+            id: randomId(),
+            role: 'error',
+            content: t(modelUnsupported ? 'viewer.ai.errorModelUnsupported' : 'viewer.ai.error'),
+            retryMessage: userMsg,
+          },
         ]);
       }
     } finally {
@@ -277,15 +278,14 @@ export function ViewerChatPanel({ mapId, layers, mapInstanceRef }: ViewerChatPan
 
   return (
     <>
-      {/* fix(#542): the viewer applied the query overlay with no legend entry,
-          badge, or dismissal — orange highlights persisted unexplained. Reuse
-          the builder's badge; the viewer's bottom-left column is occupied by
-          BasemapToggle (bottom-8) and the Map data button (bottom-20). */}
-      {/* fix(#1009): the builder moved this affordance into its layer stack
-          (EphemeralPreviewRow) and dropped the badge there. Do NOT finish the
-          deletion here: the viewer has no layer stack to host a row, so this
-          badge is #542's only dismissal surface. Removing it re-opens #542
-          verbatim — an orange overlay with no way to explain or dismiss it. */}
+      {/* The query overlay needs a badge and dismissal, or the orange
+          highlights are unexplained. Reuse the builder's badge; the viewer's
+          bottom-left column is occupied by BasemapToggle (bottom-8) and the
+          Map data button (bottom-20). */}
+      {/* The builder hosts this affordance in its layer stack
+          (EphemeralPreviewRow) and has no badge. The viewer has no layer stack
+          to host a row, so this badge is its only dismissal surface: removing
+          it leaves an orange overlay with no way to explain or dismiss it. */}
       {ephemeralResult && (
         <EphemeralBadge
           featureCount={ephemeralResult.geojson.features.length}
@@ -295,10 +295,10 @@ export function ViewerChatPanel({ mapId, layers, mapInstanceRef }: ViewerChatPan
           className="bottom-32 start-3"
         />
       )}
-    {/* fix(#542): end-16, not end-3 — the problem-reporter lifebuoy (fixed
+    {/* end-16, not end-3 — the problem-reporter lifebuoy (fixed
         bottom-10 right-4, size-10) appears in the bottom-right corner once
-        errors are captured and overlapped the FAB (same class of bug as the
-        dataset-page fix in #540). */}
+        errors are captured and would overlap the FAB (as on the dataset
+        page). */}
     <div className="absolute bottom-8 end-16 z-10 flex flex-col items-end gap-2">
       {open && (
         <section
@@ -371,7 +371,7 @@ export function ViewerChatPanel({ mapId, layers, mapInstanceRef }: ViewerChatPan
           </div>
 
           <div className="flex items-end gap-2 border-t px-3 py-2">
-            {/* fix(#438): DS-03 — raw textarea kept for the auto-growing
+            {/* Raw textarea kept for the auto-growing
                 chat composer; the ui/textarea primitive covers static fields. */}
             <textarea
               ref={inputRef}

@@ -17,7 +17,7 @@ vi.mock('@/components/import/hooks/use-ingest', () => ({
     mutateAsync: vi.fn(),
     isPending: false,
   }),
-  // fix(review #1800 CI): JobProgress (rendered by VrtCreatorForm's tracking
+  // JobProgress (rendered by VrtCreatorForm's tracking
   // step) calls useCancelJob unconditionally since #1778 — an incomplete
   // mock here throws "No useCancelJob export is defined on the mock" as an
   // unhandled error even though every assertion in this file still passes.
@@ -47,10 +47,10 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
-// fix(#1778): rebuilt to the shape service_records.py actually serializes
+// The shape service_records.py actually serializes
 // (proj:code / proj:shape / raster:bands / gsd), not the flat
-// epsg/dtype/nodata/width/height/res_x/res_y fields the API never returned.
-// fix(#1805 review round 2): `nodata` now distinguishes three real JSON
+// epsg/dtype/nodata/width/height/res_x/res_y fields the API never returns.
+// `nodata` distinguishes three real JSON
 // shapes -- omitted entirely (default '-9999' when unset, or forced via
 // `omitNodataKey` to simulate the remote-COG shape where band stats never
 // carry a nodata key), explicitly `null` (a band that HAS nodata metadata
@@ -71,7 +71,7 @@ function makeCogSource(
     width: number;
     height: number;
     gsd: number;
-    /** Independent per-axis resolution (fix(#1805 review round 5)); each
+    /** Independent per-axis resolution; each
      * defaults to `gsd` when unset, so existing gsd-only fixtures still set
      * matching res_x/res_y and their old comparisons keep working. */
     res_x: number;
@@ -84,20 +84,26 @@ function makeCogSource(
     type: 'Feature',
     id: overrides.id ?? 'ds-1',
     geometry: null,
+    time: {},
     properties: {
       type: 'Feature',
       title: overrides.title ?? 'Test COG',
-      description: null,
-      keywords: null,
+      description: '',
+      keywords: [],
       created: null,
       updated: null,
       updated_by_display: null,
       never_edited: true,
+      themes: [],
+      time: {},
+      source_freshness: 'unknown',
+      source_health: 'unknown',
+      has_quicklook: false,
       crs: overrides.crs === null ? null : (overrides.crs ?? `EPSG:${overrides.epsg ?? 4326}`),
       geometry_type: null,
       feature_count: null,
-      contacts: null,
-      license: null,
+      contacts: [],
+      license: 'proprietary',
       source_organization: null,
       record_type: 'raster_dataset',
       'proj:code': `EPSG:${overrides.epsg ?? 4326}`,
@@ -118,6 +124,7 @@ function makeCogSource(
 }
 
 import { searchDatasets } from '@/api/search';
+import { ApiError } from '@/api/client';
 
 const mockSearchDatasets = vi.mocked(searchDatasets);
 
@@ -276,7 +283,7 @@ describe('VrtCreatorForm', () => {
     expect(submitButton).toBeDisabled();
   });
 
-  // fix(#1805 review round 1): _check_crs picks the reference CRS as the
+  // _check_crs picks the reference CRS as the
   // first source in the list with a KNOWN crs, not unconditionally the
   // first selected source. With the first-selected source having no CRS,
   // the previous code (comparing everything to sources[0]) silently
@@ -308,19 +315,16 @@ describe('VrtCreatorForm', () => {
     const submitButton = screen.getByRole('button', { name: 'vrt.submit' });
     expect(submitButton).toBeDisabled();
 
-    // fix(#1877): the visible reason must use the same first-known-crs
+    // The visible reason must use the same first-known-crs
     // reference validateSources compares against, not selectedSources[0]
     // (which can be crs-unset).
     const reasons = document.getElementById('vrt-mismatch-reasons');
     expect(reasons?.textContent).toContain('"first":"EPSG:4326"');
   });
 
-  // fix(#1778): these three checks read epsg/dtype/nodata/width/height/
-  // res_x/res_y off OGCRecordProperties, none of which the API ever
-  // returned, so the operands were always undefined and every branch below
-  // was dead code -- the fixture agreed with the (wrong) hand-typed mirror
-  // and both disagreed with the server. Now sourced from raster:bands,
-  // proj:shape, and gsd, the shape the API actually serializes.
+  // These three checks source epsg/dtype/nodata/width/height/res_x/res_y
+  // from raster:bands, proj:shape, and gsd, the shape the API actually
+  // serializes (OGCRecordProperties has no such fields).
   it('mismatched dtype across mosaic sources disables submit (#1778)', { timeout: 15000 }, async () => {
     const user = userEvent.setup({ delay: null });
     const source1 = makeCogSource({ id: 'ds-dtype-a', title: 'Dtype Source A', dtype: 'uint8' });
@@ -346,8 +350,8 @@ describe('VrtCreatorForm', () => {
     expect(submitButton).toBeDisabled();
   });
 
-  // fix(#1805 review round 2 P1): round 1 fixed the VALUE-vs-PRESENCE bug
-  // but still inferred presence from a single `!= null` read, conflating
+  // A VALUE-vs-PRESENCE check
+  // must not infer presence from a single `!= null` read, conflating
   // "unknown" (no band metadata for nodata at all -- the remote-COG shape,
   // since cog_info.py's band stats carry only min/max/mean) with "absent"
   // (a band that explicitly has no nodata). Pinned per the review: a
@@ -485,13 +489,13 @@ describe('VrtCreatorForm', () => {
 
     const submitButton = screen.getByRole('button', { name: 'vrt.submit' });
     expect(submitButton).toBeDisabled();
-    // fix(#1811): the reason was only ever in a hover tooltip; now also
-    // always-visible text, and the button points at it via aria-describedby.
+    // The reason is always-visible text (not only a hover tooltip), and the
+    // button points at it via aria-describedby.
     expect(screen.getByText('vrt.gridMismatch')).toBeInTheDocument();
     expect(submitButton).toHaveAttribute('aria-describedby', 'vrt-mismatch-reasons');
   });
 
-  // fix(#1811): a matched set must show neither the disabled state nor the
+  // A matched set must show neither the disabled state nor the
   // (now absent) reason text — the mismatch UI is error-only.
   it('a matched band-stack set shows no mismatch reason text and enables submit', async () => {
     const user = userEvent.setup({ delay: null });
@@ -522,7 +526,7 @@ describe('VrtCreatorForm', () => {
     expect(submitButton).not.toHaveAttribute('aria-describedby');
   });
 
-  // fix(#1805 review round 1 P2): the backend compares res_x/res_y (which
+  // The backend compares res_x/res_y (which
   // gsd derives from) with a 1e-10 absolute tolerance, not strict equality.
   // Pinned per the review: 0.30000000000000004 vs 0.3 is aligned;
   // 0.3 vs 0.31 is misaligned.
@@ -580,7 +584,7 @@ describe('VrtCreatorForm', () => {
     expect(submitButton).toBeDisabled();
   });
 
-  // fix(#1805 review round 5): gsd is a lossy min(abs(res_x), abs(res_y)) --
+  // gsd is a lossy min(abs(res_x), abs(res_y)):
   // (res_x=10, res_y=20) and (res_x=10, res_y=30) share the identical
   // gsd=10 and identical dimensions, so a gsd-only comparison passed this
   // pair while the backend's _check_grid_alignment (independent res_x/res_y
@@ -698,12 +702,12 @@ describe('VrtCreatorForm', () => {
   });
 
   it('clears the search blur timer on unmount so it cannot fire into a torn-down tree', () => {
-    // fix(#1758): the 150 ms blur delay used to outlive the component. Nothing
-    // cleared it, so unmounting inside its window left it queued, and on the CI
-    // runner it fired after jsdom teardown and threw `window is not defined`
-    // out of react-dom's scheduler. That failed the whole vitest run while
-    // every test in it passed, which is the shape of failure hardest to
-    // attribute to the file that caused it.
+    // The 150 ms blur delay must be cleared on unmount. Otherwise
+    // unmounting inside its window leaves it queued, and on the CI runner it
+    // fires after jsdom teardown and throws `window is not defined` out of
+    // react-dom's scheduler. That fails the whole vitest run while every test
+    // in it passes, which is the shape of failure hardest to attribute to the
+    // file that caused it.
     vi.useFakeTimers();
     try {
       const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
@@ -738,5 +742,21 @@ describe('VrtCreatorForm', () => {
       vi.restoreAllMocks();
       vi.useRealTimers();
     }
+  });
+
+  it('says search is rate-limited on a 429 instead of showing the empty text', async () => {
+    mockSearchDatasets.mockRejectedValue(new ApiError('Too many requests', 429));
+    const user = userEvent.setup();
+    render(<VrtCreatorForm />);
+    await user.type(screen.getByPlaceholderText('vrt.searchPlaceholder'), 'cog');
+    expect(await screen.findByText('vrt.searchRateLimited', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.queryByText('vrt.noResults')).not.toBeInTheDocument();
+  });
+
+  it('shows the empty text for a successful empty search', async () => {
+    const user = userEvent.setup();
+    render(<VrtCreatorForm />);
+    await user.type(screen.getByPlaceholderText('vrt.searchPlaceholder'), 'cog');
+    expect(await screen.findByText('vrt.noResults', {}, { timeout: 5000 })).toBeInTheDocument();
   });
 });

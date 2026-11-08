@@ -1,10 +1,10 @@
 """Bounded reads for a service-type probe's own request.
 
-fix(#1770): `probe_ogcapi`/`probe_wfs`/`probe_arcgis_service`/
-`connect_stac_api` used a plain `client.get` with no byte cap and no
-decoded-size cap. `assert_endpoints_stay_on_origin()` only runs AFTER
-`detect_service_type()` returns, so a probe's own read could exhaust the API
-process before that check ever got a turn.
+The probes (`probe_ogcapi`/`probe_wfs`/`probe_arcgis_service`/
+`connect_stac_api`) need a byte cap and a decoded-size cap of their own:
+`assert_endpoints_stay_on_origin()` only runs AFTER
+`detect_service_type()` returns, so an unbounded probe read could exhaust
+the API process before that check ever got a turn.
 
 A separate module, not a second function in `service_endpoints.py`:
 `test_service_auth_transport_1746.py` asserts, structurally, that
@@ -17,6 +17,7 @@ the file those tests scan rather than asking them to carve out an exception.
 
 import httpx
 
+from app.platform.security import QUERY_CREDENTIAL
 from app.platform.service_endpoints import (
     MAX_DOCUMENT_BYTES,
     MAX_DOCUMENT_ELEMENTS,
@@ -35,6 +36,7 @@ async def bounded_probe_exchange(
     accept: str,
     json_body: object | None = None,
     raise_for_status: bool = True,
+    credential_in_query: bool = False,
 ) -> tuple[bytes, httpx.Response]:
     """A probe's own request to a URL its caller already SSRF-validated.
 
@@ -64,7 +66,9 @@ async def bounded_probe_exchange(
     redirect responses, and whose `headers` are the final response's.
     `json_body` is sent as a JSON request body. With `raise_for_status`
     false, a non-2xx response's body is read under the same bounds instead,
-    for a caller that wants the error a service explains in it.
+    for a caller that wants the error a service explains in it. Pass
+    `credential_in_query` when the caller put a credential into `url`, so no
+    hop may take it to another origin.
 
     Does NOT itself call `validate_url_for_ssrf`, unlike `fetch_document`.
     `fetch_document` re-validates because its caller follows a CHAIN of
@@ -84,6 +88,8 @@ async def bounded_probe_exchange(
     # or a wrapped argument list in between leaves the call unsuppressed.
     # codeql[py/full-ssrf] the caller validated this exact URL with validate_url_for_ssrf immediately before invoking bounded_probe_exchange, and the client comes from make_safe_client, whose transport re-resolves, validates and pins the IP at connect time and whose response hook revalidates every redirect hop
     request = client.build_request(method, url, headers=request_headers, json=json_body)
+    if credential_in_query:
+        request.extensions[QUERY_CREDENTIAL] = True
     redirects: list[httpx.Response] = []
     while True:
         # codeql[py/full-ssrf] the request built and validated above, or the next hop the client built for a redirect it already revalidated
@@ -120,6 +126,7 @@ async def bounded_probe_read(
     headers: dict[str, str],
     accept: str,
     raise_for_status: bool = True,
+    credential_in_query: bool = False,
 ) -> tuple[bytes, httpx.Headers]:
     """A GET through `bounded_probe_exchange`, for callers that want the body
     and the response headers and nothing else."""
@@ -130,5 +137,6 @@ async def bounded_probe_read(
         headers=headers,
         accept=accept,
         raise_for_status=raise_for_status,
+        credential_in_query=credential_in_query,
     )
     return body, response.headers

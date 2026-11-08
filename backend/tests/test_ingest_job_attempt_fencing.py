@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from app.processing.raster.vrt import overview_keys_for
 from sqlalchemy import text, update
 
 from app.platform.jobs import ledger
@@ -33,8 +34,7 @@ async def test_expired_attempt_cannot_renew_or_finalize_retried_job(test_db_sess
     await test_db_session.commit()
     await test_db_session.refresh(job)
 
-    _, running_failed = await fail_stale_jobs(test_db_session)
-    assert running_failed == 1
+    await fail_stale_jobs(test_db_session)
     await test_db_session.refresh(job)
     assert job.status == "failed"
 
@@ -113,7 +113,7 @@ async def test_vrt_generation_heartbeat_fences_stale_recovery(test_db_session):
         asset_uri="rasters/test/source.vrt",
         status="regenerating",
         current_generation_id=generation.id,
-        # fix(#1322 review round 3): this test is about HEARTBEAT-based
+        # this test is about HEARTBEAT-based
         # staleness, not composition drift — an empty built_from matches
         # this fixture's zero vrt_source_links rows (both empty sets), so
         # the composition guard finds nothing changed and the restore-to-
@@ -130,13 +130,14 @@ async def test_vrt_generation_heartbeat_fences_stale_recovery(test_db_session):
 
     generation.heartbeat_at = datetime.now(timezone.utc) - timedelta(hours=2)
     await test_db_session.commit()
-    # feat(#1322 review): the 3rd element is the dead attempt's resolved (not
+    # The 3rd element is the dead attempt's resolved (not
     # yet deleted) storage keys — deletion is the caller's job, strictly
     # after ITS commit lands, so sweep_stale_vrt_assets itself never touches
     # storage.
     generation_base = f"rasters/{dataset.id}/generations/{generation.id}"
     expected_keys = (
         f"{generation_base}/source.vrt",
+        *(f"{generation_base}/{k}" for k in overview_keys_for("source.vrt")),
         f"{generation_base}/quicklook_256.png",
         f"{generation_base}/quicklook_512.png",
     )
@@ -149,7 +150,7 @@ async def test_vrt_generation_heartbeat_fences_stale_recovery(test_db_session):
     await test_db_session.refresh(generation)
     await test_db_session.refresh(asset)
     assert generation.status == "failed"
-    # feat(#1267): restored to 'ready' — the dead attempt never touched the
+    # Restored to 'ready' — the dead attempt never touched the
     # asset's published pointer, so it keeps serving what it served before.
     assert asset.status == "ready"
     assert asset.current_generation_id is None

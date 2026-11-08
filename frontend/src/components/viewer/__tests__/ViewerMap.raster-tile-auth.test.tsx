@@ -1,12 +1,12 @@
-// fix(#890): the viewer's first-party 401/403 branch treated recoverTileAuth()'s
-// `true` as recovery for every tile, raster included. A raster/DEM auth failure
-// cannot be cured by a fresh tile token (its auth rides the Authorization header
-// attached in setTransformRequest), so the surface stayed silent and the only
-// trace was the red console row logUnhandledMapError still emits for
-// `/raster-tiles/` URLs — a blank raster layer with no user-visible reason.
+// The viewer's first-party 401/403 branch must not treat recoverTileAuth()'s
+// `true` as recovery for a raster tile. A raster/DEM auth failure cannot be
+// cured by a fresh tile token (its auth rides the Authorization header
+// attached in setTransformRequest), so a silent surface would leave only the
+// red console row logUnhandledMapError emits for `/raster-tiles/` URLs — a
+// blank raster layer with no user-visible reason.
 //
 // The re-mint still runs (its apiFetch renews an expiring JWT, which IS what a
-// raster 401 needs — codex P1 on this PR), but a raster failure no longer counts
+// raster 401 needs), but a raster failure does not count
 // as recovered: it surfaces the tile-error toast. The vector path is unchanged.
 import type { ReactNode } from 'react';
 import { render, waitFor } from '@/test/test-utils';
@@ -166,7 +166,7 @@ describe('ViewerMap raster/DEM tile auth errors (fix #890)', () => {
 
     mapState.fakeMap.emit('error', { error: { status: 403, url: RASTER_URL } });
 
-    // fix(#890) (codex P1): the re-mint still runs — its apiFetch renews an
+    // The re-mint still runs — its apiFetch renews an
     // expiring JWT, which is what a raster 401/403 actually needs — but its
     // `true` must not silence the surface the way it does for a vector tile.
     expect(tokenState.refreshTokens).toHaveBeenCalledTimes(1);

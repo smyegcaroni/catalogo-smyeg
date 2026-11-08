@@ -251,11 +251,11 @@ async def ensure_geom_column(
     )
     row = result.first()
     if row is None:
-        return False  # Non-spatial table
+        return False
 
     geom_col = row[0]
     if geom_col == "geom":
-        return True  # Already correct
+        return True
 
     logger.info(
         "Renaming geometry column",
@@ -284,7 +284,7 @@ async def rename_reserved_columns(
     column (gid, geom, geometry, geom_4326, fid, ogc_fid) to ``src_<name>``.
     Runs BEFORE add_4326_column so its ADD COLUMN geom_4326 cannot collide.
 
-    fix(#640): also renames ``:``-bearing columns (Socrata exports ship
+    Also renames ``:``-bearing columns (Socrata exports ship
     system columns like ``:id`` that survive OGR's laundering; a colon
     inside a double-quoted identifier is parsed as a bind parameter by
     SQLAlchemy ``text()``, breaking every downstream text()-built query).
@@ -318,7 +318,6 @@ async def rename_reserved_columns(
     if not reserved_check.first():
         return []
 
-    # A collision candidate exists — fetch what's needed to decide origin.
     result = await session.execute(
         text(
             "SELECT column_name, data_type, udt_name, column_default, is_identity "

@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text,
     and_,
     cast,
+    desc,
     func,
     literal,
     or_,
@@ -32,16 +33,16 @@ ACTIVE_STATUSES = ("pending", "running")
 TERMINAL_STATUSES = tuple(s for s in ALL_STATUSES if s not in ACTIVE_STATUSES)
 
 # Statuses whose row still needs the staged `file_path`: pending/running read
-# it now, failed keeps it for /jobs/{id}/retry. fix(#1249): lives here, not
-# inline, since both the retention purge and staging-orphan reconciliation read it.
+# it now, failed keeps it for /jobs/{id}/retry. Read by the retention purge and
+# staging-orphan reconciliation.
 STATUSES_NEEDING_STAGED_INPUT = ("pending", "running", "failed")
 
-# fix(#1709): stamped by the stale sweep on a fan-out parent whose dispatch
+# Stamped by the stale sweep on a fan-out parent whose dispatch
 # crashed before any child committed. jobs/router.py refuses generic retry on
 # it, since that would silently import only one layer of a multi-layer file.
 FAN_OUT_INTERRUPTED_METADATA_KEY = "fan_out_interrupted"
 
-# fix(#1710): stamped by the URL-import door and CLEARED by the staged
+# Stamped by the URL-import door and CLEARED by the staged
 # transition. While present, `file_path` names a download destination rather
 # than a complete file, so `_retry_capability` refuses the ordinary ingest
 # retry: a crash-truncated CSV is still valid to a streaming reader.
@@ -53,8 +54,8 @@ URL_DOWNLOAD_IN_FLIGHT_METADATA_KEY = "url_download_in_flight"
 # file is gone.
 URL_IMPORT_METADATA_KEY = "url_import"
 
-# fix(#1744): stamped by ``defer_with_orphan_guard`` at dispatch time. ABSENCE
-# is load-bearing — a stamp-less pending row was never queued, so the stale
+# Stamped by ``defer_with_orphan_guard`` at dispatch time. ABSENCE is
+# load-bearing: a stamp-less pending row was never queued, so the stale
 # sweep settles it `cancelled` not `failed`. Read by sweep, status poll, worker startup.
 COMMIT_ATTEMPTED_METADATA_KEY = "commit_attempted_at"
 
@@ -68,7 +69,7 @@ def commit_attempted_marker() -> dict[str, str]:
     return {COMMIT_ATTEMPTED_METADATA_KEY: datetime.now(timezone.utc).isoformat()}
 
 
-# fix(#1542): marks an admin embedding backfill run; the row exists so the
+# Marks an admin embedding backfill run; the row exists so the
 # operator sees it in flight and a second run is refused before it deletes
 # anything. Read by the admin dispatch, its concurrency guard, and jobs/router.py.
 EMBEDDING_BACKFILL_METADATA_KEY = "embedding_backfill"
@@ -79,7 +80,7 @@ EMBEDDING_BACKFILL_METADATA_KEY = "embedding_backfill"
 ACTIVE_BACKFILL_INDEX_NAME = "uq_ingest_jobs_active_embedding_backfill"
 
 # Set by the post-expiry presigned sweep (`_sweep_expired_presigned_staging`
-# in sweep.py) once done with a row's `s3_key`. fix(#1249): presence signals
+# in sweep.py) once done with a row's `s3_key`. Presence signals
 # staging-orphan reconciliation may take the key over; one string, two readers.
 STAGING_REAPED_FINAL_MARKER = "s3_key_reaped_final"
 
@@ -94,6 +95,18 @@ MANIFEST_STAGE_METADATA_KEY = "manifest_stage"
 # The manifest entry's content fingerprint, which the apply compares to skip an
 # entry it has already imported or is importing.
 MANIFEST_FINGERPRINT_METADATA_KEY = "manifest_fingerprint"
+
+# The capability the door that queued a VRT regeneration required, which the
+# publish checks again. Absent for a door that required none.
+ADMITTED_CAPABILITY_METADATA_KEY = "admitted_capability"
+
+# Set when an admin's request under restrict_public_visibility made the data
+# public, which the publish checks they still are.
+ADMITTED_PUBLIC_VISIBILITY_METADATA_KEY = "admitted_public_visibility"
+
+# Set when the door admitted an admin-only raw seed source, a local staging
+# path or a same-bucket object key, which the publish checks they still are.
+ADMITTED_RAW_SOURCE_METADATA_KEY = "admitted_raw_source"
 
 # The unpacked total the tileset upload door measured, which the commit door
 # checks against the quota again.
@@ -163,6 +176,8 @@ PUBLIC_METADATA_KEYS = frozenset(
         "nodata_override",
         "resampling",
         "strict_cog",
+        "item_id",
+        "portal_url",
         # The request that created the job.
         "analysis",
         "dataset_id",
@@ -191,6 +206,7 @@ PUBLIC_METADATA_KEYS = frozenset(
         "manifest_bbox",
         # The outcome.
         "warnings",
+        "origin_link_loss",
         "rows_failed",
         "temporal_parse_errors",
         "collision_warning",
@@ -217,7 +233,7 @@ def owned_presigned_staging_key(
 ) -> str | None:
     """Return the presigned staging key this job alone is responsible for.
 
-    fix(#1202): ``user_metadata["s3_key"]`` is the only remaining
+    ``user_metadata["s3_key"]`` is the only remaining
     reference to the client-writable staging key once ``file_path`` points at
     a frozen copy; reapers sweep it alongside ``file_path``.
 
@@ -238,7 +254,7 @@ class IngestJob(Base):
             "status IN ({})".format(", ".join(f"'{s}'" for s in ALL_STATUSES)),
             name="chk_ingest_jobs_status",
         ),
-        # DBM-03: partial index for stale-job recovery scans.
+        # Partial index for stale-job recovery scans.
         # Migration 0001_baseline is the source of truth for the actual DDL.
         Index(
             "ix_ingest_jobs_status_active",
@@ -246,8 +262,10 @@ class IngestJob(Base):
             postgresql_where=text("status IN ('running', 'pending')"),
         ),
         Index("ix_catalog_ingest_jobs_tenant_id", "tenant_id"),
-        # fix(#1542): DB-enforced (not check-then-insert, which can't stop
-        # two concurrent force runs). NULLS NOT DISTINCT is load-bearing in
+        # The admin job list's default order, id tiebreak ascending included.
+        Index("ix_ingest_jobs_created_at_id", desc("created_at"), "id"),
+        # DB-enforced (check-then-insert can't stop two concurrent force
+        # runs). NULLS NOT DISTINCT is load-bearing in
         # single-tenant mode, where every tenant_id is NULL. Migration 0050 = DDL.
         Index(
             ACTIVE_BACKFILL_INDEX_NAME,
@@ -301,9 +319,9 @@ class IngestJob(Base):
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    # REMED-02 / ingest-audit P2-07: progress fields written by workers at
-    # step boundaries; nullable for back-compat (pre-migration/service-ingest
-    # rows surface None). DB column stays String(32); Pydantic Literal is the contract (KNOWN-04).
+    # Progress fields written by workers at step boundaries; nullable, since
+    # service-ingest and older rows surface None. The DB column is String(32);
+    # the Pydantic Literal is the contract.
     progress: Mapped[float | None] = mapped_column(Float, nullable=True)
     current_step: Mapped[str | None] = mapped_column(String(32), nullable=True)
     rows_processed: Mapped[int | None] = mapped_column(Integer, nullable=True)

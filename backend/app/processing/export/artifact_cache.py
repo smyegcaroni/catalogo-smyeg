@@ -1,4 +1,4 @@
-"""Stable stored artifact behind ``GET /datasets/{id}/export`` (fix(#1532)).
+"""Stable stored artifact behind ``GET /datasets/{id}/export``.
 
 Stored once; every range request slices that one object. An artifact is
 named ``{built_at}-{size}-{digest}-{nonce}.bin`` with no other index: lookup
@@ -30,24 +30,25 @@ _ROOT = "export-cache"
 # Correctness bound on staleness, not a performance knob.
 _DEFAULT_TTL_SECONDS = 60
 
-# fix(#1532): same horizon as the temp-export sweeper (must not drift) or
-# a cached export still streaming past it is removed under its reader.
+# Same horizon as the temp-export sweeper, or a cached export still streaming
+# past it is removed under its reader.
 _SWEEP_AGE_SECONDS = EXPORTS_PERIODIC_SWEEP_AGE_SECONDS
 
 # Sweep cadence; running more often buys nothing since reclaimed objects
 # have been unusable for an hour already.
 _SWEEP_INTERVAL_SECONDS = 900
 
-# fix(#1532): tolerates NTP jitter, not a broken clock.
+# Tolerates NTP jitter, not a broken clock.
 _CLOCK_SLACK_SECONDS = 5
 
-# fix(#1532): matches nginx `proxy_read_timeout 600s`; bounds how far
-# past its key stamp an artifact's publish may land (`_published_at`).
+# Matches nginx `proxy_read_timeout 600s`; bounds how far past its key stamp an
+# artifact's publish may land (`_published_at`).
 _MAX_PUBLISH_SECONDS = 600
 
-# fix(#1532): cache ceiling; `_ROOT` shares the staging volume with every
-# conversion/ingest and the provider reports no capacity, so this is absolute.
+# Cache ceiling; `_ROOT` shares the staging volume with every conversion/ingest
+# and the provider reports no capacity, so this is absolute.
 _BUDGET_BYTES = 8 * 1024 * 1024 * 1024
+
 
 _last_sweep_at = 0.0
 
@@ -74,8 +75,8 @@ class ExportArtifact:
     built_at: float
     filename: str
     media_type: str
-    # fix(#1532): set when >1 distinct digest was fresh at lookup, so a
-    # slicing client could splice them; caller answers ranges whole while set.
+    # Set when >1 distinct digest was fresh at lookup, so a slicing client could
+    # splice them; the caller answers ranges whole while set.
     contested: bool = False
 
     @property
@@ -87,7 +88,7 @@ class ExportArtifact:
 
 
 def strong_etag(digest: str) -> str:
-    """The quoted strong entity-tag for a set of export bytes (fix(#1532))."""
+    """The quoted strong entity-tag for a set of export bytes."""
     return f'"{digest}"'
 
 
@@ -110,23 +111,26 @@ def selection_key(
     target_crs: str | None,
     bbox: str | None,
     where: str | None,
+    exporter_version: str,
 ) -> str:
     """Identity of the requested bytes, as a storage path segment.
 
     Includes ``table_name`` (a replace swaps the physical table) and
     ``dataset_title`` (becomes the GPKG layer name). ``tile_cache_version`` is
     keyed here rather than checked at freshness time: a missed bump then only
-    costs bounded staleness, not a wrong download. ``None``/``""`` stay
-    distinct through the JSON encoding (#1546).
+    costs bounded staleness, not a wrong download. ``exporter_version`` is
+    the running app's version: an upgrade can write different bytes for the
+    same selection, and nothing built before it may vouch for them.
+    ``None``/``""`` stay distinct through the JSON encoding.
     """
-    # #1585: two segments (URL identity, then version) so every artifact of
-    # one URL shares a prefix for `url_answered_other_bytes_recently`.
+    # Two segments (URL identity, then version) so every artifact of one URL
+    # shares a prefix for `url_answered_other_bytes_recently`.
     url_payload = json.dumps(
         [str(dataset_id), str(format_key), target_crs, bbox, where],
         separators=(",", ":"),
     )
     version_payload = json.dumps(
-        [table_name, dataset_title, tile_cache_version],
+        [table_name, dataset_title, tile_cache_version, exporter_version],
         separators=(",", ":"),
     )
     url_part = hashlib.sha256(url_payload.encode()).hexdigest()[:20]
@@ -142,14 +146,14 @@ def _url_prefix(dataset_id: uuid.UUID, selection: str) -> str:
 async def url_answered_other_bytes_recently(
     dataset_id: uuid.UUID, selection: str, digest: str
 ) -> bool:
-    """Has this URL answered with DIFFERENT bytes inside the last TTL?
+    """Has this URL answered with different bytes inside the last TTL?
 
-    #1585: bounds bare ranges — a client reading an earlier representation
-    that returns within its first TTL gets a whole answer instead. Scoped to
-    the URL's own versions; fails CLOSED on a listing error.
+    Bounds bare ranges: a client reading an earlier representation that returns
+    within its first TTL gets a whole answer instead. Scoped to the URL's own
+    versions; fails closed on a listing error.
     """
-    # #1585 r5: two TTLs — one for the artifact's own freshness, one for the
-    # client's window to return for a full answer.
+    # Two TTLs: one for the artifact's own freshness, one for the client's
+    # window to return for a full answer.
     cutoff = time.time() - 2 * _ttl_seconds()
     try:
         async for page in get_storage().iter_object_pages(
@@ -166,6 +170,56 @@ async def url_answered_other_bytes_recently(
     return False
 
 
+async def url_held_only_these_bytes(
+    dataset_id: uuid.UUID, selection: str, digest: str
+) -> bool:
+    """Does every artifact this URL still stores carry ``digest``, with one present?
+
+    At any age up to the sweep horizon, so a client holding offsets from any
+    of them holds offsets into these exact bytes. Fails closed on a listing
+    error.
+    """
+    found = False
+    try:
+        async for page in get_storage().iter_object_pages(
+            _url_prefix(dataset_id, selection)
+        ):
+            for obj in page:
+                parsed = parse_artifact_key(obj.key)
+                if parsed is None:
+                    continue
+                if parsed[2] != digest:
+                    return False
+                found = True
+    except Exception:  # broad: unknown history proves nothing; whole is safe
+        return False
+    return found
+
+
+async def settled_artifact(
+    dataset_id: uuid.UUID, selection: str, *, filename: str, media_type: str
+) -> ExportArtifact | None:
+    """The newest artifact inside the sweep horizon, if the URL holds no other bytes.
+
+    Lets a HEAD that finds nothing fresh describe the export without building
+    it. The GET that follows rebuilds: unchanged data reproduces these bytes
+    and is sliced like a hit, and changed data is answered whole and leaves
+    the URL holding two digests, so the next HEAD is size-less again. Only
+    for a selection whose key pins its bytes: an owned table, whose every
+    write moves the key, and no ``where`` filter, which can select other rows
+    as the clock moves. Bytes changed otherwise would be vouched for until
+    the horizon.
+    """
+    artifact = await lookup(
+        dataset_id, selection, filename=filename, media_type=media_type, any_age=True
+    )
+    if artifact is None or artifact.contested:
+        return None
+    if not await url_held_only_these_bytes(dataset_id, selection, artifact.digest):
+        return None
+    return artifact
+
+
 def _selection_prefix(dataset_id: uuid.UUID, selection: str) -> str:
     return f"{_ROOT}/{_tenant_segment()}/{dataset_id}/{selection}/"
 
@@ -177,9 +231,9 @@ def _artifact_key(
 
     ``built_at`` makes freshness/reclamation pure functions of the name,
     ``size`` detects truncation, ``digest`` is the strong ETag. ``nonce`` makes
-    the key WRITER-OWNED (fix(#1532)): without it, two builders finishing in
-    the same second shared a key and one's ``_discard`` deleted the other's
-    live object.
+    the key writer-owned: without it, two builders finishing in the same second
+    would share a key and one's ``_discard`` would delete the other's live
+    object.
     """
     nonce = uuid.uuid4().hex[:12]
     return (
@@ -209,8 +263,8 @@ def parse_artifact_key(key: str) -> tuple[float, int, str] | None:
 def parse_tmp_key(key: str) -> float | None:
     """Build time of a ``.tmp`` scratch file, or None if not one.
 
-    fix(#1532): ``LocalStorageProvider.put`` writes then renames, so a
-    SIGKILL leaves this behind; aged from the stamp of the key it targeted.
+    ``LocalStorageProvider.put`` writes then renames, so a SIGKILL leaves this
+    behind; aged from the stamp of the key it targeted.
     """
     name = key.rsplit("/", 1)[-1]
     if not name.endswith(".tmp") or ".bin." not in name:
@@ -225,19 +279,24 @@ async def lookup(
     *,
     filename: str,
     media_type: str,
+    any_age: bool = False,
+    seen_digests: set[str] | None = None,
 ) -> ExportArtifact | None:
     """Newest usable artifact for this selection, or None.
 
-    "Usable" = published inside the TTL, not future-stamped, and intact (size
-    verified via one ``size()`` call, so an in-place-truncated ``put`` is a
-    miss rather than a served truncation). ``contested`` reports >1 distinct
-    digest among siblings. Every failure here is a miss.
+    "Usable" = published inside the TTL (inside the sweep horizon with
+    ``any_age``, so nothing the sweep would reclaim is described), not
+    future-stamped, and intact (size verified via one ``size()`` call, so an
+    in-place-truncated ``put`` is a miss rather than a served truncation).
+    ``contested`` reports >1 distinct digest among siblings, which are also
+    added to ``seen_digests``, so a caller that goes on to build knows what
+    this selection held before it began. Every failure here is a miss.
     """
     now = time.time()
-    cutoff = now - _ttl_seconds()
+    cutoff = now - (_SWEEP_AGE_SECONDS if any_age else _ttl_seconds())
     horizon = now + _CLOCK_SLACK_SECONDS
-    # fix(#1532): freshness measures from modified time (put
-    # completion, via `_published_at`) so a slow upload can't expire early.
+    # Freshness measures from modified time (put completion, via
+    # `_published_at`) so a slow upload can't expire early.
     try:
         storage = get_storage()
         modified: dict[str, float] = {}
@@ -262,8 +321,8 @@ async def lookup(
         oldest_by_digest[digest] = min(
             oldest_by_digest.get(digest, _publication), _publication
         )
-        # fix(#1532): counts EVERY sibling, not just fresh ones — an old
-        # sibling lives until the horizon and a client may still read it.
+        # Every sibling counts, not just fresh ones: an old sibling lives until
+        # the horizon and a client may still read it.
         siblings.add(digest)
         if built_at > horizon:
             # A future-stamped key would outrank every honest sibling below.
@@ -275,6 +334,8 @@ async def lookup(
     # A selection with two distinct artifacts serves no ranges until sweep
     # clears the older; If-Range requests are already safe.
     contested = len(siblings) > 1
+    if seen_digests is not None:
+        seen_digests.update(siblings)
 
     for built_at, size, digest, key in sorted(candidates, reverse=True):
         try:
@@ -299,12 +360,12 @@ async def lookup(
 def _published_at(modified: float, built_at: float) -> float:
     """When this artifact became readable, bounded by the key naming it.
 
-    fix(#1532): ``built_at`` floors it (a store clock behind the
-    writer would expire artifacts at birth); ``built_at + _MAX_PUBLISH_SECONDS``
-    ceils it (a store ahead over-reports); the stamp is also pre-clamped by the
-    same allowance (a writer clock ahead would otherwise pin an unreclaimable
-    object). Pure function of the object — never reads ``now`` — so a verdict
-    only moves fresh to expired.
+    ``built_at`` floors it (a store clock behind the writer would expire
+    artifacts at birth); ``built_at + _MAX_PUBLISH_SECONDS`` ceils it (a store
+    ahead over-reports); the stamp is also pre-clamped by the same allowance (a
+    writer clock ahead would otherwise pin an unreclaimable object). A pure
+    function of the object that never reads ``now``, so a verdict only moves
+    from fresh to expired.
     """
     stamp = min(built_at, modified + _MAX_PUBLISH_SECONDS)
     return min(max(modified, stamp), stamp + _MAX_PUBLISH_SECONDS)
@@ -323,26 +384,25 @@ async def store(
 ) -> ExportArtifact | None:
     """Publish a freshly converted file. One ``put``, nothing rewritten.
 
-    ``snapshot_at`` becomes the key's stamp (fix(#1532)); None means now.
-    Returns the published artifact, or the INCUMBENT under this selection if
-    one already exists (r29: caller must serve that, not its own bytes, so a
+    ``snapshot_at`` becomes the key's stamp; None means now.
+    Returns the published artifact, or the incumbent under this selection if
+    one already exists (the caller must serve that, not its own bytes, so a
     later bare Range resolves the same representation), or None. Only
-    ``Exception`` is caught — a ``CancelledError`` must propagate.
+    ``Exception`` is caught; a ``CancelledError`` propagates.
     """
     global _last_sweep_at
     try:
         if digest is None or size is None:
             digest, size = await digest_and_size(file_path)
-        # fix(#1532): an artifact that appeared mid-conversion wins; the
-        # caller must serve IT so later Range requests resolve consistently.
+        # An artifact that appeared mid-conversion wins; the caller serves it
+        # so later Range requests resolve consistently.
         incumbent = await lookup(
             dataset_id, selection, filename=filename, media_type=media_type
         )
         if incumbent is not None:
             return incumbent
-        # fix(#1532): reclaim BEFORE the budget check/write — this is
-        # the only prod sweep call; an early exit above it deadlocks a full
-        # store.
+        # Reclaim before the budget check and write: this is the only periodic
+        # sweep call, so an early exit above it would deadlock a full store.
         await _sweep_occasionally()
         if not await _fits_in_budget(size):
             # Cadence guard may have skipped sweeping; force one and recheck.
@@ -350,8 +410,7 @@ async def store(
             _last_sweep_at = time.time()
             if not await _fits_in_budget(size):
                 logger.warning("export_cache_budget_exhausted", size=size)
-                # r29: a publisher may have landed since the re-check above —
-                # same lost race, one step later, same answer.
+                # A publisher may have landed since the re-check above.
                 return await lookup(
                     dataset_id, selection, filename=filename, media_type=media_type
                 )
@@ -363,9 +422,8 @@ async def store(
             file_path,
             built_at=time.time() if snapshot_at is None else snapshot_at,
         )
-        # fix(#1532): PUBLICATION IS FINAL — a post-write re-check could
-        # delete a key another request already resolved, truncating its
-        # stream.
+        # Publication is final: a post-write re-check could delete a key
+        # another request already resolved, truncating its stream.
         return ExportArtifact(
             key=key,
             digest=digest,
@@ -382,7 +440,7 @@ async def store(
             dataset_id=str(dataset_id),
             exc_info=True,
         )
-        # r29: same reasoning as the budget exit; `lookup` never raises.
+        # A publisher may have landed first; `lookup` never raises.
         return await lookup(
             dataset_id, selection, filename=filename, media_type=media_type
         )
@@ -399,16 +457,16 @@ async def _put_with_reclaim(
 ) -> tuple[float, str]:
     """Write the artifact, reclaiming and retrying once if the store is full.
 
-    fix(#1532): forces an unconditional sweep on failure and retries once
-    — not a loop, since an unfreed horizon means the store holds something
-    this cache doesn't own. fix(#1532): every attempted key is deleted on
-    failure, since a fresh-stamped partial can't be reclaimed by sweep rules.
+    Forces an unconditional sweep on failure and retries once, not in a loop,
+    since an unfreed horizon means the store holds something this cache doesn't
+    own. Every attempted key is deleted on failure, since a fresh-stamped
+    partial can't be reclaimed by sweep rules.
     """
     global _last_sweep_at
     attempted: list[str] = []
 
     async def _write() -> tuple[float, str]:
-        # Stamp is the caller's snapshot time (r25), unchanged on retry: the
+        # The stamp is the caller's snapshot time, unchanged on retry: the
         # bytes aren't newer for having failed to upload once.
         key = _artifact_key(dataset_id, selection, digest, size, built_at)
         attempted.append(key)
@@ -416,8 +474,8 @@ async def _put_with_reclaim(
             await get_storage().put(key, handle)
         return built_at, key
 
-    # fix(#1532): BaseException outside, Exception inside — discard must run
-    # on ANY exit (CancelledError included) but retry only on Exception.
+    # BaseException outside, Exception inside: discard must run on any exit
+    # (CancelledError included) but retry only on Exception.
     try:
         try:
             return await _write()
@@ -450,16 +508,16 @@ async def _discard(keys: list[str]) -> None:
 async def _fits_in_budget(size: int) -> bool:
     """Would publishing ``size`` more bytes keep the cache under budget?
 
-    A SOFT ceiling (fix(#1532)): ``StorageProvider`` can't claim space,
-    so concurrent publishers may each overshoot by one artifact for up to one
-    horizon. Fails OPEN on an unreadable listing.
+    A soft ceiling: ``StorageProvider`` can't claim space, so concurrent
+    publishers may each overshoot by one artifact for up to one horizon. Fails
+    open on an unreadable listing.
     """
-    # fix(#1532): checked before the listing (outside fail-open) because
-    # an empty prefix yields no page, letting any size through on a cold cache.
+    # Checked before the listing (outside fail-open) because an empty prefix
+    # yields no page, letting any size through on a cold cache.
     if size > _BUDGET_BYTES:
         return False
-    # fix(#1532): paged and stops at first overrun, bounding work by
-    # budget rather than by a caller-controlled object count.
+    # Paged, stopping at the first overrun, so work is bounded by the budget
+    # rather than by a caller-controlled object count.
     total = 0
     try:
         async for page in get_storage().iter_object_pages(f"{_ROOT}/"):
@@ -477,9 +535,9 @@ async def _fits_in_budget(size: int) -> bool:
 async def digest_and_size(file_path: str) -> tuple[str, int]:
     """SHA-256 and byte length of a converted export, read in bounded chunks.
 
-    Public: the route calls it BEFORE ``store`` (fix(#1532)) since the
-    digest validates regardless of publication. Runs off the event loop —
-    hashing a multi-GB file inline would stall every other request.
+    The route calls it before ``store`` because the digest validates
+    regardless of publication. Runs off the event loop; hashing a multi-GB
+    file inline would stall every other request.
     """
     from app.core.async_io import run_in_thread_draining
 
@@ -515,9 +573,9 @@ async def _sweep_occasionally() -> None:
 async def sweep(*, age_threshold_seconds: int = _SWEEP_AGE_SECONDS) -> int:
     """Reclaim what nothing can still be reading. Returns keys removed.
 
-    An object goes when its publication — floored at its own key's stamp,
-    raised by ``last_modified`` (r10) — is past the horizon. An aged key can
-    never become fresh, so no judgement depends on a read another worker can
+    An object goes when its publication, floored at its own key's stamp and
+    raised by ``last_modified``, is past the horizon. An aged key can never
+    become fresh, so no judgement depends on a read another worker can
     invalidate. Paged, so the cache is never materialized in memory.
     """
     cutoff = time.time() - age_threshold_seconds
@@ -531,9 +589,8 @@ async def sweep(*, age_threshold_seconds: int = _SWEEP_AGE_SECONDS) -> int:
                 built_at = parsed[0] if parsed is not None else parse_tmp_key(obj.key)
                 if built_at is None:
                     continue
-                # fix(#1532): ages from the LATER clock, via the same
-                # bound freshness uses, so a store clock ahead can't push it
-                # out.
+                # Ages from the later clock, via the bound freshness uses, so a
+                # store clock ahead can't push it out.
                 published_at = _published_at(obj.last_modified.timestamp(), built_at)
                 if published_at >= cutoff:
                     continue
@@ -547,9 +604,9 @@ async def sweep(*, age_threshold_seconds: int = _SWEEP_AGE_SECONDS) -> int:
     except Exception:  # broad: a sweep that cannot list is a no-op, not an error
         logger.warning("export_cache_sweep_list_failed", exc_info=True)
 
-    # fix(#1532): pruned HERE, not in the generic delete, where an
-    # unrelated writer's `mkdir` could race the `rmdir`. Duck-typed — object
-    # stores have no directories; `storage` is None if get_storage() raised.
+    # Pruned here, not in the generic delete, where an unrelated writer's
+    # `mkdir` could race the `rmdir`. Duck-typed because object stores have no
+    # directories; `storage` is None if get_storage() raised.
     prune = getattr(storage, "prune_empty_dirs", None)
     if prune is not None:
         try:

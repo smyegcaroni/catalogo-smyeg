@@ -91,17 +91,13 @@ export function CollectionDetailPage() {
       await removeDataset.mutateAsync({ collectionId: id!, datasetId });
       toast.success(t('toasts.datasetRemoved'));
     } catch {
-      // fix(#438): UX-07 — useRemoveDatasetFromCollection raises the error toast,
+      // useRemoveDatasetFromCollection raises the error toast,
       // including the backend reason. Swallow here so only one appears.
     }
   }
 
-  /*
-   * Collection detail uses a flat card+list layout intentionally distinct
-   * from dataset detail's tabbed approach. Collections are lightweight
-   * containers — a tabbed interface would over-complicate what is
-   * essentially "metadata + member list". See COLL-03.
-   */
+  // A flat card+list layout, not dataset detail's tabs: a collection is just
+  // metadata plus a member list.
   return (
     <PageShell maxWidth="narrow">
       <PageHeader

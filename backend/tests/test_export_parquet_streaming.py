@@ -240,13 +240,34 @@ class TestExportStreams:
         )
         reads: list[int] = []
         real_read_row_group = pq.ParquetFile.read_row_group
+        loop = asyncio.get_running_loop()
+        first_read = asyncio.Event()
 
         def _slow_read_row_group(self, i, *args, **kwargs):
             reads.append(i)
+            loop.call_soon_threadsafe(first_read.set)
             time.sleep(0.5)
             return real_read_row_group(self, i, *args, **kwargs)
 
         monkeypatch.setattr(pq.ParquetFile, "read_row_group", _slow_read_row_group)
+
+        # The budget starts at the first read, so slow segment writes on a
+        # loaded runner cannot spend it before the copy begins.
+        real_wait_for = asyncio.wait_for
+
+        async def _wait_for_from_first_read(coro, timeout):
+            task = asyncio.ensure_future(coro)
+            started = asyncio.ensure_future(first_read.wait())
+            done, _ = await asyncio.wait(
+                {task, started}, timeout=30, return_when=asyncio.FIRST_COMPLETED
+            )
+            started.cancel()
+            if not done:
+                task.cancel()
+                pytest.fail("the copy did not start within 30s")
+            return await real_wait_for(task, timeout)
+
+        monkeypatch.setattr(asyncio, "wait_for", _wait_for_from_first_read)
         names = [f"c{i}" for i in range(10)]
         # Each row gives one more column its first value, so each starts a segment.
         rows = [
@@ -1003,3 +1024,74 @@ def test_a_value_the_declared_type_would_alter_falls_back_to_text():
     )
 
     assert table.column("n").to_pylist() == ["1", "1.75"]
+
+
+class TestDeterministicOrder:
+    @pytest.mark.anyio
+    async def test_an_ordered_export_survives_a_physical_reorder(
+        self, test_db_session, staging
+    ):
+        """Unchanged rows write the same bytes however the heap holds them.
+
+        An UPDATE that changes nothing still moves each row to the end of the
+        heap, as a synchronized scan can start mid-table, so a heap-order read
+        writes a different file for the same data. The cache may only treat
+        two builds as the same bytes when they are.
+        """
+        import hashlib
+
+        table_name = f"exp_pqorder_{uuid.uuid4().hex[:12]}"
+        await test_db_session.execute(
+            text(
+                f"CREATE TABLE data.{table_name} (gid serial PRIMARY KEY, "
+                "name text, geom geometry(Point, 4326), "
+                "geom_4326 geometry(Point, 4326))"
+            )
+        )
+        await test_db_session.execute(
+            text(
+                f"INSERT INTO data.{table_name} (name, geom, geom_4326) "
+                "SELECT 'n' || i, ST_SetSRID(ST_MakePoint(i, i), 4326), "
+                "ST_SetSRID(ST_MakePoint(i, i), 4326) "
+                "FROM generate_series(1, 40) AS i"
+            )
+        )
+        await test_db_session.commit()
+
+        async def _digest() -> str:
+            plan = await plan_parquet_export(test_db_session, table_name, schema="data")
+            assert plan.has_gid
+            path, _filename, _media_type = await export_parquet(
+                test_db_session,
+                table_name,
+                "Ordered",
+                schema="data",
+                plan=plan,
+                ordered=True,
+            )
+            await test_db_session.rollback()
+            with open(path, "rb") as handle:
+                return hashlib.sha256(handle.read()).hexdigest()
+
+        try:
+            before = await _digest()
+            await test_db_session.execute(
+                text(f"UPDATE data.{table_name} SET name = name WHERE gid <= 20")
+            )
+            await test_db_session.commit()
+            first_in_heap = (
+                await test_db_session.execute(
+                    text(f"SELECT gid FROM data.{table_name} ORDER BY ctid LIMIT 1")
+                )
+            ).scalar_one()
+            assert first_in_heap == 21, "precondition: the heap order moved"
+
+            assert await _digest() == before, (
+                "the same rows in another heap order exported different bytes"
+            )
+        finally:
+            await test_db_session.rollback()
+            await test_db_session.execute(
+                text(f"DROP TABLE IF EXISTS data.{table_name}")
+            )
+            await test_db_session.commit()

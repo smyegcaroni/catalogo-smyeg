@@ -21,10 +21,10 @@ export const CUSTOM_PAINT_PROPS = new Set([
 
 /** Canonical geometry family. `other` covers null/empty and tokens that are
  *  neither point/line/polygon (e.g. GEOMETRYCOLLECTION). */
-export type GeometryFamily = 'point' | 'line' | 'polygon' | 'other';
+type GeometryFamily = 'point' | 'line' | 'polygon' | 'other';
 
 /**
- * builder-audit #338 ADAPT-02/DRY-05: single canonical geometry classifier.
+ * Single canonical geometry classifier.
  * getLayerType, renderAs.geometryFamily, layer-capabilities, and
  * color-ramps.getColorProperty all DERIVE from this one uppercase+substring scan
  * so a new geometry token or normalization rule is patched in exactly one place.
@@ -37,10 +37,12 @@ export function classifyGeometry(geometryType: string | null): GeometryFamily {
   return 'other';
 }
 
-/** fix(#430 codex r23): the generic sentinels a created/mixed dataset carries when
- *  its geometry column holds (or may hold) multiple families. These route to the
- *  mixed adapter so every family renders; unknown exotic types keep the historic
- *  fill fallback. Mirrors the backend `_derive_created_geometry_type` contract. */
+/**
+ * The generic sentinels a created/mixed dataset carries when its geometry
+ * column holds (or may hold) multiple families. These route to the mixed
+ * adapter so every family renders; unknown exotic types fall back to fill.
+ * Mirrors the backend `_derive_created_geometry_type` contract.
+ */
 export function isGenericGeometryType(geometryType: string | null): boolean {
   const gt = (geometryType ?? '').toUpperCase();
   return gt === 'GEOMETRY' || gt === 'GEOMETRYCOLLECTION';
@@ -56,20 +58,18 @@ export function getLayerType(geometryType: string | null): 'circle' | 'line' | '
 }
 
 /** Raster bounds as a fixed [west, south, east, north] tuple. */
-export type RasterBounds = [number, number, number, number];
+type RasterBounds = [number, number, number, number];
 
 /**
- * builder-audit #338 ADAPT-01: single raster-bounds guard hoisted from the verbatim
- * copies in raster-adapter, hillshade-adapter, and map-sync. Returns the bounds
- * as a 4-tuple, or undefined when the input is not exactly four finite numbers.
+ * Single raster-bounds guard shared by raster-adapter, hillshade-adapter and
+ * map-sync. Returns the bounds as a 4-tuple, or undefined when the input is not
+ * exactly four finite numbers.
  *
- * fix(#903): every result feeds a MapLibre source `bounds`, which accepts one
- * increasing box and nothing else — an antimeridian-crossing `west > east` pair
- * matches NO tile, so the layer renders blank rather than misplaced. There is
- * no way to express two boxes on one source, so the span form is the only
- * option here: over-broad (it stops constraining tile requests) but visible.
- * This is the keystone consumer named in the issue; the four call sites in
- * map-sync and hillshade-adapter inherit the guard from here.
+ * Every result feeds a MapLibre source `bounds`, which accepts one increasing
+ * box and nothing else: an antimeridian-crossing `west > east` pair matches NO
+ * tile, so the layer renders blank rather than misplaced. A source cannot
+ * express two boxes, so the span form is the only option: over-broad (it stops
+ * constraining tile requests) but visible.
  */
 export function normalizeRasterBounds(bounds: number[] | null | undefined): RasterBounds | undefined {
   if (!Array.isArray(bounds) || bounds.length !== 4) return undefined;
@@ -78,7 +78,7 @@ export function normalizeRasterBounds(bounds: number[] | null | undefined): Rast
 }
 
 /**
- * builder-audit #338 ADAPT-08/SPEC-10: extract a flat scalar fallback from a MapLibre
+ * Extract a flat scalar fallback from a MapLibre
  * expression using EXPLICIT per-op shape guards. Each op verifies the expression
  * has enough elements before reading a positional index, so a malformed or
  * newly-shaped expression (interpolate-hcl, single-stop step, multi-pair case,
@@ -151,16 +151,16 @@ const OPACITY_DEFAULTS: Record<string, number> = {
 /**
  * Per-feature opacity MULTIPLIED by the master slider, as one paint value.
  *
- * fix(#1625): this is now the path for layer types that have no `-layer-opacity`
- * in maplibre-gl v6 (circle, and the cluster/mixed point sublayers). Fill and
- * line go through `applyMasterOpacity`, which keeps the two tiers apart.
+ * The path for layer types with no `-layer-opacity` in maplibre-gl v6 (circle,
+ * and the cluster/mixed point sublayers). Fill and line go through
+ * `applyMasterOpacity`, which keeps the two tiers apart.
  *
- * fix(#846): every call site feeds this straight into `setPaintProperty(id,
+ * Every call site feeds this straight into `setPaintProperty(id,
  * '<geom>-opacity', …)`, which maplibre-gl v6 types as
  * `DataDrivenPropertyValueSpecification<number>`. Declaring that contract here
- * instead of returning `unknown` fixes the call sites at their source, and
- * leaves exactly one place — the array branch in `getFeatureOpacity` — where the
- * untyped paint JSON has to be vouched for.
+ * instead of returning `unknown` fixes the call sites at their source and
+ * leaves one place, the array branch in `getFeatureOpacity`, where the untyped
+ * paint JSON has to be vouched for.
  */
 export function getExpressionSafeOpacity(
   paint: Record<string, unknown>,
@@ -169,12 +169,30 @@ export function getExpressionSafeOpacity(
 ): DataDrivenPropertyValueSpecification<number> {
   const propOpacity = getFeatureOpacity(paint, geomType);
   if (typeof propOpacity === 'number') return propOpacity * masterOpacity;
-  // fix(#394) ST-03: multiply expression-valued opacity by the master
-  // slider — returning the expression untouched made the layer opacity
-  // slider a silent no-op whenever *-opacity is a zoom/data expression.
-  return (masterOpacity === 1
-    ? propOpacity
-    : ['*', propOpacity, masterOpacity]) as DataDrivenPropertyValueSpecification<number>;
+  // Scale an expression-valued opacity by the master slider; returning the
+  // expression untouched would make the slider a no-op whenever *-opacity is a
+  // zoom/data expression.
+  return (masterOpacity === 1 ? propOpacity : scaleOpacity(propOpacity, masterOpacity)) as DataDrivenPropertyValueSpecification<number>;
+}
+
+const hasZoom = (value: unknown): boolean =>
+  Array.isArray(value) && (value[0] === 'zoom' || value.some(hasZoom));
+
+/**
+ * An opacity value scaled by `factor`: a number multiplies; a top-level `step` or
+ * `interpolate` scales each output stop and keeps its input in place, since
+ * MapLibre accepts `zoom` only there; any other expression is wrapped in `*`.
+ * An expression that reads zoom elsewhere can't be scaled and is returned as is.
+ */
+export function scaleOpacity(value: unknown, factor: number): unknown {
+  if (typeof value === 'number') return value * factor;
+  if (!Array.isArray(value)) return value;
+  const first = value[0] === 'step' ? 2 : value[0] === 'interpolate' ? 4 : -1;
+  if (first < 0) return hasZoom(value) ? value : ['*', value, factor];
+  return value.map((item, index) => {
+    if (index < first || (index - first) % 2 !== 0) return item;
+    return typeof item === 'number' ? item * factor : ['*', item, factor];
+  });
 }
 
 /**
@@ -198,13 +216,13 @@ export function getFeatureOpacity(
 /**
  * Drive the master `layer.opacity` slider on a live vector layer.
  *
- * Fill and line layers carry two opacity tiers — the Style Editor's per-feature
- * `fill-opacity`/`line-opacity` and the master slider — and multiplying them into
- * one per-feature value (the pre-#1625 wiring) made MapLibre accumulate the
- * product across overlapping features, so overlaps inside a layer double-darkened
- * and the slider never produced a uniform layer. maplibre-gl v6's
- * `fill-layer-opacity`/`line-layer-opacity` composite the whole layer once AFTER
- * the per-feature pass, which is exactly the two-tier model: per-feature stays on
+ * Fill and line layers carry two opacity tiers: the Style Editor's per-feature
+ * `fill-opacity`/`line-opacity` and the master slider. Multiplying them into
+ * one per-feature value makes MapLibre accumulate the product across
+ * overlapping features, so overlaps inside a layer double-darken and the slider
+ * never yields a uniform layer. maplibre-gl v6's
+ * `fill-layer-opacity`/`line-layer-opacity` composite the whole layer once
+ * AFTER the per-feature pass, which is the two-tier model: per-feature stays on
  * `<geom>-opacity` unmultiplied, the master rides on `<geom>-layer-opacity`.
  */
 export function applyMasterOpacity(
@@ -215,7 +233,7 @@ export function applyMasterOpacity(
   masterOpacity: number,
 ): void {
   if (geomType === 'circle') {
-    // fix(#1625) ceiling: only fill/line have a -layer-opacity in maplibre 6;
+    // Ceiling: only fill/line have a -layer-opacity in maplibre 6;
     // other types still multiply, so point layers still double-darken.
     map.setPaintProperty(layerId, 'circle-opacity', getExpressionSafeOpacity(paint, 'circle', masterOpacity));
     return;
@@ -252,9 +270,9 @@ export function filterPaintForLayerType(
   );
 }
 
-/** fix(#392): Style-Spec numeric bounds for paint properties, mirroring backend
+/** Style-Spec numeric bounds for paint properties, mirroring backend
  *  `_PAINT_BOUNDS` (backend/app/processing/ai/schemas.py) so AI-produced paint is
- *  clamped identically on both sides of the wire. (audit B-002/CH-01) */
+ *  clamped identically on both sides of the wire. */
 const PAINT_BOUNDS: Record<string, [number, number]> = {
   'fill-opacity': [0, 1],
   'line-opacity': [0, 1],
@@ -297,34 +315,31 @@ export function clampPaintBounds(paint: Record<string, unknown>): Record<string,
 }
 
 /**
- * fix(#846): the MapLibre style-property key unions, aliased off
- * `@maplibre/maplibre-gl-style-spec` (a direct dependency) rather than off
- * `maplibre-gl`. maplibre-gl v6 made the style accessors generic over these keys
- * (`setPaintProperty<K extends keyof AllPaintProperties>(id, name: K, value:
- * AllPaintProperties[K])`); v5's signature is the untyped `name: string, value:
- * any`. Naming the union through the style-spec package keeps this file
- * compiling against both.
+ * The MapLibre style-property key unions, aliased off
+ * `@maplibre/maplibre-gl-style-spec` (a direct dependency) rather than
+ * `maplibre-gl`. maplibre-gl v6 made the style accessors generic over these
+ * keys (`setPaintProperty<K extends keyof AllPaintProperties>(id, name: K,
+ * value: AllPaintProperties[K])`).
  */
 export type PaintPropertyName = keyof AllPaintProperties;
 export type LayoutPropertyName = keyof AllLayoutProperties;
 
 /**
- * fix(#846): the ONE place v6's generic style setters are crossed with a value
- * the compiler cannot check, so the cast lives here instead of at ~20 call sites.
+ * The ONE place v6's generic style setters are crossed with a value the
+ * compiler cannot check, so the cast lives here instead of at ~20 call sites.
  *
- * Every write on these paths is driven off a layer's stored `paint`/`layout` JSON.
- * The value is an `unknown` off a `Record<string, unknown>`, and on the paths that
- * iterate that record the key is an arbitrary string too — so there is no literal
- * key for v6 to correlate a value type through, and no narrowing upstream can
- * invent one. Even where the key IS from a curated tuple, `K` widens to the whole
- * union and `AllPaintProperties[K]` widens with it.
+ * Every write on these paths is driven off a layer's stored `paint`/`layout`
+ * JSON: the value is `unknown` off a `Record<string, unknown>`, and where that
+ * record is iterated the key is an arbitrary string too, so v6 has no literal
+ * key to correlate a value type through. Even where the key IS from a curated
+ * tuple, `K` widens to the whole union and `AllPaintProperties[K]` widens with
+ * it.
  *
- * Nothing about the checking actually changes: MapLibre validates the name and the
- * value at runtime exactly as it did under v5, and every caller already wraps these
- * in the try/catch that swallows a rejected property.
+ * MapLibre validates the name and value at runtime, and every caller already
+ * wraps these in the try/catch that swallows a rejected property.
  *
- * `map` is `Pick`ed down to the one method each helper calls, so a caller holding
- * only a narrow slice of the Map (see `syncLabelLayer`) can use them too.
+ * `map` is `Pick`ed down to the one method each helper calls, so a caller
+ * holding a narrow slice of the Map (see `syncLabelLayer`) can use them too.
  */
 export function setDynamicPaintProperty(
   map: Pick<MaplibreMap, 'setPaintProperty'>,
@@ -351,92 +366,6 @@ export function setDynamicLayoutProperty(
     property as LayoutPropertyName,
     value as AllLayoutProperties[LayoutPropertyName],
   );
-}
-
-/** Read half of `setDynamicPaintProperty` — the key is an arbitrary paint-JSON key. */
-function getDynamicPaintProperty(map: MaplibreMap, layerId: string, property: string): unknown {
-  return map.getPaintProperty(layerId, property as PaintPropertyName);
-}
-
-/** Replay expression-based paint properties via setPaintProperty (avoids addLayer failures). */
-function replayExpressions(
-  map: MaplibreMap,
-  layerId: string,
-  rawPaint: Record<string, unknown>,
-  geomType: 'fill' | 'line' | 'circle',
-) {
-  for (const [prop, val] of Object.entries(rawPaint)) {
-    if (Array.isArray(val) && isPaintPropertyForLayerType(prop, geomType)) {
-      try { setDynamicPaintProperty(map, layerId, prop, val); }
-      catch (e) { if (import.meta.env.DEV) console.debug(`[map-sync] Failed to set ${prop} on ${layerId}:`, e); }
-    }
-  }
-}
-
-/** Apply expression replay, compound opacity, and filter after addLayer. */
-export function finalizeLayer(
-  map: MaplibreMap,
-  layerId: string,
-  rawPaint: Record<string, unknown>,
-  geomType: 'fill' | 'line' | 'circle',
-  masterOpacity: number,
-  filter: import('maplibre-gl').FilterSpecification | null,
-  hasExpressions: boolean,
-) {
-  if (!map.getLayer(layerId)) return;
-  if (hasExpressions) replayExpressions(map, layerId, rawPaint, geomType);
-  applyMasterOpacity(map, layerId, rawPaint, geomType, masterOpacity);
-  if (filter && Array.isArray(filter) && filter.length > 0) {
-    map.setFilter(layerId, filter);
-  }
-}
-
-/**
- * Set a paint or layout property on a MapLibre layer, swallowing any errors
- * that arise from attempting to set an unsupported property (e.g. calling
- * setPaintProperty before addLayer completes, or setting a property not valid
- * for the layer type).  In DEV mode the error is surfaced as console.debug.
- *
- * Extracted from 7+ repeated try-catch wrapped setPaintProperty occurrences
- * across layer adapters (CA-03 remediation).
- */
-export function setLayerProperty(
-  map: MaplibreMap,
-  layerId: string,
-  property: string,
-  value: unknown,
-  kind: 'paint' | 'layout' = 'paint',
-): void {
-  try {
-    if (kind === 'paint') {
-      setDynamicPaintProperty(map, layerId, property, value);
-    } else {
-      setDynamicLayoutProperty(map, layerId, property, value);
-    }
-  } catch (e) {
-    if (import.meta.env.DEV) {
-      console.debug(`[map-sync] Failed to set ${kind} property ${property} on ${layerId}:`, e);
-    }
-  }
-}
-
-/**
- * Sync the MapLibre layer filter for a given layer ID.
- * If `filter` is a non-empty array it is applied directly; otherwise the filter
- * is cleared by passing `null`.  Safe to call when the layer does not exist
- * (no-op). Extracted from duplicated filter-checking branches across adapters (CA-01).
- */
-export function syncLayerFilter(
-  map: MaplibreMap,
-  layerId: string,
-  filter: FilterSpecification | unknown[] | null | undefined,
-): void {
-  if (!map.getLayer(layerId)) return;
-  if (filter && Array.isArray(filter) && filter.length > 0) {
-    map.setFilter(layerId, filter as FilterSpecification);
-  } else {
-    map.setFilter(layerId, null);
-  }
 }
 
 /** The `source-layer` key of a layer spec. A GeoJSON source has no layers to name. */
@@ -480,9 +409,9 @@ export function resolveAdapterType(
   if (styleConfig?.render_mode === 'cluster') {
     return 'cluster';
   }
-  // fix(#430 codex r23): generic sentinel datasets mix families — route to the
-  // mixed adapter (per-family filtered sublayers) instead of the fill fallback
-  // that silently dropped point/line features.
+  // Generic sentinel datasets mix families: route to the mixed adapter
+  // (per-family filtered sublayers) instead of the fill fallback, which would
+  // drop point/line features.
   if (isGenericGeometryType(geometryType)) {
     return 'mixed';
   }
@@ -494,14 +423,6 @@ export function resolveAdapterType(
   return inferTypeFromPaint(paint) ?? getLayerType(geometryType);
 }
 
-/** Sync visibility for a single layer (used by circle, line, heatmap adapters). */
-export function syncSingleLayerVisibility(map: MaplibreMap, layerId: string, visible: boolean): void {
-  const vis = visible ? 'visible' : 'none';
-  if (map.getLayer(layerId)) {
-    map.setLayoutProperty(layerId, 'visibility', vis);
-  }
-}
-
 /** Check if two paint values differ. Uses strict equality for scalars, JSON.stringify for arrays/objects. */
 export function paintValueChanged(current: unknown, incoming: unknown): boolean {
   if (current === incoming) return false;
@@ -511,19 +432,18 @@ export function paintValueChanged(current: unknown, incoming: unknown): boolean 
 
 type VectorGeomType = 'fill' | 'line' | 'circle';
 
-// fix(#846): the ownership sets are curated `as const` tuples of real MapLibre
-// property names, so they can carry the real key union instead of `string[]`. That
-// keeps the `get*Property` reads below statically valid under v6's generics, and it
-// makes a typo'd or non-existent property name a compile error at the tuple — the
-// failure mode that hid `circle-stroke-blur` in CIRCLE_OWNED_PAINT_PROPERTIES until
-// #338 SPEC-06, because setPaintProperty's try/catch swallowed it silently.
-export interface OwnedPaintSyncOptions {
+// The ownership sets are curated `as const` tuples of real MapLibre property
+// names, so they carry the real key union instead of `string[]`. That keeps the
+// `get*Property` reads below statically valid under v6's generics and makes a
+// typo'd property name a compile error at the tuple (setPaintProperty's
+// try/catch would otherwise swallow it, as it did for `circle-stroke-blur`).
+interface OwnedPaintSyncOptions {
   ownedProperties: readonly PaintPropertyName[];
   geomType?: VectorGeomType;
   clearMissing?: boolean;
 }
 
-export interface OwnedLayoutSyncOptions {
+interface OwnedLayoutSyncOptions {
   ownedProperties: readonly LayoutPropertyName[];
   clearMissing?: boolean;
 }
@@ -636,30 +556,10 @@ export function syncOwnedLayoutProperties(
   }
 }
 
-/** Sync paint properties for a vector layer, skipping custom and cross-geometry props. */
-export function syncVectorPaint(
-  map: MaplibreMap,
-  layerId: string,
-  rawPaint: Record<string, unknown>,
-  geomType?: 'fill' | 'line' | 'circle',
-) {
-  const paint = geomType ? filterPaintForLayerType(rawPaint, geomType) : stripCustomProps(rawPaint);
-  for (const [prop, val] of Object.entries(paint)) {
-    try {
-      const current = getDynamicPaintProperty(map, layerId, prop);
-      if (paintValueChanged(current, val)) {
-        setDynamicPaintProperty(map, layerId, prop, val);
-      }
-    } catch (e) {
-      if (import.meta.env.DEV) console.debug(`[map-sync] Failed to set ${prop} on ${layerId}:`, e);
-    }
-  }
-}
-
-/** builder-audit #338 SPEC-08 / cross-cutting DRY-02: the single canonical frontend
- *  snake_case -> camelCase builder-key alias map. normalize-style-config imports
- *  this instead of maintaining a second copy (the two had diverged: this map was
- *  missing the folder_group_* keys, added below as a harmless consistency fix). */
+/**
+ * The single canonical frontend snake_case -> camelCase builder-key alias map;
+ * normalize-style-config imports it instead of keeping a second copy.
+ */
 export const BUILDER_STYLE_KEY_ALIASES: Record<string, string> = {
   fill_disabled: 'fillDisabled',
   stroke_disabled: 'strokeDisabled',

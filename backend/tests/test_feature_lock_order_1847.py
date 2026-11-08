@@ -635,13 +635,15 @@ class TestFeatureWriteErrorClassification:
 
 
 class TestEveryWriteHandlerGoesThroughTheGuard:
-    """The refresh is inside the DBAPIError classification at all four sites."""
+    """The refresh is inside the DBAPIError classification at every write site."""
 
     HANDLERS = {
-        "create_feature",
+        # The create route and its dry run share this body.
+        "_create",
         "replace_single_feature",
         "patch_single_feature",
         "delete_single_feature",
+        "delete_features_batch",
     }
     # Reaching either of these from a handler bypasses the classification, so
     # a lock conflict escapes as a 503 rather than the retryable 409.
@@ -725,10 +727,12 @@ class TestEveryWriteHandlerGoesThroughTheGuard:
             return False
 
         handlers = {
-            "create_feature",
+            # The create route and its dry run share this body.
+            "_create",
             "replace_single_feature",
             "patch_single_feature",
             "delete_single_feature",
+            "delete_features_batch",
         }
         seen = set()
         for node in ast.walk(tree):
@@ -807,8 +811,6 @@ class TestMetadataPatchTakesThePairToo:
 
 
 class TestTheMetadataPatchTakesThePairOnEveryBody:
-    """fix(#1881): every PATCH takes the pair before its first write."""
-
     @pytest.mark.parametrize(
         "body",
         [
@@ -1077,6 +1079,60 @@ class TestAttributeEditsTakeThePairToo:
 
         assert response.status_code == 200, response.text
         assert response.json()["example_values"] == ["seed"]
+
+
+class TestRetentionSettlementHoldsTheTableFirst:
+    async def test_settlement_holds_no_catalog_row_while_waiting_for_the_table(
+        self, locked_dataset, test_db_session
+    ):
+        """Column DDL, deletion and replacement hold the table before the pair,
+        so settlement must reach for the table holding nothing.
+        """
+        import app.core.db as db_module
+        from app.modules.catalog.features import retention
+
+        dataset_id = locked_dataset.id
+        async with (
+            db_module.async_session() as holder,
+            db_module.async_session() as probe,
+        ):
+            await holder.execute(
+                text(
+                    f"LOCK TABLE data.{locked_dataset.table_name} "
+                    "IN ACCESS EXCLUSIVE MODE"
+                )
+            )
+            settle = asyncio.create_task(retention._settle(dataset_id))
+            try:
+                await _await_relation_waiter(probe, locked_dataset.table_name)
+                assert not await _holds_record_lock(probe, locked_dataset.record_id), (
+                    "retention settlement is parked on the data table while "
+                    "holding the catalog pair, which deadlocks against a DDL "
+                    "holding the table and taking the pair next."
+                )
+                await holder.execute(
+                    select(Dataset.tile_cache_version)
+                    .where(Dataset.id == locked_dataset.id)
+                    .with_for_update(nowait=True)
+                )
+                await holder.execute(
+                    select(Record.id)
+                    .where(Record.id == locked_dataset.record_id)
+                    .with_for_update(nowait=True)
+                )
+                await holder.commit()
+            except BaseException:
+                await holder.rollback()
+                settle.cancel()
+                raise
+            await settle
+
+        assert (
+            await test_db_session.scalar(
+                select(Dataset.feature_count).where(Dataset.id == dataset_id)
+            )
+            == 3
+        )
 
 
 class TestOneAnswerForAContendedRow:
@@ -1587,6 +1643,7 @@ class TestEveryJobWriterLeadsWithTheJobRow:
     _ROW_LOCKS = (
         "lock_catalog_rows",
         "lock_catalog_rows_for_write",
+        "lock_dataset_rows_for_write",
         "_take_catalog_rows",
     )
 
@@ -2005,7 +2062,7 @@ class TestInvalidationsPrecedeTheReap:
 
 
 class TestOnlyThisRequestsTimeoutIsAnswered:
-    """fix(#1847): a 40P01 from a request that never installed the catalog
+    """A 40P01 from a request that never installed the catalog
     timeout is not a busy dataset; only this request's own wait answers 409."""
 
     def _handler_input(self, code: str):
@@ -2045,8 +2102,6 @@ class TestOnlyThisRequestsTimeoutIsAnswered:
 
 
 class TestTheMarkerEndsWithItsTransaction:
-    """fix(#1890): the marker ends with the transaction that installed it."""
-
     async def test_commit_clears_the_marker_the_acquisition_set(self, locked_dataset):
         import app.core.db as db_module
 
@@ -2394,7 +2449,7 @@ class TestWorkerDoorsAcquireBeforeTheirWrites:
 
 
 # ---------------------------------------------------------------------------
-# The class gate (fix(#1847))
+# The class gate
 # ---------------------------------------------------------------------------
 
 # A function that writes BOTH catalog rows acquires them in the house order
@@ -2425,6 +2480,7 @@ _PAIR_WRITER_EXEMPTIONS = {
     # --- writes both rows under its callers' acquisition -------------------
     "app.processing.ingest.catalog_projection.project": "the settlement seam takes the job row and the pair before a strategy projects",
     "app.processing.ingest.tasks_common._write_reupload_catalog": "the settlement seam takes the job row and the pair before a strategy writes",
+    "app.processing.ingest.tasks_reupload._publish_unchanged": "the file and service strategies' write step calls it, holding the job row and the pair the settlement seam took",
     "app.processing.ingest.tasks_reupload.write": "the file and service strategies' write step, which the settlement seam calls holding the job row and the pair",
     "app.processing.ingest.tasks_raster_replace.write": "the raster strategy's write step, which the settlement seam calls holding the job row, the raster row and the pair",
     "app.processing.ingest.tasks_postgis_refresh.write": "the PostGIS strategy's write step, which the settlement seam calls holding the job row and the pair",
@@ -2749,7 +2805,12 @@ def _acquires_raster_first(fn) -> bool:
         for n in ast.walk(fn)
         if isinstance(n, ast.Call)
         and isinstance(n.func, ast.Name)
-        and n.func.id in ("lock_catalog_rows", "lock_catalog_rows_for_write")
+        and n.func.id
+        in (
+            "lock_catalog_rows",
+            "lock_catalog_rows_for_write",
+            "lock_dataset_rows_for_write",
+        )
     ]
     if not calls:
         return False
@@ -3516,11 +3577,12 @@ class TestNoCatalogModuleWritesAnAbsoluteTileVersion:
             "features/router.py": 1,
             "datasets/api/router.py": 1,
         }
-        # Every feature and column write also rolls the data revision a
-        # replacement compares; the remaining feature-router site rolls tiles
-        # for a table replaced outside GeoLens and writes nothing.
+        # Every feature and column write, and each retention batch, also rolls
+        # the data revision a replacement compares; the remaining feature-router
+        # site rolls tiles for a table replaced outside GeoLens and writes nothing.
         assert self._by_file("record_live_data_write") == {
-            "features/router.py": 5,
+            "features/retention.py": 1,
+            "features/router.py": 7,
             "layers/router.py": 4,
         }
 

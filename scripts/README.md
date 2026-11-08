@@ -49,21 +49,17 @@ python scripts/seed-showcase.py \
   --username "${GEOLENS_ADMIN_USERNAME:-admin}" \
   --password "$GEOLENS_ADMIN_PASSWORD" \
   --refresh-quakes
+
+# Add (or update in place) the hurricane story and the earthquake dashboard map
+# on an instance that already has the hurricane and earthquake maps and their
+# datasets, then exit. A full seed creates both too.
+python scripts/seed-showcase.py \
+  --username "${GEOLENS_ADMIN_USERNAME:-admin}" \
+  --password "$GEOLENS_ADMIN_PASSWORD" \
+  --story-and-dashboard
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--base-url` | `http://localhost:8080` (`$GEOLENS_BASE_URL`, fallback `$GEOLENS_URL`) | GeoLens base URL |
-| `--username` | `admin` (`$GEOLENS_ADMIN_USERNAME`) | Admin username |
-| `--password` | `$GEOLENS_ADMIN_PASSWORD` | Admin password |
-| `--no-terrain` | off | Skip the Matterhorn terrain hero (~62 swissALTI3D COG downloads) |
-| `--no-sentinel2` | off | Skip the Sentinel-2 by-reference map (needs Titiler→S3 egress at view time) |
-| `--no-oceans` | off | Skip the ETOPO relief layer (saves a ~466 MB server-side download) |
-| `--only` | unset | Build one item (`catalog`, `restless`, `manhattan`, `hurricanes`, `hurricane-exposure`, `meteorites`, `matterhorn`, `sentinel2`, `collections`, `embed`) |
-| `--no-semantic` | off | Skip the semantic-search step below |
-| `--force` | off | Re-create showcase maps/datasets even if they already exist |
-| `--prune` | off | First delete the retired first-generation showcase maps/datasets |
-| `--refresh-quakes` | off | Refresh the earthquake datasets from the USGS feed, then exit |
+Run `python scripts/seed-showcase.py --help` for the flags and their defaults.
 
 Requires internet access to the upstream open-data sources (NYC Open Data, MTA
 via data.ny.gov, USDA ERS, USGS, NOAA NHC/NCEI, NASA, Natural Earth,
@@ -91,6 +87,7 @@ needs the `upload` and `export` capabilities on the seeding account.
 | Script | Purpose |
 |--------|---------|
 | `install.sh` | First-run installer (see below) |
+| `upgrade.sh` | One-command upgrade for a prebuilt-image install: pre-upgrade backup, migrate, restart, and a printed rollback recipe (`RUNBOOK.md` §10) |
 | `preflight-env.sh` | Refuse a `.env` line Compose cannot load, then validate the boot-required settings (JWT secret, admin creds, encryption key shape) as Compose will resolve them, shell environment first and then `.env`, via `make preflight` / `make dev` |
 | `check-env.sh` | Probe the running stack's env, DB connectivity, and GDAL via `make doctor` (requires the stack up) |
 | `check-demo-config.sh` | Read-only check that the public demo's rendered Compose config and API container have `LANDING_FIRST=false`, no `landing_first` DB override exists, and the effective public value is `false` |
@@ -133,6 +130,7 @@ Wired into the `Makefile` / `package.json`, not run by operators directly:
 | `public_surface_gate.json` | Configure scan boundaries, forbidden pattern IDs, and exact allowlist entries |
 | `check_deployed_surface.py` | Check live marketing/docs pages after deploy (`make deployed-surface-check` / `npm run check:deployed-surface`) |
 | `deployed_surface_gate.json` | Configure deployed page URLs plus required and forbidden assertion IDs |
+| `previous-release-compat.sh` | Boot a published release's api and worker (default: the newest release and the newest of the minor line before it), upgrade the schema to this tree's heads under them, then read a dataset, ingest one and list datasets. CI's Previous-Release Compatibility job; run it locally before tagging (needs docker, uv and free ports, and pulls the release images) |
 
 Allowlist entries in `public_surface_gate.json` must name an exact path, pattern ID, match, and rationale. Wildcard allowlist paths and stale entries fail the gate.
 

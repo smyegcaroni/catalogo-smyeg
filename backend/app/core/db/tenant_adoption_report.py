@@ -1,15 +1,14 @@
 """Report types and verdicts for :mod:`app.core.db.tenant_adoption`.
 
-Split out at the module's existing boundary: this module is what adoption
-*found* (boundary function state, fixed cluster roles, tenant ownership,
-row-security posture) plus the predicate deciding whether anything is left to
-do and the text an operator reads. :mod:`app.core.db.tenant_adoption` is what
-adoption *does* — the queries, the DDL, the CLI.
+This module holds what adoption *found* (boundary function state, fixed cluster
+roles, tenant ownership, row-security posture), the predicate deciding whether
+anything is left to do, and the text an operator reads.
+:mod:`app.core.db.tenant_adoption` is what adoption *does*: the queries, the
+DDL, the CLI.
 
 ``AdoptionReport.ok`` sits next to what it consults deliberately: it is the
-process exit code, so every printable condition must reach it. fix(#1405):
-several review rounds found the report saying something is broken while the
-check still exited 0.
+process exit code, so every printable condition must reach it, or a report
+could say something is broken while the check still exited 0.
 """
 
 from __future__ import annotations
@@ -430,7 +429,7 @@ def _tenant_verdict(
 
 def _format_tenants(report: AdoptionReport) -> list[str]:
     if not report.before:
-        # fix(#998): a tenant provisioned after the empty snapshot makes
+        # A tenant provisioned after the empty snapshot makes
         # report.ok false; "nothing to adopt" while exiting 1 would hide the
         # one condition the operator has to act on.
         if report.tenants_added_during_run:

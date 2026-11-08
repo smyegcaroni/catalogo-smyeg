@@ -1,6 +1,6 @@
 """``catalog.dataset_refresh_runs`` — one row per refresh attempt.
 
-feat(#1219), ADR-002 Decision 4.
+ADR-002 Decision 4.
 
 A sibling table rather than extra columns on ``DatasetVersion``: that table
 is a SUCCESS ledger with ``UNIQUE (dataset_id, version_number)``, and a
@@ -51,17 +51,13 @@ class DatasetRefreshRun(Base):
             "OR (trigger <> 'scheduled' AND scheduled_for IS NULL)",
             name="chk_refresh_runs_scheduled_identity",
         ),
-        # fix(#1325): origin_kind is the run's execution DOOR, written once
-        # by create_pending_run at commit time and never updated afterward.
-        # It is NOT the dataset's current origin — ORIGIN_KINDS/classify_origin()
-        # in platform/dataset_origin.py recompute that live from the
-        # dataset's current source_format, so a pending/failed run can
-        # visibly disagree with the dataset it belongs to (e.g. a STAC
-        # raster's replace run stamps 'upload' immediately, while the
-        # dataset stays 'stac' until a successful swap rebinds it). 'raster'
-        # is RESERVED for the raster-replace door (#1290) and unused today;
-        # reupload_commit always stamps raster replaces 'upload'. 'restore'
-        # republishes the dataset's retained previous version.
+        # origin_kind is the run's execution DOOR, written once by
+        # create_pending_run and never updated. It is NOT the dataset's
+        # current origin (see ORIGIN_KINDS in platform/dataset_origin.py), so
+        # a pending/failed run can visibly disagree with its dataset. 'raster'
+        # is RESERVED for the raster-replace door and unused; reupload_commit
+        # stamps raster replaces 'upload'. 'restore' republishes the dataset's
+        # retained previous version.
         CheckConstraint(
             "origin_kind IN ('upload', 'postgis', 'service', 'stac', 'raster', "
             "'restore')",
@@ -123,10 +119,10 @@ class DatasetRefreshRun(Base):
     dataset_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("catalog.datasets.id", ondelete="CASCADE"), nullable=False
     )
-    # TSEAM-01 dormant tenant_id. Not in migration 0018's stamping-trigger
+    # Dormant tenant_id. Not in migration 0018's stamping-trigger
     # set, so `create_pending_run` writes it explicitly from the parent
     # dataset's STORED value, not the ORM attribute — the trigger fills the
-    # DB column but leaves the ORM attribute None (#1218 finding).
+    # DB column but leaves the ORM attribute None.
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
@@ -186,7 +182,7 @@ class DatasetRefreshRun(Base):
     )
     feature_count_before: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     feature_count_after: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    # compute_schema_diff() output (#1223), recomputed at swap time against the
+    # compute_schema_diff() output, recomputed at swap time against the
     # staging table rather than copied from the preview.
     schema_diff: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     verification: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)

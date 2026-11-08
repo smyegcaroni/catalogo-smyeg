@@ -110,7 +110,6 @@
     "darkMode": "深色模式"
   },
   "theme": {
-    "toggle": "切换主题",
     "light": "浅色",
     "dark": "深色",
     "system": "跟随系统"
@@ -140,9 +139,6 @@
     "infrastructure": "基础设施",
     "general": "常规",
     "basemaps": "底图",
-    "mapDefaults": "地图默认设置",
-    "security": "安全",
-    "uploads": "上传",
     "settings": "设置",
     "settingsGeneral": "常规",
     "settingsAuth": "认证与安全",
@@ -152,7 +148,8 @@
     "settingsAppearance": "外观",
     "settingsInfrastructure": "基础设施",
     "configOps": "配置操作",
-    "backToApp": "返回应用"
+    "backToApp": "返回应用",
+    "groups": "用户组"
   },
   "viewer": {
     "loading": "正在加载地图...",
@@ -160,7 +157,6 @@
     "linkExpiredDescription": "此共享地图链接已不再可用。它可能已过期，或已被所有者撤销。",
     "mapNotFound": "未找到地图",
     "mapNotFoundDescription": "此地图可能已被删除，或链接无效。",
-    "poweredBy": "由 GeoLens 提供支持",
     "featureFallback": "要素",
     "legend": {
       "title": "图层",
@@ -175,10 +171,12 @@
       "weightedBy": "权重依据：{{column}}",
       "weightedByScaled": "权重依据：{{column}}（缩放）",
       "other": "其他",
+      "sampled": "当前缩放级别仅显示部分要素。放大以查看全部要素。",
       "cluster": {
         "server": "服务端聚合",
         "bounded": "客户端聚合",
-        "fallback": "回退为点"
+        "fallback": "回退为点",
+        "pointsPerCluster": "每个聚合的点数"
       },
       "geometry": {
         "point": "点",
@@ -213,7 +211,34 @@
       "booleanFalse": "假",
       "resultSummary_one": "{{count}} 个可见要素",
       "resultSummary_other": "{{count}} 个可见要素",
-      "resultSummaryTruncated": "正在显示 {{total}} 个可见要素中的 {{shown}} 个"
+      "resultSummaryTruncated": "正在显示 {{total}} 个可见要素中的 {{shown}} 个",
+      "truncatedHint": "放大或平移地图以列出其余要素。",
+      "openDatasetData": "查看 {{name}} 的全部数据",
+      "tableView": "表格",
+      "listView": "列表",
+      "viewSwitch": "地图数据视图",
+      "layerPicker": "表格图层",
+      "inView": "视图内",
+      "inViewNoGeometry": "此图层没有可按地图视图筛选的几何",
+      "filteredByMap": "已按地图筛选",
+      "filterUnsupported": "无法应用图层过滤器——显示所有行。",
+      "close": "关闭地图数据",
+      "resize": "调整地图数据大小",
+      "expand": "展开地图数据",
+      "collapse": "收起地图数据",
+      "emptyFiltered": "没有符合地图筛选条件的行",
+      "emptyInView": "视图内没有行。请平移地图或关闭“视图内”。",
+      "unavailable": "此图层的表格在此处不可用。",
+      "loadingRows": "正在加载行",
+      "allFields": "所有字段",
+      "loadingFields": "正在加载更多字段…",
+      "fieldsFailed": "无法加载其余字段。",
+      "selectionMissing": "所选要素不在此页。",
+      "selectionShow": "显示所选",
+      "selectionShowing": "仅显示所选要素。",
+      "selectionShowAll": "显示所有行",
+      "selectionHiddenByFilters": "所选要素被表格的筛选条件隐藏。",
+      "openInTable": "在表格中打开 {{name}}"
     },
     "heatmapLow": "低",
     "heatmapHigh": "高",
@@ -242,6 +267,7 @@
       "emptyHint": "就这张地图的数据提出问题。",
       "readOnlyNote": "AI 仅以只读方式回答——可在不更改地图的情况下探索数据。",
       "error": "出现问题。请重试。",
+      "errorModelUnsupported": "本站的 AI 模型需要 OpenAI Responses API。请联系管理员启用它或选择其他模型。",
       "retry": "重试",
       "queryResult": {
         "empty": "没有匹配的结果。",
@@ -305,6 +331,7 @@
     "jobFailureStaleNeverQueued": "已过期：等待时间过长（从未排队）",
     "jobFailureUploadAbandoned": "已放弃：上传从未完成",
     "jobFailureUserCancelled": "已由用户取消",
+    "jobFailureCredentialOverHttp": "此数据集的服务使用明文 HTTP，因此未发送其凭据。请从该服务的 https:// 地址重新导入，或请管理员允许其主机。",
     "jobFailureWorkerLost": "已过期：任务运行时间过长，其工作进程未报告进度",
     "requestFailed": "请求未能完成。请重试。",
     "badRequest": "请求未能完成。请检查您的输入。",
@@ -332,10 +359,12 @@
     "sharedQueryBusy": "分析预览和 AI 对话共用数据查询通道，一次只能运行一个查询，且当前已有查询正在运行。请等待其完成后再试。",
     "analysisVectorRequired": "分析需要矢量数据集——此图层不是矢量数据集。",
     "analysisMaskPolygonRequired": "裁剪掩膜必须是多边形图层。",
+    "datasetUnpublishBlockedByMaps": "这些地图正将该数据集共享给取消发布后将失去访问权的受众：{{maps}}。请移除其中的图层，或先收窄这些地图的共享范围。",
     "datasetVisibilityBlockedByMaps": "这些地图正将该数据集共享给即将失去访问权的受众：{{maps}}。请移除其中的图层，或先收窄这些地图的共享范围。",
     "workflowTransitionDeniedNoneAllowed": "在发布工作流中，此数据集不能从“{{from}}”转为“{{to}}”，且您没有其他可用步骤。请联系具备所需角色的审核人或管理员。",
     "workflowTransitionDenied": "在发布工作流中，此数据集不能从“{{from}}”转为“{{to}}”。您当前可执行的步骤：{{allowed}}。",
     "analysisUnknownDissolveColumn": "列“{{column}}”在此数据集中不存在。请选择其他分组字段。",
+    "columnsNeedRefresh": "表中已有列 {{columns}}，但 GeoLens 尚未识别。请刷新数据集后重试。",
     "corsWildcardNotAllowed": "不接受通配符来源。带凭据的请求必须完整列出每个来源，例如 https://example.com。",
     "embedDomainLockUnenforceable": "此部署尚无法强制执行域名锁定：其公开应用 URL 设置为 {{resolved}}，而您是通过 {{origin}} 访问的。嵌入地图会经由 GeoLens 本身加载，因此该锁定会拦截所有查看者。请将 PUBLIC_APP_URL 设置为 {{origin}}，然后再创建令牌。",
     "duplicateSource": "来自此数据源的数据集已注册（{{title}}）。",
@@ -353,9 +382,13 @@
     "arcgisSigninInProgress": "此账户的另一个登录流程正在进行中。请稍后重试。",
     "arcgisPortalNotHttps": "该门户或其指向的令牌服务未使用 HTTPS。GeoLens 不会通过明文 HTTP 发送密码；请使用 https:// 的门户 URL。",
     "arcgisPortalHostInvalid": "该门户地址不是可用的主机名。请检查 URL，例如 https://your-org.maps.arcgis.com。",
+    "credentialOverHttp": "该服务地址使用明文 HTTP，GeoLens 不会向其发送凭据。请使用该服务的 https:// 地址，或请管理员允许此主机。",
+    "credentialOverHttpRefresh": "此数据集的来源使用明文 HTTP，GeoLens 不会向其发送凭据。请从该服务的 https:// 地址重新导入数据，或请管理员允许此主机。",
     "refreshServiceTokenRequired": "此数据集的数据源需要服务凭据才能刷新。请在下方提供一个以继续。",
     "refreshSourceUrlBlocked": "此数据集存储的数据源 URL 未通过安全检查，无法自动刷新。请联系管理员。",
     "reuploadGeometryLoss": "此替换文件不含几何图形，而该数据集存储几何图形，因此未做任何更改。请将该文件作为新数据集导入。",
+    "serviceLayerNoFeatures": "此图层不包含要素（组图层、栅格、注记、拓扑或公用事业网络图层）。请改为导入其要素图层或表。",
+    "serviceGeometryUnsupported": "此图层包含 multipatch 几何，无法导入。请将其发布为使用其他几何类型的要素图层。",
     "reuploadOriginChanged": "在准备替换数据期间，此数据集的数据源发生了变化，因此未将任何任务加入队列。请在替换数据前检查该数据集的数据源。",
     "reuploadPointCloudUnsupported": "点云数据集不支持重新上传。请将新的点云作为新数据集上传。",
     "reuploadTilesetUnsupported": "3D Tiles 数据集不支持重新上传。请将新的瓦片集作为新数据集上传。",
@@ -446,6 +479,10 @@
     "collectionNotFound": "未找到集合",
     "mapNotFound": "未找到地图",
     "incorrectCredentials": "用户名或密码错误",
+    "loginThrottled": "此账户登录失败次数过多。请使用之前登录过的浏览器，通过 SSO 登录，或为脚本和桌面应用使用 API 密钥。",
+    "deviceTrustLinkInvalid": "此链接无效、已过期或已被使用。请向管理员索取新链接。",
+    "deviceTrustBrowserFull": "此浏览器记住的账户已达上限。请在隐私窗口或其他浏览器中打开该链接。",
+    "deviceTrustUnavailable": "此 GeoLens 在当前地址下无法记住浏览器。请联系管理员。",
     "awaitingApproval": "您的账户正在等待审批",
     "accountNotActive": "账户未激活",
     "insufficientPermissions": "权限不足",
@@ -457,6 +494,8 @@
     "layerNotFound": "未找到图层",
     "userNotFound": "未找到用户",
     "apiKeyNotFound": "未找到 API 密钥",
+    "datasetKeyLimit": "此数据集已有 100 个有效的写入密钥。请先撤销一个，再创建新的。",
+    "valueLabelsTooLarge": "此数据集的值标签超出了 1 MB 的上限。请删除一些标签后再添加。",
     "accessDenied": "访问被拒绝",
     "couldNotValidateCredentials": "无法验证凭据",
     "inactiveUser": "用户未激活",
@@ -476,6 +515,7 @@
     "stagingFileUnavailable": "暂存文件已不可用。请重新上传。",
     "serviceRequiresAuth": "此服务需要身份验证。请提供访问令牌后重试。",
     "couldNotReachService": "无法连接该服务。请检查 URL 后重试。",
+    "serviceNotRecognized": "无法识别服务类型。支持：WFS、ArcGIS Feature Service 和 OGC API Features。",
     "serviceTimeout": "服务未及时响应。请检查 URL 后重试。",
     "remoteServiceError": "远程服务返回了错误",
     "aiSummaryFailed": "生成摘要失败",
@@ -497,10 +537,46 @@
     "forbiddenEditor": "禁止访问——需要编辑者或管理员权限",
     "networkUnavailable": "网络不可用。请检查您的网络连接。",
     "requestTimeout": "请求耗时过长。请重试。",
-    "unauthorized": "您的会话已过期。请重新登录。"
+    "unauthorized": "您的会话已过期。请重新登录。",
+    "retentionUnsupportedRelation": "保留期限要求数据集的数据位于普通表中。此数据集从视图、分区表或其他类型的关系读取数据，因此无法在此开启保留期限。",
+    "retentionHasChildren": "保留期限无法在被其他表继承的表上运行，因为删除操作可能波及这些表的行。请移除继承它的表后再使用保留期限。",
+    "retentionReferenced": "有外键指向此表，删除其中的旧行也会改变引用它们的行。请移除该外键后再使用保留期限。",
+    "retentionDeleteRule": "此表有一条 DELETE 规则，会改变删除的效果。请移除该规则后再使用保留期限。",
+    "retentionNotFeatureDataset": "保留期限仅适用于要素带有几何数据的数据集。",
+    "retentionColumnMissing": "列 {{column}} 已不存在。请选择其他日期或时间戳列。",
+    "retentionColumnNotTemporal": "列 {{column}} 不是日期或时间戳列。请选择日期或时间戳列。",
+    "retentionColumnInUse": "保留期限按列 {{column}} 删除行。请先关闭保留期限或将其改用其他列，再更改该列或将其名称用于其他列。",
+    "retentionGidUnusable": "保留期限按表的整数 gid 列逐批处理，而此表已不再有该列。请恢复整数 gid 列后再使用保留期限。",
+    "retentionDeleteTrigger": "保留期限无法在带有删除触发器的表上运行，因为触发器可能保留行，或在删除旧行时更改其他行。请移除该触发器后再使用保留期限。",
+    "groupNotFound": "未找到用户组",
+    "groupNotJoined": "您只能与自己所属的用户组共享。",
+    "mapRestrictedNeedsGroups": "请先与某个用户组共享该地图，再将其设为受限。",
+    "mapChangeInProgress": "此地图上有另一项更改正在进行。请稍后重试。",
+    "groupMemberNotFound": "该用户不是此用户组的成员",
+    "groupNameTaken": "名为“{{name}}”的用户组已存在",
+    "vrtAudienceExceedsSources": "该 VRT 数据集会让无法查看其全部源数据集的人员看到它。请缩小该 VRT 的可见范围，或改用其受众可查看的源数据集。",
+    "storyNotFound": "未找到故事。",
+    "storyLocked": "此故事正在进行另一项更改，请稍后重试。",
+    "storyNewerVersion": "此故事由更新版本的 GeoLens 保存，无法在这里更改。",
+    "storyScenesUnreadable": "部分场景由更新版本的 GeoLens 保存，无法在这里发布。",
+    "storyVisibilityUnsupported": "故事暂时无法以此可见范围发布。",
+    "dashboardTooNew": "此仪表板由较新版本的 GeoLens 保存，无法在此更改。",
+    "dashboardTooManyWidgets": "一个仪表板最多包含 50 个小组件。保存前请移除一些。",
+    "dashboardWidgetsRefused": "部分仪表板小组件使用了不在此地图上或您无法读取的图层。请移除它们或选择其他图层。",
+    "storyImageUnreadable": "该文件不是可读取的图片。",
+    "storyImageTooLarge": "图片过大。请上传小于 50 MB 且像素更少的文件。",
+    "storyImageUnsupported": "只能上传 PNG、JPEG 和 WebP 图片。",
+    "storyImageBusy": "其他图片正在处理中。请稍后重试。",
+    "storyImageMissing": "未发送图片。请选择文件后重试。",
+    "storyAssetLimit": "此故事的图片已达上限：200 张或共 250 MB。",
+    "storyAssetOwnerLimit": "你的故事已达到管理员允许的图片存储上限。请从故事中移除图片，或请管理员提高上限。",
+    "storyAssetsNotFound": "未找到此故事中的部分图片。请移除这些图片块后再次保存。",
+    "storyFrameHostNotAllowed": "部分嵌入内容或视频使用了管理员未批准的网站。请修正或移除后重试。"
   },
   "settings": {
-    "apiKeys": { "manageTitle": "管理 API 密钥" },
+    "apiKeys": {
+      "manageTitle": "管理 API 密钥"
+    },
     "tabs": {
       "preferences": "偏好设置",
       "apiKeys": "API 密钥"
@@ -540,6 +616,7 @@
     "private": "私有",
     "internal": "内部",
     "public": "公开",
+    "restricted": "受限",
     "listView": "列表视图",
     "gridView": "网格视图",
     "loadFailed": "加载地图失败：{{message}}",
@@ -558,7 +635,8 @@
     "card": {
       "previewAlt": "{{name}} 预览",
       "updated": "更新于 {{date}}",
-      "delete": "删除地图"
+      "delete": "删除地图",
+      "dashboard": "仪表板"
     }
   },
   "enums": {
@@ -713,7 +791,8 @@
     "docs": "文档",
     "github": "GitHub",
     "api": "API",
-    "license": "Apache 2.0"
+    "license": "Apache 2.0",
+    "thirdPartyLicenses": "第三方许可证"
   },
   "notFound": {
     "title": "页面未找到",
@@ -744,7 +823,9 @@
     "adminSettings": "管理设置",
     "adminSaml": "SAML 单点登录配置",
     "verifyEmail": "验证电子邮箱",
-    "signingIn": "正在登录"
+    "signingIn": "正在登录",
+    "trustBrowser": "记住此浏览器",
+    "adminGroups": "用户组管理"
   },
   "sidebar": {
     "title": "侧边栏",
@@ -757,9 +838,6 @@
   },
   "inlineEdit": {
     "hint": "Ctrl+Enter 保存，Escape 取消"
-  },
-  "mapCoordReadout": {
-    "scale": "1:{{value}}"
   },
   "errorBoundary": {
     "appTitle": "出了点问题",

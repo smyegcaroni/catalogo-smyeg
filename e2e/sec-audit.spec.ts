@@ -2,10 +2,10 @@
 //
 // Run: npx playwright test e2e/sec-audit.spec.ts --project=chromium
 //
-// fix(#1778): S01/S02/S03/S05/S08/S09 used to read hand-provisioned env vars
-// (SEC_AUDIT_PRIVATE_DATASET_ID etc.) that nothing in CI ever set, so those
-// tests skipped on every run and the file reported green while covering 8
-// of 19 cases. beforeAll below seeds the same fixtures in-spec instead, the
+// S01/S02/S03/S05/S08/S09 need fixtures that nothing in CI would provision
+// by hand (SEC_AUDIT_PRIVATE_DATASET_ID etc.), and skipping on a missing
+// fixture would let the file report green while covering only 8
+// of 19 cases. beforeAll below seeds the fixtures in-spec instead, the
 // way e2e/auth.setup.ts seeds a shared dataset and e2e/auth.spec.ts creates
 // its throwaway e2e-logout-probe user.
 //
@@ -49,7 +49,7 @@ function adminHeaders(): Record<string, string> {
 }
 
 test.beforeAll(async () => {
-  // fix(review #1792 round 2): this hook used to seed five fixtures
+  // This hook used to seed five fixtures
   // sequentially. The two ingest-backed ones alone (raster + private
   // vector) can each poll for up to 60s (helpers/catalog.ts's
   // seedFixtureDataset), so a slow worker could blow past Playwright's
@@ -192,7 +192,7 @@ test('S01 STAC visibility — anonymous cannot read a private raster STAC item',
 test('S01 STAC visibility — anonymous /stac/search does not return private rasters', async ({ request }) => {
   const recordId = privateRasterId;
   const res = await request.get(`${apiBase}/stac/search?ids=${recordId}`);
-  // fix(review #1792 round 3): this `if` had no `else` -- any non-200 status
+  // This `if` had no `else` -- any non-200 status
   // (including a 500) fell through with no assertion at all, so a broken
   // endpoint passed silently. Either denied (401/403/404) or an empty
   // features list -- never the private item back.
@@ -230,7 +230,7 @@ test('S02 IDOR — editor B cannot PATCH another user\'s private dataset', async
 });
 
 test('S02 IDOR — editor B cannot DELETE another user\'s private dataset', async ({ request }) => {
-  // fix(review #1792 round 3): the positive control below calls
+  // The positive control below calls
   // seedDataset(), which alone can poll for up to 60s (helpers/catalog.ts's
   // seedFixtureDataset) -- the same 60s as Playwright's default TEST
   // timeout, with nothing left over for the denial request, the owner
@@ -278,10 +278,10 @@ test('S02 IDOR — editor B cannot DELETE another user\'s private dataset', asyn
 test('S02 IDOR — editor B cannot bulk-delete another user\'s private dataset', async ({ request }) => {
   const datasetId = privateDatasetId;
   const tokenB = editorBToken;
-  // fix(#1778): BulkDeleteRequest's schema is `{ datasets: [{ dataset_id,
+  // BulkDeleteRequest's schema is `{ datasets: [{ dataset_id,
   // confirm_title }] }` (backend/openapi.json), not `{ dataset_ids: [...] }`
-  // — the old payload always 422'd before authorization was ever reached,
-  // which the permanent skip guard hid. bulk_delete_datasets_endpoint
+  // — the latter would 422 before authorization was ever reached.
+  // bulk_delete_datasets_endpoint
   // (router.py) isolates per-item failures rather than rejecting the whole
   // batch, so a denied item surfaces as HTTP 200 with a per-item
   // status: 'error', never a top-level 401/403/404.
@@ -356,7 +356,7 @@ test('S03 IDOR — editor B cannot DROP a column on another user\'s private data
 // ─────────────────────────────────────────────────────────────────────────────
 // S04 — SSRF redirect bypass on external source connectors
 //
-// fix(#1778): removed rather than left permanently skipped. This test needs
+// Not present rather than left permanently skipped. A test here would need
 // a live external URL that 302-redirects to 169.254.169.254; CI has no such
 // endpoint and standing one up is a real infrastructure dependency, not a
 // fixture this spec can seed. The redirect-revalidation behavior itself is
@@ -398,13 +398,13 @@ test('S06 — admin user with known-public password "demodemo" cannot log in', a
 // ─────────────────────────────────────────────────────────────────────────────
 
 test('S08 — embed frame-policy endpoint reflects the actual embed-token state', async ({ request }) => {
-  // fix(review #1792 round 2): the edge reads the embed token from the `et`
+  // The edge reads the embed token from the `et`
   // query param, not the share token in the path (frontend/nginx.conf's
   // `location ~ ^/m/` forwards $arg_et to /embed/frame-policy). Without
   // `et`, embed_frame_policy (public_router.py) always emits NO
   // frame-ancestors directive at all -- so the old assertion passed only
   // because X-Frame-Options is intentionally omitted on this route (see the
-  // nginx SEC-S08 comment), never because a real per-token policy was
+  // nginx comment), never because a real per-token policy was
   // exercised.
   //
   // Implementing that fix surfaced a further problem: the nginx `auth_request`
@@ -499,7 +499,7 @@ test('S08 — embed frame-policy endpoint reflects the actual embed-token state'
     // create_embed_token_endpoint -- confirmed against the live endpoint.
     expect(restrictedRes.status()).toBe(422);
     const body = (await restrictedRes.json()) as { detail?: unknown };
-    // fix(review #1792 round 3): a vanilla FastAPI 422 body has `detail` as
+    // A vanilla FastAPI 422 body has `detail` as
     // an array of {loc, msg, type} objects, and `expect(array).toContain(
     // 'a substring')` compares array ELEMENTS for equality -- against
     // objects, that never matches, so the check would always pass or always
@@ -534,10 +534,9 @@ test('S08 — embed frame-policy endpoint reflects the actual embed-token state'
 test('S09 — dataset export -where rejects UNION / subqueries', async ({ request }) => {
   const datasetId = publicDatasetId;
   const malicious = `gid > 0 UNION SELECT 1, 2, 3`;
-  // fix(#1778): the export route is /datasets/{id}/export?format=csv, not
-  // /datasets/{id}/export.csv (backend/openapi.json has no such path) — the
-  // old URL always 404'd before the -where parser ever ran, which the
-  // permanent skip guard hid.
+  // The export route is /datasets/{id}/export?format=csv, not
+  // /datasets/{id}/export.csv (backend/openapi.json has no such path), which
+  // would 404 before the -where parser ever ran.
 
   // Positive control: the identical anonymous request, with no `where` at
   // all, against the same public/published dataset. publicDatasetId is
@@ -555,7 +554,7 @@ test('S09 — dataset export -where rejects UNION / subqueries', async ({ reques
   const res = await request.get(
     `${apiBase}/datasets/${datasetId}/export?format=csv&where=${encodeURIComponent(malicious)}`,
   );
-  // fix(review #1792 round 9): 403 dropped from the accepted set -- with the
+  // 403 dropped from the accepted set -- with the
   // positive control above proving the route is reachable anonymously, a
   // 403 here can only mean the malicious `where` never reached
   // validate_where_clause() at all (e.g. an authorization regression that
@@ -572,11 +571,11 @@ test('S13 — /search/facets/ rejects q longer than 1000 chars', async ({ reques
   const longQ = 'a'.repeat(5000);
   const res = await request.get(`${apiBase}/search/facets/?q=${encodeURIComponent(longQ)}`);
   // After fix: 422 (Pydantic validation). Pre-fix: 200 with seq-scan.
-  // fix(review #1792 round 3): dropped 429 tolerance -- it was only ever
+  // Dropped 429 tolerance -- it was only ever
   // defensive against the S11 burst test running before this one and
   // saturating the rate limiter; S11 now runs last in this file (see its
   // section below), and /search/facets/ carries no semantic-search
-  // per-route limit of its own (WR-02, search/router.py) to begin with.
+  // per-route limit of its own (search/router.py) to begin with.
   expect([400, 422]).toContain(res.status());
 });
 
@@ -584,18 +583,17 @@ test('S13 — /search/facets/ rejects q longer than 1000 chars', async ({ reques
 // Hygiene regression — ensure SQL injection sentinels remain blocked
 // ─────────────────────────────────────────────────────────────────────────────
 
-// fix(review #1792 round 5): the four tests below all hit the rate-limited
+// The four tests below all hit the rate-limited
 // /search/datasets/ route (malformed-bbox included -- same endpoint, a
 // `bbox` param rather than `q`), so their combined request count competes
 // for the same per-route bucket as every other test in this file that hits
 // it.
 //
-// fix(review #1792 round 9): round 5's "accept a 429 only when the
-// configured limit is below this describe block's own request count" logic
-// assumed this describe block is the only source of traffic against the
-// bucket. It is not: in a full nightly run, search.spec.ts also hits
-// /search/datasets/ against the same server (and, if the limiter keys on
-// IP rather than per-user, the same bucket), so a configured limit that
+// An earlier "accept a 429 only when the configured limit is below this
+// describe block's own request count" rule assumed this describe block is
+// the only source of traffic against the bucket. It is not: in a full
+// nightly run, search.spec.ts also hits /search/datasets/ against the same
+// server (and, if the limiter keys on IP rather than per-user, the same bucket), so a configured limit that
 // comfortably covers these four requests ALONE can still be exhausted by
 // the time they run, and an unconditional `expect(200)` would then fail a
 // perfectly healthy rate limiter. There is no configured-limit threshold
@@ -699,20 +697,19 @@ test('hygiene — CORS does not grant credentials to an untrusted origin', async
 // ─────────────────────────────────────────────────────────────────────────────
 
 test('S11 — /search/datasets/ has semantic-search rate limiting wired (smoke)', async ({ request }) => {
-  // fix(#1778): the skip guard used to fire on exactly the outcome this test
-  // exists to catch, so it could never go red. The per-route decorator has
-  // shipped (search/router.py's search_datasets_endpoint carries
+  // A skip guard on exactly the outcome this test exists to catch would
+  // keep it from ever going red, so there is none. The per-route decorator
+  // is in place (search/router.py's search_datasets_endpoint carries
   // @limiter.limit(_semantic_search_rate_limit)) -- gate on it.
   //
-  // fix(review #1792 round 5): this test spent four rounds trying to pin the
-  // actual discriminating behavior (is a 429 really from the per-route
-  // limiter and not the global one? does it fire exactly at the configured
-  // threshold?) against a live, shared, admin-configurable dev stack --
-  // structurally unreliable there, since this suite can neither set
+  // Pinning the actual discriminating behavior (is a 429 really from the
+  // per-route limiter and not the global one? does it fire exactly at the
+  // configured threshold?) against a live, shared, admin-configurable dev
+  // stack is structurally unreliable, since this suite can neither set
   // semantic_search_rate_limit or global_rate_limit nor isolate itself from
-  // other concurrent traffic hitting the same stack (rounds 1-4 tried
-  // reading the config, pacing bursts below the global limit, and retrying
-  // through DB-pool contention, and still could not fully close the gap).
+  // other concurrent traffic hitting the same stack. Reading the config,
+  // pacing bursts below the global limit and retrying through DB-pool
+  // contention did not fully close the gap.
   // That pin now lives in backend/tests/test_semantic_search_rate_limit_1778.py,
   // against an isolated app instance with both limits set to known values --
   // it also covers the "decorator still present" structural check. This is a

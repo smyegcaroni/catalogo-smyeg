@@ -82,7 +82,7 @@ export function formatBbox(bbox: number[] | null | undefined, fallback: string):
   return `(${bbox[0].toFixed(4)}, ${bbox[1].toFixed(4)}) to (${bbox[2].toFixed(4)}, ${bbox[3].toFixed(4)})`;
 }
 
-export function formatBytes(bytes: number | null): string {
+export function formatBytes(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined) return i18n.t('common:notAvailable');
   if (bytes === 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -92,10 +92,8 @@ export function formatBytes(bytes: number | null): string {
 }
 
 export function formatRelativeDate(dateString: string | null): string {
-  // i18next's ``.t()`` returns ``unknown`` under the new generic signature
-  // (the default ``returnNull`` / ``returnEmptyString`` options can both
-  // yield non-string results). Narrow to ``string`` at the boundary so
-  // downstream callers receive the expected type.
+  // i18next's `.t()` returns `unknown` under the generic signature; narrow to
+  // `string` at the boundary.
   const fallback = i18n.t('common:notAvailable') as string;
   if (!dateString) return fallback;
   const result = formatProvenanceTime(dateString, {
@@ -117,13 +115,11 @@ function formatMetersGsd(meters: number, locale: string): string {
 }
 
 /**
- * Format a raster ground-sample distance given in CRS units.
- *
- * fix(#569): geographic CRSs deliver `gsd` in DEGREES — formatting them as
- * meters showed "2 cm" for a 60-arc-second global DEM. When the payload says
- * the CRS is geographic (or, for older payloads without the flag, the CRS is
- * EPSG:4326), render arc units with an approximate equatorial ground
- * distance, e.g. `60″ (≈1.9 km)`.
+ * Format a raster ground-sample distance given in CRS units. Geographic CRSs
+ * deliver `gsd` in DEGREES (formatting as meters would show "2 cm" for a
+ * 60-arc-second global DEM), so when the payload says the CRS is geographic (or,
+ * for older payloads without the flag, is EPSG:4326) render arc units with an
+ * approximate equatorial ground distance, e.g. `60″ (≈1.9 km)`.
  */
 export function formatGsd(
   gsd: number,
@@ -141,9 +137,8 @@ export function formatGsd(
     // arc-seconds ("30 arc-second", "60 arc-second"), so 60″ stays 60″.
     arc = `${(arcSeconds / 60).toLocaleString(locale, { maximumFractionDigits: 1 })}′`;
   } else {
-    // fix(#588): sub-arcsecond pixels (e.g. ~0.01″ / 30 cm EPSG:4326 drone
-    // imagery) round to a meaningless "0″" at a fixed 1 decimal. Below 1″,
-    // switch to significant digits so any magnitude stays readable.
+    // Below 1″ (e.g. ~0.01″ drone imagery) a fixed 1 decimal rounds to "0″";
+    // use significant digits instead.
     const secondsOpts: Intl.NumberFormatOptions =
       arcSeconds >= 1 ? { maximumFractionDigits: 1 } : { maximumSignificantDigits: 2 };
     arc = `${arcSeconds.toLocaleString(locale, secondsOpts)}″`;

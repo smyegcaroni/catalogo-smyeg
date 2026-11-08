@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+import uuid
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 from typing import TYPE_CHECKING
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
 import structlog
 
 from app.core.config import settings
+from app.core.geo import extent_to_bbox, shown_extent, shows_mosaic_size
 from app.core.pointcloud import POINTCLOUD_MEDIA_TYPE, pointcloud_path
 from app.core.raster_bands import band_display_name, stac_band_nodata
 from app.core.record_types import RASTER_FAMILY_RECORD_TYPES, capabilities
@@ -29,7 +31,6 @@ from app.modules.catalog.datasets.domain.source_freshness import (
     compute_source_freshness,
 )
 from app.modules.catalog.records.localization import select_localized_record_text
-from app.modules.catalog.datasets.domain.utils import extract_bbox
 from app.modules.catalog.search.record_metadata import (
     build_contacts,
     build_external_ids,
@@ -155,7 +156,7 @@ def build_assets(
             }
 
     elif record_type in RASTER_FAMILY_RECORD_TYPES:
-        # Public APP origin, not /api. fix(#1372, #2007): versioned so a
+        # Public APP origin, not /api. Versioned so a
         # refetching STAC/OGC client stops sharing the unversioned entry, and
         # a publication transition rolls what it may share.
         raster_tiles_path = (
@@ -255,7 +256,7 @@ def _build_stac_assets(
 
     result = {}
     for row in asset_rows:
-        # fix(#1290): shared boundary — see app/platform/assets/keys.py for
+        # Shared boundary — see app/platform/assets/keys.py for
         # why it is an allowlist.
         if not is_public_asset_key(row["key"]):
             continue
@@ -305,15 +306,21 @@ def dataset_to_ogc_record(
     public_app_url: str | None = None,
     preferred_languages: Sequence[str] | None = None,
     lineage_summary: str | None = None,
+    vrt_extents: Mapping[uuid.UUID, object | None] | None = None,
 ) -> dict:
     """Convert a Dataset ORM object to an OGC Record GeoJSON Feature dict.
 
-    fix(#1103): ``lineage_summary`` must arrive already access-checked
+    ``lineage_summary`` must arrive already access-checked
     (``visible_lineage_summary``) — this function has no requester to check
     the derived-from titles against. Omitted when the caller doesn't supply
-    it: missing is recoverable, leaked is not.
+    it: missing is recoverable, leaked is not. A VRT shows only what
+    ``vrt_extents`` (``visible_vrt_extents``) holds for it (``shown_extent``),
+    never its stored extent or ``spatial_extent_geojson``.
     """
     record = dataset.record
+    extent = shown_extent(record, dataset.id, vrt_extents)
+    if record.record_type == "vrt_dataset":
+        spatial_extent_geojson = None
     localized = select_localized_record_text(record, preferred_languages)
     updated_user = getattr(record, "_provenance_updated_user", None)
     last_edited = derive_last_edited(
@@ -323,8 +330,8 @@ def dataset_to_ogc_record(
         updated_user=updated_user,
     )
 
-    # A caller-precomputed ST_AsGeoJSON string (PostGIS-side, fast) is parsed
-    # directly; otherwise fall back to Python-side WKB deserialization.
+    # A precomputed ST_AsGeoJSON string is parsed directly; otherwise fall back
+    # to Python-side WKB deserialization.
     geometry = None
     if spatial_extent_geojson is not None:
         try:
@@ -338,14 +345,14 @@ def dataset_to_ogc_record(
                 exc_info=True,
             )
             geometry = None
-    elif record.spatial_extent is not None:
+    elif extent is not None:
         try:
             from geoalchemy2.shape import to_shape
             from shapely.geometry import mapping
 
-            # fix(#430): mapping() emits valid GeoJSON for any geometry type;
-            # the old .exterior path built {"coordinates": []} for Point extents.
-            geometry = mapping(to_shape(record.spatial_extent))
+            # mapping() emits valid GeoJSON for any geometry type, Point
+            # extents included.
+            geometry = mapping(to_shape(extent))
         except Exception:  # broad: WKB deserialize — geoalchemy/shapely errors fall back to None geometry
             logger.warning(
                 "ogc_geometry_wkb_deserialize_failed",
@@ -354,9 +361,9 @@ def dataset_to_ogc_record(
             )
             geometry = None
 
-    # STAC 1.0.0 datetime rules: if datetime is null, start_datetime AND
-    # end_datetime MUST both be present. When no temporal extent exists,
-    # fall back to created_at so the item always passes STAC validation.
+    # STAC 1.0.0: if datetime is null, start_datetime and end_datetime must
+    # both be present. With no temporal extent, fall back to created_at so the
+    # item always validates.
     _ts = record.temporal_start
     _te = record.temporal_end
     if _ts is not None and _te is None:
@@ -376,8 +383,8 @@ def dataset_to_ogc_record(
         stac_start_datetime = None
         stac_end_datetime = None
 
-    # OGC Records puts "time" at the record root (alongside geometry)
-    # AND in properties for STAC consumer compatibility.
+    # OGC Records puts "time" at the record root (alongside geometry) and, for
+    # STAC consumers, in properties.
     record_time = build_time(dataset)
     description = (
         localized.summary.strip()
@@ -456,7 +463,7 @@ def dataset_to_ogc_record(
             "time": record_time,
             "lineage": lineage_summary,
             "update_frequency": record.update_frequency,
-            # feat(#1224): same read-time computation as dataset_to_response, so
+            # Same read-time computation as dataset_to_response, so
             # a catalog card and detail page can't disagree. SEARCH_CACHE_TTL
             # (30s) is far below the shortest declared period, so a cached
             # value only lags a transition by that window. Named
@@ -487,16 +494,16 @@ def dataset_to_ogc_record(
                 if record.usage_constraints or record.access_constraints
                 else None
             ),
-            # From record_distributions. fix(#1469): a raster/VRT ingest tail
-            # writes a row whose url is the COG's object-storage key —
-            # unresolvable and layout-exposing — so is_publishable_url drops
-            # it; build_assets' raster_tiles asset covers that access surface.
+            # From record_distributions. A raster/VRT ingest tail writes a row
+            # whose url is the COG's object-storage key, which is unresolvable
+            # and layout-exposing, so is_publishable_url drops it;
+            # build_assets' raster_tiles asset covers that access surface.
             "distributions": [
                 {
                     "type": d.distribution_type,
                     "format": d.format,
-                    # fix(#2007): as in published_distributions -- a stored
-                    # vector-tile template cannot hold a counter that rolls.
+                    # As in published_distributions: a stored vector-tile
+                    # template cannot hold a counter that rolls.
                     "url": (
                         build_url(
                             republished_tile_url(
@@ -547,11 +554,15 @@ def dataset_to_ogc_record(
         ),
     }
 
-    # STAC properties for raster/VRT records (record_type already resolved above)
     if raster_meta and record_type in RASTER_FAMILY_RECORD_TYPES:
         if raster_meta.get("epsg") is not None:
             ogc_record["properties"]["proj:code"] = f"EPSG:{raster_meta['epsg']}"
-        if raster_meta.get("width") and raster_meta.get("height"):
+        # A VRT's shape spans every member, readable or not.
+        if (
+            raster_meta.get("width")
+            and raster_meta.get("height")
+            and shows_mosaic_size(record, dataset.id, vrt_extents)
+        ):
             ogc_record["properties"]["proj:shape"] = [
                 raster_meta["height"],
                 raster_meta["width"],
@@ -563,15 +574,14 @@ def dataset_to_ogc_record(
             ogc_record["properties"]["gsd"] = min(
                 abs(raster_meta["res_x"]), abs(raster_meta["res_y"])
             )
-            # fix(#1805): gsd is a lossy min(abs(res_x), abs(res_y)) that can
-            # collapse two misaligned sources to the same value, silently
-            # passing a client gsd-only check that _check_grid_alignment
-            # (res_x and res_y independently) would reject. Expose both axes.
+            # The gsd is a lossy min(abs(res_x), abs(res_y)) that can collapse
+            # two misaligned sources to one value and pass a client gsd-only
+            # check that _check_grid_alignment (res_x and res_y independently)
+            # would reject. Expose both axes.
             ogc_record["properties"]["res_x"] = raster_meta["res_x"]
             ogc_record["properties"]["res_y"] = raster_meta["res_y"]
-            # fix(#569): gsd is in CRS units — geographic CRSs deliver degrees,
-            # and without this flag the UI formatted them as meters ("2 cm"
-            # for a 60-arc-second global DEM).
+            # The gsd is in CRS units, which are degrees for geographic CRSs;
+            # without this flag the UI would format them as meters.
             if raster_meta.get("crs_is_geographic") is not None:
                 ogc_record["properties"]["crs_is_geographic"] = raster_meta[
                     "crs_is_geographic"
@@ -579,7 +589,7 @@ def dataset_to_ogc_record(
         if raster_meta.get("band_count"):
             ogc_record["properties"]["band_count"] = raster_meta["band_count"]
 
-        # fix(#1778): band_name/nodata go through the same normalisers as the
+        # The band_name/nodata values go through the same normalisers as the
         # STAC serializer (`app.core.raster_bands`), so one dataset can't
         # report a band one way here and another way there.
         bands = []
@@ -598,11 +608,10 @@ def dataset_to_ogc_record(
                 if nodata is not None:
                     band_entry["nodata"] = nodata
                 elif raster_meta.get("nodata") is None:
-                    # fix(#1805): the asset WAS probed and its authoritative
-                    # RasterAsset.nodata column is None, so absence is
-                    # confirmed, not merely unrecorded — emit the key
-                    # explicitly so the client can tell "absent" from
-                    # "unavailable" (an omitted key means the latter).
+                    # The asset was probed and its authoritative
+                    # RasterAsset.nodata is None, so absence is confirmed, not
+                    # merely unrecorded. Emit the key so the client can tell
+                    # "absent" from "unavailable" (an omitted key).
                     band_entry["nodata"] = None
                 if bi.get("description"):
                     band_entry["description"] = bi["description"]
@@ -611,13 +620,12 @@ def dataset_to_ogc_record(
         if bands:
             ogc_record["properties"]["raster:bands"] = bands
 
-        # VRT-specific fields
         if raster_meta.get("vrt_type"):
             ogc_record["properties"]["vrt_type"] = raster_meta["vrt_type"]
         if raster_meta.get("source_count") is not None:
             ogc_record["properties"]["source_count"] = raster_meta["source_count"]
 
-    bbox = extract_bbox(dataset)
+    bbox = extent_to_bbox(extent)
     if bbox is not None:
         ogc_record["bbox"] = bbox
 

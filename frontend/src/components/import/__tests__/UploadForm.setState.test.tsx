@@ -1,5 +1,5 @@
 /**
- * IMPORT-03 regression test — setState-during-render anti-pattern
+ * Test — setState-during-render anti-pattern
  *
  * Verifies that calling handleCommitSingle, handleCommitAll, or removeEntry
  * never fires `setPhase` inside a `setEntries` updater function, which would
@@ -131,7 +131,7 @@ describe('UploadForm — IMPORT-03 setState-during-render regression', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    // fix(#1712): UploadForm now drives uploads through the module-scoped
+    // UploadForm drives uploads through the module-scoped
     // upload-session singleton, so a leftover batch from a previous test
     // would otherwise be ADOPTED by the next render() instead of that test
     // starting fresh from the dropzone.

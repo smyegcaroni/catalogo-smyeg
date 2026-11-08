@@ -30,9 +30,7 @@
     "byVisibility": "Jeux de données par visibilité",
     "noDatasets": "Aucun jeu de données pour l'instant",
     "errorLoading": "Échec du chargement des statistiques : {{message}}",
-    "totalUsers": "Utilisateurs totaux",
-    "usersByStatus": "Utilisateurs par statut",
-    "noUsers": "Aucun utilisateur"
+    "totalUsers": "Utilisateurs totaux"
   },
   "users": {
     "title": "Utilisateurs",
@@ -236,11 +234,6 @@
       "user": "Utilisateur",
       "allUsers": "Tous les utilisateurs",
       "allActions": "Toutes les actions",
-      "datasetView": "Consultation de jeu de données",
-      "datasetExport": "Exportation de jeu de données",
-      "metadataEdit": "Modification de métadonnées",
-      "datasetCreate": "Création de jeu de données",
-      "datasetDelete": "Suppression de jeu de données",
       "action": "Action",
       "userId": "ID utilisateur",
       "resourceType": "Type de ressource",
@@ -355,6 +348,8 @@
     "openaiKeyRequired": "OPENAI_API_KEY n'est pas défini. La génération d'embeddings nécessite une clé API compatible OpenAI.",
     "keyConfigured": "configurée",
     "keyNotSet": "non configurée",
+    "claudePlatformConfigured": "Claude sur {{platform}} : configuré",
+    "claudePlatformNotConfigured": "Claude sur {{platform}} : non configuré",
     "testConnection": "Tester la connexion",
     "testing": "Test en cours…",
     "testConnectionDescription": "Effectue un appel réel vers chaque fournisseur configuré pour vérifier les clés et la connectivité. Consomme une petite quantité de jetons du fournisseur.",
@@ -391,6 +386,20 @@
     "scope": "Portée",
     "scopeFull": "Accès complet",
     "scopeReadOnly": "Lecture seule",
+    "scopePublish": "Publication",
+    "scopePublishDescription": "Ajoute vos propres données et cartes, modifie les informations de vos jeux de données et remplace les jeux de données téléversés en conservant leurs versions précédentes. Elle ne peut rien rendre public ni élargir la visibilité d'un jeu de données, mettre à jour une carte existante, remplacer les jeux de données raster ou liés à un service, un élément STAC ou une table, écrire des entités ni rien supprimer.",
+    "scopeDatasetWrite": "Un jeu de données",
+    "scopeDatasetAppend": "Un jeu de données, ajout uniquement",
+    "expiry": "Expiration",
+    "expiryOptions": {
+      "never": "N'expire jamais",
+      "30d": "30 jours",
+      "90d": "90 jours",
+      "1y": "1 an"
+    },
+    "expired": "Expirée",
+    "expiresOn": "Expire le {{date}}",
+    "expiredOn": "Expirée le {{date}}",
     "creating": "Création...",
     "createError": "Échec de la création de la clé",
     "loadingKeys": "Chargement des clés...",
@@ -421,8 +430,9 @@
   },
   "apiKeyReveal": {
     "title": "Clé API créée",
-    "description": "Copiez cette clé maintenant. Elle ne sera plus affichée.",
+    "description": "Copiez cette clé maintenant.",
     "warning": "Cette clé ne sera plus affichée. Assurez-vous de la copier maintenant.",
+    "copy": "Copier la clé API",
     "done": "Terminé"
   },
   "sharedMaps": {
@@ -485,8 +495,6 @@
     "tableLabel": "Jetons d'intégration"
   },
   "settings": {
-    "copySPEntityId": "Copier l'ID d'entité SP",
-    "copyAcsUrl": "Copier l'URL ACS",
     "actions": {
       "discard": "Annuler les modifications",
       "resetDefaults": "Rétablir les valeurs par défaut",
@@ -513,6 +521,7 @@
         "upload": "Télécharger des jeux de données",
         "create_layers": "Créer des couches",
         "export": "Exporter des données",
+        "exportDescription": "Télécharger les fichiers des jeux de données et, avec « Télécharger des jeux de données », enregistrer les résultats d'analyse comme nouveaux jeux de données. Tout le monde peut télécharger les jeux de données publics publiés, et toute personne pouvant consulter un jeu de données peut lire ses entités via l'API, les tuiles de la carte et la table attributaire.",
         "edit_metadata": "Modifier les métadonnées",
         "manage_collections": "Gérer les collections",
         "use_ai_chat": "Chat IA",
@@ -522,8 +531,6 @@
     },
     "general": {
       "title": "Général",
-      "cardTitle": "Fonctionnalités",
-      "cardDescription": "Activez ou désactivez les fonctionnalités de la plateforme.",
       "registration": "Auto-inscription",
       "registrationDescription": "Permet aux personnes de créer leur propre compte, en s'inscrivant avec un mot de passe ou en se connectant via un fournisseur SSO activé. Les comptes SSO sont actifs immédiatement avec le rôle par défaut du fournisseur. Les inscriptions par mot de passe s'activent après vérification de l'e-mail (SMTP requis), sinon après approbation par un administrateur.",
       "landingFirst": "Connexion comme page d'accueil",
@@ -531,7 +538,6 @@
       "aiFeatures": "Fonctionnalités IA",
       "aiFeaturesDescription": "Activer les fonctionnalités alimentées par l'IA, notamment la rédaction de métadonnées de jeux de données (résumés, mots-clés, lignage, déclarations de qualité), le chat du constructeur de cartes et la génération de cartes par IA.",
       "saved": "Paramètres enregistrés",
-      "saveFailed": "Échec de l'enregistrement des paramètres",
       "requireMetadata": "Exiger les métadonnées pour la publication",
       "requireMetadataDescription": "Lorsque activé, les jeux de données doivent avoir des métadonnées complètes avant de pouvoir être publiés.",
       "enableDatasetEditing": "Activer l'édition des jeux de données",
@@ -541,7 +547,7 @@
       "bannerEnabled": "Activer la bannière du site",
       "bannerEnabledDescription": "Afficher la bannière d'annonce à tous les visiteurs. Le texte de la bannière ci-dessous doit également être renseigné.",
       "bannerText": "Texte de la bannière du site",
-      "bannerTextDescription": "Bannière d'annonce affichée à tous les visiteurs en haut de l'application. Laissez vide pour aucune bannière.",
+      "bannerTextDescription": "Bannière d'annonce affichée à tous les visiteurs en haut de l'application. Laissez vide pour aucune bannière. Texte du lien : [libellé](https://example.org).",
       "bannerColor": "Couleur de la bannière du site",
       "bannerColorDescription": "Couleur de la bannière d'annonce.",
       "bannerColorWarning": "Avertissement (ambre)",
@@ -557,7 +563,12 @@
       "privacyUrlDescription": "Affichée comme lien sur les pages de connexion et d'inscription. Laissez vide pour masquer le lien. Doit être une URL http(s) complète.",
       "logLevel": "Niveau de journalisation",
       "logJsonLabel": "Format de journal (JSON)",
-      "logJsonDescription": "Journaux de sortie au format JSON structuré."
+      "logJsonDescription": "Journaux de sortie au format JSON structuré.",
+      "auditRetentionDays": "Conservation du journal d'audit (jours)",
+      "auditRetentionDaysDescription": "Les enregistrements d'audit plus anciens que ce nombre de jours sont supprimés automatiquement. Laissez vide pour les conserver indéfiniment.",
+      "auditRetentionKeepForever": "Conserver indéfiniment",
+      "auditRetentionInvalid": "Saisissez un nombre entier de jours ({{min}} à {{max}}), ou laissez le champ vide.",
+      "auditRetentionComplianceWarning": "Certains régimes de conformité exigent de conserver les enregistrements d'audit au moins {{days}} jours."
     },
     "basemaps": {
       "title": "Fonds de carte",
@@ -580,8 +591,7 @@
       "apiKeyLabel": "Clé API",
       "apiKeyPlaceholder": "Facultatif — requis si l'URL contient {api_key}",
       "apiKeyHelp": "Utilisez {api_key} dans l'URL des tuiles comme espace réservé. La clé est interpolée côté serveur.",
-      "saved": "Fonds de carte enregistrés",
-      "saveFailed": "Échec de l'enregistrement des fonds de carte"
+      "saved": "Fonds de carte enregistrés"
     },
     "mapDefaults": {
       "title": "Carte par défaut",
@@ -591,9 +601,7 @@
       "longitude": "Longitude",
       "zoomLevel": "Niveau de zoom",
       "preview": "Aperçu",
-      "useCurrentView": "Utiliser la vue actuelle",
-      "saved": "Paramètres de carte enregistrés",
-      "saveFailed": "Échec de l'enregistrement des paramètres de carte"
+      "saved": "Paramètres de carte enregistrés"
     },
     "plugins": {
       "title": "Plugins de carte",
@@ -621,8 +629,6 @@
     },
     "security": {
       "title": "Sécurité",
-      "cardTitle": "Limitation du taux de connexion",
-      "cardDescription": "Contrôlez le nombre maximum de tentatives de connexion par minute par adresse IP.",
       "loginRateLimit": "Tentatives de connexion par minute",
       "accessTokenExpire": "Durée de vie du jeton d'accès (minutes)",
       "refreshTokenExpire": "Délai d'inactivité de la session (jours)",
@@ -630,7 +636,6 @@
       "tokenLifetimeNote": "Les modifications de durée de vie des jetons s'appliquent uniquement aux jetons nouvellement émis.",
       "loginRateLimitDescription": "Nombre maximum de requêtes de connexion autorisées par minute depuis une seule adresse IP (1–1000).",
       "saved": "Paramètres de sécurité enregistrés",
-      "saveFailed": "Échec de l'enregistrement des paramètres de sécurité",
       "passwordLogin": "Autoriser la connexion par mot de passe",
       "passwordLoginDescription": "Permet aux utilisateurs de se connecter avec un identifiant et un mot de passe. Le désactiver impose un fournisseur SSO : activez-en un d'abord. Les administrateurs peuvent toujours se connecter par mot de passe en dernier recours.",
       "emailVerificationRequired": "Exiger la vérification de l'e-mail",
@@ -656,7 +661,6 @@
       "unknownError": "Erreur inconnue"
     },
     "saved": "Paramètres enregistrés",
-    "saveFailed": "Échec de l'enregistrement des paramètres",
     "resetDefaults": "Rétablir les valeurs par défaut",
     "tabs": {
       "general": "Général",
@@ -671,14 +675,16 @@
     },
     "uploads": {
       "title": "Paramètres de téléchargement",
-      "cardTitle": "Limites de téléchargement",
-      "cardDescription": "Configurez la taille maximale des fichiers et les extensions autorisées.",
       "maxSizeMb": "Taille maximale du fichier (Mo)",
       "maxSizeMbDescription": "Taille maximale en mégaoctets (1-10 000).",
       "allowedExtensions": "Extensions autorisées",
       "allowedExtensionsDescription": "Liste d'extensions autorisées séparées par des virgules.",
       "tileCacheTtl": "TTL du cache de tuiles (secondes)",
       "tileCacheTtlDescription": "Temps en secondes avant l'expiration des entrées du cache de tuiles (0 = pas de cache).",
+      "previousVersionsKept": "Versions précédentes conservées par jeu de données",
+      "previousVersionsKeptDescription": "Nombre de versions remplacées de chaque jeu de données qui restent restaurables, de 1 à 50. Une valeur plus basse libère l'espace au prochain remplacement ou à la prochaine restauration de chaque jeu de données.",
+      "invalidPreviousVersionsKept": "Saisissez un nombre entier de 1 à 50.",
+      "previousVersionsStorage": "Les versions conservées occupent actuellement {{size}}.",
       "perUserLimitsTitle": "Limites par utilisateur",
       "perUserLimitsDescription": "Plafonds appliqués à chaque utilisateur lors du téléchargement. 0 = illimité.",
       "maxStoragePerUser": "Stockage maximal par utilisateur",
@@ -689,8 +695,9 @@
       "invalidStorageQuantity": "Saisissez une quantité correspondant à un nombre entier d’octets.",
       "maxDatasetsPerUser": "Jeux de données max. par utilisateur",
       "maxDatasetsPerUserDescription": "Nombre maximal de jeux de données que chaque utilisateur peut créer (0 = illimité).",
-      "saved": "Paramètres de téléchargement enregistrés",
-      "saveFailed": "Échec de l'enregistrement"
+      "maxStoryImageMbPerUser": "Stockage maximal d’images d’histoires par utilisateur (Mo)",
+      "maxStoryImageMbPerUserDescription": "La taille totale des images que les histoires d’un utilisateur peuvent contenir, en mégaoctets (0 = illimité). Les images déjà stockées restent ; seuls les nouveaux envois et les copies sont refusés.",
+      "saved": "Paramètres de téléchargement enregistrés"
     },
     "oauth": {
       "title": "Fournisseurs OAuth",
@@ -799,6 +806,20 @@
       "registrationAdminConfirmDescription": "Chaque inscription par mot de passe dont l'e-mail est vérifié deviendra administrateur. Assurez-vous que c'est bien voulu.",
       "signupAdminActivationDescription": "Après cette modification, les personnes qui s'inscrivent peuvent devenir administratrices sans l'approbation d'un administrateur. Assurez-vous que c'est bien ce que vous voulez.",
       "verificationNeedsRegistration": "S'applique lorsque l'auto-inscription est activée."
+    },
+    "storyFrames": {
+      "title": "Intégrations et vidéos des récits",
+      "description": "Sites dont les récits peuvent afficher les pages et les lecteurs vidéo dans un cadre. Les navigateurs des lecteurs les chargent directement depuis ces sites. Sans site, les blocs d’intégration et de vidéo sont désactivés.",
+      "empty": "Aucun site pour l’instant : les blocs d’intégration et de vidéo sont désactivés.",
+      "hostLabel": "Nom d’hôte du site",
+      "add": "Ajouter le site",
+      "invalid": "Saisissez un nom d’hôte comme media.example.org, sans https:// ni chemin. Les jokers ne sont pas acceptés.",
+      "duplicate": "Ce site figure déjà dans la liste.",
+      "full": "La liste contient au plus {{max}} sites.",
+      "sameOrigin": "Conserver l’origine du site",
+      "sameOriginHint": "Certains lecteurs vidéo ont besoin de leur propre origine pour lire. Le cadre garde cette origine où que le site l’emmène, donc tout autre site approuvé qu’il ouvre la reçoit aussi. À activer seulement pour un site auquel vous confiez tous les sites approuvés.",
+      "remove": "Retirer {{host}}",
+      "reloadHint": "Les pages déjà ouvertes prennent en compte la liste après un rechargement."
     }
   },
   "infrastructure": {
@@ -809,14 +830,8 @@
     "tileCache": "Cache de tuiles",
     "type": "Type",
     "status": "Statut",
-    "latency": "Latence",
-    "ttl": "TTL",
     "cdn": "CDN",
-    "pooler": "Pooler",
-    "connected": "Connecté",
-    "disconnected": "Déconnecté",
     "configured": "Configuré",
-    "notConfigured": "Non configuré",
     "loading": "Chargement du statut de l'infrastructure...",
     "errorLoading": "Échec du chargement du statut de l'infrastructure",
     "allOperational": "Tous les systèmes opérationnels",
@@ -833,8 +848,7 @@
       "title": "SSO SAML",
       "description": "Non disponible dans cette version.",
       "heading": "SAML n'est pas disponible",
-      "body": "Cette version de GeoLens prend en charge les comptes locaux et les fournisseurs OAuth comme Google, GitHub et OIDC générique.",
-      "docsLink": "SAML n'est pas disponible dans cette version"
+      "body": "Cette version de GeoLens prend en charge les comptes locaux et les fournisseurs OAuth comme Google, GitHub et OIDC générique."
     },
     "addProvider": "Ajouter un fournisseur SAML",
     "loading": "Chargement des fournisseurs SAML...",
@@ -894,5 +908,66 @@
   "sortable": {
     "sortAscending": "trier par ordre croissant",
     "sortDescending": "trier par ordre décroissant"
+  },
+  "groups": {
+    "title": "Groupes",
+    "listHeading": "Groupes de partage",
+    "errorLoading": "Impossible de charger les groupes : {{message}}",
+    "nameLabel": "Nom du groupe",
+    "actionsFor": "Actions du groupe {{name}}",
+    "table": {
+      "name": "Nom",
+      "members": "Membres",
+      "created": "Créé",
+      "actions": "Actions",
+      "manageMembers": "Membres",
+      "memberCount_one": "{{count}} membre",
+      "memberCount_other": "{{count}} membres"
+    },
+    "empty": {
+      "title": "Aucun groupe pour le moment",
+      "hint": "Créez un groupe, ajoutez-y des personnes, puis partagez-lui des jeux de données, des cartes et des récits."
+    },
+    "create": {
+      "button": "Créer un groupe",
+      "title": "Créer un groupe",
+      "description": "Les groupes permettent de partager des jeux de données, des cartes et des récits restreints avec un ensemble de personnes."
+    },
+    "rename": {
+      "button": "Renommer",
+      "title": "Renommer le groupe",
+      "description": "Choisissez un nouveau nom pour {{name}}."
+    },
+    "delete": {
+      "title": "Supprimer {{name}} ?",
+      "description_one": "Ce groupe compte {{count}} membre. Il perd aussitôt l’accès aux jeux de données, aux cartes et aux récits partagés avec le groupe. Cette action est irréversible.",
+      "description_other": "Ce groupe compte {{count}} membres. Ils perdent aussitôt l’accès aux jeux de données, aux cartes et aux récits partagés avec le groupe. Cette action est irréversible.",
+      "deleting": "Suppression..."
+    },
+    "members": {
+      "title": "Membres de {{name}}",
+      "description": "Les personnes de ce groupe peuvent ouvrir les jeux de données, les cartes et les récits partagés avec lui.",
+      "addLabel": "Ajouter une personne",
+      "listHeading_one": "{{count}} membre",
+      "listHeading_other": "{{count}} membres",
+      "listLabel": "Membres de {{name}}",
+      "removeLabel": "Retirer {{name}} de {{group}}",
+      "empty": "Ce groupe n’a pas encore de membres.",
+      "added": "{{name}} ajouté",
+      "removed": "{{name}} retiré",
+      "errorLoading": "Impossible de charger les membres : {{message}}",
+      "needsUserManagement": "Ajouter des personnes nécessite l’autorisation de gérer les utilisateurs. Vous pouvez toujours voir et retirer des membres."
+    },
+    "picker": {
+      "placeholder": "Rechercher par nom d’utilisateur",
+      "noMatches": "Aucune personne correspondante",
+      "results_one": "{{count}} personne disponible",
+      "results_other": "{{count}} personnes disponibles"
+    },
+    "toasts": {
+      "created": "Groupe créé",
+      "renamed": "Groupe renommé",
+      "deleted": "Groupe supprimé"
+    }
   }
 }

@@ -19,6 +19,7 @@ function makeMap(overrides: Partial<MapSummaryResponse> = {}): MapSummaryRespons
     description: null,
     visibility: 'private',
     layer_count: 2,
+    has_dashboard: false,
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-02T00:00:00Z',
     thumbnail_url: '/api/maps/map-1/thumbnail/',
@@ -29,6 +30,17 @@ function makeMap(overrides: Partial<MapSummaryResponse> = {}): MapSummaryRespons
 }
 
 describe('MapCard', () => {
+  it.each([
+    ['list', MapCard],
+    ['grid', MapCardGrid],
+  ])('badges a map that shows the reader a dashboard in the %s view', (_view, Card) => {
+    mockUseMapThumbnail.mockReturnValue(null);
+    const { rerender } = render(<Card map={makeMap()} onDelete={() => {}} />);
+    expect(screen.queryByText('Dashboard')).not.toBeInTheDocument();
+    rerender(<Card map={makeMap({ has_dashboard: true })} onDelete={() => {}} />);
+    expect(screen.getByText('Dashboard')).toBeInTheDocument();
+  });
+
   it('renders img when thumbnail is present and no error', () => {
     mockUseMapThumbnail.mockReturnValue('blob:http://localhost/fake-thumb');
     render(<MapCard map={makeMap()} onDelete={() => {}} />);
@@ -105,9 +117,9 @@ describe('MapCardGrid', () => {
   });
 });
 
-// fix(#1005): the thumbnail cache version moved off `updated_at`, which was
-// carrying two meanings — a lazy backfill on first builder open reordered the
-// "Last updated" gallery for what was a read.
+// The thumbnail cache version is not `updated_at`, which carries two
+// meanings — a lazy backfill on first builder open would reorder the
+// "Last updated" gallery for what is a read.
 describe.each([
   ['MapCard', MapCard],
   ['MapCardGrid', MapCardGrid],

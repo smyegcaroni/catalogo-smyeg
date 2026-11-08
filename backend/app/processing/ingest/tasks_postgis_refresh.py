@@ -1,19 +1,17 @@
 """Procrastinate task: re-measure a registered PostGIS table.
 
-feat(#1265) / ADR-002 Decision 5a. A registered table copies no data — the
-catalog points at the live relation — so what GeoLens stores about it is a
-measurement taken once at registration, of a table its owner keeps writing
-to. This task re-takes that measurement: no fetch, no staging table, no
-swap, the source IS the destination.
+A registered table copies no data (the catalog points at the live relation),
+so what GeoLens stores about it is a measurement of a table its owner keeps
+writing to. This task re-takes that measurement: no fetch, no staging table,
+no swap.
 
-Runs as a worker task (not inline in the request) to reuse the shared
-admission-gate/run-ledger/history machinery (handoff invariant 11), and to
-avoid holding an HTTP connection open across a ``COUNT(*)`` of unknown size.
+Runs as a worker task to reuse the admission-gate/run-ledger/history
+machinery, and to avoid holding an HTTP connection open across a
+``COUNT(*)`` of unknown size.
 
-The source-health probe (#1222) refuses postgis origins outright — probing
-one would mean an HTTP request to a relation — so this task owns the
-``source_health`` verdict for its origin kind via a SQLSTATE lookup, rather
-than leaving it to the probe's classifier like every other strategy does.
+The source-health probe refuses postgis origins (probing one would mean an
+HTTP request to a relation), so this task owns the ``source_health`` verdict
+for its origin kind via a SQLSTATE lookup.
 """
 
 from __future__ import annotations
@@ -30,6 +28,7 @@ from sqlalchemy.exc import DBAPIError
 from app.core.db.sqlstate import sqlstate
 from app.core.db.tenant_session import tenant_task
 from app.platform.catalog_locks import bump_tile_cache_version_atomic
+from app.platform.dataset_origin import BoundPointer, bound_pointer
 from app.processing.ingest.catalog_projection import measure, project
 from app.processing.ingest.publication import (
     PUBLISH,
@@ -50,17 +49,16 @@ from app.processing.ingest.tasks_common import (
 
 logger = structlog.get_logger(__name__)
 
-# ADR-002's stored source_health values, retyped rather than imported since
-# processing/ may not import app.modules.catalog
-# (test_no_processing_imports_catalog); test_postgis_refresh_1265 asserts
-# these against the probe's own vocabulary so a divergence fails a test.
+# ADR-002's stored source_health values, retyped because processing/ may not
+# import app.modules.catalog; test_postgis_refresh_1265 asserts them against
+# the probe's vocabulary.
 _HEALTHY = "healthy"
 _MISSING = "missing"
 _INACCESSIBLE = "inaccessible"
 
 # Members of the probe's closed DETAIL_CODES set: dropped relation = resource
-# gone, revoked GRANT = access lost, dead connection = transport failing —
-# the same three distinctions the probe draws over HTTP.
+# gone, revoked GRANT = access lost, dead connection = transport failing, the
+# distinctions the probe draws over HTTP.
 _NOT_FOUND = "not_found"
 _UNAUTHORIZED = "unauthorized"
 _NETWORK_ERROR = "network_error"
@@ -70,35 +68,34 @@ _ERROR_CODE_INACCESSIBLE = "source_inaccessible"
 _ERROR_CODE_GENERIC = "postgis_refresh_failed"
 _ERROR_CODE_SUPERSEDED = "superseded"
 
-# fix(#1738): repair phase's own statement deadline, in ms. Worker statements
-# have no deadline (`install_api_statement_timeout` only runs in the API
-# process), and this repair UPDATE is the one write this task makes to a
-# relation GeoLens doesn't own — bounding it caps how long it holds someone
-# else's row locks. Five minutes covers the common case (matches no rows, one
-# seq scan) while giving the deadline back on an oversized table; the bound
-# covers the whole transaction since the DDL's ACCESS EXCLUSIVE lock is
-# blocking whether held or awaited.
+# Repair phase's statement deadline, in ms. Worker statements have no
+# deadline (`install_api_statement_timeout` only runs in the API process), and
+# the repair UPDATE is this task's one write to a relation GeoLens doesn't own,
+# so bounding it caps how long it holds someone else's row locks. Five minutes
+# covers the common case (no rows match, one seq scan). It applies to each
+# statement in the transaction, DDL included, since the DDL's ACCESS EXCLUSIVE
+# lock blocks whether held or awaited.
 _REPAIR_STATEMENT_TIMEOUT_MS = 300_000
 
-# fix(#1738): a much shorter bound on WAITING for the lock — a QUEUED lock
-# request already blocks readers behind it, so waiting the full statement
-# deadline for one would stall the owner's traffic for 5 minutes. 5 seconds
-# instead: a busy table gives its queue position back and the next refresh retries.
+# Whole-transaction bound (PostgreSQL 17+): the DDL lock is held until commit.
+_REPAIR_TRANSACTION_TIMEOUT_MS = 300_000
+
+# A much shorter bound on waiting for the lock: a queued lock request already
+# blocks readers behind it, so a busy table gives its queue position back
+# after 5 seconds and the next refresh retries.
 _REPAIR_LOCK_TIMEOUT_MS = 5_000
 
 # query_canceled (statement_timeout) vs lock_not_available (lock_timeout):
-# distinguished because they mean different things in the log — too much
-# data to re-derive, versus somebody else using the table right now.
+# too much data to re-derive, versus somebody else using the table now.
 _STATEMENT_TIMEOUT_SQLSTATE = "57014"
+_TRANSACTION_TIMEOUT_SQLSTATE = "25P04"
 _LOCK_TIMEOUT_SQLSTATE = "55P03"
 
-# Coded repair-phase outcomes, logged every run. NOT run error codes — a
-# failed repair doesn't fail the refresh (see `_repair_geom_4326`).
-#
-# These describe the render column only; the reader grant and GiST index are
-# restored on every outcome where the table/column exist, so
-# `not_applicable` may still mean work was done — see `index_added` on the
-# report for that half (fix(#1738)).
+# Coded repair-phase outcomes, logged every run; not run error codes, since a
+# failed repair doesn't fail the refresh. They describe the render column
+# only: the reader grant and GiST index are restored wherever the table and
+# column exist, so `not_applicable` may still mean work was done (see
+# `index_added`).
 _REPAIR_REPAIRED = "repaired"
 _REPAIR_NOT_APPLICABLE = "not_applicable"
 _REPAIR_TIMED_OUT = "timed_out"
@@ -114,9 +111,8 @@ class _RepairReport(NamedTuple):
     column_added: bool = False
     index_added: bool = False
     gid_added: bool = False
-    # The version the bump actually published, read back from the increment
-    # rather than computed here (fix(#1738)); None when nothing was
-    # rewritten and so nothing was bumped.
+    # The version the bump published, read back from the increment; None when
+    # nothing was rewritten and so nothing was bumped.
     tile_cache_version: int | None = None
 
 
@@ -126,11 +122,10 @@ class _Verdict(NamedTuple):
     error_code: str
     health: str | None
     detail: str | None
-    # Written for the person reading the refresh history, and composed here
-    # rather than from the driver: ADR-002 Decision 3 forbids a raw exception
-    # in a stored reason string, and driver text carries the statement, its
-    # parameters, and in some shapes a connection string. The exception itself
-    # still reaches the logs.
+    # For the person reading the refresh history, composed here rather than
+    # from the driver: ADR-002 Decision 3 forbids a raw exception in a stored
+    # reason, and driver text carries the statement, its parameters and
+    # sometimes a connection string. The exception still reaches the logs.
     message: str
 
 
@@ -143,17 +138,14 @@ _MISSING_VERDICT = _Verdict(
     "restore or re-create the table, then refresh again.",
 )
 
-# SQLSTATE -> verdict. Only failures that say something true about the ORIGIN
-# are listed. A statement timeout or deadlock says something about the
-# query, not the table, and falls through to the inconclusive verdict below,
-# which writes no health — reporting a healthy table missing because one
-# COUNT(*) was slow would be worse than reporting nothing.
+# SQLSTATE -> verdict, only for failures that say something true about the
+# origin. A statement timeout or deadlock describes the query, not the table,
+# and falls through to the inconclusive verdict, which writes no health.
 _VERDICT_BY_SQLSTATE: dict[str, _Verdict] = {
     # undefined_table
     "42P01": _MISSING_VERDICT,
-    # insufficient_privilege. Deliberately NOT "missing": the table may be
-    # intact behind a revoked GRANT — same distinction the probe draws
-    # between 404 and 403.
+    # insufficient_privilege. Not "missing": the table may be intact behind a
+    # revoked GRANT, as the probe tells 404 from 403.
     "42501": _Verdict(
         _ERROR_CODE_INACCESSIBLE,
         _INACCESSIBLE,
@@ -164,10 +156,9 @@ _VERDICT_BY_SQLSTATE: dict[str, _Verdict] = {
     ),
 }
 
-# connection_exception and friends, matched on the two-character class since
-# the whole class means one thing here. Barely reachable while gate 2 holds
-# (origin is a relation in the DB GeoLens already talks to), mapped anyway so
-# it can't fall through to a verdict that blames the table.
+# connection_exception and friends, matched on the two-character class. Barely
+# reachable (the origin is a relation in the DB GeoLens already talks to), but
+# mapped so it can't fall through to a verdict that blames the table.
 _CONNECTION_CLASS = "08"
 _CONNECTION_VERDICT = _Verdict(
     _ERROR_CODE_INACCESSIBLE,
@@ -182,8 +173,8 @@ class PostgisRefreshError(Exception):
     """A refresh failure that already knows what it means.
 
     Carries the run's ``error_code`` and, when the failure described the
-    origin, the source-health verdict to persist — classified once, at the
-    point with the evidence, rather than re-classified by the failure handler.
+    origin, the source-health verdict to persist, classified once where the
+    evidence is.
     """
 
     def __init__(
@@ -221,12 +212,13 @@ def _inconclusive_verdict(code: str | None) -> _Verdict:
 def _chained_sqlstates(exc: BaseException) -> Iterator[str]:
     """Every SQLSTATE on an exception's chain, outermost first.
 
-    fix(#1313): the outermost code isn't always informative. When a table is
-    dropped/revoked mid-measurement, ``extract_metadata``'s retry inside an
-    already-aborted transaction surfaces ``25P02``
-    (in_failed_sql_transaction) with the real ``42P01``/``42501`` in
-    ``__context__``. ``25P02`` carries no information of its own, so the
-    honest answer is the earlier code found by walking the chain.
+    When a table is dropped or revoked mid-measurement, ``extract_metadata``'s
+    retry inside the aborted transaction surfaces ``25P02``
+    (in_failed_sql_transaction), which says nothing, with the real
+    ``42P01``/``42501`` in ``__context__``.
+
+    Driver exceptions on the chain count too: a transaction timeout ends the
+    session, so only asyncpg's inner exception carries ``25P04``.
     """
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -234,8 +226,12 @@ def _chained_sqlstates(exc: BaseException) -> Iterator[str]:
         seen.add(id(current))
         if isinstance(current, DBAPIError):
             code = sqlstate(current)
-            if code:
-                yield code
+        else:
+            code = getattr(current, "sqlstate", None) or getattr(
+                current, "pgcode", None
+            )
+        if code:
+            yield str(code)
         current = current.__cause__ or current.__context__
 
 
@@ -264,13 +260,11 @@ def _resolve_bound_table(dataset: Any, *, schema: str) -> str:
     """The bare table name to re-measure, proven to be this dataset's own.
 
     ``origin_ref.table_name`` (JSONB) names the table but must not steer the
-    read: a name taken from it and dropped into a query is one bad row away
-    from measuring a relation belonging to somebody else. So the pointer is
-    checked, not trusted — it must match the active tenant's data schema
-    plus ``datasets.table_name``, the pair every other reader uses.
-    Registration writes both from one value, so disagreement is a genuine
-    fault (hand-edited row, interrupted tenant migration) that stops the
-    refresh rather than silently picking a winner.
+    read: a name taken from it is one bad row away from measuring somebody
+    else's relation. So it must match the active tenant's data schema plus
+    ``datasets.table_name``, the pair every other reader uses. Registration
+    writes both from one value, so disagreement is a fault (hand-edited row,
+    interrupted tenant migration) that stops the refresh.
     """
     ref = dataset.origin_ref or {}
     bound = ref.get("table_name")
@@ -297,9 +291,9 @@ async def _relation_exists(session: Any, *, schema: str, table: str) -> bool:
     ``to_regclass`` answers for a name, so a dropped/renamed table is a NULL
     instead of an exception, keeping the "missing" verdict from depending on
     which statement hit the absence first. ``format('%I.%I', ...)`` composes
-    the identifier from bound parameters — nothing is interpolated here —
-    and the casts are load-bearing since ``format`` is variadic ``"any"``
-    and asyncpg can't infer a parameter type through it.
+    the identifier from bound parameters; the casts are needed because
+    ``format`` is variadic ``"any"`` and asyncpg can't infer a type through
+    it.
     """
     return bool(
         await session.scalar(
@@ -332,15 +326,13 @@ async def _repair_geom_4326(
     committed before the content token is read; a later bump would trip the
     write step's superseded check against this task's own repair.
 
-    Bounded twice (``_REPAIR_STATEMENT_TIMEOUT_MS``,
-    ``_REPAIR_LOCK_TIMEOUT_MS``) since holding and waiting on a lock are
-    different hazards on a table GeoLens doesn't own. The reader GRANT and
-    GiST index are restored whatever the geometry outcome: they are the other
-    two things ``-overwrite`` destroys.
+    Bounded per statement, per transaction and per lock wait, since holding
+    and waiting on a lock are different hazards on a table GeoLens doesn't
+    own. The reader GRANT and GiST index, the other things ``-overwrite``
+    destroys, are restored whatever the geometry outcome.
 
     Never fatal: a refresh whose repair can't run still takes its
-    measurement and reports the repair outcome, leaving the dataset no more
-    broken than it already was.
+    measurement and reports the repair outcome.
     """
     from app.core.db import async_session
     from app.processing.ingest.metadata import (
@@ -358,18 +350,30 @@ async def _repair_geom_4326(
 
     async with async_session() as session:
         try:
-            # SET LOCAL via set_config(..., is_local => true) so the statement
-            # stays static SQL with a bound value (`SET` takes no
-            # parameters). Set before anything else runs, so every statement
-            # below is covered, DDL included.
+            # set_config(..., is_local => true) keeps the statement static SQL
+            # with a bound value (`SET` takes no parameters). First, so every
+            # statement below is covered, DDL included. The CASE skips
+            # transaction_timeout before PostgreSQL 17, which doesn't know it.
+            # A shorter configured timeout stays. A longer one is set to 0 first
+            # (the inner call), since an armed timer isn't rescheduled by a new
+            # positive value.
             await session.execute(
                 text(
                     "SELECT set_config('statement_timeout', :ms, true), "
-                    "       set_config('lock_timeout', :lock_ms, true)"
+                    "       set_config('lock_timeout', :lock_ms, true), "
+                    "       CASE WHEN current_setting('server_version_num')::int"
+                    " >= 170000 AND (SELECT setting::int FROM pg_settings"
+                    " WHERE name = 'transaction_timeout')"
+                    " NOT BETWEEN 1 AND :tx_ms_int"
+                    " THEN set_config('transaction_timeout',"
+                    " CASE WHEN set_config('transaction_timeout', '0', true) = '0'"
+                    " THEN :tx_ms END, true) END"
                 ),
                 {
                     "ms": str(_REPAIR_STATEMENT_TIMEOUT_MS),
                     "lock_ms": str(_REPAIR_LOCK_TIMEOUT_MS),
+                    "tx_ms": str(_REPAIR_TRANSACTION_TIMEOUT_MS),
+                    "tx_ms_int": _REPAIR_TRANSACTION_TIMEOUT_MS,
                 },
             )
             # Columns, not the ORM instance: only the binding is needed, and
@@ -387,19 +391,19 @@ async def _repair_geom_4326(
             try:
                 table_name = _resolve_bound_table(binding, schema=schema)
             except PostgisRefreshError:
-                # A binding fault is phase 2's to report; don't touch its failure path.
+                # A binding fault is the measurement's to report.
                 return _RepairReport(_REPAIR_NOT_APPLICABLE)
             if not await _relation_exists(session, schema=schema, table=table_name):
                 # Same: the "missing" verdict belongs to the measurement.
                 return _RepairReport(_REPAIR_NOT_APPLICABLE)
             srid = await get_declared_srid(session, table_name, schema=schema)
             if srid == 0:
-                # Phase 2 refuses a table without an SRID, so nothing about it
-                # is re-derived, indexed or granted first.
+                # The measurement refuses a table without an SRID, so nothing
+                # about it is re-derived, indexed or granted first.
                 return _RepairReport(_REPAIR_NOT_APPLICABLE)
             gid_keyable = await probe_gid(session, table_name, schema=schema)
             if gid_keyable is False:
-                # Phase 2 refuses this too, on the same terms.
+                # The measurement refuses this too.
                 return _RepairReport(_REPAIR_NOT_APPLICABLE)
             gid_added = gid_keyable is None
             if gid_added:
@@ -412,12 +416,10 @@ async def _repair_geom_4326(
                     session, table_name, srid, schema=schema, state=state
                 )
 
-            # fix(#1738): index restored on the same rule as the grant below —
-            # every outcome where the column EXISTS, not only a rewrite.
-            # `rederive_geom_4326` was the only caller of the index helper,
-            # so a valid STORED GENERATED `geom_4326` after overwrite (nothing
-            # to re-derive) left no GiST index, and bbox predicates fell back
-            # to a sequential scan on a table GeoLens doesn't own.
+            # Wherever the column exists, not only after a rewrite: a valid
+            # STORED GENERATED `geom_4326` after overwrite has nothing to
+            # re-derive but still needs its GiST index, or bbox predicates
+            # fall back to a sequential scan on a table GeoLens doesn't own.
             if repair is not None:
                 index_added = repair.index_added
             elif state.has_render:
@@ -427,24 +429,19 @@ async def _repair_geom_4326(
             else:
                 index_added = False
 
-            # fix(#1738): unconditional, not only when rewritten. The GRANT
-            # is the third thing `-overwrite` destroys regardless of the
-            # recreated table's geometry — including a valid STORED
-            # GENERATED `geom_4326` or a non-spatial table, both of which
-            # need no re-derive but still left `geolens_reader` locked out
-            # when this was gated on it. Idempotent, same call registration makes.
+            # Unconditional: `-overwrite` destroys the GRANT whatever the
+            # recreated table's geometry, and a valid STORED GENERATED
+            # `geom_4326` or a non-spatial table needs no re-derive but would
+            # leave `geolens_reader` locked out. Idempotent, the call
+            # registration makes.
             await grant_reader_access(session, table_name, schema=schema, role=role)
 
             tile_version = None
             if gid_added or (repair is not None and repair.rows_rewritten):
-                # Gated on rewritten ROWS or a new gid, not column or index:
-                # the bump's contract is that it fires with a change to tile
-                # CONTENT, and a new gid renumbers every feature. An index
-                # restore doesn't change content; an added render column on
-                # an empty table renders the same nothing.
-                #
-                # fix(#1738): atomic spelling — this transaction holds no
-                # lock on the datasets row.
+                # Gated on rewritten rows or a new gid, not column or index:
+                # the bump fires with a change to tile content, and a new gid
+                # renumbers every feature. The atomic spelling, because this
+                # transaction holds no lock on the datasets row.
                 tile_version = await bump_tile_cache_version_atomic(
                     session, dataset_cls=Dataset, dataset_id=dataset_uuid
                 )
@@ -461,7 +458,7 @@ async def _repair_geom_4326(
         except Exception as exc:  # broad: the repair is best-effort — see the docstring
             await session.rollback()
             codes = set(_chained_sqlstates(exc))
-            if _STATEMENT_TIMEOUT_SQLSTATE in codes:
+            if codes & {_STATEMENT_TIMEOUT_SQLSTATE, _TRANSACTION_TIMEOUT_SQLSTATE}:
                 code = _REPAIR_TIMED_OUT
             elif _LOCK_TIMEOUT_SQLSTATE in codes:
                 code = _REPAIR_BLOCKED
@@ -476,11 +473,10 @@ async def _repair_geom_4326(
             return _RepairReport(code)
 
     if purge_table is not None:
-        # Outside the transaction, so a concurrent tile request can't re-cache
-        # pre-repair rows. Without it, rows just made visible stay hidden behind
-        # cached tiles until the API re-reads the bumped version. Repeated by
-        # the end-of-run purge on the success path, but doing it here too makes
-        # the repair visible even if the measurement that follows fails.
+        # After the commit, so a concurrent tile request can't re-cache
+        # pre-repair rows; otherwise repaired rows stay hidden behind cached
+        # tiles until the API re-reads the bumped version. The end-of-run purge
+        # repeats it, but this one survives a failed measurement.
         await invalidate_tile_cache_for_table(purge_table)
 
     return report
@@ -496,9 +492,10 @@ class _PostgisRefresh:
 
     def __init__(self, *, dataset_id: str):
         self.dataset_uuid = uuid.UUID(dataset_id)
-        # The binding this attempt measured against. None until the
-        # measurement reads it: nothing before that says anything about an origin.
-        self.bound: tuple | None = None
+        # The binding this attempt measured against; None until the
+        # measurement reads it, since nothing earlier says anything about an
+        # origin.
+        self.bound: BoundPointer | None = None
 
     def prepare(self, job, dataset, staging_table: str) -> None:
         return None
@@ -551,7 +548,7 @@ class _PostgisRefresh:
             ).scalar_one_or_none()
             if dataset is None:
                 raise DatasetDeleted
-            self.bound = (dataset.origin_uri, dataset.origin_ref, dataset.source_format)
+            self.bound = bound_pointer(dataset)
             table_name = _resolve_bound_table(dataset, schema=schema)
             # The fence `write` checks: the tile version moves with every
             # change to this dataset's content.
@@ -635,7 +632,7 @@ class _PostgisRefresh:
             )
         # With no staging copy the diff is the live table against what was
         # recorded. Drift is recorded, never refused.
-        schema_diff = await project(session, dataset, self.measurement)
+        schema_diff = await project(session, dataset, self.measurement, field_labels={})
         # The measurement read the relation, so it exists and is readable, and
         # this strategy is the only writer of its origin kind's verdict.
         dataset.source_health = _HEALTHY

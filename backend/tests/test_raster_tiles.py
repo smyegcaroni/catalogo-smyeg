@@ -148,7 +148,7 @@ class TestRasterTokenZoomMetadata:
     def test_falls_back_to_legacy_maxzoom_without_metadata(self):
         assert _raster_maxzoom_from_metadata(None, None) == 18
 
-    # fix(#939): the degrees-vs-metres decision was `epsg == 4326`, so every
+    # The degrees-vs-metres decision was `epsg == 4326`, so every
     # other geographic CRS had its degree resolutions read as metres and
     # derived maxzoom 22 instead of 7 (measured on the live ETOPO 9518
     # dataset). Fixtures mirror that raster: 21600x10800 at 1/60 degree.
@@ -214,7 +214,7 @@ class TestRasterTokenZoomMetadata:
                 'ANGLEUNIT["degree",0.0174532925199433]]',
             ),
             (
-                # fix(#939 codex r3): WKT2:2015 spelling — GEODCRS with an
+                # WKT2:2015 spelling — GEODCRS with an
                 # ellipsoidal CS, the form rasterio still emits.
                 4269,
                 'GEODCRS["NAD83",DATUM["North American Datum 1983",'
@@ -246,7 +246,7 @@ class TestRasterTokenZoomMetadata:
         assert _raster_maxzoom_from_metadata(asset, self._ETOPO_BOUNDS) == 7
 
     def test_grads_geographic_crs_falls_back_to_bounds_estimate(self):
-        # fix(#939): a grads GEOGCS (NTF Paris family) is geographic but its
+        # A grads GEOGCS (NTF Paris family) is geographic but its
         # stored resolution is neither metres nor degrees. Pinned behavior:
         # skip the stored resolution and use the bounds/width estimate, which
         # for this global fixture also lands on 7 (vs 22 if the grads value
@@ -312,7 +312,7 @@ class TestRasterAuthCheck:
     async def test_auth_check_mismatched_tile_version_is_not_cacheable(
         self, client: AsyncClient, test_db_session
     ):
-        """fix(#1372 codex r3): tile_cache_version is advertised in public URLs
+        """tile_cache_version is advertised in public URLs
         and increments predictably, so a caller could pre-warm the NEXT
         version's nginx cache key with pre-replace bytes. A `v` that does not
         match the dataset's current version must therefore never produce a
@@ -340,7 +340,7 @@ class TestRasterAuthCheck:
         assert resp.status_code == 200
         assert resp.headers.get("x-geolens-cache-status") == "private"
 
-        # fix(#1372 codex r4): duplicate v — nginx keys on the FIRST value,
+        # Duplicate v — nginx keys on the FIRST value,
         # Starlette's .get() would return the LAST, so a naive check passes
         # while nginx caches under the future key. Exactly one v is required.
         resp = await client.get(
@@ -349,7 +349,7 @@ class TestRasterAuthCheck:
         assert resp.status_code == 200
         assert resp.headers.get("x-geolens-cache-status") == "private"
 
-        # fix(#1372 codex r4): nginx matches the param NAME case-insensitively
+        # nginx matches the param NAME case-insensitively
         # ($arg_v sees V=999); an exact-case backend check would miss it.
         resp = await client.get(
             "/tiles/raster-auth-check/",
@@ -398,7 +398,7 @@ class TestRasterAuthCheck:
         viewer_auth_header: dict,
         test_db_session,
     ):
-        """fix(#929): the raster auth gate mirrors can_access_dataset, so the
+        """The raster auth gate mirrors can_access_dataset, so the
         creator exemption applies here too — a non-admin owner of a restricted
         raster gets 200, while another authenticated non-grantee stays 404."""
         from tests.conftest import _create_test_user
@@ -434,7 +434,7 @@ class TestRasterAuthCheck:
         test_db_session,
         monkeypatch,
     ):
-        """fix(#929 review): the raster gate consults the permission
+        """The raster gate consults the permission
         extension rather than hard-coding an owner short-circuit, so an
         overlay policy that deliberately denies a dataset's creator
         (revoked clearance, ABAC) is enforced here too."""
@@ -463,10 +463,10 @@ class TestRasterAuthCheck:
         )
         assert resp.status_code == 404
 
-    async def test_auth_check_401_for_unauthenticated_private(
+    async def test_auth_check_404_for_unauthenticated_private(
         self, client: AsyncClient, test_db_session
     ):
-        """Private raster, no auth -> 401."""
+        """Private raster, no auth -> 404, as for a missing dataset."""
         admin_id = await _get_admin_id(test_db_session)
         await _create_raster_dataset(
             test_db_session, created_by=admin_id, visibility="private"
@@ -480,7 +480,7 @@ class TestRasterAuthCheck:
             "/tiles/raster-auth-check/",
             params={"dataset_id": str(dataset.id)},
         )
-        assert resp.status_code == 401
+        assert resp.status_code == 404
 
     async def test_auth_check_404_for_nonexistent_dataset(
         self, client: AsyncClient, test_db_session
@@ -671,7 +671,8 @@ class TestDemTerrainNodataAuthCheck:
 
 
 class TestDefaultRescaleAuthCheck:
-    """raster_auth_check flags float rasters whose default rescale is the data range."""
+    """raster_auth_check flags float and single-band signed integer rasters whose
+    default rescale is the data range."""
 
     async def _headers(self, client, session, **raster):
         admin_id = await _get_admin_id(session)
@@ -692,17 +693,38 @@ class TestDefaultRescaleAuthCheck:
         assert headers.get("x-geolens-data-range-default") == "1"
         assert headers["x-geolens-render-params"] == "rescale=0,1.0"
 
-    @pytest.mark.parametrize("dtype", ["int16", "uint8", None])
+    @pytest.mark.parametrize("dtype", ["int8", "int16", "int32"])
+    async def test_signed_int_raster_is_flagged_and_keeps_the_dtype_fallback(
+        self, client: AsyncClient, test_db_session, dtype
+    ):
+        headers = await self._headers(client, test_db_session, dtype=dtype)
+        assert headers.get("x-geolens-data-range-default") == "1"
+        assert headers["x-geolens-render-params"].startswith("rescale=0,")
+
+    async def test_multiband_signed_int_raster_is_not_flagged(
+        self, client: AsyncClient, test_db_session
+    ):
+        admin_id = await _get_admin_id(test_db_session)
+        _, dataset, _ = await _create_raster_dataset(
+            test_db_session, created_by=admin_id, band_count=3, dtype="int16"
+        )
+        resp = await client.get(
+            "/tiles/raster-auth-check/", params={"dataset_id": str(dataset.id)}
+        )
+        assert "x-geolens-data-range-default" not in resp.headers
+
+    @pytest.mark.parametrize("dtype", ["uint8", "uint16", "uint32", None])
     async def test_other_rasters_are_not_flagged(
         self, client: AsyncClient, test_db_session, dtype
     ):
         headers = await self._headers(client, test_db_session, dtype=dtype)
         assert "x-geolens-data-range-default" not in headers
 
-    async def test_float_dem_is_not_flagged(self, client: AsyncClient, test_db_session):
-        headers = await self._headers(
-            client, test_db_session, dtype="float32", is_dem=True
-        )
+    @pytest.mark.parametrize("dtype", ["float32", "int16"])
+    async def test_dem_is_not_flagged(
+        self, client: AsyncClient, test_db_session, dtype
+    ):
+        headers = await self._headers(client, test_db_session, dtype=dtype, is_dem=True)
         assert "x-geolens-data-range-default" not in headers
         assert headers["x-geolens-render-params"].startswith("algorithm=terrainrgb")
 
@@ -821,7 +843,7 @@ class TestRasterTokenEndpoint:
     async def test_raster_token_url_carries_tile_cache_version(
         self, client: AsyncClient, test_db_session
     ):
-        """fix(#1372): the signed template carries v=<tile_cache_version>, the
+        """The signed template carries v=<tile_cache_version>, the
         segment nginx's shared raster cache keys on ($arg_v) — a raster replace
         bumps the version, so the shared cache rolls instead of serving
         pre-replace bytes for up to proxy_cache_valid."""
@@ -924,21 +946,21 @@ class TestRasterTokenEndpoint:
         assert "scope" in data
         assert "expires_in" in data
 
-    async def test_raster_token_401_for_private_unauthenticated(
+    async def test_raster_token_404_for_private_unauthenticated(
         self, client: AsyncClient, test_db_session
     ):
-        """Private raster, no auth -> 401."""
+        """Private raster, no auth -> 404, as for a missing dataset."""
         admin_id = await _get_admin_id(test_db_session)
         record, dataset, asset = await _create_raster_dataset(
             test_db_session, created_by=admin_id, visibility="private"
         )
 
         resp = await client.get(f"/tiles/token/{dataset.id}/")
-        assert resp.status_code == 401
+        assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
-# HYG-01: _band_stats_cache LRUCache unit tests
+# _band_stats_cache LRUCache unit tests
 # ---------------------------------------------------------------------------
 
 
@@ -984,7 +1006,7 @@ async def test_band_stats_cache_hit(monkeypatch):
     monkeypatch.setattr("app.processing.tiles.router._titiler_client.get", mock_get)
 
     path = "/data/cache-hit-test.tif"
-    # Phase 1153: _fetch_band_statistics now requires pmin/pmax for cache-key isolation
+    # _fetch_band_statistics now requires pmin/pmax for cache-key isolation
     result1 = await _fetch_band_statistics(path, 2.0, 98.0)
     result2 = await _fetch_band_statistics(path, 2.0, 98.0)
 
@@ -1012,6 +1034,35 @@ def test_data_range_rescale(bands, n_bands, expected):
     from app.processing.tiles.router import _data_range_rescale
 
     assert _data_range_rescale(bands, n_bands) == expected
+
+
+@pytest.mark.parametrize(
+    ("stretch", "band", "expected"),
+    [
+        (
+            "percentile",
+            {"percentile_2": -1.5, "percentile_98": 1e20},
+            ["rescale=-1.5,1e%2B20"],
+        ),
+        (
+            "percentile",
+            {"percentile_2": 1e-05, "percentile_98": 2e-05},
+            ["rescale=1e-05,2e-05"],
+        ),
+        (
+            "stddev",
+            {"mean": 1e20, "std": 1e19, "min": 0.0, "max": 5e20},
+            ["rescale=8e%2B19,1.2e%2B20"],
+        ),
+    ],
+)
+def test_stretch_rescale_keeps_extreme_bounds_intact(stretch, band, expected):
+    from app.processing.tiles.router import _compute_stretch_rescale
+
+    assert (
+        _compute_stretch_rescale([band], stretch, 1, pmin=2.0, pmax=98.0, sigma=2.0)
+        == expected
+    )
 
 
 @pytest.mark.asyncio
@@ -1086,7 +1137,7 @@ async def test_band_stats_failure_is_reused_then_retried_after_ttl(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# fix(#688): signed raster tile templates
+# Signed raster tile templates
 # ---------------------------------------------------------------------------
 
 
@@ -1146,7 +1197,7 @@ class TestSignedRasterTileTemplate:
         assert resp.status_code == 200
         assert asset.asset_uri in resp.headers["x-geolens-asset-openpath"]
 
-    async def test_an_unsigned_request_for_a_private_raster_still_401s(
+    async def test_an_unsigned_request_for_a_private_raster_is_still_refused(
         self, client: AsyncClient, test_db_session
     ):
         """The signed branch is additive; it does not open the unsigned path."""
@@ -1159,7 +1210,7 @@ class TestSignedRasterTileTemplate:
             "/tiles/raster-auth-check/", params={"dataset_id": str(dataset.id)}
         )
 
-        assert resp.status_code == 401
+        assert resp.status_code == 404
 
     async def test_a_tampered_signature_falls_through_to_normal_auth(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
@@ -1179,10 +1230,10 @@ class TestSignedRasterTileTemplate:
             params={"dataset_id": str(dataset.id), **params},
         )
 
-        # fix(#688 codex r1): an unusable signature falls through to the normal
-        # branches rather than refusing, so an unauthenticated caller lands on
-        # the same 401 it would have got without presenting one at all.
-        assert resp.status_code == 401
+        # An unusable signature falls through to the normal branches, which
+        # refuse an anonymous caller with signature parameters as they would
+        # for a missing dataset.
+        assert resp.status_code == 403
 
     async def test_a_signature_minted_for_another_dataset_does_not_authorize(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
@@ -1208,7 +1259,7 @@ class TestSignedRasterTileTemplate:
             params={"dataset_id": str(other.id), **self._signed_params(token)},
         )
 
-        assert resp.status_code == 401
+        assert resp.status_code == 403
 
     async def test_an_expired_signature_does_not_authorize(
         self, client: AsyncClient, test_db_session
@@ -1233,7 +1284,7 @@ class TestSignedRasterTileTemplate:
             },
         )
 
-        assert resp.status_code == 401
+        assert resp.status_code == 403
 
     async def test_a_non_numeric_exp_does_not_500(
         self, client: AsyncClient, test_db_session
@@ -1253,12 +1304,12 @@ class TestSignedRasterTileTemplate:
             },
         )
 
-        assert resp.status_code == 401
+        assert resp.status_code == 403
 
     async def test_a_signed_template_renders_an_unpublished_public_draft(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ):
-        """fix(#688 codex r1): the draft-preview case.
+        """The draft-preview case.
 
         A public-but-unpublished raster is an owner/admin preview, and the mint
         endpoint issues a template for it. Gating the signature branch on
@@ -1291,7 +1342,7 @@ class TestSignedRasterTileTemplate:
     async def test_an_expired_signature_does_not_break_a_signed_in_session(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ):
-        """fix(#688 codex r1): the signature is additive, never a restriction.
+        """The signature is additive, never a restriction.
 
         MapLibre keeps requesting the URL it was handed, so a preemptive refusal
         403'd an in-app map holding a valid session the moment its 15-minute

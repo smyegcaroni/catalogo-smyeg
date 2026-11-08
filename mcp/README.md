@@ -2,9 +2,7 @@
 
 Apache-2.0 read-only [Model Context Protocol](https://modelcontextprotocol.io) server for [GeoLens](https://github.com/geolens-io/geolens).
 
-Point a coding agent (Claude Code, Cursor, Codex, …) at a GeoLens instance so it can discover datasets, inspect schemas, read features and maps, and run read-only SQL from inside a dev session.
-
-**Read-only by design.** No writes, ingest, or admin. The discovery tools are `GET`s against existing API endpoints; `query` is a `POST` mechanically but executes inside the server's READ ONLY SQL sandbox, so it cannot modify anything. Calls are scoped to the caller's access: with an API key, the agent sees the datasets that key's user can see; with no credential it sees only public/published data (`query` additionally requires a credential whose user holds the AI-chat permission — `read_only` API keys work, via a route-specific server-side carve-out).
+Point a coding agent (Claude Code, Cursor, Codex, …) at a GeoLens instance so it can discover datasets, inspect schemas, read features and maps, and run read-only SQL from inside a dev session. It has no write, ingest or admin tools, and every call is scoped to the caller's access.
 
 ## Install
 
@@ -12,51 +10,25 @@ Point a coding agent (Claude Code, Cursor, Codex, …) at a GeoLens instance so 
 pip install geolens-mcp        # or: uvx geolens-mcp
 ```
 
-## Configure
-
-The server reads its target instance and credentials from the environment (same names as the `geolens` CLI):
-
-| Variable | Required | Meaning |
-|---|---|---|
-| `GEOLENS_INSTANCE` | yes | Instance URL, e.g. `https://geolens.example.com`. The `/api` suffix is appended automatically if you omit it. |
-| `GEOLENS_API_KEY` | recommended | API key, sent as `X-Api-Key`. Create one in **Settings → API keys**. Omit for public-only access. |
-| `GEOLENS_TOKEN` | — | JWT bearer token, used only if `GEOLENS_API_KEY` is unset. |
-
-## Register with an MCP client
-
-Claude Code:
-
-```bash
-claude mcp add geolens -e GEOLENS_INSTANCE=https://geolens.example.com -e GEOLENS_API_KEY=... -- uvx geolens-mcp
-```
-
-Cursor / Codex / any client that reads an `mcpServers` block:
-
-```json
-{
-  "mcpServers": {
-    "geolens": {
-      "command": "uvx",
-      "args": ["geolens-mcp"],
-      "env": {
-        "GEOLENS_INSTANCE": "https://geolens.example.com",
-        "GEOLENS_API_KEY": "your-api-key"
-      }
-    }
-  }
-}
-```
+The server reads `GEOLENS_INSTANCE` and, for non-public data, `GEOLENS_API_KEY` from the environment. Client setup, the tool list and the credential rules are in the [MCP guide](https://docs.getgeolens.com/guides/sdk/mcp/).
 
 ## Tools
 
-| Tool | What it does |
-|---|---|
-| `search_datasets` | Catalog search by free text (semantic ranking where the instance enables it). Returns dataset records as GeoJSON features with safe origin and freshness state; health/check/refresh keys are null when unavailable in the search summary. |
-| `get_dataset_schema` | A dataset's columns, geometry type, CRS/SRID, feature count, extent, and source trust metadata. |
-| `get_features` | Bounded GeoJSON features for a dataset (OGC API — Features), with optional bbox. |
-| `list_maps` | Saved maps (id, name, visibility, layer count). |
-| `get_map` | One saved map's full metadata, including layers and view state. |
-| `query` | One read-only SQL `SELECT` through the server's hardened sandbox ([#565](https://github.com/geolens-io/geolens/issues/565)): single statement over `data.*` tables, allowlisted functions, a mandatory `restrict_tables` scope, and a strict server-side budget (statement timeout, self-join cap, row limit, rate limits). Needs a credential whose user has the AI-chat permission; requires GeoLens ≥ the release that ships `POST /api/query/`. |
+All tools are read-only and scoped to the caller's access.
+
+- `search_datasets`, `get_dataset_schema`, `get_features`: find datasets, read their columns and page through features.
+- `list_maps`, `get_map`: saved maps and their layers.
+- `list_stories`, `get_story`: published stories and their chapters. Drafts are never read. Against a server that predates chapter counts, `chapter_count` is null.
+- `aggregate`: exact counts, statistics, histograms, group-bys and row pages over one dataset.
+- `query`: one sandboxed SELECT. Use `aggregate` for counts and summaries.
+
+```text
+list_stories(search="skyline", limit=10)
+get_story(story_id="<id from list_stories>")
+aggregate(dataset_id="<id>", request={"op": "group_by", "group_column": "borough", "stat": "count", "limit": 5})
+```
+
+`aggregate` keeps the route's limits. A `too_wide` refusal means the `bbox` holds over 500,000 rows, so narrow it. A `query_busy` refusal means two aggregates are already running for you, so retry after a short pause.
 
 ## Develop
 

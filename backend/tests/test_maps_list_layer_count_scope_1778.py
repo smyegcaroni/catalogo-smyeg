@@ -1,4 +1,4 @@
-"""fix(#1778): the maps gallery listing must not aggregate the whole layer table.
+"""The maps gallery listing must not aggregate the whole layer table.
 
 Codebase audit 2026-08-30 (8dc529f17): ``list_maps`` read its per-map layer
 count from an uncorrelated ``GROUP BY map_id`` subquery LEFT JOINed onto the
@@ -71,7 +71,8 @@ async def test_page_statement_does_not_touch_the_layer_table_1778():
 @pytest.mark.anyio
 async def test_layer_counts_are_restricted_to_the_page_ids_1778():
     map_id = uuid.uuid4()
-    session = _RecordingSession([(_map(map_id), "ada")], [(map_id, 7)], 1)
+    visible_layers = [(map_id, uuid.uuid4()) for _ in range(7)]
+    session = _RecordingSession([(_map(map_id), "ada")], visible_layers, 1)
 
     maps, total = await list_maps(session, skip=0, limit=50)
 

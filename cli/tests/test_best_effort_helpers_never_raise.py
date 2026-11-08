@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""fix(#1778 round 32): every cleanup helper documented as "best-effort"
+"""Every cleanup helper documented as "best-effort"
 must actually be non-raising. _discard_unpaired_refresh_token() claimed
 this in its own docstring, but its file WRITE was unguarded -- an
 unwritable credentials.toml raised straight out of it, past
@@ -13,13 +13,13 @@ every failure point the helper's own docstring claims to tolerate:
 - _discard_unpaired_refresh_token() -- keyring deletes AND the file
   read/write, all raising.
 - _delete_keyring_refresh_entries() -- its keyring half, which
-  fix(#1807) factored out for try_refresh()'s backend-fallback path
-  and which carries the same contract.
+  try_refresh()'s backend-fallback path uses on its own and which
+  carries the same contract.
 - _restore_credentials() -- keyring deletes/sets AND the file
   read/write, all raising.
 - delete_credentials()'s own keyring loop -- all four accounts raising
-  (the file clear at the end is INTENTIONALLY NOT best-effort, per
-  round 22: logout must refuse on a corrupt file, so that part is not
+  (the file clear at the end is INTENTIONALLY NOT best-effort:
+  logout must refuse on a corrupt file, so that part is not
   pinned here).
 """
 from __future__ import annotations
@@ -64,7 +64,7 @@ class TestDiscardUnpairedRefreshTokenNeverRaises:
         _auth._set_credential_field(INSTANCE, "refresh_token", "some-refresh-token")
         _auth._set_credential_field("https://other.example.com/api", "bearer_token", "x")
         monkeypatch.setattr(_auth, "_write_credentials_file", _raise_os_error)
-        # Must not raise -- this is the exact finding round 32 fixes.
+        # Must not raise -- this is the failure the guard exists to prevent.
         _auth._discard_unpaired_refresh_token(INSTANCE)
 
 
@@ -99,7 +99,7 @@ class TestRestoreCredentialsNeverRaises:
 
 class TestDeleteCredentialsKeyringLoopNeverRaises:
     """logout's file-side _clear_credential_section() is deliberately
-    NOT best-effort (round 22: a corrupt file must make logout refuse,
+    NOT best-effort (a corrupt file must make logout refuse,
     not silently rewrite it empty) -- only the keyring loop's own
     documented "missing entries are silently ignored" contract is
     pinned here."""
@@ -114,7 +114,7 @@ class TestDeleteCredentialsKeyringLoopNeverRaises:
 
 
 class TestDeleteKeyringRefreshEntriesNeverRaises:
-    """fix(#1807): the keyring half of _discard_unpaired_refresh_token(),
+    """The keyring half of _discard_unpaired_refresh_token(),
     factored out because try_refresh() needs exactly that half on its
     own when a rotation falls back to the file (the file side there
     holds the copy that must survive). It inherits the same

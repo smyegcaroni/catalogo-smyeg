@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildCategoricalExpression, buildGraduatedExpression, buildGraduatedSizeExpression, getRampColors } from '@/lib/color-ramps';
 import { MAP_COLORS } from '@/lib/map-colors';
-import { buildNullableSafeNumericAccessor } from '@/lib/maplibre-filter-utils';
+import { buildNullSafeNumericComparison } from '@/lib/maplibre-filter-utils';
 import type { BuilderStyleConfig, MapLayerResponse } from '@/types/api';
 import { describeLayers } from '@/components/builder/layer-description';
 import { toSyncInput } from '@/components/builder/map-sync';
@@ -111,10 +111,22 @@ const fixtureHeat: Partial<Record<keyof typeof SAVED_LAYERS, Pick<LegendFacts, '
 };
 
 /** The cluster fixtures' kinds, from their saved strategies. */
+const CLUSTER_SWATCH: LegendSwatch = {
+  fill: null,
+  fillOpacity: 1,
+  opacity: 1,
+  stroke: { color: MAP_COLORS.cluster.stroke, width: 1.5 },
+  pattern: null,
+};
+const SERVER_STEPS = {
+  classes: { mode: 'graduated', target: 'color', title: '', items: [{ color: '#bbf7d0' }, { color: '#16a34a' }], breaks: [100] } satisfies LegendClasses,
+  swatch: CLUSTER_SWATCH,
+};
+
 const fixtureCluster: Partial<Record<keyof typeof SAVED_LAYERS, LegendFacts['cluster']>> = {
-  boundedCluster: { kind: 'bounded-geojson' },
-  serverCluster: { kind: 'server-tile' },
-  fallbackCluster: { kind: 'fallback' },
+  boundedCluster: { kind: 'bounded-geojson', steps: null },
+  serverCluster: { kind: 'server-tile', steps: SERVER_STEPS },
+  fallbackCluster: { kind: 'fallback', steps: null },
 };
 
 const fixtureRows: Row[] = Object.entries(SAVED_LAYERS).map(([key, layer]) => {
@@ -165,6 +177,16 @@ const swatchRows: Row[] = [
     'outline from the paint mirror',
     polygon({ 'fill-color': '#3b82f6', 'fill-opacity': 0.5, '_outline-color': '#ec4b7f', '_outline-width': 2 }),
     fillFacts({ fill: '#3b82f6', fillOpacity: 0.5, stroke: { color: '#ec4b7f', width: 2 } }),
+  ],
+  [
+    'outline from the native fill-outline-color',
+    polygon({ 'fill-color': '#3b82f6', 'fill-outline-color': '#14532d' }),
+    fillFacts({ fill: '#3b82f6', stroke: { color: '#14532d', width: 1 } }),
+  ],
+  [
+    'builder outline over the native fill-outline-color',
+    polygon({ 'fill-color': '#3b82f6', 'fill-outline-color': '#14532d' }, { outlineColor: '#ec4b7f' }),
+    fillFacts({ fill: '#3b82f6', stroke: { color: '#ec4b7f', width: 1 } }),
   ],
   [
     'builder outline width over the paint mirror',
@@ -376,7 +398,7 @@ const codedPoints = (arms: [number, string][], filter: unknown, type = 'integer'
   filter: filter as MapLayerResponse['filter'],
 });
 /** The filter editor's equality on a numeric `code` column. */
-const codeEquals = (value: number) => ['all', ['==', buildNullableSafeNumericAccessor('code', '==', value), value]];
+const codeEquals = (value: number) => ['all', buildNullSafeNumericComparison('code', '==', value)];
 /** The graduated-colour fixture with its fill-color replaced. */
 const graduatedPop = (fillColor: unknown) => ({ ...SAVED_LAYERS.graduatedColor, paint: { 'fill-color': fillColor } });
 
@@ -761,8 +783,13 @@ const classRows: ClassRow[] = [
     [categories('code', [{ color: '#f472b6', label: '1' }, { color: '#60a5fa', label: '2' }])],
   ],
   [
-    'a numeric equality with 0, which lets nulls reach the fallback',
+    'a numeric equality with 0, which lets no null reach the fallback',
     codedPoints([[0, '#f472b6'], [1, '#60a5fa']], codeEquals(0)),
+    [categories('code', [{ color: '#f472b6', label: '0' }, { color: '#60a5fa', label: '1' }])],
+  ],
+  [
+    'a bare number accessor equal to 0, which lets nulls reach the fallback',
+    codedPoints([[0, '#f472b6'], [1, '#60a5fa']], ['all', ['==', ['to-number', ['get', 'code'], 0], 0]]),
     [categories('code', [{ color: '#f472b6', label: '0' }, { color: '#60a5fa', label: '1' }, other('#cccccc')])],
   ],
   [
@@ -1072,25 +1099,25 @@ const drawnRows: DrawnRow[] = [
     'a bounded cluster drawn from its GeoJSON',
     SAVED_LAYERS.boundedCluster,
     { drawsAs: 'cluster' },
-    { drawsAs: 'cluster', cluster: { kind: 'bounded-geojson' } },
+    { drawsAs: 'cluster', cluster: { kind: 'bounded-geojson', steps: null } },
   ],
   [
     'a bounded cluster whose GeoJSON never arrived',
     SAVED_LAYERS.boundedCluster,
     { drawsAs: 'circle' },
-    { drawsAs: 'circle', cluster: { kind: 'fallback' } },
+    { drawsAs: 'circle', cluster: { kind: 'fallback', steps: null } },
   ],
   [
     'a server cluster drawn from cluster tiles',
     SAVED_LAYERS.serverCluster,
     { drawsAs: 'cluster' },
-    { drawsAs: 'cluster', cluster: { kind: 'server-tile' } },
+    { drawsAs: 'cluster', cluster: { kind: 'server-tile', steps: SERVER_STEPS } },
   ],
   [
     'a cluster with no feature count, drawn as points',
     SAVED_LAYERS.fallbackCluster,
     { drawsAs: 'circle' },
-    { drawsAs: 'circle', cluster: { kind: 'fallback' } },
+    { drawsAs: 'circle', cluster: { kind: 'fallback', steps: null } },
   ],
 ];
 
@@ -1101,13 +1128,45 @@ describe('legendFacts for what the map drew', () => {
     }
   });
 
+  it('lists a cluster ramp as graduated count classes read from the layer', () => {
+    const layer = {
+      ...SAVED_LAYERS.serverCluster,
+      style_config: {
+        render_mode: 'cluster' as const,
+        builder: {
+          clusterColorRamp: [
+            { count: 2500, color: '#4338ca' },
+            { count: 0, color: '#818cf8' },
+            { count: 25, color: '#6366f1' },
+            { count: 25, color: '#000000' },
+          ],
+        },
+      },
+    };
+
+    expect(legendFacts({ ...layer, opacity: 0.4 })?.cluster?.steps).toEqual({
+      classes: {
+        mode: 'graduated',
+        target: 'color',
+        title: '',
+        items: [{ color: '#818cf8' }, { color: '#6366f1' }, { color: '#4338ca' }],
+        breaks: [25, 2500],
+      },
+      swatch: { ...CLUSTER_SWATCH, opacity: 0.4 },
+    });
+  });
+
+  it('gives a cluster with a single flat colour no count classes', () => {
+    expect(legendFacts(SAVED_LAYERS.boundedCluster)?.cluster?.steps).toBeNull();
+  });
+
   it('a bounded cluster is a fallback until the description has its GeoJSON', () => {
     const layer = SAVED_LAYERS.boundedCluster;
     const [before] = describeLayers([toSyncInput(layer)], RENDER_CONTEXTS.viewer).layers;
     const [after] = describeLayers([toSyncInput(layer)], RENDER_CONTEXTS.viewerWithClusterData).layers;
 
-    expect(legendFacts(layer, before)?.cluster).toEqual({ kind: 'fallback' });
-    expect(legendFacts(layer, after)?.cluster).toEqual({ kind: 'bounded-geojson' });
+    expect(legendFacts(layer, before)?.cluster).toEqual({ kind: 'fallback', steps: null });
+    expect(legendFacts(layer, after)?.cluster).toEqual({ kind: 'bounded-geojson', steps: null });
   });
 
   it('the description leaves every fact of a layer that is not a cluster as the saved style gives it', () => {

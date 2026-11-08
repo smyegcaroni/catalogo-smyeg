@@ -28,6 +28,7 @@ function makeLineLayer(overrides: Partial<MapLayerResponse> = {}): MapLayerRespo
     display_name: 'Line Layer',
     sort_order: 0,
     visible: true,
+    show_in_legend: true,
     opacity: 1,
     paint: { 'line-color': '#ff0000', 'line-width': 2 },
     layout: {},
@@ -196,15 +197,42 @@ describe('LineEditor', () => {
     expect(screen.queryByText('Solid color')).not.toBeInTheDocument();
   });
 
-  it('is a named export and a default export from LineEditor.tsx', async () => {
-    const { LineEditor: named } = await import('../LineEditor');
-    const defaultExport = (await import('../LineEditor')).default;
-    expect(named).toBeDefined();
-    expect(defaultExport).toBeDefined();
-    expect(named).toBe(defaultExport);
+
+  it('lets arrows go back to the line colour once an arrow colour is picked', () => {
+    const onBuilderChange = vi.fn();
+    const layer = makeLineLayer({
+      style_config: { render_mode: 'arrow', builder: { arrowColor: '#fb923c' } } as MapLayerResponse['style_config'],
+    });
+    render(<LineEditor {...makeProps(layer, { styleConfig: layer.style_config ?? null, onBuilderChange })} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'style.arrow.matchLine' }));
+
+    expect(onBuilderChange).toHaveBeenCalledWith({ arrowColor: undefined });
   });
 
-  // Phase 1136-02: line-cap / line-join Selects (EDITOR-LINE-01, EDITOR-LINE-02)
+  it('names the arrow swatch as following a data-driven line colour and offers no reset', () => {
+    const layer = makeLineLayer({
+      paint: { 'line-color': ['match', ['get', 'kind'], 'a', '#ff0000', '#00ff00'], 'line-width': 2 },
+      style_config: { render_mode: 'arrow', column: 'kind', mode: 'categorical' } as MapLayerResponse['style_config'],
+    });
+    render(<LineEditor {...makeProps(layer, { isDataDriven: true, styleConfig: layer.style_config ?? null })} />);
+
+    expect(screen.getByRole('button', { name: 'style.arrow.colorMatchesLine' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'style.arrow.matchLine' })).not.toBeInTheDocument();
+  });
+
+  it('keeps the plain arrow swatch when the line has no stored colour', () => {
+    const layer = makeLineLayer({
+      paint: { 'line-width': 2 },
+      style_config: { render_mode: 'arrow' } as MapLayerResponse['style_config'],
+    });
+    render(<LineEditor {...makeProps(layer, { styleConfig: layer.style_config ?? null })} />);
+
+    expect(screen.queryByRole('button', { name: 'style.arrow.colorMatchesLine' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'style.arrow.color' })).toBeInTheDocument();
+  });
+
+  // Line-cap / line-join Selects
   it('renders a "Line ends" section heading after the dash pattern row', () => {
     render(<LineEditor {...makeProps(makeLineLayer(), {
       t: (key: string) => {

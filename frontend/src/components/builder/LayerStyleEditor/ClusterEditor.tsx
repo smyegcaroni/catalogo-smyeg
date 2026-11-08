@@ -11,16 +11,13 @@ import type { BaseStyleEditorProps } from './types';
 
 type ClusterColorStop = { count: number; color: string };
 
-// Default tiers seeded when "color by cluster size" is enabled. MapLibre's own
-// "create and style clusters" example uses 100/750, but those thresholds are
-// tuned to its dense earthquake dataset — for typical clustered layers the
-// rendered cluster point_count at usable zooms sits in the 1s–low-100s, so
-// 100/750 leaves every cluster in the base bucket and the toggle looks dead
-// (a few-thousand-point layer tops out around a couple hundred per cluster at
-// min zoom, dropping into the low tens by the default view).
-// Seed reachable breaks so enabling the ramp produces a visible gradient out of
-// the box; the user can raise them for denser data.
-// Ramp seeds trace to the shared categorical palette (amber -> pink).
+// Default tiers seeded when "color by cluster size" is enabled. MapLibre's
+// "create and style clusters" example uses 100/750, tuned to its dense
+// earthquake dataset; for typical clustered layers point_count at usable zooms
+// sits in the 1s–low-100s, so 100/750 would leave every cluster in the base
+// bucket and the toggle would look dead. These reachable breaks give a visible
+// gradient out of the box; users can raise them for denser data. Ramp seeds
+// trace to the shared categorical palette (amber -> pink).
 const DEFAULT_RAMP_TIERS: ClusterColorStop[] = [
   { count: 10, color: MAP_COLORS.categorical[6] },
   { count: 50, color: MAP_COLORS.categorical[5] },
@@ -35,7 +32,7 @@ export function ClusterEditor({
   const clusterColor = builderConfig.clusterColor
     ?? (typeof paint['circle-color'] === 'string' ? paint['circle-color'] as string : CIRCLE_DEFAULTS['circle-color']);
   const clusterTextColor = builderConfig.clusterTextColor ?? MAP_COLORS.cluster.text;
-  // ux(#839): absent = true so existing maps keep their counts.
+  // Absent = true so existing maps keep their counts.
   const showCounts = builderConfig.clusterShowCounts !== false;
 
   const ramp: ClusterColorStop[] = Array.isArray(builderConfig.clusterColorRamp)
@@ -45,8 +42,8 @@ export function ClusterEditor({
   // anything less falls back to the flat clusterColor.
   const rampActive = ramp.length >= 2;
 
-  // Empty array (not undefined) disables the ramp without relying on builder
-  // field-deletion semantics — the adapter reads length < 2 as "flat color".
+  // An empty array (not undefined) disables the ramp without relying on builder
+  // field-deletion semantics; the adapter reads length < 2 as "flat color".
   const setRamp = (next: ClusterColorStop[]) => onBuilderChange({ clusterColorRamp: next });
 
   const toggleRamp = (on: boolean) => {
@@ -88,8 +85,8 @@ export function ClusterEditor({
         onChange={(val) => onBuilderChange({ clusterMaxZoom: val })}
       />
 
-      {/* ux(#839): counts are a separate opt-out from the Labels tab — the
-          count layer is emitted by cluster mode itself, not label_config. */}
+      {/* Counts are a separate opt-out from the Labels tab: the count layer is
+          emitted by cluster mode itself, not label_config. */}
       <div className="flex items-center justify-between">
         <Label htmlFor="cluster-show-counts" className="text-sm font-normal">
           {t('style.cluster.showCounts')}
@@ -190,5 +187,3 @@ export function ClusterEditor({
     </div>
   );
 }
-
-export default ClusterEditor;

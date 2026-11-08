@@ -1,14 +1,14 @@
 /**
- * fix(#1712): a STAC import must survive the form unmounting.
+ * A STAC import must survive the form unmounting.
  *
  * The Import page renders tabs conditionally, so switching away mid-import
  * unmounts StacImportForm. `importStacItems` keeps running server-side and
  * creates datasets SYNCHRONOUSLY (no job id — see
- * api/stac-import-session.ts's module docstring for why this tab's actual
- * shape differs from what #1712 assumed by analogy with the Service tab).
+ * api/stac-import-session.ts's module docstring for how this tab differs
+ * from the Service tab).
  * An unmount mid-request loses the created/skipped/error counts even though
  * the datasets it created are real; this session protects that response.
- * Mirrors UrlImportForm.unmount.test.tsx (#1708) for this tab's shape.
+ * Mirrors UrlImportForm.unmount.test.tsx for this tab's shape.
  */
 import { StrictMode, act } from 'react';
 import { createRoot } from 'react-dom/client';
@@ -255,7 +255,7 @@ describe('StacImportForm unmount survival', () => {
     expect(screen.getByRole('link', { name: 'bulk.openDataset' })).toHaveAttribute('href', '/datasets/ds-1');
   });
 
-  // fix(codex #1763 r3): the session used to restore only `importResult` on
+  // The session used to restore only `importResult` on
   // adoption, so "Back to Results" (which sets `step` back to 'items')
   // rendered nothing — that branch guards on `selectedCollection` and
   // `catalogInfo`, both null on a fresh mount. The session now carries the
@@ -296,7 +296,7 @@ describe('StacImportForm unmount survival', () => {
     await waitFor(() => expect(screen.getByText(ITEM.title)).toBeInTheDocument());
     expect(screen.getByText('Test Collection')).toBeInTheDocument();
 
-    // fix(codex #1763 r3): one level further back — the collections
+    // One level further back — the collections
     // breadcrumb — used to render an empty list, because `collections`
     // was not part of the restored context (only `selectedCollection`
     // was). Clicking through has to show the catalog's real collection,
@@ -343,7 +343,7 @@ describe('StacImportForm unmount survival', () => {
     });
   });
 
-  // fix(codex #1763 r3): the app renders under React.StrictMode (main.tsx),
+  // The app renders under React.StrictMode (main.tsx),
   // whose dev-mode effect replay (setup, cleanup, setup) used to register
   // TWO settlement handlers on the same session promise, because the
   // adoption effect had no cleanup of its own — only mountedRef did, and
@@ -437,5 +437,24 @@ describe('StacImportForm unmount survival', () => {
     await waitFor(() => expect(screen.getByRole('textbox')).toBeInTheDocument());
     expect(mockImportStacItems).toHaveBeenCalledTimes(1);
     expect(peekStacImport()).toBeNull();
+  });
+
+  test.each([
+    ['import_failed', 'stac.itemErrorImportFailed'],
+    ['too_long', 'stac.itemErrorTooLong'],
+  ])('the per-item failure code %s renders as its translated text', async (code, key) => {
+    mockImportStacItems.mockResolvedValue({
+      created: 0,
+      skipped: 0,
+      errors: 1,
+      results: [{ item_id: 'flow-item-1', dataset_id: null, status: 'error', error: code }],
+    });
+
+    const { user } = await driveToConfirmStep();
+    await user.click(screen.getByRole('button', { name: /stac\.confirm\.confirmImport/i }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(key));
+    expect(await screen.findByText(key)).toBeInTheDocument();
+    expect(screen.queryByText(code)).not.toBeInTheDocument();
   });
 });

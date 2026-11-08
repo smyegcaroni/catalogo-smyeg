@@ -4,16 +4,18 @@ Logic lives in the service_* sub-modules plus _sql_safety; cross-imports
 between them are fine. External callers MUST import from this façade, never
 a sub-module directly — enforced by
 `test_no_external_imports_of_dataset_domain_submodules` in
-`backend/tests/test_layering.py` (DECOUPLE-04).
+`backend/tests/test_layering.py`.
 """
 
 from app.modules.catalog.datasets.domain._sql_safety import (
+    _safe_column_ref,  # noqa: F401 -- re-exported for features/retention.py
     _safe_table_ref,  # noqa: F401 -- re-exported for tests/test_sql_safety.py
 )
 from app.modules.catalog.datasets.domain.service_analysis import (
     PREVIEW_FEATURE_CAP,
     build_preview_sql,
     compile_layer_filter,
+    preview_slot_bound,
     resolve_source_feature_count,
     run_analysis_preview,
 )
@@ -34,9 +36,11 @@ from app.modules.catalog.datasets.domain.service_metadata import (
     defer_metadata_embedding,
     get_attribute,
     list_attributes,
+    refuse_stranding_shared_maps,
     reset_attribute,
     sample_example_values,
     update_attribute,
+    ValueLabelsOverBudget,
     update_user_metadata,
 )
 from app.modules.catalog.datasets.domain.service_previous_version import (
@@ -45,13 +49,24 @@ from app.modules.catalog.datasets.domain.service_previous_version import (
     drop_previous_version,
 )
 from app.modules.catalog.datasets.domain.service_query import (
+    InvalidSortColumn,
     get_dataset,
     get_dataset_detail,
     get_dataset_rows,
     get_datasets_list,
     get_pointcloud_pointer,
+    get_row_bboxes,
     get_tileset_href,
+    is_sortable_column,
     list_datasets,
+    nulls_last_keyset,
+    sortable_columns,
+)
+from app.modules.catalog.datasets.domain.service_sharing import (
+    GroupNotJoinedError,
+    UnknownGroupsError,
+    dataset_groups,
+    set_dataset_groups,
 )
 from app.modules.catalog.datasets.domain.service_relationships import (
     auto_detect_relationships,
@@ -70,6 +85,8 @@ __all__ = [
     "reap_managed_storage",
     "DatasetTitleMismatchError",
     "DependentVrtError",
+    "GroupNotJoinedError",
+    "InvalidSortColumn",
     "PREVIEW_FEATURE_CAP",
     "PreviousVersionRefused",
     "admit_restore",
@@ -80,6 +97,7 @@ __all__ = [
     "create_dataset",
     "create_empty_dataset",
     "create_relationship",
+    "dataset_groups",
     "defer_metadata_embedding",
     "delete_dataset",
     "delete_relationship",
@@ -91,19 +109,28 @@ __all__ = [
     "get_dataset_versions",
     "get_datasets_list",
     "get_pointcloud_pointer",
+    "get_row_bboxes",
     "get_tileset_href",
     "get_related_datasets",
     "get_related_records",
     "get_relationship_datasets",
     "list_attributes",
     "list_datasets",
+    "preview_slot_bound",
+    "is_sortable_column",
+    "nulls_last_keyset",
+    "sortable_columns",
     "list_relationships",
     "list_relationships_with_total",
     "validate_relationship_columns",
+    "refuse_stranding_shared_maps",
     "reset_attribute",
     "sample_example_values",
+    "set_dataset_groups",
     "resolve_source_feature_count",
     "run_analysis_preview",
+    "UnknownGroupsError",
     "update_attribute",
+    "ValueLabelsOverBudget",
     "update_user_metadata",
 ]

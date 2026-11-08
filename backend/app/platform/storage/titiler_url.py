@@ -22,10 +22,9 @@ from app.platform.storage.raster_relay import (
     relay_url,
 )
 
-# IN-01: env-overridable TITILER_BASE_URL, read lazily (in
-# _get_titiler_base_url) so the module can import before FastAPI settings
-# are ready. Defaults to "http://titiler:8000" when unset.
-_TITILER_BASE_URL: str | None = None  # populated lazily on first call
+# TITILER_BASE_URL, read lazily by _get_titiler_base_url so the module can
+# import before settings are ready.
+_TITILER_BASE_URL: str | None = None
 
 
 def _get_titiler_base_url() -> str:
@@ -42,13 +41,6 @@ def _get_titiler_base_url() -> str:
     return _TITILER_BASE_URL
 
 
-# WR-01: path-traversal defense, checked before any VSI path is built.
-# Defense-in-depth — asset_uri is DB-set by ingest, not user-controlled here.
-_BLOCKED_ASSET_URI_PATTERNS: tuple[str, ...] = (
-    "..",  # path traversal (relative or absolute)
-)
-
-
 def _validate_asset_uri(asset_uri: str) -> None:
     """Raise ValueError if asset_uri contains path-traversal or injection patterns.
 
@@ -56,7 +48,7 @@ def _validate_asset_uri(asset_uri: str) -> None:
     exploitation needs a prior DB write compromise; this guard stops a
     compromised or malformed value from escaping the tenant prefix.
 
-    Checked (WR-01): ``..`` traversal, a leading ``/`` (absolute path), and
+    Checked: ``..`` traversal, a leading ``/`` (absolute path), and
     embedded scheme-like strings (``://``, ``/vsicurl/``, ``/vsis3/``,
     ``/vsiaz/``) that would reconstruct a raw VSI path. http(s):// URLs are
     exempt — they pass through the STAC branch unchanged.

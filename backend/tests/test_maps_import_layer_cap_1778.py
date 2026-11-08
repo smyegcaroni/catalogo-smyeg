@@ -1,4 +1,4 @@
-"""fix(#1778): POST /maps/import needs the layer cap its sibling doors carry.
+"""POST /maps/import needs the layer cap its sibling doors carry.
 
 Codebase audit 2026-08-30 (8dc529f17): `MapStyleImportRequest.layers` was the
 one layer-carrying schema in the module with no bound at all. A 5000-layer body
@@ -10,7 +10,7 @@ The second consequence outlasts the first: `apply_layer_diff` raises once
 over it could not be saved from the builder at all. Every ordinary edit
 answered 400 until the owner bulk-deleted the excess.
 
-Round 1 review: the raw `layers` array is NOT the logical layer count. A GeoLens
+The raw `layers` array is NOT the logical layer count. A GeoLens
 export emits companions beside every primary, so `_MAX_LAYERS_PER_MAP` on the
 raw array refused valid exports of about 50 polygons upward. The two bounds are
 separate now: a resource bound on the document at the schema, and the per-map

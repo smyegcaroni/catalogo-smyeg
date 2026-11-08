@@ -75,7 +75,7 @@ async def test_export_dataset_creates_temp_dir_after_staging_guard_passes(
 ) -> None:
     monkeypatch.setattr(settings, "upload_staging_dir", str(tmp_path))
 
-    # fix(#1778): this double used to restate run_ogr2ogr_export's parameter
+    # This double used to restate run_ogr2ogr_export's parameter
     # list by hand. That is a mirror with no one holding it: adding a keyword
     # to the real function made the double reject a call the real function
     # accepts, and the failure named this test rather than the change. It now
@@ -116,7 +116,7 @@ async def test_export_dataset_creates_temp_dir_after_staging_guard_passes(
 def test_sweep_stale_gdal_header_files_removes_only_old_matching_files(
     tmp_path: Path,
 ) -> None:
-    """fix(#1746): only ``gdal_auth_*.hdr`` files older than ``max_age_seconds``
+    """Only ``gdal_auth_*.hdr`` files older than ``max_age_seconds``
     are removed. A fresh header file (still owned by a running ogr2ogr
     subprocess) and a non-matching old file both survive.
     """
@@ -158,7 +158,7 @@ def test_sweep_stale_gdal_header_files_missing_dir_is_a_noop(tmp_path: Path) -> 
 def test_sweep_stale_gdal_header_files_defaults_without_provisioning(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """fix(#1746 codex r2): the no-argument form reads GDAL_HEADER_DIR and
+    """The no-argument form reads GDAL_HEADER_DIR and
     never creates it.
 
     Both boot hooks and the API's periodic pass call it with no argument. It
@@ -188,7 +188,7 @@ def test_sweep_stale_gdal_header_files_defaults_without_provisioning(
 def test_gdal_header_dir_is_on_the_container_tmpfs_not_the_backed_up_volume(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """fix(#1746 codex r2): the bearer-header directory is /tmp, mode 0700.
+    """The bearer-header directory is /tmp, mode 0700.
 
     Two properties, and they fail for different reasons. It must be under /tmp,
     because the api and the worker each mount that as their own 512m tmpfs —

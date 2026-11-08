@@ -1,4 +1,4 @@
-"""Regression tests for SEC-009: non-public vector tiles get a private cache scope.
+"""Regression tests: non-public vector tiles get a private cache scope.
 
 `_authorize_vector_tile_request` returned "public" for a valid NON-public signed
 request (it fell through past the signature check), so `_tile_headers` emitted
@@ -28,7 +28,7 @@ from app.platform.cache.scope import is_publicly_cacheable
 class _FakeRequest:
     """Minimal stand-in for starlette's Request.
 
-    fix(#1518): ``query_params`` is part of the shape now, not decoration.
+    ``query_params`` is part of the shape now, not decoration.
     ``_authorize_vector_tile_request`` reaches ``request_carries_credentials``,
     which reads the deprecated ``?api_key=`` lane as well as the headers, and a
     double missing the attribute fails with AttributeError rather than
@@ -104,7 +104,7 @@ async def test_public_published_tile_stays_public_scope():
 
 @pytest.mark.anyio
 async def test_non_public_without_signature_is_rejected(monkeypatch):
-    """GUARD: a non-public dataset with no signature is still 403 (not cached)."""
+    """GUARD: a non-public dataset with no signature is refused, never served."""
     from fastapi import HTTPException
 
     with pytest.raises(HTTPException) as exc:
@@ -117,11 +117,11 @@ async def test_non_public_without_signature_is_rejected(monkeypatch):
             scope=None,
             user=None,
         )
-    assert exc.value.status_code == 403
+    assert exc.value.status_code == 404
 
 
 # ---------------------------------------------------------------------------
-# SEC-002 follow-up (Codex P1 on PR #243): public BUT unpublished previews are
+# Follow-up: public BUT unpublished previews are
 # owner/admin-only and must NOT be shared-cached.
 # ---------------------------------------------------------------------------
 

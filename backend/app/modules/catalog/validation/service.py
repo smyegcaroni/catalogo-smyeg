@@ -36,9 +36,9 @@ async def validate_record(
 ) -> ValidationResult:
     """Validate a record for publishing readiness.
 
-    Hard (VAL-01, blocks publish): title, summary, license, spatial_extent,
+    Hard (blocks publish): title, summary, license, spatial_extent,
     CRS, lineage_summary, >=1 contact, >=1 keyword.
-    Soft (VAL-02, warnings only): temporal extent, update_frequency,
+    Soft (warnings only): temporal extent, update_frequency,
     quality_statement, attribute descriptions, source_url.
     """
     errors: list[ValidationIssue] = []
@@ -112,14 +112,16 @@ async def validate_record(
                 AttributeMetadata.dataset_id == dataset.id,
                 AttributeMetadata.is_current == True,  # noqa: E712
                 AttributeMetadata.description.is_(None),
-                AttributeMetadata.semantic_role != "geometry",
+                AttributeMetadata.semantic_role.is_distinct_from("geometry"),
             )
         )
         if attr_without_desc and attr_without_desc > 0:
             warnings.append(
                 ValidationIssue(
                     "attribute_descriptions",
-                    f"{attr_without_desc} attribute(s) missing descriptions",
+                    f"{attr_without_desc} attribute missing a description"
+                    if attr_without_desc == 1
+                    else f"{attr_without_desc} attributes missing descriptions",
                     "warning",
                 )
             )

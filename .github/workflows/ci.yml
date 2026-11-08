@@ -5,43 +5,38 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # fix(#1000): merge-queue runs. All three required contexts (Detect Changes,
-  # Pre-commit, CI OK) come from this workflow, so the queue cannot validate a
-  # candidate merge commit without it.
+  # Merge-queue runs. All three required contexts (Detect Changes, Pre-commit,
+  # CI OK) come from this workflow, so the queue cannot validate a candidate
+  # merge commit without it.
   #
-  # Adding this line is the easy half. The job conditionals below are the
-  # reason the queue must NOT be enabled before they are fixed: 12 of them
-  # were gated on `needs.changes.outputs.X == 'true' || github.event_name ==
-  # 'push'`, and a merge_group event matches neither `push` nor
-  # `pull_request`, so every one of them would skip — while `ci-ok` counts a
-  # skip as a pass (correct for a path-filtered PR, catastrophic here). The
-  # queue would have reported green having tested nothing.
+  # The queue run is the full matrix: there is no path filter to trust there,
+  # and `ci-ok` counts a skip as a pass, so every gated job reads
+  # `|| github.event_name == 'merge_group'`. test_ci_merge_queue.py holds that.
   #
-  # A queue run validates a candidate merge commit against main the same way a
-  # push run validates the merged result, so both want the full matrix rather
-  # than a path-filtered subset. Every gated job below therefore reads
-  # `|| github.event_name == 'merge_group'` alongside its push clause.
+  # The queue squash-merges, so main fast-forwards to the exact commit the
+  # queue tested and the push run that follows sees the same SHA. Repeating
+  # the matrix there tests nothing new. `changes` looks up a passing
+  # merge_group run for the pushed SHA; when it finds one, the gated jobs skip
+  # on push. A direct push, or a queue run that failed or was cancelled, finds
+  # nothing and the push runs the full matrix.
   merge_group:
   # Nightly full-matrix E2E: the e2e-test job below runs ONLY on `schedule`/
   # `workflow_dispatch` (it stays skipped on push/PR). PRs that can affect the
-  # stack run the small e2e-smoke job instead (fix #825), so this cron remains
+  # stack run the small e2e-smoke job instead, so this cron remains
   # the only trigger for the full browser matrix.
   schedule:
     - cron: "0 7 * * *" # 07:00 UTC nightly
   workflow_dispatch:
 
 concurrency:
-  # Include the event name so daily dependabot pushes stop cancelling the
-  # scheduled run — every nightly for a week was cancelled this way, which is
-  # how the e2e suite silently rotted (v1.6.0 audit N2 family).
+  # Include the event name so daily dependabot pushes cannot cancel the
+  # scheduled run, which would let the e2e suite silently rot.
   #
-  # fix(#1000), checked rather than changed: this shape is already safe for the
-  # merge queue. Each queue entry runs on its own `gh-readonly-queue/main/pr-N-<sha>`
-  # ref, so `github.ref` alone puts every entry in a distinct group — two
-  # batches in flight cannot cancel each other, and a queue run and the PR run
-  # it came from differ in both ref and event name. `cancel-in-progress` stays
-  # true because the only thing that can now share a group is a re-run of the
-  # same queue entry.
+  # Each queue entry runs on its own `gh-readonly-queue/main/pr-N-<sha>` ref, so
+  # two batches in flight never cancel each other, and a queue run and the PR
+  # run it came from differ in both ref and event name. A rebuilt entry gets a
+  # new ref and so a new group; the `cancel-superseded-queue-runs` job stops the
+  # runs it replaced.
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
@@ -51,19 +46,66 @@ permissions:
   contents: read
 
 jobs:
+  # A rebuilt queue entry gets a new ref, so nothing shares a concurrency group
+  # with the run it replaces. This stops the same PR's runs whose queue branch
+  # is gone. It gates nothing and is not in `ci-ok`.
+  cancel-superseded-queue-runs:
+    name: Cancel superseded queue runs
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      QUEUE_REF: ${{ github.ref_name }}
+    steps:
+      - name: Cancel runs on queue branches that no longer exist
+        run: |
+          set -euo pipefail
+          prefix='gh-readonly-queue/main/pr-'
+          if [[ ! "$QUEUE_REF" =~ ^gh-readonly-queue/main/pr-([0-9]+)-[0-9a-f]+$ ]]; then
+            echo "Not a queue ref: $QUEUE_REF"
+            exit 0
+          fi
+          pr="${BASH_REMATCH[1]}"
+          for status in queued in_progress; do
+            gh run list --workflow ci.yml --event merge_group --status "$status" \
+              --limit 100 --json databaseId,headBranch \
+              --jq '.[] | "\(.databaseId) \(.headBranch)"' |
+            while read -r run_id branch; do
+              # Only this PR's own queue branches, never this run's, never
+              # another PR's (the trailing dash stops pr-12 matching pr-123).
+              [[ "$branch" == "${prefix}${pr}-"* && "$branch" != "$QUEUE_REF" ]] || continue
+              # Cancel only on a definite 404; any other API error leaves the run alone.
+              if out=$(gh api "repos/$GH_REPO/git/ref/heads/$branch" 2>&1); then
+                echo "Keeping run $run_id: $branch still exists"
+              elif [[ "$out" == *"HTTP 404"* ]]; then
+                echo "Cancelling run $run_id on removed branch $branch"
+                gh run cancel "$run_id" || true
+              else
+                echo "Keeping run $run_id: could not check $branch: $out"
+              fi
+            done
+          done
+
   # ---------- detect changed paths for conditional jobs ----------
   changes:
     name: Detect Changes
     runs-on: ubuntu-26.04
-    # Every job below now carries an explicit cap. Runner apt-get/npm-mirror
-    # installs have blackholed nine times across geolens-io repos in the two
-    # days before 2026-08-19 (e.g. runs 32158035509, 32172191527,
-    # 32175407198, 32229174137), sitting 40min-6h until someone cancelled
-    # them by hand. A cap turns a stuck runner into a bounded, self-reported
-    # failure; the apt/Playwright install steps below also get their own
+    # Every job carries an explicit cap. Runner apt-get/npm-mirror installs
+    # can blackhole and sit for hours until someone cancels them by hand. A
+    # cap turns a stuck runner into a bounded, self-reported failure; the
+    # apt/Playwright install steps below also get their own
     # step-level timeout plus a bounded retry loop.
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     outputs:
+      queue_verified: ${{ steps.queue.outputs.verified }}
       backend: ${{ steps.filter.outputs.backend }}
       frontend: ${{ steps.filter.outputs.frontend }}
       e2e: ${{ steps.filter.outputs.e2e }}
@@ -71,25 +113,46 @@ jobs:
       mcp: ${{ steps.filter.outputs.mcp }}
       sdks: ${{ steps.filter.outputs.sdks }}
       alembic: ${{ steps.filter.outputs.alembic }}
+      compat: ${{ steps.filter.outputs.compat }}
       installer: ${{ steps.filter.outputs.installer }}
       backup: ${{ steps.filter.outputs.backup }}
       monitoring: ${{ steps.filter.outputs.monitoring }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          # fix(#1094): the default depth-1 clone grafts the checked-out commit
+          # The default depth-1 clone grafts the checked-out commit
           # as a shallow boundary, and git then reports it as having NO parents:
           # `git rev-parse HEAD^1` dies with "ambiguous argument". Depth 2 is the
           # minimum that materialises the merge ref's two parents, which is all
           # the base resolution below needs.
           fetch-depth: 2
-      # fix(#1094): resolve the PR diff base ourselves. paths-filter's no-token
+          persist-credentials: false
+      # Any failure here, including an API error or a timeout, leaves
+      # `verified` unset, and the push then runs the full matrix.
+      - name: Find a passing merge-queue run for this commit
+        id: queue
+        if: github.event_name == 'push'
+        timeout-minutes: 2
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          count="$(gh api -X GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=merge_group&status=success&head_sha=${GITHUB_SHA}" \
+            --jq '.total_count')" || count=0
+          if [[ "$count" =~ ^[1-9][0-9]*$ ]]; then
+            echo "A merge-queue run passed on ${GITHUB_SHA}; the gated jobs skip."
+            echo "verified=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No passing merge-queue run for ${GITHUB_SHA}; running the full matrix."
+          fi
+      # Resolve the PR diff base ourselves. paths-filter's no-token
       # path diffs `pull_request.base.sha .. merge-commit`, and base.sha is
       # frozen at PR-open time while GitHub recomputes the merge ref every time
-      # main moves. So the diff grew to include everything that landed since:
-      # #1027 changed 4 files and the filter reported 117, turning Backend Tests
-      # on for other people's backend/** work. Coverage got WIDER the staler a
-      # branch was, which is backwards.
+      # main moves. The diff would then include everything that landed since:
+      # a PR that changed 4 files could report 117, turning Backend Tests on for
+      # other people's backend/** work, wider the staler the branch.
       #
       # checkout leaves us on refs/pull/N/merge, whose FIRST parent is the base
       # branch tip as of when that ref was built. Diffing against it yields the
@@ -106,24 +169,26 @@ jobs:
           echo "sha=$base" >> "$GITHUB_OUTPUT"
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4
         id: filter
-        # fix(#1000): the filter has nothing to diff against on merge_group and
-        # nothing to say either way. Git-diff detection (see the token note
-        # below) resolves its base from pull-request context or a push's
-        # before-SHA, and a `gh-readonly-queue/*` branch supplies neither. Every
-        # gated job below ORs in `merge_group` and so ignores these outputs
-        # there, which leaves one requirement: this job, a REQUIRED context,
-        # must still succeed. Skipping the step is how it does — the outputs
-        # come out empty, which is exactly as meaningful as anything the filter
-        # could have produced without a base.
-        if: github.event_name != 'merge_group'
+        # The filter has nothing to diff against on merge_group. Git-diff
+        # detection (see the token note below) resolves its base from
+        # pull-request context or a push's before-SHA, and a
+        # `gh-readonly-queue/*` branch supplies neither. Every gated job ORs in
+        # `merge_group` and ignores these outputs there; this job, a REQUIRED
+        # context, still has to succeed, so the step is skipped and the outputs
+        # come out empty.
+        #
+        # On push the run is all or nothing, decided by the queue lookup above.
+        # A push diff that matched a filter would otherwise run those jobs again
+        # after the queue already passed them.
+        if: github.event_name != 'merge_group' && github.event_name != 'push'
         with:
-          # fix(#546): empty token switches paths-filter to git-diff detection,
+          # Empty token switches paths-filter to git-diff detection,
           # removing the GitHub API call whose transient 503s failed this
-          # required check hard. fix(#1094) supplies the base that detection
+          # required check hard. The diffbase step supplies the base that detection
           # diffs from; without it the action falls back to the stale
           # pull_request.base.sha.
           token: ''
-          # fix(#1094): empty on push and merge_group, where the action's own
+          # Empty on push and merge_group, where the action's own
           # defaults (before-SHA / merge_group.base_sha) are already right.
           # The action logs "'base' input parameter is ignored when action is
           # triggered by pull request event" — that warning is wrong on this
@@ -154,10 +219,14 @@ jobs:
               - 'scripts/check_suppressed_alerts.py'
               # test_frontend_dev_entrypoint.py runs this script against a stub npm.
               - 'frontend/docker-dev-entrypoint.sh'
+              # The same tests run the dev readiness check and assert the builder
+              # module it loads still exists.
+              - 'frontend/scripts/dev-readiness.mjs'
+              - 'frontend/src/components/builder/BuilderMap.tsx'
               # Decides which test files each Backend Tests shard runs; a PR
               # touching only it must exercise the sharded run.
               - 'scripts/ci_backend_shards.py'
-              # fix(#1277 review): test_sdks_round_trip.py asserts the generated
+              # test_sdks_round_trip.py asserts the generated
               # SDK carries no unguarded optional-body emission, which is what
               # this script produces during `make sdks`. A PR editing only the
               # script would otherwise skip Backend Tests and never run the
@@ -169,7 +238,7 @@ jobs:
               # The SDK's hand-maintained modules (auth.py, cog_download.py) are
               # tested only in test_sdks_round_trip.py and change without backend/**.
               - 'sdks/python/geolens/*.py'
-              # fix(#1607): test_seed_showcase_pins_1607.py imports this seeder
+              # test_seed_showcase_pins_1607.py imports this seeder
               # and walks its AST to prove every builder routes its map-exists
               # check through _keep_existing_map, so the maps geolens-examples
               # links by UUID survive --force. A seeder-only PR that skipped
@@ -181,9 +250,8 @@ jobs:
               # nginx/CSP/Dockerfile regressions). Specific files only — NOT
               # frontend/src/** — so ordinary frontend PRs stay backend-skipped.
               - 'frontend/nginx.conf'
-              # fix(#1088): 'frontend/Dockerfile' was here and matched nothing —
-              # INF-10 deleted that file and test_phase_272_dockerfile.py keeps
-              # it deleted. A dead glob is silent in both directions.
+              # frontend/Dockerfile does not exist (test_phase_272_dockerfile.py
+              # keeps it deleted), and a dead glob is silent in both directions.
               - 'frontend/Dockerfile.dev'
               - 'frontend/docker-entrypoint.sh'
               - 'frontend/index.html'
@@ -193,21 +261,13 @@ jobs:
               - 'frontend/src/lib/capabilities.ts'
               - 'frontend/src/lib/__tests__/record-type-capabilities.cases.json'
               - 'frontend/src/components/builder/layer-adapters/shared.ts'
-              # fix(#1778): more frontend files (plus one
-              # e2e spec below) that backend tests reference by literal path
-              # were absent from this list. A PR editing only AuditLogViewer.tsx
-              # matched the 'frontend' filter but not 'backend', so Backend
-              # Tests skipped and the audit-action parity gate
-              # (test_frontend_action_list_matches_backend_registry) never
-              # ran — the same "skipped required job reads as green" trap the
-              # #1088 fix above describes for scripts/backup-entrypoint.sh.
-              # test_ci_alembic_filter_paths.py::TestBackendFilterCoversReferencedScripts
-              # now scans for both scripts/ and frontend|e2e/ literals, so this
-              # list and that scan cannot drift apart again; the last four
-              # entries are cross-references inside docstrings rather than
-              # files under test, kept here anyway so the currency scan (which
-              # cannot tell the two apart, deliberately — see its docstring)
-              # stays green without special-casing prose mentions.
+              # More frontend files that backend parity gates read by literal
+              # path. Without them a PR editing only AuditLogViewer.tsx skips
+              # Backend Tests, and the audit-action parity gate reads as green
+              # without having run. test_ci_alembic_filter_paths.py fails when
+              # a backend test names a scripts/, frontend/ or e2e/ file this
+              # list misses. Files a test only mentions in prose sit in that
+              # test's allowlist instead, so editing them skips the shards.
               - 'frontend/src/components/admin/AuditLogViewer.tsx'
               - 'frontend/src/lib/__tests__/public-app-url-shape.cases.json'
               - 'frontend/src/lib/error-map.ts'
@@ -215,12 +275,7 @@ jobs:
               # fixed-failure-code to translation-key table); a
               # frontend-only edit here must still run Backend Tests.
               - 'frontend/src/lib/failure-reason.ts'
-              - 'frontend/README.md'
-              - 'frontend/src/components/admin/__tests__/AdminSidebar.test.tsx'
-              - 'frontend/src/lib/__tests__/public-urls.test.ts'
-              - 'frontend/src/lib/normalize-style-config.ts'
-              - 'frontend/vite.config.ts'
-              # fix(#1778): test_settings_key_drift.py reads these by
+              # test_settings_key_drift.py reads these by
               # literal path (the settings-key subset guard: frontend_keys
               # is a subset of backend registry keys) and
               # test_iso_option_drift.py reads iso-constants.ts (the ISO
@@ -232,49 +287,53 @@ jobs:
               # reads this spec by literal path to pin the S08 test block; the
               # 'e2e' filter alone does not trigger Backend Tests.
               - 'e2e/sec-audit.spec.ts'
-              # fix(#1088): repo-root scripts that backend tests read by literal
-              # path. #1027 changed backup-entrypoint.sh and its own regression
-              # test (test_backup_staging_tar_skew.py) never ran — the backup
-              # filter covered the script, but nothing pulled in the backend
-              # suite that asserts against it. Backup Restore Round-trip went
-              # green while the test written to catch that break sat skipped.
+              # repo-root scripts that backend tests read by literal
+              # path. Without them, a change to backup-entrypoint.sh would skip its
+              # own regression test (test_backup_staging_tar_skew.py): the backup
+              # filter covers the script, but nothing else pulls in the backend
+              # suite that asserts against it.
               # backend/scripts/* needs no entry here; backend/** covers it.
-              # test_ci_alembic_filter_paths.py now enforces both directions.
+              # test_ci_alembic_filter_paths.py enforces both directions.
               - 'scripts/backup-entrypoint.sh'
               - 'scripts/init-db.sh'
               - 'scripts/lib/configure-runtime-db-role.sh'
-              # fix(#1798 review round 11 audit, P1): read by literal path in
+              # Read by literal path in
               # test_audit_1798_runbook_shell_sourcing.py, which asserts this
               # wrapper exists, is executable, and calls get_env_value.
               - 'scripts/env-value.sh'
-              # fix(#1517): test_alert_rules.py reads both of these by literal
+              # test_compose_db_healthcheck.py reads its db healthcheck.
+              - 'scripts/tests/ci-restore-db.compose.yml'
+              # test_alert_rules.py reads both of these by literal
               # path — it checks the alert rules' handler selectors against the
               # app's real route table, and that every rule has a promtool case.
               # Without this, an alerts-only PR skips the only gate that would
               # catch a selector matching nothing.
               - 'infra/monitoring/alerts.yml'
               - 'infra/monitoring/alerts.test.yml'
-              # fix(#1778): test_alert_rules.py reads this one by literal path
+              # test_alert_rules.py reads this one by literal path
               # too -- it checks that the worker scrape job discovers every
               # replica, because the job counters live in the process that did
               # the work and an unscraped replica is invisible.
               - 'infra/monitoring/prometheus.yml'
-              # fix(#1778 codex r8): and the dashboard, for the other half of
+              # The dashboard too, for the other half of
               # that -- once discovery finds every replica, a panel reading a
               # per-replica job series without an aggregator draws one partial
               # line per replica.
               - 'infra/monitoring/grafana-dashboard.json'
-              # fix(#561): a change to this workflow can alter HOW Backend Tests
+              # A change to this workflow can alter HOW Backend Tests
               # runs (e.g. the -n4 parallelization / coverage core), so the suite
               # must run on PRs that touch it — otherwise CI-config changes ship
               # unvalidated by the very tests they configure.
               - '.github/workflows/ci.yml'
-              # fix(#1609): test_release_dispatch_targets_1609.py reads
+              # test_release_dispatch_targets_1609.py reads
               # release.yml by literal path and asserts both downstream
               # dispatches (the site and geolens-examples) stay wired and
               # independent. Without this, a release.yml-only PR skips the
               # only suite that would notice one of them going away.
               - '.github/workflows/release.yml'
+              # test_publish_requires_green_commit.py runs the publish gate
+              # step and checks every publish job still needs it.
+              - '.github/workflows/publish.yml'
               # test_codeql_qtable_suppressions.py reads both of these by
               # literal path: it asserts the init step still runs the local
               # alert-suppression query, that a step still acts on the SARIF,
@@ -284,32 +343,30 @@ jobs:
               # CodeQL.
               - '.github/workflows/codeql.yml'
               - '.github/codeql/**'
-              # fix(#1925): test_unscoped_finding_markers.py reads this config
+              # test_unscoped_finding_markers.py reads this config
               # and asserts the marker hook still runs the detector, so a
               # config-only PR must run the suite that notices a hook drifting.
               - '.pre-commit-config.yaml'
-              # fix(#1778 review): test_ci_alembic_filter_paths.py's currency
-              # scan flagged these two — both are docstring cross-references
-              # (test_backup_entrypoint_atomic_writes.py names this script as
-              # the real end-to-end coverage its own structural checks stand
-              # in for; test_audit_1778_docs.py's EGRESS/CONTRIBUTING test
-              # names package.json while asserting Prettier isn't a frontend
-              # dependency), not files under test, but the scan cannot tell
-              # the two apart from a literal path string, deliberately — see
-              # its docstring, and the "last four entries" comment above for
-              # the same shape.
+              # test_runtime_db_role.py reads this script's source.
               - 'scripts/tests/test-backup-restore-roundtrip.sh'
-              - 'frontend/package.json'
+              # Backend tests that build these paths from parts
+              # (ROOT / "scripts" / ...) and read or import them.
+              - 'scripts/flatten_openapi_defs.py'
+              - 'scripts/init-test-db.sh'
+              - 'scripts/install.sh'
+              - 'scripts/minio-setup.sh'
+              - 'scripts/restore.sh'
+              - 'scripts/showcase-121-state.py'
             frontend:
               - 'frontend/**'
               - 'backend/openapi.json'
               - 'scripts/flatten_openapi_defs.py'
-              # fix(#636): template-parity.test.ts asserts the in-app problem
+              # template-parity.test.ts asserts the in-app problem
               # reporter's prefill against this Issue Form — a template-only PR
               # must still run the frontend tests or drift lands silently.
               - '.github/ISSUE_TEMPLATE/bug_report.yml'
-              # PR #745 bumped root @playwright/test with every frontend/e2e/axe
-              # job skipping — the root manifests were in NO filter.
+              # A bump of root @playwright/test must run the frontend/e2e/axe jobs,
+              # so the root manifests belong in this filter.
               - 'package.json'
               - 'package-lock.json'
             e2e:
@@ -319,14 +376,14 @@ jobs:
               - 'playwright.config.ts'
               - 'playwright.builder-hardening.config.ts'
               - 'docker-compose*.yml'
-              # PR #745: the Playwright toolchain lives in the ROOT manifests.
+              # The Playwright toolchain lives in the ROOT manifests.
               - 'package.json'
               - 'package-lock.json'
-              # fix(#825): same rationale as the backend filter's #561 entry —
+              # Same rationale as the backend filter's workflow entry:
               # a change to this workflow alters HOW the e2e-smoke PR gate
               # runs, so the gate must run on PRs that touch it.
               - '.github/workflows/ci.yml'
-              # fix(#862 review): the smoke job copies .env.example and boots
+              # The smoke job copies .env.example and boots
               # the compose stack, so its remaining build/boot inputs must
               # trigger the gate: the root api/worker Dockerfile and the
               # .dockerignore that trims its context, the db image context
@@ -346,7 +403,7 @@ jobs:
             mcp:
               - 'mcp/**'
               - 'sdks/python/**'
-              # fix(#827, #866 review): the live tier tests backend BEHAVIOR,
+              # The live tier tests backend BEHAVIOR,
               # not just schema — a runtime regression in the handlers the
               # five tools read (or in the auth/config paths the tier relies
               # on) can ship with a byte-identical openapi.json, so the whole
@@ -359,17 +416,17 @@ jobs:
               - '.env.example'
               - 'db/**'
               - 'scripts/init-db.sh'
-              # fix(#866 review r4): the job invokes the root `make mcp-test`
+              # The job invokes the root `make mcp-test`
               # and `make mcp-live-test` recipes, so a Makefile-only change
               # must run it.
               - 'Makefile'
-              # Same rationale as the backend filter's #561 entry — a change
+              # Same rationale as the backend filter's workflow entry: a change
               # to this workflow alters HOW the mcp job runs (incl. the live
               # tier's boot recipe), so the job must run on PRs that touch it.
               - '.github/workflows/ci.yml'
-            # fix(#709): a PR that only touches the SDKs' own toolchain
-            # (generator, package.json, tsconfig) ran neither drift gate,
-            # so generator breakage merged green and reddened main on push.
+            # A PR that only touches the SDKs' own toolchain
+            # (generator, package.json, tsconfig) would run neither drift gate,
+            # so generator breakage could merge green and redden main on push.
             sdks:
               - 'sdks/**'
               - 'backend/openapi.json'
@@ -385,26 +442,31 @@ jobs:
               # either must exercise the exact fresh-cluster boot path.
               - 'scripts/init-db.sh'
               - 'scripts/lib/configure-runtime-db-role.sh'
-              # OCG-02: backend/app/models/** was deleted in b63803c1; replaced
-              # with the real model layout so model-only PRs still trigger alembic
-              # check (blocks model migration drift regressions).
+              # The real model layout, so model-only PRs still trigger alembic
+              # check (blocks model migration drift).
               - 'backend/app/**/models.py'
               - 'backend/app/core/db/models.py'
               - 'backend/app/processing/**/models.py'
               - 'db/**'
+            # The previous-release check also runs on every migration or model
+            # change above; this adds its own inputs.
+            compat:
+              - 'scripts/previous-release-compat.sh'
+              - '.github/workflows/ci.yml'
             installer:
               - 'scripts/install.sh'
               - 'scripts/upgrade.sh'
               - 'scripts/restore.sh'
               - 'scripts/check-env.sh'
               - 'scripts/lib/common.sh'
-              # fix(#1882): preflight now reads .env through common.sh's
+              # Preflight reads .env through common.sh's
               # get_env_value, so both it and its test belong on this filter.
               - 'scripts/preflight-env.sh'
               - 'scripts/tests/test-preflight-env.sh'
               - 'scripts/backup-entrypoint.sh'
               - 'scripts/tests/test-install-tag-resolution.sh'
               - 'scripts/tests/test-install-secret-generation.sh'
+              - 'scripts/tests/test-install-bundled-cache.sh'
               - 'scripts/tests/test-install-main-wrapper.sh'
               - 'scripts/tests/test-upgrade-order.sh'
               - 'scripts/tests/test-upgrading-doc-consistency.sh'
@@ -413,12 +475,15 @@ jobs:
               - 'scripts/tests/test-restore-env-sourcing-safety.sh'
               - 'scripts/tests/test-env-file-compose-oracle.sh'
               - 'scripts/check_env_doc_drift.py'
-              # check_env_doc_drift.py parses the Settings class out of this
-              # file — a new Settings field must re-run the drift gate.
+              - 'tests/test_check_env_doc_drift.py'
+              # check_env_doc_drift.py parses the Settings fields out of these
+              # files — a new Settings field must re-run the drift gate.
               - 'backend/app/core/config.py'
+              - 'backend/app/core/config_ai.py'
+              - 'backend/app/core/auth_settings.py'
               - '.env.example'
               - 'UPGRADING.md'
-              # fix(#950): the drift gate resolves scripts/ paths referenced by
+              # The drift gate resolves scripts/ paths referenced by
               # these docs, so an edit to any of them (or a script deletion)
               # must re-run it, not just land unchecked until the push on main.
               - '.env.test.example'
@@ -439,7 +504,7 @@ jobs:
               - 'scripts/restore.sh'
               - 'scripts/lib/configure-runtime-db-role.sh'
               - 'scripts/tests/test-backup-restore-roundtrip.sh'
-              # test(#826): the bundled-mode leg restores through the REAL
+              # The bundled-mode leg restores through the REAL
               # restore.sh against this db-only compose stack.
               - 'scripts/tests/ci-restore-db.compose.yml'
               - 'db/**'
@@ -451,7 +516,7 @@ jobs:
               # The round-trip proof itself is ~220 inline lines of THIS
               # workflow — a ci.yml-only edit to those steps must run them.
               - '.github/workflows/ci.yml'
-            # fix(#1521 review): the promtool suite. Separate from `backend`
+            # The promtool suite. Separate from `backend`
             # because it needs no Python at all and should not run on every
             # backend PR; the alerts files are in BOTH filters on purpose, since
             # backend/tests/test_alert_rules.py reads them too.
@@ -465,7 +530,7 @@ jobs:
   backend-lint:
     name: Backend Lint
     needs: changes
-    if: needs.changes.outputs.backend == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.backend == 'true' || (github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'merge_group'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     defaults:
@@ -473,14 +538,16 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         with:
           version: "0.10.2"
           enable-cache: true
           cache-dependency-glob: "backend/uv.lock"
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
@@ -493,9 +560,9 @@ jobs:
       - name: Ruff format check
         run: uv run ruff format --check .
 
-      # TSEAM-03 (Phase 1207-02): no third "cloud" runtime mode.
+      # No third "cloud" runtime mode.
       # A literal 'cloud' token in edition.py or license.py would re-introduce
-      # a separate hosted-product axis (KISS Rule 1).
+      # a separate hosted-product axis.
       # `grep -nE` returns exit 0 on a match (which is a FAIL for us) and
       # exit 1 on no match (which is our SUCCESS) — flip semantics with `!`.
       - name: TSEAM-03 - no literal 'cloud' runtime token in core/edition.py or core/license.py
@@ -512,17 +579,29 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: 22
 
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+        with:
+          version: "0.10.2"
+          enable-cache: true
+          cache-dependency-glob: "backend/uv.lock"
+
+      # Installs the hash-locked pre-commit group from backend/uv.lock, not the
+      # backend project itself.
       - name: Install pre-commit
-        run: python -m pip install pre-commit
+        run: |
+          uv sync --project backend --locked --only-group pre-commit
+          echo "$PWD/backend/.venv/bin" >> "$GITHUB_PATH"
 
       # Security guardrails (SSRF/IDOR) + generic hygiene. Ruff is covered by the
       # backend-lint job; gitleaks runs as a dedicated full-tree scan below (the
@@ -532,13 +611,13 @@ jobs:
           SKIP: ruff-check,ruff-format,gitleaks
         run: pre-commit run --all-files --show-diff-on-failure
 
-      # fix(#474): this scans backend detail= assignments as well as the
+      # This scans backend detail= assignments as well as the
       # frontend classifier, so it must run for backend-only PRs too.
       - name: Localized API error boundary
         run: node frontend/scripts/check-api-error-boundary.mjs
 
       - name: Install gitleaks
-        # fix(#1859): retries a transient download failure instead of letting
+        # Retries a transient download failure instead of letting
         # it evict the whole merge-queue entry on a required job.
         run: |
           GL=8.30.1
@@ -562,11 +641,13 @@ jobs:
   installer-test:
     name: Installer Tag Resolution
     needs: changes
-    if: needs.changes.outputs.installer == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.installer == 'true' || (github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'merge_group'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Tag/branch shadowing regression test
         run: sh scripts/tests/test-install-tag-resolution.sh
@@ -574,11 +655,14 @@ jobs:
       - name: Installer secret-generation regression test
         run: sh scripts/tests/test-install-secret-generation.sh
 
+      - name: Installer bundled-cache regression test
+        run: sh scripts/tests/test-install-bundled-cache.sh
+
       - name: Installer main() wrapper regression test
         run: sh scripts/tests/test-install-main-wrapper.sh
 
-      # Both upgrade suites shipped without CI wiring; the order test now also
-      # covers the PG-major refusal (chore(#704)), so it has to actually run.
+      # The order test also covers the PG-major refusal, so both upgrade suites
+      # have to run.
       - name: Upgrade order + PG-major guard regression test
         run: sh scripts/tests/test-upgrade-order.sh
 
@@ -597,16 +681,18 @@ jobs:
       - name: preflight-env.sh .env parsing regression test
         run: sh scripts/tests/test-preflight-env.sh
 
-      # fix(#1798 review round 13, P2, review 5103870781): get_env_value's
-      # .env interpolation/decoding checked against REAL `docker compose`
-      # (not just our own understanding of its grammar) for the full corpus
-      # of rounds 6-12 findings. `docker compose config` needs no daemon,
+      # get_env_value's .env interpolation/decoding is checked against REAL
+      # `docker compose` (not just our own understanding of its grammar).
+      # `docker compose config` needs no daemon,
       # image pull, or network — ubuntu-26.04 ships docker compose.
       - name: get_env_value vs real Docker Compose oracle test
         run: sh scripts/tests/test-env-file-compose-oracle.sh
 
       - name: Environment contract drift gate
         run: python3 scripts/check_env_doc_drift.py
+
+      - name: Environment contract drift gate regression tests
+        run: python3 -m unittest tests.test_check_env_doc_drift
 
       - name: Validate compose files parse
         env:
@@ -623,12 +709,12 @@ jobs:
           docker compose -f docker-compose.yml config -q
           docker compose -f docker-compose.prod.yml config -q
 
-  # ---------- backup + restore round-trip (BKP-03) ----------
+  # ---------- backup + restore round-trip ----------
   # Boots the backup image (built/loaded from --target backup in the root
   # Dockerfile) and exercises backup → restore for BOTH DB modes:
   #   BUNDLED: backup image runs pg_dump + SigV4 S3 upload inside the image;
   #            the dump is then restored by the REAL scripts/restore.sh
-  #            (test(#826)) into a db-only compose stack
+  #            into a db-only compose stack
   #            (scripts/tests/ci-restore-db.compose.yml); restored row counts
   #            must match exactly and geolens_reader must SELECT restored data.
   #   MANAGED: provider-snapshot DB (seeded directly) + object-storage archive
@@ -639,7 +725,7 @@ jobs:
   backup-roundtrip:
     name: Backup Restore Round-trip
     needs: changes
-    if: needs.changes.outputs.backup == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.backup == 'true' || (github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'merge_group'
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
@@ -685,15 +771,17 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
 
       - name: Build backup image (Dockerfile --target backup, --load for docker run)
         run: |
-          # BKP-03: build+load the backup stage so CI boots the SAME image
+          # Build+load the backup stage so CI boots the SAME image
           # definition that publish.yml ships. On a PR no GHCR tag exists yet;
           # --load makes it available to `docker run` on this runner without a
-          # registry push (T-1247-SC: never pull an external image for the proof).
+          # registry push (never pull an external image for the proof).
           docker buildx build \
             --load \
             --target backup \
@@ -702,17 +790,16 @@ jobs:
 
       - name: Install postgresql-client + tooling
         # A step-level cap plus a bounded retry loop: an apt mirror that goes
-        # unreachable mid-fetch now fails this step in well under the job
-        # timeout instead of hanging for hours (2026-08-19). Each apt-get
+        # unreachable mid-fetch fails this step in well under the job
+        # timeout instead of hanging for hours. Each apt-get
         # invocation is wrapped in its OWN `sudo timeout -k 10 <N>` (update
         # and install separately, not chained under one timeout) so apt-get
         # is timeout's DIRECT child — no sudo/shell grandchild between them
         # to block the signal, unlike the Playwright-install steps. Both
-        # Acquire::http::Timeout AND Acquire::https::Timeout are set: job
-        # 96122006694 (a sibling "Install system dependencies" step) stalled
-        # the full 10-minute cap with ZERO output after apt fell back from a
-        # failing http mirror to an https one, which our http-only timeout
-        # never bounded. The cleanup between attempts matches the
+        # Acquire::http::Timeout AND Acquire::https::Timeout are set: apt falling
+        # back from a failing http mirror to an https one stalled a sibling step
+        # for the full 10-minute cap with ZERO output, which an http-only timeout
+        # never bounds. The cleanup between attempts matches the
         # Playwright-install steps for the same reason: apt-get can still
         # orphan a dpkg child if timeout kills it mid-unpack. The final
         # `dpkg --configure -a` is itself timeout-wrapped: an unbounded
@@ -745,6 +832,8 @@ jobs:
               && break
             echo "apt attempt $i failed"
             [ "$i" = 3 ] && exit 1
+            # A stalled Azure mirror stays stalled for the retries, so fall back to archive.ubuntu.com.
+            sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt 2>/dev/null || true
             sudo pkill -TERM -x apt-get || true
             sudo pkill -TERM -x dpkg || true
             sleep 5
@@ -785,7 +874,7 @@ jobs:
 
       - name: BUNDLED MODE — boot backup image (SigV4 S3 upload via image) → REAL scripts/restore.sh → row-count + reader assert
         env:
-          # test(#826): everything scripts/restore.sh needs, env-parameterized
+          # Everything scripts/restore.sh needs, env-parameterized
           # (the CI checkout ships no .env): the db-only compose stack whose
           # `db` service is the restore target, and the target credentials/
           # database. COMPOSE_PROJECT_NAME is pinned so this step's compose
@@ -824,10 +913,10 @@ jobs:
 
           # Run the backup image — it connects to $SRC, runs pg_dump, archives
           # /staging, and uploads BOTH to MinIO via the image's SigV4 uploader
-          # (BKP-02 path — this is the shipped behaviour being proven here).
+          # (the shipped behaviour being proven here).
           # --network host lets the container reach the postgres + minio services.
           # Array form keeps the run_args readable while putting docker run and
-          # the image name on a single line (required by the acceptance grep).
+          # the image name on a single line.
           run_args=(
             --rm --network host
             -e POSTGRES_HOST=localhost -e POSTGRES_PORT=5432
@@ -841,16 +930,17 @@ jobs:
             -v /tmp/ci-backups:/backups -v /tmp/ci-staging:/staging:ro
           )
           docker run "${run_args[@]}" geolens-backup:ci --run-backup
+          sudo chmod -R a+rX /tmp/ci-backups
 
           # Verify the backup image produced a non-empty dump.
           DUMP_FILE=$(find /tmp/ci-backups/daily -name '*.dump' -type f | head -1)
           [ -n "$DUMP_FILE" ] || { echo "FAIL: backup image produced no dump file"; exit 1; }
           [ -s "$DUMP_FILE" ] || { echo "FAIL: backup image dump file is empty"; exit 1; }
 
-          # test(#826): restore through the REAL scripts/restore.sh — no inline
-          # replica of its flags. The old copy here had already drifted (it
-          # validated with `pg_restore --list`, which passes a truncated -Fc
-          # dump, while the script uses the stricter `-f /dev/null`, #710).
+          # Restore through the REAL scripts/restore.sh — no inline
+          # replica of its flags, which would drift (`pg_restore --list` passes
+          # a truncated -Fc dump, while the script uses the stricter
+          # `-f /dev/null`).
           # Bring up the db-only compose stack the script will exec into; its
           # image is the shipped db/Dockerfile build (restore.sh's fail-closed
           # pre-restore DDL needs postgis/pg_trgm/unaccent/vector installed).
@@ -862,8 +952,8 @@ jobs:
           # Its exit code is the gate (set -e).
           bash scripts/restore.sh "$DUMP_FILE"
 
-          # Hard row-count asserts — must not be weakened with || true
-          # (T-1247-09). The restored side now lives in the compose db.
+          # Hard row-count asserts — must not be weakened with || true.
+          # The restored side lives in the compose db.
           DST_R=$(docker compose -f "$COMPOSE_FILE" exec -T db \
             psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT COUNT(*) FROM catalog.records;")
           DST_D=$(docker compose -f "$COMPOSE_FILE" exec -T db \
@@ -873,7 +963,7 @@ jobs:
 
           # geolens_reader grant round-trip: --clean drops schema `data` with
           # its ACLs and the dump is --no-acl, so restore.sh re-grants AFTER
-          # pg_restore. The re-grant now ran inside the script; prove its
+          # pg_restore. The re-grant runs inside the script; prove its
           # EFFECT independently — the reader role can actually select from a
           # restored table in schema `data`.
           # tail -1: -tA still prints the SET command tag ahead of the count
@@ -883,7 +973,7 @@ jobs:
           [ "$READER_CNT" = "1" ] || { echo "FAIL: geolens_reader cannot select restored data.ci_probe (got '${READER_CNT}')"; exit 1; }
           echo "  geolens_reader post-restore grant verified (data.ci_probe readable)"
 
-          # #947: restore runs with POSTGRES_USER, then the canonical reconciler
+          # Restore runs with POSTGRES_USER, then the canonical reconciler
           # restores the opt-in runtime role without handing it role/schema DDL.
           ROLE_STATE=$(docker compose -f "$COMPOSE_FILE" exec -T db \
             psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc \
@@ -929,7 +1019,7 @@ jobs:
              INSERT INTO catalog.datasets (slug) SELECT 'img-d-'||g FROM generate_series(1, 57) g;"
           SNAP_R=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$SNAP" -tAc "SELECT COUNT(*) FROM catalog.records;")
           SNAP_D=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$SNAP" -tAc "SELECT COUNT(*) FROM catalog.datasets;")
-          # Hard row-count asserts — must not be weakened with || true (T-1247-09).
+          # Hard row-count asserts — must not be weakened with || true.
           [ "$SNAP_R" = "113" ] || { echo "FAIL: managed-mode snapshot DB records wrong: $SNAP_R"; exit 1; }
           [ "$SNAP_D" = "57" ]  || { echo "FAIL: managed-mode snapshot DB datasets wrong: $SNAP_D"; exit 1; }
           echo "  managed-mode snapshot DB: records=${SNAP_R} datasets=${SNAP_D}"
@@ -957,7 +1047,7 @@ jobs:
   openapi-snapshot:
     name: OpenAPI Snapshot Drift
     needs: changes
-    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.sdks == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.sdks == 'true' || (github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'merge_group'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     defaults:
@@ -974,14 +1064,16 @@ jobs:
       PYTHONPATH: .
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         with:
           version: "0.10.2"
           enable-cache: true
           cache-dependency-glob: "backend/uv.lock"
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
@@ -994,7 +1086,7 @@ jobs:
   sdks-check:
     name: SDKs Drift Gate
     needs: changes
-    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.sdks == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.sdks == 'true' || (github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'merge_group'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     env:
@@ -1006,18 +1098,20 @@ jobs:
       PYTHONPATH: backend
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         with:
           version: "0.10.2"
           enable-cache: true
           cache-dependency-glob: "backend/uv.lock"
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -1029,7 +1123,7 @@ jobs:
 
       - name: Install TypeScript SDK dependencies (locked)
         working-directory: sdks/typescript
-        # fix(#1816): same npm-ci-stall settings as License Check
+        # Same npm-ci-stall settings as License Check
         # (frontend)'s Install step, applied here for consistency —
         # any job restoring the npm cache and then fetching from the
         # registry can hit the same registry stall.
@@ -1043,9 +1137,9 @@ jobs:
         run: make sdks-check
 
   # ---------- version coherence ----------
-  # REL-04: assert every version site agrees (backend/cli/sdks×2/root+frontend
+  # Assert every version site agrees (backend/cli/sdks×2/root+frontend
   # package.json/openapi.json info.version/main.py fallback constant/the 5
-  # lockfiles that embed the package's own version, fix(#877)). Blocks a
+  # lockfiles that embed the package's own version). Blocks a
   # release where one site silently drifted from the rest. Pure stdlib (tomllib
   # + json + re); no DB, no Docker, runs on every push/PR.
   version-coherence:
@@ -1054,8 +1148,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
@@ -1065,16 +1161,15 @@ jobs:
       # The CHANGELOG half of that gate only helps if it asks the same question
       # release.yml asks. This asserts the two extractions agree case for case,
       # including the empty-section and prerelease-tag paths that both fall back
-      # to a filtered git log (fix(#715)).
+      # to a filtered git log.
       - name: Check the CHANGELOG gate tracks release.yml
         run: python scripts/tests/test-changelog-gate.py
 
       # The reference-style compare links at the bottom of CHANGELOG.md are a
-      # separate block from the `## [version]` section above and used to be
-      # unenforced entirely: a release could ship with `[Unreleased]` still
-      # comparing from the previous tag and no link for the new version
-      # (v1.17.0, #1714). Pins the gate's link assertions and bump_version.py's
-      # mechanical write of both lines (fix(#1716)).
+      # separate block from the `## [version]` section above: a release could
+      # otherwise ship with `[Unreleased]` still comparing from the previous tag
+      # and no link for the new version. Pins the gate's link assertions and
+      # bump_version.py's mechanical write of both lines.
       - name: Check the CHANGELOG compare links
         run: python scripts/tests/test-changelog-links.py
 
@@ -1092,8 +1187,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
@@ -1109,25 +1206,19 @@ jobs:
   # ---------- README assets ----------
   # Gate over the committed README screenshots in .github/assets/.
   #
-  # The image-sanitizer Claude Code plugin resizes images IN PLACE from a
-  # PreToolUse hook on the Read tool (shrink-only, 1200px cap), so any committed
-  # image wider than that silently loses resolution the first time someone opens
-  # it to look at it. docs and marketing (both in getgeolens.com) each grew a gate
-  # against this; the README shots did not, because they are produced in that repo
-  # and committed in THIS one, so neither side owned the check. Three of the
-  # source-panel crops are 1232px wide and were live-vulnerable.
-  #
-  # No path filter on purpose: the corruption edits the images, so a filtered job
-  # would still fire, but this also catches a manifest edit that quietly unpins a
-  # file. Pure stdlib Node — no DB, browser, or network. Runs on every push/PR.
+  # Pins every README image to its exact size (see scripts/check-readme-assets.mjs
+  # for why). No path filter on purpose: it also catches a manifest edit that
+  # quietly unpins a file. Pure stdlib Node, no DB, browser or network.
   readme-assets:
     name: README Assets
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: 22
 
@@ -1137,15 +1228,15 @@ jobs:
         run: npm run check:readme-assets
 
   # ---------- monitoring ----------
-  # fix(#1521 review): infra/monitoring/alerts.test.yml replays every alert rule
-  # against synthetic series, and until this job existed nothing ran it. A
+  # infra/monitoring/alerts.test.yml replays every alert rule
+  # against synthetic series, and only this job runs it. A
   # PromQL expression that no longer parses, or an expected-alert case that
-  # stopped holding, would have shipped green — the backend suite only reads
+  # stopped holding, would ship green — the backend suite only reads
   # those files as text. promtool is the only thing that can evaluate a rule.
   monitoring-rules:
     name: Monitoring Rules
     needs: changes
-    if: needs.changes.outputs.monitoring == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.monitoring == 'true' || (github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'merge_group'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     env:
@@ -1154,6 +1245,8 @@ jobs:
       PROMETHEUS_IMAGE: prom/prometheus:v3.6.0@sha256:76947e7ef22f8a698fc638f706685909be425dbe09bd7a2cd7aca849f79b5f64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       # `promtool test rules` reports SUCCESS on a file that declares no cases
       # at all, and `check rules` is happy with a rule nothing exercises. Both
@@ -1184,7 +1277,7 @@ jobs:
           docker run --rm -v "$PWD/infra/monitoring:/w:ro" \
             --entrypoint promtool "$PROMETHEUS_IMAGE" test rules /w/alerts.test.yml
 
-      # fix(#1778): the scrape config was never validated by anything. It grew
+      # Nothing else validates the scrape config. It has
       # a dns_sd_configs block so the worker job discovers every replica, and a
       # typo there is a config Prometheus refuses at startup — which an
       # operator finds out about instead of CI.
@@ -1201,7 +1294,7 @@ jobs:
   cli-test:
     name: CLI Tests
     needs: changes
-    if: needs.changes.outputs.cli == 'true' || needs.changes.outputs.backend == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.cli == 'true' || needs.changes.outputs.backend == 'true' || (github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'merge_group'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     env:
@@ -1218,6 +1311,8 @@ jobs:
       PYTHONPATH: backend
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Start PostgreSQL with PostGIS + pgvector
         working-directory: .
@@ -1226,10 +1321,9 @@ jobs:
         # apt steps, so this also gets a bound.
         timeout-minutes: 10
         run: |
-          # fix(#1859): the base-image pull inside `docker build` hit a
+          # The base-image pull inside `docker build` can hit a
           # transient Docker Hub token-fetch reset ("failed to fetch oauth
-          # token: ... connection reset by peer") in merge-group run
-          # 33966364665 and again on #1858's Backend Tests, evicting an
+          # token: ... connection reset by peer"), which would evict an
           # otherwise-clean queue entry. Retry the whole build, since that is
           # where the pull happens.
           for attempt in 1 2 3 4 5; do
@@ -1258,12 +1352,12 @@ jobs:
             sleep 2
           done
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         with:
           version: "0.10.2"
           enable-cache: true
           cache-dependency-glob: "backend/uv.lock"
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
@@ -1281,7 +1375,11 @@ jobs:
           uv pip install -e ../sdks/python
           uv pip install -e "../cli[dev]"
 
-      # OCCLI-06 structural gate (1/2): no direct httpx/requests imports.
+      - name: CLI ruff check
+        working-directory: cli
+        run: uv run --project ../backend ruff check .
+
+      # Structural gate (1/2): no direct httpx/requests imports.
       # `grep -rE` returns exit 1 when no matches → success for us; flip
       # to fail if we DID match.
       - name: OCCLI-06 — no httpx/requests imports in cli/geolens_cli/
@@ -1293,7 +1391,7 @@ jobs:
           fi
           echo "OK: zero direct httpx/requests imports in cli/geolens_cli/"
 
-      # OCCLI-06 structural gate (2/2): cli/pyproject.toml declares no
+      # Structural gate (2/2): cli/pyproject.toml declares no
       # httpx or requests dep (transitive via the geolens SDK is fine).
       # Use system python (not `uv run`) — the script only needs stdlib
       # tomllib, and `uv run` from cli/ would force a separate cli/.venv
@@ -1341,19 +1439,21 @@ jobs:
   mcp-test:
     name: MCP Server Tests
     needs: changes
-    if: needs.changes.outputs.mcp == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.mcp == 'true' || (github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'merge_group'
     runs-on: ubuntu-26.04
     # Compose boot + image build for the live tier need headroom on a shared
     # runner; the e2e-smoke job uses the same budget for a larger stack.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         with:
           version: "0.10.2"
           enable-cache: true
           cache-dependency-glob: "mcp/pyproject.toml"
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
@@ -1363,7 +1463,7 @@ jobs:
       - name: MCP server unit tests
         run: make mcp-test
 
-      # ---- Live-contract tier (fix #827) ----
+      # ---- Live-contract tier ----
       # The unit tests above are transport-mocked and can't see a backend
       # change breaking what the tools actually return. Boot db+migrate+api
       # from THIS checkout (same .env recipe as the e2e jobs, minus the
@@ -1376,7 +1476,7 @@ jobs:
           # must be ≥ 32 chars to satisfy the Settings validator.
           sed -i -E 's|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=geolens_dev|' .env
           sed -i -E 's|^JWT_SECRET_KEY=.*|JWT_SECRET_KEY=mcp-live-secret-key-padding-32chars-min|' .env
-          # fix(#866 review r4): BOTH admin values must land in .env before
+          # BOTH admin values must land in .env before
           # compose up — .env.example ships GEOLENS_ADMIN_USERNAME= blank,
           # compose interpolates it with no default, and the boot guard
           # FATALs on an empty username. (The e2e jobs solve this by
@@ -1408,9 +1508,8 @@ jobs:
   backend-test:
     name: Backend Tests (${{ matrix.shard }}/4)
     needs: changes
-    # Alembic-only changes must run the suite too — this condition absorbed the
-    # deleted pytest-parallel-isolation job's trigger when that job folded in.
-    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.alembic == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    # Alembic-only changes must run the suite too.
+    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.alembic == 'true' || (github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'merge_group'
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     strategy:
@@ -1429,7 +1528,7 @@ jobs:
       POSTGRES_HOST: localhost
       POSTGRES_PORT: 5432
       POSTGRES_DB: postgres
-      # Must be ≥ 32 chars to satisfy the Settings validator (backend/app/config.py).
+      # Must be ≥ 32 chars to satisfy the Settings validator (backend/app/core/config.py).
       JWT_SECRET_KEY: test-secret-key-for-ci-padding-32chars
       GEOLENS_ADMIN_USERNAME: admin
       GEOLENS_ADMIN_PASSWORD: geolens-ci-admin-password
@@ -1442,6 +1541,8 @@ jobs:
       COVERAGE_FILE: coverage.shard-${{ matrix.shard }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Start PostgreSQL with PostGIS + pgvector
         working-directory: .
@@ -1450,10 +1551,9 @@ jobs:
         # apt steps, so this also gets a bound.
         timeout-minutes: 10
         run: |
-          # fix(#1859): the base-image pull inside `docker build` hit a
+          # The base-image pull inside `docker build` can hit a
           # transient Docker Hub token-fetch reset ("failed to fetch oauth
-          # token: ... connection reset by peer") in merge-group run
-          # 33966364665 and again on #1858's Backend Tests, evicting an
+          # token: ... connection reset by peer"), which would evict an
           # otherwise-clean queue entry. Retry the whole build, since that is
           # where the pull happens.
           for attempt in 1 2 3 4 5; do
@@ -1482,21 +1582,20 @@ jobs:
             sleep 2
           done
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         with:
           version: "0.10.2"
           enable-cache: true
           cache-dependency-glob: "backend/uv.lock"
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
       - name: Install system dependencies
         # See backup-roundtrip's "Install postgresql-client + tooling" for
-        # the full incident writeup (job 96122006694 stalled here for the
-        # full 10-minute cap on a silent https fallback our http-only
-        # timeout never bounded).
+        # the full incident writeup (a silent https fallback stalled a step
+        # for the full 10-minute cap, which an http-only timeout never bounds).
         timeout-minutes: 16
         run: |
           for i in 1 2 3; do
@@ -1505,6 +1604,8 @@ jobs:
               && break
             echo "apt attempt $i failed"
             [ "$i" = 3 ] && exit 1
+            # A stalled Azure mirror stays stalled for the retries, so fall back to archive.ubuntu.com.
+            sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt 2>/dev/null || true
             sudo pkill -TERM -x apt-get || true
             sudo pkill -TERM -x dpkg || true
             sleep 5
@@ -1564,7 +1665,7 @@ jobs:
           PGPASSWORD=geolens_test psql -h localhost -U geolens -d postgres -c \
             "ALTER DATABASE postgres SET search_path TO data, public;"
 
-      # MIG-03: autogenerate drift gate. With the DB now at head, `alembic check`
+      # Autogenerate drift gate. With the DB now at head, `alembic check`
       # exits non-zero if the ORM models have drifted from the migration scripts
       # (e.g. a model column added without a matching migration). env.py's
       # include_object filter hides extension-provided SAML columns when no
@@ -1584,6 +1685,26 @@ jobs:
             tests/test_manifest_apply_vrt.py \
             tests/test_manifest_apply_roundtrip.py \
             tests/test_layering.py
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        if: matrix.shard == 1
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+
+      - name: TypeScript SDK round trip against the in-process API
+        # The shards skip the Node-driven tests because nothing builds
+        # sdks/typescript/dist for them. Build it here, in one shard, and fail
+        # rather than skip if Node, dist or uvicorn is missing.
+        if: matrix.shard == 1
+        env:
+          GEOLENS_REQUIRE_TS_SDK: "1"
+          NPM_CONFIG_FETCH_TIMEOUT: "30000"
+          NPM_CONFIG_FETCH_RETRIES: "2"
+        run: |
+          (cd ../sdks/typescript && npm ci && npm run build)
+          uv run pytest -v tests/test_sdks_round_trip.py -k typescript
 
       - name: List this shard's tests
         # Compared with the full collection by the coverage job, so a test file
@@ -1615,10 +1736,9 @@ jobs:
 
       - name: Verify SAML fixtures unchanged after pytest
         run: |
-          # Catch BOTH modified-tracked-files (the original regression) AND
-          # newly-created fixture files like idp_response_*.xml.b64 — those
-          # are untracked after the originals were renamed to .template,
-          # and `git diff --quiet` would silently miss them.
+          # Catch BOTH modified tracked files AND newly-created fixture files
+          # like idp_response_*.xml.b64, which are untracked, so
+          # `git diff --quiet` would silently miss them.
           DIRTY=$(git status --porcelain -- tests/fixtures/saml/)
           if [ -n "$DIRTY" ]; then
             echo "::error::SAML fixture dir mutated by pytest run -- regression of phase 227 (saml-test-fixture-tmp-path)."
@@ -1630,7 +1750,7 @@ jobs:
 
       - name: Upload shard coverage data
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: backend-coverage-shard-${{ matrix.shard }}
           path: |
@@ -1643,18 +1763,17 @@ jobs:
         # scripts/ci_backend_shards.py --timings reads these to refresh the
         # per-file durations it balances the shards with.
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: backend-junit-shard-${{ matrix.shard }}
           path: backend/junit-shard-${{ matrix.shard }}.xml
           if-no-files-found: warn
           retention-days: 14
 
-      # fix(#1633): the gpkg byte-determinism gate
+      # The gpkg byte-determinism gate
       # (test_export_artifact_cache_1532.py::test_every_export_format_is_byte_deterministic)
-      # flaked once in a merge-group run and passed 10/10 locally right after —
-      # a rare, environment- or time-dependent nondeterminism the issue asks
-      # to gather evidence on at the next occurrence rather than guess at now.
+      # can fail rarely, in an environment- or time-dependent way, so a failure
+      # uploads evidence instead of leaving the cause to a guess.
       # This job runs pytest directly on the runner (Postgres is started via
       # a plain `docker run`, not docker compose exec into a container), so
       # `backend/test-artifacts/determinism/` — written by the test itself
@@ -1664,7 +1783,7 @@ jobs:
       # silently ANDs success()) so this only fires when a step above failed.
       - name: Upload determinism evidence
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: determinism-evidence-${{ matrix.shard }}
           path: backend/test-artifacts/determinism/
@@ -1695,14 +1814,16 @@ jobs:
       SHARD_COUNT: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         with:
           version: "0.10.2"
           enable-cache: true
           cache-dependency-glob: "backend/uv.lock"
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
@@ -1710,7 +1831,7 @@ jobs:
         run: uv sync --locked --dev
 
       - name: Download shard coverage data
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: backend-coverage-shard-*
           merge-multiple: true
@@ -1749,7 +1870,7 @@ jobs:
 
       - name: Upload backend coverage report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: backend-coverage
           path: |
@@ -1768,19 +1889,21 @@ jobs:
   alembic-clean-db:
     name: Alembic Clean-DB Upgrade
     needs: changes
-    if: needs.changes.outputs.alembic == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.alembic == 'true' || (github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'merge_group'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         with:
           version: "0.10.2"
           enable-cache: true
           cache-dependency-glob: "backend/uv.lock"
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
@@ -1796,11 +1919,55 @@ jobs:
           ALEMBIC_TEST_DB_PORT: 54399
           ALEMBIC_TEST_TIMEOUT: 90
 
+  # ---------- previous-release compatibility ----------
+  # A release's migrations run while the previous release's api and worker
+  # still serve, as in a rolling upgrade. Boot the newest release and the
+  # newest of the minor line before it from their published images, upgrade
+  # the schema to this tree's heads under them, then read a dataset, ingest
+  # one and list datasets. Advisory: it stays out of ci-ok and the queue.
+  previous-release-compat:
+    name: Previous-Release Compatibility
+    needs: changes
+    if: needs.changes.outputs.alembic == 'true' || needs.changes.outputs.compat == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+        with:
+          version: "0.10.2"
+          enable-cache: true
+          cache-dependency-glob: "backend/uv.lock"
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.14"
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: uv sync --locked --no-dev
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run the previous releases against this schema
+        run: scripts/previous-release-compat.sh
+
   # ---------- frontend ----------
   frontend-lint:
     name: Frontend Lint & Typecheck
     needs: changes
-    if: needs.changes.outputs.frontend == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.frontend == 'true' || (github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'merge_group'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     defaults:
@@ -1809,20 +1976,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         with:
           version: "0.10.2"
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
-        # fix(#1816): same npm-ci-stall settings as License Check
+        # Same npm-ci-stall settings as License Check
         # (frontend)'s Install step, applied here for consistency —
         # any job restoring the npm cache and then fetching from the
         # registry can hit the same registry stall.
@@ -1847,13 +2015,12 @@ jobs:
       - name: ESLint
         run: npm run lint
 
-      # fix(#836): the four sec lint pins existed in package.json but nothing ran
+      # The four sec lint pins in package.json need a step to run
       # them. The *-regression scripts strip inline eslint-disable comments and
       # assert the security rule still FIRES on its fixture (exit != 0); the
       # *-no-false-positive scripts assert the sanitized fixture stays clean.
       # Without this step, an eslint-config change that silently drops
-      # SEC-S14 (token-in-localStorage ban) or SEC-FU-03 (react/no-danger)
-      # would land unnoticed.
+      # the token-in-localStorage ban or react/no-danger would land unnoticed.
       - name: ESLint security-rule regression pins
         run: |
           npm run lint:sec-s14-regression
@@ -1867,10 +2034,14 @@ jobs:
         # type gate is `tsc -b --noEmit`, which walks the project references.
         run: npm run typecheck
 
+      - name: Unused exports and files
+        # Test files count as consumers, so this is knip's default mode; see knip.jsonc.
+        run: npm run knip
+
   frontend-test:
     name: Frontend Tests
     needs: changes
-    if: needs.changes.outputs.frontend == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.frontend == 'true' || (github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'merge_group'
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     defaults:
@@ -1878,15 +2049,17 @@ jobs:
         working-directory: frontend
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
-        # fix(#1816): same npm-ci-stall settings as License Check
+        # Same npm-ci-stall settings as License Check
         # (frontend)'s Install step, applied here for consistency —
         # any job restoring the npm cache and then fetching from the
         # registry can hit the same registry stall.
@@ -1901,7 +2074,7 @@ jobs:
 
       - name: Upload frontend coverage report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: frontend-coverage
           path: frontend/coverage/
@@ -1916,8 +2089,7 @@ jobs:
     runs-on: ubuntu-26.04
     if: always()  # run even if other jobs fail
     timeout-minutes: 5
-    # fix(#1816 round 2): job-scoped, not step-scoped. Codex round 1 on #1818
-    # caught that a step-level env: on "Install frontend dependencies" only
+    # job-scoped, not step-scoped: a step-level env: on "Install frontend dependencies" only
     # covers `npm ci` — the next step's two `npx --yes license-checker`
     # calls fetch that package over the network too (it's in neither
     # package.json nor package-lock.json, unlike `npx playwright` elsewhere
@@ -1931,8 +2103,10 @@ jobs:
       NPM_CONFIG_LOGLEVEL: http
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -1940,8 +2114,7 @@ jobs:
 
       - name: Install frontend dependencies (locked)
         working-directory: frontend
-        # fix(#1816): three PR runs on 2026-09-03 (License Check job,
-        # runs 33814256132, 33817442567 x2) printed nothing for five
+        # PR runs of the License Check job have printed nothing for five
         # minutes after the npm cache restored, then hit the job's
         # timeout-minutes cap with the run marked "cancelled" rather
         # than failed. npm's own defaults (`npm config list -l`:
@@ -1977,7 +2150,7 @@ jobs:
             --summary
 
       - name: Upload license report
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: license-report
           path: artifacts/license-report.json
@@ -1987,7 +2160,7 @@ jobs:
   security-scan:
     name: Security Scan
     needs: changes
-    if: needs.changes.outputs.backend == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.backend == 'true' || (github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'merge_group'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     defaults:
@@ -1995,14 +2168,16 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         with:
           version: "0.10.2"
           enable-cache: true
           cache-dependency-glob: "backend/uv.lock"
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
@@ -2022,20 +2197,18 @@ jobs:
   # or cancelled fails it; skipped and success pass. Branch protection should
   # require THIS single context instead of the individual skippable jobs.
   #
-  # fix(#1000): "skipped counts as pass" is right for a path-filtered PR and
+  # "skipped counts as pass" is right for a path-filtered PR and
   # would be a hole in the merge queue, where a skip means "never ran against
-  # this candidate merge". It is not fixed HERE — the rule stays as it is —
-  # because the honest fix is upstream: every job in this list now actually
+  # this candidate merge". The rule stays as it is
+  # because every job in this list actually
   # RUNS on merge_group, so there is nothing to mis-credit. If you add a job to
   # this aggregator, give it a merge_group clause too, or you have quietly
   # reopened the hole.
   #
-  # fix(#1096): accessibility and stac-validate USED TO be listed here as
-  # deliberately off merge_group. That reasoning held only while the queue was
-  # off. With it on, "still runs when the batch lands on main" meant they could
-  # not block the commit that broke them, and neither was in this list, so a
-  # failure gated nothing anywhere and just painted main red with no owner.
-  # Both now run on merge_group and appear below.
+  # Accessibility and stac-validate run on merge_group and are listed here:
+  # a job that only runs once the batch lands on main cannot block the commit
+  # that broke it, so a failure would gate nothing and just paint main red
+  # with no owner.
   #
   # Still deliberately off merge_group: runtime-extension-image-probe (builds
   # images), e2e-test (the full nightly suite) and ai-evals (spends provider
@@ -2058,28 +2231,28 @@ jobs:
       - frontend-lint
       - frontend-test
       - security-scan
-      # fix(#1521 review): the promtool suite gates nothing unless it is here —
+      # The promtool suite gates nothing unless it is here:
       # branch protection only sees CI OK.
       - monitoring-rules
-      # fix(#824): always-run jobs must feed the aggregator too — before this,
+      # Always-run jobs must feed the aggregator too: otherwise
       # a failure in version-coherence or docs-contract could not block a
       # merge (branch protection only sees CI OK). changes and pre-commit are
       # included so the aggregator is complete on its own: a failed `changes`
       # job skips every path-filtered job above, which would otherwise leave
       # CI OK green having gated nothing. license-check stays OUT on purpose:
-      # ADMIN-13 mandates it is advisory, and test_phase_279_compose_ci.py::
+      # it is advisory, and test_phase_279_compose_ci.py::
       # test_license_check_job_is_non_blocking fails any `needs:` on it.
       - changes
       - pre-commit
       - version-coherence
       - docs-contract
       - readme-assets
-      # fix(#825): PR-only browser gate; skipped (non-stack PRs, push, cron)
+      # PR-only browser gate; skipped (non-stack PRs, push, cron)
       # counts as pass below, failed blocks the merge.
       - e2e-smoke
-      # fix(#1096): skipped on PRs (both stay off pull_request), which the step
-      # below counts as pass, so per-PR cost stays zero. They RUN on
-      # merge_group and on push, and there a failure blocks.
+      # Skipped on PRs (both stay off pull_request), which the step below
+      # counts as pass, so per-PR cost stays zero. They run on merge_group, and
+      # on a push the queue did not already pass, and there a failure blocks.
       - accessibility
       - stac-validate
     # always() alone would rubber-stamp: it only guarantees this job RUNS.
@@ -2101,19 +2274,18 @@ jobs:
           fi
           echo "OK: no needed job failed (skipped counts as pass)"
 
-  # ---------- WORK-04: runtime extension image probe matrix ----------
+  # ---------- runtime extension image probe matrix ----------
   # Builds BOTH the 'api' and 'worker' image targets and runs a python probe
   # asserting the in-repo dummy runtime extension (not Default) resolves on each.
   #
-  # Proof: WORK-01/02/03 worker bootstrap fix holds across both runtime images
-  # in a real container (not just in pytest). The dummy runtime extension keeps
+  # Proof: the worker bootstrap holds across both runtime images in a real
+  # container (not just in pytest). The dummy runtime extension keeps
   # the probe self-contained in the public source tree.
   #
-  # Trigger scope: push to main + manual dispatch only (pin-sha-probe-push-only
-  # decision). This conserves geolens-io free-tier Actions minutes — PRs do not
-  # burn two docker-build+run cycles per push (the FULL e2e suite follows the
-  # same convention; PRs run only the core smoke subset — #825).
-  # References: WORK-04.
+  # Trigger scope: push to main + manual dispatch only. This conserves
+  # geolens-io free-tier Actions minutes — PRs do not burn two
+  # docker-build+run cycles per push (the FULL e2e suite follows the same
+  # convention; PRs run only the core smoke subset).
   runtime-extension-image-probe:
     name: "Runtime Extension Image Probe (${{ matrix.target }})"
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
@@ -2125,6 +2297,8 @@ jobs:
         target: [api, worker]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Build ${{ matrix.target }} image with dummy runtime extension fixture baked in
         run: |
@@ -2172,7 +2346,7 @@ jobs:
   # Runs on the nightly `schedule` cron and manual `workflow_dispatch` ONLY — it
   # stays skipped on push/PR so the FULL dockerized browser matrix never burns
   # the free-tier Actions budget per-PR. PRs get the small e2e:smoke:core subset
-  # via the e2e-smoke job below (fix #825). Reviewers still run the remaining
+  # via the e2e-smoke job below. Reviewers still run the remaining
   # groups (`npm run e2e:smoke[:audit]`) locally before approving user-flow
   # changes; the cron provides the recurring full-suite signal, and a red
   # nightly files/refreshes a tracking issue (nightly-e2e-report, end of file).
@@ -2187,22 +2361,26 @@ jobs:
       && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-26.04
     needs: [backend-lint, backend-test, frontend-lint, frontend-test, security-scan]
-    # A clean run includes fixture ingestion, 150+ checks, retries, and cleanup.
-    # Keep enough headroom for the whole suite to finish on a shared runner.
-    timeout-minutes: 30
-    # fix(#896): failing spec names travel to nightly-e2e-report as a job
+    # A clean run takes about 27 minutes. Playwright's CI globalTimeout stops
+    # the main suite at 30, so failing specs that each burn their retries
+    # still reach the failure summary below. The cap also covers a slow setup:
+    # the browser install alone may take 13 minutes.
+    timeout-minutes: 50
+    # Failing spec names travel to nightly-e2e-report as a job
     # output (readable from `needs` even when this job fails), so the
     # tracking issue can name specs instead of only "e2e-test: failure".
     outputs:
       failed_specs: ${{ steps.failed-specs.outputs.list }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Create .env file
         run: |
           cp .env.example .env
           # Override the dev defaults with CI-distinct values. JWT_SECRET_KEY must
-          # be ≥ 32 chars to satisfy the Settings validator (backend/app/config.py).
+          # be ≥ 32 chars to satisfy the Settings validator (backend/app/core/config.py).
           sed -i -E 's|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=geolens_dev|' .env
           sed -i -E 's|^JWT_SECRET_KEY=.*|JWT_SECRET_KEY=e2e-test-secret-key-padding-32chars-min|' .env
           sed -i -E 's|^GEOLENS_ADMIN_PASSWORD=.*|GEOLENS_ADMIN_PASSWORD=geolens-ci-admin-password|' .env
@@ -2216,14 +2394,14 @@ jobs:
       - name: Start services
         run: docker compose up -d --wait --wait-timeout 120
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: package-lock.json
 
       - name: Install dependencies
-        # fix(#1816): same npm-ci-stall settings as License Check
+        # Same npm-ci-stall settings as License Check
         # (frontend)'s Install step, applied here for consistency —
         # any job restoring the npm cache and then fetching from the
         # registry can hit the same registry stall.
@@ -2251,22 +2429,21 @@ jobs:
         run: |
           # playwright install-deps shells out to its own `apt-get update &&
           # apt-get install` for font/library packages, with no timeout of
-          # its own (2026-08-19: jobs 96101445154, 96108423519 both burned
-          # the full step cap inside it). Three independent bounds, because
+          # its own (it has burned the full step cap). Three independent bounds, because
           # apt's own Acquire::http::Timeout is a socket INACTIVITY timeout,
           # not a minimum-transfer-rate one:
           #   - a genuinely dead connection is caught by the apt.conf.d
           #     write below.
           #   - a connection that stays open but trickles a few KB/s never
-          #     goes inactive, so apt's timeout never fires (job
-          #     96108423519 took 5m26s to fetch a 5.6 MB font package from a
-          #     degraded azure.archive.ubuntu.com mirror). `timeout -k 10
+          #     goes inactive, so apt's timeout never fires (one run took
+          #     5m26s to fetch a 5.6 MB font package from a degraded
+          #     mirror). `timeout -k 10
           #     180` bounds each attempt regardless of why it's slow.
           #   - `timeout` only signals its DIRECT child; the real apt-get is
           #     a grandchild (npx -> node -> sudo -> sh -c -> apt-get) that
           #     sudo places outside its reach, so a cut attempt leaves
-          #     apt-get running and holding the dpkg lock (job 96120667995:
-          #     attempts 2 and 3 both died instantly with "Could not get
+          #     apt-get running and holding the dpkg lock (retry
+          #     attempts then died instantly with "Could not get
           #     lock /var/lib/dpkg/lock-frontend. It is held by process
           #     12362 (apt-get)"). Kill it and wait for it to actually exit
           #     before retrying. psmisc (fuser) is not confirmed installed
@@ -2293,6 +2470,8 @@ jobs:
             timeout -k 10 180 npx playwright install --with-deps chromium && break
             echo "playwright install attempt $i failed"
             [ "$i" = 3 ] && exit 1
+            # A stalled Azure mirror stays stalled for the retries, so fall back to archive.ubuntu.com.
+            sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt 2>/dev/null || true
             sudo pkill -TERM -x apt-get || true
             sudo pkill -TERM -x dpkg || true
             sleep 5
@@ -2318,25 +2497,22 @@ jobs:
       - name: Run E2E tests
         run: npx playwright test
 
-      # fix(#524 B-036): the builder-hardening suite previously ran in NO CI
-      # trigger (this job runs only the default config), so a red hardening
-      # gate on main was invisible. Chromium projects only: the runner
+      # The default config does not cover the builder-hardening suite, so
+      # it needs its own step. Chromium projects only: the runner
       # installs chromium alone, and the firefox/webkit projects are a local
       # reviewer concern. --reporter=line keeps it from clobbering the main
       # suite's playwright-report/ artifact.
       #
-      # fix(#1778): chromium-hardening-dark (light-mode gap closed for this
-      # config) was defined but never selected here, so it never actually
-      # ran in CI. Both chromium projects in one invocation; still no
+      # Both chromium projects (light and dark) run in one invocation; still no
       # firefox/webkit install needed since both are chromium under the
       # hood, just a different colorScheme.
       - name: Run builder-hardening E2E suite (chromium, light + dark)
         run: npx playwright test -c playwright.builder-hardening.config.ts --project=chromium-hardening --project=chromium-hardening-dark --reporter=line
 
-      # fix(#896): extract the failing spec names from the json reporter
+      # Extract the failing spec names from the json reporter
       # output (playwright.config.ts) so the nightly report can say WHICH
-      # specs are red and how many attempts each burned — the six-day
-      # dataset-chat rot was invisible behind a bare "e2e-test: failure".
+      # specs are red and how many attempts each burned, instead of a bare
+      # "e2e-test: failure".
       # Runs on failure too (the interesting case); a missing summary file
       # (e.g. npm ci died before Playwright ran) yields an empty output.
       # The builder-hardening suite uses --reporter=line and is not itemized.
@@ -2359,7 +2535,7 @@ jobs:
 
       - name: Upload test results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: playwright-test-results
           path: test-results/
@@ -2367,7 +2543,7 @@ jobs:
 
       - name: Upload Playwright report
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: playwright-report
           path: playwright-report/
@@ -2382,9 +2558,9 @@ jobs:
         run: docker compose down
 
   # ---------- E2E smoke (PR gate) ----------
-  # fix(#825): the browser suites used to run nightly ONLY, so a PR that broke
-  # a core user flow merged green and the breakage surfaced days later — and
-  # compounded when the nightly itself was silently cancelled (see the
+  # A nightly-only browser suite lets a PR that breaks
+  # a core user flow merge green, and the breakage surfaces days later (the
+  # nightly was once silently cancelled; see the
   # concurrency comment at the top of this file). This job runs the small
   # `e2e:smoke:core` script (root package.json; ~1 min of specs against the
   # composed stack) on PRs whose changes can affect it, per the `e2e` path
@@ -2394,7 +2570,7 @@ jobs:
   e2e-smoke:
     name: E2E Smoke (core)
     needs: changes
-    # fix(#1000): unconditional on merge_group — no path filter, because there
+    # Unconditional on merge_group — no path filter, because there
     # is no reliable one there (see the `changes` job) and because the queue is
     # the last gate before main. It is also the one job in `ci-ok` whose whole
     # purpose is catching what a COMBINATION breaks: two PRs can each leave the
@@ -2409,12 +2585,14 @@ jobs:
       # The recipe below mirrors the nightly e2e-test job above — same .env
       # shape, same compose boot, same toolchain — only the spec set differs.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Create .env file
         run: |
           cp .env.example .env
           # Override the dev defaults with CI-distinct values. JWT_SECRET_KEY must
-          # be ≥ 32 chars to satisfy the Settings validator (backend/app/config.py).
+          # be ≥ 32 chars to satisfy the Settings validator (backend/app/core/config.py).
           sed -i -E 's|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=geolens_dev|' .env
           sed -i -E 's|^JWT_SECRET_KEY=.*|JWT_SECRET_KEY=e2e-test-secret-key-padding-32chars-min|' .env
           sed -i -E 's|^GEOLENS_ADMIN_PASSWORD=.*|GEOLENS_ADMIN_PASSWORD=geolens-ci-admin-password|' .env
@@ -2428,14 +2606,14 @@ jobs:
       - name: Start services
         run: docker compose up -d --wait --wait-timeout 120
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: package-lock.json
 
       - name: Install dependencies
-        # fix(#1816): same npm-ci-stall settings as License Check
+        # Same npm-ci-stall settings as License Check
         # (frontend)'s Install step, applied here for consistency —
         # any job restoring the npm cache and then fetching from the
         # registry can hit the same registry stall.
@@ -2463,22 +2641,21 @@ jobs:
         run: |
           # playwright install-deps shells out to its own `apt-get update &&
           # apt-get install` for font/library packages, with no timeout of
-          # its own (2026-08-19: jobs 96101445154, 96108423519 both burned
-          # the full step cap inside it). Three independent bounds, because
+          # its own (it has burned the full step cap). Three independent bounds, because
           # apt's own Acquire::http::Timeout is a socket INACTIVITY timeout,
           # not a minimum-transfer-rate one:
           #   - a genuinely dead connection is caught by the apt.conf.d
           #     write below.
           #   - a connection that stays open but trickles a few KB/s never
-          #     goes inactive, so apt's timeout never fires (job
-          #     96108423519 took 5m26s to fetch a 5.6 MB font package from a
-          #     degraded azure.archive.ubuntu.com mirror). `timeout -k 10
+          #     goes inactive, so apt's timeout never fires (one run took
+          #     5m26s to fetch a 5.6 MB font package from a degraded
+          #     mirror). `timeout -k 10
           #     180` bounds each attempt regardless of why it's slow.
           #   - `timeout` only signals its DIRECT child; the real apt-get is
           #     a grandchild (npx -> node -> sudo -> sh -c -> apt-get) that
           #     sudo places outside its reach, so a cut attempt leaves
-          #     apt-get running and holding the dpkg lock (job 96120667995:
-          #     attempts 2 and 3 both died instantly with "Could not get
+          #     apt-get running and holding the dpkg lock (retry
+          #     attempts then died instantly with "Could not get
           #     lock /var/lib/dpkg/lock-frontend. It is held by process
           #     12362 (apt-get)"). Kill it and wait for it to actually exit
           #     before retrying. psmisc (fuser) is not confirmed installed
@@ -2505,6 +2682,8 @@ jobs:
             timeout -k 10 180 npx playwright install --with-deps chromium && break
             echo "playwright install attempt $i failed"
             [ "$i" = 3 ] && exit 1
+            # A stalled Azure mirror stays stalled for the retries, so fall back to archive.ubuntu.com.
+            sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt 2>/dev/null || true
             sudo pkill -TERM -x apt-get || true
             sudo pkill -TERM -x dpkg || true
             sleep 5
@@ -2532,7 +2711,7 @@ jobs:
 
       - name: Upload test results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: e2e-smoke-playwright-test-results
           path: test-results/
@@ -2540,7 +2719,7 @@ jobs:
 
       - name: Upload Playwright report
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: e2e-smoke-playwright-report
           path: playwright-report/
@@ -2555,9 +2734,8 @@ jobs:
         run: docker compose down
 
   # ---------- nightly live AI evals ----------
-  # fix(#548): the assertion-based NL→SQL evals (backend/tests/evals/, added in
-  # #537/#538) call the REAL Anthropic API and execute the generated SQL through
-  # the production sandbox. They cost provider tokens, so they run ONLY on
+  # The assertion-based NL→SQL evals (backend/tests/evals/) call the REAL
+  # Anthropic API and execute the generated SQL through the production sandbox. They cost provider tokens, so they run ONLY on
   # schedule/workflow_dispatch — never on push/PR (fork PRs receive no secrets
   # anyway, so they could never run there). A failure here signals prompt/model/
   # sandbox drift, not ordinary flake: generate_sql pins temperature 0.0 and the
@@ -2578,7 +2756,7 @@ jobs:
       POSTGRES_HOST: localhost
       POSTGRES_PORT: 5432
       POSTGRES_DB: postgres
-      # Must be ≥ 32 chars to satisfy the Settings validator (backend/app/config.py).
+      # Must be ≥ 32 chars to satisfy the Settings validator (backend/app/core/config.py).
       JWT_SECRET_KEY: test-secret-key-for-ci-padding-32chars
       GEOLENS_ADMIN_USERNAME: admin
       GEOLENS_ADMIN_PASSWORD: geolens-ci-admin-password
@@ -2589,6 +2767,8 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Start PostgreSQL with PostGIS + pgvector
         working-directory: .
@@ -2597,10 +2777,9 @@ jobs:
         # apt steps, so this also gets a bound.
         timeout-minutes: 10
         run: |
-          # fix(#1859): the base-image pull inside `docker build` hit a
+          # The base-image pull inside `docker build` can hit a
           # transient Docker Hub token-fetch reset ("failed to fetch oauth
-          # token: ... connection reset by peer") in merge-group run
-          # 33966364665 and again on #1858's Backend Tests, evicting an
+          # token: ... connection reset by peer"), which would evict an
           # otherwise-clean queue entry. Retry the whole build, since that is
           # where the pull happens.
           for attempt in 1 2 3 4 5; do
@@ -2629,21 +2808,20 @@ jobs:
             sleep 2
           done
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         with:
           version: "0.10.2"
           enable-cache: true
           cache-dependency-glob: "backend/uv.lock"
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
       - name: Install system dependencies
         # See backup-roundtrip's "Install postgresql-client + tooling" for
-        # the full incident writeup (job 96122006694 stalled here for the
-        # full 10-minute cap on a silent https fallback our http-only
-        # timeout never bounded).
+        # the full incident writeup (a silent https fallback stalled a step
+        # for the full 10-minute cap, which an http-only timeout never bounds).
         timeout-minutes: 16
         run: |
           for i in 1 2 3; do
@@ -2652,6 +2830,8 @@ jobs:
               && break
             echo "apt attempt $i failed"
             [ "$i" = 3 ] && exit 1
+            # A stalled Azure mirror stays stalled for the retries, so fall back to archive.ubuntu.com.
+            sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt 2>/dev/null || true
             sudo pkill -TERM -x apt-get || true
             sudo pkill -TERM -x dpkg || true
             sleep 5
@@ -2693,16 +2873,17 @@ jobs:
       - name: Run live AI evals (NL→SQL and tool choice)
         run: uv run pytest tests/evals/ -v --tb=short
 
-  # ---- E2E / A11Y trigger matrix (REL-03) ----
+  # ---- E2E / A11Y trigger matrix ----
   # nightly cron ("0 7 * * *") + workflow_dispatch → e2e-test (full npx playwright test
   #                                                  + builder-hardening chromium suite)
   # release tag push (v*)                         → prod-smoke.yml (e2e:smoke:audit against
   #                                                  published images), gates release.yml via
   #                                                  workflow_run on "Prod Compose Smoke"
-  # pull_request (e2e path filter)                → e2e-smoke (e2e:smoke:core only — fix #825)
-  # push(main) + nightly + dispatch               → accessibility (axe + keyboard-nav, below)
-  # push(main) + nightly + dispatch               → stac-validate (stac-api-validator, below)
+  # pull_request (e2e path filter) + merge_group  → e2e-smoke (e2e:smoke:core only)
+  # merge_group + unverified push + nightly + dispatch → accessibility (axe + keyboard-nav, below)
+  # merge_group + unverified push + nightly + dispatch → stac-validate (stac-api-validator, below)
   # nightly cron, e2e-test/accessibility not green → nightly-e2e-report (tracking issue, below)
+  # An unverified push is one with no passing merge-queue run for its SHA.
   accessibility:
     name: Accessibility (axe + keyboard-nav)
     # always() so this still evaluates when the needed jobs are SKIPPED on
@@ -2714,19 +2895,21 @@ jobs:
     # This job gates ci-ok, so in the queue it runs against the candidate merge
     # and a failure keeps it out. It needs only the lints and the security scan
     # (a few minutes), not the test suites: the browser suite does not depend
-    # on them, and waiting for the slowest backend shard put ~8 min of a11y on
-    # the critical path after ~18 min of pytest. Now it runs alongside the
+    # on them, and waiting for the slowest backend shard would put ~8 min of a11y on
+    # the critical path after ~18 min of pytest, so it runs alongside the
     # shards and finishes before they do.
     if: >-
       always()
-      && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
+      && ((github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
       && !contains(needs.*.result, 'failure')
       && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-26.04
-    needs: [backend-lint, frontend-lint, security-scan]
+    needs: [changes, backend-lint, frontend-lint, security-scan]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Create .env file
         run: |
@@ -2744,14 +2927,14 @@ jobs:
       - name: Start services
         run: docker compose up -d --wait --wait-timeout 120
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: package-lock.json
 
       - name: Install dependencies
-        # fix(#1816): same npm-ci-stall settings as License Check
+        # Same npm-ci-stall settings as License Check
         # (frontend)'s Install step, applied here for consistency —
         # any job restoring the npm cache and then fetching from the
         # registry can hit the same registry stall.
@@ -2779,22 +2962,21 @@ jobs:
         run: |
           # playwright install-deps shells out to its own `apt-get update &&
           # apt-get install` for font/library packages, with no timeout of
-          # its own (2026-08-19: jobs 96101445154, 96108423519 both burned
-          # the full step cap inside it). Three independent bounds, because
+          # its own (it has burned the full step cap). Three independent bounds, because
           # apt's own Acquire::http::Timeout is a socket INACTIVITY timeout,
           # not a minimum-transfer-rate one:
           #   - a genuinely dead connection is caught by the apt.conf.d
           #     write below.
           #   - a connection that stays open but trickles a few KB/s never
-          #     goes inactive, so apt's timeout never fires (job
-          #     96108423519 took 5m26s to fetch a 5.6 MB font package from a
-          #     degraded azure.archive.ubuntu.com mirror). `timeout -k 10
+          #     goes inactive, so apt's timeout never fires (one run took
+          #     5m26s to fetch a 5.6 MB font package from a degraded
+          #     mirror). `timeout -k 10
           #     180` bounds each attempt regardless of why it's slow.
           #   - `timeout` only signals its DIRECT child; the real apt-get is
           #     a grandchild (npx -> node -> sudo -> sh -c -> apt-get) that
           #     sudo places outside its reach, so a cut attempt leaves
-          #     apt-get running and holding the dpkg lock (job 96120667995:
-          #     attempts 2 and 3 both died instantly with "Could not get
+          #     apt-get running and holding the dpkg lock (retry
+          #     attempts then died instantly with "Could not get
           #     lock /var/lib/dpkg/lock-frontend. It is held by process
           #     12362 (apt-get)"). Kill it and wait for it to actually exit
           #     before retrying. psmisc (fuser) is not confirmed installed
@@ -2821,6 +3003,8 @@ jobs:
             timeout -k 10 180 npx playwright install --with-deps chromium && break
             echo "playwright install attempt $i failed"
             [ "$i" = 3 ] && exit 1
+            # A stalled Azure mirror stays stalled for the retries, so fall back to archive.ubuntu.com.
+            sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt 2>/dev/null || true
             sudo pkill -TERM -x apt-get || true
             sudo pkill -TERM -x dpkg || true
             sleep 5
@@ -2834,11 +3018,10 @@ jobs:
             sleep 10
           done
 
-      # fix(#1817): 2026-09-03 runs 33790017112 and 33815788642 both hit this
-      # job's 15-minute cap with the log frozen at "Running 68 tests using 1
-      # worker" — GitHub then marks every step "cancelled", which the two
-      # upload steps below (correctly) skip via !cancelled(), so the ejected
-      # #1798 queue run left no report to look at. playwright.config.ts's CI
+      # A run that hits this job's 15-minute cap with the log frozen at
+      # "Running 68 tests using 1 worker" gets every step marked "cancelled",
+      # which the two upload steps below (correctly) skip via !cancelled(), so
+      # the ejected queue run would leave no report to look at. playwright.config.ts's CI
       # reporter set ([github, html, json]) writes only at the end, so
       # nothing streams to the log while a run is in progress; --reporter
       # here is scoped to this invocation only (CLI --reporter replaces,
@@ -2880,7 +3063,7 @@ jobs:
 
       - name: Upload test results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: accessibility-playwright-test-results
           path: test-results/
@@ -2888,7 +3071,7 @@ jobs:
 
       - name: Upload Playwright report
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: accessibility-playwright-report
           path: playwright-report/
@@ -2913,14 +3096,16 @@ jobs:
     # security scan only, so it runs alongside the test shards.
     if: >-
       always()
-      && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
+      && ((github.event_name == 'push' && needs.changes.outputs.queue_verified != 'true') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
       && !contains(needs.*.result, 'failure')
       && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-26.04
-    needs: [backend-lint, frontend-lint, security-scan]
+    needs: [changes, backend-lint, frontend-lint, security-scan]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Create .env file
         run: |
@@ -2934,7 +3119,7 @@ jobs:
       # .env.example ships GEOLENS_ADMIN_USERNAME= EMPTY, OS env beats .env in
       # compose interpolation, and Settings accepts "" — without this export a
       # fresh stack seeds an admin whose username is the empty string and every
-      # admin login 401s (the failure mode of this job's first two runs).
+      # admin login 401s.
       - name: Export admin credentials
         run: |
           echo "GEOLENS_ADMIN_USERNAME=admin" >> $GITHUB_ENV
@@ -2962,10 +3147,8 @@ jobs:
         # port — because docker-compose.yml defaults PUBLIC_API_URL to
         # http://localhost:8080/api, so every link the STAC API emits points
         # there; pystac traversal follows links, and a direct-port root-url
-        # produces a split-brain URL surface. (The maiden-run failure blamed
-        # on the proxy was actually the empty admin username — see the export
-        # step above.) No -f/-s silent flags — on a bad response the body must
-        # land in the job log.
+        # produces a split-brain URL surface. No -f/-s silent flags — on a bad
+        # response the body must land in the job log.
         run: |
           for i in 1 2 3; do
             resp=$(curl -X POST http://localhost:8080/api/auth/login \
@@ -2999,9 +3182,9 @@ jobs:
         run: docker compose down
 
   # ---------- nightly red-run tracking issue ----------
-  # fix(#825): a red nightly was only visible in the Actions tab, and the cron
-  # was once silently cancelled for a week (see the concurrency comment at the
-  # top of this file) — the two gaps compounded. On scheduled runs this job
+  # A red nightly is otherwise only visible in the Actions tab, and the cron
+  # can be silently cancelled (see the concurrency comment at the top of this
+  # file). On scheduled runs this job
   # files the failure where it cannot be missed: it comments on the open
   # `nightly-e2e`-labelled tracking issue, or creates it if none is open.
   # Anything short of success counts — on schedule, e2e-test/accessibility
@@ -3026,7 +3209,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           E2E_RESULT: ${{ needs.e2e-test.result }}
           A11Y_RESULT: ${{ needs.accessibility.result }}
-          # fix(#896): spec-level detail from the json reporter, so a
+          # spec-level detail from the json reporter, so a
           # deterministic spec break reads differently from a flake without
           # anyone downloading traces.
           FAILED_SPECS: ${{ needs.e2e-test.outputs.failed_specs }}

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import type { ServiceAuthRequest } from '@/types/api';
 
 type ServiceCredentialMethod = 'none' | 'bearer' | 'basic' | 'header';
@@ -12,25 +13,21 @@ interface ServiceCredentialBlockProps {
 }
 
 /**
- * fix(#1746 B4, plan 3.1): the refresh door's WFS / OGC API Features
- * credential prompt. Sibling to `ArcgisCredentialBlock` in this same
- * directory — that component's own module comment already notes the two
- * are independent copies of one taxonomy, converging remains a follow-up —
- * so this one matches its conventions (own state, a callback rather than a
- * controlled value, cleared fields on a method switch) without trying to
- * unify the two.
+ * The refresh door's WFS / OGC API Features credential prompt. Sibling to
+ * `ArcgisCredentialBlock` in this directory, an independent copy of one
+ * taxonomy; it matches that component's conventions (own state, a callback
+ * rather than a controlled value, cleared fields on a method switch) without
+ * unifying the two.
  *
- * Backend B2b widened this door beyond a bearer-only token to the same
- * four-way `CredentialMethod` the ArcGIS block already offers a three-way
- * slice of (ArcGIS itself stays bearer-only — an ArcGIS token is
- * percent-encoded into the query, so `build_credential_header` never
- * composes a header for it — which is why ArcGIS keeps its own sign-in
- * option instead of gaining Basic/header here).
+ * Offers the same four-way `CredentialMethod` the ArcGIS block offers a
+ * three-way slice of. ArcGIS itself stays bearer-only (its token is
+ * percent-encoded into the query, so `build_credential_header` never composes
+ * a header for it), which is why ArcGIS keeps its own sign-in option instead of
+ * gaining Basic/header here.
  *
- * None of these three methods mints or expires a credential the way ArcGIS
- * sign-in does, so there is no imperative handle here for a synchronous
- * pre-submit expiry check — the parent reads whatever `onAuthChange` last
- * reported.
+ * None of these methods mints or expires a credential the way ArcGIS sign-in
+ * does, so there is no imperative handle for a synchronous pre-submit expiry
+ * check; the parent reads whatever `onAuthChange` last reported.
  */
 export function ServiceCredentialBlock({ onAuthChange, disabled }: ServiceCredentialBlockProps) {
   const { t } = useTranslation('dataset');
@@ -41,10 +38,10 @@ export function ServiceCredentialBlock({ onAuthChange, disabled }: ServiceCreden
   const [headerName, setHeaderName] = useState('');
   const [headerValue, setHeaderValue] = useState('');
 
-  // Reports the credential this block currently describes on every change,
-  // rather than the parent pulling it only at submit time — SourceRefreshAction
-  // clears its own copy on dialog close/submit the same way it clears the
-  // ArcGIS block's token, so it needs the live value, not just a snapshot.
+  // Reports the credential this block currently describes on every change
+  // rather than the parent pulling it at submit time: SourceRefreshAction
+  // clears its own copy on dialog close/submit as it does the ArcGIS block's
+  // token, so it needs the live value, not a snapshot.
   useEffect(() => {
     if (method === 'none') {
       onAuthChange(undefined);
@@ -89,18 +86,17 @@ export function ServiceCredentialBlock({ onAuthChange, disabled }: ServiceCreden
         <Label htmlFor="service-credential-method">
           {t('sourcePanel.refresh.credential.service.methodLabel')}
         </Label>
-        <select
-          id="service-credential-method"
-          value={method}
-          onChange={(event) => handleMethodChange(event.target.value)}
-          disabled={fieldsDisabled}
-          className="w-full rounded-md border border-border bg-surface-0 px-3 py-2 text-sm disabled:opacity-60"
-        >
-          <option value="none">{t('sourcePanel.refresh.credential.service.methodNone')}</option>
-          <option value="bearer">{t('sourcePanel.refresh.credential.service.methodBearer')}</option>
-          <option value="basic">{t('sourcePanel.refresh.credential.service.methodBasic')}</option>
-          <option value="header">{t('sourcePanel.refresh.credential.service.methodHeader')}</option>
-        </select>
+        <Select value={method} onValueChange={handleMethodChange} disabled={fieldsDisabled}>
+          <SelectTrigger id="service-credential-method" className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="none">{t('sourcePanel.refresh.credential.service.methodNone')}</SelectItem>
+            <SelectItem value="bearer">{t('sourcePanel.refresh.credential.service.methodBearer')}</SelectItem>
+            <SelectItem value="basic">{t('sourcePanel.refresh.credential.service.methodBasic')}</SelectItem>
+            <SelectItem value="header">{t('sourcePanel.refresh.credential.service.methodHeader')}</SelectItem>
+          </SelectContent>
+        </Select>
       </div>
 
       {method === 'bearer' && (

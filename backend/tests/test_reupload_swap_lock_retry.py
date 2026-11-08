@@ -1,7 +1,6 @@
-"""Regression test for ING-06 / P2-08: the reupload swap must retry once on lock_timeout failure.
+"""Regression test: the reupload swap must retry once on lock_timeout failure.
 
-Background — see ``.planning/audits/INGEST-AUDIT-2026-05-21.md`` P2-08:
-the swap ran ``SET LOCAL lock_timeout = '5s'`` before three
+Background: the swap ran ``SET LOCAL lock_timeout = '5s'`` before three
 ``ALTER TABLE ... RENAME TO`` statements. Under autovacuum contention on
 large tables the AccessExclusiveLock acquire failed at the 5s mark, AFTER
 staging had been loaded — surfacing a late, user-visible failure.
@@ -42,7 +41,7 @@ async def swap_in(session, *, dataset, staging_table, measurement, **writes):
     )
     await _take_catalog_rows(session, _SWAP, dataset)
     written = await _write_reupload_catalog(
-        session, dataset=dataset, measurement=measurement, **writes
+        session, dataset=dataset, measurement=measurement, field_labels=None, **writes
     )
     await catalog_locks.bump_tile_cache_version_on(session, dataset)
     return written
@@ -94,14 +93,16 @@ def _make_dataset_stub(table_name: str):
         current_version=1,
         tile_cache_version=1,
         source_url=None,
+        origin_ref=None,
         last_refreshed_at=None,
+        column_info=None,
     )
 
 
 def _stub_projection(monkeypatch, trace: list | None = None) -> None:
     """Stand in for ``project``, which writes catalog rows these stubs do not have."""
 
-    async def _project(session, dataset, measurement):
+    async def _project(session, dataset, measurement, **_):
         if trace is not None:
             trace.append(("write", "project"))
         return {}
@@ -264,7 +265,7 @@ class TestReuploadSwapRetry:
         ).scalar()
         assert staging_exists is False
 
-        # db-audit #529 BLOAT-3: the swap also renamed the staging-era PK
+        # The swap also renamed the staging-era PK
         # constraint, so direct-DB clients see `<live_table>_pkey`.
         pkey = (
             await self.session.execute(
@@ -288,7 +289,7 @@ class TestReuploadSwapRetry:
         assert dataset.tile_cache_version == 2
 
     async def test_service_swap_stamps_last_checked_at(self, monkeypatch) -> None:
-        """fix(#1271 review): a service reupload fetched its bytes from the
+        """A service reupload fetched its bytes from the
         origin moments before the swap, so the swap IS a contact. Clearing
         probe state without re-stamping the timestamp made the API claim the
         origin was never contacted right after it demonstrably was."""
@@ -369,7 +370,7 @@ class TestReuploadSwapRetry:
         # call inside ``_swap_with_timeout`` raises ``LockNotAvailableError``.
         original_execute = self.session.execute
         raised = {"once": False}
-        kept = previous_version_table(self.live, dataset.id)
+        kept = previous_version_table(self.live, dataset.id, 1)
 
         async def _flaky_execute(stmt, *args, **kwargs):
             # Only intercept the live-table rename on the first pass: the
@@ -442,7 +443,7 @@ class TestReuploadSwapRetry:
 
 
 class TestRenamePkeyToMatchTable:
-    """Direct coverage for ``rename_pkey_to_match_table`` (db-audit #529 BLOAT-3)."""
+    """Direct coverage for ``rename_pkey_to_match_table``."""
 
     _PKEY_SQL = (
         "SELECT con.conname FROM pg_constraint con "

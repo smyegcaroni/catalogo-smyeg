@@ -37,6 +37,8 @@ const reorderBasemapAboveDataMock = vi.mocked(reorderBasemapAboveData);
 function map(styleLoaded = true) {
   return {
     isStyleLoaded: vi.fn(() => styleLoaded),
+    getLayer: vi.fn(),
+    moveLayer: vi.fn(),
   } as unknown as MaplibreMap;
 }
 
@@ -65,6 +67,8 @@ function skyMap(initialSky?: Sky) {
       setMissingStyleImageResolver: vi.fn(),
       setSky,
       getSky: vi.fn(() => stored),
+      getLayer: vi.fn(),
+      moveLayer: vi.fn(),
     } as unknown as MaplibreMap,
     setSky,
     sky: () => stored,
@@ -73,7 +77,7 @@ function skyMap(initialSky?: Sky) {
 }
 
 // A map holding a real container element, so the space backdrop can be read
-// back the way the stylesheet selects it (feat(#1479)).
+// back the way the stylesheet selects it.
 function containerMap() {
   const container = document.createElement('div');
   container.className = 'maplibregl-map';
@@ -83,6 +87,8 @@ function containerMap() {
       setProjection: vi.fn(),
       setMissingStyleImageResolver: vi.fn(),
       getContainer: vi.fn(() => container),
+      getLayer: vi.fn(),
+      moveLayer: vi.fn(),
     } as unknown as MaplibreMap,
     container,
   };
@@ -166,7 +172,7 @@ describe('map composition sync', () => {
       expect.anything(),
       basemapConfig.sublayer_overrides,
       'viewer-source-',
-      1, // builder-audit #338 CORR-01: master opacity (config.opacity undefined → 1)
+      1, // Master opacity (config.opacity undefined → 1)
     );
     expect(reorderDataLayersMock).toHaveBeenCalledWith(expect.anything(), layers, 'viewer-');
     expect(callOrder).toEqual([
@@ -180,9 +186,9 @@ describe('map composition sync', () => {
     ]);
   });
 
-  it('applies the saved projection with the basemap appearance (feat(#845))', () => {
+  it('applies the saved projection with the basemap appearance', () => {
     const setProjection = vi.fn();
-    const target = { isStyleLoaded: vi.fn(() => true), setProjection } as unknown as MaplibreMap;
+    const target = { isStyleLoaded: vi.fn(() => true), setProjection, getLayer: vi.fn(), moveLayer: vi.fn() } as unknown as MaplibreMap;
 
     applyMapBasemapAppearance({
       map: target,
@@ -197,16 +203,16 @@ describe('map composition sync', () => {
 
     // setProjection is attempted even while isStyleLoaded() is false — it
     // only needs the style parsed, and gating on idle left a saved globe map
-    // visibly in mercator during slow tile loads (Codex P2 round 2 on #848).
+    // visibly in mercator during slow tile loads.
     setProjection.mockClear();
     applyMapBasemapAppearance({
-      map: { isStyleLoaded: vi.fn(() => false), setProjection } as unknown as MaplibreMap,
+      map: { isStyleLoaded: vi.fn(() => false), setProjection, getLayer: vi.fn(), moveLayer: vi.fn() } as unknown as MaplibreMap,
       basemapConfig: { projection: 'globe' } as MapBasemapConfig,
     });
     expect(setProjection).toHaveBeenCalledWith({ type: 'globe' });
   });
 
-  it('retries an unparsed-style projection on style.load and cancels stale retries (feat(#845))', () => {
+  it('retries an unparsed-style projection on style.load and cancels stale retries', () => {
     // A style that is not parsed yet makes setProjection throw.
     let styleParsed = false;
     const setProjection = vi.fn(() => {
@@ -214,7 +220,7 @@ describe('map composition sync', () => {
     });
     const once = vi.fn();
     const off = vi.fn();
-    const loading = { isStyleLoaded: vi.fn(() => false), setProjection, once, off } as unknown as MaplibreMap;
+    const loading = { isStyleLoaded: vi.fn(() => false), setProjection, once, off, getLayer: vi.fn(), moveLayer: vi.fn() } as unknown as MaplibreMap;
 
     applyMapBasemapAppearance({
       map: loading,
@@ -224,7 +230,7 @@ describe('map composition sync', () => {
     const globeRetry = once.mock.calls[0][1] as () => void;
 
     // A newer application cancels the stale retry, so a projection change
-    // during the load window can't be reverted (Codex P2 round 1 on #848).
+    // during the load window can't be reverted.
     applyMapBasemapAppearance({
       map: loading,
       basemapConfig: { projection: 'mercator' } as MapBasemapConfig,
@@ -239,10 +245,10 @@ describe('map composition sync', () => {
     expect(setProjection).toHaveBeenCalledWith({ type: 'mercator' });
   });
 
-  it('applies the globe atmosphere with the projection and resets it on mercator (feat(#1473))', () => {
+  it('applies the globe atmosphere with the projection and resets it on mercator', () => {
     const setProjection = vi.fn();
     const setSky = vi.fn();
-    const target = { isStyleLoaded: vi.fn(() => true), setProjection, setSky } as unknown as MaplibreMap;
+    const target = { isStyleLoaded: vi.fn(() => true), setProjection, setSky, getLayer: vi.fn(), moveLayer: vi.fn() } as unknown as MaplibreMap;
 
     applyMapBasemapAppearance({
       map: target,
@@ -261,7 +267,7 @@ describe('map composition sync', () => {
     // Sky is attempted on the same not-yet-idle path as the projection.
     setSky.mockClear();
     applyMapBasemapAppearance({
-      map: { isStyleLoaded: vi.fn(() => false), setProjection, setSky } as unknown as MaplibreMap,
+      map: { isStyleLoaded: vi.fn(() => false), setProjection, setSky, getLayer: vi.fn(), moveLayer: vi.fn() } as unknown as MaplibreMap,
       basemapConfig: { projection: 'globe' } as MapBasemapConfig,
     });
     expect(setSky).toHaveBeenCalledWith(
@@ -269,7 +275,7 @@ describe('map composition sync', () => {
     );
   });
 
-  it('layers the atmosphere over a style-provided sky and restores it (fix(#1474))', () => {
+  it('layers the atmosphere over a style-provided sky and restores it', () => {
     const styleSky = { 'sky-color': '#0b1026', 'horizon-color': '#7ba0c0' };
     const target = skyMap(styleSky);
     const globe = { projection: 'globe' } as MapBasemapConfig;
@@ -292,7 +298,7 @@ describe('map composition sync', () => {
     expect(target.sky()).toEqual({ 'sky-color': '#222222', 'atmosphere-blend': 0.8 });
   });
 
-  it('restores a style-provided atmosphere-blend verbatim (fix(#1474))', () => {
+  it('restores a style-provided atmosphere-blend verbatim', () => {
     const styleSky = { 'sky-color': '#000000', 'atmosphere-blend': 0.3 };
     const target = skyMap(styleSky);
 
@@ -306,7 +312,7 @@ describe('map composition sync', () => {
     expect(target.sky()).toEqual(styleSky);
   });
 
-  it('still resets after maplibre drops a no-op sky write (fix(#1474))', () => {
+  it('still resets after maplibre drops a no-op sky write', () => {
     // maplibre skips the assignment when the spec changes nothing, so what we
     // believe is on the map has to be read back rather than assumed.
     const target = skyMap();
@@ -320,7 +326,7 @@ describe('map composition sync', () => {
     expect(target.sky()).toBeUndefined();
   });
 
-  it('retries the globe sky on style.load with the projection (feat(#1473))', () => {
+  it('retries the globe sky on style.load with the projection', () => {
     // The projection throws first on an unparsed style, so the sky never runs
     // until the retry — proving it rides the same deferral.
     let styleParsed = false;
@@ -332,6 +338,8 @@ describe('map composition sync', () => {
     const off = vi.fn();
     const loading = {
       isStyleLoaded: vi.fn(() => false), setProjection, setSky, once, off,
+      getLayer: vi.fn(),
+      moveLayer: vi.fn(),
     } as unknown as MaplibreMap;
 
     applyMapBasemapAppearance({
@@ -357,6 +365,8 @@ describe('map composition sync', () => {
       setProjection: vi.fn(),
       setMissingStyleImageResolver: vi.fn(),
       setSky: throwingSky,
+      getLayer: vi.fn(),
+      moveLayer: vi.fn(),
       once: skyOnce,
       off: vi.fn(),
     } as unknown as MaplibreMap;
@@ -375,7 +385,7 @@ describe('map composition sync', () => {
     );
   });
 
-  it('marks the container for globe and unmarks it on mercator (feat(#1479))', () => {
+  it('marks the container for globe and unmarks it on mercator', () => {
     const target = containerMap();
 
     applyMapBasemapAppearance({
@@ -400,7 +410,7 @@ describe('map composition sync', () => {
     expect(target.container.hasAttribute('data-globe-space')).toBe(false);
   });
 
-  it('leaves the marker off a container it never set (feat(#1479))', () => {
+  it('leaves the marker off a container it never set', () => {
     // Reverting a map that was never a globe must not invent the attribute,
     // and removeAttribute on an absent attribute must stay silent.
     const target = containerMap();
@@ -408,7 +418,7 @@ describe('map composition sync', () => {
     expect(target.container.hasAttribute('data-globe-space')).toBe(false);
   });
 
-  it('keeps one surface\'s backdrop out of the other (feat(#1479))', () => {
+  it('keeps one surface\'s backdrop out of the other', () => {
     const builder = containerMap();
     const viewer = containerMap();
 
@@ -436,7 +446,7 @@ describe('map composition sync', () => {
     expect(viewer.container.getAttribute('data-globe-space')).toBe('true');
   });
 
-  it('does not wait for a parsed style to update the backdrop (feat(#1479))', () => {
+  it('does not wait for a parsed style to update the backdrop', () => {
     // The backdrop is DOM, not style state. Riding the projection's retry
     // would strand it behind any setProjection throw — the whole style.load
     // window on the way in, and forever if the throw had another cause.
@@ -445,6 +455,8 @@ describe('map composition sync', () => {
       isStyleLoaded: vi.fn(() => false),
       setProjection: vi.fn(() => { throw new Error('Style is not done loading'); }),
       getContainer: vi.fn(() => container),
+      getLayer: vi.fn(),
+      moveLayer: vi.fn(),
       once: vi.fn(),
       off: vi.fn(),
     } as unknown as MaplibreMap;
@@ -459,7 +471,7 @@ describe('map composition sync', () => {
     expect(container.hasAttribute('data-globe-space')).toBe(false);
   });
 
-  it('reports the backdrop to capture paths through hasGlobeSpaceBackdrop (fix(#1479))', () => {
+  it('reports the backdrop to capture paths through hasGlobeSpaceBackdrop', () => {
     // Image captures read this instead of re-deriving globeness, so it has to
     // track the marker exactly — including for a map that cannot be marked.
     const target = containerMap();
@@ -477,7 +489,7 @@ describe('map composition sync', () => {
     expect(hasGlobeSpaceBackdrop(map())).toBe(false);
   });
 
-  it('tolerates a map with no container (feat(#1479))', () => {
+  it('tolerates a map with no container', () => {
     expect(() =>
       applyMapBasemapAppearance({
         map: map(),
@@ -509,7 +521,7 @@ describe('map composition sync', () => {
       expect.anything(),
       basemapConfig.sublayer_overrides,
       'viewer-source-',
-      1, // builder-audit #338 CORR-01: master opacity (config.opacity undefined → 1)
+      1, // Master opacity (config.opacity undefined → 1)
     );
     expect(applyBasemapConfigToMapMock).not.toHaveBeenCalled();
     expect(reorderBasemapLabelsMock).not.toHaveBeenCalled();

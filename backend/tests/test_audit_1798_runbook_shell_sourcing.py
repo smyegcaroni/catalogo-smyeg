@@ -1,4 +1,4 @@
-"""fix(#1798 review round 11 audit, P1): RUNBOOK.md told operators to
+"""RUNBOOK.md told operators to
 `set -a; . ./.env; set +a` in three places (globals restore, runtime-role
 verification, role rotation) — exactly the shell-sourcing restore.sh's own
 header explains get_env_value exists to avoid: `.` executes the file, so an
@@ -46,12 +46,43 @@ def test_runbook_does_not_shell_source_env() -> None:
     )
 
 
+# env-value.sh exits 1 with no output when the key is absent from .env, so a bare
+# `VAR="$(scripts/env-value.sh KEY)"` blanks a value supplied only through the
+# environment. Snippets assign through `if _v=...; then VAR="$_v"; fi` instead.
+_UNGUARDED_ENV_VALUE = re.compile(
+    r'^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*="\$\(scripts/env-value\.sh',
+    re.MULTILINE,
+)
+
+
+def test_runbook_env_value_assignments_are_guarded() -> None:
+    for bad in (
+        'POSTGRES_DB="$(scripts/env-value.sh POSTGRES_DB)"',
+        '  POSTGRES_DB="$(scripts/env-value.sh POSTGRES_DB)"',
+        'export POSTGRES_DB="$(scripts/env-value.sh POSTGRES_DB)"',
+    ):
+        assert _UNGUARDED_ENV_VALUE.search(bad), bad
+    assert not _UNGUARDED_ENV_VALUE.search(
+        'if _v="$(scripts/env-value.sh POSTGRES_DB)"; then POSTGRES_DB="$_v"; fi'
+    )
+    match = _UNGUARDED_ENV_VALUE.search(_read("RUNBOOK.md"))
+    assert match is None, (
+        f"unguarded env-value.sh assignment in RUNBOOK.md: {match.group(0)!r}"
+    )
+
+
 def test_runbook_uses_the_env_value_wrapper_for_postgres_settings() -> None:
     body = _read("RUNBOOK.md")
     assert "scripts/env-value.sh POSTGRES_USER" in body
     assert "scripts/env-value.sh POSTGRES_DB" in body
-    assert "scripts/env-value.sh GEOLENS_RUNTIME_DB_ROLE" in body
-    assert "scripts/env-value.sh GEOLENS_RUNTIME_DB_PASSWORD" in body
+
+
+def test_runbook_keeps_the_runtime_password_off_the_host_command_line() -> None:
+    body = _read("RUNBOOK.md")
+    # Expanding the password in the host shell puts it in `ps` output; the
+    # snippet must read it from the db container's own environment instead.
+    assert 'sh -c \'PGPASSWORD="$GEOLENS_RUNTIME_DB_PASSWORD"' in body
+    assert "env PGPASSWORD=" not in body
 
 
 def test_env_value_wrapper_script_exists_and_is_executable() -> None:

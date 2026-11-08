@@ -30,9 +30,7 @@
     "byVisibility": "Datensätze nach Sichtbarkeit",
     "noDatasets": "Noch keine Datensätze",
     "errorLoading": "Statistiken konnten nicht geladen werden: {{message}}",
-    "totalUsers": "Benutzer gesamt",
-    "usersByStatus": "Benutzer nach Status",
-    "noUsers": "Noch keine Benutzer"
+    "totalUsers": "Benutzer gesamt"
   },
   "users": {
     "title": "Benutzer",
@@ -226,7 +224,7 @@
     }
   },
   "audit": {
-    "title": "Protokoll",
+    "title": "Audit-Protokoll",
     "loading": "Protokolleinträge werden geladen...",
     "errorLoading": "Protokolleinträge konnten nicht geladen werden: {{message}}",
     "searchPlaceholder": "Benutzer / Aktion",
@@ -236,11 +234,6 @@
       "user": "Benutzer",
       "allUsers": "Alle Benutzer",
       "allActions": "Alle Aktionen",
-      "datasetView": "Datensatz angesehen",
-      "datasetExport": "Datensatz exportiert",
-      "metadataEdit": "Metadaten bearbeitet",
-      "datasetCreate": "Datensatz erstellt",
-      "datasetDelete": "Datensatz gelöscht",
       "action": "Aktion",
       "userId": "Benutzer-ID",
       "resourceType": "Ressourcentyp",
@@ -355,6 +348,8 @@
     "openaiKeyRequired": "OPENAI_API_KEY ist nicht gesetzt. Die Embedding-Generierung erfordert einen OpenAI-kompatiblen API-Schlüssel.",
     "keyConfigured": "konfiguriert",
     "keyNotSet": "nicht konfiguriert",
+    "claudePlatformConfigured": "Claude auf {{platform}}: konfiguriert",
+    "claudePlatformNotConfigured": "Claude auf {{platform}}: nicht konfiguriert",
     "testConnection": "Verbindung testen",
     "testing": "Wird getestet…",
     "testConnectionDescription": "Führt einen Live-Aufruf an jeden konfigurierten Anbieter aus, um Schlüssel und Konnektivität zu prüfen. Verbraucht eine kleine Menge Anbieter-Tokens.",
@@ -391,6 +386,20 @@
     "scope": "Berechtigung",
     "scopeFull": "Voller Zugriff",
     "scopeReadOnly": "Nur Lesen",
+    "scopePublish": "Veröffentlichen",
+    "scopePublishDescription": "Fügt eigene Daten und Karten hinzu, bearbeitet die Angaben eigener Datensätze und ersetzt hochgeladene Datensätze; frühere Versionen bleiben erhalten. Kann nichts öffentlich machen oder die Sichtbarkeit eines Datensatzes erweitern, keine bestehende Karte aktualisieren, keine Raster-Datensätze oder an einen Dienst, ein STAC-Element oder eine Tabelle gebundene Datensätze ersetzen, keine Features schreiben und nichts löschen.",
+    "scopeDatasetWrite": "Ein Datensatz",
+    "scopeDatasetAppend": "Ein Datensatz, nur hinzufügen",
+    "expiry": "Läuft ab",
+    "expiryOptions": {
+      "never": "Läuft nie ab",
+      "30d": "30 Tage",
+      "90d": "90 Tage",
+      "1y": "1 Jahr"
+    },
+    "expired": "Abgelaufen",
+    "expiresOn": "Läuft ab am {{date}}",
+    "expiredOn": "Abgelaufen am {{date}}",
     "creating": "Wird erstellt...",
     "createError": "Schlüssel konnte nicht erstellt werden",
     "loadingKeys": "Schlüssel werden geladen...",
@@ -421,8 +430,9 @@
   },
   "apiKeyReveal": {
     "title": "API-Schlüssel erstellt",
-    "description": "Kopieren Sie diesen Schlüssel jetzt. Er wird nicht erneut angezeigt.",
+    "description": "Kopieren Sie diesen Schlüssel jetzt.",
     "warning": "Dieser Schlüssel wird nicht erneut angezeigt. Kopieren Sie ihn jetzt.",
+    "copy": "API-Schlüssel kopieren",
     "done": "Fertig"
   },
   "sharedMaps": {
@@ -485,8 +495,6 @@
     "tableLabel": "Einbettungstokens"
   },
   "settings": {
-    "copySPEntityId": "SP-Entitäts-ID kopieren",
-    "copyAcsUrl": "ACS-URL kopieren",
     "actions": {
       "discard": "Änderungen verwerfen",
       "resetDefaults": "Auf Standardwerte zurücksetzen",
@@ -513,6 +521,7 @@
         "upload": "Datensätze hochladen",
         "create_layers": "Ebenen erstellen",
         "export": "Daten exportieren",
+        "exportDescription": "Datensatzdateien herunterladen und, zusammen mit „Datensätze hochladen“, Analyseergebnisse als neue Datensätze speichern. Veröffentlichte öffentliche Datensätze kann weiterhin jeder herunterladen, und wer einen Datensatz ansehen kann, kann seine Objekte über die API, die Kartenkacheln und die Attributtabelle lesen.",
         "edit_metadata": "Metadaten bearbeiten",
         "manage_collections": "Sammlungen verwalten",
         "use_ai_chat": "KI-Chat",
@@ -522,8 +531,6 @@
     },
     "general": {
       "title": "Allgemein",
-      "cardTitle": "Funktionen",
-      "cardDescription": "Plattformfunktionen aktivieren oder deaktivieren.",
       "registration": "Selbstregistrierung",
       "registrationDescription": "Erlaubt es Personen, selbst ein Konto anzulegen, per Passwort-Registrierung oder durch Anmeldung über einen aktivierten SSO-Anbieter. SSO-Konten sind sofort mit der Standardrolle des Anbieters aktiv. Registrierungen mit Passwort werden nach der E-Mail-Bestätigung aktiv (SMTP erforderlich), sonst nach Freigabe durch einen Administrator.",
       "landingFirst": "Anmeldung als Startseite",
@@ -531,7 +538,6 @@
       "aiFeatures": "KI-Funktionen",
       "aiFeaturesDescription": "KI-gestützte Funktionen aktivieren, einschließlich Entwurf von Datensatz-Metadaten (Zusammenfassungen, Schlüsselwörter, Herkunft, Qualitätsaussagen), Kartenersteller-Chat und KI-Kartengenerierung.",
       "saved": "Einstellungen gespeichert",
-      "saveFailed": "Einstellungen konnten nicht gespeichert werden",
       "requireMetadata": "Metadaten für Veröffentlichung erforderlich",
       "requireMetadataDescription": "Wenn aktiviert, müssen Datensätze vollständige Metadaten haben, bevor sie veröffentlicht werden können.",
       "enableDatasetEditing": "Datensatzbearbeitung aktivieren",
@@ -541,7 +547,7 @@
       "bannerEnabled": "Site-Banner aktivieren",
       "bannerEnabledDescription": "Das Ankündigungsbanner allen Besuchern anzeigen. Der Banner-Text unten muss ebenfalls gesetzt sein.",
       "bannerText": "Site-Banner-Text",
-      "bannerTextDescription": "Ankündigungsbanner, das allen Besuchern oben in der Anwendung angezeigt wird. Leer lassen für kein Banner.",
+      "bannerTextDescription": "Ankündigungsbanner, das allen Besuchern oben in der Anwendung angezeigt wird. Leer lassen für kein Banner. Linktext: [Beschriftung](https://example.org).",
       "bannerColor": "Site-Banner-Farbe",
       "bannerColorDescription": "Farbe des Ankündigungsbanners.",
       "bannerColorWarning": "Warnung (Bernstein)",
@@ -557,7 +563,12 @@
       "privacyUrlDescription": "Wird als Link auf den Anmelde- und Registrierungsseiten angezeigt. Leer lassen, um den Link auszublenden. Muss eine vollständige http(s)-URL sein.",
       "logLevel": "Protokollierungsstufe",
       "logJsonLabel": "Protokollformat (JSON)",
-      "logJsonDescription": "Protokolle im strukturierten JSON-Format ausgeben."
+      "logJsonDescription": "Protokolle im strukturierten JSON-Format ausgeben.",
+      "auditRetentionDays": "Aufbewahrung des Audit-Protokolls (Tage)",
+      "auditRetentionDaysDescription": "Audit-Einträge, die älter als diese Anzahl Tage sind, werden automatisch gelöscht. Leer lassen, um sie dauerhaft aufzubewahren.",
+      "auditRetentionKeepForever": "Dauerhaft aufbewahren",
+      "auditRetentionInvalid": "Geben Sie eine ganze Zahl von Tagen ({{min}} bis {{max}}) ein oder lassen Sie das Feld leer.",
+      "auditRetentionComplianceWarning": "Einige Compliance-Vorgaben verlangen, Audit-Einträge mindestens {{days}} Tage aufzubewahren."
     },
     "basemaps": {
       "title": "Basiskarten",
@@ -580,8 +591,7 @@
       "apiKeyLabel": "API-Schlüssel",
       "apiKeyPlaceholder": "Optional — erforderlich wenn URL {api_key} enthält",
       "apiKeyHelp": "Verwenden Sie {api_key} in der Kachel-URL als Platzhalter. Der Schlüssel wird serverseitig interpoliert.",
-      "saved": "Basiskarten gespeichert",
-      "saveFailed": "Basiskarten konnten nicht gespeichert werden"
+      "saved": "Basiskarten gespeichert"
     },
     "mapDefaults": {
       "title": "Kartenvorgaben",
@@ -591,9 +601,7 @@
       "longitude": "Längengrad",
       "zoomLevel": "Zoomstufe",
       "preview": "Vorschau",
-      "useCurrentView": "Aktuelle Ansicht verwenden",
-      "saved": "Kartenvorgaben gespeichert",
-      "saveFailed": "Kartenvorgaben konnten nicht gespeichert werden"
+      "saved": "Kartenvorgaben gespeichert"
     },
     "plugins": {
       "title": "Karten-Plugins",
@@ -621,8 +629,6 @@
     },
     "security": {
       "title": "Sicherheit",
-      "cardTitle": "Anmelde-Ratenbegrenzung",
-      "cardDescription": "Maximale Anzahl der Anmeldeversuche pro Minute pro IP-Adresse festlegen.",
       "loginRateLimit": "Anmeldeversuche pro Minute",
       "accessTokenExpire": "Zugriffstoken-Lebensdauer (Minuten)",
       "refreshTokenExpire": "Inaktivitäts-Timeout der Sitzung (Tage)",
@@ -630,7 +636,6 @@
       "tokenLifetimeNote": "Änderungen der Token-Lebensdauer gelten nur für neu ausgestellte Token.",
       "loginRateLimitDescription": "Maximale Anzahl der erlaubten Anmeldeanfragen pro Minute von einer einzelnen IP-Adresse (1–1000).",
       "saved": "Sicherheitseinstellungen gespeichert",
-      "saveFailed": "Sicherheitseinstellungen konnten nicht gespeichert werden",
       "passwordLogin": "Passwort-Anmeldung erlauben",
       "passwordLoginDescription": "Erlaubt Benutzern die Anmeldung mit Benutzername und Passwort. Wird das deaktiviert, ist SSO nötig, aktivieren Sie daher zuerst einen Anbieter. Administratoren können sich im Notfall weiterhin mit Passwort anmelden.",
       "emailVerificationRequired": "E-Mail-Verifizierung erforderlich",
@@ -656,7 +661,6 @@
       "unknownError": "Unbekannter Fehler"
     },
     "saved": "Einstellungen gespeichert",
-    "saveFailed": "Einstellungen konnten nicht gespeichert werden",
     "resetDefaults": "Auf Standardwerte zurücksetzen",
     "tabs": {
       "general": "Allgemein",
@@ -671,14 +675,16 @@
     },
     "uploads": {
       "title": "Upload-Einstellungen",
-      "cardTitle": "Upload-Limits",
-      "cardDescription": "Konfigurieren Sie die maximale Dateigröße und erlaubte Dateierweiterungen.",
       "maxSizeMb": "Maximale Dateigröße (MB)",
       "maxSizeMbDescription": "Maximale Dateigröße in Megabytes (1-10.000).",
       "allowedExtensions": "Erlaubte Erweiterungen",
       "allowedExtensionsDescription": "Kommagetrennte Liste erlaubter Dateierweiterungen.",
       "tileCacheTtl": "Tile-Cache-TTL (Sekunden)",
       "tileCacheTtlDescription": "Zeit in Sekunden, bevor Tile-Cache-Einträge ablaufen (0 = kein Cache).",
+      "previousVersionsKept": "Aufbewahrte vorherige Versionen pro Datensatz",
+      "previousVersionsKeptDescription": "Wie viele ersetzte Versionen jedes Datensatzes wiederherstellbar bleiben, von 1 bis 50. Ein niedrigerer Wert gibt Speicher bei der nächsten Ersetzung oder Wiederherstellung des jeweiligen Datensatzes frei.",
+      "invalidPreviousVersionsKept": "Geben Sie eine ganze Zahl von 1 bis 50 ein.",
+      "previousVersionsStorage": "Aufbewahrte Versionen belegen derzeit {{size}}.",
       "perUserLimitsTitle": "Limits pro Benutzer",
       "perUserLimitsDescription": "Obergrenzen, die für jeden Benutzer gelten und beim Upload durchgesetzt werden. 0 = unbegrenzt.",
       "maxStoragePerUser": "Max. Speicher pro Benutzer",
@@ -689,8 +695,9 @@
       "invalidStorageQuantity": "Geben Sie eine Menge ein, die einer ganzen Anzahl von Bytes entspricht.",
       "maxDatasetsPerUser": "Max. Datensätze pro Benutzer",
       "maxDatasetsPerUserDescription": "Maximale Anzahl an Datensätzen, die jeder Benutzer erstellen kann (0 = unbegrenzt).",
-      "saved": "Upload-Einstellungen gespeichert",
-      "saveFailed": "Upload-Einstellungen konnten nicht gespeichert werden"
+      "maxStoryImageMbPerUser": "Max. Story-Bildspeicher pro Benutzer (MB)",
+      "maxStoryImageMbPerUserDescription": "Die Gesamtgröße der Bilder, die die Storys eines Benutzers enthalten können, in Megabyte (0 = unbegrenzt). Bereits gespeicherte Bilder bleiben; nur neue Uploads und Kopien werden abgelehnt.",
+      "saved": "Upload-Einstellungen gespeichert"
     },
     "oauth": {
       "title": "OAuth-Anbieter",
@@ -799,6 +806,20 @@
       "registrationAdminConfirmDescription": "Jede Registrierung mit Passwort, die ihre E-Mail bestätigt, wird Administrator. Stellen Sie sicher, dass das beabsichtigt ist.",
       "signupAdminActivationDescription": "Nach dieser Änderung können Personen, die sich registrieren, ohne Freigabe durch einen Administrator zu Administratoren werden. Stellen Sie sicher, dass Sie das wollen.",
       "verificationNeedsRegistration": "Gilt, wenn die Selbstregistrierung aktiv ist."
+    },
+    "storyFrames": {
+      "title": "Einbettungen und Videos in Storys",
+      "description": "Websites, deren Seiten und Videoplayer Storys in einem Rahmen zeigen dürfen. Die Browser der Leser laden sie direkt von diesen Websites. Ohne Websites sind Einbettungs- und Videoblöcke aus.",
+      "empty": "Noch keine Websites, daher sind Einbettungs- und Videoblöcke aus.",
+      "hostLabel": "Hostname der Website",
+      "add": "Website hinzufügen",
+      "invalid": "Geben Sie einen Hostnamen wie media.example.org ein, ohne https:// oder Pfad. Platzhalter werden nicht akzeptiert.",
+      "duplicate": "Diese Website steht bereits auf der Liste.",
+      "full": "Die Liste fasst höchstens {{max}} Websites.",
+      "sameOrigin": "Herkunft der Website beibehalten",
+      "sameOriginHint": "Manche Videoplayer brauchen ihre eigene Herkunft zum Abspielen. Der Rahmen behält diese Herkunft, wohin die Website ihn auch führt, also erhält sie auch jede andere freigegebene Website, die er öffnet. Nur für eine Website einschalten, der Sie mit allen freigegebenen Websites vertrauen.",
+      "remove": "{{host}} entfernen",
+      "reloadHint": "Bereits geöffnete Seiten übernehmen die Liste nach dem Neuladen."
     }
   },
   "infrastructure": {
@@ -809,14 +830,8 @@
     "tileCache": "Tile-Cache",
     "type": "Typ",
     "status": "Status",
-    "latency": "Latenz",
-    "ttl": "TTL",
     "cdn": "CDN",
-    "pooler": "Pooler",
-    "connected": "Verbunden",
-    "disconnected": "Getrennt",
     "configured": "Konfiguriert",
-    "notConfigured": "Nicht konfiguriert",
     "loading": "Infrastrukturstatus wird geladen...",
     "errorLoading": "Infrastrukturstatus konnte nicht geladen werden",
     "allOperational": "Alle Systeme betriebsbereit",
@@ -833,8 +848,7 @@
       "title": "SAML SSO",
       "description": "In diesem Build nicht verfügbar.",
       "heading": "SAML ist nicht verfügbar",
-      "body": "Dieser GeoLens Build unterstützt lokale Konten und OAuth-Anbieter wie Google, GitHub und generisches OIDC.",
-      "docsLink": "SAML ist in diesem Build nicht verfügbar"
+      "body": "Dieser GeoLens Build unterstützt lokale Konten und OAuth-Anbieter wie Google, GitHub und generisches OIDC."
     },
     "addProvider": "SAML-Provider hinzufügen",
     "loading": "SAML-Provider werden geladen...",
@@ -894,5 +908,66 @@
   "sortable": {
     "sortAscending": "aufsteigend sortieren",
     "sortDescending": "absteigend sortieren"
+  },
+  "groups": {
+    "title": "Gruppen",
+    "listHeading": "Freigabegruppen",
+    "errorLoading": "Gruppen konnten nicht geladen werden: {{message}}",
+    "nameLabel": "Gruppenname",
+    "actionsFor": "Aktionen für Gruppe {{name}}",
+    "table": {
+      "name": "Name",
+      "members": "Mitglieder",
+      "created": "Erstellt",
+      "actions": "Aktionen",
+      "manageMembers": "Mitglieder",
+      "memberCount_one": "{{count}} Mitglied",
+      "memberCount_other": "{{count}} Mitglieder"
+    },
+    "empty": {
+      "title": "Noch keine Gruppen",
+      "hint": "Legen Sie eine Gruppe an, fügen Sie Personen hinzu und geben Sie Datensätze, Karten und Stories für sie frei."
+    },
+    "create": {
+      "button": "Gruppe erstellen",
+      "title": "Gruppe erstellen",
+      "description": "Mit Gruppen geben Sie eingeschränkte Datensätze, Karten und Stories für einen festgelegten Personenkreis frei."
+    },
+    "rename": {
+      "button": "Umbenennen",
+      "title": "Gruppe umbenennen",
+      "description": "Wählen Sie einen neuen Namen für {{name}}."
+    },
+    "delete": {
+      "title": "{{name}} löschen?",
+      "description_one": "Diese Gruppe hat {{count}} Mitglied. Es verliert sofort den Zugriff auf die für die Gruppe freigegebenen Datensätze, Karten und Stories. Das lässt sich nicht rückgängig machen.",
+      "description_other": "Diese Gruppe hat {{count}} Mitglieder. Sie verlieren sofort den Zugriff auf die für die Gruppe freigegebenen Datensätze, Karten und Stories. Das lässt sich nicht rückgängig machen.",
+      "deleting": "Wird gelöscht..."
+    },
+    "members": {
+      "title": "Mitglieder von {{name}}",
+      "description": "Personen in dieser Gruppe können die für sie freigegebenen Datensätze, Karten und Stories öffnen.",
+      "addLabel": "Person hinzufügen",
+      "listHeading_one": "{{count}} Mitglied",
+      "listHeading_other": "{{count}} Mitglieder",
+      "listLabel": "Mitglieder von {{name}}",
+      "removeLabel": "{{name}} aus {{group}} entfernen",
+      "empty": "Diese Gruppe hat noch keine Mitglieder.",
+      "added": "{{name}} hinzugefügt",
+      "removed": "{{name}} entfernt",
+      "errorLoading": "Mitglieder konnten nicht geladen werden: {{message}}",
+      "needsUserManagement": "Zum Hinzufügen von Personen ist die Berechtigung zur Benutzerverwaltung nötig. Mitglieder können Sie weiterhin ansehen und entfernen."
+    },
+    "picker": {
+      "placeholder": "Nach Benutzernamen suchen",
+      "noMatches": "Keine passenden Personen",
+      "results_one": "{{count}} Person verfügbar",
+      "results_other": "{{count}} Personen verfügbar"
+    },
+    "toasts": {
+      "created": "Gruppe erstellt",
+      "renamed": "Gruppe umbenannt",
+      "deleted": "Gruppe gelöscht"
+    }
   }
 }

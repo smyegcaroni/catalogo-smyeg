@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import builtins
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator, BinaryIO, Protocol
 
@@ -11,7 +11,7 @@ from typing import AsyncIterator, BinaryIO, Protocol
 class StoredObject:
     """One object as the provider reports it right now.
 
-    feat(#1249): ``last_modified`` is timezone-aware UTC on every provider —
+    ``last_modified`` is timezone-aware UTC on every provider —
     a naive value would make the caller's cutoff comparison raise instead of
     answer.
     """
@@ -30,7 +30,7 @@ class StorageProvider(Protocol):
     async def get(self, key: str) -> bytes:
         """Retrieve raw bytes for a key.
 
-        Raises FileNotFoundError if the key does not exist (BA-24).
+        Raises FileNotFoundError if the key does not exist.
         """
         ...
 
@@ -40,7 +40,7 @@ class StorageProvider(Protocol):
         Server-side wherever the provider supports it — the bytes must not
         round-trip through this process, because callers use this to snapshot
         multi-GB uploads. Raises FileNotFoundError if ``src_key`` does not
-        exist (BA-24).
+        exist. The copy's modified time is the time of the copy.
         """
         ...
 
@@ -50,8 +50,7 @@ class StorageProvider(Protocol):
         For checking a bounded window of a large object (e.g. a header, or
         Parquet's trailing magic) without downloading it whole. ``length``
         must be positive; returns fewer bytes if the window runs past the
-        object's end. Raises FileNotFoundError if the key does not exist
-        (BA-24).
+        object's end. Raises FileNotFoundError if the key does not exist.
         """
         ...
 
@@ -70,7 +69,7 @@ class StorageProvider(Protocol):
     ) -> AsyncIterator[bytes]:
         """Stream a bounded window as ``get_range``, in chunks as ``get_stream``.
 
-        fix(#1540): implementations MUST issue ONE provider read for the
+        Implementations MUST issue ONE provider read for the
         whole window and chunk the response as it arrives — looping
         ``get_range`` per chunk turns one range request into one request per
         chunk, invisible to the per-request rate limiter.
@@ -78,7 +77,7 @@ class StorageProvider(Protocol):
         ``length`` must be positive. The stream ends early if the object is
         shorter than the window — never pad to length, which trades a loud
         transfer error for a silent corruption. Raises FileNotFoundError if
-        the key does not exist (BA-24).
+        the key does not exist.
         """
         ...
 
@@ -97,7 +96,7 @@ class StorageProvider(Protocol):
     async def size(self, key: str) -> int:
         """Return the stored object size in bytes.
 
-        Raises FileNotFoundError if the key does not exist (BA-24: all providers
+        Raises FileNotFoundError if the key does not exist (all providers
         normalize their native not-found error to FileNotFoundError).
         """
         ...
@@ -111,10 +110,10 @@ class StorageProvider(Protocol):
     ) -> AsyncIterator["builtins.list[StoredObject]"]:
         """Yield objects under a prefix one provider page at a time.
 
-        feat(#1249): also answers how old each key is, distinguishing an
+        Also answers how old each key is, distinguishing an
         abandoned staging object from one whose upload just landed.
 
-        Paged (fix(#1249)) so a caller with a bounded per-pass budget never
+        Paged so a caller with a bounded per-pass budget never
         has to materialize an unbounded prefix first; stopping early stops
         the provider's paging with it.
 
@@ -141,8 +140,8 @@ class StorageProvider(Protocol):
     ) -> str:
         """Generate a presigned PUT URL for direct upload.
 
-        MUST clamp ``expiration`` to ``settings.pending_job_timeout_seconds``
-        (fix(#1234)), as for part URLs below — a longer-lived URL is usable
+        MUST clamp ``expiration`` to ``settings.pending_job_timeout_seconds``,
+        as for part URLs below — a longer-lived URL is usable
         against a row the pending sweep already failed. Raises
         NotImplementedError for local storage.
         """
@@ -179,8 +178,8 @@ class StorageProvider(Protocol):
     ) -> str:
         """Generate a presigned URL for uploading a single part.
 
-        MUST clamp ``expiration`` to ``settings.pending_job_timeout_seconds``
-        (fix(#1234)), same reason as the put URL above. Raises
+        MUST clamp ``expiration`` to ``settings.pending_job_timeout_seconds``,
+        same reason as the put URL above. Raises
         NotImplementedError for local storage.
         """
         ...
@@ -237,7 +236,7 @@ def init_storage() -> None:
             raise RuntimeError(
                 "storage_provider='azure' but azure_storage_container is not configured"
             )
-        # CR-04: connection_string takes precedence over account_url+key
+        # connection_string takes precedence over account_url+key
         # inside AzureBlobStorageProvider. reveal() here is passed straight
         # to the SDK and never logged.
         _storage = AzureBlobStorageProvider(
@@ -259,3 +258,14 @@ def get_storage() -> StorageProvider:
             "Storage provider not initialized. Call init_storage() first."
         )
     return _storage
+
+
+def as_utc(value: datetime) -> datetime:
+    """Normalize a timestamp to timezone-aware UTC.
+
+    Providers may return naive datetimes; this pins the ``StoredObject``
+    contract that reconciliation's cutoff comparison depends on.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)

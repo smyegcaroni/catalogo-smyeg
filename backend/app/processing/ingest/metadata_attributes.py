@@ -1,8 +1,7 @@
 """Attribute metadata rows derived from a table's column list.
 
-Split out of ``metadata.py`` (#1042). Name-and-type inference (title, units,
-semantic role, domain type) plus the two writers that apply it: one for the
-initial ingest, one for re-upload, which differ only in that the re-upload path
+Name-and-type inference (title, units, semantic role, domain type) plus the
+writers that apply it: one for the initial ingest, one for re-upload, which
 must leave user-edited fields alone.
 """
 
@@ -130,12 +129,9 @@ def _build_attribute_metadata(
     ordinal_position: int | None = None,
     is_nullable: bool | None = None,
 ) -> "Attribute":
-    """Factory for creating a new AttributeMetadata row with inferred fields.
+    """A new AttributeMetadata row with inferred fields.
 
-    Shared by generate_attribute_metadata (initial ingest) and
-    refresh_attribute_metadata (new columns on re-upload). Callers resolve
-    the ORM class once via the Port and pass it in to avoid a repeat lookup
-    per column in the loop.
+    Callers resolve the ORM class once via the Port, not per column.
     """
     example_vals = None
     if sample_values and col_name in sample_values:
@@ -161,10 +157,7 @@ def _build_geometry_attribute_row(
     dataset_id: uuid.UUID,
     geometry_type: str | None,
 ) -> "Attribute":
-    """Factory for the special ``geom`` attribute metadata row.
-
-    Callers pass the resolved ORM class to avoid redundant Port lookups.
-    """
+    """The special ``geom`` attribute metadata row."""
     return AttributeMetadata(
         dataset_id=dataset_id,
         field_name="geom",
@@ -238,10 +231,11 @@ async def apply_source_field_labels(
     dataset_id: uuid.UUID,
     user_metadata: dict,
 ) -> None:
-    """Give a new dataset's attributes the alias and description its source published.
+    """Give a new dataset's attributes the labels its source published.
 
     ``user_metadata["field_labels"]`` is keyed by stored column name. The alias
-    replaces the humanized title and a description fills the empty one. Only
+    replaces the humanized title, a description fills the empty one and code
+    labels are stored as they are. Only
     called on a first import, before any user edit exists.
     """
     labels = user_metadata.get("field_labels")
@@ -265,6 +259,8 @@ async def apply_source_field_labels(
             am.title = alias
         if label.get("description"):
             am.description = label["description"]
+        if label.get("value_labels"):
+            am.value_labels = label["value_labels"]
     await session.flush()
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import (
     APIRouter,
@@ -21,6 +22,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db.tenant_schema import tenant_data_schema
 from app.core.dependencies import get_db
 from app.core.identity import Identity
+from app.core.public_urls import (
+    get_browser_reachable_api_url,
+    get_browser_reachable_app_url,
+)
 from app.core.tenancy import is_multi_tenant
 from app.modules.audit.service import AuditEvent, audit_emit
 from app.modules.auth.dependencies import (
@@ -30,10 +35,11 @@ from app.modules.auth.dependencies import (
     reject_unresolvable_credentials,
     require_permission,
 )
-from app.modules.catalog.authorization import get_user_roles
+from app.modules.catalog.authorization import ANONYMOUS_MAP_VISIBILITIES
+from app.modules.catalog.authorization import check_map_access, get_user_roles
+from app.modules.catalog.link_preview import preview_description
 from app.modules.catalog.maps._router_helpers import (
     _build_frame_ancestors,
-    _check_map_read_access,
     _layers_from_tuples,
 )
 from app.modules.catalog.maps.schemas import (
@@ -53,6 +59,8 @@ from app.modules.catalog.maps.service import (
     get_map,
     get_map_with_layers,
     get_shared_map,
+    lock_map_layers,
+    map_group_layer_gaps,
     revoke_share_token_by_map,
     update_share_token,
     validate_public_visibility,
@@ -60,6 +68,8 @@ from app.modules.catalog.maps.service import (
 from app.modules.catalog.maps.style_json import build_maplibre_style
 from app.modules.embed_tokens.service import revoke_embed_tokens_by_map
 from app.platform.cache.scope import public_cache_control
+from app.platform.extensions.reader_theme import current_reader_theme
+from app.platform.request_credential import refuse_publish_key
 from app.standards.ogc.errors import FORBIDDEN_RESPONSE, GONE_RESPONSE
 
 router = APIRouter()
@@ -85,10 +95,10 @@ async def shared_map_card_endpoint(
     map_obj = None
     if token_obj is not None and not isinstance(token_obj, str):
         map_obj = await get_map(db, token_obj.map_id)
-    if map_obj is None or map_obj.visibility != "public":
-        # fix(#526): "Copy Link" copies this /card URL — return 200 HTML
+    if map_obj is None or map_obj.visibility not in ANONYMOUS_MAP_VISIBILITIES:
+        # "Copy Link" copies this /card URL — return 200 HTML
         # with a meta-refresh into the SPA shell (not bare 404 JSON) so it
-        # lands on the same "link expired" page as /m/{token} (SH-01/SH-07).
+        # lands on the same "link expired" page as /m/{token}.
         viewer_url = f"/m/{html.escape(token)}"
         fallback_html = (
             "<!doctype html>\n"
@@ -105,7 +115,9 @@ async def shared_map_card_endpoint(
     image_url = await get_share_card_image_url(db, request, map_obj)
     image_url = html.escape(image_url, quote=True)
     title = html.escape(map_obj.name or "GeoLens Map")
-    description = html.escape(map_obj.description or "View this map on GeoLens")
+    description = html.escape(
+        preview_description(map_obj.description, "View this map on GeoLens")
+    )
     viewer_url = f"/m/{html.escape(token)}"
     card_html = (
         "<!doctype html>\n"
@@ -132,6 +144,7 @@ async def shared_map_card_endpoint(
     "/shared/{token}",
     response_model=SharedMapResponse,
     responses={403: FORBIDDEN_RESPONSE, 410: GONE_RESPONSE},
+    summary="Get a shared map",
 )
 async def get_shared_map_endpoint(
     token: str,
@@ -164,7 +177,7 @@ async def get_shared_map_endpoint(
         embed_token=embed_token,
         request=request,
     )
-    # fix(#1518): 404/410 arms are exempt from the credential
+    # 404/410 arms are exempt from the credential
     # rule — the share token addresses the resource, identity only widens
     # which layers come back, so a dead credential can't change these answers.
     if result is None:
@@ -185,40 +198,45 @@ async def get_shared_map_endpoint(
     response.headers["Content-Security-Policy"] = _build_frame_ancestors(
         allowed_origins
     )
-    return SharedMapResponse(**map_data, layers=layers)
+    return SharedMapResponse(
+        **map_data, layers=layers, reader_theme=current_reader_theme()
+    )
 
 
-@router.get("/{map_id}/visibility-check/", response_model=VisibilityCheckResponse)
+@router.get(
+    "/{map_id}/visibility-check/",
+    response_model=VisibilityCheckResponse,
+    summary="Check which layers a map's audience cannot see",
+)
 async def visibility_check_endpoint(
     map_id: uuid.UUID,
     user: Identity = Depends(require_permission("edit_metadata")),
     db: AsyncSession = Depends(get_db),
 ) -> VisibilityCheckResponse:
-    """Check if a map has non-public datasets. Informational only.
+    """Check which layers a map's audience can't see. Informational only.
 
-    Owner-or-admin like the other sharing mutations: the response names
-    non-public dataset titles, which read access alone must not reveal.
-    Read access is checked first so unreadable maps keep answering 404
-    (existence-hiding); readable non-owners get 403.
+    Owner-or-admin, since the answer names datasets that read access alone
+    must not reveal. Unreadable maps answer 404; readable non-owners get 403.
     """
     map_obj = await get_map(db, map_id)
     if map_obj is None:
         raise HTTPException(status_code=404, detail="Map not found")
-    await _check_map_read_access(map_obj, user, db)
-    await check_map_ownership(map_obj, user, db)
-    non_public_names = await validate_public_visibility(db, map_id)
+    roles = await check_map_ownership(map_obj, user, db)
+    non_public_names = await validate_public_visibility(db, map_id, user)
+    gaps = await map_group_layer_gaps(db, map_obj, user, "admin" in roles)
     return VisibilityCheckResponse(
         non_public_datasets=non_public_names,
         has_non_public=len(non_public_names) > 0,
+        hidden_from_groups=gaps,
     )
 
 
 @router.get(
     "/{map_id}/style.json",
     responses={
-        # fix(#1672): 200 schema stays open — a hand-typed mirror drifts
-        # (#1670). One pinned shape: sprite is always the array form,
-        # matching what /maps/import accepts.
+        # The 200 schema stays open, since a hand-typed mirror drifts. One
+        # shape is pinned: sprite is always the array form, as /maps/import
+        # accepts.
         200: {
             "description": (
                 "A complete MapLibre style document for the saved map. Its "
@@ -233,9 +251,8 @@ async def visibility_check_endpoint(
                 "application/json": {
                     "schema": {
                         "type": "object",
-                        # fix(#1672): without this, openapi-typescript
-                        # renders the open object as Record<string, never> and
-                        # TS consumers cannot touch any style property.
+                        # Without this, openapi-typescript renders the open
+                        # object as Record<string, never>.
                         "additionalProperties": True,
                         "description": (
                             "MapLibre style document "
@@ -247,6 +264,7 @@ async def visibility_check_endpoint(
         },
         403: FORBIDDEN_RESPONSE,
     },
+    summary="Export a map as a MapLibre style",
 )
 async def export_map_style_endpoint(
     map_id: uuid.UUID,
@@ -264,7 +282,7 @@ async def export_map_style_endpoint(
     map_obj, layer_tuples, _, _ = await get_map_with_layers(db, map_id)
     if map_obj is None:
         raise HTTPException(status_code=404, detail="Map not found")
-    await _check_map_read_access(map_obj, user, db)
+    await check_map_access(db, map_obj, user)
     layer_tuples = await filter_layer_rows_by_dataset_visibility(db, layer_tuples, user)
     layers = _layers_from_tuples(layer_tuples)
     style = build_maplibre_style(
@@ -274,6 +292,8 @@ async def export_map_style_endpoint(
         terrain_dataset_ids=await terrain_dataset_ids_visible_to(
             db, map_obj.terrain_config, [layer.dataset_id for layer in layers], user
         ),
+        app_url=await get_browser_reachable_app_url(db, request=request),
+        api_url=await get_browser_reachable_api_url(db, request=request),
     )
     return JSONResponse(
         content=style,
@@ -282,9 +302,19 @@ async def export_map_style_endpoint(
     )
 
 
-@router.get("/{map_id}/share/", response_model=ShareTokenResponse | None)
+def _app_link(app_url: str | None, path: str) -> str | None:
+    """``path`` on the app URL a person on another machine can open."""
+    return f"{app_url}{path}" if app_url else None
+
+
+@router.get(
+    "/{map_id}/share/",
+    response_model=ShareTokenResponse | None,
+    summary="Get a map's share token",
+)
 async def get_map_share_token_endpoint(
     map_id: uuid.UUID,
+    request: Request,
     user: Identity = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> ShareTokenResponse | None:
@@ -299,12 +329,19 @@ async def get_map_share_token_endpoint(
     return ShareTokenResponse(
         token=token_obj.token_hint,
         share_url=None,
+        viewer_url=_app_link(
+            await get_browser_reachable_app_url(db, request=request), f"/maps/{map_id}"
+        ),
         expires_at=token_obj.expires_at,
         is_active=token_obj.is_active,
     )
 
 
-@router.post("/{map_id}/share/", response_model=ShareTokenResponse)
+@router.post(
+    "/{map_id}/share/",
+    response_model=ShareTokenResponse,
+    summary="Create a map share token",
+)
 async def share_map_endpoint(
     map_id: uuid.UUID,
     request: Request,
@@ -317,8 +354,17 @@ async def share_map_endpoint(
     if map_obj is None:
         raise HTTPException(status_code=404, detail="Map not found")
     await check_map_ownership(map_obj, user, db)
-    if map_obj.visibility != "public":
+    if map_obj.visibility not in ANONYMOUS_MAP_VISIBILITIES:
         raise HTTPException(status_code=400, detail="Map must be public before sharing")
+    # A new expiry on a live link could end it early. Locked first, as
+    # create_share_token locks, so the check and the write see the same token.
+    if body and (body.expires_at is not None or body.expires_in_days is not None):
+        await lock_map_layers(db, map_id)
+        live = await get_active_share_token(db, map_id)
+        if live is not None and (
+            live.expires_at is None or live.expires_at > datetime.now(timezone.utc)
+        ):
+            refuse_publish_key(db, "A publish key can't change a share link's expiry")
     try:
         token_obj = await create_share_token(
             db,
@@ -340,17 +386,26 @@ async def share_map_endpoint(
             ip_address=request.client.host if request.client else None,
         ),
     )
+    # Resolved before the commit: the raw token exists only in this response, so
+    # a lookup that fails afterwards would strand a token nobody can read.
+    app_url = await get_browser_reachable_app_url(db, request=request)
     await db.commit()
     raw_token = getattr(token_obj, "_raw_token", None)
     return ShareTokenResponse(
         token=raw_token or token_obj.token_hint,
         share_url=f"/m/{raw_token}" if raw_token else None,
+        share_url_absolute=_app_link(app_url, f"/m/{raw_token}") if raw_token else None,
+        viewer_url=_app_link(app_url, f"/maps/{map_id}"),
         expires_at=token_obj.expires_at,
         is_active=token_obj.is_active,
     )
 
 
-@router.patch("/{map_id}/share/", response_model=ShareTokenResponse)
+@router.patch(
+    "/{map_id}/share/",
+    response_model=ShareTokenResponse,
+    summary="Update a map share token",
+)
 async def update_map_share_token_endpoint(
     map_id: uuid.UUID,
     body: ShareTokenRequest,
@@ -401,7 +456,11 @@ async def update_map_share_token_endpoint(
     )
 
 
-@router.delete("/{map_id}/share/", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{map_id}/share/",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke a map share token",
+)
 async def revoke_map_share_endpoint(
     map_id: uuid.UUID,
     request: Request,

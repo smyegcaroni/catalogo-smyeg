@@ -12,11 +12,13 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from app.core.geo import shown_extent
 from app.modules.catalog.records.localization import select_localized_record_text
 from app.standards.distributions import (
     PublishedDistribution,
     published_distributions,
 )
+from app.standards.text import has_text, required_description
 
 logger = structlog.stdlib.get_logger(__name__)
 
@@ -254,17 +256,19 @@ def record_to_dcat(
     preferred_languages: Sequence[str] | None = None,
     lineage_summary: str | None = None,
     has_raster_asset: bool = False,
+    vrt_extents: Mapping[uuid.UUID, object | None] | None = None,
 ) -> dict:
     """Serialize a Dataset (with loaded record relationships) to DCAT 3 JSON-LD.
 
-    ``app_base_url`` — fix(#1469): the raster tile template is served
+    ``app_base_url``: the raster tile template is served
     there, not under the API base. ``include_context``: False for
     entries nested in a catalog feed to avoid duplication.
     ``lineage_summary`` (``dcterms:provenance``) arrives already
-    access-checked by the caller — fix(#1103): not read off the record,
+    access-checked by the caller, not read off the record,
     since an analysis output's lineage names datasets an anonymous
     requester may not see. Omitted when absent. ``has_raster_asset``
-    gates the COG download distribution the same way.
+    gates the COG download distribution the same way. A VRT shows only the
+    extent ``vrt_extents`` (``visible_vrt_extents``) holds for it.
     """
     record = dataset.record
     result: dict = {}
@@ -284,12 +288,12 @@ def record_to_dcat(
     # Per-record language
     result["dcterms:language"] = _lang_to_uri(lang)
 
-    if _has_text(localized.summary):
+    if has_text(localized.summary):
         result["dcterms:description"] = {
             "@value": localized.summary.strip(),
             "@language": lang,
         }
-    elif _has_text(record.summary):
+    elif has_text(record.summary):
         # A title-only translation is still useful. DCAT requires a
         # description, so retain the primary summary with its own provenance
         # instead of dropping the whole record from catalog feeds.
@@ -299,7 +303,7 @@ def record_to_dcat(
         }
     else:
         result["dcterms:description"] = {
-            "@value": _required_description(localized.title, None),
+            "@value": required_description(localized.title, None),
             "@language": lang,
         }
 
@@ -352,7 +356,6 @@ def record_to_dcat(
     if distributions:
         result["dcat:distribution"] = [_distribution_to_dcat(d) for d in distributions]
 
-    # Temporal extent
     if record.temporal_start or record.temporal_end:
         temporal: dict = {"@type": "dcterms:PeriodOfTime"}
         if record.temporal_start:
@@ -361,17 +364,17 @@ def record_to_dcat(
             temporal["dcat:endDate"] = record.temporal_end.isoformat()
         result["dcterms:temporal"] = temporal
 
-    # Spatial extent
-    if record.spatial_extent:
+    spatial_extent = shown_extent(record, dataset.id, vrt_extents)
+    if spatial_extent is not None:
         from app.core.geo import extent_to_span_bbox
 
-        # fix(#892): dcat:bbox is a planar WKT ring, which cannot express
+        # dcat:bbox is a planar WKT ring, which cannot express
         # RFC 7946's west > east crossing bbox -- a ring built from one silently
         # becomes the complementary 340°. Take the monotonic span, so a
         # seam-crossing extent serializes over-broad (-180..180) but honest.
         # extent_to_span_bbox swallows geoalchemy/shapely parse failures and
-        # returns None, which degrades to no dcterms:spatial as before.
-        bounds = extent_to_span_bbox(record.spatial_extent)
+        # returns None, which degrades to no dcterms:spatial.
+        bounds = extent_to_span_bbox(spatial_extent)
         if bounds is None:
             logger.debug(
                 "DCAT spatial extent serialization failed", record_id=str(record.id)
@@ -388,7 +391,6 @@ def record_to_dcat(
                 ),
             }
 
-    # Theme categories
     if record.theme_category:
         result["dcat:theme"] = [
             {
@@ -436,6 +438,7 @@ def catalog_to_dcat(
     preferred_languages: Sequence[str] | None = None,
     lineage_by_record_id: Mapping[uuid.UUID, str | None] | None = None,
     has_raster_asset_by_id: Mapping[uuid.UUID, bool] | None = None,
+    vrt_extents: Mapping[uuid.UUID, object | None] | None = None,
 ) -> dict:
     """Serialize a list of visible datasets to a DCAT 3 Catalog JSON-LD dict.
 
@@ -461,6 +464,7 @@ def catalog_to_dcat(
             preferred_languages=preferred_languages,
             lineage_summary=lineage.get(ds.record_id),
             has_raster_asset=raster_assets.get(ds.id, False),
+            vrt_extents=vrt_extents,
         )
         for ds in datasets
     ]
@@ -492,17 +496,6 @@ def dcat_fallback_fields(
 ) -> tuple[str, ...]:
     """Return protocol-required fields supplied by deterministic fallbacks."""
     localized = select_localized_record_text(dataset.record, preferred_languages)
-    if not _has_text(localized.summary) and not _has_text(dataset.record.summary):
+    if not has_text(localized.summary) and not has_text(dataset.record.summary):
         return ("dcterms:description",)
     return ()
-
-
-def _required_description(title: str, summary: str | None) -> str:
-    """Return a non-empty, truthful description for catalog harvesting."""
-    if _has_text(summary):
-        return summary.strip()
-    return title.strip() or "Untitled dataset"
-
-
-def _has_text(value: str | None) -> bool:
-    return bool(value and value.strip())

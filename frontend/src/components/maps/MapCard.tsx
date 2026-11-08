@@ -1,7 +1,7 @@
 import { memo, useState } from 'react';
 import { Link } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { Trash2, Map as MapIcon, User, Layers, Calendar } from 'lucide-react';
+import { Trash2, Map as MapIcon, User, Layers, Calendar, LayoutDashboard } from 'lucide-react';
 import { useMapThumbnail } from '@/components/maps/hooks/use-map-thumbnail';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -12,10 +12,19 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip';
 import { formatDate } from '@/lib/format';
-import { getVisibilityLabel } from '@/i18n/labels';
-import { visibilityColors } from '@/lib/status-colors';
 import type { MapSummaryResponse } from '@/types/api';
-import { VisibilityIcon } from './VisibilityIcon';
+import { VisibilityBadge } from './VisibilityBadge';
+
+/** Marks a map that shows the reader a dashboard; both card layouts use it. */
+export function DashboardBadge() {
+  const { t } = useTranslation();
+  return (
+    <Badge variant="secondary" className="text-xs gap-1">
+      <LayoutDashboard className="h-3 w-3" aria-hidden="true" />
+      {t('maps.card.dashboard')}
+    </Badge>
+  );
+}
 
 export interface MapCardProps {
   map: MapSummaryResponse;
@@ -66,14 +75,7 @@ export const MapCard = memo(function MapCard({ map, onDelete }: MapCardProps) {
             >
               {map.name}
             </Link>
-            {/* Keep state perceivable without relying on color or hover. */}
-            <Badge
-              variant="outline"
-              className={`shrink-0 gap-1 ${visibilityColors[map.visibility] ?? 'border-border bg-muted text-muted-foreground'}`}
-            >
-              <VisibilityIcon visibility={map.visibility} withLabel={false} />
-              {getVisibilityLabel(t, map.visibility)}
-            </Badge>
+            <VisibilityBadge visibility={map.visibility} />
           </div>
 
           {map.description && (
@@ -87,6 +89,7 @@ export const MapCard = memo(function MapCard({ map, onDelete }: MapCardProps) {
               <Layers className="h-3 w-3" />
               {t('maps.layerCount', { count: map.layer_count })}
             </Badge>
+            {map.has_dashboard && <DashboardBadge />}
             {map.created_by_username && (
               <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
                 <User className="h-3 w-3" />

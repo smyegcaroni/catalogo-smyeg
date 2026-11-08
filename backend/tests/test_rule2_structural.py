@@ -1,4 +1,4 @@
-"""Rule-2 structural guard for the GDAL/rasterio half (fix(#936)).
+"""Rule-2 structural guard for the GDAL/rasterio half.
 
 AGENTS.md Rule 2 has two halves. The httpx half (``make_safe_client()`` for
 any ``follow_redirects=True`` client) is enforced by the ``ssrf-safe-client``
@@ -44,9 +44,9 @@ This module closes that gap structurally, in the spirit of
 
 2. **GDAL CLI subprocess argv is built next to the safe env or justified,
    per call.** Every argv list or tuple literal whose head names a
-   gdal*/ogr* executable (the family, not a fixed list — codex round 10)
+   gdal*/ogr* executable (the family, not a fixed list)
    must be covered by a ``gdal_safe_env()`` call in one of the ALLOWLISTED
-   SHAPES below (fix(#1077)), or match a ``GDAL_CLI_CALL_ALLOWLIST`` entry
+   SHAPES below, or match a ``GDAL_CLI_CALL_ALLOWLIST`` entry
    keyed (module, function, tool) with an exact expected count and a
    justification.
 
@@ -56,8 +56,7 @@ going stale.
 
 Known limits (accepted trade-offs, same posture as the Rule-1 guard):
 
-- rasterio detection resolves ACTUAL bindings per scope (codex rounds 5 and
-  12): ``import rasterio [as X]``, ``from rasterio import open/Env [as Y]``,
+- rasterio detection resolves ACTUAL bindings per scope: ``import rasterio [as X]``, ``from rasterio import open/Env [as Y]``,
   and simple alias assignments from either (``ropen = rasterio.open``,
   ``rs = rasterio``, chained) are tracked, so ``rs.open(...)`` and
   ``ropen(...)`` are both seen. An alias built through an expression the
@@ -88,7 +87,7 @@ Known limits (accepted trade-offs, same posture as the Rule-1 guard):
   (``create_subprocess_shell``, ``shell=True``, ``os.system``, ``os.popen``),
   where the command is one string and there is no argv to read (#1857 item 2).
 - A GDAL-headed literal counts as an argv only when its value ESCAPES —
-  handed to a call, returned, or yielded (fix(#996)). The escape is followed
+  handed to a call, returned, or yielded. The escape is followed
   directly, out of transparent wrappers (container literals, ternary, ``+``,
   ``or``), and through the PATH it is bound to: a name, an attribute or a
   constant key (``cmd``, ``box.cmd``, ``registry['cmd']``), bound by ``=``
@@ -97,7 +96,7 @@ Known limits (accepted trade-offs, same posture as the Rule-1 guard):
   containers to a fixed point. Consuming operations stop it: a single-index
   subscript of the VECTOR yields an element, while the same subscript of a
   CONTAINER yields the vector. ITERATING one is the same question as
-  subscripting it and gets the same two answers (fix(#1394)): a ``for`` over a
+  subscripting it and gets the same two answers: a ``for`` over a
   container binds each argv to the loop target, while a ``for`` over the vector
   binds strings. That holds whether or not the container has a name —
   ``for cmd in (["gdalinfo", path],):`` and ``commands = (["gdalinfo", path],)``
@@ -114,7 +113,7 @@ Known limits (accepted trade-offs, same posture as the Rule-1 guard):
   requirement would blind the gate to the sites it exists for. Two or more
   elements are required for the name-list rule, since ``("gdalinfo",)`` is
   indistinguishable from a bare invocation.
-- WHERE THE ESCAPE ANALYSIS STOPS (fix(#996), after eight review rounds).
+- WHERE THE ESCAPE ANALYSIS STOPS.
   What it does is def-use tracking over paths, not dataflow: no flow
   sensitivity beyond the one narrow rebinding rule, no cross-function
   propagation, no container element tracking. Known and accepted residue, in
@@ -127,7 +126,7 @@ Known limits (accepted trade-offs, same posture as the Rule-1 guard):
   neither is one extracted from an ANONYMOUS container that never gets a name
   (`cmd = ({"k": ["gdalinfo", path]})["k"]`), because the path machinery keys
   on a binding and there is none to key on.
-  Three more silent residues sit next to the iteration rule (fix(#1394)), all
+  Three more silent residues sit next to the iteration rule, all
   of them "no container-element tracking" wearing different clothes, and each
   needs its own machinery rather than a wider rule: the container kind names
   what ONE wrapper yields, not a depth, so a container of containers
@@ -145,12 +144,12 @@ Known limits (accepted trade-offs, same posture as the Rule-1 guard):
   written justification, which is the same answer #974 reached for the wrapper
   and credit questions. If a new shape shows up, prefer an allowlist entry and
   a note here over another rule.
-- Comprehensions and generator expressions are binding scopes (fix(#996)),
+- Comprehensions and generator expressions are binding scopes,
   so their targets cannot shadow a name used elsewhere in the enclosing
   function. Two carve-outs match Python: the outermost iterable is evaluated
   before the comprehension's scope exists, and a walrus inside a
   comprehension binds in the CONTAINING scope (PEP 572). For CLI call-credit
-  they are no longer transparent (fix(#1077)): only that outermost iterable is
+  they are no longer transparent: only that outermost iterable is
   an allowlisted position, because a comprehension body runs once per item and
   an empty iterable runs it never.
 - Wrapping is judged lexically, with two execution-order rules (codex round
@@ -182,12 +181,12 @@ Known limits (accepted trade-offs, same posture as the Rule-1 guard):
   IS the protection: a call that drops it clamps nothing. So a bare
   ``gdal_safe_env()`` statement, and ``env = gdal_safe_env()`` whose target is
   never read, both report.
-- CREDIT IS AN ALLOWLIST OF SHAPES (fix(#1077)). Credit used to be granted by
-  WALKING the scope: any canonical call the walk reached exempted every argv
-  in that scope. That is a broad exemption from a narrow observation, and it
-  failed in the direction that matters — a call that is SEEN but not RUN
+- CREDIT IS AN ALLOWLIST OF SHAPES. Granting credit by WALKING the scope
+  (any canonical call the walk reached exempts every argv in that scope) is
+  a broad exemption from a narrow observation, and it
+  fails in the direction that matters — a call that is SEEN but not RUN
   (``if False:``, an untaken ternary arm, an unreached ``match`` case)
-  produced silent credit in a security gate. Patching that shape by shape does
+  produces silent credit in a security gate. Patching that shape by shape does
   not converge, because every conditional structure is another instance of it.
 
   So the default is inverted. A helper call credits an argv only when both of
@@ -242,15 +241,15 @@ Known limits (accepted trade-offs, same posture as the Rule-1 guard):
   ``For.iter``. That is a detection gap, not a credit gap — credit decides
   which DETECTED sites are exempt, and no exemption rule makes an undetected
   site appear. Earlier text here filed it as the third of three "credit gap
-  classes" #1077 would close at once, which conflated the two. fix(#1394)
-  closes it where it belongs, in the escape analysis: the shape is now an argv
+  classes" #1077 would close at once, which conflated the two. It is
+  closed where it belongs, in the escape analysis: the shape is now an argv
   site, credited by the ordinary rules when a safe env covers it and reported
   when none does. Note what the two rules say together — a helper call in the
   LOOP BODY does not credit (a loop body may run zero times, per
   ``_EAGER_POSITIONS``), so the creditable spelling hoists the env above the
   loop, and the inline ``for cmd in (["gdalinfo", path],):`` form has always
   been judged that way.
-- Remote-source detection is LITERAL only (codex round 7): an open or argv
+- Remote-source detection is LITERAL only: an open or argv
   whose argument is, or obviously leads with, a remote-prefixed string
   literal (http/https, ``/vsicurl*``, hardcoded ``/vsis3``/``/vsiaz``/
   ``/vsigs``) gets no wrapper/safe-env credit, because no GDAL env stops a
@@ -271,7 +270,7 @@ from pathlib import Path, PurePosixPath
 APP_ROOT = Path(__file__).resolve().parent.parent / "app"
 
 # The GDAL CLI executables the codebase is KNOWN to spawn today —
-# documentation, not the detection predicate. codex round 10 on #974: a
+# documentation, not the detection predicate. A
 # fixed membership list silently skipped every other family member
 # (gdal_rasterize, gdaltindex, ogrlineref, ...), so detection classifies by
 # family prefix instead — see _is_gdal_cli_tool. Verified against the tree:
@@ -311,10 +310,10 @@ GDAL_CLI_EXTRA_TOOLS = frozenset(
 def _gdal_cli_tool_name(value: object) -> str | None:
     """The executable name when a literal argv head names a gdal*/ogr* tool.
 
-    codex round 11 on #974: containers routinely spell the head as a path
+    Containers routinely spell the head as a path
     (``/usr/bin/gdalinfo``, ``./bin/ogr2ogr``), which matched neither family
     prefix — normalize to the basename before classifying. The family, not a
-    fixed seven (codex round 10).
+    fixed seven.
     """
     if not isinstance(value, str):
         return None
@@ -328,7 +327,7 @@ def _gdal_cli_tool_name(value: object) -> str | None:
 
 SAFE_SUBPROCESS_ENV_HELPER = "gdal_safe_env"
 SAFE_OPEN_ENV_HELPER = "gdal_safe_open_env"
-# fix(#1846, GHSA-hrf5-v3cq-frx5): the vector CLI surface needs a different
+# The vector CLI surface needs a different
 # clamp from the raster one -- what matters for a vector source is which DRIVER
 # GDAL is allowed to pick, not which /vsicurl extensions it may fetch. Both
 # live in the same canonical module and both credit an argv the same way; a
@@ -346,12 +345,12 @@ SUBPROCESS_ENV_HELPERS = (
 )
 ENV_HELPERS = (SAFE_OPEN_ENV_HELPER, *SUBPROCESS_ENV_HELPERS)
 
-# fix(#1846): the two GDAL_SKIP driver clamps, which fix(#1857 item 3) moved
-# out to `app/platform/gdal_env.py`. Named as their own set because that is
+# The two GDAL_SKIP driver clamps, which live in
+# `app/platform/gdal_env.py`. Named as their own set because that is
 # the module's whole contents and the only thing it may vouch for.
 DRIVER_SKIP_HELPERS = (SAFE_VECTOR_ENV_HELPER, SAFE_SERVICE_ENV_HELPER)
 
-# fix(#1846, GHSA-hrf5-v3cq-frx5): the OTHER half of the vector clamp, and the
+# The OTHER half of the vector clamp, and the
 # primary one. The env helper is a denylist -- it names drivers GDAL may not
 # register -- and a denylist can only exclude what somebody thought of, cannot
 # name a driver whose short name contains a space (GDAL_SKIP tokenises on
@@ -362,7 +361,7 @@ DRIVER_SKIP_HELPERS = (SAFE_VECTOR_ENV_HELPER, SAFE_SERVICE_ENV_HELPER)
 DRIVER_ALLOWLIST_HELPER = "local_input_driver_args"
 DRIVER_ALLOWLIST_MODULE = "app.processing.ingest.gdal_drivers"
 
-# fix(#1846, GHSA-hrf5-v3cq-frx5): and the THIRD layer, which is neither of the
+# And the THIRD layer, which is neither of the
 # other two. GPKG and SQLite are pointer-following drivers -- a SQLite schema
 # row can say "this table's rows come from that file over there" -- and neither
 # clamp can exclude them, because GPKG is the primary supported upload format
@@ -382,13 +381,12 @@ THREAD_OFFLOAD_HELPER = "run_in_thread_draining"
 # The one module whose definitions of the helpers are canonical. Credit for
 # using a helper requires the name to be BOUND to this module (imported from
 # it, or used inside it) — a bare tail-match would hand credit to a local
-# shadow or an unrelated `something.gdal_safe_open_env()` (codex round 3 on
-# #974). Module paths are matched EXACTLY (codex round 9): a suffix match
+# shadow or an unrelated `something.gdal_safe_open_env()`. Module paths are matched EXACTLY: a suffix match
 # credited `from evil.processing.raster.vrt import ...`. The real tree
 # imports only the absolute form; relative imports (`from .vrt import ...`)
 # are not used and get no credit — the conservative failure direction.
 #
-# fix(#1857 item 3): TWO canonical modules, each vouching only for the helpers
+# TWO canonical modules, each vouching only for the helpers
 # the map gives it. `processing/raster/vrt.py`'s re-export of the driver clamps
 # is credited because the map NAMES that module; an unnamed intermediate still
 # earns nothing.
@@ -439,8 +437,8 @@ RASTERIO_OPEN_ALLOWLIST: dict[tuple[str, str], tuple[int, str]] = {
 }
 
 # (module path relative to backend/app, enclosing function name) ->
-# (expected rasterio.Env construction count, justification). Counted exactly
-# (codex round 2 on #974): a second Env built inside the wrapper function
+# (expected rasterio.Env construction count, justification). Counted exactly:
+# a second Env built inside the wrapper function
 # would share the site tuple and ride the canonical entry under a set-based
 # check, so membership alone is not enough.
 RASTERIO_ENV_ALLOWLIST: dict[tuple[str, str], tuple[int, str]] = {
@@ -456,7 +454,7 @@ RASTERIO_ENV_ALLOWLIST: dict[tuple[str, str], tuple[int, str]] = {
 # counts (codex P2 on #974): a module- or function-level pass may not absorb
 # a future hand-rolled subprocess — a new argv in a justified function, or a
 # new function in a covered module, must fail on its own.
-# fix(#1846, GHSA-hrf5-v3cq-frx5): five entries left this list, and the reason
+# Five entries left this list, and the reason
 # they left is worth keeping. Three of them ("local staged file ... no HTTP
 # surface") were exemptions granted on a claim about the file's PATH. The path
 # was local. What GDAL did with it was not bounded by that: several OGR drivers
@@ -467,7 +465,7 @@ RASTERIO_ENV_ALLOWLIST: dict[tuple[str, str], tuple[int, str]] = {
 # for one. Those sites now carry gdal_vector_safe_env plus the input-driver
 # allowlist, and are credited rather than excused. The two remaining
 # ogr2ogr/ogrinfo sites in ogr.py and export/ogr.py went the same way.
-# fix(#1857 item 3): EMPTY, and that is the point. The single entry that used
+# EMPTY, and that is the point. The single entry that used
 # to live here was `run_service_preview`, justified on the grounds that
 # `modules/catalog/` may not import `app.processing.*` and the helpers lived
 # there. That describes a layering accident, not a property of the site, and a
@@ -496,7 +494,7 @@ OTHER_INPUT = "other_input"
 # (module, function, tool) -> (expected argv count, policy kind, the env
 # helper this site MUST use or None, justification).
 #
-# fix(#1846 codex P2, thread 3939092275): the env helper is named PER SITE
+# The env helper is named PER SITE
 # rather than taken from the kind, and the credit check demands that one
 # helper rather than any of the three. Accepting the family let the clamps
 # cross: a staged upload wired to `gdal_safe_env` passed this test while
@@ -561,11 +559,9 @@ VECTOR_CLI_DRIVER_POLICY: dict[
         "the source is a bare local path the page walker wrote (#1846). Takes "
         "the SERVICE env for the same reason run_ogr2ogr_service does: the "
         "service branch exists to use WFS and OAPIF, which the vector variant "
-        "skips. fix(#1857 item 3): this used to be the one site with no env "
-        "helper at all, recorded here as None, because modules/catalog/ may "
-        "not import app.processing.* (test_layering.py) and that is where the "
-        "helpers lived. They live in app/platform/gdal_env.py now, so the "
-        "site is credited rather than excused",
+        "skips. modules/catalog/ may not import app.processing.* "
+        "(test_layering.py), so this site takes its env helper from "
+        "app/platform/gdal_env.py",
     ),
 }
 
@@ -622,7 +618,7 @@ _KIND_RASTERIO_MOD = "__rasterio_module__"
 _KIND_RASTERIO_OPEN = "__rasterio_open__"
 _KIND_RASTERIO_ENV = "__rasterio_env__"
 # Names an alias chain points at a guarded callable through an expression
-# this resolver cannot follow exactly (codex round 12). Calling one is
+# this resolver cannot follow exactly. Calling one is
 # UNCLASSIFIED — a violation, never a silent pass.
 _KIND_UNSURE = "__unsure_guarded__"
 
@@ -651,7 +647,7 @@ _PROPAGATED_KINDS = (
 
 _SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
-# fix(#996): comprehensions and generator expressions are lexical scopes too —
+# Comprehensions and generator expressions are lexical scopes too —
 # their targets bind inside them, not in the enclosing function. Kept as a
 # separate tuple rather than folded into _SCOPE_NODES because the two are used
 # for different questions: _SCOPE_NODES means "a callable whose body runs
@@ -669,7 +665,7 @@ class _ScopeInfo:
     helper/module BY THIS SCOPE'S OWN imports. ``bound`` is every other name
     this scope binds locally (params, assignments, defs, non-canonical
     imports, loop/with targets) — a binding here shadows any outer canonical
-    name for the whole scope (codex round 4 on #974: module-wide alias
+    name for the whole scope (module-wide alias
     collection let one function's import credit another function that had
     rebound the same name)."""
 
@@ -689,10 +685,10 @@ class _ScopeInfo:
             _KIND_UNSURE: set(),
         }
         self.bound: set[str] = set()
-        # `from rasterio import *` binds open/Env invisibly (codex round 11).
+        # `from rasterio import *` binds open/Env invisibly.
         self.star_from_rasterio = False
         # name -> value expressions of simple `name = <expr>` assignments in
-        # THIS scope (codex round 12: `ropen = rasterio.open` must propagate
+        # THIS scope (`ropen = rasterio.open` must propagate
         # the binding, not merely shadow it).
         self.assign_values: dict[str, list[ast.expr]] = {}
         # Names bound by anything other than a simple assignment (params,
@@ -709,7 +705,7 @@ _FROM_IMPORT_KINDS: dict[str, dict[str, str]] = {
 
 def _record_import_from(info: _ScopeInfo, node: ast.ImportFrom) -> None:
     module = node.module or ""
-    # codex round 9: exact module comparison, never a suffix match — a
+    # Exact module comparison, never a suffix match — a
     # suffix credited `from evil.processing.raster.vrt import ...`. Relative
     # imports (node.level > 0) are not spellings the tree uses; their names
     # fall through to `bound` and earn no credit.
@@ -727,7 +723,7 @@ def _record_import_from(info: _ScopeInfo, node: ast.ImportFrom) -> None:
     elif node.level == 0 and module == CANONICAL_HELPER_PARENT:
         kinds = {"vrt": _KIND_MODALIAS}
     elif node.level == 0:
-        # codex round 5 on #974: `from rasterio import open as ropen` was
+        # `from rasterio import open as ropen` was
         # invisible to the alias-guessing predicate — an unsafe miss.
         kinds = _FROM_IMPORT_KINDS.get(module, {})
     else:
@@ -749,7 +745,7 @@ def _record_plain_import(info: _ScopeInfo, node: ast.Import) -> None:
         if alias.name in CANONICAL_HELPER_MODULES and alias.asname:
             info.canonical[_KIND_MODALIAS].add(alias.asname)
         elif alias.name == "rasterio":
-            # codex round 5: `import rasterio as rs` must be tracked as a
+            # `import rasterio as rs` must be tracked as a
             # rasterio-module binding, not guessed from the alias spelling.
             info.canonical[_KIND_RASTERIO_MOD].add(alias.asname or "rasterio")
         elif alias.name.startswith("rasterio.") and not alias.asname:
@@ -779,7 +775,7 @@ def _comprehension_walrus_targets(comp: ast.AST):
             continue
         if isinstance(child, ast.NamedExpr) and isinstance(child.target, ast.Name):
             # Both: the NamedExpr so _record_assign_targets can propagate its
-            # VALUE (fix(#996 review) — `[(ropen := rasterio.open) for _ in x]`
+            # VALUE (`[(ropen := rasterio.open) for _ in x]`
             # must make `ropen` a rasterio alias, not merely a bound name), and
             # the target so _scope_info records the binding itself.
             yield child
@@ -791,24 +787,22 @@ def _iter_immediate(node: ast.AST):
     """Yield descendants of ``node`` without entering nested scopes; nested
     scope NODES themselves are yielded (their names bind in this scope).
 
-    fix(#996): comprehensions stop the walk, because their targets bind in
+    Comprehensions stop the walk, because their targets bind in
     their OWN scope. They did not before, so a function containing
     ``[rasterio for rasterio in tools]`` recorded ``rasterio`` as bound in the
     function and a genuine ``rasterio.open(path)`` elsewhere in that same
     function resolved to _OTHER — an unwrapped open reported as zero opens.
 
-    fix(#1077): this walk now answers ONE question, binding resolution. CLI
-    call-credit used to borrow it with ``stop_at_comprehensions=False`` and
-    decide execution from what the walk reached; credit is now a position
-    allowlist (``_EAGER_POSITIONS``) that reads the AST upward instead, so the
-    second mode is gone.
+    This walk answers ONE question, binding resolution. CLI call-credit is a
+    position allowlist (``_EAGER_POSITIONS``) that reads the AST upward
+    instead of borrowing this walk.
     """
     stop = (*_LEXICAL_SCOPES, ast.ClassDef)
     for child in ast.iter_child_nodes(node):
         yield child
         if isinstance(child, stop):
             if isinstance(child, _COMPREHENSION_NODES):
-                # fix(#996 review): PEP 572 — a walrus inside a comprehension
+                # PEP 572 — a walrus inside a comprehension
                 # binds in the CONTAINING scope, not the comprehension's. So
                 # the walk stops here for ordinary targets but still hands the
                 # enclosing scope its walrus bindings, or
@@ -836,7 +830,7 @@ def _record_params(info: _ScopeInfo, scope: ast.AST) -> None:
 
 def _record_assign_targets(info: _ScopeInfo, scope: ast.AST) -> set[int]:
     """Record simple ``name = <expr>`` targets, whose bindings PROPAGATE
-    (codex round 12) instead of merely shadowing. Returns their node ids."""
+    instead of merely shadowing. Returns their node ids."""
     assign_target_nodes: set[int] = set()
     for node in _iter_immediate(scope):
         if isinstance(node, ast.Assign) and all(
@@ -845,7 +839,7 @@ def _record_assign_targets(info: _ScopeInfo, scope: ast.AST) -> set[int]:
             for target in node.targets:
                 assign_target_nodes.add(id(target))
                 info.assign_values.setdefault(target.id, []).append(node.value)
-        # fix(#996 review): a walrus binds a value the same way `=` does, and
+        # A walrus binds a value the same way `=` does, and
         # `ropen := rasterio.open` was landing in `bound` as an opaque name, so
         # a later `ropen(path)` resolved to _OTHER and vanished from detection.
         # Covers walruses anywhere in the scope, not only the comprehension
@@ -859,7 +853,7 @@ def _record_assign_targets(info: _ScopeInfo, scope: ast.AST) -> set[int]:
 def _is_canonical_def(scope: ast.AST, node: ast.AST, rel: str) -> bool:
     """True for a helper definition inside the module that DEFINES it.
 
-    fix(#1857 item 3): keyed per module, so `processing/raster/vrt.py` vouches
+    Keyed per module, so `processing/raster/vrt.py` vouches
     for the two raster helpers it still defines and `platform/gdal_env.py` for
     the two driver clamps. vrt.py's re-export of the latter pair is an import
     and reaches credit through `_record_import_from` like any other caller's.
@@ -889,7 +883,7 @@ def _scope_info(scope: ast.AST, rel: str) -> _ScopeInfo:
     assign_target_nodes = _record_assign_targets(info, scope)
     _record_canonical_defs(info, scope, rel)
 
-    # fix(#996 review): a walrus inside a comprehension binds in the CONTAINING
+    # A walrus inside a comprehension binds in the CONTAINING
     # scope (PEP 572), and _comprehension_walrus_targets already exports it
     # there. Recording it HERE as well put the same name in both scopes, so
     # `[run(cmd) for _ in items if (cmd := ["gdalinfo", path])]` had its own
@@ -914,7 +908,7 @@ def _scope_info(scope: ast.AST, rel: str) -> _ScopeInfo:
             if id(node) not in assign_target_nodes:
                 info.other_bound.add(node.id)
 
-    # codex round 10 on #974: a name both canonically bound AND rebound in
+    # A name both canonically bound AND rebound in
     # the same scope is left in BOTH sets. The old demotion subtracted it
     # from canonical, which resolved helper credit conservatively but also
     # made a real rasterio.open() through the ambiguous name INVISIBLE to
@@ -935,8 +929,7 @@ def _assigned_kind(value: ast.expr, rel: str) -> str | None:
     Handles ``x = rasterio``, ``x = rasterio.open``, ``x = vrt``,
     ``x = gdal_safe_open_env`` and chains through further simple
     assignments. Anything else that MENTIONS a guarded name resolves to
-    ``_KIND_UNSURE`` so calls through the alias flag rather than vanish
-    (codex round 12).
+    ``_KIND_UNSURE`` so calls through the alias flag rather than vanish.
     """
     if isinstance(value, ast.Name):
         for kind in _PROPAGATED_KINDS:
@@ -1005,11 +998,11 @@ def _in_signature(
     decorator, or annotation.
 
     Those expressions evaluate in the ENCLOSING scope, not the new one
-    (codex round 11 on #974: ``def f(rasterio=rasterio.open(url))`` consulted
+    (``def f(rasterio=rasterio.open(url))`` consulted
     the new function's params and misresolved the open). Handled as the
     general lexical rule rather than a special case for defaults.
 
-    fix(#996): a comprehension's OUTERMOST iterable is the same shape —
+    A comprehension's OUTERMOST iterable is the same shape —
     ``[x for rasterio in rasterio.open(p)]`` evaluates ``rasterio.open(p)`` in
     the enclosing scope, before the comprehension's own scope exists, so the
     target must not shadow it. The path runs through the ``ast.comprehension``
@@ -1037,7 +1030,7 @@ def _classify_name(name: str, kind: str, usage: ast.AST, rel: str) -> str:
     prev_child: ast.AST | None = None
     current = getattr(usage, "_rule2_parent", None)
     while current is not None:
-        # fix(#996): _LEXICAL_SCOPES, so a comprehension target resolves in the
+        # _LEXICAL_SCOPES, so a comprehension target resolves in the
         # comprehension rather than leaking into the enclosing function.
         if isinstance(current, (*_LEXICAL_SCOPES, ast.Module)) and not _in_signature(
             current, prev, prev_child
@@ -1058,12 +1051,12 @@ def _resolve_credit(
 ) -> bool:
     """True when ``name`` at ``usage`` resolves to a canonical binding.
 
-    Walks lexical scopes innermost-first (codex round 4): a scope whose own
+        Walks lexical scopes innermost-first: a scope whose own
     import binds the name canonically grants credit; a scope that rebinds it
     any other way kills credit; otherwise resolution continues outward to
     the module scope.
 
-    codex round 10: a name both canonically bound AND rebound in the same
+    A name both canonically bound AND rebound in the same
     scope is ambiguous without statement-order analysis, and the safe answer
     differs by caller. Helper CREDIT must treat ambiguity as no
     (``ambiguous_counts=False``, the default) so a maybe-shadowed helper
@@ -1095,7 +1088,7 @@ def _is_canonical_helper_call(expr: ast.expr, helper: str, rel: str) -> bool:
 def _inside_safe_open_env(node: ast.AST, rel: str) -> bool:
     """True when ``node`` executes under an ACTIVE gdal_safe_open_env().
 
-    codex round 6 on #974, two lexical rules:
+    Two lexical rules:
     - The ancestor walk stops at the first enclosing def/lambda boundary. A
       callable DEFINED inside a wrapped block runs later, when the context
       is gone, so it may not inherit the outer wrapper's credit — the
@@ -1109,10 +1102,10 @@ def _inside_safe_open_env(node: ast.AST, rel: str) -> bool:
     prev: ast.AST = node
     current = getattr(node, "_rule2_parent", None)
     while current is not None:
-        # codex round 12: stop at the callable boundary for the DEFERRED
+        # Stop at the callable boundary for the DEFERRED
         # BODY only. A signature expression (default, decorator, annotation)
         # is evaluated eagerly, while an enclosing `with` is still active,
-        # so it keeps that wrapper's credit — the round-11 boundary rule
+        # so it keeps that wrapper's credit — the earlier boundary rule
         # reported such code unwrapped, a false positive.
         if isinstance(current, _SCOPE_NODES) and not _in_signature(current, prev):
             return False
@@ -1131,7 +1124,7 @@ def _inside_safe_open_env(node: ast.AST, rel: str) -> bool:
     return False
 
 
-# codex round 7 on #974: gdal_safe_open_env provides NO redirect protection
+# gdal_safe_open_env provides NO redirect protection
 # (the #937 fact), so wrapper credit must not extend to sources that are
 # lexically, obviously remote. A literal /vsis3//vsiaz//vsigs counts too:
 # managed-storage paths are always CONSTRUCTED from settings at runtime, so
@@ -1165,7 +1158,7 @@ def _is_remote_literal(expr: ast.expr) -> bool:
     lit = _leading_literal(expr)
     if lit is None:
         return False
-    # codex round 8: URL schemes are case-insensitive, so HTTPS:// must be
+    # URL schemes are case-insensitive, so HTTPS:// must be
     # caught — compare those lowercased. The /vsi* prefixes stay exact:
     # GDAL's VSI handler lookup is case-sensitive, so /VSICURL/ would not
     # reach the network in the first place.
@@ -1177,7 +1170,7 @@ def _is_remote_literal(expr: ast.expr) -> bool:
 
 def _open_source_expr(node: ast.Call) -> ast.expr | None:
     """The source argument of a rasterio.open call: first positional, or the
-    ``fp`` keyword (codex round 8: ``rasterio.open(fp="https://...")``
+    ``fp`` keyword (``rasterio.open(fp="https://...")``
     slipped past a positional-only inspection)."""
     if node.args:
         return node.args[0]
@@ -1198,7 +1191,7 @@ def _enclosing_function_node(
     return None
 
 
-# fix(#1077): the POSITIONS that can carry safe-env credit, as an allowlist.
+# The POSITIONS that can carry safe-env credit, as an allowlist.
 # Every entry names a place where the child expression or statement runs
 # exactly once whenever the construct holding it runs — the property credit
 # actually depends on. A helper call reached through any position NOT named
@@ -1254,7 +1247,7 @@ def _is_eager_position(child: ast.AST, parent: ast.AST) -> bool:
     if field is None:
         return False
     # The OUTERMOST iterable of a comprehension or generator expression is the
-    # one part evaluated at construction (fix(#996)); the element, the `if`
+    # one part evaluated at construction; the element, the `if`
     # clauses and any later `for`'s iterable run per item, or never. Written as
     # position rules so the recursion is automatic: the iterable of a genexp
     # nested inside another genexp's element is not reached at all, which is
@@ -1353,7 +1346,7 @@ def _argv_has_safe_env_credit(
     """True when an allowlisted shape of ``required_helpers`` covers ``argv``.
 
     ``required_helpers`` is not optional and is deliberately not defaulted to
-    the whole family (fix(#1846 codex P2)). The three subprocess env helpers
+    the whole family. The three subprocess env helpers
     clamp different things -- the raster one sets
     CPL_VSIL_CURL_ALLOWED_EXTENSIONS and VRT_VIRTUAL_OVERVIEWS, the vector one
     sets GDAL_SKIP over the pointer and network drivers, and the service one
@@ -1362,7 +1355,7 @@ def _argv_has_safe_env_credit(
     upload be credited by the raster helper, with no vector driver skip
     anywhere near it, and the gate reported clean.
 
-    fix(#1077) inverts the old model. Credit used to be granted by WALKING the
+    This inverts the old model. Credit used to be granted by WALKING the
     scope: any canonical call the walk saw exempted every argv in that scope,
     so a call that was seen but never executed (``if False:``, an untaken
     ternary arm, an unreached ``match`` case) produced silent credit — a false
@@ -1376,7 +1369,7 @@ def _argv_has_safe_env_credit(
     bounded by construction: a shape the gate does not recognise costs a false
     alarm somebody investigates, never a silent pass.
 
-    codex round 4 on #974 still holds inside the shapes: credit requires an
+    One rule still holds inside the shapes: credit requires an
     actual Call resolving to the canonical binding, so a bare Name reference
     (assignment of the function itself, a log line) earns nothing.
     """
@@ -1416,16 +1409,16 @@ def _expression_root_name(expr: ast.expr) -> ast.Name | None:
 def _rasterio_call_kind(node: ast.Call, rel: str) -> str | None:
     """Classify a call as ``"open"``/``"Env"``/``UNCLASSIFIED``, else None.
 
-    codex round 5 on #974: the previous predicate GUESSED alias spellings
+    The previous predicate GUESSED alias spellings
     ("rasterio" in the name, or "rio"), so `import rasterio as rs` made
     `rs.open(...)` invisible — an unsafe miss, unlike the conservative
     edges. Detection uses per-scope binding resolution: `import rasterio
     [as X]` binds X as the module, `from rasterio import open/Env [as Y]`
     binds Y as the callable.
 
-    codex round 10: ambiguous (bound both ways) resolves to DETECTED.
+    Ambiguous (bound both ways) resolves to DETECTED.
 
-    codex round 11 — THE INVARIANT: a call that LOOKS like a rasterio
+    — THE INVARIANT: a call that LOOKS like a rasterio
     open/Env by name and that the resolver cannot confidently classify as
     something else is ``UNCLASSIFIED``, which is a violation. Never a silent
     drop. Only two things end detection: a confident non-rasterio binding
@@ -1466,7 +1459,7 @@ def _rasterio_call_kind(node: ast.Call, rel: str) -> str | None:
             if _resolve_credit(func.id, kind, func, rel, ambiguous_counts=True):
                 return label
         # An alias whose chain reaches a guarded callable through an
-        # expression this resolver cannot follow (codex round 12).
+        # expression this resolver cannot follow.
         if _resolve_credit(func.id, _KIND_UNSURE, func, rel, ambiguous_counts=True):
             return UNCLASSIFIED
     return None
@@ -1485,7 +1478,7 @@ def _star_imports_rasterio(usage: ast.AST, rel: str) -> bool:
 
 
 def _blank_justification_violations(allowlist_name: str, allowlist: dict) -> list[str]:
-    """codex round 3 on #974: an entry with a blank justification defeats the
+    """An entry with a blank justification defeats the
     reviewed-justification contract while still counting as covered."""
     violations = []
     for key, (_count, justification) in sorted(allowlist.items()):
@@ -1518,11 +1511,11 @@ def _scan_rasterio_calls(modules: list[tuple[str, ast.Module]]):
             if kind == "open":
                 total_open_calls += 1
                 site = (rel, _enclosing_function(node))
-                # codex round 7 on #974: a lexically remote source gets NO
+                # A lexically remote source gets NO
                 # wrapper credit — gdal_safe_open_env carries no redirect
                 # protection (#937), so wrapping a remote open proves
                 # nothing. It must be allowlisted with its own review.
-                # codex round 8: the source may arrive as the fp keyword.
+                # The source may arrive as the fp keyword.
                 source = _open_source_expr(node)
                 remote = source is not None and _is_remote_literal(source)
                 if not remote and _inside_safe_open_env(node, rel):
@@ -1536,7 +1529,7 @@ def _scan_rasterio_calls(modules: list[tuple[str, ast.Module]]):
                 env_counts[site] = env_counts.get(site, 0) + 1
                 env_lines.setdefault(site, []).append(node.lineno)
             elif kind is UNCLASSIFIED:
-                # THE INVARIANT (codex round 11): unclassifiable is a
+                # THE INVARIANT: unclassifiable is a
                 # violation, never a silent pass.
                 unclassified.append(
                     f"{rel}:{node.lineno} ({_enclosing_function(node)}) calls "
@@ -1565,11 +1558,11 @@ def _collect_rasterio_violations(
 ) -> tuple[list[str], int]:
     """Return (violations, total rasterio.open call count).
 
-    codex round 1 on #974: allowlisting is per-call, not per-function —
+    Allowlisting is per-call, not per-function —
     unwrapped opens are COUNTED per (module, function) and the count must
     equal the allowlist entry exactly.
 
-    codex round 2 on #974: a wrapped open sharing its (module, function)
+    A wrapped open sharing its (module, function)
     tuple with a justified unwrapped one is NOT evidence the entry is stale —
     staleness is judged only from the collected unwrapped counts. And
     rasterio.Env constructions are counted per site too, so a second Env
@@ -1656,8 +1649,8 @@ def _collect_rasterio_violations(
 def _tool_name_list(node: ast.List | ast.Tuple) -> bool:
     """True for a literal that is a SET OF TOOL NAMES, not a command vector.
 
-    fix(#996): ``SUPPORTED_TOOLS = ["gdalinfo", "ogrinfo"]`` used to trip the
-    gate, and the only ways out were a misleading allowlist entry or a
+    ``SUPPORTED_TOOLS = ["gdalinfo", "ogrinfo"]`` must not trip the
+    gate, since the only ways out would be a misleading allowlist entry or a
     pointless call to the env helper. A command's non-head elements are flags,
     paths or variables; they are never further GDAL utility names.
 
@@ -1704,14 +1697,14 @@ def _escape_kind(node: ast.AST, *, vector: bool = True) -> int:
     prev: ast.AST = node
     current: ast.AST | None = getattr(node, "_rule2_parent", None)
     while current is not None:
-        # fix(#996 review): a comparison yields a BOOLEAN, so
+        # A comparison yields a BOOLEAN, so
         # `log.debug("matched=%s", cmd == expected)` hands over the result, not
         # the vector. Same family as the subscript rule below: an operation
         # that consumes the value and produces something else is where the
         # escape stops.
         if isinstance(current, ast.Compare):
             return best
-        # fix(#996 review): `cmd[0]` yields a STRING, so `return cmd[0]` and
+        # `cmd[0]` yields a STRING, so `return cmd[0]` and
         # `consume(cmd[0])` move an element, not the command vector. A slice
         # still yields a sequence that could be spawned, so only a single
         # index stops the walk.
@@ -1743,7 +1736,7 @@ def _expr_path(expr: ast.expr) -> str | None:
     """A stable textual handle for a storable location, or None.
 
     ``cmd`` -> ``"cmd"``; ``box.cmd`` -> ``"box.cmd"``; ``registry['tools']``
-    -> ``"registry['tools']"``. fix(#996 review): the analysis tracks PATHS
+    -> ``"registry['tools']"``. The analysis tracks PATHS
     rather than bare names, so a vector stored on an attribute or under a
     constant key can be matched when it is loaded back. A computed key gets no
     path — it cannot be compared textually, and guessing would be the
@@ -1763,7 +1756,7 @@ def _expr_path(expr: ast.expr) -> str | None:
 def _target_names(target: ast.expr) -> set[str]:
     """The paths an assignment TARGET binds.
 
-    fix(#996 review), twice over. First: walking every ``Name`` in the target
+    Two traps. First: walking every ``Name`` in the target
     read ``settings.choices = [...]`` as binding ``settings``, so a later
     ``render(settings)`` looked like the argv escaping — a false positive on
     data that never moves. Then: returning NOTHING for such targets meant
@@ -1786,7 +1779,7 @@ def _is_value_position(current: ast.AST, parent: ast.AST) -> bool:
     """True when ``parent`` can EVALUATE TO ``current``.
 
     Not every field of a value wrapper is one of its values, and the two that
-    are not both showed up as false positives (codex rounds 7 and 8).
+    are not both showed up as false positives.
 
     A ternary yields one of its two RESULTS; its condition is only read for
     truthiness, so ``[] if commands else ()`` is never ``commands``.
@@ -1800,8 +1793,7 @@ def _is_value_position(current: ast.AST, parent: ast.AST) -> bool:
 
     Everything else in ``_VALUE_WRAPPERS`` (the arithmetic chain) passes its
     value through from any operand. That deliberately includes repetition by a
-    literal zero, ``commands * 0``, which is always empty (codex round 9,
-    declined): this gate does no constant folding ANYWHERE, by the same
+    literal zero, ``commands * 0``, which is always empty (declined): this gate does no constant folding ANYWHERE, by the same
     decision #1077 made when it chose to report ``if False: gdal_safe_env()``
     rather than evaluate the condition. Both cost a false alarm and neither
     costs a silent pass, which is the trade this module takes everywhere. The
@@ -1828,19 +1820,19 @@ def _intact_loop_target(target: ast.expr) -> ast.expr | None:
 
     A plain name or path receives it intact. So does a LEADING star, which is
     the thing that decides this: ``for *cmd, in commands:`` binds ``cmd`` to
-    ``list(element)``, the vector rebuilt (codex round 7), and ``for *cmd,
+    ``list(element)``, the vector rebuilt, and ``for *cmd,
     ignored in commands:`` binds it to everything but the tail — still an argv,
-    because it still starts with the tool name (codex round 17). Both were
+    because it still starts with the tool name. Both were
     rejected with the rest of the patterns, and both hid a real command.
 
-    Ordinary positional destructuring gets nothing (codex round 2):
+    Ordinary positional destructuring gets nothing:
     ``for tool, arg in commands:`` splits the vector into strings. Neither does
     a star anywhere but first, ``for tool, *rest in commands:`` — ``rest`` is a
     SUFFIX of the argv, which has no GDAL head and would be judged against the
     wrong tool if it were treated as a command.
 
     Position decides it, not arity, and the gap that leaves is deliberate
-    (codex round 18, declined). ``for *cmd, ignored in [("gdalinfo",)]:`` binds
+    (declined). ``for *cmd, ignored in [("gdalinfo",)]:`` binds
     ``cmd`` to ``[]``, because the pattern's fixed names eat the only element —
     so the site reports and nothing runs. Closing it means comparing the
     pattern's arity against the LITERAL's, which couples a target-shape
@@ -1862,18 +1854,17 @@ def _depth_preserving_ancestor(expr: ast.AST) -> ast.AST:
 
     Same value meaning the same thing at the same container depth, so a caller
     holding a container of argvs still holds one at the top. Four wrappers
-    qualify, each already named elsewhere in this module (fix(#1394), codex
-    round 6 and after):
+    qualify, each already named elsewhere in this module:
 
     * a VALUE wrapper — ``commands or ()``, ``commands if flag else ()``,
       ``commands + extra`` — or a walrus, in a position the wrapper can
       actually evaluate to, which rules out a ternary's condition and a
       non-final ``and`` operand (see ``_is_value_position``).
     * a star inside a display, ``(*commands,)``, which splices ``commands``'
-      elements into a new one and so preserves its depth (codex round 5). The
+      elements into a new one and so preserves its depth. The
       pair counts once, exactly as it does in ``_binding_targets``.
     * a SLICE, ``commands[:]``, which yields a sequence of the same things
-      (codex round 9). A single index does not: it consumes a level.
+      A single index does not: it consumes a level.
 
     A CONTAINER wrapper is deliberately absent: ``[commands]`` is a level
     deeper, and pretending otherwise is the container mistake #996 is about.
@@ -1892,7 +1883,7 @@ def _depth_preserving_ancestor(expr: ast.AST) -> ast.AST:
         # A SLICE yields a sequence of the same things: `commands[:]` is still
         # a container of argvs, `cmd[1:]` still a sequence of strings. #996
         # already reads it that way in `_escape_kind`, where only a SINGLE
-        # index — which consumes a level — stops the walk (codex round 9).
+        # index — which consumes a level — stops the walk.
         if (
             isinstance(parent, ast.Subscript)
             and parent.value is current
@@ -1911,7 +1902,7 @@ def _loop_target_paths(iterable: ast.AST) -> set[str]:
     in an iterated position, when the target is a shape ``_target_names``
     cannot name, or when the target DESTRUCTURES.
 
-    fix(#1394): ONE definition of what a loop binds, because two callers need
+    ONE definition of what a loop binds, because two callers need
     it and they know different things. ``_binding_targets`` calls it for a
     literal written directly inside the iterable (``for cmd in (["gdalinfo",
     path],):``), where the container is visible in the AST. ``_argv_escape_kind``
@@ -1919,7 +1910,7 @@ def _loop_target_paths(iterable: ast.AST) -> set[str]:
     (``commands = (["gdalinfo", path],)`` then ``for cmd in commands:``), where
     it is not.
 
-    The destructuring rule is codex round 2 on #1394, and it predates the
+    The destructuring rule predates the
     named-container half: ``for tool, arg in commands:`` splits the element
     apart, so each name gets a PIECE of the argv and none of them gets the
     argv. ``_target_names`` flattens a pattern to all its names, which is the
@@ -1931,7 +1922,7 @@ def _loop_target_paths(iterable: ast.AST) -> set[str]:
     is not destructuring though it is spelled like one — see
     ``_intact_loop_target``.
 
-    codex round 6 on #1394: the iterable is reached through
+    The iterable is reached through
     ``_depth_preserving_ancestor``, so ``for cmd in commands or ():`` is the
     same loop as ``for cmd in commands:``. Requiring the load to be the direct
     child of ``For.iter`` let a value wrapper — the ternary, ``+`` and ``or``
@@ -1952,7 +1943,7 @@ def _loop_target_paths(iterable: ast.AST) -> set[str]:
 def _positional_targets(targets: list[ast.expr], index: int) -> list[ast.expr] | None:
     """The targets an unpacking assigns position ``index`` to, or None.
 
-    fix(#996 review): binding every target name to every nested literal made
+    Binding every target name to every nested literal made
     ``ignored, choices = (None, ["gdalinfo", "-json"])`` read ``choices`` as
     escaping through ``ignored``, a false positive on inert data — the class of
     failure this whole issue is about. Positions are matched instead.
@@ -1977,8 +1968,7 @@ def _positional_targets(targets: list[ast.expr], index: int) -> list[ast.expr] |
 
 
 # A wrapper whose contents are known only by KIND, not by shape: which position
-# holds the argv is unknowable, and in a container of argvs every one does
-# (fix(#1394), codex round 14).
+# holds the argv is unknowable, and in a container of argvs every one does.
 #
 # So unpacking one binds EVERY name in the pattern, and where the container is
 # actually heterogeneous — `container = (argv, None)` reached through a name,
@@ -1986,7 +1976,7 @@ def _positional_targets(targets: list[ast.expr], index: int) -> list[ast.expr] |
 # 15, declined). Positions are exactly what a kind drops, and this analysis has
 # tracked no container ELEMENTS since #996; recovering them means the static
 # analyser #996 declined to write. The alternative on the table was dropping
-# the inherited level, which reinstates the round-14 silent miss: a false alarm
+# the inherited level, which reinstates the earlier silent miss: a false alarm
 # somebody investigates traded for an all-clear nobody sees. Take the alarm.
 _ANY_POSITION = -1
 
@@ -2000,7 +1990,7 @@ def _all_pattern_elements(targets: list[ast.expr]) -> list[ast.expr] | None:
     the caller keeps its conservative answer.
 
     Keeping the non-starred names and dropping the star was the obvious
-    narrowing and is deliberately NOT taken (codex round 16, declined). In
+    narrowing and is deliberately NOT taken (declined). In
     ``cmd, *rest = commands`` the star's target holds a container of argvs and
     a later ``for c in rest:`` is a real path to an exec, so dropping it trades
     this over-report for a silent miss — the one direction that is worse.
@@ -2034,7 +2024,7 @@ def _unpacked_binding(
     holding the value at that depth. Returns None when nothing was unpacked at
     all, and the caller keeps its plain-assignment answer.
 
-    fix(#1394), codex rounds 11 through 13, one shape at a time.
+    One shape at a time.
 
     Unpacking CONSUMES the wrapper it takes apart, so ``alias, = (["gdalinfo",
     path],)`` leaves ``alias`` holding the vector and ``for part in alias:``
@@ -2052,7 +2042,7 @@ def _unpacked_binding(
     unpack to DIFFERENT depths, so a target whose pattern ends early is kept at
     that depth instead of being dropped when its siblings descend further.
 
-    Those endpoints keep their OWN kinds (codex round 15). Chained targets can
+    Those endpoints keep their OWN kinds. Chained targets can
     end at different depths, so ``(alias,) = ((deep,),) = ((["gdalinfo",
     path],),)`` leaves ``alias`` holding a container and ``deep`` holding the
     argv, and one kind for both names could only be wrong about one of them.
@@ -2103,8 +2093,8 @@ def _unpacked_binding(
 
 # Expression wrappers a value passes through without being consumed. A literal
 # inside one is still the value the surrounding statement binds or hands on.
-# Two kinds, and the difference is load-bearing. fix(#996 review): they shared
-# one tuple and one `climbed` flag, which conflated "the value here CONTAINS
+# Two kinds, and the difference is load-bearing: sharing
+# one tuple and one `climbed` flag would conflate "the value here CONTAINS
 # the vector" with "the value here IS the vector". `cmd = ["gdalinfo", "-json"]
 # + []` then `consume(cmd[0])` was then read as a container access yielding the
 # argv — but a BinOp yields the vector itself, so `cmd[0]` is only a string.
@@ -2130,8 +2120,8 @@ _VALUE_WRAPPERS = (
 )
 _TRANSPARENT_WRAPPERS = (*_CONTAINER_WRAPPERS, *_VALUE_WRAPPERS)
 
-# What ITERATING a path that holds the vector hands to a loop target
-# (fix(#1394), codex round 1). "Holds a container" is one bit and iteration
+# What ITERATING a path that holds the vector hands to a loop target.
+# "Holds a container" is one bit and iteration
 # needs two, because the containers do not agree: a list, tuple or set yields
 # its elements, so `for cmd in commands:` receives the argv, while a dict
 # yields its KEYS, so the same line over `{"inspect": ["gdalinfo", path]}`
@@ -2158,7 +2148,7 @@ def _container_iteration_kind(container: ast.AST, held: ast.AST) -> str:
 
 
 # How much FOLLOWING each kind licenses, so two answers for one path merge to
-# the louder rather than to whichever arrived last (fix(#1394), codex round 3).
+# the louder rather than to whichever arrived last.
 # `None` — the path IS the vector — follows least: a subscript on it yields an
 # element and stops the escape. Holding a container follows more, because the
 # subscript then yields the vector and the extraction is chased; and a
@@ -2216,7 +2206,7 @@ def _defaults_owner(node: ast.AST) -> ast.AST | None:
 
     The default itself is evaluated in the enclosing scope, but the parameter
     it binds lives in the callable's own body — so that body, not the
-    enclosing scope, is where its uses are (fix(#996 review)).
+    enclosing scope, is where its uses live.
     """
     prev: ast.AST = node
     current: ast.AST | None = getattr(node, "_rule2_parent", None)
@@ -2233,7 +2223,7 @@ def _binding_targets(
 ) -> dict[str, str | None]:
     """Names this literal's value is reachable through in its own scope.
 
-    Climbs out of transparent wrappers first (fix(#996 review)), so
+    Climbs out of transparent wrappers first, so
     ``commands = {"inspect": ["gdalinfo", path]}`` binds through ``commands``
     and a later ``subprocess.run(commands["inspect"])`` still counts. Covers
     ``=`` including unpacking, annotated ``=``, the walrus, and the loop target
@@ -2243,17 +2233,17 @@ def _binding_targets(
     refers to the command vector ITSELF, which is what decides that a subscript
     on it yields an element rather than the vector. Otherwise the path refers
     to something WRAPPING the vector, and the kind says what ITERATING that
-    wrapper hands over (fix(#1394), see ``_container_iteration_kind``); callers
+    wrapper hands over (see ``_container_iteration_kind``); callers
     that only need the one bit ask ``kind is not None``.
 
-    Per path, not one kind for the set (codex round 15): a chained unpacking
+    Per path, not one kind for the set: a chained unpacking
     can end at different depths, and one answer for every name could only be
     wrong about some of them.
 
     ``inherited`` is the kind ``node``'s value ALREADY carries when the AST
     does not show it — a name known to hold a container of argvs, say. The
     returned kind is relative to that, so a caller passing it must not add it
-    back (fix(#1394), codex round 14).
+    back.
     """
     current: ast.AST = node
     parent = getattr(current, "_rule2_parent", None)
@@ -2264,7 +2254,7 @@ def _binding_targets(
     # consumes these one for one, so the pairing needs the whole chain, not
     # just its outermost link.
     chain: list[tuple[int | None, str | None, bool]] = []
-    # fix(#1394), codex round 14: an INHERITED container is an unpackable level
+    # an INHERITED container is an unpackable level
     # too, and the innermost one — `alias, = commands` takes `commands` apart
     # exactly as `alias, = (["gdalinfo", path],)` takes the display apart, and
     # leaves `alias` holding the vector. Only for a container that yields the
@@ -2273,7 +2263,7 @@ def _binding_targets(
     if inherited == _ITER_YIELDS_VECTOR:
         chain.append((_ANY_POSITION, None, True))
     while isinstance(parent, _TRANSPARENT_WRAPPERS):
-        # fix(#1394), codex round 8: a VALUE wrapper only carries the value in
+        # a VALUE wrapper only carries the value in
         # a position it can evaluate to. `empty = [] if commands else ()` never
         # binds `commands` to `empty`, and neither does
         # `nothing = commands and ()`; climbing anyway put an always-empty name
@@ -2284,7 +2274,7 @@ def _binding_targets(
             current, parent
         ):
             break
-        # fix(#1394), codex rounds 4 and 5: a star and the display around it
+        # A star and the display around it
         # are ONE level, not two. `*X` splices X's ELEMENTS into that display,
         # which PRESERVES X's own depth rather than adding or removing one:
         # `[*["gdalinfo", path]]` is `["gdalinfo", path]`, still the vector,
@@ -2296,7 +2286,7 @@ def _binding_targets(
         starred = isinstance(parent, ast.Starred) or isinstance(current, ast.Starred)
         kind_below = container_kind
         # Only a CONTAINER wrapper means the level above holds the vector
-        # rather than being it (fix(#996 review)) — which is the same thing as
+        # rather than being it — which is the same thing as
         # adding a level for an unpacking pattern to consume.
         adds_level = isinstance(parent, _CONTAINER_WRAPPERS) and not starred
         if adds_level:
@@ -2322,19 +2312,19 @@ def _binding_targets(
             for target in parent.targets
             for n in _target_names(target)
         }
-    # fix(#996 review): the same path rule as the Assign branch above. An
+    # The same path rule as the Assign branch above. An
     # annotated `box.cmd: list[str] = [...]` binds a path exactly like the
     # unannotated form; requiring a bare Name here dropped it. A walrus target
     # is always a Name, so it rides the same branch.
     if isinstance(parent, (ast.AnnAssign, ast.NamedExpr)) and parent.value is current:
         return {n: container_kind for n in _target_names(parent.target)}
-    # fix(#996 review): `cmd = []` then `cmd += ["gdalinfo", path]` assembles a
+    # `cmd = []` then `cmd += ["gdalinfo", path]` assembles a
     # real argv, and the literal's parent is an AugAssign that none of the
     # branches above matched. The kind is None regardless: `+=` splices the
     # elements in, so the target holds the vector rather than a container.
     if isinstance(parent, ast.AugAssign) and parent.value is current:
         return {n: None for n in _target_names(parent.target)}
-    # fix(#996 review): `def run(cmd=("gdalinfo", "-json")): subprocess.run(cmd)`
+    # `def run(cmd=("gdalinfo", "-json")): subprocess.run(cmd)`
     # executes the default on every bare call. The literal sits in the
     # signature, so the escape walk stops at the function boundary and no
     # assignment matches — the vector bound to the parameter NAME is the link.
@@ -2342,7 +2332,7 @@ def _binding_targets(
         name = _default_parameter_name(parent, current)
         if name:
             return {name: None}
-    # fix(#996 review): `for cmd in (["gdalinfo", path],): subprocess.run(cmd)`
+    # `for cmd in (["gdalinfo", path],): subprocess.run(cmd)`
     # reaches an exec through the loop target. Same for `async for` and for a
     # comprehension's generator.
     #
@@ -2373,13 +2363,13 @@ def _enclosing_statement(node: ast.AST, body: list) -> ast.stmt | None:
 def _overwritten_before(used: ast.AST, binding: ast.AST, path: str) -> bool:
     """True when ``path`` is re-bound between its binding and this use.
 
-    fix(#996 review): `cmd = ["gdalinfo", ...]` then `cmd = ["echo", "ok"]`
+    `cmd = ["gdalinfo", ...]` then `cmd = ["echo", "ok"]`
     then `run(cmd)` reported the GDAL literal as escaping, although nothing
     GDAL can execute — ordinary variable reuse producing a CI-blocking false
     positive.
 
     Deliberately narrow. Only rebindings in the SAME statement list count, so
-    "later" really means later: #974 round 10 already declined statement-order
+    "later" really means later: #974 already declined statement-order
     analysis for the rasterio resolver, and a rebinding under an `if` is not
     ordered against a use in the `else`. Where order is not straight-line this
     returns False and the use still counts, which keeps the miss on the
@@ -2419,7 +2409,7 @@ def _overwritten_before(used: ast.AST, binding: ast.AST, path: str) -> bool:
 def _use_reaches_the_binding(used: ast.Name, scope: ast.AST, rel: str) -> bool:
     """True when ``used`` is the scope's binding rather than a nested shadow.
 
-    fix(#996 review): the escape search walks the whole scope, so a nested
+    The escape search walks the whole scope, so a nested
     ``def inner(cmd): consume(cmd)`` counted as a use of an outer ``cmd`` and
     turned an inert constant into a security failure. Any lexical scope between
     the use and the binding that binds the same name breaks the link -- the
@@ -2451,7 +2441,7 @@ def _derived_paths(used: ast.expr, kind: str | None) -> list[tuple[str, str | No
     """
     derived: list[tuple[str, str | None]] = []
     if kind is not None:
-        # fix(#996 review): reading a CONTAINER through a subscript or
+        # Reading a CONTAINER through a subscript or
         # attribute yields the vector — `commands = {...}` then
         # `cmd = commands["inspect"]`. Follow that extraction, or the alias
         # chain stops dead at the container.
@@ -2462,14 +2452,13 @@ def _derived_paths(used: ast.expr, kind: str | None) -> list[tuple[str, str | No
             # so `sliced = commands[:]` inherits this path's kind (codex round
             # 9). Fixed here as well as in `_depth_preserving_ancestor` because
             # the alias path went around the loop's own iterable once already
-            # (round 8).
             sliced = isinstance(parent, ast.Subscript) and isinstance(
                 parent.slice, ast.Slice
             )
             derived += list(
                 _binding_targets(parent, inherited=kind if sliced else None).items()
             )
-        # fix(#1394): ITERATING a container hands each element — the argv — to
+        # ITERATING a container hands each element — the argv — to
         # the loop target, exactly as subscripting it hands over one.
         # `_binding_targets` already reads that off the AST when the container
         # is written in place (`for cmd in (["gdalinfo", path],):`); once the
@@ -2482,15 +2471,14 @@ def _derived_paths(used: ast.expr, kind: str | None) -> list[tuple[str, str | No
         #
         # Gated on the kind for the same reason #996 gated its in-place twin:
         # iterating the VECTOR (`for part in cmd:`) yields strings, and
-        # iterating a dict that holds the argv as a VALUE yields keys (codex
-        # round 1).
+        # iterating a dict that holds the argv as a VALUE yields keys.
         if kind == _ITER_YIELDS_VECTOR:
             derived += [(n, None) for n in _loop_target_paths(used)]
     # A wrapper at the ALIAS site is the outermost one now, so it decides what
     # iterating the alias yields; with no new wrapper the kind carries over
     # unchanged, and an UNPACKING there takes one off. All three are the same
     # question, so the inherited kind goes in and the answer comes back
-    # absolute rather than being re-applied here (codex round 14).
+    # absolute rather than being re-applied here.
     derived += list(_binding_targets(used, inherited=kind).items())
     return derived
 
@@ -2498,8 +2486,8 @@ def _derived_paths(used: ast.expr, kind: str | None) -> list[tuple[str, str | No
 def _argv_escape_kind(node: ast.List | ast.Tuple, rel: str) -> int:
     """The strongest escape a GDAL-headed literal reaches, its bindings included.
 
-    fix(#996): the gate used to treat ANY GDAL-headed sequence as a command
-    vector, so plain data tripped a security gate. A literal is a command when
+    The gate must not treat ANY GDAL-headed sequence as a command
+    vector, or plain data trips a security gate. A literal is a command when
     its value goes somewhere — directly, or through a name it is bound to
     (``cmd = ["ogrinfo", ...]`` ... ``create_subprocess_exec(*cmd, ...)``,
     which is the shape most of this codebase uses).
@@ -2518,7 +2506,7 @@ def _argv_escape_kind(node: ast.List | ast.Tuple, rel: str) -> int:
     if not bindings or scope is None:
         return best
 
-    # fix(#996 review): follow re-aliasing to a fixed point. `cmd = [...]`,
+    # Follow re-aliasing to a fixed point. `cmd = [...]`,
     # `alias = cmd`, `subprocess.run(alias)` reaches an exec through a name the
     # literal was never directly bound to, and stopping at the first hop lost
     # it — a regression against the pre-#996 scan, which flagged everything.
@@ -2526,7 +2514,7 @@ def _argv_escape_kind(node: ast.List | ast.Tuple, rel: str) -> int:
     # DIRECTLY. For a derived alias the statement that introduces it would
     # itself look like an overwrite, and over-reporting is the safe side.
     original_paths = set(bindings)
-    # fix(#1394), codex round 3: path -> kind, MERGED, never overwritten. The
+    # Path -> kind, MERGED, never overwritten. The
     # worklist used to be a set of pairs collapsed with `{n: c for n, c in
     # batch}`, so one path reached with two kinds — `x = commands` beside
     # `x = {"label": commands}` — kept whichever the set happened to yield
@@ -2565,7 +2553,7 @@ def _argv_escape_kind(node: ast.List | ast.Tuple, rel: str) -> int:
     return best
 
 
-# fix(#1857 item 2): callee -> the index of the PROGRAM argument, because the
+# Callee -> the index of the PROGRAM argument, because the
 # signature decides it: create_subprocess_exec(program, *args) leads with the
 # program, AbstractEventLoop.subprocess_exec(protocol_factory, program, *args)
 # does not. The argv follows the program inline.
@@ -2588,7 +2576,7 @@ _SEQUENCE_ARGV_SPAWNERS: dict[str, int] = {
     "execvpe": 0,
 }
 
-# fix(#1884): the keyword each callee binds its program and argv sequence to.
+# The keyword each callee binds its program and argv sequence to.
 # os.execv is positional-only and a keyword-bound os.execl* has the empty argv
 # execv refuses, so neither runs from a keyword spelling and neither is listed.
 _SPAWN_KEYWORDS: dict[str, tuple[str, str | None]] = {
@@ -2658,7 +2646,7 @@ def _positional_argv_tool(
 def _display_argv_tool(node: ast.AST, rel: str) -> str | None:
     """The tool a list or tuple DISPLAY names, when the display is an argv site.
 
-    fix(#1857 item 2, audit P3-A): its own predicate so the ``execv*`` skip can
+    Its own predicate so the ``execv*`` skip can
     ask whether the sequence IS a site rather than whether it is a literal.
     ``os.execv("ogrinfo", ["-so", path])`` is a literal that this refuses, and
     skipping the call for it left the spawn seen by neither branch.
@@ -2669,14 +2657,14 @@ def _display_argv_tool(node: ast.AST, rel: str) -> str | None:
     tool = _gdal_cli_tool_name(first.value) if isinstance(first, ast.Constant) else None
     if tool is None:
         return None
-    # fix(#996): a GDAL-looking sequence is only a command vector if it is one.
+    # A GDAL-looking sequence is only a command vector if it is one.
     # Flagging plain data was a false positive that blocked correct code.
     escape = _argv_escape_kind(node, rel)
     if escape == _ESCAPE_NONE:
         return None  # inert: the value never leaves, so it cannot execute
     if escape != _ESCAPE_CALL and _tool_name_list(node):
-        # A tool-NAME list that is only returned is a choices helper. fix(#996
-        # review): the exemption stops at _ESCAPE_CALL, because a literal handed
+        # A tool-NAME list that is only returned is a choices helper. The
+        # exemption stops at _ESCAPE_CALL, because a literal handed
         # into a call is a plausible argv whatever it contains.
         return None
     return tool
@@ -2705,7 +2693,7 @@ def _iter_argv_sites(rel: str, tree: ast.Module):
                 # The sequence is a site in its own right, so yielding the call
                 # too would count one subprocess twice.
                 continue
-            # fix(#1884): the display's elements are the tail, so a remote
+            # The display's elements are the tail, so a remote
             # literal behind a flag head is judged as it is in a headed display.
             tail = list(sequence.elts)
         elif sequence is not None:
@@ -2720,10 +2708,10 @@ def _collect_gdal_cli_violations(
 ) -> tuple[list[str], int]:
     """Return (violations, total GDAL CLI argv count).
 
-    codex round 1 on #974: judged per ENCLOSING FUNCTION with exact counts,
+    Judged per ENCLOSING FUNCTION with exact counts,
     not per module — a new hand-rolled argv in a module that references
     gdal_safe_env elsewhere fails on its own. Staleness is judged only from
-    the collected unclamped counts (codex round 2: no shared-scope shortcut).
+    the collected unclamped counts (no shared-scope shortcut).
     """
     violations: list[str] = []
     total_argv_sites = 0
@@ -2740,11 +2728,11 @@ def _collect_gdal_cli_violations(
             func_node = _enclosing_function_node(node)
             func_name = func_node.name if func_node is not None else "<module>"
             scope: ast.AST = func_node if func_node is not None else tree
-            # codex round 7 on #974: an argv carrying a literally-remote
+            # An argv carrying a literally-remote
             # element gets no safe-env credit — the safe env cannot stop a
             # redirect (#937), so the site needs its own reviewed entry.
             remote = any(_is_remote_literal(elt) for elt in tail)
-            # fix(#1846 codex P2): which helper this argv may be credited by
+            # Which helper this argv may be credited by
             # depends on the tool family. A raster CLI needs the raster clamps
             # and nothing else vouches for it; a vector CLI may use any of the
             # three here, because `test_vector_gdal_argv_restricts_input_drivers`
@@ -2858,7 +2846,7 @@ def _argv_has_helper_credit(
     nothing, which is what ``_credit_shape_is_named`` refuses. For a validator
     the protection IS the raise, so a bare statement call is the correct
     spelling and there is no discarded result to refuse; only the position
-    rules apply (fix(#1846)).
+    rules apply.
     """
     for node in ast.walk(scope):
         if not _is_named_helper_call(node, kind, rel):
@@ -2896,7 +2884,7 @@ def _collect_vector_driver_violations(
     violations: list[str] = []
     counts: dict[tuple[str, str, str], int] = {}
     lines: dict[tuple[str, str, str], list[int]] = {}
-    # fix(#1857 item 1): keys whose env helper cannot be resolved. The site
+    # Keys whose env helper cannot be resolved. The site
     # loop feeds that string to _classify_name as a binding KIND, which indexes
     # a dict with it, so an unrecognised name raises instead of reporting. Only
     # the env helper needs this; an unknown KIND is only ever a set membership
@@ -2995,7 +2983,7 @@ def _collect_vector_driver_violations(
 def test_policy_naming_an_unknown_env_helper_reports_instead_of_raising():
     """A typo in VECTOR_CLI_DRIVER_POLICY reports, and names the allowed set.
 
-    fix(#1857 item 1). The site key must be a REAL one: an entry pointing
+    The site key must be a REAL one: an entry pointing
     nowhere reports as stale and never reaches the resolution under test.
     """
     key = ("processing/export/ogr.py", "run_ogr2ogr_export", "ogr2ogr")
@@ -3032,7 +3020,7 @@ def test_policy_naming_an_unknown_env_helper_reports_instead_of_raising():
 def test_vector_gdal_argv_restricts_input_drivers():
     """Every staged-upload ogrinfo/ogr2ogr argv carries BOTH clamps.
 
-    fix(#1846, GHSA-hrf5-v3cq-frx5). The gate that existed passed while an
+    The gate that existed passed while an
     uploaded archive could make GDAL pick a driver that reads the document as
     instructions and go fetch what it names, because three sites were exempted
     on a justification about the input being a local file. It was. That is not
@@ -3100,7 +3088,7 @@ def test_every_default_upload_extension_is_clamped_or_scanned():
 def test_every_sqlite_family_extension_is_content_checked():
     """The two tables that decide "is this a database" must agree.
 
-    fix(#1846, GHSA-hrf5-v3cq-frx5). `-if GPKG` and `-if SQLite` are the two
+    `-if GPKG` and `-if SQLite` are the two
     allowed drivers that read a schema, and a schema row can name a source
     outside the file. Adding an extension to the driver table that maps to
     either of them, without adding it to the set the content check covers,
@@ -3135,7 +3123,7 @@ def test_every_sqlite_family_extension_is_content_checked():
     assert ZIP_CONTAINER_EXTENSIONS, "container list went empty"
 
 
-# fix(#1857 item 2): both fixtures spawn the same tool with the same arguments
+# Both fixtures spawn the same tool with the same arguments
 # and differ only in the env, so one passing and one reporting isolates what is
 # measured. Source rather than a file in app/, which would be a real spawn.
 _POSITIONAL_ARGV_UNCLAMPED = """
@@ -3193,7 +3181,7 @@ def test_positional_argv_is_seen_by_the_cli_env_gate():
     assert not violations, violations
 
 
-# fix(#1857 item 2, codex review): two signatures the first cut read wrong.
+# Two callee signatures where the program is not argument 0.
 _EVENT_LOOP_SPAWN = """
 import asyncio
 
@@ -3230,7 +3218,7 @@ def probe(path):
 def test_the_program_index_follows_the_callee_signature():
     """``loop.subprocess_exec`` leads with a protocol factory, not the program.
 
-    fix(#1857 item 2, codex review). Reading argument 0 for every callee found
+    Reading argument 0 for every callee found
     a factory rather than a tool name there, so the shape yielded no argv site
     at all and an unclamped GDAL subprocess passed both gates.
     """
@@ -3245,7 +3233,7 @@ def test_the_program_index_follows_the_callee_signature():
 def test_a_sequence_form_spawn_counts_once():
     """``os.execv`` names the program and hands the argv as one list.
 
-    fix(#1857 item 2, codex review). Both halves matched, so one subprocess
+    Both halves matched, so one subprocess
     counted as two argv sites and no exact count in VECTOR_CLI_DRIVER_POLICY
     could be right for it. The display is the site; the call is yielded only
     when the sequence is not a literal, which is the half that would otherwise
@@ -3263,7 +3251,7 @@ def test_a_sequence_form_spawn_counts_once():
 
 
 def test_a_sequence_the_display_rule_refuses_still_leaves_one_site():
-    """fix(#1857 item 2, audit P3-A): a literal is not the same as a site.
+    """A literal is not the same as a site.
 
     ``os.execv("ogrinfo", ["-so", path])`` builds a real argv whose FIRST
     element is a flag, so the display rule refuses it. Skipping the call for
@@ -3276,7 +3264,7 @@ def test_a_sequence_the_display_rule_refuses_still_leaves_one_site():
         assert len(violations) == 1, violations
 
 
-# fix(#1884): a keyword-bound program is an argv site like a positional one.
+# A keyword-bound program is an argv site like a positional one.
 _KEYWORD_PROGRAM_SPAWN = """
 import asyncio
 
@@ -3323,7 +3311,7 @@ def probe(cmd):
 
 
 def test_a_keyword_bound_program_is_still_the_program():
-    """fix(#1884): a keyword-bound program is one argv site for both gates,
+    """A keyword-bound program is one argv site for both gates,
     reported without a safe env and passed with the vector one."""
     for source in (_KEYWORD_PROGRAM_SPAWN, _KEYWORD_PROGRAM_EVENT_LOOP_SPAWN):
         for collect in (
@@ -3343,7 +3331,7 @@ def test_a_keyword_bound_program_is_still_the_program():
 
 
 def test_a_keyword_bound_sequence_counts_once():
-    """fix(#1884): a keyword-bound sequence spawn is exactly one site, whether
+    """A keyword-bound sequence spawn is exactly one site, whether
     the sequence is a literal (the display) or a name (the call)."""
     for source in (_KEYWORD_SEQUENCE_SPAWN, _KEYWORD_SEQUENCE_SPAWN_DYNAMIC):
         for collect in (
@@ -3355,7 +3343,7 @@ def test_a_keyword_bound_sequence_counts_once():
             assert len(violations) == 1, violations
 
 
-# fix(#1884): a remote literal in an unheaded sequence gets no safe-env credit.
+# A remote literal in an unheaded sequence gets no safe-env credit.
 _SEQUENCE_SPAWN_UNHEADED_REMOTE = """
 import os
 
@@ -3391,7 +3379,7 @@ def probe():
 
 
 def test_an_unheaded_sequence_tail_is_its_elements():
-    """fix(#1884): a remote literal in an unheaded sequence gets no safe-env
+    """A remote literal in an unheaded sequence gets no safe-env
     credit, positional or keyword-bound; a local element keeps it."""
     for source in (_SEQUENCE_SPAWN_UNHEADED_REMOTE, _KEYWORD_SEQUENCE_SPAWN_REMOTE):
         violations, total = _collect_gdal_cli_violations(_fixture_modules(source), {})
@@ -3409,7 +3397,7 @@ def test_an_unheaded_sequence_tail_is_its_elements():
 def test_positional_argv_is_seen_by_the_vector_driver_policy():
     """Both gates read ``_iter_argv_sites``, so one widening reaches both.
 
-    fix(#1857 item 2). A positional ogrinfo with no entry must report as
+    A positional ogrinfo with no entry must report as
     unreviewed rather than as absent.
     """
     violations, total = _collect_vector_driver_violations(
@@ -3443,7 +3431,7 @@ def _mod(src: str) -> list[tuple[str, ast.Module]]:
 
 
 def test_guard_mixed_wrapped_and_allowlisted_open_passes():
-    """codex round 2: one justified unwrapped open PLUS a new open correctly
+    """One justified unwrapped open PLUS a new open correctly
     wrapped in gdal_safe_open_env share the (module, function) tuple; the
     wrapped call must not make the entry read as stale."""
     violations, _ = _collect_rasterio_violations(
@@ -3464,7 +3452,7 @@ def test_guard_mixed_wrapped_and_allowlisted_open_passes():
 
 
 def test_guard_second_unwrapped_open_in_justified_function_fails():
-    """codex round 1: a second unwrapped open may not ride the entry."""
+    """A second unwrapped open may not ride the entry."""
     violations, _ = _collect_rasterio_violations(
         _mod(
             "import rasterio\n"
@@ -3479,7 +3467,7 @@ def test_guard_second_unwrapped_open_in_justified_function_fails():
 
 
 def test_guard_second_env_inside_wrapper_fails():
-    """codex round 2: two rasterio.Env constructions collapse to one site
+    """Two rasterio.Env constructions collapse to one site
     tuple; the count must catch the second one."""
     violations, _ = _collect_rasterio_violations(
         _mod(
@@ -3495,7 +3483,7 @@ def test_guard_second_env_inside_wrapper_fails():
 
 
 def test_guard_new_cli_argv_in_covered_module_fails():
-    """codex round 1: a module referencing gdal_safe_env elsewhere may not
+    """A module referencing gdal_safe_env elsewhere may not
     absorb a hand-rolled argv in a function that does not use it."""
     violations, _ = _collect_gdal_cli_violations(
         _mod(
@@ -3511,7 +3499,7 @@ def test_guard_new_cli_argv_in_covered_module_fails():
 
 
 def test_guard_shadowed_open_env_helper_gets_no_credit():
-    """codex round 3: a local shadow of gdal_safe_open_env, or an unrelated
+    """A local shadow of gdal_safe_open_env, or an unrelated
     `something.gdal_safe_open_env()`, must not earn wrapping credit — only a
     name bound to the canonical vrt module counts."""
     violations, _ = _collect_rasterio_violations(
@@ -3565,7 +3553,7 @@ def test_guard_canonically_imported_helper_gets_credit():
 
 
 def test_guard_shadowed_cli_helper_gets_no_credit():
-    """codex round 3, CLI side: a local def of gdal_safe_env must not credit
+    """A local def of gdal_safe_env must not credit
     the argvs in its module."""
     violations, _ = _collect_gdal_cli_violations(
         _mod(
@@ -3582,7 +3570,7 @@ def test_guard_shadowed_cli_helper_gets_no_credit():
 
 
 def test_guard_scope_shadow_kills_credit_only_where_shadowed():
-    """codex round 4: a module-level canonical alias must not credit a
+    """A module-level canonical alias must not credit a
     function that REBINDS the same name locally, while the clean sibling
     function keeps its credit."""
     violations, _ = _collect_rasterio_violations(
@@ -3607,7 +3595,7 @@ def test_guard_scope_shadow_kills_credit_only_where_shadowed():
 
 
 def test_guard_cli_reference_without_call_gets_no_credit():
-    """codex round 4: a bare reference to gdal_safe_env (assignment, log
+    """A bare reference to gdal_safe_env (assignment, log
     line, dead code) must not credit an unclamped argv; an actual call to
     the canonical binding must."""
     violations, _ = _collect_gdal_cli_violations(
@@ -3627,7 +3615,7 @@ def test_guard_cli_reference_without_call_gets_no_credit():
 
 
 def test_guard_rasterio_alias_and_from_import_are_detected():
-    """codex round 5: `import rasterio as rs` / `from rasterio import open`
+    """`import rasterio as rs` / `from rasterio import open`
     previously slipped past the alias-guessing predicate — an unsafe miss.
     Both forms must be flagged when unwrapped."""
     violations, total = _collect_rasterio_violations(
@@ -3671,7 +3659,7 @@ def test_guard_unrelated_rs_name_is_not_rasterio():
 
 
 def test_guard_nested_call_does_not_credit_outer_argv():
-    """codex round 5: a canonical gdal_safe_env call inside a NESTED def or
+    """A canonical gdal_safe_env call inside a NESTED def or
     lambda must not credit the outer function's argv; a same-scope call
     still does."""
     violations, _ = _collect_gdal_cli_violations(
@@ -3706,7 +3694,7 @@ def test_guard_nested_call_does_not_credit_outer_argv():
 
 
 def test_guard_deferred_callable_inside_wrapper_gets_no_credit():
-    """codex round 6: a def/lambda DEFINED inside a wrapped block runs after
+    """A def/lambda DEFINED inside a wrapped block runs after
     the context exits, so its rasterio.open may not inherit the outer
     wrapper's credit."""
     violations, _ = _collect_rasterio_violations(
@@ -3731,7 +3719,7 @@ def test_guard_deferred_callable_inside_wrapper_gets_no_credit():
 
 
 def test_guard_with_item_order_decides_credit():
-    """codex round 6: context managers enter left to right, so a helper
+    """Context managers enter left to right, so a helper
     LATER in the same with-statement must not credit an earlier open; the
     canonical helper-first shape still passes."""
     violations, _ = _collect_rasterio_violations(
@@ -3753,7 +3741,7 @@ def test_guard_with_item_order_decides_credit():
 
 
 def test_guard_remote_literal_open_gets_no_wrapper_credit():
-    """codex round 7: gdal_safe_open_env stops no redirect (#937), so a
+    """gdal_safe_open_env stops no redirect (#937), so a
     wrapped open of a literally-remote source must still be flagged — plain
     literal and f-string forms both."""
     violations, _ = _collect_rasterio_violations(
@@ -3783,7 +3771,7 @@ def test_guard_remote_literal_open_gets_no_wrapper_credit():
 
 
 def test_guard_remote_literal_argv_gets_no_safe_env_credit():
-    """codex round 7, CLI side: a safe-env call cannot credit an argv that
+    """A safe-env call cannot credit an argv that
     carries a remote-prefixed literal element."""
     violations, _ = _collect_gdal_cli_violations(
         _mod(
@@ -3802,7 +3790,7 @@ def test_guard_remote_literal_argv_gets_no_safe_env_credit():
 
 
 def test_guard_remote_fp_keyword_and_uppercase_scheme_are_caught():
-    """codex round 8: the remote check must also see the fp keyword form
+    """The remote check must also see the fp keyword form
     and case-varied URL schemes; a hand-written /VSICURL/ literal stays
     uncredited-but-local because GDAL's VSI lookup is case-sensitive and
     would never reach the network."""
@@ -3828,7 +3816,7 @@ def test_guard_remote_fp_keyword_and_uppercase_scheme_are_caught():
 
 
 def test_guard_tuple_argv_is_detected():
-    """codex round 9: a tuple argv (subprocess.run(("gdalinfo", url))) must
+    """A tuple argv (subprocess.run(("gdalinfo", url))) must
     be judged exactly like a list argv."""
     violations, total = _collect_gdal_cli_violations(
         _mod(
@@ -3841,7 +3829,7 @@ def test_guard_tuple_argv_is_detected():
 
 
 def test_guard_evil_prefixed_module_gets_no_credit():
-    """codex round 9: module paths compare exactly — a suffix match credited
+    """Module paths compare exactly — a suffix match credited
     from evil.processing.raster.vrt import gdal_safe_open_env."""
     violations, _ = _collect_rasterio_violations(
         _mod(
@@ -3859,7 +3847,7 @@ def test_guard_evil_prefixed_module_gets_no_credit():
 
 
 def test_guard_import_then_reassign_open_is_detected_not_invisible():
-    """codex round 10: the old demotion made a rasterio.open through an
+    """The old demotion made a rasterio.open through an
     imported-then-rebound name invisible (not flagged, not counted) — the
     unsafe direction. Ambiguity must classify as a violation."""
     violations, total = _collect_rasterio_violations(
@@ -3878,7 +3866,7 @@ def test_guard_import_then_reassign_open_is_detected_not_invisible():
 
 
 def test_guard_gdal_family_tool_is_detected():
-    """codex round 10: any gdal*/ogr* executable is a GDAL CLI — a fixed
+    """Any gdal*/ogr* executable is a GDAL CLI — a fixed
     seven-name list skipped gdal_rasterize, gdaltindex, ogrlineref, ..."""
     violations, total = _collect_gdal_cli_violations(
         _mod(
@@ -3894,7 +3882,7 @@ def test_guard_gdal_family_tool_is_detected():
 
 
 def test_guard_signature_expression_open_is_detected():
-    """codex round 11: defaults, decorators, and annotations evaluate in the
+    """Defaults, decorators, and annotations evaluate in the
     ENCLOSING scope. The walk used to consult the new function's params
     first, so def f(rasterio=rasterio.open(url)) was neither counted nor
     rejected — invisible, the failure class the invariant forbids."""
@@ -3912,7 +3900,7 @@ def test_guard_signature_expression_open_is_detected():
 
 
 def test_guard_unclassifiable_call_is_a_violation():
-    """THE INVARIANT (codex round 11): a call the resolver cannot classify —
+    """THE INVARIANT: a call the resolver cannot classify —
     here an .open() on a name bound nowhere it can see — is reported, never
     dropped. The sibling call on a confidently-bound non-rasterio object
     stays silent, so the invariant costs no false alarms on normal code."""
@@ -3933,7 +3921,7 @@ def test_guard_unclassifiable_call_is_a_violation():
 
 
 def test_guard_path_qualified_argv_head_is_detected():
-    """codex round 11: containers spell the executable as a path; the head
+    """Containers spell the executable as a path; the head
     normalizes to its basename before family classification."""
     violations, total = _collect_gdal_cli_violations(
         _mod(
@@ -3951,7 +3939,7 @@ def test_guard_path_qualified_argv_head_is_detected():
 
 
 def test_guard_alias_assignment_propagates_the_binding():
-    """codex round 12: `ropen = rasterio.open; ropen(url)` recorded only a
+    """`ropen = rasterio.open; ropen(url)` recorded only a
     generic bound name, so the call was invisible — a silent-pass path
     reachable by renaming, which falsified the module invariant. Aliases
     propagate now, including module aliases and chains."""
@@ -3993,9 +3981,9 @@ def test_guard_unfollowable_alias_is_unclassified_not_invisible():
 
 
 def test_guard_signature_default_keeps_enclosing_wrapper_credit():
-    """codex round 12: a default is evaluated eagerly, while an enclosing
+    """A default is evaluated eagerly, while an enclosing
     `with gdal_safe_open_env():` is still active, so it IS protected. The
-    round-11 boundary rule reported it unwrapped — a false positive that
+    earlier boundary rule reported it unwrapped — a false positive that
     would have blocked correct code. The deferred BODY still gets no
     credit."""
     violations, total = _collect_rasterio_violations(
@@ -4018,7 +4006,7 @@ def test_guard_signature_default_keeps_enclosing_wrapper_credit():
 
 
 def test_guard_non_prefixed_gdal_utilities_are_detected():
-    """codex round 12: GDAL ships utilities matching neither family prefix
+    """GDAL ships utilities matching neither family prefix
     (nearblack, sozip, gnmmanage, ...)."""
     violations, total = _collect_gdal_cli_violations(
         _mod(
@@ -4036,7 +4024,7 @@ def test_guard_non_prefixed_gdal_utilities_are_detected():
 
 
 def test_guard_blank_justification_fails():
-    """codex round 3: a (count, '') entry defeats the reviewed-justification
+    """A (count, '') entry defeats the reviewed-justification
     contract; blank justifications fail in every allowlist."""
     modules = _mod(
         "import rasterio\ndef fn(path):\n    with rasterio.open(path):\n        pass\n"
@@ -4052,7 +4040,7 @@ def test_guard_blank_justification_fails():
 
 
 # ---------------------------------------------------------------------------
-# fix(#996): the two resolution edges #936/#974 merged with open.
+# Two resolution edges of the escape analysis.
 # ---------------------------------------------------------------------------
 
 
@@ -4077,7 +4065,7 @@ def test_guard_gdal_named_constant_that_never_runs_is_not_an_argv():
 
 
 def test_guard_tool_name_list_handed_to_a_call_is_still_an_argv():
-    """fix(#996 review): the tool-name-list exemption stops at a call.
+    """The tool-name-list exemption stops at a call.
 
     A dataset or output path may legitimately be named ``ogrinfo``, so
     ``subprocess.run(["gdalinfo", "ogrinfo"])`` is a real invocation and shape
@@ -4097,7 +4085,7 @@ def test_guard_tool_name_list_handed_to_a_call_is_still_an_argv():
 
 
 def test_guard_argv_inside_a_container_or_walrus_is_still_detected():
-    """fix(#996 review): escape analysis follows a literal out of the
+    """Escape analysis follows a literal out of the
     container it is nested in, and through a walrus binding. Both shapes
     reach an exec while being bound to nothing directly."""
     violations, total = _collect_gdal_cli_violations(
@@ -4248,7 +4236,7 @@ def test_guard_comprehension_target_still_shadows_inside_the_comprehension():
 
 
 def test_guard_comprehension_walrus_binds_in_the_containing_scope():
-    """fix(#996 review): PEP 572 — a walrus inside a comprehension binds
+    """PEP 572 — a walrus inside a comprehension binds
     OUTSIDE it. Making comprehensions scopes must not swallow that, or a
     rebinding of `rasterio` in the containing function goes unrecorded.
 
@@ -4288,7 +4276,7 @@ def test_guard_comprehension_walrus_does_not_leak_the_loop_target_too():
 
 
 def test_guard_comprehension_walrus_alias_still_resolves_to_rasterio():
-    """fix(#996 review): exporting the binding is not enough, the VALUE must
+    """Exporting the binding is not enough, the VALUE must
     travel too. `[(ropen := rasterio.open) for _ in items]` then `ropen(path)`
     is a real unwrapped open; recording `ropen` as an opaque name would leave
     it classified as unrelated and invisible to the gate."""
@@ -4323,7 +4311,7 @@ def test_guard_plain_walrus_alias_resolves_too():
 
 
 def test_guard_argv_bound_by_unpacking_is_still_detected():
-    """fix(#996 review): `cmd, _ = ([...], None)` puts an ast.Tuple in
+    """`cmd, _ = ([...], None)` puts an ast.Tuple in
     `targets`, so a Name-only filter found no binding and a real invocation
     read as inert."""
     violations, total = _collect_gdal_cli_violations(
@@ -4341,7 +4329,7 @@ def test_guard_argv_bound_by_unpacking_is_still_detected():
 
 
 def test_guard_nested_shadow_does_not_make_an_inert_literal_escape():
-    """fix(#996 review): a nested scope that REBINDS the name is not a use of
+    """A nested scope that REBINDS the name is not a use of
     the outer value. Without this the escape search read `def inner(cmd):
     consume(cmd)` as the outer constant reaching a call, and failed a security
     gate on code where the literal never moves."""
@@ -4378,9 +4366,9 @@ def test_guard_genuine_closure_use_still_escapes():
 
 
 def test_guard_argv_built_by_a_conditional_or_concatenation_is_detected():
-    """fix(#996 review): the climb used to stop at the wrapping expression, so
-    a literal assembled through a ternary or a `+` never reached its
-    assignment and read as inert."""
+    """The climb continues past the wrapping expression, so
+    a literal assembled through a ternary or a `+` reaches its
+    assignment instead of reading as inert."""
     violations, total = _collect_gdal_cli_violations(
         _mod(
             "import subprocess\n"
@@ -4399,7 +4387,7 @@ def test_guard_argv_built_by_a_conditional_or_concatenation_is_detected():
 
 
 def test_guard_argv_reached_through_a_loop_target_is_detected():
-    """fix(#996 review): iteration binds the argv to the loop target, which
+    """Iteration binds the argv to the loop target, which
     the assignment-only model did not see."""
     violations, total = _collect_gdal_cli_violations(
         _mod(
@@ -4415,7 +4403,7 @@ def test_guard_argv_reached_through_a_loop_target_is_detected():
 
 
 def test_guard_argv_iterated_from_a_named_container_is_detected():
-    """fix(#1394): the container above wearing a name.
+    """The container above wearing a name.
 
     ``commands = (["gdalinfo", path],)`` then ``for cmd in commands:`` reported
     ZERO argv sites, because extraction followed subscript and attribute loads
@@ -4477,7 +4465,7 @@ def test_guard_argv_iterated_from_a_named_container_is_detected():
 
 
 def test_guard_iterating_the_vector_itself_binds_strings_not_argvs():
-    """The control for fix(#1394): the follow is gated on holding a CONTAINER.
+    """The control for the container follow, which is gated on holding a CONTAINER.
 
     ``for part in cmd:`` walks the argv's own elements, and a named tool-name
     list is the same shape — binding either to the loop target would flag
@@ -4501,7 +4489,7 @@ def test_guard_iterating_the_vector_itself_binds_strings_not_argvs():
 
 
 def test_guard_iterating_a_dict_yields_keys_not_the_argv():
-    """fix(#1394), codex round 1: not every container yields its contents.
+    """Not every container yields its contents.
 
     ``for key in commands:`` over a dict hands over ``"inspect"``; the argv
     stays put, so following the loop target flagged inert data — the #996
@@ -4552,7 +4540,7 @@ def test_guard_iterating_a_dict_yields_keys_not_the_argv():
 
 
 def test_guard_destructuring_loop_target_does_not_receive_the_argv():
-    """fix(#1394), codex round 2: unpacking splits the argv into strings.
+    """Unpacking splits the argv into strings.
 
     ``for tool, arg in commands:`` binds ``"gdalinfo"`` and the path, never the
     vector, so linking the literal to either name flagged data that cannot
@@ -4581,7 +4569,7 @@ def test_guard_destructuring_loop_target_does_not_receive_the_argv():
 
 
 def test_guard_a_leading_star_target_keeps_the_argv():
-    """fix(#1394), codex rounds 7 and 17: a LEADING star is not destructuring.
+    """A LEADING star is not destructuring.
 
     ``for *cmd, in commands:`` binds ``cmd`` to ``list(element)`` — the vector,
     whole — and ``for *cmd, ignored in commands:`` binds it to everything but
@@ -4629,7 +4617,7 @@ def test_guard_a_leading_star_target_keeps_the_argv():
 
 
 def test_guard_starring_an_argv_splices_it_into_the_display():
-    """fix(#1394), codex rounds 4 and 5: `*` preserves depth.
+    """`*` preserves depth.
 
     ``commands = [*["gdalinfo", path]]`` IS ``["gdalinfo", path]``. Reading the
     outer display as a container of the argv made ``for part in commands:``
@@ -4701,12 +4689,12 @@ def test_guard_starring_an_argv_splices_it_into_the_display():
 
 
 def test_guard_a_wrapped_iterable_is_still_the_same_loop():
-    """fix(#1394), codex round 6: the value wrappers reach the loop too.
+    """The value wrappers reach the loop too.
 
     ``for cmd in commands or ():`` iterates ``commands``. Requiring the load to
     be the direct child of ``For.iter`` let the ternary, ``+`` and ``or`` forms
     #996 follows everywhere else hide a real argv — a silent miss. A star into
-    a display preserves depth the same way (round 5), so it reaches the loop
+    a display preserves depth the same way, so it reaches the loop
     too.
 
     A CONTAINER wrapper must NOT reach it: ``for held in [commands]:`` binds
@@ -4733,7 +4721,7 @@ def test_guard_a_wrapped_iterable_is_still_the_same_loop():
         "cmd"
     }
     assert loop_targets_of("for held in [commands]:\n    pass\n", "commands") == set()
-    # codex round 7: the ternary qualifies through its RESULTS, not its test.
+    # The ternary qualifies through its RESULTS, not its test.
     assert loop_targets_of(
         "for cmd in (commands if flag else ()):\n    pass\n", "commands"
     ) == {"cmd"}
@@ -4741,7 +4729,7 @@ def test_guard_a_wrapped_iterable_is_still_the_same_loop():
         loop_targets_of("for cmd in ([] if commands else ()):\n    pass\n", "commands")
         == set()
     )
-    # codex round 8: `and` yields a non-final operand only when it is FALSY,
+    # `and` yields a non-final operand only when it is FALSY,
     # so an `and`-guarded container can never be iterated with anything in it.
     # `or` yields it when truthy, and the final operand is a result for both.
     assert (
@@ -4753,7 +4741,7 @@ def test_guard_a_wrapped_iterable_is_still_the_same_loop():
     assert loop_targets_of("for cmd in () or commands:\n    pass\n", "commands") == {
         "cmd"
     }
-    # codex round 10: a walrus evaluates to its value as well as binding it,
+    # A walrus evaluates to its value as well as binding it,
     # and its target is a Store that the Load-only alias walk never sees.
     assert loop_targets_of(
         "for cmd in (alias := commands):\n    pass\n", "commands"
@@ -4808,7 +4796,7 @@ def test_guard_a_wrapped_iterable_is_still_the_same_loop():
 
 
 def test_guard_positional_unpacking_consumes_the_wrapper():
-    """fix(#1394), codex round 11: unpacking takes the container apart.
+    """Unpacking takes the container apart.
 
     ``alias, = (["gdalinfo", path],)`` binds the vector itself, so
     ``for part in alias:`` yields strings and reporting it was a false positive
@@ -4819,7 +4807,7 @@ def test_guard_positional_unpacking_consumes_the_wrapper():
     The control in the middle: ``alias`` is the vector, so spawning it directly
     is still a site — the fix must not turn the unpacking into a dead end.
 
-    codex round 12: patterns nest as freely as displays do, so the wrappers and
+    Patterns nest as freely as displays do, so the wrappers and
     the patterns are counted one for one. ``((alias,),) = ((argv,),)`` consumes
     two and lands where the single unpacking does, while ``(alias,) =
     ((argv,),)`` consumes one and leaves a container — the last two functions.
@@ -4858,7 +4846,7 @@ def test_guard_positional_unpacking_consumes_the_wrapper():
 
 
 def test_guard_unpacking_pairs_only_with_real_levels():
-    """fix(#1394), codex round 13: two ways the one-for-one count goes wrong.
+    """Two ways the one-for-one count goes wrong.
 
     A wrapper that adds NO level is not a pattern's to consume, so it has to be
     stepped over rather than end the pairing: ``(alias,) = ((argv,) + ())``
@@ -4895,7 +4883,7 @@ def test_guard_unpacking_pairs_only_with_real_levels():
     assert total_uneven == 1, (total_uneven, uneven)
     assert len(uneven) == 1 and "(uneven_chain)" in uneven[0]
 
-    # codex round 15: those two endpoints hold DIFFERENT things — `alias` a
+    # Those two endpoints hold DIFFERENT things — `alias` a
     # container, `deep` the argv — so one kind for both names could only be
     # wrong about one of them. Iterating `deep` yields strings.
     per_endpoint, total_per_endpoint = _collect_gdal_cli_violations(
@@ -4912,7 +4900,7 @@ def test_guard_unpacking_pairs_only_with_real_levels():
 
 
 def test_guard_unpacking_a_named_container_consumes_its_kind():
-    """fix(#1394), codex round 14: the same rule one alias hop away.
+    """The same rule one alias hop away.
 
     ``alias, = commands`` takes ``commands`` apart exactly as
     ``alias, = (["gdalinfo", path],)`` takes the display apart, and leaves
@@ -4954,7 +4942,7 @@ def test_guard_unpacking_a_named_container_consumes_its_kind():
 
 
 def test_guard_a_sliced_container_is_still_a_container():
-    """fix(#1394), codex round 9: a slice yields a sequence of the same things.
+    """A slice yields a sequence of the same things.
 
     ``for cmd in commands[:]:`` iterates argvs, and the loop rule could not
     climb the subscript, so a real GDAL invocation went undetected — the silent
@@ -4962,7 +4950,7 @@ def test_guard_a_sliced_container_is_still_a_container():
     only a SINGLE index stops the walk because it consumes a level.
 
     Fixed on the alias path too (``sliced = commands[:]``), since that is how
-    round 8 got around the round-7 fix. The controls: an INDEX still yields the
+    got around the earlier fix. The controls: an INDEX still yields the
     vector, and slicing the vector itself still yields strings.
     """
     violations, total = _collect_gdal_cli_violations(
@@ -4995,7 +4983,7 @@ def test_guard_a_sliced_container_is_still_a_container():
 
 
 def test_guard_a_dead_wrapper_alias_is_not_followed_either():
-    """fix(#1394), codex round 8: the same rule one alias hop away.
+    """The same rule one alias hop away.
 
     ``empty = [] if commands else ()`` and ``nothing = commands and ()`` are
     always empty, so a later ``for cmd in empty:`` runs nothing. The wrapper
@@ -5037,7 +5025,7 @@ def test_guard_a_dead_wrapper_alias_is_not_followed_either():
 
 
 def test_guard_conflicting_container_kinds_merge_to_the_louder():
-    """fix(#1394), codex round 3: a path reached twice has ONE answer.
+    """A path reached twice has ONE answer.
 
     ``x = commands`` beside ``x = {"label": commands}`` puts ``x`` on the
     worklist as both a sequence and a dict. Collapsing the pairs kept whichever
@@ -5073,7 +5061,7 @@ def test_guard_conflicting_container_kinds_merge_to_the_louder():
 
 
 def test_guard_container_kind_survives_an_alias_hop():
-    """fix(#1394), codex round 1: the kind travels with the path.
+    """The kind travels with the path.
 
     An alias of a container is the same container, so ``alias = commands`` then
     ``for x in alias:`` has to reach the SAME verdict as iterating ``commands``
@@ -5101,7 +5089,7 @@ def test_guard_container_kind_survives_an_alias_hop():
 
 
 def test_guard_unpacking_binds_by_position_not_by_all_names():
-    """fix(#996 review): attaching every target name to every nested literal
+    """Attaching every target name to every nested literal
     let a SIBLING's escape drag inert data into the gate — the false-positive
     class this issue exists to remove. Positions are matched instead."""
     violations, total = _collect_gdal_cli_violations(
@@ -5134,7 +5122,7 @@ def test_guard_unpacking_still_detects_the_position_that_does_escape():
 
 
 def test_guard_canonical_import_shadow_also_breaks_the_escape_link():
-    """fix(#996 review): a canonical import lands in `canonical`, not `bound`,
+    """A canonical import lands in `canonical`, not `bound`,
     so a nested `from rasterio import open as cmd` was not recognised as a
     shadow and the inner load was credited to an outer literal."""
     violations, total = _collect_gdal_cli_violations(
@@ -5153,7 +5141,7 @@ def test_guard_canonical_import_shadow_also_breaks_the_escape_link():
 
 
 def test_guard_iterating_a_tool_name_list_is_not_an_argv():
-    """fix(#996 review): `for tool in ["gdalinfo", "ogrinfo"]` binds each
+    """`for tool in ["gdalinfo", "ogrinfo"]` binds each
     STRING to the target, not the list. Linking the list to every load of the
     target flagged ordinary tool-name data — the loop-target rule only applies
     when the literal is an ELEMENT of the iterable."""
@@ -5168,7 +5156,7 @@ def test_guard_iterating_a_tool_name_list_is_not_an_argv():
 
 
 def test_guard_subscripting_an_argv_yields_an_element_not_the_vector():
-    """fix(#996 review): `cmd[0]` is a string. Returning or passing it moves an
+    """`cmd[0]` is a string. Returning or passing it moves an
     element, so the command-shaped list stays inert; a SLICE still yields a
     sequence that could be spawned and keeps escaping."""
     violations, total = _collect_gdal_cli_violations(
@@ -5199,7 +5187,7 @@ def test_guard_subscripting_an_argv_yields_an_element_not_the_vector():
 
 
 def test_guard_argv_reached_through_an_alias_chain_is_detected():
-    """fix(#996 review): `cmd = [...]`, `alias = cmd`, `run(alias)` reaches an
+    """`cmd = [...]`, `alias = cmd`, `run(alias)` reaches an
     exec through a name the literal was never directly bound to. Stopping at
     the first hop lost it, a regression against the pre-#996 scan."""
     violations, total = _collect_gdal_cli_violations(
@@ -5218,7 +5206,7 @@ def test_guard_argv_reached_through_an_alias_chain_is_detected():
 
 
 def test_guard_chained_unpacking_keeps_every_target():
-    """fix(#996 review): `a, b = cmd, y = (...)` binds the same position twice;
+    """`a, b = cmd, y = (...)` binds the same position twice;
     returning only the first target dropped the name that reaches the exec."""
     violations, total = _collect_gdal_cli_violations(
         _mod(
@@ -5234,7 +5222,7 @@ def test_guard_chained_unpacking_keeps_every_target():
 
 
 def test_guard_argv_assembled_by_augmented_assignment_is_detected():
-    """fix(#996 review): `cmd = []` then `cmd += [...]` assembles a real argv,
+    """`cmd = []` then `cmd += [...]` assembles a real argv,
     and the literal's parent is an AugAssign no binding branch matched."""
     violations, total = _collect_gdal_cli_violations(
         _mod(
@@ -5251,8 +5239,8 @@ def test_guard_argv_assembled_by_augmented_assignment_is_detected():
 
 
 def test_guard_argv_behind_a_boolean_fallback_is_detected():
-    """fix(#996 review): `fallback or [...]` is a value-producing wrapper like
-    the ternary; the climb used to stop at the BoolOp."""
+    """`fallback or [...]` is a value-producing wrapper like
+    the ternary, and the climb passes through the BoolOp."""
     violations, total = _collect_gdal_cli_violations(
         _mod(
             "import subprocess\n"
@@ -5267,7 +5255,7 @@ def test_guard_argv_behind_a_boolean_fallback_is_detected():
 
 
 def test_guard_attribute_target_does_not_bind_its_container():
-    """fix(#996 review): `settings.choices = [...]` binds nothing this analysis
+    """`settings.choices = [...]` binds nothing this analysis
     can follow. Reading `settings` as the binding made `render(settings)` look
     like the argv escaping — a false positive on data that never moves."""
     violations, total = _collect_gdal_cli_violations(
@@ -5297,9 +5285,8 @@ def test_guard_subscript_target_does_not_bind_its_container_either():
 
 
 def test_guard_argv_stored_on_an_attribute_or_key_is_detected():
-    """fix(#996 review): refusing to bind the container was right; binding
-    NOTHING was not. `box.cmd = [...]` then `subprocess.run(box.cmd)` executes
-    the literal, so the PATH is what gets tracked."""
+    """A container target must still bind its path: `box.cmd = [...]` then
+    `subprocess.run(box.cmd)` executes the literal, so the PATH is tracked."""
     violations, total = _collect_gdal_cli_violations(
         _mod(
             "import subprocess\n"
@@ -5318,7 +5305,7 @@ def test_guard_argv_stored_on_an_attribute_or_key_is_detected():
 
 
 def test_guard_extracting_a_vector_from_a_container_keeps_the_chain():
-    """fix(#996 review): `commands = {...}`, `cmd = commands["inspect"]`,
+    """`commands = {...}`, `cmd = commands["inspect"]`,
     `run(cmd)`. The alias chain used to stop at the container, because a
     subscript is not a transparent wrapper for a vector."""
     violations, total = _collect_gdal_cli_violations(
@@ -5336,7 +5323,7 @@ def test_guard_extracting_a_vector_from_a_container_keeps_the_chain():
 
 
 def test_guard_argv_as_a_default_parameter_is_detected():
-    """fix(#996 review): a default executes on every bare call, but the literal
+    """A default executes on every bare call, but the literal
     sits in the signature — the escape walk stops at the function boundary, so
     the parameter NAME is the link."""
     violations, total = _collect_gdal_cli_violations(
@@ -5355,7 +5342,7 @@ def test_guard_argv_as_a_default_parameter_is_detected():
 
 
 def test_guard_rebinding_before_use_is_not_an_escape():
-    """fix(#996 review): ordinary variable reuse must not fail the gate.
+    """Ordinary variable reuse must not fail the gate.
     `cmd = [gdal]; cmd = ['echo', 'ok']; run(cmd)` executes nothing GDAL."""
     violations, total = _collect_gdal_cli_violations(
         _mod(
@@ -5374,8 +5361,8 @@ def test_guard_rebinding_before_use_is_not_an_escape():
 def test_guard_rebinding_in_a_branch_still_reports():
     """The narrowness is deliberate: only a rebinding in the SAME statement
     list is ordered against the use. A rebinding under an `if` is not, so the
-    literal still counts — the miss stays on the reported side, matching #974
-    round 10's refusal to do statement-order analysis."""
+    literal still counts — the miss stays on the reported side, matching #974's
+    refusal to do statement-order analysis."""
     violations, total = _collect_gdal_cli_violations(
         _mod(
             "import subprocess\n"
@@ -5392,7 +5379,7 @@ def test_guard_rebinding_in_a_branch_still_reports():
 
 
 def test_guard_annotated_path_target_is_tracked():
-    """fix(#996 review): `box.cmd: list[str] = [...]` binds a path exactly like
+    """`box.cmd: list[str] = [...]` binds a path exactly like
     the unannotated form. The AnnAssign branch still required a bare Name."""
     violations, total = _collect_gdal_cli_violations(
         _mod(
@@ -5408,7 +5395,7 @@ def test_guard_annotated_path_target_is_tracked():
 
 
 def test_guard_comparison_result_is_not_the_vector():
-    """fix(#996 review): a comparison yields a BOOLEAN. Passing that to a call
+    """A comparison yields a BOOLEAN. Passing that to a call
     hands over the result, not the argv — same family as the subscript rule."""
     violations, total = _collect_gdal_cli_violations(
         _mod(
@@ -5441,7 +5428,7 @@ def test_guard_comparison_does_not_hide_a_later_real_escape():
 
 
 def test_guard_value_wrapper_does_not_make_the_name_a_container():
-    """fix(#996 review): a BinOp/IfExp/BoolOp evaluates TO the vector, so the
+    """A BinOp/IfExp/BoolOp evaluates TO the vector, so the
     name it is assigned to holds the vector, not a container of it. Sharing one
     `climbed` flag with the container wrappers made `cmd[0]` read as a
     container access yielding the argv, when only a string escapes."""
@@ -5486,7 +5473,7 @@ def test_guard_container_wrapper_still_marks_the_name_a_container():
 
 
 def test_guard_generator_expression_does_not_grant_safe_env_credit():
-    """fix(#996 review): building `(gdal_safe_env() for _ in ())` executes
+    """Building `(gdal_safe_env() for _ in ())` executes
     nothing, so it must not credit the scope. This module lumped generator
     expressions in with the eager comprehensions and its own comment claimed
     only def and lambda defer — an unclamped argv beside one passed."""
@@ -5506,7 +5493,7 @@ def test_guard_generator_expression_does_not_grant_safe_env_credit():
 
 
 def test_guard_comprehension_body_no_longer_grants_safe_env_credit():
-    """fix(#1077) changed this verdict on purpose. A comprehension body is
+    """A comprehension body is
     eager only in the sense that it runs inside the enclosing statement —
     ``[gdal_safe_env() for _ in ()]`` still executes nothing, so "eager" was
     never the same claim as "runs". It is not a shape the position allowlist
@@ -5546,7 +5533,7 @@ def test_guard_generator_expression_outermost_iterable_is_still_eager():
 
 
 def test_guard_comprehension_walrus_argv_is_detected():
-    """fix(#996 review): the walrus binds in the CONTAINING scope, so
+    """The walrus binds in the CONTAINING scope, so
     recording it in the comprehension too made its own load read as a nested
     shadow and the argv vanished."""
     violations, total = _collect_gdal_cli_violations(
@@ -5563,7 +5550,7 @@ def test_guard_comprehension_walrus_argv_is_detected():
 
 
 # ---------------------------------------------------------------------------
-# fix(#1077): credit is an ALLOWLIST of positions, not a walk that credits any
+# Credit is an ALLOWLIST of positions, not a walk that credits any
 # call it sees. The three shapes below all execute eagerly WHEN REACHED, so
 # #996's deferred-body rule never touched them; they credited silently until
 # the inversion. Each pairs the conditional form with the unconditional
@@ -5703,7 +5690,7 @@ def test_guard_finally_env_does_not_credit_the_try_body():
 
 
 def test_guard_nested_generator_iterable_no_longer_credits():
-    """fix(#1077) also closes the recursion hole #996 left in the eager half
+    """Closes the recursion hole in the eager half
     of the deferral rule: a genexp's outermost iterable is eager, but when
     that iterable is ITSELF a generator expression nothing runs. The hand
     rolled scan re-entered and credited; positions compose, so this one
@@ -5757,11 +5744,10 @@ def test_guard_env_that_goes_nowhere_does_not_credit():
 
 def test_guard_real_tree_credit_shapes_are_all_allowlisted():
     """The practicality check, pinned as a test rather than left to the
-    measurement in #1077's PR body: the exact shapes the credited argv sites in
+    one-off measurement: the exact shapes the credited argv sites in
     ``app/`` use. ``prepare_with_overviews`` assigns the env inside a ``try``;
     ``convert_to_cog`` builds its argv across conditional ``extend`` calls and
-    passes an env variable (fix(#1291) removed its second, gdalwarp site, whose
-    shape was an env passed inline from inside an ``if``); ``_build_vrt``
+    passes an env variable; ``_build_vrt``
     builds the argv in the straight-line body and passes the env inline from
     inside a ``try``. Narrowing the allowlist until any of these reports means
     breaking the tree, and this is where that shows up."""
@@ -5801,7 +5787,7 @@ def test_guard_real_tree_credit_shapes_are_all_allowlisted():
 
 
 def test_guard_staged_upload_credited_by_the_raster_helper_reports():
-    """fix(#1846 codex P2, thread 3939092275): the clamps may not cross.
+    """The clamps may not cross.
 
     A staged-upload argv wired to `gdal_safe_env` has the RASTER clamps and no
     vector driver skip anywhere near it, so the drivers that read a document as

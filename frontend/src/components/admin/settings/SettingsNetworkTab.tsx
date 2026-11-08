@@ -7,9 +7,11 @@ import { Button } from '@/components/ui/button';
 import { SettingSourceBadge } from './SettingSourceBadge';
 import { SettingsFormActions } from './SettingsFormActions';
 import { findSetting } from './utils';
+import { coerceStoryFrameHosts, StoryFrameHostsField } from './StoryFrameHostsField';
 import { useSettingsForm, type ResetHandler } from './useSettingsForm';
 import { useNotificationStatus, useSendTestNotification } from '@/hooks/use-settings';
 import type { SettingItem, NotificationTestChannelResult } from '@/api/settings';
+import type { StoryFrameHost } from '@/types/api';
 import { Textarea } from '@/components/ui/textarea';
 
 interface TabProps {
@@ -27,11 +29,11 @@ const FIELDS = [
   { key: 'cors_allowed_origins', defaultValue: '' },
   { key: 'global_rate_limit', defaultValue: 60 },
   { key: 'ogc_items_max_page_size', defaultValue: 1000 },
-  // fix(#1778): the registry puts these two on tab="network" and their
-  // docstrings say the admin Settings UI is the only control (there is no
-  // env var for either) — but no tab component ever read the keys.
+  // These two live on tab="network"; the admin Settings UI is their only
+  // control (there is no env var for either).
   { key: 'semantic_search_rate_limit', defaultValue: 30 },
   { key: 'basemap_proxy_rate_limit', defaultValue: 120 },
+  { key: 'story_frame_hosts', defaultValue: [] as StoryFrameHost[], compare: 'json' as const, coerce: coerceStoryFrameHosts },
 ] as const;
 
 function NotificationChannelBadge({ ok, label }: { ok: boolean; label: string }) {
@@ -62,7 +64,7 @@ export function SettingsNetworkTab({ settings, envOnly, onSave, onReset: submitR
   const { t } = useTranslation('admin');
   const { values, setters, dirty, hasDirty, discard, onReset } = useSettingsForm(settings, FIELDS, isSaving, settingsUpdatedAt, saveFailed, submitReset);
 
-  // Phase 1229 Plan 03 — notification channel status + test-send (NOTIF-06).
+  // Notification channel status + test-send.
   const { data: notifStatus, isLoading: notifLoading } = useNotificationStatus();
   const testSend = useSendTestNotification();
   const [testResult, setTestResult] = useState<{ sent: boolean; channels: NotificationTestChannelResult[]; message: string } | null>(null);
@@ -172,7 +174,15 @@ export function SettingsNetworkTab({ settings, envOnly, onSave, onReset: submitR
         />
       </div>
 
-      {/* Phase 1229 Plan 03 — Notification channel status + test-send (NOTIF-06) */}
+      <StoryFrameHostsField
+        settings={settings}
+        hosts={values.story_frame_hosts as StoryFrameHost[]}
+        onChange={setters.story_frame_hosts}
+        onReset={onReset}
+        envOnly={envOnly}
+      />
+
+      {/* Notification channel status + test-send */}
       <div className="space-y-3 border rounded-md p-4">
         <div>
           <h3 className="text-sm font-medium">{t('settings.notifications.title')}</h3>

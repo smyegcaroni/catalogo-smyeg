@@ -98,9 +98,8 @@ describe('HeatmapStyleControls', () => {
     expect(screen.getByTestId('color-ramp-picker')).toHaveTextContent('Blues');
   });
 
-  // test(#828): the reverse toggle regressed once in the 1.6.0 cycle (an inert
-  // default-false checkbox with no callback wired). Pin the write side: toggling
-  // must persist _heatmap-reversed AND rebuild heatmap-color with the flag.
+  // Pin the write side of the reverse toggle: toggling must persist
+  // _heatmap-reversed AND rebuild heatmap-color with the flag.
   describe('ramp reversal write side (#828)', () => {
     beforeEach(() => {
       vi.mocked(buildHeatmapColorExpression).mockClear();
@@ -171,7 +170,7 @@ describe('HeatmapStyleControls', () => {
     });
   });
 
-  // fix(#788 item 3): SliderRow omitted aria-valuetext, so AT read the raw
+  // SliderRow omitted aria-valuetext, so AT read the raw
   // number ("0.8") while the screen showed the formatted value ("80%").
   it('exposes the formatted value to AT via aria-valuetext on each slider', () => {
     render(<HeatmapStyleControls layer={baseLayer} onPaintChange={vi.fn()} />);

@@ -2,284 +2,114 @@
 
 Apache-2.0 command-line interface for the [GeoLens](https://github.com/geolens-io/geolens) API.
 
-Login, scan local directories of spatial data, apply manifest-driven catalogs, publish vector or raster files, replace an uploaded dataset's data from a file, refresh remote service datasets, inspect source status, run PostGIS analysis operations, and export STAC metadata against any GeoLens instance.
+Log in, scan local directories of spatial data, publish files, apply manifest-driven catalogs, replace and refresh datasets, inspect source status, run PostGIS analysis operations, export STAC metadata and plan an ArcGIS migration against any GeoLens instance.
 
-See [docs.getgeolens.com](https://docs.getgeolens.com/) for the full command reference.
-
-## Quickstart
+## Install
 
 ```bash
-pip install geolens-cli
+pip install geolens-cli      # installs the `geolens` command; Python 3.11 or newer
+```
+
+## Quick start
+
+```bash
 geolens login https://geolens.example.com/api
-geolens scan ./data
-geolens init
-geolens validate geolens.yaml
-geolens schema --output geolens-manifest-v1.schema.json
-geolens apply --dry-run geolens.yaml
-geolens apply geolens.yaml
 geolens publish ./data/cities.geojson
-geolens replace <dataset-id> ./data/cities-updated.geojson --wait
-geolens status <dataset-id>
-geolens refresh <dataset-id> --wait
-geolens analysis preview <dataset-id> --operation buffer --distance 500 > ring.geojson
-geolens analysis materialize <dataset-id> --operation buffer --distance 500 --title "500 m ring"  # waits for the job; --timeout to bound it
-geolens export stac <dataset-id> -o cities.stac.json
-geolens arcgis inventory --portal-url https://<org>.maps.arcgis.com -o ./inventory
+geolens status DATASET_ID        # the UUID at the end of the URL publish printed
 ```
 
-For a one-command quickstart, run `geolens publish examples/manifests/first-catalog/city-parks.geojson` against a running stack. See the full walkthrough at [docs.getgeolens.com](https://docs.getgeolens.com/).
+The CLI wraps the [`geolens`](https://pypi.org/project/geolens/) Python SDK package.
 
-The CLI consumes the [`geolens`](https://pypi.org/project/geolens/) Python SDK package. Manifest apply posts to the generated `POST /ingest/manifest/apply` contract through the SDK-owned client transport rather than a hand-rolled HTTP client.
+## Migrate from ArcGIS
 
-## Apply, replace, and refresh
-
-`geolens apply` reconciles declared catalog configuration. It re-imports a
-manifest entry only when that entry's fingerprint changes; applying an
-unchanged manifest returns `skip_complete` and does not re-fetch a remote
-source whose data changed independently.
-
-An update that removes or retypes a column, or otherwise needs review, ends
-blocked for review. Applying that entry again unchanged does not queue it a
-second time: the entry comes back `blocked` with the run to accept and its
-reasons, apply prints
-`geolens refresh <dataset-id> --accept-blocked-run <run-id>`, and exits 6. A
-changed entry is queued as usual.
-
-A vector source can carry an optional `checksum: sha256:<64 lowercase hex>`
-field. It is declared, not verified: apply never fetches the source bytes to
-check it, and folds it into the entry fingerprint like any other field. That
-makes it the way to force a re-import under a stable URI, such as
-`latest.gpkg` or a path an ETL job overwrites in place, where the entry
-itself never changes but the file underneath it does. Bump `checksum` when
-the file changes and the next apply reclassifies the entry as an update
-instead of skipping it. This does not apply to `raster_cog` sources: manifest
-raster updates are not supported, so do not set or change `checksum` on a
-raster entry. A changed checksum there still reclassifies the entry the same
-way, but the update then fails with an error result ("Manifest raster
-updates are not supported; create a new raster dataset instead."), not a
-skip. An unchanged raster entry, checksum included, still skips normally.
-Replace raster data by creating a new raster dataset instead.
-
-`geolens replace <dataset-id> <file>` replaces this dataset's data from a
-local file, the CLI equivalent of the Re-upload dialog in the web app. It
-prints the preview (layer, feature count, detected SRID) and what the
-replacement would change (columns removed, retyped and added, old and new row
-counts, and each reason it needs review) before committing, then asks for
-confirmation once. `--srid` applies to the preview as well as the commit. Pass
-`--yes` to skip the prompt; it does not acknowledge the review reasons, so a
-replacement that needs review still stops as a blocked run. Confirming at the
-prompt does acknowledge them. `--wait` follows the run to its end and fails
-loudly on a bad import. A blocked run prints its reasons and
-`geolens refresh <dataset-id> --accept-blocked-run <run-id>`, and exits 6. A file with more than one layer needs `--layer`, since omitting
-it would otherwise commit the first layer without telling you. A raster
-dataset has no layer to preview, so `replace` uploads and commits it directly
-and `--layer` is rejected. `replace` only accepts a local file. A dataset
-whose data comes from a remote service origin, or a registered database
-table, cannot be replaced this way; use `geolens refresh` for that instead.
-`--json` never prompts, so it requires `--yes`.
-
-`geolens refresh <dataset-id>` re-pulls data from the origin binding stored by
-GeoLens. It does not accept a URL, layer, or client-selected trigger. Add
-`--wait` to poll the durable refresh run; pass `--timeout` when you need a
-finite bound. JSON output includes the verification result. A refresh that ends
-blocked for review exits 6 and prints the accept command. Unattended refresh is
-not supported: a blocked run waits for a person to review it. Use `apply` when
-the declared source configuration itself changes.
-
-Service refresh compares the staged row count with the source count when the
-provider supplies one. A mismatch fails without changing live data. A missing
-source count, an empty replacement for a non-empty dataset, or a removed or
-retyped column blocks publication for review. After checking the Source panel,
-use `--accept-blocked-run <run-id>` to accept that source and staged content
-once. The retry must match the reviewed attributes and geometries. A later or
-different result blocks again. Matching counts still do not prove that a mutable
-provider served every page from one snapshot.
-
-Registered PostGIS refresh measures the registered live relation; it does not
-copy or preserve that relation. Referenced STAC refresh updates the remote item
-and asset pointer; it does not copy the asset bytes. A failed or blocked service
-refresh retains the current managed table. After a successful file replacement
-or service refresh of a vector dataset, GeoLens keeps the replaced table as the
-previous version until the next replacement, and `POST
-/api/datasets/{id}/previous-version/restore` publishes it again. A registered
-PostGIS refresh, a partitioned table, rasters, mosaics, tilesets and point
-clouds keep no previous version, so restoring their earlier data requires a
-backup or re-import.
-
-Protected services can receive bearer credentials with `--token`. Use bare
-`--token` for a hidden prompt. Use `--auth-file` with a protected JSON file for
-bearer, Basic, or named-header credentials. The server needs a reachable shared
-credential store (`REDIS_URL`) to hand the single-use secret to the worker; the
-configuration validation endpoint reports this separately from ordinary cache
-health. GeoLens does not store the credential in the dataset binding.
-
-`geolens status <dataset-id>` reports the catalog status together with source
-origin, freshness, health, and the last successful refresh time. Use `--json`
-before the command for a machine-readable status payload.
-
-`geolens apply --wait` follows each queued job to its end and adds a STATUS
-column (`complete`, `failed`, `blocked`, `cancelled`). With `--json`, each
-result gains `final_status` and `run_id`.
-
-### Exit codes
-
-| Code | Meaning |
-|---|---|
-| 0 | Success |
-| 1 | Generic failure, including a failed or cancelled run |
-| 2 | Usage error |
-| 3 | Authentication or permission error |
-| 4 | Network error or timeout |
-| 5 | Server error |
-| 6 | Blocked for review: `replace --wait`, `refresh --wait` or `apply --wait` ended with a run waiting for review. For `apply --wait`, a failure in any entry takes precedence and exits 1. |
-
-## ArcGIS migration inventory
-
-`geolens arcgis inventory` lists an ArcGIS Online or Portal for ArcGIS
-organization's content and reports what would carry over to GeoLens. It is
-read-only: it changes nothing on the portal, needs no GeoLens instance or
-sign-in, and talks only to the portal URL you give it. It never contacts the
-services an item points at.
+Three commands move an ArcGIS Online organization or a self-hosted ArcGIS portal into GeoLens. They are written for an ArcGIS organization administrator, because a portal search only returns items shared with the caller and a non-admin never sees other people's private items. On the GeoLens side the session must be an admin (`geolens login` as one), since the run reads the user list and hands ownership to the people the plan names. The exception is one person moving their own content: when the plan maps every item to the account you are signed in as, an editor can run `migrate`. Nothing is transferred and no user list is read; the items stay with you. A plan that maps any item to someone else, or a role that lacks the permission the selected items need (`upload` for datasets, `edit_metadata` for maps), still needs an admin and exits 2. What an editor can't do degrades and is reported rather than refused: a public item under `restrict_public_visibility` becomes internal (`public_blocked_by_policy` in the report), collections are skipped without `manage_collections`, and an item shared only with ArcGIS groups is shared with the GeoLens groups you already belong to whose name matches the ArcGIS group's title (or the plan's `geolens_group`), or becomes private (`private_no_matching_group`), never internal or public. An editor creates no groups and can't read a group's members, so the report and `--cutover` flag every matched group's members as unread; check them in GeoLens.
 
 ```bash
-export ARCGIS_TOKEN=...   # or --token-stdin, or --username with a password prompt
-geolens arcgis inventory --portal-url https://<org>.maps.arcgis.com -o ./inventory
-geolens arcgis inventory --portal-url https://gis.example.com/portal --scope org
-geolens --json arcgis inventory --portal-url https://<org>.maps.arcgis.com > inventory.json
+geolens arcgis inventory --portal-url https://yourorg.maps.arcgis.com --scope org -o ./run
+geolens arcgis plan ./run/arcgis-inventory.json --owner-map owners.json
+geolens arcgis migrate ./run/arcgis-migration-plan.json
 ```
 
-Each item is classified as `supported` (hosted feature layers and views,
-feature and map services GeoLens can reach), `partial` (web maps, whose layers
-import but whose styling and popups need translation; hosted tile layers; OGC
-services; data files) or `unsupported` (apps, dashboards, StoryMaps, scenes,
-image and vector tile services, and anything the CLI doesn't recognize).
-Web AppBuilder apps and classic Esri Story Maps are flagged with Esri's
-retirement dates. Web maps and apps are read to record which layers and maps
-they depend on. Every item also records its snippet, description, tags,
-credits, license, extent, thumbnail name, spatial reference, folder, the
-groups it is shared with and its owner's name and email. Folder titles,
-owner names and group lists come back null where the portal doesn't let the
-signed-in account read them, and the group list holds only the groups that
-account can see. An anonymous run skips group reads. `--no-groups` skips the one-request-per-item
-group read.
+1. `inventory` reads the portal and writes `arcgis-inventory.json` and a readable report.
+2. `plan` turns it into `arcgis-migration-plan.json`, which you review and edit. Each item has an action (`import_layers`, `import_file`, `import_map`, `export_only` or `skip`), a target owner, visibility, collections and title. `owners.json` maps ArcGIS usernames to GeoLens usernames or emails; an empty value means no owner yet.
+3. `migrate` runs the plan one item at a time, in dependency order. Add `--dry-run` first to check the plan and the owners without importing anything. With `--username`, the dry run also makes the one ArcGIS sign-in the run starts with, so a refused password exits 3 before the real run; a token isn't checked.
 
-With `-o`, each Web Map's configuration is also saved as `webmaps/<item id>.json`
-and each app's as `apps/<item id>.json` (StoryMaps, Experiences, Dashboards,
-Hub sites and pages, Web Scenes, Notebooks and the other app types), mode 0600.
-Before writing, the value under any key named like a credential (`token`,
-`password`, `apiKey`, `secret`, `clientSecret`, `credentials`,
-`customParameters`) becomes `[REDACTED]` at any depth. `--read-all-item-data`
-reads every other item's data too and records any item ids it names. Hosted
-views, hosted layers and Survey123 forms also record their source service,
-source file or results service, at one extra request each. A dependency is marked `external` when it
-belongs to another organization, such as Living Atlas content.
+### What each action does
 
-- `--scope user` (the default) lists the signed-in user's folders;
-  `--scope org` lists every organization item the account can see. Without
-  credentials only `--scope org` works, and it lists public items.
-- Credentials: an existing token through `ARCGIS_TOKEN`, `--token-stdin` or
-  `--token`, or `--username` for a built-in account. The password comes from
-  `ARCGIS_PASSWORD`, `--password-stdin` or a prompt, and is used once to mint
-  a 60-minute token bound to the portal URL as its referer; later requests
-  send that `Referer`. A token you bring is sent without a `Referer`. SAML and
-  OpenID Connect accounts need a token. The token travels in the
-  `X-Esri-Authorization` header, never in a URL, and is never written to the
-  report, the terminal or disk. Redirects are refused.
-- Output: Markdown on stdout, JSON with `--json`, or both files
-  (`arcgis-inventory.json`, `arcgis-inventory.md`, mode 0600) with
-  `-o/--output-dir`. The JSON schema ships in the package as
-  `geolens_cli/manifest/schemas/arcgis-inventory-v2.schema.json`.
-- Limits: `--max-items` (default 10,000), `--concurrency` 1 to 4 for item
-  reads, at most ten requests a second, and retries with backoff on 429 and
-  502 to 504. ArcGIS search returns only the first 10,000 results of a query,
-  so a `--scope org` listing that reaches that limit is marked truncated
-  (`search_ceiling`) whatever `--max-items` is.
-- Exit codes: 0 when the report is complete, even if some items could not be
-  read (they are listed under errors; `--strict` makes that exit 1); 2 for
-  usage errors or a redirecting portal; 3 when the token is rejected; 4 for
-  network errors; 5 for portal server errors. If the token expires mid-run,
-  the partial report is still written, marked `"complete": false`; rerun with
-  a fresh token.
+- `import_layers`: GeoLens imports the feature layers and tables of a hosted or federated service itself; the CLI never contacts the service.
+- `import_file`: a CSV, GeoJSON, Shapefile or File Geodatabase item is downloaded from the portal and uploaded. It is bounded by the instance's upload size limit; an item over it is skipped with its size.
+- `export_only`: items GeoLens can't host (dashboards, forms, StoryMaps, Hub pages and so on) are saved under `export/<type>/<item id>/` next to the state file, with `item.json`, the item's data, its resources and, for a story, a readable `story.md`. `export/INDEX.md` lists them, and the source files of hosted layers, with what to use instead. Uploaded files keep their type: a CSV is saved as `data.csv` and a PDF as `data.pdf`, from the portal's file name or the item type, and `data.bin` only when neither gives one. A `story.md` links each map to the GeoLens map made from it at the instance's `PUBLIC_APP_URL`, or at the instance URL without `/api` when `PUBLIC_APP_URL` isn't set, so set it on an install that serves the web app from another origin. A map that hasn't been migrated is linked to its ArcGIS item page instead, which stops working when the portal is retired, so replace those links before cutover. `--export-cap-mb` (default 200) limits each item. An export can finish with files missing: one over the cap, JSON that can't be redacted, a request the portal refused, or an unsafe resource name. The item notes, the report and `INDEX.md` (status `partial` or `complete, with errors`) say which, so check them before retiring the ArcGIS source. A network or server error while exporting leaves the item failed, and a rerun retries it.
+- `import_map`: a Web Map becomes a GeoLens map through the server's web map translator. Its operational layers are matched to the datasets the run imported for their service items, so the map waits for those items (`depends_on`); a layer from another organization or a service that was not imported is left out. Basemaps follow the plan's `basemap_map`. A matched layer that the web map leaves to its source is drawn with the renderer saved on its layer item, read from the portal, or else its service layer's own renderer, read only from a host the run trusts with its token (`--trust-service-host`). `webmap-loss/<item id>.json` next to the state file lists what was not carried over, and the report lists the path under its loss reports and in the follow-ups. The state keeps each ArcGIS layer id's map layer id. The map gets the web map item's thumbnail, read from the portal with the run's credential, and a rerun gives it to a migrated map that has no thumbnail; a thumbnail already on the map is never replaced. A PNG or JPEG over the size GeoLens takes for a thumbnail, any other image type, or a failed read or upload is reported on the item and leaves the map without one. A dry run notes each new map that would get one.
 
-### Planning the migration
+Items are imported as you, then handed to the owner the plan names. Each target user needs a role with `upload` (datasets) or `edit_metadata` (maps). `--unmapped-owner` names an owner for items whose plan owner can't take them yet: the mapping is empty, the user hasn't signed in to GeoLens yet (an OIDC user before first sign-in), is inactive, or has a role without that permission, such as the `viewer` role new OIDC users get. Those items go to the `--unmapped-owner` for now and are recorded as waiting; a later run hands each one to its owner once the owner can take it, or to a new `--unmapped-owner` if you pass another. For a role, the run asks you to promote the user to editor instead of letting the transfer fail, and when GeoLens itself refuses a transfer because of the user's role, the item fails with the same request. Without `--unmapped-owner` such items stop the run before anything is imported, except a role without the permission, which is a warning and the server decides. When the refusal is an empty `owner_map` entry and GeoLens already has an account with the same username and the email the inventory read for that owner, the message names it; `migrate` doesn't map it for you, because an owner gets the item itself, which is more than group membership. A migrated item whose plan owner you later edit to an empty value, a name that matches no user or one that matches two is listed in the output and the report, and stays with its current owner. When an item's ArcGIS owner changes after it was migrated, a rerun hands it to the GeoLens user `owner_map` gives the new owner, one object at a time, and each object moves only while it is as the last run left it; one transferred or changed in GeoLens since then keeps its owner and is reported. A handover that stops part way is recorded as incomplete; the next run gives each of the item's objects that someone else owns to the owner the plan then names, and `--cutover` refuses until every object has that owner. Items are handed over in dependency order, so a map moves after the datasets it shows. `--dry-run` lists the handovers the run would make (`handovers` in `--json`), with the same `--only` selection. An item the last merged inventory didn't list isn't handed over until an inventory lists it again. A portal owner change that the plan's `target.owner` overrides is listed under `owner_conflicts` in the output and as `owner_conflict` in the report. An item whose `target.owner` you set keeps that owner, and the run lists the new ArcGIS owner under `owner_conflicts`. A new owner you give an item after it was migrated, through `target.owner` or an `owner_map` edit, isn't applied: the item is listed for you to transfer by hand. Folders become collections (`defaults.collection_from` in the plan: `folder` or `none`). A folder whose name another collection holds is filed under `<portal name> - <folder>`. When that name is held too, the run stops before importing anything, as it does when a group's name and `ArcGIS - <name>` are both taken; rename the folder in the items' `target.collections`, or set `collection_from` to `none`.
 
-`geolens arcgis plan` turns an inventory into an editable plan. It reads only
-the inventory file, so it needs no portal or GeoLens access.
+### Sharing and groups
 
-```bash
-geolens arcgis inventory --portal-url https://<org>.maps.arcgis.com -o ./inventory
-geolens arcgis plan ./inventory/arcgis-inventory.json
-geolens arcgis plan ./inventory/arcgis-inventory.json --owner-map owners.json
-```
+ArcGIS sharing maps to GeoLens visibility: `private` stays private, `org` becomes internal, `public` stays public, and an item shared only with groups becomes `restricted`, shared with a GeoLens group for each of its ArcGIS groups. Under the `restrict_public_visibility` setting, a public item whose owner isn't a GeoLens admin becomes internal instead; when a run has public items and can't read that setting, it stops before importing anything. Each ArcGIS group's entry in the plan's `group_map` decides its GeoLens group through `geolens_group`. Left `null`, `migrate` creates a group named after the ArcGIS group (or `ArcGIS - <name>` when another group already has that name; it never joins a group it didn't create) and adds the members the inventory read. A member resolves like an owner: through `owner_map` when it lists them, otherwise by the same username or email in GeoLens, but only when the email the inventory read for that ArcGIS user, if any, is the account's. `--dry-run` and the report list which GeoLens user each ArcGIS member became, so check that a same-named account belongs to the same person. A member who isn't a GeoLens user yet, or whom GeoLens refused to add, stays pending and is added by a later run (the output counts members without a GeoLens account once and lists their names, and names `geolens admin users import --from-inventory` as the way to create them; the report keeps one line per member and group); a refused add also makes the run exit 1. Set `geolens_group` to an existing group's exact name to share with that group instead (a name that matches several groups apart from case is refused); its members are left as they are, since adding to it would also give them the rest of what it can read, and the ArcGIS members it lacks are listed. An empty string maps the ArcGIS group to no GeoLens group, and an item none of whose groups maps to one becomes private. `plan` also writes each entry's `collection`, the ArcGIS group's title, which names a group `migrate` creates only when the inventory has no title for it, and `visibility`, the group's ArcGIS access, which `migrate` doesn't read. A rerun follows the plan: an item gets the groups its plan entry now names, and loses the groups `migrate` itself added that the entry no longer names (none while its groups weren't read). Groups shared with an item in GeoLens stay, even when the plan later names them too, and a group someone removes from an item in GeoLens isn't added again or removed later. GeoLens makes a private dataset or map shared with any group restricted, so one the plan keeps private while groups shared in GeoLens remain on it is reported instead of changed. A rerun that can't bring an item up to date leaves its groups as they are and lists the changes still waiting. Sharing replaces an item's whole group list, so a group change someone makes to the same item while `migrate` shares it can be overwritten; run it while nobody is editing sharing. A map is shared with its groups without widening its layers, which keep the sharing of their own items. A map's groups are written only while the map is as `migrate` last left it, and `migrate` records the version GeoLens answers the write with; a GeoLens older than 1.30 doesn't answer one, so a later change to such a map is reported rather than told apart from the share. A member `migrate` added to a group it created is removed again on a rerun once the ArcGIS member it was added for has left the group. A member still listed but no longer resolving (renamed, deactivated, or mapped to someone else in `owner_map`) keeps the account it was added as, nothing is removed while a group's members weren't read, and anyone added or removed in GeoLens stays as they are. The output, `--dry-run` and the report list each removal. A state file from before version 4 doesn't say which members `migrate` added, so the next run lists them once for you to check by hand and removes none of them. It doesn't say which groups `migrate` shared an item with either, so a group the plan no longer names that is still on an item is listed once for you to check, and left. A rerun prints each item it shared with a group or took a group off, and the report lists them under "Item sharing changed by this run".
 
-It writes `arcgis-migration-plan.json` (mode 0600) next to the inventory, or
-into `-o/--output-dir`, and prints how many items each action covers and which
-dependencies point at items that are not in the inventory. It refuses a v1
-inventory and says to rerun the inventory. Running it again gives the same
-file; if the file on disk differs, because you edited it, `plan` stops unless
-you pass `--force`.
+Only an organization administrator sees every group an item is shared with, and a group can hide its members from everyone but its managers and administrators. `plan` lists items shared only with groups that a non-admin's inventory may have missed, and the report lists, as `under_shared` follow-ups, items whose groups weren't all read or carried over. A rerun changes a migrated map's groups the same way while the map is as `migrate` left it and both it and its plan entry are private or restricted; a map changed in GeoLens since, or one whose plan now gives it another visibility, is reported rather than changed.
 
-The fields you are expected to edit:
+### Users
 
-- `items[].action`: `import_layers`, `import_file`, `import_map`,
-  `export_only` or `skip`. The default follows the inventory: supported feature
-  and map services import as layers, data files import as files, web maps
-  import as maps, and apps, scenes and unsupported types are `export_only`.
-  Set `skip` for anything you don't want.
-  A web map whose data could not be read defaults to `export_only` and the
-  plan warns, because its layer dependencies are unknown.
-- `items[].target`: the `visibility` (ArcGIS private, org and public become
-  private, internal and public), the `collections` (the item's folder), the
-  `groups` (the ArcGIS group ids it is shared with, `null` when the inventory
-  did not read group sharing), the `title` and the `tags`. `target.owner` is
-  `null` to use `owner_map`, or a GeoLens username or email to override it for
-  one item.
-- `owner_map`: every ArcGIS owner, with an empty value to fill in with the
-  GeoLens user who should end up owning the item. `--owner-map file.json`
-  fills it from a prepared `{"arcgis_user": "geolens_user"}` object.
-- `group_map`: every group seen, with the collection its items join and that
-  collection's visibility. Items join these collections through
-  `target.groups`, so renaming a group's collection here renames it for every
-  item.
-- `basemap_map`: every basemap URL used by a web map, to fill in with the
-  GeoLens basemap that replaces it.
-- `items[].alias_of`: set by hand, with action `skip`, on a hosted view that
-  filters nothing, so web maps using it point at the parent's dataset. The
-  inventory can't tell, because a view's filter lives in the service, which
-  the inventory never contacts.
+Owners and group members have to be GeoLens users before `migrate` can hand them items or add them to groups. `geolens admin users import users.csv` creates them from a CSV with a header row naming `username`, `email` and `role` (`admin`, `editor` or `viewer`; empty means `viewer`), and skips anyone GeoLens already has with that username and email. A row whose username belongs to an account with another email, or whose email belongs to another account, is a conflict: it isn't created, and the run exits 1. `--from-inventory arcgis-inventory.json` takes the users from an inventory instead: every item owner as an editor, with the email the inventory read, and every member of a group an item is shared with as a viewer. Add `--seed-csv users.csv` to write those rows to a new file you can review and edit, creating nothing. It refuses to overwrite a file, and a cell starting with `=`, `+`, `-` or `@` gets a leading `'` so a spreadsheet doesn't run it as a formula. The import drops that `'` again, so a name or email that really starts with `'` followed by one of those characters can't be given in a CSV. `--dry-run` says what would be created. The command needs a GeoLens admin session and exits 3 without one. It exits 1 when any user couldn't be created.
 
-`depends_on` lists the items to migrate first. An id that is not among the
-plan's items is not in the inventory. Items from other organizations, such as
-Living Atlas layers, get no row and never appear in `depends_on`. A data file
-that a hosted layer was published from is `export_only` with `superseded_by`
-naming the layer, so its rows are not imported twice.
+Each new user gets a generated 72-character password, the longest GeoLens accepts, so it meets any password policy. `--print-passwords` shows each one once on standard output; nothing else writes them anywhere, so without it nobody knows them and you set one for each user through the admin password reset (Admin, Users) and pass it on.
 
-The plan and the sidecar files hold the same redacted JSON as the inventory:
-credential-named keys are replaced, and neither file ever contains a token or
-password.
+An instance that signs in through an identity provider (OpenID Connect, SAML or a sign-in extension) creates its users at their first sign-in, so the import creates nobody there: those owners and members stay pending, and a `migrate` rerun after they sign in hands them their items and adds them to their groups. `--link-by-email` creates them anyway, with a random password nobody is shown, so their first sign-in links to the account by email. GeoLens links only when the provider sends `email_verified`; without it that sign-in is refused. Users without an email stay pending. GeoLens counts an email an admin enters as verified, so whoever signs in through the provider with that address gets the account: check every email in a seeded CSV before importing it with `--link-by-email`. Ctrl-C stops before the next user and still prints the passwords made so far.
 
-## Manifest schema distribution
+### Credentials
 
-The versioned manifest JSON Schema is intentionally distributed inside
-`geolens-cli`, rather than as a separate package. A second artifact would add a
-release/version-skew surface without a demonstrated independent consumer; the
-CLI is already the canonical manifest authoring and validation tool. Editors and
-non-Python tooling can obtain the exact installed schema with `geolens schema`
-or `geolens schema -o schema.json`. Its stable `$id` identifies manifest v1.
+Public items need none. For anything else pass `--token`, `ARCGIS_TOKEN` or `--token-stdin`, or `--username` with the password in `ARCGIS_PASSWORD`, `--password-stdin` or a prompt. A token made from a password is renewed before it expires. A token you pasted is not: when it runs out the run stops, writes the state file and tells you to resume with a fresh one. Accounts that sign in with SAML or OpenID Connect have no password to give here, so use a token. Tokens and passwords are never written to the state file, the report or the export folder.
 
-This decision should be revisited if multiple consumers need schema releases on
-a cadence independent from the CLI. Until then, schema changes and CLI versions
-ship atomically and the wheel test locks resource inclusion.
+A private service hosted on a federated ArcGIS Server whose host differs from the portal's (or from `arcgis.com`) only receives the token when you name its host with `--trust-service-host <host>` (repeatable); without it the item fails before any import and the error names the host to pass.
 
-## Environment variables
+GeoLens needs `REDIS_URL` set to take a token for a private service import; without it the instance answers 503 and the run stops with that message.
 
-The CLI normally stores its active instance through `geolens login` and keeps
-tokens in the OS keyring. Ephemeral CI jobs can avoid persistent state with:
+### Updating the plan
 
-| Variable | Purpose |
-|---|---|
-| `GEOLENS_INSTANCE` | GeoLens instance URL. The CLI normalizes the URL and appends `/api` when needed. An explicit `--instance` option takes precedence. |
-| `GEOLENS_TOKEN` | Bearer token used instead of the keyring/credentials file. Treat it as a secret and inject it from the CI secret store. |
+Run `plan` again on a newer inventory to bring an existing plan up to date. The plan records the defaults it gave each item, so the merge can tell your edits apart: a value you edited stays, and one you left alone takes the new default. When both changed, your value stays and `plan` prints what the inventory now gives. An edit stays an edit until you set it back to its default, even when the portal later changes to match it. New portal items are added at the end with defaults; the rest keep your order. An item gone from the portal stays in the plan with `"removed": true`; `migrate` doesn't run it again, and what it already migrated stays in GeoLens. Only a complete `--scope org` inventory read by an organization administrator marks items removed, since anyone else misses items not shared with them. Any other inventory (partial, truncated, user scope, anonymous, a non-admin account, or one written before the CLI recorded the account's role) marks the items it doesn't list `"unlisted": true`, and `migrate` leaves those pending, so the run exits 1 until a merge lists them again. If you never run a complete org inventory as an admin, an item deleted from the portal stays unlisted; set its action to `skip`, or delete it from the plan, to finish. A non-admin also may not see every group an item is shared with, so its inventory only adds groups to an item's `groups`; a group it doesn't list is kept until an admin's inventory leaves it out. `plan` and `migrate` refuse an inventory of another ArcGIS organization than the plan's, which matters on `www.arcgis.com`, where every organization shares one URL; a plan from an earlier version records no organization, so only its portal URL is checked. Your `owner_map`, `group_map`, `basemap_map` and plan `defaults` entries win over the inventory and `--owner-map`. To leave an item out, set its action to `skip`: an item deleted from the plan comes back with defaults on the next merge. `--force` replaces the plan with fresh defaults instead.
 
-For load-test and seed-script variables, use the documented Tooling / Load
-Tests section in the repository's `.env.example`.
+Plans written by earlier versions still migrate. They record no defaults and no inventory scope, so their items keep every value as an edit on every merge, `depends_on` included. Delete an item from the plan, or use `--force`, to give it defaults that follow the portal.
+
+### Resuming and reports
+
+Progress is saved in `arcgis-migration-state.json` (mode 0600) after every item. Run the same command again to resume: failed items are retried (`--no-retry` leaves them alone), and layers already imported are never imported twice. `--only <item id>` runs one item plus the unfinished items it depends on. Only one run can use a state file at a time. A run that finds no state file at its path checks whether GeoLens already holds datasets imported from the plan's items, and when it does it stops before importing anything and names a few of them, since it would import them all again. Point `--state` at the earlier run's state file, or pass `--start-fresh` to migrate them again anyway.
+
+A rerun first hands waiting items to their owners, then imports what isn't finished, then brings every item migrated before up to date. Each dataset of a service item is refreshed from its source with the run's ArcGIS credential, so private items need `--token` or `--username` on every rerun. A data file item is downloaded again and replaces its datasets. An `export_only` item is exported again when the portal changed it since its bundle was written, which the new bundle replaces in one step; if that export fails, the earlier bundle stays and the item is reported as not up to date. A service item is probed even when it had nothing to import, so a layer added since is reported. A migrated web map whose portal item changed since the last run is translated again into the same GeoLens map: its layers, initial view, basemap and the loss report in its notes are replaced, each layer keeping its GeoLens layer id, and the loss report file is rewritten, or removed when nothing was lost. A web map that no longer has an initial view leaves the GeoLens map's view and rotation as they are, and the map's notes and the report say so. When GeoLens has no basemap enabled the translation names none, and the map keeps its basemap. A layer whose dataset the run's account can't read, also one the portal repointed to such a dataset, is left out of the translation and its map layer is kept as it was, and the item's notes list it; each later run translates the map again until no layer is left out. A layer the portal dropped whose map layer the run couldn't read, and a layer whose service the plan imports but the run hasn't finished, are translated again the same way; layers of unsupported or unplanned sources are only reported. A web map with such a layer still owed is reported as not up to date, so `--cutover` refuses it until the layer is applied; the first import records the layers its unfinished sources owe too. A save whose answer was lost is adopted by the next run only when the map still holds exactly what the save sent: every field of the map, layer styles and notes included, with a style sent null checked against the one the server filled in at the last confirmed save that also sent it null. A map with a layer hidden from the run, or a style with no such record, is reported as a change made in GeoLens instead. Kept and hidden layers count toward the map's 200-layer cap, so a translation that would pass it gives up its last layers, which the notes and the loss report list as `layer_cap`. A map changed in GeoLens since the last run is reported and left as it is, and so is one GeoLens changes while the new translation is saved. A map the state has no record of leaving, such as one imported while its owner was pending under a version that didn't record it, is reported for you to update by hand rather than translated again. Re-translating needs GeoLens and the `geolens` package 1.30 or newer; with either older, the map is reported instead. The item's metadata is written again on each dataset that a refresh or replacement published, and a field the portal has emptied since is emptied too, unless it was edited in GeoLens. A visibility the portal's sharing changed since the import is applied to each dataset, unless it was changed in GeoLens or the state file can't tell, which is reported instead. Every service item is refreshed, because an item's `modified` date doesn't move when its features are edited. A refresh that stops for review (live edits, a destructive schema change, an empty result) publishes nothing: the run reports it with the `geolens refresh <dataset> --accept-blocked-run <run>` command that accepts it, and never accepts it for you. A rerun recognises the run you accept it with, and a refresh GeoLens accepted but whose answer was lost, as this command's own. A migrated web map whose owner was changed in GeoLens is reported, and one waiting for its planned owner is not handed over after such a change. A map whose state records no baseline, from a version before baselines were recorded, is never handed over or kept on the strength of a read: it is reported for you to update by hand, or to rerun once you have checked it. `--only` limits the rerun to the items it names.
+
+A rerun never overwrites a change made in GeoLens. After each write the state file records the dataset's last update, feature count and data revision, which counts every feature and column edit, your own included. Each dataset is compared right before its own refresh or replacement; one whose values differ (edited, transferred or refreshed in GeoLens) is reported and left alone, and so is one deleted there. The request carries the recorded revision, so GeoLens stops the publication for review if the data is edited after the check, and a file replacement is checked again after its upload. A GeoLens too old to report data revisions gets no refresh or replacement at all; each dataset is reported until you upgrade it. A refresh that doesn't publish leaves the dataset's record as it was, and one edited while its refresh ran is reported and not recorded. Set the item's action to `skip` to stop bringing it up to date. Change a finished `export_only` or `skip` item's action to `import_file`, `import_layers` or `import_map` and the next run imports it (the export bundle stays on disk but is no longer tracked); other action changes on a finished item aren't acted on. A state file from an earlier version has no recorded values, so a dataset is taken as unchanged only when your GeoLens account made its last change, before the item finished. The state file is now version 6, which an earlier CLI refuses to read rather than rewrite.
+
+A run that gets as far as the item loop writes `arcgis-migration-report.md` and `.json` next to the state file, also when it is interrupted or stops on a failed request. `--dry-run` writes none, and neither does a run refused before it starts (an unusable plan, state file or owner mapping, or a failed GeoLens check). The report covers every item of the plan: the manual follow-ups (failed items, skipped files and layers, group-only sharing, partial exports, items that can't run yet or wait on others) and the unsupported items with where each was saved.
+
+Exit codes:
+
+- 0: no item of the plan is failed, no item the run selected was left waiting or unable to run, and no group membership change failed; or a `--cutover` run that didn't stop refused nothing, because every check that failed was accepted with its `--accept-*` flag, and no group membership change failed. Skipped items (a file over the upload limit or with too many layers) and pending items the run did not select, such as items that can't run yet, don't change it, so read the report's counts and follow-ups before treating the migration as complete.
+- 1: an item of the plan is failed (including one this run left out with `--only` or `--no-retry`, and a portal download or GeoLens server error once items are running), an item the run selected was left pending because its action can't run yet or it waits on another item, a migrated item couldn't be brought up to date or handed to its owner, a group membership change failed, `--cutover` refused (any failing check left unaccepted), or the run stopped (for example on an expired pasted token).
+- 2: the plan, state file, owner mapping or credentials couldn't be used, the GeoLens session isn't an admin's and the plan names another owner (or the role can't upload), a group or collection name the run needs is taken, there is no state file while GeoLens holds datasets migrated from the plan's items, or the portal URL redirected before any item ran. `--dry-run` exits 2 on a taken name or those datasets too. A redirect refused once items are running fails that item (exit 1).
+- 3: authentication failed before any item ran (the GeoLens checks, or an ArcGIS password sign-in), or the server rejected a `GEOLENS_TOKEN` at any point, which stops the run with this code. A stored login that is rejected once items are running fails that item (exit 1).
+- 4: the portal couldn't be reached while signing in, or a GeoLens request couldn't connect or timed out at any point, which stops the run with this code. The exception is a timeout on the status poll of an import job: it is retried until the poll's deadline, and a deadline that runs out fails that item (exit 1). A portal download that fails once items are running also fails only that item (exit 1).
+- 5: a server error from the GeoLens checks, before any item ran.
+- 130: interrupted; run the same command to resume.
+
+For a large migration, run the GeoLens worker with `WORKER_CONCURRENCY=2` or more, since each layer import and refresh is a background job.
+
+### Cutover
+
+A migration ends with one last run after the portal stops changing, marked with `--cutover`:
+
+1. Tell the portal's users that it is frozen, and stop edits to its items and services.
+2. Run `inventory --scope org` again as an organization administrator, then `plan` on it, so the plan holds everything the portal has now.
+3. Run `migrate --dry-run --cutover` to see what the cutover would refuse, and fix what you can: retry failed items, map owners, promote owners to editor, accept or fix refreshes that stopped for review.
+4. Run `migrate --cutover` with the same credentials as before. It runs like any rerun, then checks what wouldn't carry over and marks the run as the final one only when nothing is left, or when you accept each loss:
+   - `--accept-unfinished-items`: a plan item isn't done (failed, skipped, can't run yet or waits on another item), is unlisted (even a finished one, since a rerun doesn't bring it up to date) or isn't up to date (its refresh failed or stopped for review, or GeoLens changed it). Items set to `skip` and items gone from the portal don't count.
+   - `--accept-incomplete-inventory`: the plan wasn't last merged from a complete `--scope org` inventory read by an organization administrator, or the portal has items of the organization changed since that inventory started reading it, by the portal's own clock, so the plan may miss or misstate them. An inventory written by an earlier version, or by a portal that sent no time, records no start and fails this check; run it again. The run asks the portal with its ArcGIS credential, which must be an organization administrator's; without one, or when the portal can't answer, this check fails too.
+   - `--accept-attachment-loss`: a migrated layer has attachments, or its service doesn't say. GeoLens doesn't import attachments yet.
+   - `--accept-unresolved-users`: an item still waits for its owner, its plan owner doesn't name one GeoLens user, or its plan now names another owner than the one it was given; or a member of an ArcGIS group isn't in its GeoLens group yet.
+   - `--accept-under-sharing`: an item shared only with ArcGIS groups may reach fewer people in GeoLens: the inventory wasn't read by an organization administrator, one of its groups maps to no GeoLens group, or a group's members couldn't be read.
+5. Read `arcgis-migration-report.md`, which records the cutover and the losses you accepted, and keep it with the state file. Then retire the portal. A refresh after that fails with the service's error, and the datasets stay as they are.
+
+A refused cutover exits 1 and leaves the run unmarked; nothing it imported or refreshed is undone. A marked cutover exits 0 even when the items you accepted are still failed or not up to date, and the report lists them. `--cutover` runs the whole plan, so it can't be combined with `--only`.
+
+## Documentation
+
+The full command reference, manifest schema, exit codes and CI setup are in the [CLI guide](https://docs.getgeolens.com/guides/cli/).

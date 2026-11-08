@@ -1,16 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import {
-  getAdapter,
-  resolveAdapterType,
-  circleAdapter,
-  symbolAdapter,
-  lineAdapter,
-  fillAdapter,
-  rasterAdapter,
-  hillshadeAdapter,
-  heatmapAdapter,
-  clusterAdapter,
-} from '@/components/builder/layer-adapters';
+import { getAdapter } from '@/components/builder/layer-adapters/registry';
+import { resolveAdapterType } from '@/components/builder/layer-adapters/shared';
+import { circleAdapter } from '@/components/builder/layer-adapters/circle-adapter';
+import { symbolAdapter } from '@/components/builder/layer-adapters/symbol-adapter';
+import { lineAdapter } from '@/components/builder/layer-adapters/line-adapter';
+import { fillAdapter } from '@/components/builder/layer-adapters/fill-adapter';
+import { rasterAdapter } from '@/components/builder/layer-adapters/raster-adapter';
+import { hillshadeAdapter } from '@/components/builder/layer-adapters/hillshade-adapter';
+import { heatmapAdapter } from '@/components/builder/layer-adapters/heatmap-adapter';
+import { clusterAdapter } from '@/components/builder/layer-adapters/cluster-adapter';
 import type { AdapterLayerInput } from '@/components/builder/layer-adapters/types';
 
 vi.mock('@/lib/tile-utils', () => ({
@@ -172,7 +170,7 @@ describe('resolveAdapterType', () => {
     expect(resolveAdapterType('MULTIPOLYGON', null, { 'circle-color': '#f00' })).toBe('fill');
   });
 
-  // fix(#430 codex r23): generic sentinels route to the mixed adapter so
+  // Generic sentinels route to the mixed adapter so
   // point/line features of a mixed-family sketch are no longer dropped on maps.
   it('returns mixed for the GEOMETRY sentinel', () => {
     expect(resolveAdapterType('GEOMETRY', null)).toBe('mixed');
@@ -254,7 +252,7 @@ describe('lineAdapter', () => {
       'line-offset': -2,
     }));
     // Identity (===) — engine-foundation guarantee that saved gradient expressions are
-    // not deep-cloned mid-pipeline (see REVIEW.md WR-05 + the dedicated identity test below).
+    // not deep-cloned mid-pipeline (see the dedicated identity test below).
     const gradientCalls = (map.setPaintProperty as ReturnType<typeof vi.fn>).mock.calls
       .filter(([, prop]) => prop === 'line-gradient');
     expect(gradientCalls.length).toBeGreaterThan(0);
@@ -307,7 +305,7 @@ describe('lineAdapter', () => {
 
     expect(map.setPaintProperty).toHaveBeenCalledWith('layer-l5b', 'line-width', widthExpression);
     // Identity (===) — see comment on the previous test. line-gradient specifically uses
-    // identity because Phase 256 builder UI relies on in-place stop mutation; the other
+    // identity because builder UI relies on in-place stop mutation; the other
     // expression paints (line-width, line-opacity) keep structural equality below.
     const gradientCalls = (map.setPaintProperty as ReturnType<typeof vi.fn>).mock.calls
       .filter(([, prop]) => prop === 'line-gradient');
@@ -316,15 +314,15 @@ describe('lineAdapter', () => {
       expect(value).toBe(gradient);
     }
     // Structural equality (JSON.stringify) for non-line-gradient expression paints. Future
-    // tightening to identity is OK but not required — the engine-foundation guarantee in
-    // CONTEXT.md targets line-gradient specifically. See REVIEW.md WR-05 for context.
+    // tightening to identity is OK but not required — the engine-foundation guarantee targets
+    // line-gradient specifically.
     const opacityCalls = (map.setPaintProperty as ReturnType<typeof vi.fn>).mock.calls
       .filter(([, prop]) => prop === 'line-opacity');
     expect(opacityCalls.length).toBeGreaterThan(0);
-    // fix(#1625): the LAST write wins — the per-feature expression lands on
+    // The LAST write wins — the per-feature expression lands on
     // line-opacity UNMULTIPLIED (shape preserved, never flattened to a number)
     // and the master slider (0.4) rides on line-layer-opacity. Before #1625 the
-    // last write was ['*', expr, 0.4] (fix(#394) ST-03).
+    // last write was ['*', expr, 0.4].
     const lastOpacityValue = opacityCalls[opacityCalls.length - 1][2];
     expect(JSON.stringify(lastOpacityValue)).toBe(JSON.stringify(opacityExpression));
     expect(map.setPaintProperty).toHaveBeenCalledWith('layer-l5b', 'line-layer-opacity', 0.4);
@@ -351,7 +349,7 @@ describe('lineAdapter', () => {
     expect(map.setPaintProperty).toHaveBeenCalledWith('layer-l6', 'line-gap-width', 5);
     expect(map.setPaintProperty).toHaveBeenCalledWith('layer-l6', 'line-blur', 2);
     expect(map.setPaintProperty).toHaveBeenCalledWith('layer-l6', 'line-offset', 3);
-    // Identity (===) — engine-foundation guarantee for Phase 256. See REVIEW.md WR-05.
+    // Identity (===) — engine-foundation guarantee for the line-gradient engine.
     const gradientCalls = (map.setPaintProperty as ReturnType<typeof vi.fn>).mock.calls
       .filter(([, prop]) => prop === 'line-gradient');
     expect(gradientCalls.length).toBeGreaterThan(0);
@@ -400,7 +398,7 @@ describe('lineAdapter', () => {
     lineAdapter.syncPaint(map, input);
 
     expect(map.setPaintProperty).toHaveBeenCalledWith('layer-l7', 'line-width', widthExpression);
-    // Identity (===) — engine-foundation guarantee for Phase 256. See REVIEW.md WR-05.
+    // Identity (===) — engine-foundation guarantee for the line-gradient engine.
     const gradientCalls = (map.setPaintProperty as ReturnType<typeof vi.fn>).mock.calls
       .filter(([, prop]) => prop === 'line-gradient');
     expect(gradientCalls.length).toBeGreaterThan(0);
@@ -412,7 +410,7 @@ describe('lineAdapter', () => {
     const opacityCalls = (map.setPaintProperty as ReturnType<typeof vi.fn>).mock.calls
       .filter(([, prop]) => prop === 'line-opacity');
     expect(opacityCalls.length).toBeGreaterThan(0);
-    // fix(#1625): per-feature expression stays unmultiplied on line-opacity;
+    // Per-feature expression stays unmultiplied on line-opacity;
     // the master slider (0.4) goes to line-layer-opacity (was ['*', expr, 0.4]).
     const lastOpacityValue = opacityCalls[opacityCalls.length - 1][2];
     expect(JSON.stringify(lastOpacityValue)).toBe(JSON.stringify(opacityExpression));
@@ -420,7 +418,7 @@ describe('lineAdapter', () => {
   });
 
   it('addLayers does not pass flattened line-gradient string to MapLibre addLayer when expressions present', () => {
-    // Regression for REVIEW.md WR-02: simplifyPaint flattens line-gradient arrays to a scalar
+    // Regression: simplifyPaint flattens line-gradient arrays to a scalar
     // fallback (e.g. value[4] color stop for interpolate). MapLibre's line-gradient REQUIRES
     // a ['line-progress'] expression — a constant string fails addLayer validation and the
     // try/catch silently swallows the error. The fix drops line-gradient from addLayer.paint
@@ -473,9 +471,32 @@ describe('lineAdapter', () => {
     // syncPaint -> syncVectorPaint sets it again.
     expect(setCalls.length).toBeGreaterThanOrEqual(2);
     for (const [, , value] of setCalls) {
-      // Identity (===), not just equality. Engine-foundation guarantee for Phase 256.
+      // Identity (===), not just equality.
       expect(value).toBe(gradient);
     }
+  });
+
+  it('arrows follow a data-driven line colour unless an arrow colour is set', () => {
+    const lineColor = ['match', ['get', 'kind'], 'road', '#ff0000', '#00ff00'];
+    const base = {
+      layerId: 'layer-l-arrow-expr',
+      sourceId: 'source-l-arrow-expr',
+      sourceLayer: 'data.routes',
+      dataset_geometry_type: 'LINESTRING' as const,
+      paint: { 'line-color': lineColor, 'line-width': 3 },
+    };
+    const iconColor = (input: ReturnType<typeof makeInput>) => {
+      const arrow = lineAdapter.describe!(input).specs.find((spec) => spec.layer.id === 'layer-l-arrow-expr-arrow');
+      return (arrow?.layer.paint as Record<string, unknown>)['icon-color'];
+    };
+
+    expect(iconColor(makeInput({ ...base, id: 'l-arrow-expr', style_config: { render_mode: 'arrow' } })))
+      .toEqual(lineColor);
+    expect(iconColor(makeInput({
+      ...base,
+      id: 'l-arrow-expr',
+      style_config: { render_mode: 'arrow', builder: { arrowColor: '#fb923c' } },
+    }))).toBe('#fb923c');
   });
 
   it('syncPaint updates arrow companion appearance, opacity, visibility, and filter', () => {

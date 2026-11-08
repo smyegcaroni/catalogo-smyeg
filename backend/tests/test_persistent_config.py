@@ -36,7 +36,7 @@ async def _clean_settings(client: AsyncClient):
     except RuntimeError:
         pass
 
-    # BUG-008: the per-process sync rate-limit cache is now warmed on
+    # The per-process sync rate-limit cache is now warmed on
     # set()/reset(); clear it between tests so a warmed value never leaks into
     # an unrelated case.
     from app.core.persistent_config import _sync_rate_limit_cache
@@ -223,7 +223,7 @@ async def test_get_uncached_bypasses_stale_cache(client: AsyncClient):
 
 @pytest.mark.anyio
 async def test_set_public_url_invalidates_public_url_cache(client: AsyncClient):
-    """BUG-025: writing a public-URL key invalidates the public_urls module cache.
+    """Writing a public-URL key invalidates the public_urls module cache.
 
     public_urls._PUBLIC_URL_CACHE is a SEPARATE 60s memoization from the
     config: cache. Before the fix, PUBLIC_APP_URL.set() cleared only the
@@ -344,13 +344,13 @@ async def test_log_level_side_effect(client: AsyncClient):
 
 @pytest.mark.anyio
 async def test_log_level_side_effect_raises_httpx_floor_too(client: AsyncClient):
-    """fix(#1746 codex r8): a runtime LOG_LEVEL change must raise httpx's floor.
+    """A runtime LOG_LEVEL change must raise httpx's floor.
 
     `apply_http_logger_levels()` keeps httpx/httpcore at least WARNING, but
     that floor has to track root upward too: a LOG_LEVEL=CRITICAL change made
     through the admin settings UI at runtime (not just LOG_LEVEL set at boot)
     must not leave httpx sitting at WARNING -- MORE verbose than the
-    deployment just asked for. The round 5/6 test guards already restore
+    deployment just asked for. The test guards already restore
     httpx/httpcore's level around every test, so no manual cleanup is needed
     for those two here; only root's own level is restored, matching the
     sibling test above.
@@ -367,13 +367,13 @@ async def test_log_level_side_effect_raises_httpx_floor_too(client: AsyncClient)
         async for db in app.dependency_overrides[get_db]():
             await LOG_LEVEL.set(db, "CRITICAL")
             assert logging.getLogger().level == logging.CRITICAL
-            assert logging.getLogger("httpx").level == logging.CRITICAL
-            assert logging.getLogger("httpcore").level == logging.CRITICAL
+            for name in ("httpx", "httpcore", "httpx2", "httpcore2"):
+                assert logging.getLogger(name).level == logging.CRITICAL, name
 
             # Dropping back below WARNING restores the WARNING floor.
             await LOG_LEVEL.set(db, "INFO")
-            assert logging.getLogger("httpx").level == logging.WARNING
-            assert logging.getLogger("httpcore").level == logging.WARNING
+            for name in ("httpx", "httpcore", "httpx2", "httpcore2"):
+                assert logging.getLogger(name).level == logging.WARNING, name
     finally:
         logging.getLogger().setLevel(original_level)
 
@@ -397,7 +397,7 @@ async def test_sync_rate_limit_accessor(client: AsyncClient):
 
 @pytest.mark.anyio
 async def test_set_warms_sync_cache_with_new_value(client: AsyncClient):
-    """BUG-008: set() must warm the sync rate-limit cache with the NEW value.
+    """set() must warm the sync rate-limit cache with the NEW value.
 
     On main, set() warmed the sync cache only with the OLD value (via the
     get(db) at the top of set()) and never the new one, so slowapi kept
@@ -484,7 +484,7 @@ async def test_get_all_settings_returns_grouped(
 async def test_get_all_settings_env_only_shows_env_default_not_db_override(
     client: AsyncClient, admin_auth_header: dict
 ):
-    """BUG-030: GET /settings/all in ENV_ONLY_CONFIG mode shows the effective
+    """GET /settings/all in ENV_ONLY_CONFIG mode shows the effective
     env_default, not the stale DB override.
 
     PersistentConfig.get short-circuits to env_default when env_only is set, so
@@ -1079,7 +1079,7 @@ async def test_model_defaults_follow_the_selected_provider(
         json={"settings": {"llm_provider": "anthropic"}},
         headers=admin_auth_header,
     )
-    assert await models() == ("anthropic-chat-env", "claude-haiku-4-5-20251001")
+    assert await models() == ("anthropic-chat-env", "claude-haiku-5-5")
 
     await client.put(
         "/settings/",
@@ -1682,7 +1682,7 @@ async def test_a_legacy_blank_model_row_reads_as_the_provider_default(
 
 
 # ---------------------------------------------------------------------------
-# Log level propagation tests (CFG-06)
+# Log level propagation tests
 # ---------------------------------------------------------------------------
 
 
@@ -1725,7 +1725,7 @@ async def test_log_level_propagation_via_api(
 
 
 # ---------------------------------------------------------------------------
-# Tile cache TTL tests (CFG-07)
+# Tile cache TTL tests
 # ---------------------------------------------------------------------------
 
 
@@ -1837,7 +1837,7 @@ async def test_bulk_settings_update_creates_per_field_audit_entries(
 
 
 # ---------------------------------------------------------------------------
-# Phase 222: TypeAdapter runtime validation at JSONB unwrap boundary (D-06)
+# TypeAdapter runtime validation at JSONB unwrap boundary
 # ---------------------------------------------------------------------------
 
 
@@ -2069,95 +2069,10 @@ async def test_an_export_pairs_models_with_the_exported_provider(
 
 
 @pytest.mark.anyio
-async def test_get_all_registry_values_resolves_unset_models(
-    client: AsyncClient, admin_auth_header: dict, _both_ai_keys
-):
-    from app.api.main import app
-    from app.core.dependencies import get_db
-    from app.core.persistent_config import get_all_registry_values
-
-    await client.put(
-        "/settings/",
-        json={"settings": {"llm_provider": "openai_compatible"}},
-        headers=admin_auth_header,
-    )
-    async for db in app.dependency_overrides[get_db]():
-        values = await get_all_registry_values(db)
-        assert (values["llm_model"], values["llm_model_light"]) == (
-            "openai-chat-env",
-            "openai-light-env",
-        )
-
-
-@pytest.mark.anyio
-async def test_get_all_registry_values_applies_validation(client: AsyncClient):
-    """get_all_registry_values() validates each row through the registered TypeAdapter.
-
-    Happy path: all DB-stored values are valid and batch-returned unchanged.
-    """
-    from app.core.dependencies import get_db
-    from app.api.main import app
-    from app.core.persistent_config import (
-        AI_ENABLED,
-        LOGIN_RATE_LIMIT,
-        get_all_registry_values,
-    )
-
-    async for db in app.dependency_overrides[get_db]():
-        # Write known-good values via set()
-        await LOGIN_RATE_LIMIT.set(db, 20)
-        await AI_ENABLED.set(db, False)
-
-        all_values = await get_all_registry_values(db)
-        assert all_values["login_rate_limit"] == 20
-        assert all_values["ai_enabled"] is False
-
-
-@pytest.mark.anyio
-async def test_get_all_registry_values_falls_back_on_bad_row(client: AsyncClient):
-    """get_all_registry_values() falls back to env_default for a single corrupt row
-    while returning normal values for other registered keys."""
-    from sqlalchemy import delete
-
-    from app.core.dependencies import get_db
-    from app.api.main import app
-    from app.core.persistent_config import (
-        AI_ENABLED,
-        LOGIN_RATE_LIMIT,
-        get_all_registry_values,
-    )
-    from app.core.db.models import AppSetting
-
-    async for db in app.dependency_overrides[get_db]():
-        # Good row for ai_enabled
-        await AI_ENABLED.set(db, True)
-
-        # Corrupt row for login_rate_limit
-        await db.execute(delete(AppSetting).where(AppSetting.key == "login_rate_limit"))
-        db.add(AppSetting(key="login_rate_limit", value={"v": "not_an_int"}))
-        await db.commit()
-
-        with patch("app.core.persistent_config.logger") as mock_logger:
-            all_values = await get_all_registry_values(db)
-
-        # Corrupt key returned env_default
-        assert all_values["login_rate_limit"] == LOGIN_RATE_LIMIT.env_default
-        # Good key returned DB value
-        assert all_values["ai_enabled"] is True
-        # Warning was logged for the corrupt key
-        mock_logger.warning.assert_called()
-        # Check that at least one warning call included login_rate_limit
-        keys_logged = [
-            call.kwargs.get("key") for call in mock_logger.warning.call_args_list
-        ]
-        assert "login_rate_limit" in keys_logged
-
-
-@pytest.mark.anyio
 @pytest.mark.parametrize(
     "type_,good_value,bad_value",
     [
-        (bool, True, "not_a_bool"),  # CORRECTED from D-06: "yes" coerces in LAX
+        (bool, True, "not_a_bool"),  # "yes" coerces in LAX
         (str, "hi", 42),
         (int, 5, "five"),
         (list, [1, 2], {"k": "v"}),
@@ -2316,3 +2231,40 @@ async def test_an_endpoint_write_waits_for_a_model_reset_in_progress(
             resp = await reset
 
     assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.anyio
+async def test_sync_log_level_applies_a_level_saved_by_another_process(monkeypatch):
+    """Only the saving process runs _on_change; peers converge via the sync."""
+    import logging
+
+    from app.core import persistent_config as pc
+
+    root = logging.getLogger()
+    original = root.level
+
+    async def _stored(_db):
+        return "debug"
+
+    monkeypatch.setattr(pc.LOG_LEVEL, "get", _stored)
+    root.setLevel(logging.WARNING)
+    try:
+        await pc.sync_log_level(None)  # type: ignore[arg-type]
+        assert root.level == logging.DEBUG
+    finally:
+        root.setLevel(original)
+        pc.apply_http_logger_levels(logging.getLevelName(original))
+
+
+@pytest.mark.anyio
+async def test_the_api_warmer_applies_the_shared_log_level():
+    """Structural, because the warmer is a closure inside the API lifespan."""
+    import inspect
+
+    from app.api import main
+
+    source = inspect.getsource(main.lifespan)
+    start = source.index("async def _rate_limit_warmer")
+    end = source.index("rate_limit_warmer_task = asyncio.create_task", start)
+
+    assert "await sync_log_level(session)" in source[start:end]

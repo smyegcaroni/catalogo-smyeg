@@ -1,14 +1,14 @@
-"""On-demand source-health probe for live-referenced dataset origins (#1222).
+"""On-demand source-health probe for live-referenced dataset origins.
 
-One of two writers of ``datasets.source_health``/``last_checked_at``
-(the other is the refresh executor, #1220). Only ``stac``/``service``
-origins are probeable; everything else 409s rather than returning
-``unknown``, keeping "nothing to probe" distinct from "couldn't tell".
+One of two writers of ``datasets.source_health``/``last_checked_at`` (the
+other is the refresh executor). Only ``stac``/``service`` origins are
+probeable; everything else 409s rather than returning ``unknown``, keeping
+"nothing to probe" distinct from "couldn't tell".
 
-Owner-or-admin, not read-gated: probing is an ACTION (outbound request
-plus a write), so visibility alone would let anyone amplify traffic at
-somebody else's origin. Readers still see the stored state via
-``DatasetResponse`` (#1218); they just can't trigger a re-check.
+Owner-or-admin, not read-gated: probing is an ACTION (outbound request plus a
+write), so visibility alone would let anyone amplify traffic at somebody
+else's origin. Readers still see the stored state via ``DatasetResponse``;
+they just can't trigger a re-check.
 """
 
 from __future__ import annotations
@@ -38,12 +38,13 @@ from app.modules.catalog.sources.origin_probe import (
     probe_service_origin,
     service_probe_target,
 )
+from app.modules.catalog.write_recheck import recheck_dataset_write_access
 from app.observability.metrics.refresh import (
     origin_probe_duration_seconds,
     origin_probe_total,
 )
 from app.platform.cache.tiles import invalidate_catalog_cache
-from app.platform.dataset_origin import classify_origin
+from app.platform.dataset_origin import bound_pointer, classify_origin, still_bound
 from app.platform.extensions import get_catalog_port
 from app.standards.ogc.errors import ERROR_RESPONSES_WRITE
 
@@ -97,9 +98,9 @@ async def _stac_probe_targets(
 ) -> tuple[str | None, str | None]:
     """Resolve what a STAC probe would contact, on the request's DB session.
 
-    fix(#1271): split from the probing itself so the handler can
-    release its pooled connection before the outbound wait — target
-    resolution is the only part that needs the database.
+    Split from the probing itself so the handler can release its pooled
+    connection before the outbound wait; only target resolution needs the
+    database.
     """
     asset_uri = await _remote_stac_asset_uri(db, dataset.id) or dataset.origin_uri
     item_href = (dataset.origin_ref or {}).get("item_href")
@@ -146,7 +147,7 @@ async def _probe_stac_targets(
 def _service_probe_target(dataset: Dataset) -> str:
     """The URL a service probe contacts. Reachability is all it can claim.
 
-    fix(#1746): ArcGIS answers several conditions with HTTP 200 and an
+    ArcGIS answers several conditions with HTTP 200 and an
     error envelope, so :func:`probe_arcgis_origin` parses codes 498/499
     (auth refusals) from the ``/query`` operation the worker actually
     reads, not the layer document. A DROPPED LAYER still reads as
@@ -165,7 +166,11 @@ def _service_probe_target(dataset: Dataset) -> str:
     return target
 
 
-@router.post("/{dataset_id}/source-health/", response_model=SourceHealthResponse)
+@router.post(
+    "/{dataset_id}/source-health/",
+    response_model=SourceHealthResponse,
+    summary="Check a dataset's source",
+)
 async def check_source_health(
     dataset_id: uuid.UUID,
     user: Identity = Depends(get_current_active_user),
@@ -201,16 +206,14 @@ async def check_source_health(
             },
         )
 
-    # fix(#1271): the probe awaits a third-party host, and a reupload can
+    # The probe awaits a third-party host, and a reupload can
     # commit a new origin binding in that window. Persisting through the
     # ORM instance would write the OLD origin's verdict onto the new
     # binding, permanently if a service became an upload (uploads 409
     # above, so nothing could re-probe). Snapshot the binding now and make
     # the write conditional on it below; set_dataset_origin clearing probe
     # state on rebind covers the other interleaving.
-    bound_uri = dataset.origin_uri
-    bound_ref = dataset.origin_ref
-    bound_format = dataset.source_format
+    bound = bound_pointer(dataset)
 
     # Resolve what to contact while the session is still live...
     if origin == "stac":
@@ -220,19 +223,19 @@ async def check_source_health(
     else:
         asset_uri = item_href = None
         service_target = _service_probe_target(dataset)
-        # fix(#1746): read while the session is still live -- the ORM
+        # Read while the session is still live -- the ORM
         # instance is dead after the rollback below, and the probe branch
         # needs to know whether this origin speaks ArcGIS error envelopes.
         service_type = (dataset.origin_ref or {}).get("service_type")
 
-    # fix(#1271): release the pooled connection BEFORE the outbound wait.
+    # Release the pooled connection BEFORE the outbound wait.
     # The probe can take 10s against a slow origin, and a session held
     # across it pins a pool slot -- a dozen concurrent probes would starve
     # every other database-backed request. The conditional UPDATE below
     # opens its own fresh transaction.
     await db.rollback()
 
-    # feat(#1268): timed around the outbound wait only, not the handler --
+    # Timed around the outbound wait only, not the handler --
     # the duration an operator cares about is the origin's, and folding
     # database work in would blur the one number that says "this source
     # got slow".
@@ -240,7 +243,7 @@ async def check_source_health(
     if origin == "stac":
         result = await _probe_stac_targets(asset_uri, item_href)
     else:
-        # fix(#1746): ArcGIS answers an auth refusal with HTTP 200 and an
+        # ArcGIS answers an auth refusal with HTTP 200 and an
         # error envelope, which a status-code probe reads as healthy, so
         # the probe is chosen by service type, same as the refresh door.
         result = await probe_service_origin(service_target, service_type)
@@ -269,14 +272,9 @@ async def check_source_health(
         values["last_checked_at"] = now
     outcome = await db.execute(
         update(Dataset)
-        .where(
-            Dataset.id == dataset_id,
-            Dataset.origin_uri.is_not_distinct_from(bound_uri),
-            Dataset.origin_ref.is_not_distinct_from(bound_ref),
-            Dataset.source_format.is_not_distinct_from(bound_format),
-        )
+        .where(still_bound(Dataset, dataset_id, bound))
         .values(**values)
-        # fix(#1271): the response reports what the row actually holds
+        # The response reports what the row actually holds
         # after this write, not a pre-probe snapshot -- a concurrent probe
         # may have committed a newer contact time that this outcome leaves
         # in place.
@@ -286,6 +284,10 @@ async def check_source_health(
     # ChunkedIteratorResult, which has no rowcount — and rows also separate
     # "no match" (empty) from "matched, NULL timestamp" (one row of None).
     returned_rows = outcome.all()
+    if returned_rows:
+        # The UPDATE holds the datasets row, which an ownership transfer takes
+        # before it changes the owner.
+        await recheck_dataset_write_access(db, await get_dataset(db, dataset_id))
     await db.commit()
     if not returned_rows:
         # The row was rebound (or deleted) while the probe was in flight; the
@@ -301,7 +303,7 @@ async def check_source_health(
             },
         )
 
-    # fix(#1271): GET /datasets/ serves these fields from a 60s cache, so
+    # GET /datasets/ serves these fields from a 60s cache, so
     # without this the list keeps reporting pre-probe state. After the
     # rowcount check: a discarded verdict changed nothing.
     await invalidate_catalog_cache()

@@ -6,6 +6,12 @@ collections, and a private embed demo. ``--showcase-121`` also builds City in
 Shade, a real COPC sample, and a real 3D Tiles sample. GeoLens serves the 3D
 assets to external clients; its map viewer does not render them natively.
 
+A published story over the two hurricane maps, a dashboard map over the USGS
+earthquake layer, and a skyline story and dashboard map over the Manhattan
+buildings are seeded too, found by title and updated in place on a rerun.
+``--story-and-dashboard`` runs just those four on an instance that already has
+the maps and datasets.
+
 Existing showcase maps are updated in place through the metadata and styling
 passes. Pinned maps, dataset titles, and share links must survive updates.
 Run ``showcase-121-state.py snapshot`` first and pass ``--expected-state`` when
@@ -15,8 +21,16 @@ The USGS earthquake feed is a refreshed snapshot, not a streaming layer.
 Check its source status before claiming it is current. Fixed Sentinel-2
 acquisitions are referenced remotely and are not a refresh cadence.
 
-Preparation commands, artifact checksums, staging checks, and rollback steps
-are in ``scripts/showcase-121/README.md``. This script needs httpx.
+``prepare-showcase-canopy.sh`` and ``prepare-showcase-tiles3d.py`` build the
+external artifacts that ``--showcase-121`` takes. The COPC file is a plain
+download that the first seed needs as ``--copc-file`` and checks against
+``COPC_SHA256``::
+
+    curl -fL --retry 3 -o autzen-classified.copc.laz 'https://media.githubusercontent.com/media/PDAL/data/refs/heads/main/autzen/autzen-classified.copc.laz'
+
+Pass ``--no-thumbnails`` with ``--expected-state``: the thumbnail backfill is
+not captured by the snapshot, so ``showcase-121-state.py restore`` cannot undo
+it. This script needs httpx.
 """
 
 import argparse
@@ -25,12 +39,16 @@ import hashlib
 import importlib.util
 import io
 import json
+import math
 import os
 import re
 import shlex
 import subprocess
 import sys
 import time
+import uuid
+from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 try:
@@ -259,6 +277,55 @@ QUAKES_HEAT_TITLE = "Recent Earthquakes - Heatmap source"
 HURRICANE_MAP = "Hurricane Alley - Major Atlantic Storms Since 1950"
 HURRICANE_MAP_LEGACY = "Hurricane Alley - 75 Years of Major Atlantic Storms"
 
+STORY_TITLE = "Where the Atlantic's Major Hurricanes Go"
+SKYLINE_MAP = "Manhattan - A Century of Skyline"
+SKYLINE_BUILDINGS_TITLE = "Manhattan Building Heights"
+SKYLINE_STORY_TITLE = "A Century of Manhattan's Skyline"
+SKYLINE_DASHBOARD_MAP = "Manhattan Skyline Dashboard"
+SKYLINE_DASHBOARD_DESCRIPTION = (
+    "A dashboard over the Manhattan building footprints, extruded to surveyed "
+    "roof height and colored by construction era: how many buildings are in "
+    "view, the tallest roof, how the buildings split by era and how their "
+    "heights spread. Click an era to filter the map. The dashboard follows the "
+    "map view, so pan and zoom to ask about a block. Source: NYC Open Data."
+)
+SKYLINE_PHOTO_URL = (
+    "https://cdn.loc.gov/service/pnp/fsa/8b16000/8b16200/8b16269v.jpg"
+)
+SKYLINE_PHOTO_SHA256 = "42696910409373efc0b2f5c6a1b4db8336c201cec38e1465b37e1756f776b844"
+# west, south, east, north
+SKYLINE_FIDI_BBOX = [-74.020, 40.700, -73.995, 40.718]
+SKYLINE_MIDTOWN_BBOX = [-73.995, 40.740, -73.960, 40.765]
+SKYLINE_57TH_BBOX = [-73.992, 40.760, -73.968, 40.772]
+SKYLINE_CAMERAS = {
+    "overview": {"center": [-73.985, 40.736], "zoom": 13.0, "pitch": 55, "bearing": -30},
+    "downtown": {"center": [-74.008, 40.7105], "zoom": 15.4, "pitch": 60, "bearing": 160},
+    "midtown": {"center": [-73.9806, 40.750], "zoom": 15.3, "pitch": 62, "bearing": -23},
+    "supertalls": {"center": [-73.979, 40.7672], "zoom": 15.1, "pitch": 62, "bearing": 15},
+    "method": {"center": [-73.99, 40.735], "zoom": 13.6, "pitch": 40, "bearing": 0},
+    "dashboard": {"center": [-74.0, 40.718], "zoom": 14.2, "pitch": 55, "bearing": -20},
+}
+ORBIT_MAP = "New York From Orbit - Sentinel-2, by Reference"
+NYC_STORY_TITLE = "New York, From Orbit to the Street Tree"
+NYC_STORY_SUMMARY = (
+    "From Sentinel-2 imagery of the whole city to Manhattan's skyline, its "
+    "subway, and the trees of one East Village park."
+)
+DASHBOARD_MAP = "Earthquake Dashboard - USGS M2.5+ Snapshot"
+DASHBOARD_MAP_DESCRIPTION = (
+    "A dashboard over the USGS M2.5+ earthquake service: how many quakes are "
+    "in view, the strongest one, how their magnitudes spread, and which "
+    "magnitude types and networks report them. Pick a bar or a network to "
+    "filter the map. The dashboard follows the map view, so pan and zoom to "
+    "ask about a region. "
+    "The earthquake layer is a refreshed snapshot of the 30-day USGS service, "
+    "not a streaming layer; check the dataset's Source panel for its actual "
+    "refresh time before treating it as current."
+)
+# Widget, chapter and block ids are derived rather than random so a rerun
+# writes the same document instead of replacing every id.
+_SEED_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://getgeolens.com/showcase-seed")
+
 # The two HURDAT2 track datasets. Titles are stable (neither carries a year
 # count), but --refresh-hurdat2 resolves both by title, so they are named once.
 HURDAT2_TRACKS_TITLE = "Atlantic Hurricane Tracks (HURDAT2, majors since 1950)"
@@ -326,6 +393,24 @@ MAP_VIEW_FIXES = {
         "expected": {"center_lng": -73.97, "center_lat": 40.72, "zoom": 10.2},
         "wanted": {"center_lng": -74.015, "center_lat": 40.725, "zoom": 11.1},
     },
+    # A map saved without a camera has null centre and zoom and default
+    # pitch and bearing; this is the framing build_matterhorn gives a new map.
+    "The Matterhorn in 3D": {
+        "expected": {
+            "center_lng": None,
+            "center_lat": None,
+            "zoom": None,
+            "pitch": 0,
+            "bearing": 0,
+        },
+        "wanted": {
+            "center_lng": 7.6586,
+            "center_lat": 45.9750,
+            "zoom": 14.0,
+            "pitch": 66,
+            "bearing": -150,
+        },
+    },
 }
 
 # Dataset summaries for the two quake bindings. Written by exactly ONE thing,
@@ -380,10 +465,9 @@ CITY_LABEL_CONFIG = {
     "textOffset": [0, 0.5],
     "allowOverlap": False,
 }
-# Ramp from 2.5, the floor of the live service's feed. It used to start at 4,
-# the floor of the old M4.5+ download; left there, every quake in the 2.5-4
-# band - most of the ~2,300 - pins to the same minimum weight and the surface
-# grades by density alone instead of by magnitude.
+# Ramp from 2.5, the floor of the live service's feed. Starting higher would pin
+# every quake in the 2.5-4 band (most of the ~2,300) to the same minimum weight,
+# so the surface would grade by density alone instead of by magnitude.
 QUAKE_HEATMAP_WEIGHT = [
     "interpolate",
     ["linear"],
@@ -620,16 +704,25 @@ class Api:
             f"{self.base}/api/datasets/{dataset_id}/reupload/{job}/preview",
             headers=self.h,
         ).raise_for_status()
+        # No fingerprint: a replacement the server wants reviewed (an empty feed,
+        # a destructive schema change) is held instead of published.
         self.reupload_commit(dataset_id, job)
         self.poll(job)
 
-    def reupload_commit(self, dataset_id: str, job_id: str) -> None:
+    def reupload_commit(
+        self, dataset_id: str, job_id: str, review_fingerprint: str | None = None
+    ) -> None:
         """Commit a staged reupload. Shared by the file and the service paths -
-        both stage into the same job and swap through the same door."""
+        both stage into the same job and swap through the same door.
+
+        The server holds a run that has review reasons unless the commit echoes
+        the preview's fingerprint. Only convert_to_service sends one, after it
+        prints the schema diff."""
+        body = {"review_fingerprint": review_fingerprint} if review_fingerprint else {}
         self.client.post(
             f"{self.base}/api/datasets/{dataset_id}/reupload/{job_id}/commit",
             headers=self.h,
-            json={},
+            json=body,
         ).raise_for_status()
 
     # --- live service bindings -------------------------------------------------
@@ -694,15 +787,14 @@ class Api:
     def list_maps(self) -> dict[str, str]:
         """This account's OWN maps, name -> id, newest-created match winning.
 
-        A map name is not a key, and three separate things follow from that
-        (fix(#1404 review)):
+        A map name is not a key, and three separate things follow from that:
 
         * Keep the FIRST match and only maps this account created. `--force`
           creates a SECOND map with the same name rather than replacing the
           first, and an admin token sees every user's maps, so a plain
           name->id comprehension resolves to whichever duplicate the page
           happened to end on. That is the same rule datasets_by_title already
-          applies to titles for the same reason (fix(#389)) - the maps side
+          applies to titles for the same reason - the maps side
           just never had a caller that MUTATED what it resolved. It does now:
           _map_exists would read a stranger's map as "already built", prune
           would delete it, and apply_globe_projection would project it while
@@ -744,8 +836,8 @@ class Api:
         older titles once an instance crosses 200, breaking every title-based
         reuse/refresh path.
 
-        Scoped to `created_by` for the same reason list_maps is scoped
-        (fix(#1404 review)): a title is not a key, an admin token sees every
+        Scoped to `created_by` for the same reason list_maps is scoped:
+        a title is not a key, an admin token sees every
         user's datasets, and all three callers here MUTATE what they resolve.
         Unscoped, _get_or_analyze would publish and rewrite the summary of a
         stranger's same-titled dataset and then build the showcase chain on it,
@@ -853,6 +945,169 @@ class Api:
             json={"keyword": keyword, "keyword_type": "theme"},
         )
         r.raise_for_status()
+
+    def list_stories(self) -> dict[str, str]:
+        """This account's OWN stories, title -> id, PAGINATED like list_maps."""
+        out: dict[str, str] = {}
+        seen = 0
+        while True:
+            r = self.client.get(
+                f"{self.base}/api/stories/?owned_only=true&limit=200&skip={seen}",
+                headers=self.h,
+            )
+            r.raise_for_status()
+            d = r.json()
+            page = d["stories"]
+            for story in page:
+                out.setdefault(story["title"], story["id"])
+            seen += len(page)
+            if not page or seen >= d["total"]:
+                return out
+
+    def create_story(self, title: str, summary: str) -> str:
+        r = self.client.post(
+            f"{self.base}/api/stories/",
+            headers=self.h,
+            json={"title": title, "summary": summary},
+        )
+        r.raise_for_status()
+        return r.json()["id"]
+
+    def upload_story_asset(self, story_id: str, filename: str, data: bytes) -> str:
+        """Upload an image to the story; return its asset id."""
+        r = self.client.post(
+            f"{self.base}/api/stories/{story_id}/assets",
+            headers=self.h,
+            files={"file": (filename, data, "image/jpeg")},
+        )
+        r.raise_for_status()
+        return r.json()["id"]
+
+    def raster_bounds(self, dataset_id: str) -> list[float] | None:
+        """West, south, east, north of a raster dataset, as its tile token has them."""
+        r = self.client.get(
+            f"{self.base}/api/tiles/token/{dataset_id}/", headers=self.h
+        )
+        r.raise_for_status()
+        return r.json().get("bounds")
+
+    def raster_tile(self, dataset_id: str, z: int, x: int, y: int) -> bytes | None:
+        """One rendered JPEG tile, or None when it falls outside the raster."""
+        url = f"{self.base}/api/tiles/raster-proxy/{dataset_id}/{z}/{x}/{y}.jpg"
+        for attempt in range(5):
+            r = self.client.get(url, headers=self.h)
+            if r.status_code != 429 or attempt == 4:
+                break
+            time.sleep(1.0)
+        if r.status_code == 204:
+            return None
+        r.raise_for_status()
+        return r.content
+
+    def publish_story(
+        self,
+        story_id: str,
+        title: str,
+        summary: str,
+        document: dict,
+        cover_asset_id: str | None = None,
+    ) -> None:
+        """Replace the draft with *document*, make the story public, publish it."""
+        r = self.client.get(f"{self.base}/api/stories/{story_id}/draft", headers=self.h)
+        r.raise_for_status()
+        r = self.client.put(
+            f"{self.base}/api/stories/{story_id}/draft",
+            headers=self.h,
+            json={"revision": r.json()["revision"], "document": document},
+        )
+        r.raise_for_status()
+        revision = r.json()["revision"]
+        r = self.client.patch(
+            f"{self.base}/api/stories/{story_id}",
+            headers=self.h,
+            json={
+                "title": title,
+                "summary": summary,
+                "visibility": "public",
+                **({"cover_asset_id": cover_asset_id} if cover_asset_id else {}),
+            },
+        )
+        r.raise_for_status()
+        r = self.client.post(
+            f"{self.base}/api/stories/{story_id}/publish",
+            headers=self.h,
+            json={"revision": revision},
+        )
+        r.raise_for_status()
+
+    def aggregate(self, dataset_id: str, **body) -> dict:
+        """One exact aggregate over a dataset - the call the widgets make."""
+        # The endpoint is rate limited per second, and a story's figures come
+        # from back-to-back aggregates.
+        for attempt in range(5):
+            r = self.client.post(
+                f"{self.base}/api/datasets/{dataset_id}/aggregate/",
+                headers=self.h,
+                json=body,
+            )
+            if r.status_code != 429 or attempt == 4:
+                break
+            try:
+                wait = float(r.headers.get("Retry-After", ""))
+            except ValueError:  # absent, or an HTTP date
+                wait = 0.2
+            time.sleep(min(max(wait, 0.2), 5.0))
+        r.raise_for_status()
+        return r.json()["result"]
+
+    def rows(
+        self, dataset_id: str, cql2: dict, sort: str, limit: int
+    ) -> list[dict]:
+        """The dataset rows matching a CQL2-JSON filter, highest *sort* first."""
+        r = self.client.get(
+            f"{self.base}/api/datasets/{dataset_id}/rows/",
+            headers=self.h,
+            params={
+                "filter": json.dumps(cql2),
+                "sort": sort,
+                "order": "desc",
+                "limit": limit,
+            },
+        )
+        r.raise_for_status()
+        return r.json()["rows"]
+
+    def attributes(self, dataset_id: str) -> list[dict]:
+        r = self.client.get(
+            f"{self.base}/api/datasets/{dataset_id}/attributes/", headers=self.h
+        )
+        r.raise_for_status()
+        return r.json()["attributes"]
+
+    def set_attribute_title(self, dataset_id: str, attr_id: str, title: str) -> None:
+        r = self.client.patch(
+            f"{self.base}/api/datasets/{dataset_id}/attributes/{attr_id}/",
+            headers=self.h,
+            json={"title": title},
+        )
+        r.raise_for_status()
+
+    def public_app_url(self) -> str:
+        """The address readers open the app at, as share links use it.
+
+        The seed may reach the API through localhost or an internal name, which
+        a published link must not carry. Falls back to the API base when the
+        deployment has no public app URL configured.
+        """
+        r = self.client.get(f"{self.base}/api/settings/tile-config/", headers=self.h)
+        r.raise_for_status()
+        return (r.json().get("public_app_url") or self.base).rstrip("/")
+
+    def story_document(self, story_id: str) -> dict:
+        """The story's current draft document."""
+        r = self.client.get(f"{self.base}/api/stories/{story_id}/draft", headers=self.h)
+        r.raise_for_status()
+        return r.json()["document"]
 
     def delete_map(self, map_id: str) -> None:
         r = self.client.delete(f"{self.base}/api/maps/{map_id}", headers=self.h)
@@ -965,7 +1220,7 @@ class Api:
     def datasets_by_title(self) -> dict[str, str]:
         """This account's own datasets, title -> id, newest match winning.
 
-        fix(#389): /api/datasets orders newest-first and titles are NOT unique
+        /api/datasets orders newest-first and titles are NOT unique
         - a --force reseed creates fresh datasets alongside same-titled
         predecessors. Keep the FIRST (newest) match so lookups resolve to the
         freshly created dataset, not a stale duplicate.
@@ -1263,7 +1518,7 @@ def convert_to_service(
     body = service_binding_body(api, service_url)
     staged = api.service_reupload_preview(dataset_id, body)
     _print_schema_diff(staged["schema_diff"])
-    api.reupload_commit(dataset_id, staged["job_id"])
+    api.reupload_commit(dataset_id, staged["job_id"], staged.get("review_fingerprint"))
     api.poll(staged["job_id"], timeout=timeout)
     return True
 
@@ -1604,8 +1859,8 @@ def meteorite_feed() -> tuple[bytes, int]:
     US-style timestamp; precomputes mass_kg (mass is grams upstream).
 
     The FULL ~32k located set ships deliberately: above 5,000 features the
-    viewer switches to server-side cluster tiles, and fix(#403) made that
-    path project the cols=-requested attribute columns onto unclustered
+    viewer switches to server-side cluster tiles, and that
+    path projects the cols=-requested attribute columns onto unclustered
     features - so Fell/Found colors, mass-graded radii and popups work past
     cluster max zoom. Requires a backend at or after that fix.
     """
@@ -1789,7 +2044,7 @@ def _keep_existing_map(
 ) -> bool:
     """Whether a builder must leave the map row that is already there alone.
 
-    fix(#1607). Pure - no API call, no printing - so the whole truth table is
+    Pure - no API call, no printing - so the whole truth table is
     testable, and ONE function rather than a condition spelled out in each
     builder, so a builder added later cannot quietly grow its own rule and drop
     a pinned map's uuid on the floor:
@@ -1824,7 +2079,7 @@ def _keep_existing_map(
     reads this True as "keep the ROW", not "do nothing": it runs the whole
     force path and rebinds the existing map's layers in place
     (_replace_map_layers), which is the only shape that repairs the scenes
-    without minting the new uuid --force-pinned would (fix(#1607 review r2)).
+    without minting the new uuid --force-pinned would.
     """
     if not exists:
         return False
@@ -1840,8 +2095,7 @@ def _announce_kept_map(name: str, force: bool, note: str = "") -> str:
     the outcome main() reports cannot drift apart: a pinned keep is "(pinned)"
     and an ordinary skip is "(skipped)". They read the same to a builder and
     differently to the operator, which is the point - "use --force to recreate"
-    is the opposite of what --force does to a pinned map
-    (fix(#1607 review r2)).
+    is the opposite of what --force does to a pinned map.
 
     Separate from the decision so that stays pure. The force case has to name
     the flag that lifts the pin: an operator who typed --force and watched
@@ -1883,7 +2137,7 @@ def _rename_map_if_needed(api: Api, name: str, legacy: str) -> None:
 def _replace_map_layers(api: Api, map_id: str, layers: list[dict]) -> int:
     """Swap a map's whole layer stack, leaving the map ROW alone.
 
-    fix(#1607 review r2). This is what lets build_sentinel2 repair a pinned map
+    This is what lets build_sentinel2 repair a pinned map
     under plain --force: a layer points at a dataset id, the scene re-import
     mints new ids, and the map's uuid and share tokens have to survive because
     geolens-examples addresses them. Delete-then-add is the only shape that
@@ -1908,12 +2162,12 @@ def _replace_map_layers(api: Api, map_id: str, layers: list[dict]) -> int:
 def _rows_to_rebind(newest: str | None, retained: list[str]) -> list[str]:
     """Every map row a pinned repair has to rebind, primary first, deduped.
 
-    fix(#1607 review r4). `retained` is every same-named row the force path
+    `retained` is every same-named row the force path
     kept instead of deleting; `newest` is the one list_maps() resolves, which
     is what the seeder's other passes target and therefore the primary. They
     overlap in the ordinary case and must not be rebound twice.
 
-    Older duplicates exist because --force used to stack a second map beside
+    Older duplicates can exist because --force stacks a second map beside
     the first rather than replacing it. They are not cosmetic here: the scene
     deletion cascades EVERY retained row's layers away at once, so a row left
     unrebound keeps its uuid and becomes an EMPTY map. Guessing which
@@ -1933,7 +2187,7 @@ def _rebind_pinned_rows(
 ) -> str:
     """Give every row in `rows` the same fresh layer stack and view.
 
-    fix(#1607 review r4). Returns the primary (rows[0]) - the id the builder
+    Returns the primary (rows[0]) - the id the builder
     reports and the rest of the seeder resolves. Rebinding is deliberately not
     conditional on a row being a duplicate: an empty map and a stale map fail
     the same way for whoever follows the link, and the work is one small
@@ -2001,7 +2255,7 @@ def ensure_quake_datasets(api: Api, by_title: dict) -> tuple[str, str]:
     "re-ingest instead of reusing", but there is nothing to re-download from a
     service binding, and creating a second pair would orphan the datasets the
     Restless Earth map's layers point at. A stale binding is fixed by
-    converting, which this already does on every run. fix(#1607): the map row
+    converting, which this already does on every run. The map row
     is pinned for the same shape of reason - the examples embed it by share
     token, and a token belongs to a map id.
 
@@ -2098,7 +2352,7 @@ def prune(api: Api) -> None:
     for name in RETIRED_MAPS:
         if name not in maps:
             continue
-        # fix(#1607): the retired and pinned lists are meant to be disjoint -
+        # The retired and pinned lists are meant to be disjoint -
         # both pin tuples say so in words - but this is a delete keyed on a
         # name, so it checks instead of trusting the comment. Same below for
         # the titles.
@@ -2363,12 +2617,14 @@ def _showcase_map_names() -> set[str]:
         HURRICANE_MAP,
         HURRICANE_MAP_LEGACY,
         EXPOSURE_MAP,
+        DASHBOARD_MAP,
+        SKYLINE_DASHBOARD_MAP,
         "Everything That Fell From the Sky",
         "The Matterhorn in 3D",
         "New York From Orbit - Sentinel-2, by Reference",
         "Private Embed Demo",
     } | set(RETIRED_MAPS)
-    # fix(#1607): the pinned names are folded in separately, so one of them can
+    # The pinned names are folded in separately, so one of them can
     # never read as a stray if the literals above are ever edited apart from
     # PINNED_MAP_NAMES.
     return names | set(PINNED_MAP_NAMES)
@@ -2390,7 +2646,7 @@ def _classify_userdata(api: Api, known_maps: set, recognised) -> dict:
     pinned_maps, pinned_map_impostors = [], []
     for m in api.list_all_maps():
         if m.get("name") in PINNED_MAP_NAMES:
-            # fix(#1607): first, whoever owns it, for the same reason as the
+            # First, whoever owns it, for the same reason as the
             # pinned datasets below - the examples address these by the uuid
             # this seeder minted, and one of them by share token, so the ROW
             # has to survive. A name is no more proof of identity than a title
@@ -2453,7 +2709,7 @@ def _classify_userdata(api: Api, known_maps: set, recognised) -> dict:
 
 
 def _report_pinned_maps(pinned_maps: list, impostors: list) -> None:
-    """The pinned-map half of the prune report (fix(#1607)).
+    """The pinned-map half of the prune report.
 
     Its own function so prune_userdata does not grow two more loops for a rule
     _classify_userdata has already applied. Owner is printed for the impostors
@@ -2568,7 +2824,7 @@ def prune_userdata(api: Api, execute: bool = False) -> int:
     # Ownership is still worth SHOWING for the expected-foreign pins: they are
     # trusted, but a cleanup audit that never mentions a kept dataset belongs
     # to another account would be hiding the one fact the pin class encodes.
-    # fix(#1487 review): a NULL owner is a deleted creator account, not a
+    # A NULL owner is a deleted creator account, not a
     # visitor - label it as the unknown it is instead of calling it expected.
     # It stays hard-kept either way; only the words change.
     pinned_foreign = [
@@ -2707,7 +2963,7 @@ def build_catalog(api: Api, force: bool = False, force_pinned: bool = False) -> 
         "Source: USDA ERS Atlas of Rural & Small-Town America.",
         force=force,
     )
-    # fix(#626): water/hydrology terms (water, water bodies, rivers, lakes,
+    # Water/hydrology terms (water, water bodies, rivers, lakes,
     # hydrology) were the top zero-result organic searches on the public demo,
     # and the README's own `q=hydrology` curl returned nothing - the showcase
     # had no aquatic data at all. Both files are ~800 KB and public domain.
@@ -2998,9 +3254,8 @@ def build_restless_earth(
                 "colors": quake_colors,
                 "sizeLabel": "Magnitude",
             },
-            # Service column vocabulary, not the old seeder-derived one: every
-            # refresh rebuilds column_info from the service, so depth_km and
-            # time_utc are gone for good and these names are permanent.
+            # Service column vocabulary: every refresh rebuilds column_info
+            # from the service, so these names are the permanent ones.
             "popup_config": QUAKE_POPUP_CONFIG,
         },
     )
@@ -3352,13 +3607,78 @@ def build_restless_earth(
     return map_id
 
 
+def manhattan_buildings_layer(buildings_ds: str, sort_order: int) -> dict:
+    """The 3D buildings layer: extruded to surveyed roof height, colored by era.
+
+    Shared by the Manhattan map and the skyline dashboard map.
+    """
+    # Era color: brick -> deco amber -> midcentury steel -> glass. The
+    # extrusion companion takes its color from paint.fill-color, so the era
+    # ramp carries into 3D automatically. Categorical era STRINGS (not year
+    # breaks): the graduated legend abbreviates numbers (1900 -> "1.9K").
+    eras = [
+        ("Pre-1900", "#7c2d12"),  # brick
+        ("1900-1929", "#b45309"),
+        ("1930-1949", "#d97706"),  # deco
+        ("1950-1979", "#94a3b8"),  # steel
+        ("1980-1999", "#60a5fa"),  # blue glass
+        ("2000-2014", "#22d3ee"),
+        ("2015+", "#a5f3fc"),  # ice glass
+    ]
+    era_match: list = ["match", ["get", "era"]]
+    for era_value, era_color in eras:
+        era_match += [era_value, era_color]
+    era_match.append("#334155")  # Unknown
+    return {
+        "dataset_id": buildings_ds,
+        "sort_order": sort_order,
+        "opacity": 1.0,
+        "display_name": "Buildings (3D height, colored by era)",
+        "layout": {"_minzoom": 12},
+        "paint": {
+            "fill-color": [
+                "case",
+                ["==", ["get", "era"], None],
+                "#334155",
+                era_match,
+            ],
+            "fill-opacity": 0.92,
+        },
+        "style_config": {
+            "mode": "categorical",
+            "column": "era",
+            "ramp": "Plasma",
+            "categories": [{"value": v, "color": c, "label": v} for v, c in eras],
+            "builder": {
+                "height_column": "height_roof",
+                "height_scale": 0.3048,  # feet -> meters
+                "extrusion_min_zoom": 13,
+                "extrusion_opacity": 0.92,
+                "stroke_disabled": True,
+            },
+        },
+        "popup_config": {
+            "enabled": True,
+            "expression": "{title}",
+            "visible_fields": [
+                "construction_year",
+                "height_roof",
+                "ground_elevation",
+                "feature_code",
+            ],
+        },
+    }
+
+
 def build_manhattan(api: Api, force: bool = False, force_pinned: bool = False) -> str:
     """The city hero: 3D extrusion at TRUE surveyed height, colored by
     construction ERA (height carries the form, color carries the story), over
     the subway in official MTA route colors with ADA-coded stations.
 
     * Stations fade in past ~z12.5 via zoom-interpolated circle-opacity so
-      the city view stays clean (layout._minzoom would crash the viewer).
+      the city view stays clean.
+    * Buildings start at z12 (layout._minzoom): below it their tiles run to
+      0.7-0.8 MB each for footprints too small to read.
     * Socrata serialises numbers as strings - height_roof, construction_year
       and the stations' ada flag are all coerced before upload.
     * Era is a precomputed STRING column: the graduated legend abbreviates
@@ -3514,64 +3834,7 @@ def build_manhattan(api: Api, force: bool = False, force_pinned: bool = False) -
         "stations. Ask AI: what share of stations are wheelchair-accessible? "
         "Which decade built the tallest towers? Sources: NYC Open Data, MTA.",
     )
-    # Era color: brick -> deco amber -> midcentury steel -> glass. The
-    # extrusion companion takes its color from paint.fill-color, so the era
-    # ramp carries into 3D automatically. Categorical era STRINGS (not year
-    # breaks): the graduated legend abbreviates numbers (1900 -> "1.9K").
-    eras = [
-        ("Pre-1900", "#7c2d12"),  # brick
-        ("1900-1929", "#b45309"),
-        ("1930-1949", "#d97706"),  # deco
-        ("1950-1979", "#94a3b8"),  # steel
-        ("1980-1999", "#60a5fa"),  # blue glass
-        ("2000-2014", "#22d3ee"),
-        ("2015+", "#a5f3fc"),  # ice glass
-    ]
-    era_match: list = ["match", ["get", "era"]]
-    for era_value, era_color in eras:
-        era_match += [era_value, era_color]
-    era_match.append("#334155")  # Unknown
-    api.add_layer(
-        map_id,
-        {
-            "dataset_id": buildings_ds,
-            "sort_order": 2,
-            "opacity": 1.0,
-            "display_name": "Buildings (3D height, colored by era)",
-            "paint": {
-                "fill-color": [
-                    "case",
-                    ["==", ["get", "era"], None],
-                    "#334155",
-                    era_match,
-                ],
-                "fill-opacity": 0.92,
-            },
-            "style_config": {
-                "mode": "categorical",
-                "column": "era",
-                "ramp": "Plasma",
-                "categories": [{"value": v, "color": c, "label": v} for v, c in eras],
-                "builder": {
-                    "height_column": "height_roof",
-                    "height_scale": 0.3048,  # feet -> meters
-                    "extrusion_min_zoom": 13,
-                    "extrusion_opacity": 0.92,
-                    "stroke_disabled": True,
-                },
-            },
-            "popup_config": {
-                "enabled": True,
-                "expression": "{title}",
-                "visible_fields": [
-                    "construction_year",
-                    "height_roof",
-                    "ground_elevation",
-                    "feature_code",
-                ],
-            },
-        },
-    )
+    api.add_layer(map_id, manhattan_buildings_layer(buildings_ds, sort_order=2))
     # The route palette comes from the MTA standard, not the source feed.
     # Keep its many entries out of the legend so the building eras stay visible.
     service_match: list = ["match", ["get", "service"]]
@@ -3621,10 +3884,6 @@ def build_manhattan(api: Api, force: bool = False, force_pinned: bool = False) -
             "sort_order": 0,
             "opacity": 1.0,
             "display_name": "Stations (green = ADA accessible)",
-            # Zoom-gated via zoom-interpolated opacity, NOT layout._minzoom:
-            # MapLibre's addLayer validation rejects unknown layout properties,
-            # so a persisted underscore layout key crashes the whole layer on
-            # the viewer path (verified live 2026-07-04).
             "paint": {
                 "circle-radius": [
                     "interpolate",
@@ -4009,8 +4268,8 @@ def build_hurricanes(api: Api, force: bool = False, force_pinned: bool = False) 
             "style_config": {
                 "render_mode": "arrow",
                 "builder": {
-                    # White arrows read clearly against the magenta Cat-5 line;
-                    # the old dark-purple (#701a75) was nearly invisible on it.
+                    # White arrows read clearly against the magenta Cat-5
+                    # line; dark purple is nearly invisible on it.
                     "arrow_color": "#ffffff",
                     "arrow_size": 16,
                     "arrow_spacing": 90,
@@ -4042,7 +4301,7 @@ def build_hurricanes(api: Api, force: bool = False, force_pinned: bool = False) 
             "dataset_id": tracks_ds,
             "sort_order": 1,
             # Single source of dimming: layer opacity 1.0 × line-opacity 0.85 keeps
-            # the intended ~0.85. The old 0.9 compounded to a washed-out 0.765.
+            # the intended ~0.85; 0.9 here would compound to a washed-out 0.765.
             "opacity": 1.0,
             "display_name": "Storm tracks (by intensity at each leg)",
             "style_config": {
@@ -4411,12 +4670,1331 @@ def build_hurricane_exposure(
     return map_id
 
 
+def _seed_id(*parts: str) -> str:
+    return str(uuid.uuid5(_SEED_NAMESPACE, "/".join(parts)))
+
+
+def _story_scene(
+    map_doc: dict,
+    layer_visibility: dict[str, bool] | None = None,
+    camera: dict | None = None,
+    transition: str | None = None,
+) -> dict:
+    return {
+        **({"transition": transition} if transition else {}),
+        "map_id": map_doc["id"],
+        "camera": camera
+        or {
+            "center": [map_doc["center_lng"], map_doc["center_lat"]],
+            "zoom": map_doc["zoom"],
+            "bearing": map_doc.get("bearing") or 0,
+            "pitch": map_doc.get("pitch") or 0,
+        },
+        "layer_visibility": layer_visibility or {},
+    }
+
+
+def _story_chapter(
+    key: str,
+    title: str,
+    scene: dict,
+    text: str,
+    extra_blocks: list[dict] | None = None,
+) -> dict:
+    return {
+        "id": _seed_id("story", key),
+        "title": title,
+        "scene": scene,
+        "blocks": [
+            {
+                "id": _seed_id("story", key, "text"),
+                "type": "markdown",
+                "v": 1,
+                "config": {"text": text},
+            },
+            *(extra_blocks or []),
+        ],
+    }
+
+
+def _story_block(key: str, name: str, kind: str, **fields) -> dict:
+    return {"id": _seed_id("story", key, name), "type": kind, "v": 1, **fields}
+
+
+def _story_blocks_chapter(
+    key: str, title: str, scene: dict, blocks: list[dict]
+) -> dict:
+    """A chapter whose blocks are given whole, for text, images and buttons."""
+    return {
+        "id": _seed_id("story", key),
+        "title": title,
+        "scene": scene,
+        "blocks": blocks,
+    }
+
+
+def seed_hurricane_story(
+    api: Api, force: bool = False, force_pinned: bool = False
+) -> str:
+    """The published story over the two hurricane maps, found by title.
+
+    Updated in place on a rerun. Every figure in the text is read from the
+    datasets behind the maps when this runs, so a refreshed HURDAT2 release
+    changes the words with the data. The maps are not touched.
+    """
+    maps = api.list_maps()
+    by_title = api.datasets_by_title()
+    legs_ds = by_title.get(HURDAT2_LEGS_TITLE)
+    exposure_ds = by_title.get(EXPOSURE_CHAIN_TITLES[2])
+    if (
+        HURRICANE_MAP not in maps
+        or EXPOSURE_MAP not in maps
+        or not (legs_ds and exposure_ds)
+    ):
+        raise RuntimeError(
+            "the hurricane maps and their datasets are not seeded yet - run "
+            "--only hurricanes and --only hurricane-exposure first"
+        )
+    print("\n[story] " + STORY_TITLE)
+    tracks_map = api.get_map(maps[HURRICANE_MAP])
+    exposure_map = api.get_map(maps[EXPOSURE_MAP])
+
+    storms = api.aggregate(legs_ds, op="count")["count"]
+    seasons = api.aggregate(legs_ds, op="stats", column="season", stats=["min", "max"])
+    peaks = {
+        row["value"]: row["count"]
+        for row in api.aggregate(
+            legs_ds, op="value_counts", column="peak_category", limit=10
+        )["values"]
+    }
+    regions = api.aggregate(exposure_ds, op="count")["count"]
+    top = api.aggregate(
+        exposure_ds,
+        op="group_by",
+        group_column="region",
+        stat="max",
+        column="source_count",
+        limit=3,
+    )["groups"]
+
+    by_peak = ", ".join(
+        f"{peaks[c]} at {c.replace('Cat ', 'Category ')}"
+        for c in sorted(peaks, reverse=True)
+    )
+    tracks_text = (
+        f"From {seasons['min']} to {seasons['max']}, {storms} Atlantic storms "
+        f"reached Category 3 or stronger in NOAA's HURDAT2 best tracks. Their "
+        f"peak intensity: {by_peak}.\n\n"
+        "Each track is drawn in six-hour segments. The colour warms from blue "
+        "tropical storm to magenta Category 5 as a storm intensifies, the "
+        "width follows wind speed, and arrows mark direction of motion on "
+        "Category 5 legs."
+    )
+    ranked = ", ".join(f"{g['key']} ({g['value']})" for g in top)
+    coasts_text = (
+        "To see which coasts these storms reach, GeoLens buffered every "
+        "Category 3+ leg by 100 km, intersected the corridors with Natural "
+        "Earth regions and dissolved by region. The fill counts distinct "
+        "major storms whose corridor touched a region; darker means more.\n\n"
+        f"{regions} regions lie inside at least one corridor. The most "
+        f"reached, with their storm counts: {ranked}.\n\n"
+        "The corridor is a screening measure, not a damage or future-risk "
+        "forecast."
+    )
+    legs_layer = next(
+        (lay["id"] for lay in exposure_map["layers"] if lay["dataset_id"] == legs_ds),
+        None,
+    )
+    if legs_layer is None:
+        raise RuntimeError(
+            f"{EXPOSURE_MAP!r} has no storm legs layer to show in the method chapter"
+        )
+    data_text = (
+        "- **Tracks:** NOAA National Hurricane Center, HURDAT2 Atlantic "
+        "best-track database (public domain).\n"
+        "- **Regions:** Natural Earth.\n"
+        "- **Method:** the Category 3+ storm legs, shown here, were buffered "
+        "by 100 km, intersected with the regions and dissolved by region. Each "
+        "derived dataset's provenance panel records the operation and its "
+        "parameters."
+    )
+    document = {
+        "version": 1,
+        "chapters": [
+            _story_chapter(
+                "tracks", "The tracks", _story_scene(tracks_map), tracks_text
+            ),
+            _story_chapter(
+                "coasts",
+                "The coasts they reach",
+                _story_scene(exposure_map),
+                coasts_text,
+            ),
+            _story_chapter(
+                "data",
+                "Where the data comes from",
+                _story_scene(exposure_map, {legs_layer: True}),
+                data_text,
+            ),
+        ],
+    }
+    summary = (
+        "Every Atlantic storm since 1950 that reached Category 3, and the "
+        "coasts that lie within 100 km of their tracks."
+    )
+    story_id = api.list_stories().get(STORY_TITLE)
+    verb = "updated"
+    if story_id is None:
+        story_id = api.create_story(STORY_TITLE, summary)
+        verb = "created"
+    api.publish_story(story_id, STORY_TITLE, summary, document)
+    print(f"  -> story {story_id} ({verb}, published, public)")
+    return story_id
+
+
+def _dashboard_map(
+    api: Api, name: str, description: str, layer: dict
+) -> tuple[str, dict, bool, str]:
+    """Find or create the named map and its layer over ``layer["dataset_id"]``.
+
+    Returns the map id, the map as found, whether it was created, and the
+    layer id.
+    """
+    map_id = api.list_maps().get(name)
+    created = map_id is None
+    if created:
+        map_id = api.create_map(name, description)
+    current = api.get_map(map_id)
+    found = next(
+        (
+            lay
+            for lay in current["layers"]
+            if lay["dataset_id"] == layer["dataset_id"]
+        ),
+        None,
+    )
+    if found is None:
+        found = api.add_layer(map_id, layer)
+    return map_id, current, created, found["id"]
+
+
+def _dashboard_widget(
+    prefix: str, layer_id: str, key: str, kind: str, title: str, config: dict
+) -> dict:
+    """A data widget scoped to the map view, with an id stable across reruns."""
+    return {
+        "id": _seed_id(prefix, key),
+        "type": kind,
+        "v": 1,
+        "title": title,
+        "layer_id": layer_id,
+        "scope": "view",
+        "config": config,
+    }
+
+
+def seed_quake_dashboard(
+    api: Api, force: bool = False, force_pinned: bool = False
+) -> str:
+    """A public map whose dashboard summarizes the USGS earthquake layer.
+
+    Its own map, found by name, so the pinned Restless Earth map stays as it
+    is. The snapshot note lives in the map description.
+    """
+    quakes_ds = api.datasets_by_title().get(QUAKES_TITLE)
+    if not quakes_ds:
+        raise RuntimeError(
+            f"{QUAKES_TITLE!r} is not seeded yet - run --only restless first"
+        )
+    print("\n[dashboard] " + DASHBOARD_MAP)
+    edges = [5.0, 6.0, 7.0]
+    map_id, current, created, layer_id = _dashboard_map(
+        api,
+        DASHBOARD_MAP,
+        DASHBOARD_MAP_DESCRIPTION,
+        {
+            "dataset_id": quakes_ds,
+            "sort_order": 0,
+            "opacity": 1.0,
+            "display_name": "Earthquakes (last 30 days, by magnitude)",
+            "paint": {
+                "circle-radius": step_expr("mag", edges, [3, 5, 8, 12]),
+                "circle-color": step_expr(
+                    "mag", edges, ["#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"]
+                ),
+                "circle-opacity": 0.85,
+                "circle-stroke-color": "#7f1d1d",
+                "circle-stroke-width": 0.5,
+            },
+            "popup_config": QUAKE_POPUP_CONFIG,
+        },
+    )
+
+    def widget(key: str, kind: str, title: str, config: dict) -> dict:
+        return _dashboard_widget("dashboard", layer_id, key, kind, title, config)
+
+    camera = (
+        {
+            "center_lng": 0,
+            "center_lat": 20,
+            "zoom": 1.4,
+            "pitch": 0,
+            "bearing": 0,
+            "basemap_style": "openfreemap-positron",
+            "show_basemap_labels": True,
+        }
+        # Keyed on the stored view, so a rerun after a failed save still sets it.
+        if current.get("center_lng") is None
+        else {}
+    )
+    api.set_view(
+        map_id,
+        **camera,
+        description=DASHBOARD_MAP_DESCRIPTION,
+        visibility="public",
+        dashboard_config={
+            "version": 1,
+            "widgets": [
+                widget("count", "indicator", "Earthquakes in view", {"stat": "count"}),
+                widget(
+                    "strongest",
+                    "indicator",
+                    "Strongest earthquake in view (magnitude)",
+                    {"stat": "max", "column": "mag"},
+                ),
+                widget(
+                    "magnitudes",
+                    "histogram",
+                    "Earthquakes by magnitude",
+                    {"column": "mag", "bins": 20},
+                ),
+                widget(
+                    "magtype",
+                    "bar_chart",
+                    "Reports by magnitude type",
+                    {"column": "magtype", "stat": "count", "limit": 8},
+                ),
+                widget(
+                    "network",
+                    "category_selector",
+                    "Reporting network",
+                    {"column": "net"},
+                ),
+            ],
+        },
+    )
+    print(f"  -> map {map_id} ({'created' if created else 'updated'}, public)")
+    return map_id
+
+
+def seed_skyline_dashboard(
+    api: Api, force: bool = False, force_pinned: bool = False
+) -> str:
+    """A public map whose dashboard summarizes the Manhattan buildings layer.
+
+    Its own map, found by name, so the Manhattan map stays as it is.
+    """
+    buildings_ds = api.datasets_by_title().get(SKYLINE_BUILDINGS_TITLE)
+    if not buildings_ds:
+        raise RuntimeError(
+            f"{SKYLINE_BUILDINGS_TITLE!r} is not seeded yet - run "
+            "--only manhattan first"
+        )
+    print("\n[skyline-dashboard] " + SKYLINE_DASHBOARD_MAP)
+    layer = manhattan_buildings_layer(buildings_ds, 0)
+    # The Map data table opens with the popup's fields, so it leads with the
+    # building's name rather than survey columns.
+    fields = ["title", "height_roof", "construction_year", "era"]
+    layer["popup_config"] = {**layer["popup_config"], "visible_fields": fields}
+    map_id, current, created, layer_id = _dashboard_map(
+        api, SKYLINE_DASHBOARD_MAP, SKYLINE_DASHBOARD_DESCRIPTION, layer
+    )
+    existing = next((lay for lay in current["layers"] if lay["id"] == layer_id), None)
+    current_popup = (existing or {}).get("popup_config") or {}
+    if existing and current_popup.get("visible_fields") != fields:
+        # Over the seed's popup, so a layer saved without one still sends `enabled`.
+        popup = {**layer["popup_config"], **current_popup, "visible_fields": fields}
+        api.update_layer(map_id, {"id": layer_id, "popup_config": popup})
+
+    def widget(key: str, kind: str, title: str, config: dict) -> dict:
+        return _dashboard_widget(
+            "skyline-dashboard", layer_id, key, kind, title, config
+        )
+
+    camera = SKYLINE_CAMERAS["dashboard"]
+    api.set_view(
+        map_id,
+        center_lng=camera["center"][0],
+        center_lat=camera["center"][1],
+        zoom=camera["zoom"],
+        pitch=camera["pitch"],
+        bearing=camera["bearing"],
+        basemap_style="openfreemap-dark",
+        show_basemap_labels=False,
+        description=SKYLINE_DASHBOARD_DESCRIPTION,
+        visibility="public",
+        dashboard_config={
+            "version": 1,
+            "widgets": [
+                widget("count", "indicator", "Buildings in view", {"stat": "count"}),
+                widget(
+                    "tallest",
+                    "indicator",
+                    "Tallest roof in view (ft)",
+                    {"stat": "max", "column": "height_roof"},
+                ),
+                widget(
+                    "eras",
+                    "bar_chart",
+                    "Buildings by era",
+                    {"column": "era", "stat": "count", "limit": 8},
+                ),
+                widget(
+                    "heights",
+                    "histogram",
+                    "Roof heights (ft)",
+                    {"column": "height_roof", "bins": 20},
+                ),
+                {
+                    "id": _seed_id("skyline-dashboard", "howto"),
+                    "type": "markdown",
+                    "v": 1,
+                    "title": None,
+                    "config": {
+                        "text": "Move the map to change what the panel counts. "
+                        "Click an era to filter the buildings.\n\n"
+                        "Building footprints and heights: NYC Open Data."
+                    },
+                },
+            ],
+        },
+    )
+    print(f"  -> map {map_id} ({'created' if created else 'updated'}, public)")
+    return map_id
+
+
+def _skyline_tallest(
+    api: Api, dataset_id: str, bbox: list[float], eras: list[str], limit: int = 2
+) -> list[tuple[str, float]]:
+    """The tallest roofs, in feet, of the given eras inside bbox, as (label, height).
+
+    Ranked by row, because unnamed footprints share a "Built <year>" title.
+    """
+    rows = api.rows(
+        dataset_id,
+        {
+            "op": "and",
+            "args": [
+                {"op": "in", "args": [{"property": "era"}, eras]},
+                {
+                    "op": "s_intersects",
+                    "args": [{"property": "geometry"}, {"bbox": bbox}],
+                },
+            ],
+        },
+        sort="height_roof",
+        limit=limit,
+    )
+    if len(rows) < limit:
+        raise RuntimeError(f"fewer than {limit} buildings of {eras} inside {bbox}")
+    return [
+        (
+            f"a tower completed in {row['title'].removeprefix('Built ')}"
+            if row["title"].startswith("Built ")
+            else row["title"],
+            row["height_roof"],
+        )
+        for row in rows
+    ]
+
+
+def _skyline_count(
+    api: Api, dataset_id: str, bbox: list[float], eras: list[str]
+) -> int:
+    return api.aggregate(
+        dataset_id,
+        op="count",
+        bbox=bbox,
+        filter={"op": "in", "args": [{"property": "era"}, eras]},
+    )["count"]
+
+
+def seed_skyline_story(
+    api: Api, force: bool = False, force_pinned: bool = False
+) -> str:
+    """The published skyline story over the Manhattan map, found by title.
+
+    Every chapter flies the one Manhattan map to its own camera. Updated in
+    place on a rerun, and every figure in the text is read from the buildings
+    dataset when this runs. The map is not touched.
+    """
+    maps = api.list_maps()
+    by_title = api.datasets_by_title()
+    buildings_ds = by_title.get(SKYLINE_BUILDINGS_TITLE)
+    map_id = maps.get(SKYLINE_MAP)
+    dashboard_id = maps.get(SKYLINE_DASHBOARD_MAP)
+    stations_ds = by_title.get("NYC Subway Stations (MTA)")
+    if not (buildings_ds and stations_ds and map_id and dashboard_id):
+        raise RuntimeError(
+            f"{SKYLINE_MAP!r} or {SKYLINE_DASHBOARD_MAP!r} is not seeded yet - "
+            "run --only manhattan and --only skyline-dashboard first"
+        )
+    print("\n[skyline-story] " + SKYLINE_STORY_TITLE)
+    app_url = api.public_app_url()
+    manhattan = api.get_map(map_id)
+    subway = [
+        lay["id"] for lay in manhattan["layers"] if lay["dataset_id"] != buildings_ds
+    ]
+
+    total = api.aggregate(buildings_ds, op="count")["count"]
+    by_era = {
+        row["value"]: row["count"]
+        for row in api.aggregate(
+            buildings_ds, op="value_counts", column="era", limit=10
+        )["values"]
+    }
+    tallest_all = api.aggregate(
+        buildings_ds, op="stats", column="height_roof", stats=["max"]
+    )["max"]
+    pre_1930 = ["Pre-1900", "1900-1929"]
+    downtown_n = _skyline_count(api, buildings_ds, SKYLINE_FIDI_BBOX, pre_1930)
+    downtown_top = _skyline_tallest(
+        api, buildings_ds, SKYLINE_FIDI_BBOX, pre_1930, limit=1
+    )[0]
+    midtown_n = _skyline_count(api, buildings_ds, SKYLINE_MIDTOWN_BBOX, ["1930-1949"])
+    midtown_top = _skyline_tallest(
+        api, buildings_ds, SKYLINE_MIDTOWN_BBOX, ["1930-1949"]
+    )
+    super_n = _skyline_count(api, buildings_ds, SKYLINE_57TH_BBOX, ["2015+"])
+    super_top = _skyline_tallest(api, buildings_ds, SKYLINE_57TH_BBOX, ["2015+"])
+    stations = api.aggregate(stations_ds, op="count")["count"]
+    accessible = {
+        str(row["value"]): row["count"]
+        for row in api.aggregate(stations_ds, op="value_counts", column="ada", limit=5)[
+            "values"
+        ]
+    }
+
+    overview_text = (
+        f"The map holds {total:,} building footprints in Lower and Midtown "
+        "Manhattan. Each is raised to its surveyed roof height and colored by "
+        "the decade it was built.\n\n"
+        f"{by_era['1900-1929']:,} date from 1900 to 1929 and {by_era['Pre-1900']:,} "
+        f"from before 1900. Only {by_era['2015+']:,} are from 2015 or later. The "
+        f"tallest roof in the data is {tallest_all:,.0f} ft."
+    )
+    downtown_text = (
+        f"The Financial District has {downtown_n:,} buildings from before 1930, "
+        "packed into the narrow street grid at the island's tip.\n\n"
+        f"The tallest of them is {downtown_top[0]}, with a roof at "
+        f"{downtown_top[1]:,.0f} ft."
+    )
+    midtown_text = (
+        f"In Midtown, {midtown_n:,} buildings date from 1930 to 1949. The tallest "
+        f"are {midtown_top[0][0]} ({midtown_top[0][1]:,.0f} ft) and "
+        f"{midtown_top[1][0]} ({midtown_top[1][1]:,.0f} ft).\n\n"
+        "Heights are surveyed roof heights, so antennas and spires are not "
+        "counted."
+    )
+    supertall_text = (
+        f"Around 57th Street, {super_n:,} buildings went up in 2015 or later. "
+        f"The tallest is {super_top[0][0]}, with a roof at {super_top[0][1]:,.0f} "
+        f"ft, followed by {super_top[1][0]} at {super_top[1][1]:,.0f} ft.\n\n"
+        f"That is {super_top[0][1] - midtown_top[0][1]:,.0f} ft above the "
+        f"{midtown_top[0][0]}, the tallest of the 1930s towers."
+    )
+    method_text = (
+        "- **Buildings:** NYC Open Data building footprints, with roof height "
+        "in feet and construction year. The era is derived from the year; "
+        f"{by_era.get('Unknown', 0):,} footprints have none and show as "
+        "Unknown.\n"
+        f"- **Subway:** {stations} MTA stations, {accessible.get('1', 0)} of "
+        "them fully ADA accessible, with the lines in official route "
+        "colors.\n"
+        "- **Method:** the figures in this story are counts and maxima "
+        "computed from the dataset when it was written."
+    )
+
+    summary = (
+        "Manhattan's buildings extruded to their roof heights and colored by "
+        "construction era, from the Financial District to 57th Street."
+    )
+    story_id = api.list_stories().get(SKYLINE_STORY_TITLE)
+    verb = "updated"
+    if story_id is None:
+        story_id = api.create_story(SKYLINE_STORY_TITLE, summary)
+        verb = "created"
+
+    # Keyed on the pin, so a rerun reuses the uploaded photo and a new pin
+    # uploads a new one.
+    photo_block_id = _seed_id(
+        "story", "skyline-midtown", "photo", SKYLINE_PHOTO_SHA256
+    )
+    asset_id = None
+    if verb == "updated":
+        asset_id = next(
+            (
+                block.get("asset_id")
+                for chapter in api.story_document(story_id).get("chapters", [])
+                for block in chapter.get("blocks", [])
+                if block.get("id") == photo_block_id
+            ),
+            None,
+        )
+    if asset_id is None:
+        photo = fetch(SKYLINE_PHOTO_URL)
+        if hashlib.sha256(photo).hexdigest() != SKYLINE_PHOTO_SHA256:
+            raise RuntimeError(
+                "skyline photo checksum differs from the pinned value"
+            )
+        asset_id = api.upload_story_asset(story_id, "midtown-1941.jpg", photo)
+
+    def scene(camera: str, show_subway: bool = False) -> dict:
+        visibility = {layer_id: show_subway for layer_id in subway}
+        return _story_scene(manhattan, visibility, SKYLINE_CAMERAS[camera])
+
+    document = {
+        "version": 1,
+        "chapters": [
+            _story_chapter(
+                "skyline-overview",
+                "Manhattan, building by building",
+                scene("overview"),
+                overview_text,
+            ),
+            _story_chapter(
+                "skyline-downtown",
+                "Downtown before 1930",
+                scene("downtown"),
+                downtown_text,
+            ),
+            _story_chapter(
+                "skyline-midtown",
+                "Midtown in the 1930s",
+                scene("midtown"),
+                midtown_text,
+                [
+                    {
+                        "id": photo_block_id,
+                        "type": "image",
+                        "v": 1,
+                        "asset_id": asset_id,
+                        "config": {
+                            "alt": "Black-and-white photograph of Midtown "
+                            "Manhattan in haze, with a slender tower topped by a "
+                            "mast at left and the flank of a larger tower at "
+                            "right.",
+                            "caption": "Midtown Manhattan, December 1941. Library "
+                            "of Congress, Prints & Photographs Division, FSA/OWI "
+                            "Collection, LC-DIG-fsa-8b16269. No known "
+                            "restrictions on publication.",
+                        },
+                    }
+                ],
+            ),
+            _story_chapter(
+                "skyline-supertalls",
+                "57th Street since 2015",
+                scene("supertalls"),
+                supertall_text,
+            ),
+            _story_chapter(
+                "skyline-method",
+                "Where the data comes from",
+                scene("method", show_subway=True),
+                method_text,
+                [
+                    {
+                        "id": _seed_id("story", "skyline-method", "dashboard"),
+                        "type": "button",
+                        "v": 1,
+                        "config": {
+                            "label": "Open the skyline dashboard",
+                            "url": f"{app_url}/maps/{dashboard_id}",
+                        },
+                    }
+                ],
+            ),
+        ],
+    }
+    api.publish_story(story_id, SKYLINE_STORY_TITLE, summary, document)
+    print(f"  -> story {story_id} ({verb}, published, public)")
+    return story_id
+
+
+_ORBIT_LAYER = re.compile(r"^Sentinel-2 - (\d{4}-\d{2}-\d{2})")
+
+
+def _map_layer(map_doc: dict, name: str) -> str:
+    """The id of the one layer of *map_doc* called *name*."""
+    return _map_layer_row(map_doc, name)["id"]
+
+
+def _map_layer_row(map_doc: dict, name: str) -> dict:
+    found = [lay for lay in map_doc["layers"] if lay.get("display_name") == name]
+    if len(found) != 1:
+        raise RuntimeError(
+            f"{map_doc.get('name', 'a map')!r} has {len(found)} layers named "
+            f"{name!r}, expected one"
+        )
+    return found[0]
+
+
+def _orbit_passes(orbit: dict) -> dict[str, list[dict]]:
+    """The orbit map's Sentinel-2 layers by acquisition date, newest date first."""
+    passes: dict[str, list[dict]] = {}
+    for layer in orbit["layers"]:
+        match = _ORBIT_LAYER.match(layer.get("display_name") or "")
+        if not match:
+            continue
+        try:
+            date.fromisoformat(match.group(1))
+        except ValueError:
+            print(f"  skipping layer {layer['display_name']!r}: not a calendar date")
+            continue
+        passes.setdefault(match.group(1), []).append(layer)
+    return dict(sorted(passes.items(), reverse=True))
+
+
+def _earlier_pass(dates: list[str]) -> tuple[str, int]:
+    """The older date nearest a week before the newest, and its gap in days."""
+    newest = date.fromisoformat(dates[0])
+    gaps = {d: (newest - date.fromisoformat(d)).days for d in dates[1:]}
+    pick = min(gaps, key=lambda d: abs(gaps[d] - 7))
+    return pick, gaps[pick]
+
+
+def _tile_at(lng: float, lat: float, z: int) -> tuple[int, int]:
+    n = 2**z
+    x = int((lng + 180) / 360 * n)
+    y = int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n)
+    return x, y
+
+
+def _tile_bbox(z: int, x: int, y: int) -> tuple[float, float, float, float]:
+    """West, south, east, north of an XYZ tile."""
+    n = 2**z
+
+    def lat(row: int) -> float:
+        return math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * row / n))))
+
+    return x / n * 360 - 180, lat(y + 1), (x + 1) / n * 360 - 180, lat(y)
+
+
+def _has_pillow() -> bool:
+    return importlib.util.find_spec("PIL") is not None
+
+
+def _stitch_tiles(api: Api, dataset_id: str, z: int, x: int, y: int) -> bytes | None:
+    """The tile's area as one 1024 px JPEG from the 4x4 tiles two zooms down.
+
+    None when Pillow is missing or any of the sixteen tiles is empty.
+    """
+    if not _has_pillow():
+        return None
+    from PIL import Image
+
+    canvas = Image.new("RGB", (1024, 1024))
+    for row in range(4):
+        for col in range(4):
+            tile = api.raster_tile(dataset_id, z + 2, x * 4 + col, y * 4 + row)
+            if not tile:
+                return None
+            with Image.open(io.BytesIO(tile)) as image:
+                canvas.paste(image.convert("RGB"), (col * 256, row * 256))
+    out = io.BytesIO()
+    canvas.save(out, "JPEG", quality=85)
+    return out.getvalue()
+
+
+def _covers(b: list[float] | None, west, south, east, north) -> bool:
+    return bool(b) and b[0] <= west and b[1] <= south and east <= b[2] and north <= b[3]
+
+
+def _orbit_crop(
+    api: Api,
+    passes: dict[str, list[dict]],
+    bounds: dict[str, list[float] | None],
+    lng: float,
+    lat: float,
+) -> tuple[bytes, str]:
+    """A true-colour tile of the point and the date of the scene it came from.
+
+    The first zoom at which one scene covers the whole tile wins, so the crop
+    has no empty corner, and the newest such scene is used. The 1024 px stitch
+    asks for tiles two zooms deeper, so it stops at zoom 12.
+    """
+    for z in range(10, 15):
+        x, y = _tile_at(lng, lat, z)
+        box = _tile_bbox(z, x, y)
+        for day, layers in passes.items():
+            for layer in layers:
+                if not _covers(bounds[layer["id"]], *box):
+                    continue
+                stitched = (
+                    _stitch_tiles(api, layer["dataset_id"], z, x, y)
+                    if z <= 12
+                    else None
+                )
+                if stitched:
+                    return stitched, day
+                tile = api.raster_tile(layer["dataset_id"], z, x, y)
+                if tile:
+                    print("  image is a single 256 px tile (low resolution)")
+                    return tile, day
+    raise RuntimeError(
+        f"no single Sentinel-2 scene covers the centre of {ORBIT_MAP!r}, so "
+        "there is no image for the story"
+    )
+
+
+def _meets(b: list[float] | None, view: tuple[float, float, float, float]) -> bool:
+    west, south, east, north = view
+    return bool(b) and b[0] <= east and b[2] >= west and b[1] <= north and b[3] >= south
+
+
+def _view_bbox(camera: dict) -> tuple[float, float, float, float]:
+    """Roughly what a 1280 x 800 map shows at the camera, as west, south, east, north."""
+    lng, lat = camera["center"]
+    degrees = 360 / (512 * 2 ** camera["zoom"])
+    half_w = degrees * 1280 / 2
+    half_h = degrees * 800 / 2 * math.cos(math.radians(lat))
+    return lng - half_w, lat - half_h, lng + half_w, lat + half_h
+
+
+def _uncovered(
+    rect: tuple[float, float, float, float], covers: list[list[float]]
+) -> bool:
+    """Whether any part of *rect* lies outside every rectangle in *covers*."""
+    west, south, east, north = rect
+
+    def cuts(low: int, high: int, lo: float, hi: float) -> list[float]:
+        edges = {lo, hi}
+        for c in covers:
+            edges.update(min(max(c[i], lo), hi) for i in (low, high))
+        return sorted(edges)
+
+    xs = cuts(0, 2, west, east)
+    ys = cuts(1, 3, south, north)
+    return any(
+        not any(
+            c[0] <= (x0 + x1) / 2 <= c[2] and c[1] <= (y0 + y1) / 2 <= c[3]
+            for c in covers
+        )
+        for x0, x1 in zip(xs, xs[1:])
+        for y0, y1 in zip(ys, ys[1:])
+    )
+
+
+def _overlaps(rect: tuple[float, float, float, float], other: list[float]) -> bool:
+    """Whether two rectangles share area, not just an edge."""
+    return (
+        rect[0] < other[2]
+        and other[0] < rect[2]
+        and rect[1] < other[3]
+        and other[1] < rect[3]
+    )
+
+
+def _orbit_visibility(
+    passes: dict[str, list[dict]],
+    bounds: dict[str, list[float] | None],
+    view: tuple[float, float, float, float],
+    day: str,
+) -> dict[str, bool]:
+    """Layer visibility that fills the view with imagery, preferring *day*.
+
+    Every scene of *day* that meets the view shows. A scene of another date
+    shows only if its part of the view extends beyond all scenes of *day* and
+    it either is older, so the map draws it below them, or does not overlap
+    them. A newer scene that overlaps is dropped, which can leave a gap.
+    """
+    west, south, east, north = view
+    preferred = [
+        bounds[lay["id"]]
+        for lay in passes.get(day, [])
+        if _meets(bounds[lay["id"]], view)
+    ]
+    visibility = {}
+    for other, layers in passes.items():
+        for layer in layers:
+            b = bounds[layer["id"]]
+            if not _meets(b, view):
+                visibility[layer["id"]] = False
+            elif other == day:
+                visibility[layer["id"]] = True
+            else:
+                part = (
+                    max(b[0], west),
+                    max(b[1], south),
+                    min(b[2], east),
+                    min(b[3], north),
+                )
+                draws_over = other > day and any(_overlaps(part, c) for c in preferred)
+                visibility[layer["id"]] = not draws_over and _uncovered(part, preferred)
+    return visibility
+
+
+def _finite_number(value, what: str) -> float:
+    """*value* as a finite number; an exact numeric string is accepted."""
+    try:
+        if value is None or isinstance(value, bool):
+            raise ValueError
+        number = float(Decimal(str(value).strip()))
+    except (ValueError, InvalidOperation):
+        number = math.nan
+    if not math.isfinite(number):
+        raise RuntimeError(f"the aggregate for {what} came back as {value!r}")
+    return number
+
+
+def _nyc_story_missing(api: Api) -> list[str]:
+    """What the New York story reads that this instance does not have yet."""
+    maps = api.list_maps()
+    by_title = api.datasets_by_title()
+    wanted = [
+        *(
+            (f"map {name!r}", name in maps)
+            for name in (ORBIT_MAP, SKYLINE_MAP, CITY_SHADE_MAP, DASHBOARD_MAP)
+        ),
+        (f"dataset {SKYLINE_BUILDINGS_TITLE!r}", SKYLINE_BUILDINGS_TITLE in by_title),
+        (
+            "dataset 'NYC Subway Stations (MTA)'",
+            "NYC Subway Stations (MTA)" in by_title,
+        ),
+        (f"dataset {CITY_SHADE_RESULT!r}", CITY_SHADE_RESULT in by_title),
+        (f"story {STORY_TITLE!r}", STORY_TITLE in api.list_stories()),
+    ]
+    return [what for what, present in wanted if not present]
+
+
+def seed_nyc_story_if_ready(
+    api: Api, force: bool = False, force_pinned: bool = False
+) -> str:
+    """seed_nyc_story, or a "(missing: ...)" result when its inputs are absent.
+
+    The default seed does not build City in Shade (``--showcase-121``) or the
+    orbit map (``--no-sentinel2``), and a story that cannot be built must not
+    fail the whole run.
+    """
+    missing = _nyc_story_missing(api)
+    if missing:
+        return "(missing: " + ", ".join(missing) + ")"
+    return seed_nyc_story(api, force=force, force_pinned=force_pinned)
+
+
+def seed_nyc_story(api: Api, force: bool = False, force_pinned: bool = False) -> str:
+    """The published New York story across four showcase maps, found by title.
+
+    Maps, layers and link targets are looked up by name when this runs. The
+    first chapter's image is a tile the API renders from the newest Sentinel-2
+    scene on the orbit map, uploaded as the story's cover and reused on a rerun
+    while it stays the same. The maps are not touched.
+    """
+    missing = _nyc_story_missing(api)
+    if missing:
+        raise RuntimeError(
+            "the New York story is missing "
+            + ", ".join(missing)
+            + " - seed those first"
+        )
+    maps = api.list_maps()
+    stories = api.list_stories()
+    print("\n[nyc-story] " + NYC_STORY_TITLE)
+    app_url = api.public_app_url()
+    orbit = api.get_map(maps[ORBIT_MAP])
+    manhattan = api.get_map(maps[SKYLINE_MAP])
+    shade = api.get_map(maps[CITY_SHADE_MAP])
+    if orbit.get("center_lng") is None or orbit.get("center_lat") is None:
+        raise RuntimeError(f"{ORBIT_MAP!r} has no saved camera")
+
+    passes = _orbit_passes(orbit)
+    if len(passes) < 2:
+        raise RuntimeError(f"{ORBIT_MAP!r} needs scenes from at least two dates")
+    bounds = {
+        lay["id"]: api.raster_bounds(lay["dataset_id"])
+        for layers in passes.values()
+        for lay in layers
+    }
+    orbit_camera = {
+        "center": [orbit["center_lng"], orbit["center_lat"]],
+        "zoom": 10.0,
+        "bearing": 0,
+        "pitch": 0,
+    }
+    crop, crop_day = _orbit_crop(
+        api, passes, bounds, orbit["center_lng"], orbit["center_lat"]
+    )
+    # The chapters' dates follow what the camera sees; the crop's own date
+    # belongs to the picture alone.
+    view = _view_bbox(orbit_camera)
+    in_view = [
+        day
+        for day, layers in passes.items()
+        if any(_meets(bounds[lay["id"]], view) for lay in layers)
+    ]
+    if not in_view:
+        raise RuntimeError(f"no Sentinel-2 scene of {ORBIT_MAP!r} meets its view")
+    newest = in_view[0]
+    comparison = len(in_view) > 1
+    if comparison:
+        earlier, gap = _earlier_pass(in_view)
+    else:
+        print(
+            f"  only the {newest} pass meets the view: "
+            "no earlier-pass chapter without a change to show"
+        )
+
+    def orbit_scene(show: str, transition: str) -> dict:
+        # A layer left out of the override would keep its saved visibility.
+        visibility = {lay["id"]: False for lay in orbit["layers"]}
+        visibility.update(_orbit_visibility(passes, bounds, view, show))
+        return _story_scene(orbit, visibility, orbit_camera, transition)
+
+    buildings = _map_layer(manhattan, "Buildings (3D height, colored by era)")
+    subway = _map_layer(manhattan, "Subway (official MTA colors)")
+    stations = _map_layer(manhattan, "Stations (green = ADA accessible)")
+
+    def manhattan_scene(camera: dict, transition: str, underground: bool) -> dict:
+        visibility = {
+            buildings: not underground,
+            subway: underground,
+            stations: underground,
+        }
+        return _story_scene(manhattan, visibility, camera, transition)
+
+    shade_visibility = {
+        _map_layer(shade, name): True
+        for name in (
+            "Canopy change in the study window",
+            "Rectangular study window",
+            "East Village source subset",
+        )
+    }
+
+    # The datasets the scenes display, not the newest same-titled ones.
+    buildings_ds = _map_layer_row(manhattan, "Buildings (3D height, colored by era)")[
+        "dataset_id"
+    ]
+    stations_ds = _map_layer_row(manhattan, "Stations (green = ADA accessible)")[
+        "dataset_id"
+    ]
+    canopy_ds = _map_layer_row(shade, "Canopy change in the study window")["dataset_id"]
+    # Checked before the story or its cover exist, so a bad figure leaves nothing behind.
+    total = int(
+        _finite_number(api.aggregate(buildings_ds, op="count")["count"], "buildings")
+    )
+    tallest = _finite_number(
+        api.aggregate(buildings_ds, op="stats", column="height_roof", stats=["max"])[
+            "max"
+        ],
+        "the tallest roof",
+    )
+    station_count = int(
+        _finite_number(api.aggregate(stations_ds, op="count")["count"], "stations")
+    )
+    classes = {
+        row["value"]: int(_finite_number(row["count"], f"canopy class {row['value']}"))
+        for row in api.aggregate(
+            canopy_ds, op="value_counts", column="class", limit=10
+        )["values"]
+    }
+
+    story_id = stories.get(NYC_STORY_TITLE)
+    verb = "updated"
+    if story_id is None:
+        story_id = api.create_story(NYC_STORY_TITLE, NYC_STORY_SUMMARY)
+        verb = "created"
+
+    # Keyed on the picture's bytes, so a rerun over the same scene reuses the
+    # uploaded asset and a newer scene uploads a new one.
+    image_id = _seed_id("story", "nyc-orbit", "image", hashlib.sha256(crop).hexdigest())
+    asset_id = None
+    if verb == "updated":
+        asset_id = next(
+            (
+                block.get("asset_id")
+                for chapter in api.story_document(story_id).get("chapters", [])
+                for block in chapter.get("blocks", [])
+                if block.get("id") == image_id
+            ),
+            None,
+        )
+    if asset_id is None:
+        asset_id = api.upload_story_asset(story_id, "new-york-from-orbit.jpg", crop)
+
+    def text(key: str, body: str) -> dict:
+        return _story_block(key, "text", "markdown", config={"text": body})
+
+    def button(key: str, name: str, label: str, url: str) -> dict:
+        return _story_block(key, name, "button", config={"label": label, "url": url})
+
+    def separator(key: str) -> dict:
+        return _story_block(key, "separator", "separator", config={"style": "line"})
+
+    earlier_chapters = []
+    if comparison:
+        earlier_title = "A week earlier" if gap == 7 else "An earlier pass"
+        earlier_chapters = [
+            _story_blocks_chapter(
+                "nyc-earlier",
+                earlier_title,
+                orbit_scene(earlier, "glide"),
+                [
+                    text(
+                        "nyc-earlier",
+                        f"The same camera, now preferring the pass on {earlier}, "
+                        f"{gap} days before the first. Each pass is its own "
+                        "layer, so the scene swaps while the camera stays put.\n\n"
+                        "Coverage varies by tile: a corner of the view may come "
+                        "from an older pass, and a newer pass that would overlap "
+                        "this one is hidden, which can leave a gap. Cloud and "
+                        "haze change from one date to the next.",
+                    ),
+                    separator("nyc-earlier"),
+                ],
+            ),
+        ]
+    document = {
+        "version": 1,
+        "chapters": [
+            _story_blocks_chapter(
+                "nyc-orbit",
+                "From orbit",
+                orbit_scene(newest, "fly"),
+                [
+                    text(
+                        "nyc-orbit",
+                        f"This is New York as the Sentinel-2 satellites saw it on "
+                        f"{newest}. On the map, the satellite layers are true "
+                        "colour at 10 m a pixel and GeoLens draws them straight "
+                        "from the public archive instead of keeping a copy. The "
+                        "picture below is different: a stored crop of the "
+                        f"{crop_day} scene, credited to Copernicus Sentinel "
+                        "data.\n\n"
+                        "Each satellite pass covers the city in tiles, so where "
+                        f"the {newest} scene stops, the map shows the nearest "
+                        "other pass. Water is dark, the built-up city is grey "
+                        "and the parks are green."
+                        + (
+                            ""
+                            if comparison
+                            else f"\n\nOnly the {newest} pass meets this view, "
+                            "so there is no earlier pass to compare it with."
+                        ),
+                    ),
+                    {
+                        "id": image_id,
+                        "type": "image",
+                        "v": 1,
+                        "asset_id": asset_id,
+                        "config": {
+                            "alt": "True-colour satellite image of the New York "
+                            "City area, with dark water, grey built-up land and "
+                            "green parks.",
+                            "caption": f"Sentinel-2 true colour, {crop_day}. "
+                            f"Contains modified Copernicus Sentinel data "
+                            f"{crop_day[:4]}.",
+                        },
+                    },
+                ],
+            ),
+            *earlier_chapters,
+            _story_blocks_chapter(
+                "nyc-skyline",
+                "The skyline",
+                manhattan_scene(
+                    {
+                        "center": [-73.9806, 40.750],
+                        "zoom": 15.0,
+                        "bearing": -28,
+                        "pitch": 60,
+                    },
+                    "fly",
+                    False,
+                ),
+                [
+                    text(
+                        "nyc-skyline",
+                        f"A second map holds {total:,} building footprints in "
+                        "Lower and Midtown Manhattan. Height is the form of the "
+                        "city: each footprint is raised to its surveyed roof "
+                        f"height, up to {tallest:,.0f} ft.\n\n"
+                        "Colour is the construction era, from the oldest blocks "
+                        "to the towers completed since 2015.",
+                    )
+                ],
+            ),
+            _story_blocks_chapter(
+                "nyc-turn",
+                "Turn the city",
+                manhattan_scene(
+                    {
+                        "center": [-73.990, 40.744],
+                        "zoom": 15.5,
+                        "bearing": 120,
+                        "pitch": 70,
+                    },
+                    "glide",
+                    False,
+                ),
+                [
+                    text(
+                        "nyc-turn",
+                        "The same map, turned to look at Lower Midtown from the "
+                        "river side.\n\n"
+                        "At this angle the older, lower blocks and the towers "
+                        "beside them stand apart.",
+                    )
+                ],
+            ),
+            _story_blocks_chapter(
+                "nyc-beneath",
+                "What runs beneath",
+                manhattan_scene(
+                    {
+                        "center": [-73.99, 40.735],
+                        "zoom": 13.2,
+                        "bearing": 0,
+                        "pitch": 45,
+                    },
+                    "fly",
+                    True,
+                ),
+                [
+                    text(
+                        "nyc-beneath",
+                        "With the buildings switched off, the subway shows. The "
+                        f"map draws {station_count:,} MTA stations and the lines "
+                        "between them in their official route colours.",
+                    ),
+                    button(
+                        "nyc-beneath",
+                        "manhattan",
+                        "Open the Manhattan map",
+                        f"{app_url}/maps/{maps[SKYLINE_MAP]}",
+                    ),
+                ],
+            ),
+            _story_blocks_chapter(
+                "nyc-trees",
+                "Down to the trees",
+                _story_scene(shade, shade_visibility, None, "fly"),
+                [
+                    text(
+                        "nyc-trees",
+                        "The last map is City in Shade: how tree canopy changed "
+                        "between 2010 and 2017 around Tompkins Square Park. In "
+                        f"the study window, {classes.get('Gain', 0):,} polygons "
+                        f"mark canopy gained, {classes.get('Loss', 0):,} canopy "
+                        f"lost and {classes.get('No Change', 0):,} no change.\n\n"
+                        "The pale layer underneath is the larger source subset "
+                        "the window was clipped from. It is a historical "
+                        "sample, not a measure of today's shade.",
+                    ),
+                    separator("nyc-trees"),
+                    button(
+                        "nyc-trees",
+                        "dashboard",
+                        "Open the earthquake dashboard",
+                        f"{app_url}/maps/{maps[DASHBOARD_MAP]}",
+                    ),
+                    button(
+                        "nyc-trees",
+                        "hurricanes",
+                        "Read the hurricane story",
+                        f"{app_url}/stories/{stories[STORY_TITLE]}",
+                    ),
+                ],
+            ),
+        ],
+    }
+    api.publish_story(
+        story_id, NYC_STORY_TITLE, NYC_STORY_SUMMARY, document, cover_asset_id=asset_id
+    )
+    print(f"  -> story {story_id} ({verb}, published, public)")
+    return story_id
+
+
+ATTRIBUTE_TITLES = {
+    SKYLINE_BUILDINGS_TITLE: {
+        "height_roof": "Roof height (ft)",
+        "construction_year": "Year built",
+        "era": "Era",
+        "name": "Name",
+        "title": "Building",
+    },
+    QUAKES_TITLE: {
+        "place": "Place",
+        "mag": "Magnitude",
+        "event_time_utc_date_fmt": "Time (UTC)",
+        "depth_num": "Depth (km)",
+        "felt": "Felt reports",
+        "tsunami": "Tsunami flag",
+        "sig": "Significance",
+        "magtype": "Magnitude type",
+        "net": "Network",
+    },
+}
+
+
+def set_attribute_titles(api: Api) -> None:
+    """Give the dashboard datasets readable column titles; a rerun changes nothing.
+
+    Widgets and the Map data table label a column by its attribute title.
+    """
+    by_title = api.datasets_by_title()
+    for dataset_title, titles in ATTRIBUTE_TITLES.items():
+        dataset_id = by_title.get(dataset_title)
+        if dataset_id is None:
+            continue
+        changed = 0
+        for attr in api.attributes(dataset_id):
+            title = titles.get(attr["field_name"])
+            if title is None or attr["title"] == title:
+                continue
+            api.set_attribute_title(dataset_id, attr["id"], title)
+            changed += 1
+        print(f"  attribute titles: {dataset_title} ({changed} set)")
+
+
+def run_story_and_dashboard(api: Api) -> int:
+    """Seed only the story and the dashboard map, then exit.
+
+    For an instance that already has the showcase maps and datasets; unlike a
+    full seed it runs none of the metadata, styling or thumbnail passes.
+    """
+    failed = False
+    try:
+        set_attribute_titles(api)
+    except httpx.HTTPError as e:
+        print(f"\nERROR in [set_attribute_titles]: {e}", file=sys.stderr)
+        failed = True
+    for seed in (
+        seed_hurricane_story,
+        seed_quake_dashboard,
+        seed_skyline_dashboard,
+        seed_skyline_story,
+        seed_nyc_story_if_ready,
+    ):
+        try:
+            result = seed(api)
+            if result and result.startswith("(missing: "):
+                print(_builder_outcome_line(seed.__name__, result))
+        except (httpx.HTTPError, RuntimeError, TimeoutError) as e:
+            print(f"\nERROR in [{seed.__name__}]: {e}", file=sys.stderr)
+            if isinstance(e, httpx.HTTPStatusError):
+                print(e.response.text[:500], file=sys.stderr)
+            failed = True
+    return 1 if failed else 0
+
+
 def build_meteorites(api: Api, force: bool = False, force_pinned: bool = False) -> str:
     """The cluster hero: all ~32k located meteorite landings.
 
     Above 5,000 points the viewer switches from client GeoJSON clustering to
     SERVER-SIDE cluster tiles - this map exists to show that tier at full
-    scale. fix(#403) made those tiles project the cols=-requested attribute
+    scale. Those tiles project the cols=-requested attribute
     columns onto unclustered features, so the Fell/Found colors, mass-graded
     radii and popups keep working past cluster max zoom (requires a backend
     at or after that fix). Count-graded cluster bubbles split apart on zoom
@@ -4718,7 +6296,7 @@ def build_matterhorn(
         return _announce_kept_map(name, force)
     print("\n[matterhorn] The Matterhorn (3D terrain via regional VRT mosaic)")
     vrt_title = "swissALTI3D Matterhorn DEM (2m mosaic)"
-    # fix(#1508): the DEM mosaic and its 62 tile rasters are reused even under
+    # The DEM mosaic and its 62 tile rasters are reused even under
     # --force. The manifest endpoint refuses updates to existing raster
     # datasets ("Manifest raster updates are not supported"), so a forced
     # re-push aborted the whole builder before the map and OSM overlay steps —
@@ -4866,6 +6444,43 @@ def _sentinel2_tile(f: dict) -> str:
     )
 
 
+# Collection-1 ids read S2B_T18TXL_20260911T155930_L2A, legacy ids
+# S2B_18TXL_20230911_0_L2A.
+_SENTINEL2_SCENE_ID = re.compile(
+    r"S2([A-D])_T?(\d{2}[C-X][A-Z]{2})_(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2}))?"
+)
+
+
+def _sentinel2_scene_fields(title: str) -> dict:
+    """The scene's summary and Copernicus credit, from the item id in its title."""
+    m = _SENTINEL2_SCENE_ID.match(title.removeprefix("Sentinel-2 TCI "))
+    if not m:
+        return {}
+    unit, tile, year, month, day, hour, minute = m.groups()
+    when = f"{year}-{month}-{day}" + (f" at {hour}:{minute} UTC" if hour else "")
+    zone, north = int(tile[:2]), tile[2] >= "N"
+    epsg = (32600 if north else 32700) + zone
+    return {
+        "summary": (
+            f"Sentinel-2{unit} Level-2A true-colour image (TCI) of MGRS tile "
+            f"{tile}, acquired {when}. Three 8-bit bands (red, green and blue "
+            f"from B04, B03 and B02) at 10 m resolution in UTM zone {zone}"
+            f"{'N' if north else 'S'} (EPSG:{epsg}), on the tile's 10,980 x "
+            "10,980 pixel grid. Registered from Element84 Earth Search, the STAC "
+            "catalog of Sentinel-2 L2A Cloud-Optimized GeoTIFFs on AWS Open Data."
+        ),
+        "attribution": f"Contains modified Copernicus Sentinel data {year}",
+    }
+
+
+def _sentinel2_layer_label(item: dict) -> str:
+    """A scene layer's name. Tiles imaged on one pass share a date; the tile id
+    tells their layers apart."""
+    day = item["datetime_start"][:10]
+    m = _SENTINEL2_SCENE_ID.match(item["id"])
+    return f"{day} (T{m.group(2)})" if m else day
+
+
 def _sentinel2_item(f: dict) -> dict:
     """One build_sentinel2 import item from a Sentinel-2 STAC feature."""
     # Collection-1 items use projection-extension v2 "proj:code"
@@ -4880,7 +6495,7 @@ def _sentinel2_item(f: dict) -> dict:
         "collection": f.get("collection", "sentinel-2-l2a"),
         "title": f"Sentinel-2 TCI {f['id']}",
         "data_asset_href": (f.get("assets") or {}).get("visual", {}).get("href"),
-        # feat(#1222): the item's rel=self link. The backend records it
+        # The item's rel=self link. The backend records it
         # as origin_ref.item_href, which is what makes the dataset
         # REFRESHABLE - without it every refresh 409s origin_unavailable.
         # The in-app import flow captures this server-side via the
@@ -4990,8 +6605,7 @@ def build_sentinel2(api: Api, force: bool = False, force_pinned: bool = False) -
     mints the new uuid the examples must not get. Instead the pin is honoured
     by REUSING the row: the force preflight, the scene deletion and the STAC
     import all run exactly as they do without a pin, and only create_map is
-    skipped, in favour of rebinding the existing map's layers in place
-    (fix(#1607 review r2))."""
+    skipped, in favour of rebinding the existing map's layers in place."""
     name = "New York From Orbit - Sentinel-2, by Reference"
     keep_pinned_row = _keep_existing_map(
         name, _map_exists(api, name), force, force_pinned
@@ -5012,18 +6626,17 @@ def build_sentinel2(api: Api, force: bool = False, force_pinned: bool = False) -
     # href -> own dataset id for holdings the force preflight proved the
     # skip-fallback can use; consulted before the by-title fallback because
     # titles are NOT unique (see datasets_by_title) and the newest same-titled
-    # row is not necessarily the row holding the asset (round 8).
+    # row is not necessarily the row holding the asset.
     resolved_by_href: dict[str, str] = {}
     # Same-named rows the loop below kept instead of deleting. Every one of
-    # them loses its layers to the scene cascade, so every one is rebound
-    # (fix(#1607 review r4)).
+    # them loses its layers to the scene cascade, so every one is rebound.
     retained_rows: list[str] = []
     if force:
-        # fix(#1493 review round 8): the shared-scene and conflict scans
+        # The shared-scene and conflict scans
         # below must see EVERY map and dataset. --username can select a
         # non-admin account, and non-admin listings are visibility-filtered -
         # a stranger's PRIVATE map layering one of these public scenes would
-        # be invisible to the round-5 sweep and its imagery silently
+        # be invisible to the sweep and its imagery silently
         # cascaded away by the delete.
         if "admin" not in api.roles:
             raise RuntimeError(
@@ -5031,14 +6644,14 @@ def build_sentinel2(api: Api, force: bool = False, force_pinned: bool = False) -
                 "listing cannot see other users' private maps, so the "
                 "shared-scene protection would be blind"
             )
-        # fix(#1493 review): --force must REBUILD, not duplicate - the import
+        # --force must REBUILD, not duplicate - the import
         # endpoint dedupes on source_url and returns status="skipped" WITHOUT
         # updating origin_ref, so a rerun over existing scenes could never
         # record fresh bindings. Deleting the SCENES first is what makes
         # `--only sentinel2 --force` the supported repair for instances seeded
         # before item_href was sent.
         #
-        # fix(#1607 review r2): the map ROW is a separate question from the
+        # The map ROW is a separate question from the
         # scenes, and since the name is pinned the two now part company. The
         # scene deletion and re-import below are what the repair actually is,
         # and they run unchanged; the map row is kept and rebound in place
@@ -5050,20 +6663,20 @@ def build_sentinel2(api: Api, force: bool = False, force_pinned: bool = False) -
         #
         # Three deliberate shapes here:
         #
-        # * Runs AFTER the catalog search succeeded (round 3): a flaky
+        # * Runs AFTER the catalog search succeeded: a flaky
         #   Element84 must fail this builder BEFORE it destroys a working
         #   showcase, not after.
-        # * Enumerates ALL owned maps under the name via list_all_maps()
-        #   (round 2): list_maps() collapses a name to the newest id, and the
+        # * Enumerates ALL owned maps under the name via list_all_maps():
+        #   list_maps() collapses a name to the newest id, and the
         #   old --force behavior could stack duplicates; deleting only the
         #   newest would cascade the survivors' layers away and leave husks.
         # * Deletes only scene datasets ATTACHED to those maps, intersected
-        #   with own+prefix+raster (round 3): a bare title-prefix sweep would
+        #   with own+prefix+raster: a bare title-prefix sweep would
         #   destroy an operator's unrelated same-prefixed import, and a bare
         #   attached-layer sweep would destroy a shared context dataset if a
         #   styling pass ever adds one to this map.
         # * Aborts BEFORE deleting when a selected asset is held by a dataset
-        #   the rebuild can neither delete nor resolve (rounds 4+6): the
+        #   the rebuild can neither delete nor resolve: the
         #   import dedupe is instance-wide on asset href, and the
         #   skip-fallback below resolves own datasets by seeder title only.
         #   A holding survives the rebuild unless it is in the deletion set,
@@ -5072,8 +6685,8 @@ def build_sentinel2(api: Api, force: bool = False, force_pinned: bool = False) -
         #   ownerless row, an own manual import or renamed scene) would
         #   dedupe-skip into a missing scene or an all-conflict raise after
         #   the maps were already gone. Keyed the same way the backend guard
-        #   is (fix(#1286)): origin_ref.asset_href, source_url as fallback.
-        # * Deletes datasets BEFORE maps (round 7): a scene serving a
+        #   is: origin_ref.asset_href, source_url as fallback.
+        # * Deletes datasets BEFORE maps: a scene serving a
         #   committed VRT or an in-progress generation makes its DELETE 409
         #   DependentVrtError, and that check is server-side only (origin_ref
         #   and derived_from expose no VRT sources client-side) - the delete
@@ -5098,7 +6711,7 @@ def build_sentinel2(api: Api, force: bool = False, force_pinned: bool = False) -
                 ):
                     doomed[ds_id] = title
         if doomed:
-            # fix(#1493 review round 5): a scene someone layered into ANY
+            # A scene someone layered into ANY
             # other map is not ours to cascade away - keep it and say so. The
             # kept scene then rides the dedupe skip-fallback below if the
             # fresh search reselects its asset (reattached, still
@@ -5119,7 +6732,7 @@ def build_sentinel2(api: Api, force: bool = False, force_pinned: bool = False) -
                             f"also layered in map {m.get('name', m['id'])!r}"
                         )
                         doomed.pop(ds_id)
-        # Preflight (rounds 4+6) - runs on the FINAL doomed set, after the
+        # Preflight - runs on the FINAL doomed set, after the
         # shared-scene exclusions, and before anything is deleted.
         href_to_title = {it["data_asset_href"]: it["title"] for it in items}
         conflicts = []
@@ -5140,7 +6753,7 @@ def build_sentinel2(api: Api, force: bool = False, force_pinned: bool = False) -
                 # Own + seeder-titled: resolvable. Record WHICH row holds the
                 # href so the skipped-result resolution below can bind to it
                 # directly - a newer same-titled own row would win the
-                # by-title lookup and attach the wrong data (round 8).
+                # by-title lookup and attach the wrong data.
                 resolved_by_href[held] = d["id"]
                 continue
             conflicts.append(d)
@@ -5179,14 +6792,14 @@ def build_sentinel2(api: Api, force: bool = False, force_pinned: bool = False) -
         if doomed:
             print(f"  [force] deleted {len(doomed)} attached scene datasets")
         for map_id in stale_maps:
-            # fix(#1607): this loop is the line that actually destroys the uuid
+            # This loop is the line that actually destroys the uuid
             # the examples gallery links, so the decision is asked here rather
             # than inherited from a caller 250 lines up. Under a pinned repair
             # the row is kept and rebound below; --force-pinned is what turns
             # this back into a delete-and-recreate, and this delete is why the
             # --force-pinned help singles this map out: for the other three
             # pinned maps the override leaves the old row standing, and here it
-            # does not (fix(#1607 review r3)).
+            # does not.
             if _keep_existing_map(name, True, force, force_pinned):
                 retained_rows.append(map_id)
                 print(f"  [pinned] keeping map {map_id} - rebound in place below")
@@ -5206,23 +6819,23 @@ def build_sentinel2(api: Api, force: bool = False, force_pinned: bool = False) -
     # to the row the force preflight proved holds the asset, falling back to
     # the title we assigned. The href binding comes first because titles are
     # not unique: a newer same-titled own row would win the by-title lookup
-    # and attach the wrong data to the map (round 8).
+    # and attach the wrong data to the map.
     id_to_title = {it["id"]: it["title"] for it in items}
-    id_to_date = {it["id"]: it["datetime_start"][:10] for it in items}
+    id_to_label = {it["id"]: _sentinel2_layer_label(it) for it in items}
     id_to_href = {it["id"]: it["data_asset_href"] for it in items}
     by_title = None
-    scenes = []  # (dataset_id, capture_date)
+    scenes = []  # (dataset_id, layer label)
     pinned_dataset_id = None
     for x in results:
         item_id = x.get("item_id")
         if x.get("dataset_id"):
-            scenes.append((x["dataset_id"], id_to_date.get(item_id, "?")))
+            scenes.append((x["dataset_id"], id_to_label.get(item_id, "?")))
             if item_id == PINNED_HARBOR_SCENE_ID:
                 pinned_dataset_id = x["dataset_id"]
         elif x.get("status") == "skipped":
             held_id = resolved_by_href.get(id_to_href.get(item_id, ""))
             if held_id:
-                scenes.append((held_id, id_to_date.get(item_id, "?")))
+                scenes.append((held_id, id_to_label.get(item_id, "?")))
                 if item_id == PINNED_HARBOR_SCENE_ID:
                     pinned_dataset_id = held_id
                 continue
@@ -5241,7 +6854,7 @@ def build_sentinel2(api: Api, force: bool = False, force_pinned: bool = False) -
                     continue  # leave pinned_dataset_id unset; the check below raises
                 pinned_dataset_id = existing
             if existing:
-                scenes.append((existing, id_to_date.get(item_id, "?")))
+                scenes.append((existing, id_to_label.get(item_id, "?")))
     if not scenes:
         raise RuntimeError(
             "STAC import resolved no dataset_ids (skipped items not found by "
@@ -5261,14 +6874,14 @@ def build_sentinel2(api: Api, force: bool = False, force_pinned: bool = False) -
             "dataset_id": ds_id,
             "sort_order": i,  # newest first = on top (results are date-desc)
             "opacity": 1.0,
-            "display_name": f"Sentinel-2 - {day}",
+            "display_name": f"Sentinel-2 - {label}",
             "layer_type": "raster_geolens",
             # true color = NO render_mode, no paint (default RGB path).
             "style_config": {"builder": {}},
         }
-        for i, (ds_id, day) in enumerate(scenes)
+        for i, (ds_id, label) in enumerate(scenes)
     ]
-    # fix(#1607 review r2): under a pinned repair the row the examples link is
+    # Under a pinned repair the row the examples link is
     # reused instead of created. Resolved through list_maps(), which is what
     # every other pass in this seeder already targets (the globe projection,
     # the styling pass and the prune classifier all read it) - repairing a
@@ -5404,14 +7017,13 @@ def build_embed_demo(api: Api, force: bool = False, force_pinned: bool = False) 
 
 # Collection membership: dataset TITLES per collection. Missing titles (e.g.
 # terrain skipped) are silently ignored; add_to_collection is idempotent, so
-# membership tops up on every run (fix #389).
+# membership tops up on every run.
 COLLECTIONS = {
     "Restless Planet": (
         # Worded for the STAC surface as much as for the catalog. STAC exposes
-        # only a collection's RASTER members, so this description used to
-        # promise earthquakes and eruptions to a STAC client that could see
-        # neither - it lists what the collection HOLDS without claiming what any
-        # one surface will show.
+        # only a collection's RASTER members, so the description lists what the
+        # collection HOLDS without promising earthquakes or eruptions to a STAC
+        # client that could see neither.
         # No "live" here, deliberately. This text is written by a pass that
         # runs whether or not the service conversion succeeded, and unlike the
         # map notes it has no natural gate to hang on - a collection is a label
@@ -5507,8 +7119,8 @@ def build_collections(api: Api, force: bool = False, force_pinned: bool = False)
 # ingest flow (ingest_geojson / manifest) only sets title + summary, so every
 # one of these defaulted to license "proprietary" with zero keywords - which
 # reads as a proprietary raster dump and contradicts the open sources their
-# own summaries cite (fix(#614): proprietary licenses + empty keyword facets on
-# the demo, flagged in the 2026-07-20 pre-launch audit).
+# own summaries cite (proprietary licenses and empty keyword facets on
+# the demo).
 # Licenses are each dataset's real upstream terms; keywords power the faceted-
 # search sidebar.
 #
@@ -5601,6 +7213,8 @@ SHOWCASE_METADATA: dict[str, dict] = {
         "keywords": ["tree canopy", "change", "east village", "2010", "2017"],
         "source_organization": "NYC OTI and University of Vermont",
         "source_url": "https://data.cityofnewyork.us/d/by9k-vhck",
+        "data_vintage_start": "2010-01-01",
+        "data_vintage_end": "2017-12-31",
         "update_frequency": "notPlanned",
         "theme_category": ["environment"],
     },
@@ -5616,6 +7230,8 @@ SHOWCASE_METADATA: dict[str, dict] = {
         "keywords": ["tree canopy", "gain", "loss", "analysis", "clip"],
         "source_organization": "NYC OTI and University of Vermont",
         "source_url": "https://data.cityofnewyork.us/d/by9k-vhck",
+        "data_vintage_start": "2010-01-01",
+        "data_vintage_end": "2017-12-31",
         "update_frequency": "notPlanned",
         "theme_category": ["environment"],
     },
@@ -5730,9 +7346,8 @@ SHOWCASE_METADATA: dict[str, dict] = {
         # Gated for the same reason as the circles dataset, and this one needs
         # it more: its title never changes, so the rename-after-conversion gate
         # that protects the circles dataset does not cover it at all.
-        # fix(#614): the old summary read as an internal rendering workaround;
-        # describe it as the map's density layer instead. Now also corrected to
-        # M2.5+, which is what the live service actually serves.
+        # Described as the map's density layer, at M2.5+ as the live service
+        # serves it.
         "requires_origin": "service",
         "gated": {
             "update_frequency": "continual",
@@ -5813,11 +7428,14 @@ SHOWCASE_METADATA: dict[str, dict] = {
     #
     # source_organization is deliberately UNSET on all three: no outside body
     # published them, GeoLens computed them, and the provenance panel already
-    # names the operation chain. The vintage IS set, because it is a real
-    # property of the inputs rather than a guess - these cover exactly the
-    # HURDAT2 seasons the corridors were buffered from.
+    # names the operation chain. attribution credits the inputs' publishers
+    # for their data, which is not a claim that they published the result. The
+    # vintage IS set, because it is a real property of the inputs rather than a
+    # guess - these cover exactly the HURDAT2 seasons the corridors were
+    # buffered from.
     "Major Hurricane Corridors (100 km buffer)": {
         "license": "Derived in GeoLens from NOAA NHC HURDAT2 (US public domain)",
+        "attribution": "NOAA National Hurricane Center (HURDAT2)",
         "keywords": ["hurricanes", "buffer", "analysis", "derived", "corridor"],
         "data_vintage_start": "1950-01-01",
         "theme_category": ["climatologyMeteorologyAtmosphere"],
@@ -5827,6 +7445,7 @@ SHOWCASE_METADATA: dict[str, dict] = {
             "Derived in GeoLens from NOAA NHC HURDAT2 and Natural Earth "
             "(both public domain)"
         ),
+        "attribution": "NOAA National Hurricane Center (HURDAT2); Natural Earth",
         "keywords": ["hurricanes", "intersect", "analysis", "derived", "exposure"],
         "data_vintage_start": "1950-01-01",
         "theme_category": ["climatologyMeteorologyAtmosphere", "boundaries"],
@@ -5844,6 +7463,7 @@ SHOWCASE_METADATA: dict[str, dict] = {
             "derived",
             "coastal",
         ],
+        "attribution": "NOAA National Hurricane Center (HURDAT2); Natural Earth",
         "data_vintage_start": "1950-01-01",
         "theme_category": ["climatologyMeteorologyAtmosphere", "boundaries"],
     },
@@ -5869,6 +7489,12 @@ SHOWCASE_METADATA: dict[str, dict] = {
         "theme_category": ["location"],
     },
     "ETOPO 2022 Global Relief (60 arc-second)": {
+        "summary": (
+            "NOAA NCEI's ETOPO 2022 global relief model, combining land "
+            "topography and ocean bathymetry. A 60 arc-second grid (about "
+            "1.85 km at the equator) of 21,600 x 10,800 cells in WGS 84, with "
+            "one float32 band of elevation in metres."
+        ),
         "license": "US public domain (NOAA NCEI)",
         "keywords": ["bathymetry", "relief", "etopo", "global", "elevation"],
         "source_organization": "NOAA NCEI",
@@ -5912,6 +7538,7 @@ SHOWCASE_METADATA_BY_PREFIX: dict[str, dict] = {
         # satellite constellation continues to collect new scenes.
         "update_frequency": "notPlanned",
         "theme_category": ["imageryBaseMapsEarthCover"],
+        "from_title": _sentinel2_scene_fields,
     },
 }
 
@@ -5946,7 +7573,7 @@ def _metadata_spec(title: str) -> dict | None:
 def enrich_showcase_metadata(api: "Api") -> list[str]:
     """Backfill the catalog metadata the ingest flow does not set.
 
-    License and keywords (fix(#614)), plus the provenance fields that make a
+    License and keywords, plus the provenance fields that make a
     dataset legible in the catalog and exportable through DCAT/ISO:
     source_organization, source_url, update_frequency, the data vintage and the
     ISO theme categories. See SHOWCASE_METADATA for what each one means and why
@@ -5981,6 +7608,8 @@ def enrich_showcase_metadata(api: "Api") -> list[str]:
             fields = {k: spec[k] for k in _ENRICH_PATCH_FIELDS if k in spec}
             if spec.get("summary"):
                 fields["summary"] = spec["summary"]
+            if spec.get("from_title"):
+                fields.update(spec["from_title"](title))
             # Claims that are only true once the data really came from a given
             # origin are written only when the dataset OBSERVABLY has it. This
             # pass runs whether or not the builder that was supposed to make it
@@ -6278,8 +7907,10 @@ def _basin_context_layer_body(regions_ds: str) -> dict:
         "dataset_id": regions_ds,
         "sort_order": 2,
         "opacity": 1.0,
-        "display_name": "Atlantic basin regions (context)",
-        "show_in_legend": False,
+        "display_name": (
+            "Atlantic basin regions (hatched where no major storm passed within 100 km)"
+        ),
+        "show_in_legend": True,
         "paint": {
             "fill-pattern": "geolens-fill-hatch",
             "fill-color": "#64748b",
@@ -6535,6 +8166,8 @@ def run_maintenance_mode(api: Api, args) -> int | None:
         return refresh_hurdat2(api)
     if args.prune_userdata:
         return prune_userdata(api, execute=args.execute)
+    if args.story_and_dashboard:
+        return run_story_and_dashboard(api)
     return None
 
 
@@ -6545,7 +8178,7 @@ def _builder_outcome_line(bname: str, result: str | None) -> str | None:
     main() so the wording is testable and so the pinned case cannot drift back
     to the generic line, which tells the operator to do the one thing that
     would break the examples: "use --force to recreate" is exactly what --force
-    declines to do to a pinned map (fix(#1607 review r2)).
+    declines to do to a pinned map.
 
     A falsy result keeps the generic line it has always had - a builder that
     returned nothing built nothing.
@@ -6556,6 +8189,8 @@ def _builder_outcome_line(bname: str, result: str | None) -> str | None:
             "--force left its id and share links alone; --force-pinned builds "
             "a fresh row beside it"
         )
+    if result and result.startswith("(missing: "):
+        return f"  {bname}: skipped, not built yet: {result[10:-1]}"
     if not result or result == "(skipped)":
         return f"  {bname}: already exists, skipped (use --force to recreate)"
     return None
@@ -6819,6 +8454,11 @@ def main() -> int:
             "sentinel2",
             "collections",
             "embed",
+            "story",
+            "dashboard",
+            "skyline-dashboard",
+            "skyline-story",
+            "nyc-story",
         ],
         help="build only one showcase item",
     )
@@ -6865,6 +8505,13 @@ def main() -> int:
         "exit. DRY RUN unless --execute is also passed",
     )
     ap.add_argument(
+        "--story-and-dashboard",
+        action="store_true",
+        help="seed (or update in place) the hurricane and skyline stories and "
+        "the earthquake and skyline dashboard maps on an instance that already has the showcase maps, then "
+        "exit. A full seed does this too",
+    )
+    ap.add_argument(
         "--execute",
         action="store_true",
         help="with --prune-userdata, actually perform the deletions",
@@ -6898,11 +8545,20 @@ def main() -> int:
         or args.prune_userdata
         or args.refresh_quakes
         or args.refresh_hurdat2
-        or args.only == "embed"
+        or args.story_and_dashboard
+        or args.only
+        in (
+            "embed",
+            "story",
+            "dashboard",
+            "skyline-dashboard",
+            "skyline-story",
+            "nyc-story",
+        )
     ):
         ap.error(
-            "--expected-state cannot be combined with force, prune, refresh or "
-            "embed runs"
+            "--expected-state cannot be combined with force, prune, refresh, "
+            "story, dashboard or embed runs"
         )
 
     print(f"Logging in to {args.base_url} as {args.username}...")
@@ -6976,6 +8632,11 @@ def main() -> int:
         "sentinel2": build_sentinel2,
         "collections": build_collections,
         "embed": build_embed_demo,
+        "story": seed_hurricane_story,
+        "dashboard": seed_quake_dashboard,
+        "skyline-dashboard": seed_skyline_dashboard,
+        "skyline-story": seed_skyline_story,
+        "nyc-story": seed_nyc_story,
     }
 
     built = {}
@@ -7003,6 +8664,20 @@ def main() -> int:
                     ("tiles3d", fns["tiles3d"]),
                 ]
             )
+        # The stories read the hurricane and Manhattan maps, the dashboards the
+        # quake and building layers.
+        # A guarded update skips both: a new story and map are outside the
+        # snapshot, so a rollback could not withdraw them.
+        if not args.expected_state:
+            builders.extend(
+                [
+                    ("story", fns["story"]),
+                    ("dashboard", fns["dashboard"]),
+                    ("skyline-dashboard", fns["skyline-dashboard"]),
+                    ("skyline-story", fns["skyline-story"]),
+                    ("nyc-story", seed_nyc_story_if_ready),
+                ]
+            )
         # collections + embed LAST: they reference the datasets above.
         builders.append(("collections", fns["collections"]))
         # A guarded update skips it: a new embed map and token are outside the
@@ -7016,7 +8691,7 @@ def main() -> int:
         try:
             # Every builder takes the same (api, force, force_pinned) so the
             # pinned-map rule cannot be forgotten by a builder added later; the
-            # two with no map of their own ignore force_pinned (fix(#1607)).
+            # two with no map of their own ignore force_pinned.
             result = fn(api, force=args.force, force_pinned=args.force_pinned)
         except (httpx.HTTPError, RuntimeError, TimeoutError) as e:
             print(f"\nERROR in [{bname}]: {e}", file=sys.stderr)
@@ -7029,6 +8704,13 @@ def main() -> int:
             built[bname] = result
         else:
             print(outcome)
+
+    if not args.expected_state:
+        try:
+            set_attribute_titles(api)
+        except httpx.HTTPError as e:
+            print(f"\nERROR in [attribute titles]: {e}", file=sys.stderr)
+            failed["attribute titles"] = str(e)
 
     # Backfill license + keywords on whatever showcase datasets now exist (the
     # ingest flow leaves them "proprietary" with no keywords). Isolated per
@@ -7075,6 +8757,8 @@ def main() -> int:
         path = (
             "collections"
             if bname == "collections"
+            else "api/stories"
+            if bname in ("story", "skyline-story", "nyc-story")
             else "datasets"
             if bname in ("copc", "tiles3d")
             else "maps"

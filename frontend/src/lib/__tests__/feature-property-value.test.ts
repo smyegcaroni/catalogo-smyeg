@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatFeaturePropertyValue } from '../feature-property-value';
+import { formatFeaturePropertyValue, groupsDigits } from '../feature-property-value';
 
 describe('formatFeaturePropertyValue', () => {
   it('returns null for null/undefined so callers can render their own empty text', () => {
@@ -17,7 +17,7 @@ describe('formatFeaturePropertyValue', () => {
     expect(formatFeaturePropertyValue(1.23456789, 'en', 'True', 'False')).toBe('1.2346');
   });
 
-  it('fix(#1629 codex): a caller-supplied maxFractionDigits overrides the 4-digit default', () => {
+  it('a caller-supplied maxFractionDigits overrides the 4-digit default', () => {
     // The data panel renders raw feature coordinates and needs 5 digits;
     // the popup relies on the default. Both must be reachable through the
     // same shared function.
@@ -25,13 +25,25 @@ describe('formatFeaturePropertyValue', () => {
     expect(formatFeaturePropertyValue(1.234567, 'en', 'True', 'False')).toBe('1.2346');
   });
 
-  it('fix(#1627): renders a plain object as its JSON text, not [object Object]', () => {
+  it('drops digit grouping when the caller asks', () => {
+    expect(formatFeaturePropertyValue(1952, 'en', 'True', 'False', 4, false)).toBe('1952');
+    expect(formatFeaturePropertyValue(12345.5, 'de', 'True', 'False', 4, false)).toBe('12345,5');
+  });
+
+  it('groups digits for every role but identifiers and temporal fields', () => {
+    expect(groupsDigits('temporal')).toBe(false);
+    expect(groupsDigits('identifier')).toBe(false);
+    expect(groupsDigits('measure')).toBe(true);
+    expect(groupsDigits(undefined)).toBe(true);
+  });
+
+  it('renders a plain object as its JSON text, not [object Object]', () => {
     const result = formatFeaturePropertyValue({ a: 1, b: 'two' }, 'en', 'True', 'False');
     expect(result).toBe('{"a":1,"b":"two"}');
     expect(result).not.toContain('[object Object]');
   });
 
-  it('fix(#1627): renders a nested array as its JSON text', () => {
+  it('renders a nested array as its JSON text', () => {
     const result = formatFeaturePropertyValue([1, { x: 'y' }, [2, 3]], 'en', 'True', 'False');
     expect(result).toBe('[1,{"x":"y"},[2,3]]');
   });

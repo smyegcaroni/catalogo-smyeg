@@ -28,10 +28,10 @@ repos:
           bash -c '
           for f in "$@"; do
             if grep -qE "follow_redirects\s*=\s*True" "$f"; then
-              # fix(#430 BA-26): scope to the construction site. A raw httpx.AsyncClient(
+              # Scope to the construction site. A raw httpx.AsyncClient(
               # call with follow_redirects=True is the danger; callers using
-              # make_safe_client() never write httpx.AsyncClient( at all. The old
-              # file-wide "make_safe_client|security.py" substring let a mere
+              # make_safe_client() never write httpx.AsyncClient( at all. A
+              # file-wide "make_safe_client|security.py" substring would let a mere
               # docstring/comment mention grant a pass. The two legit raw-construction
               # sites are handled by exclude: below.
               if grep -qE "httpx\.AsyncClient\(" "$f"; then
@@ -63,17 +63,17 @@ repos:
           apply_visibility_filter. See AGENTS.md Security, Rule 1.
           This grep is the cheap commit-time layer only — it is file-scoped and
           only sees get_dataset( call sites. The authoritative per-handler check
-          is backend/tests/test_rule1_structural.py (fix(#822)), which walks the
+          is backend/tests/test_rule1_structural.py, which walks the
           FastAPI route table and covers db.get/select/service-layer fetch paths
           plus processing/ routes.
         language: system
         entry: >-
           bash -c '
           for f in "$@"; do
-            # fix(#430 BA-07): match ANY router var. The old alternation stac_|ogc_|layers_
-            # was each followed by "\." but the real vars are stac_router,
-            # ogc_features_router, layers_router, features_router, ... so only
-            # "@router." ever matched, letting features/router.py and
+            # Match ANY router var: the real vars are stac_router,
+            # ogc_features_router, layers_router, features_router, ..., so an
+            # alternation of stac_|ogc_|layers_ followed by "\." would only
+            # match "@router." and let features/router.py and
             # layers/router.py escape the hook entirely.
             if grep -qE "^@[A-Za-z_]*router\.(get|post|patch|delete|put)" "$f" \
               && grep -qE "get_dataset\(" "$f" \
@@ -87,28 +87,30 @@ repos:
         files: '^backend/app/(modules/catalog|standards)/.*\.py$'
 
       - id: no-unscoped-finding-markers
-        name: "AGENTS.md — remove unscoped finding tags from backend documentation"
+        name: "AGENTS.md — remove unscoped finding tags from comments and docstrings"
         description: >
           AGENTS.md ("Contracts and Comments") prefers plain explanations over
           finding tags and review history. Remove unnecessary tags; do not add
           anchors merely to pass this legacy guard. A retained reference must
           provide essential context and identify a public issue or PR.
 
-          This hook runs backend/tests/finding_markers.py over the whole of
-          backend/app. That detector parses each module, reads comments and
-          docstrings only (never code, so a string literal cannot trip it), and
+          This hook runs backend/tests/finding_markers.py. In backend/app and
+          in the other tracked Python it parses each module and reads comments
+          and docstrings only (never code, so a string literal cannot trip
+          it); in the other file types it reads each line's comment, wherever
+          it starts outside a quoted string. Tests, generated SDK code and
+          Markdown are not scanned. It
           reports a coded finding id (SEC-002, T-1214-17, PERF-N5) or a
-          denylisted agent tag with no #issue anchor within two lines. A
-          published-standard token (UTF-8, ISO-8601) is exempt by name, and
-          `# noqa` / `# codeql[...]` carry no marker shape at all.
-          The markers already on main are frozen per module in that file and
-          only go down; backend/tests/test_unscoped_finding_markers.py runs the
-          same check in CI and pins the detector's behaviour.
+          planning reference (Phase 1184, RESEARCH.md) with no #issue anchor
+          within two lines, and every agent tag and fix(#N)-style provenance
+          prefix. A published-standard token (UTF-8, ISO-8601, ADR-002) is
+          exempt by name, and `# noqa` / `# codeql[...]` carry no marker shape
+          at all. backend/tests/test_unscoped_finding_markers.py runs the same
+          check in CI and pins the detector's behaviour.
 
           The same run also scans backend/openapi.json's `description` strings
           (#1946): a string literal the walk above cannot see, but one that
-          still reaches the published API surface and the generated SDKs, so
-          it gets zero tolerance rather than a debt ledger.
+          still reaches the published API surface and the generated SDKs.
           backend/tests/test_openapi_finding_markers.py pins that half.
 
           Drop unnecessary tags and preserve the useful explanation. Anchored
@@ -117,27 +119,24 @@ repos:
         language: system
         entry: python3 backend/tests/finding_markers.py
         pass_filenames: false
-        files: '^backend/(app/.*\.py|openapi\.json|tests/(finding_markers|test_openapi_finding_markers)\.py)$'
 
       - id: no-agent-tag-markers
-        name: "AGENTS.md — remove unscoped agent tags"
+        name: "AGENTS.md — remove agent tags"
         description: >
-          The denylist half of the same rule, for the file types the AST
-          detector above does not parse (frontend/, e2e/, cli/, mcp/, plus
-          markdown/sql/yaml/json anywhere in the tree). A case-insensitive
-          literal grepped over the whole file rather than its comments — that
-          is all this hook checks and all it claims. A `ponytail:` tag is
-          legal only when the same line also carries a `fix(#<issue>)`
-          anchor; a bare tag fails everywhere. The general class is enforced
-          for backend/app, and only there, by no-unscoped-finding-markers.
+          The agent-tag half of the same rule, for the file types the detector
+          above does not read (tests, markdown and json anywhere in the tree)
+          as well as the ones it does. A case-insensitive literal grepped over
+          the whole file rather than its comments — that is all this hook
+          checks and all it claims. Any `ponytail:` tag fails; an issue anchor
+          does not make one acceptable.
         language: system
         entry: >-
           bash -c '
           rc=0;
           for f in "$@"; do
-            if grep -nFi "ponytail:" "$f" | grep -viE "fix\(#[0-9]+\)"; then
-              echo "FAIL: $f has an unscoped finding marker (see above).";
-              echo "  Remove the agent tag and keep the useful explanation.";
+            if grep -nFi "ponytail:" "$f"; then
+              echo "FAIL: $f has an agent tag (see above).";
+              echo "  Remove the tag and keep the useful explanation.";
               echo "  See AGENTS.md > Contracts and Comments.";
               rc=1;
             fi;
@@ -179,7 +178,7 @@ repos:
 
   # --- Generic hygiene + secret scanning ---
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       # Auto-fixers — generated/vendored trees excluded so they keep matching
       # their generators, and backend/licenses/ so verbatim third-party license

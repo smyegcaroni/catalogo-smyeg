@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { Map as MaplibreMap } from 'maplibre-gl';
+import { toFitBounds } from '@/lib/bbox';
 import { MAP_COLORS } from '@/lib/map-colors';
 
 const EPHEMERAL_LAYERS = [
@@ -10,8 +11,8 @@ const EPHEMERAL_LAYERS = [
 ] as const;
 const EPHEMERAL_SOURCE = 'ephemeral-result';
 
-/** feat(#675): the params needed to reconstruct a chat run_analysis preview in
- *  the Analysis panel, so "Save as dataset" can prefill it. */
+/** The params needed to reconstruct a chat run_analysis preview in the Analysis
+ *  panel, so "Save as dataset" can prefill it. */
 export interface EphemeralAnalysisHandoff {
   operation: 'buffer' | 'centroid';
   layerId: string;
@@ -24,33 +25,29 @@ export function useEphemeralLayers(
   const [ephemeralResult, setEphemeralResult] = useState<{
     geojson: GeoJSON.FeatureCollection;
     bbox: [number, number, number, number];
-    /** fix(#674 audit): set when the server capped the result, so the preview
-     *  surface can disclose "N of TOTAL" instead of passing a capped preview
-     *  off as the whole answer. fix(#1009): this hook feeds both surfaces —
-     *  the builder's stack row and the badge (viewer, and the builder's
-     *  <1100px rail) — so the field is deliberately surface-agnostic. */
+    /** Set when the server capped the result, so the preview surface can
+     *  disclose "N of TOTAL" instead of passing a capped preview off as the
+     *  whole answer. This hook feeds both the builder's stack row and the badge
+     *  (viewer, and the builder's <1100px rail), so the field is
+     *  surface-agnostic. */
     truncated?: boolean;
     totalCount?: number;
-    /** fix(#727): set when totalCount was computed against the map's
-     *  viewport rather than the whole dataset — so "N of TOTAL" can name the
-     *  previewed extent instead of implying TOTAL describes the same area
-     *  the source dataset does. Chat previews never set this: they send no
-     *  bbox, so their totalCount (when present) is always the whole-dataset
-     *  count, unchanged from before this field existed. */
+    /** Set when totalCount was computed against the map's viewport rather than
+     *  the whole dataset, so "N of TOTAL" can name the previewed extent. Chat
+     *  previews never set it: they send no bbox, so their totalCount (when
+     *  present) is the whole-dataset count. */
     viewportScoped?: boolean;
-    /** feat(#675): present when the overlay came from a chat run_analysis
-     *  preview the builder can hand off to the Analysis panel. */
+    /** Present when the overlay came from a chat run_analysis preview the
+     *  builder can hand off to the Analysis panel. */
     analysis?: EphemeralAnalysisHandoff;
-    /** feat(#1241): the chat prompt that produced this preview. The builder
-     *  uses it to suggest a title when the preview is saved as a dataset —
-     *  the same "a handoff lands on the save form with a title already in it"
-     *  pattern AnalysisPanel's prefill uses. Absent for Analysis-panel
-     *  previews (they carry `analysis` instead) and for the cold-load
-     *  handoff, which stashes geometry only. */
+    /** The chat prompt that produced this preview, used to suggest a title when
+     *  the preview is saved as a dataset (as AnalysisPanel's prefill does).
+     *  Absent for Analysis-panel previews (they carry `analysis`) and for the
+     *  cold-load handoff, which stashes geometry only. */
     prompt?: string;
-    /** fix(#793 review): stamped by the Analysis panel's own previews so
-     *  its stale-restore cleanup can tell them from a chat result sharing
-     *  this slot — it must never clear an overlay someone else drew. */
+    /** Stamped by the Analysis panel's own previews so its stale-restore cleanup
+     *  can tell them from a chat result sharing this slot; it must never clear
+     *  an overlay someone else drew. */
     source?: 'analysis-panel';
   } | null>(null);
 
@@ -79,14 +76,12 @@ export function useEphemeralLayers(
       }
       if (map.getSource(EPHEMERAL_SOURCE)) map.removeSource(EPHEMERAL_SOURCE);
 
-      // fix(#1472 review): deliberately carries no `attribution`, unlike every
-      // other dataset-backed source in the builder. This renders the OUTPUT of
-      // a spatial operation, not a dataset — the geometry is computed, the
-      // result is transient (cleared on the next run and never persisted or
-      // exported), and the hook receives only the result GeoJSON, with no
-      // handle on which input datasets produced it. Crediting derived analysis
-      // output is a real question, but it belongs with the analysis feature
-      // that knows its inputs, not here.
+      // Deliberately no `attribution`, unlike other dataset-backed sources in the
+      // builder: this renders the output of a spatial operation, not a dataset.
+      // The geometry is computed, transient (cleared on the next run, never
+      // persisted or exported), and the hook receives only the result GeoJSON
+      // with no handle on the input datasets. Crediting derived output belongs
+      // with the analysis feature that knows its inputs.
       map.addSource(EPHEMERAL_SOURCE, {
         type: 'geojson',
         data: ephemeralResult.geojson,
@@ -135,35 +130,30 @@ export function useEphemeralLayers(
 
     }
 
-    // fix(#394) LM-02/B-028: zoom only on the FIRST add for this result — the
-    // persistent style.load re-adds below must not re-fit the viewport on
-    // every basemap switch.
+    // Zoom only on the first add for this result; the persistent style.load
+    // re-adds below must not re-fit the viewport on every basemap switch.
     let zoomed = false;
     function addLayersAndMaybeZoom() {
       if (!map || !ephemeralResult) return;
       addLayers();
       if (!zoomed) {
         zoomed = true;
-        const [west, south, east, north] = ephemeralResult.bbox;
-        map.fitBounds([[west, south], [east, north]], { padding: 40, maxZoom: 18 });
+        map.fitBounds(toFitBounds(ephemeralResult.bbox), { padding: 40, maxZoom: 18 });
       }
     }
 
     if (map.isStyleLoaded()) {
       addLayersAndMaybeZoom();
     } else {
-      // fix(#533 follow-up): on the ?chat_result=1 cold-load pickup the
-      // dataset-layer sync leaves the style transiently not-loaded while the
-      // initial `style.load` has ALREADY fired, so the subscription below
-      // never fires and the overlay is silently dropped (badge shows, map
-      // stays at world view). One-shot `idle` retries once the map settles —
-      // same idiom as BuilderMap's SP-03 layer-sync gate.
+      // On the ?chat_result=1 cold-load pickup the dataset-layer sync leaves the
+      // style transiently not-loaded after the initial `style.load` has already
+      // fired, so the subscription below never fires and the overlay would be
+      // dropped (badge shows, map at world view). A one-shot `idle` retries once
+      // the map settles, as BuilderMap's layer-sync gate does.
       map.once('idle', addLayersAndMaybeZoom);
     }
-    // fix(#394) LM-02/B-028: subscribe for the LIFETIME of the result — a
-    // basemap/style reload wipes the overlay from the map while the result
-    // badge stays, with no re-show path. The previous `once` only covered the
-    // initial not-yet-loaded case.
+    // Subscribe for the lifetime of the result: a basemap/style reload wipes the
+    // overlay while the result badge stays, with no re-show path.
     map.on('style.load', addLayersAndMaybeZoom);
 
     return () => {

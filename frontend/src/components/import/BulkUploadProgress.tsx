@@ -47,8 +47,8 @@ export function BulkUploadProgress({ entries }: BulkUploadProgressProps) {
                 <span className="font-mono font-normal text-muted-foreground">{ext}</span>
               </div>
               {pct != null && (
-                /* fix(#438): A11Y-01 — was a visual-only div; expose progress
-                   semantics so assistive tech can announce it. */
+                /* Expose progress semantics so assistive tech can announce
+                   it. */
                 <div
                   className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-surface-2"
                   role="progressbar"
@@ -64,7 +64,7 @@ export function BulkUploadProgress({ entries }: BulkUploadProgressProps) {
                 </div>
               )}
               {entry.status === 'upload-failed' && entry.error && (
-                <p className="mt-0.5 text-xs text-destructive">{entry.error}</p>
+                <p role="alert" className="mt-0.5 text-xs text-destructive">{entry.error}</p>
               )}
             </div>
             <div className="flex items-center gap-2">

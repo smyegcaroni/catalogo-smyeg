@@ -1,4 +1,4 @@
-"""Regression tests for SEC-014: embed-token positive-cache expiry re-check.
+"""Regression tests: embed-token positive-cache expiry re-check.
 
 Without the fix, a token whose expires_at has passed is still allowed on
 cache-hit because the cached dict does not include expires_at and the
@@ -13,8 +13,19 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
 from app.modules.embed_tokens.service import validate_embed_token_access
+
+
+@pytest.fixture(autouse=True)
+def _minter_reads_every_dataset(monkeypatch):
+    async def _readable(db, dataset_ids, user_id):
+        return set(dataset_ids)
+
+    monkeypatch.setattr(
+        "app.modules.embed_tokens.service.datasets_account_can_read", _readable
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -22,10 +33,10 @@ from app.modules.embed_tokens.service import validate_embed_token_access
 # ---------------------------------------------------------------------------
 
 
-# fix(#1778 codex r3): validate_embed_token_access now compares each positive
+# validate_embed_token_access compares each positive
 # entry's generation stamp against the cluster-global revocation generation, and
 # an entry that carries no stamp (or a stale one) is treated as a miss. These
-# cases are about the SEC-014 expiry re-check, so they pin the generation and
+# cases are about the expiry re-check, so they pin the generation and
 # stamp the entries they prime with it.
 _TEST_GENERATION = 11
 
@@ -57,14 +68,14 @@ class FakeCache:
     async def set_if_absent(
         self, key: str, value, ttl: int = 300, *, security: bool = False
     ) -> bool:
-        """fix(#1778): mirrors the provider contract: never overwrite."""
+        """Mirrors the provider contract: never overwrite."""
         if key in self._store:
             return False
         self._store[key] = value
         return True
 
     async def set_authoritative(self, key: str, value, ttl: int = 300) -> None:
-        """fix(#1778 codex r1): one store here, so this is set."""
+        """One store here, so this is set."""
         self._store[key] = value
 
     async def delete(self, key: str) -> None:
@@ -82,12 +93,12 @@ class FakeCache:
 
 
 # ---------------------------------------------------------------------------
-# SEC-014 regression: expired token denied even on cache hit
+# Regression: expired token denied even on cache hit
 # ---------------------------------------------------------------------------
 
 
 class TestEmbedTokenExpiryCacheHit:
-    """SEC-014: expired token must be denied on the positive-cache-hit path."""
+    """Expired token must be denied on the positive-cache-hit path."""
 
     async def _run(
         self,
@@ -112,6 +123,7 @@ class TestEmbedTokenExpiryCacheHit:
             "scoped_dataset_ids": [str(dataset_id)],
             "allowed_origins": None,
             "map_id": str(uuid.uuid4()),
+            "created_by": "00000000-0000-0000-0000-000000000003",
             "generation": _TEST_GENERATION,
         }
 
@@ -160,6 +172,7 @@ class TestEmbedTokenExpiryCacheHit:
             "scoped_dataset_ids": [str(dataset_id)],
             "allowed_origins": None,
             "map_id": str(uuid.uuid4()),
+            "created_by": "00000000-0000-0000-0000-000000000003",
             "expires_at": expires_at.isoformat(),
             "generation": _TEST_GENERATION,
         }
@@ -206,6 +219,7 @@ class TestEmbedTokenExpiryCacheHit:
             "scoped_dataset_ids": [str(dataset_id)],
             "allowed_origins": None,
             "map_id": str(uuid.uuid4()),
+            "created_by": "00000000-0000-0000-0000-000000000003",
             "expires_at": expires_at.isoformat(),
             "generation": _TEST_GENERATION,
         }
@@ -217,7 +231,7 @@ class TestEmbedTokenExpiryCacheHit:
                 AsyncMock(return_value=_TEST_GENERATION),
             ),
             patch(
-                "app.modules.embed_tokens.service.map_contains_dataset",
+                "app.modules.embed_tokens.service.map_embeds_dataset",
                 new=AsyncMock(return_value=True),
             ) as membership,
             patch(
@@ -235,13 +249,13 @@ class TestEmbedTokenExpiryCacheHit:
 
 
 # ---------------------------------------------------------------------------
-# SEC-014: end-to-end service flow — cache miss populates expires_at, then
+# End-to-end service flow — cache miss populates expires_at, then
 # second call (cache hit) still enforces expiry after time advances.
 # ---------------------------------------------------------------------------
 
 
 class TestEmbedTokenExpiryEndToEnd:
-    """SEC-014 end-to-end: verify the full cache-miss→prime→hit cycle."""
+    """End-to-end: verify the full cache-miss→prime→hit cycle."""
 
     async def test_cache_miss_then_expired_hit_denied(self):
         """
@@ -261,6 +275,7 @@ class TestEmbedTokenExpiryEndToEnd:
         mock_token.allowed_origins = None
         mock_token.scoped_dataset_ids = [str(dataset_id)]
         mock_token.map_id = uuid.uuid4()
+        mock_token.created_by = uuid.uuid4()
         mock_token.id = uuid.uuid4()
         mock_token.expires_at = expires_at
 
@@ -332,6 +347,7 @@ class TestEmbedTokenExpiryEndToEnd:
         mock_token.allowed_origins = None
         mock_token.scoped_dataset_ids = [str(dataset_id)]
         mock_token.map_id = uuid.uuid4()
+        mock_token.created_by = uuid.uuid4()
         mock_token.id = uuid.uuid4()
         mock_token.expires_at = expires_at
 

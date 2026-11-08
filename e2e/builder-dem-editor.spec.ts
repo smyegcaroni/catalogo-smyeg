@@ -2,12 +2,12 @@ import { expect, test, type APIRequestContext, type Page } from './helpers/sessi
 import { deleteDataset, seedDemDataset, getAuthToken } from './helpers/catalog';
 
 /**
- * fix(#451): E2E coverage for the composable two-switch DEM editor.
+ * E2E coverage for the composable two-switch DEM editor.
  *
  * Seeds a real single-band Float32 GeoTIFF (ingested as a DEM), builds a map
  * around it, and drives the builder UI through the states the composable model
  * introduced: Hillshade shading and "Use as 3D terrain" as independent
- * switches, the "Not shown" badge when both are off, and the HT-14 guarantee
+ * switches, the "Not shown" badge when both are off, and the guarantee
  * that an eye-toggle + Save touches ONLY the layer's `visible` flag.
  */
 

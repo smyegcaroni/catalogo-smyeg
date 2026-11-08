@@ -7,34 +7,28 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=scripts/lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-# fix(#1778): read only the four values this script needs from .env with
-# get_env_value's awk parser, not by shell-sourcing the file. Compose's own
-# `.env` parser and `sh` disagree about the same file: install.sh writes
-# values verbatim (an operator-typed admin password can legally contain a
-# space), and `.` executes the rest of such a line as a command. Under
-# `set -e` that is a 127 exit before this disaster-recovery entry point has
-# validated anything; a value containing backticks or $(...) is executed
-# with the operator's privileges. Sourcing also pulled in every OTHER secret
-# in the file as a side effect, when only these four are ever read below.
+# Read only the four values this script needs from .env with get_env_value's
+# awk parser, not by shell-sourcing the file. Compose's own `.env` parser and
+# `sh` disagree about the same file: install.sh writes values verbatim (an
+# operator-typed admin password can legally contain a space), and `.` executes
+# the rest of such a line as a command. Under `set -e` that is a 127 exit
+# before this disaster-recovery entry point has validated anything; a value
+# containing backticks or $(...) is executed with the operator's privileges.
+# Sourcing would also pull in every other secret in the file when only these
+# four are read.
 #
-# fix(#1778 review round 6, P2): assign to each target ONLY when
-# get_env_value reports the key is actually present in .env (exit 0) — a
-# setting Compose supports supplying purely through the process environment
-# (`POSTGRES_DB=production scripts/restore.sh ...`, deliberately omitted
-# from .env) used to be overwritten with an empty string the instant the
-# key was simply absent, since get_env_value's old "" exit-0 result for
-# "missing" was indistinguishable from "present but empty". The `if` guard
-# is exempt from `set -e`, and assigning the real target only inside it
-# (never on the failure path) is what actually preserves the inherited
-# value.
+# Assign to each target only when get_env_value reports the key is present in
+# .env (exit 0). A setting supplied purely through the process environment
+# (`POSTGRES_DB=production scripts/restore.sh ...`, omitted from .env) must
+# not be overwritten with an empty string; get_env_value returns 1 for
+# "missing", distinct from "present but empty". The `if` guard is exempt from
+# `set -e`, and assigning the real target only inside it preserves the
+# inherited value.
 #
-# fix(#1798 review round 15, P2, review 5104520795): assigns straight into
-# each target via env_value_into instead of `_v="$(get_env_value ...)"` —
-# plain command substitution strips a trailing newline regardless of
-# anything get_env_value itself preserves (a decoded POSTGRES_DB with a
-# trailing \n escape would lose that trailing byte at THIS assignment,
-# one layer outside get_env_value's own control, even though
-# get_env_value's own return value is correct since round 13).
+# Assign straight into each target via env_value_into rather than
+# `_v="$(get_env_value ...)"`: command substitution strips a trailing newline,
+# so a decoded POSTGRES_DB with a trailing \n escape would lose that byte at
+# the assignment.
 if [ -f "$PROJECT_ROOT/.env" ]; then
     env_value_into COMPOSE_FILE COMPOSE_FILE "$PROJECT_ROOT/.env" || true
     env_value_into POSTGRES_USER POSTGRES_USER "$PROJECT_ROOT/.env" || true
@@ -42,14 +36,11 @@ if [ -f "$PROJECT_ROOT/.env" ]; then
     env_value_into GEOLENS_RUNTIME_DB_ROLE GEOLENS_RUNTIME_DB_ROLE "$PROJECT_ROOT/.env" || true
 fi
 
-# fix(#1798 review round 16, P2, review 5104847831): calls the shared
-# compose() wrapper (scripts/lib/common.sh) instead of this script's own
-# local COMPOSE=(...) array -- that array already built an absolute -f
-# path, but nothing told Compose the project directory explicitly for its
-# OWN .env-driven controls (COMPOSE_PROJECT_NAME, COMPOSE_PROFILES); see
-# common.sh's own doc comment on compose() for the full reasoning and what
-# was verified against the oracle. PROJECT_ROOT (set above, before
-# common.sh was sourced) is what the wrapper uses.
+# Use the shared compose() wrapper (scripts/lib/common.sh) rather than a local
+# COMPOSE=(...) array: Compose also needs the project directory for its own
+# .env-driven controls (COMPOSE_PROJECT_NAME, COMPOSE_PROFILES); see compose()
+# in common.sh. PROJECT_ROOT, set above before common.sh was sourced, is what
+# the wrapper uses.
 
 # Argument validation
 if [ $# -ne 1 ]; then
@@ -65,18 +56,17 @@ if [ ! -f "$BACKUP_FILE" ]; then
 fi
 
 # Validate backup integrity before restore
-# chore(#704): read stdin by OMITTING the filename — the literal "-" alias was
-# never documented for pg_restore and PG 18 rejects it as a filename.
+# Read stdin by omitting the filename: the literal "-" alias is not documented
+# for pg_restore and PG 18 rejects it as a filename.
 #
-# `-f /dev/null`, NOT `--list`: the -Fc table of contents sits at the front of
-# the archive, so `--list` reports a truncated dump as valid (measured: a
-# 60%-truncated dump passes `--list`). That matters more here than anywhere
-# else — the restore below runs `--clean --if-exists`, which DROPS the existing
-# objects first. Passing a short dump through this gate means dropping a live
-# database and then failing partway through repopulating it. `-f /dev/null`
-# forces every data block to be read and decompressed. It costs one extra
-# stream of the dump into the container (~0.1s per 20 MB of archive), which is
-# cheap next to what it prevents.
+# Use `-f /dev/null`, not `--list`: the -Fc table of contents sits at the
+# front of the archive, so `--list` reports a truncated dump as valid (a
+# 60%-truncated dump passes). That matters most here because the restore below
+# runs `--clean --if-exists`, which drops the existing objects first; a short
+# dump passing this gate would drop a live database and then fail partway
+# through repopulating it. `-f /dev/null` forces every data block to be read
+# and decompressed, at the cost of one extra stream of the dump into the
+# container (~0.1s per 20 MB).
 echo "Validating backup integrity..."
 if ! compose exec -T db \
     pg_restore -f /dev/null < "$BACKUP_FILE" > /dev/null 2>&1; then
@@ -92,39 +82,33 @@ echo ""
 POSTGRES_USER="${POSTGRES_USER:-geolens}"
 POSTGRES_DB="${POSTGRES_DB:-geolens}"
 
-# Sibling-artifact lookup. Both the object-storage archive and the globals dump
-# are written by backup-entrypoint.sh next to the dump with the SAME timestamp,
-# so one parse serves both (the staging block near the end of this script reuses
-# these). dump name is <db>_<YYYYmmdd_HHMMSS>.dump.
+# Sibling-artifact lookup. Both the object-storage archive and the globals
+# dump are written by backup-entrypoint.sh next to the dump with the same
+# timestamp, so one parse serves both (the staging block near the end of this
+# script reuses it). The dump name is <db>_<YYYYmmdd_HHMMSS>.dump.
 _dump_dir="$(cd "$(dirname "$BACKUP_FILE")" && pwd)"
 _dump_base="$(basename "$BACKUP_FILE")"
-# Anchored at the END of the name. The old leftmost `grep -oE ... | head -n1`
-# matched inside $POSTGRES_DB whenever the database name carried its own
-# 8-digit_6-digit run, silently sending every sibling lookup down the
-# unpaired-fallback path.
+# Anchored at the end of the name: a leftmost `grep -oE ... | head -n1` would
+# match inside $POSTGRES_DB whenever the database name carried its own
+# 8-digit_6-digit run, sending every sibling lookup down the unpaired-fallback
+# path.
 #
-# fix(#1778 round 19, P2 class): was `printf '%s' "$_dump_base" | sed -nE
-# '...p'`. `_dump_base` is `basename "$BACKUP_FILE"`, and the dump side of
-# that name is `${POSTGRES_DB}_<timestamp>.dump` — a POSTGRES_DB carrying an
-# embedded newline puts one inside `_dump_base` intact (basename does not
-# reject or strip it, and `$(...)` only strips a TRAILING newline, never an
-# internal one). sed then reads `_dump_base` as multiple lines and, with
-# `-n '...p'`, can print more than one match, so `$_ts` stops being a single
-# timestamp. The paired-artifact lookups just below (`${_dump_dir}/globals-
-# ${_ts}.sql`, and further down `${_dump_dir}/staging-${_ts}.tar.gz`) then
-# look for a path that does not exist and silently fall back to "unpaired"
-# — the same failure mode this comment already describes for the
-# grep-inside-POSTGRES_DB case, reached a different way. `[[ str =~ regex ]]`
-# matches the whole string in one shot, so an embedded newline can only make
-# the anchored pattern fail to match at all (same as any other name this
-# script cannot parse), never yield a second match.
+# The match is bash `=~`, not `printf '%s' "$_dump_base" | sed -nE '...p'`.
+# `_dump_base` is `basename "$BACKUP_FILE"`, and a POSTGRES_DB with an
+# embedded newline puts one inside it intact (basename does not strip it, and
+# `$(...)` only strips a trailing newline). sed would read it as multiple
+# lines and could print more than one match, so `$_ts` would stop being a
+# single timestamp and the paired-artifact lookups below would silently fall
+# back to "unpaired". `[[ str =~ regex ]]` matches the whole string in one
+# shot, so an embedded newline can only make the anchored pattern fail (as
+# with any other name this script cannot parse), never yield a second match.
 if [[ "$_dump_base" =~ ^.*_([0-9]{8}_[0-9]{6})(\..*)?$ ]]; then
     _ts="${BASH_REMATCH[1]}"
 else
     _ts=""
 fi
 
-# fix(#995): roles are cluster objects and travel in globals-<ts>.sql, never in
+# Roles are cluster objects and travel in globals-<ts>.sql, never in
 # the dump. Report BEFORE the destructive --clean rather than after: replaying
 # globals is a pre-restore step, and on a fresh cluster a restore that runs
 # without it lands every object owned by the restoring user with no tenant
@@ -151,7 +135,7 @@ if [ -n "$_globals_dump" ]; then
             echo "           ${_missing_roles}"
             echo "         Replay them BEFORE continuing, or restored objects will carry"
             echo "         neither their owners nor their grants (RUNBOOK.md"
-            echo "         §\"Multi-tenant role reconstruction after a fresh-cluster restore\"):"
+            echo "         §\"Role reconstruction after a fresh-cluster restore\"):"
             echo ""
             echo "           docker compose exec -T db psql -U \"\$POSTGRES_USER\" -d postgres \\"
             echo "             < ${_globals_dump}"
@@ -189,12 +173,10 @@ compose stop api worker 2>/dev/null || true
 # and partly repopulated, and their boot-time migrations would run against it.
 RESTORE_SUCCEEDED=0
 _cleanup() {
-    # fix(#1778 round 20, P1 class): `trap` holds only ONE handler per
-    # signal — this trap (set below) REPLACES common.sh's own EXIT trap
-    # (which would otherwise clean up its env-snapshot directory, see
-    # scripts/lib/common.sh's own comment near the top of that file), so
-    # this cleanup takes over that job too rather than leaking the
-    # directory for the rest of this process's run.
+    # `trap` holds one handler per signal, so this trap (set below)
+    # replaces common.sh's EXIT trap, which cleans up its env-snapshot
+    # directory (see the top of common.sh). This cleanup takes over that
+    # job too rather than leaking the directory.
     _env_snapshot_cleanup 2>/dev/null || true
     echo ""
     if [ "$RESTORE_SUCCEEDED" = "1" ]; then
@@ -266,7 +248,7 @@ if [ -n "${GEOLENS_RUNTIME_DB_ROLE:-}" ]; then
     echo "${GEOLENS_RUNTIME_DB_ROLE} least-privilege attributes verified."
 fi
 
-# fix(#1778): the mandatory reconciliation step (RUNBOOK.md: "start runtime
+# The mandatory reconciliation step (RUNBOOK.md: "start runtime
 # services only after that command succeeds") has now run and every grant it
 # makes has been verified — restarting api/worker on exit is safe from here.
 RESTORE_SUCCEEDED=1
@@ -282,15 +264,15 @@ compose exec -T db \
 echo ""
 echo "Restore complete."
 
-# BKP-01 (Phase 1219): object-storage (upload_staging) is backed up as a
-# sibling staging-<timestamp>.tar.gz next to the dump. restore.sh keeps its
+# Object-storage (upload_staging) is backed up as a sibling
+# staging-<timestamp>.tar.gz next to the dump. restore.sh keeps its
 # single-arg, DB-focused contract; restoring objects into the upload_staging
 # volume requires a one-off container with that volume mounted, so it is a
-# documented MANUAL step (see RUNBOOK.md §"full restore (DB + object storage)").
-# If we can spot
-# the matching archive, point the operator at it rather than silently dropping
-# the staged objects.
-# _dump_dir / _ts are parsed once before the restore (see the globals block).
+# documented manual step (RUNBOOK.md
+# §"Step-by-step: full restore (DB + object storage)"). If the matching archive
+# is found, point the operator at it rather than silently dropping the staged
+# objects. _dump_dir / _ts are parsed once before the restore (see the globals
+# block).
 _staging_archive=""
 _staging_match="exact"
 if [ -n "$_ts" ] && [ -f "${_dump_dir}/staging-${_ts}.tar.gz" ]; then
@@ -311,7 +293,7 @@ if [ -n "$_staging_archive" ]; then
     echo "        ${_staging_archive}"
     echo "      The database is restored, but staged source objects are NOT"
     echo "      auto-extracted. To restore them into the upload_staging volume, run"
-    echo "      the documented manual step (RUNBOOK.md §\"full restore (DB + object storage)\"):"
+    echo "      the documented manual step (RUNBOOK.md §\"Step-by-step: full restore (DB + object storage)\"):"
     echo ""
     echo "        docker run --rm \\"
     echo "          -v <project>_upload_staging:/staging \\"
@@ -321,9 +303,7 @@ if [ -n "$_staging_archive" ]; then
 fi
 # _cleanup trap restarts api/worker on exit (runs here too — normal exit).
 
-# ==============================================================================
-# WAL Archiving (Optional PITR Upgrade)
-# ==============================================================================
+# WAL archiving (optional PITR upgrade)
 #
 # For point-in-time recovery (PITR), WAL archiving enables restoring the
 # database to any moment between backups. This is NOT configured by default.
@@ -348,6 +328,5 @@ fi
 #   pg_wal fills the filesystem and the database stops accepting writes.
 #   Monitor archiver health before enabling this. See RUNBOOK.md section 3.
 #
-# chore(#704): docs pinned to the bundled major — move with db/Dockerfile.
+# Docs pinned to the bundled major; move with db/Dockerfile.
 # See: https://www.postgresql.org/docs/18/continuous-archiving.html
-# ==============================================================================

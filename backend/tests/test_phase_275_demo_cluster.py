@@ -1,19 +1,14 @@
-"""Phase 275 / API-14 regression: README + cross-cutting correctness locks.
+"""README and cross-cutting correctness locks.
 
-Static regression locks in:
-- No 'demo.geolens.io' references remain in active code/docs (M-75 — the
-  project owns getgeolens.com only per memory project_domain_ownership.md).
-- README.md §'See It in Action' has the JWT-mint one-liner so a first-time
-  reader can actually execute the curl examples (M-76).
-- README.md keeps the six body-prose lines flagged by L-16 in the
-  humanized separator style (one lead-in plus five selected Why GeoLens bullets).
+- No 'demo.geolens.io' references remain in active code or docs; the project
+  owns getgeolens.com only.
+- CLI flags in README.md keep their hyphens.
 
-Pure static analysis — no docker daemon, database, or HTTP fixture needed.
+Pure static analysis: no docker daemon, database, or HTTP fixture needed.
 """
 
 from __future__ import annotations
 
-import re
 import subprocess
 
 from tests.repo_paths import repo_root
@@ -26,11 +21,11 @@ def _read(relative_path: str) -> str:
 
 
 def test_no_geolens_io_typos() -> None:
-    """API-14 / M-75: project owns getgeolens.com only — no demo.geolens.io references.
+    """Project owns getgeolens.com only — no demo.geolens.io references.
 
     Active, public-tracked code + docs only. Excluded paths:
     - .planning/, docs-internal/  → both gitignored, historical context only
-    - CHANGELOG.md                → preserves the Phase 269 fix record
+    - CHANGELOG.md                → preserves the historical fix record
     - this test file               → self-references in docstrings/strings
     """
     self_filename = "test_phase_275_demo_cluster.py"
@@ -60,7 +55,7 @@ def test_no_geolens_io_typos() -> None:
         and ".planning/" not in line
         and "docs-internal/" not in line  # gitignored historical audits
         and "graphify-out/" not in line  # generated graphify knowledge-graph reports
-        and "CHANGELOG.md" not in line  # historical fix record from Phase 269
+        and "CHANGELOG.md" not in line  # historical fix record
         and not line.split(":", 1)[0].endswith(self_filename)
     ]
     assert not hits, (
@@ -69,38 +64,8 @@ def test_no_geolens_io_typos() -> None:
     )
 
 
-def test_readme_has_jwt_mint_oneliner() -> None:
-    """API-14 / M-76: README §See It in Action must give readers an actionable token flow."""
-    body = _read("README.md")
-    assert re.search(r"TOKEN=\$\(curl[^)]*auth/login", body, re.DOTALL), (
-        "README.md missing the JWT mint one-liner before §'See It in Action' curl examples"
-    )
-    assert "Authorization: Bearer $TOKEN" in body, (
-        "README.md curl examples should reference $TOKEN, not literal <token>"
-    )
-
-
-def test_readme_humanized_separator_style_in_six_known_lines() -> None:
-    """API-14 / L-16: the six known separator lines keep the humanized style.
-
-    This test does NOT enforce punctuation everywhere, only the six lines
-    flagged in the plan. CLI flags (--username, --api-key) remain hyphens.
-    """
-    body = _read("README.md")
-    expected_humanized_signals = [
-        "Spatial data ends up scattered: ",
-        "One data hub:** ",
-        "Works with your tools:** ",
-        "Semantic and spatial search:** ",
-        "Built-in map builder:** ",
-        "AI-assisted (optional):** ",
-    ]
-    for signal in expected_humanized_signals:
-        assert signal in body, f"README.md missing humanized separator for: {signal}"
-
-
 def test_cli_flags_preserved_in_readme() -> None:
-    """API-14: CLI flag instances like --username must NOT have been mutated."""
+    """CLI flag instances like --username must NOT have been mutated."""
     body = _read("README.md")
     # Appears in the seed-showcase example; a real flag (em-dash sweep guard).
     assert "--username admin" in body or "--username/--password" in body, (

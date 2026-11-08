@@ -31,6 +31,7 @@ export function AppFooter({
     { href: GEOLENS_DISCUSSIONS_URL, label: t('footer.community') },
     { href: GEOLENS_API_DOCS_URL, label: t('footer.api') },
     { href: GEOLENS_LICENSE_URL, label: t('footer.license') },
+    { href: '/third-party-licenses.txt', label: t('footer.thirdPartyLicenses') },
   ];
 
   return (
@@ -39,7 +40,7 @@ export function AppFooter({
         aria-label={showBranding ? t('footer.poweredBy') : t('appName')}
         className={cn('flex items-center justify-center flex-wrap gap-x-1.5', navClassName)}
       >
-        {/* fix(#441): badge click-through — top-of-funnel link was a dead <span> */}
+        {/* Badge click-through — a top-of-funnel link, not a dead <span> */}
         {showBranding && (
           <a
             href={GEOLENS_SITE_URL}

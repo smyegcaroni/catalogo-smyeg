@@ -1,8 +1,8 @@
 """Shared MapLibre filter-expression validator/normalizer.
 
-Single source of truth (builder-audit #338 P1-04) for the editable subset
-of MapLibre expression-form layer filters, shared by layer schemas, style
-export/import, and the AI ``set_filter`` path.
+Single source of truth for the editable subset of MapLibre expression-form
+layer filters, shared by layer schemas, style export/import, and the AI
+``set_filter`` path.
 
 ``validate_filter(value)``: ``None``/``[]`` clear the filter; the editable
 subset (comparisons, ``in``/``has``, ``!``, ``all``/``any``, legacy
@@ -22,7 +22,7 @@ _COMBINATORS = {"all", "any"}
 # Legacy MapLibre feature-filter pseudo-fields resolved by the renderer itself,
 # NOT read from feature properties — they must NOT be rewritten to ["get", ...].
 _LEGACY_PSEUDO_FIELDS = {"$type", "$id"}
-# fix(#1778): real filters nest single digits (`all`/`!` cost one level each);
+# Real filters nest single digits (`all`/`!` cost one level each);
 # past this the validator raises FilterValidationError; the bound exists so
 # `_normalize_node`/`json.dumps` never reach Python's recursion limit, whose
 # RecursionError (not ValueError) Pydantic can't turn into a 422.
@@ -167,20 +167,20 @@ def _assert_depth_within_bound(value: Any) -> None:
 
 
 def validate_filter(value: list | None) -> list | None:
-    """Validate + normalize a MapLibre layer filter (builder-audit #338 P1-04).
+    """Validate + normalize a MapLibre layer filter.
 
     ``None``/``[]`` clear the filter. A recognized form with invalid arity
     raises ``FilterValidationError``; opaque forms pass through verbatim.
     A filter nested past ``_MAX_FILTER_DEPTH`` also raises it, so every
-    caller gets a 422 (or a dropped action, on the AI path) instead of the
-    RecursionError this walk used to produce.
+    caller gets a 422 (or a dropped action, on the AI path) rather than a
+    RecursionError.
     """
     if value is None:
         return None
     if not isinstance(value, list):
         raise FilterValidationError("filter must be a JSON array or null")
     if len(value) == 0:
-        # EDIT-03: an empty array is not a valid MapLibre filter; treat as clear.
+        # An empty array is not a valid MapLibre filter; treat as clear.
         return None
     _assert_depth_within_bound(value)
     return _normalize_node(value)

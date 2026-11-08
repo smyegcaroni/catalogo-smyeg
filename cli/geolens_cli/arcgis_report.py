@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from importlib.resources import files
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, BinaryIO
 from urllib.parse import quote
 
 if TYPE_CHECKING:
@@ -44,6 +45,7 @@ def build_report(
     *,
     tool_version: str,
     generated_at: str,
+    started_at_local: str,
     max_items: int,
     retirements: Mapping[str, Mapping[str, str | None]],
     classes: Iterable[str],
@@ -59,6 +61,8 @@ def build_report(
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": generated_at,
+        **({"started_at": inv.started_at} if inv.started_at else {}),
+        "started_at_local": started_at_local,
         "tool_version": tool_version,
         "complete": inv.abort is None,
         "abort_reason": str(inv.abort) if inv.abort is not None else None,
@@ -80,7 +84,10 @@ def build_report(
             "by_class": by_class,
             "by_type": dict(sorted(by_type.items())),
             "retired": sum(by_retirement.values()),
-            "failed": len({e["item_id"] for e in inv.errors}),
+            # A group's members failing to read fails no item.
+            "failed": len(
+                {e["item_id"] for e in inv.errors if e["phase"] != "group_members"}
+            ),
         },
         "retirements": [
             {
@@ -97,6 +104,7 @@ def build_report(
         "items": inv.items,
         "dependencies": inv.dependencies,
         "errors": inv.errors,
+        **({"groups": inv.groups} if inv.groups is not None else {}),
     }
 
 
@@ -125,7 +133,12 @@ def _item_link(report: Mapping[str, Any], item_id: str) -> str:
     return f"[{md_escape(item_id)}]({target})"
 
 
-def _table(header: list[str], rows: Iterable[list[str]]) -> list[str]:
+def groups_without_members(report: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """The report's groups whose members the reading account couldn't see."""
+    return [g for g in report.get("groups") or [] if g.get("members_unread")]
+
+
+def md_table(header: list[str], rows: Iterable[list[str]]) -> list[str]:
     lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
     lines.extend("| " + " | ".join(row) + " |" for row in rows)
     return lines
@@ -147,6 +160,17 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     lines.append(
         f"Scope: {scope_text}. Sign-in: {md_escape(report['auth']['mode'])}.  "
     )
+    role = report["auth"].get("role")
+    if role != "org_admin":
+        who = (
+            f"an account that isn't an org admin ({md_escape(role)})"
+            if role
+            else "an anonymous or role-less sign-in"
+        )
+        lines.append(
+            f"Read by {who}: only items that account can see are listed, so "
+            "other items, groups and folders may be missing.  "
+        )
     lines.append(
         f"Generated {md_escape(report['generated_at'])} by geolens-cli "
         f"{md_escape(report['tool_version'])}. Read-only: nothing was changed."
@@ -190,7 +214,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         lines[-1] = ""
 
     lines += ["## Summary", ""]
-    lines += _table(
+    lines += md_table(
         ["Class", "Items"],
         [
             [_CLASS_HEADINGS.get(name, name), str(count)]
@@ -199,13 +223,22 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         + [["**Total**", str(counts["total"])]],
     )
     lines += ["", f"Items and owners that could not be read: {counts['failed']}.", ""]
+    unread_groups = groups_without_members(report)
+    if unread_groups:
+        names = ", ".join(md_escape(g.get("title") or g["id"]) for g in unread_groups)
+        lines += [
+            f"Groups whose members could not be read ({len(unread_groups)}): "
+            f"{names}. Their members are not in this report, so a migration "
+            "can't add them to GeoLens groups.",
+            "",
+        ]
 
     for name, heading in _CLASS_HEADINGS.items():
         rows = [row for row in report["items"] if row["class"] == name]
         if not rows:
             continue
         lines += [f"## {heading}", ""]
-        lines += _table(
+        lines += md_table(
             ["Item", "Title", "Type", "Owner", "Sharing", "Size", "Reason"],
             [
                 [
@@ -229,7 +262,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     )
     if folders:
         lines += ["## Folders", ""]
-        lines += _table(
+        lines += md_table(
             ["Folder", "Id", "Items"],
             [
                 [md_escape(title or "(title unknown)"), md_escape(fid), str(count)]
@@ -246,7 +279,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         entry[1] += 1
     if owners:
         lines += ["## Owners", ""]
-        lines += _table(
+        lines += md_table(
             ["Owner", "Name", "Email", "Items"],
             [
                 [
@@ -262,7 +295,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
 
     if report["dependencies"]:
         lines += ["## Dependencies", ""]
-        lines += _table(
+        lines += md_table(
             ["From", "To", "Role", "Layer type", "Hosted", "In inventory", "External"],
             [
                 [
@@ -281,7 +314,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
 
     if report["errors"]:
         lines += ["## Errors", ""]
-        lines += _table(
+        lines += md_table(
             ["Item", "Phase", "Status", "Message"],
             [
                 [
@@ -299,17 +332,37 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
-def write_private(path: Path, text: str) -> None:
-    """Atomic write at mode 0600: the report lists private items."""
+def _write_atomic(path: Path, fill: Callable[[BinaryIO], None]) -> None:
+    """Fill a new 0600 file beside *path*, flush it to disk, then rename it
+    over *path*. A failure leaves nothing at *path* from this call and no
+    temporary file; an existing file of any mode is replaced, not reused."""
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-        os.chmod(tmp, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            os.chmod(tmp, 0o600)
+            fill(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def write_private(path: Path, data: str | bytes) -> None:
+    """Atomic write at mode 0600: a report or export lists private items."""
+    raw = data.encode("utf-8") if isinstance(data, str) else data
+    _write_atomic(path, lambda handle: handle.write(raw))
+
+
+def copy_private(path: Path, source: Path) -> None:
+    """Atomically put a copy of the file *source* at *path*, mode 0600."""
+
+    def fill(handle: BinaryIO) -> None:
+        with source.open("rb") as src:
+            shutil.copyfileobj(src, handle)
+
+    _write_atomic(path, fill)
 
 
 def write_report_files(

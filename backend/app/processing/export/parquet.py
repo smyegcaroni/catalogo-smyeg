@@ -28,6 +28,8 @@ from app.core.async_io import run_in_thread_draining
 from app.core.config import settings
 from app.core.runtime.staging import ensure_staging_ready
 from app.processing.export.ogr import (
+    MAX_EXPORT_FEATURES as _MAX_EXPORT_FEATURES,
+    PARQUET_MEDIA_TYPE,
     ExportError,
     bbox_where_sql,
     export_subprocess_timeout_seconds,
@@ -35,15 +37,6 @@ from app.processing.export.ogr import (
 from app.processing.export.service import export_descriptor, validate_where_clause
 from app.processing.export.where_validator import canonical_where
 from app.processing.ingest.metadata import _qtable, get_column_info, probe_geom_4326
-
-# Re-exported from `ogr.py`, which owns it so `api/main.py` can read the whole
-# set of export media types without importing pyarrow (fix(#1532)).
-from app.processing.export.ogr import PARQUET_MEDIA_TYPE  # noqa: F401
-
-# Mirror router._MAX_EXPORT_FEATURES. The router skips its cap when a dataset's
-# feature_count is NULL (legacy/registered rows), so the parquet path enforces
-# its own bounded-count cap regardless.
-_MAX_EXPORT_FEATURES = 5_000_000
 
 # Rows, or approximate bytes of Python values, held before a batch is encoded
 # and appended to the file. Whichever bound trips first flushes, so memory
@@ -428,6 +421,7 @@ class ParquetExportPlan(NamedTuple):
     where_sql: str
     params: dict
     json_columns: frozenset[str] = frozenset()
+    has_gid: bool = False
 
 
 async def plan_parquet_export(
@@ -438,37 +432,39 @@ async def plan_parquet_export(
     bbox: list[float] | None = None,
     where: str | None = None,
 ) -> ParquetExportPlan:
-    """Everything that decides a parquet export's STATUS, producing no file.
+    """Everything that decides a parquet export's status, producing no file.
 
-    fix(#1513): split out so the route can run this
-    BEFORE answering a HEAD — introspection, filter validation and the
-    bounded count are reads a HEAD can afford; left inside
-    ``export_parquet``, a HEAD answered 200 while the GET later failed
-    400/413.
+    Split out so the route can run this before answering a HEAD:
+    introspection, filter validation and the bounded count are reads a HEAD
+    can afford, and a HEAD must not answer 200 for a GET that fails 400/413.
 
     Raises:
         ValueError: bad filter (unknown column, malformed clause) -> 400.
         ExportTooLargeError: selection over the cap -> 413.
     """
-    # Introspect the live table once for BOTH column selection and filter
-    # validation: dataset.column_info is nullable, and trusting it would (a)
-    # silently export geometry-only or (b) reject a valid filter when columns
-    # are right here.
+    # Introspect the live table once for both column selection and filter
+    # validation: dataset.column_info is nullable, and trusting it could
+    # silently export geometry only or reject a valid filter.
     live_columns = await get_column_info(db, table_name, schema=schema)
     attr_names = _attr_names(live_columns)
     # The driver decodes json into Python objects, and Arrow would give every
     # row a struct slot for every key in the column, so Postgres writes these
     # as JSON text. udt_name is a domain's base type, and _json(b) for arrays.
-    json_columns = frozenset(
+    # The same read says whether gid, which live_columns omits, exists.
+    udt_names = dict(
         (
             await db.execute(
                 text(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_schema = :schema AND table_name = :table_name "
-                    "AND udt_name IN ('json', 'jsonb', '_json', '_jsonb')"
+                    "SELECT column_name, udt_name FROM information_schema.columns "
+                    "WHERE table_schema = :schema AND table_name = :table_name"
                 ).bindparams(schema=schema, table_name=table_name)
             )
-        ).scalars()
+        ).all()
+    )
+    json_columns = frozenset(
+        name
+        for name, udt in udt_names.items()
+        if udt in ("json", "jsonb", "_json", "_jsonb")
     )
 
     if where is not None:
@@ -486,12 +482,10 @@ async def plan_parquet_export(
     clauses: list[str] = []
     params: dict = {}
     if bbox is not None:
-        # Mirrors features query bbox semantics (features/service.py): an &&
-        # prefilter plus exact ST_Intersects, with the antimeridian split
-        # when minx > maxx (parse_bbox allows it) — && alone would drop
-        # antimeridian boxes and return an envelope-overlap superset.
-        # fix(#885): fragment comes from the shared builder in export/ogr.py
-        # so the ogr2ogr path splits identically.
+        # Mirrors the features query bbox semantics (features/service.py): an
+        # && prefilter plus exact ST_Intersects, split at the antimeridian when
+        # minx > maxx. The shared builder in export/ogr.py makes the ogr2ogr
+        # path split identically.
         clauses.append(bbox_where_sql(bbox))
         params.update(minx=bbox[0], miny=bbox[1], maxx=bbox[2], maxy=bbox[3])
     if safe_where is not None:
@@ -521,7 +515,9 @@ async def plan_parquet_export(
             "with a bbox or attribute filter."
         )
 
-    return ParquetExportPlan(attr_names, where_sql, params, json_columns)
+    return ParquetExportPlan(
+        attr_names, where_sql, params, json_columns, "gid" in udt_names
+    )
 
 
 def _approx_bytes(value: object) -> int:
@@ -625,6 +621,7 @@ async def export_parquet(
     schema: str,
     plan: ParquetExportPlan,
     deadline: float | None = None,
+    ordered: bool = False,
 ) -> tuple[str, str, str]:
     """Write the planned selection to a GeoParquet file.
 
@@ -636,18 +633,20 @@ async def export_parquet(
     Rows are written in bounded batches, so memory does not grow with the
     selection.
 
+    ordered: read rows by ``gid`` (the plan must have one), so unchanged data
+        always writes the same bytes; a heap scan's order can move with an
+        UPDATE or a synchronized scan.
     deadline: ``time.monotonic()`` stamp for the whole request. Reuses
         ``export_subprocess_timeout_seconds`` since an unindexed table can
         stream past the edge-proxy window with nothing else to stop it. None
         outside a request.
     """
-    attr_names, where_sql, params, json_columns = plan
+    attr_names, where_sql, params, json_columns, _ = plan
 
-    # Selects attribute columns directly (not via to_jsonb) so the async
+    # Attribute columns are selected directly (not via to_jsonb) so the async
     # driver returns native Python values and Arrow infers real types; json
-    # columns come back as their JSON text. Geometry is selected last, read
+    # columns come back as their JSON text. Geometry is selected last and read
     # positionally, so a user column sharing the WKB alias can't shadow it.
-    # Idents double-quoted defensively.
     select_parts = []
     for name in attr_names:
         ident = '"' + name.replace('"', '""') + '"'
@@ -656,13 +655,14 @@ async def export_parquet(
         )
     geom_idx = len(attr_names)
     from_sql = f"FROM {_qtable(table_name, schema=schema)} t WHERE {where_sql}"
+    if ordered:
+        from_sql += " ORDER BY t.gid"
 
     exports_root = ensure_staging_ready(
         os.path.join(settings.upload_staging_dir, "exports")
     )
     temp_dir = str(exports_root / uuid.uuid4().hex)
     os.mkdir(temp_dir)
-    # One naming rule for both verbs; see export_descriptor.
     filename, _ = export_descriptor(dataset_name, "parquet")
     output_path = os.path.join(temp_dir, filename)
     sink = _GeoParquetWriter(output_path, attr_names, _geometry_column_name(attr_names))

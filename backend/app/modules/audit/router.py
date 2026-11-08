@@ -1,14 +1,11 @@
 """Audit log API endpoints: query audit logs (admin-only).
 
 CSV/JSON exports stream via `stream_audit_logs` with a server-side cursor,
-not `query_audit_logs` (which materializes a list) -- audit logs can grow
-to millions of rows. Don't switch the export endpoints to the list query
-without adding a hard limit upstream.
+not `query_audit_logs` (which materializes a list): audit logs can grow to
+millions of rows.
 
-All endpoints require `manage_settings` (admin only): the audit log
-contains resource/user IDs that would otherwise bypass RBAC. Note: an
-earlier draft used `view_audit`, which is not in the canonical
-`ALL_CAPABILITIES` registry (backend/app/core/permissions.py).
+The admin endpoints require `manage_settings`: the audit log contains
+resource/user IDs that would otherwise bypass RBAC.
 """
 
 import csv
@@ -57,8 +54,8 @@ logger = structlog.stdlib.get_logger(__name__)
 # Shares /admin prefix with admin/router.py — kept separate for module organization.
 router = APIRouter(prefix="/admin", tags=["Admin"], responses=ERROR_RESPONSES_AUTH)
 
-# SEC-FU-08: Owner-facing column-DDL feed at /audit/* (separate prefix so it
-# is accessible to non-admin dataset owners, not just superusers).
+# Owner-facing column-DDL feed at /audit/*, a separate prefix so non-admin
+# dataset owners can reach it.
 audit_datasets_router = APIRouter(
     prefix="/audit", tags=["Audit"], responses=ERROR_RESPONSES_AUTH
 )
@@ -71,14 +68,13 @@ FORMAT_HANDLERS: dict[str, str] = {
     "json": "application/json",
 }
 _EXPORT_OUTCOME_TIMEOUT_SECONDS = 5
-# fix(#620): rows buffered per resource-name lookup batch. Bounds export
-# memory while amortizing name resolution to a few IN queries per chunk.
+# Rows buffered per resource-name lookup batch. Bounds export memory while
+# amortizing name resolution to a few IN queries per chunk.
 _EXPORT_NAME_CHUNK_ROWS = 500
 
 
-# fix(#1778): one shared rule (core/csv_safety.py) with the admin user
-# export and the dataset CSV export -- the third writer had no hardening
-# at all, which is what a private copy per writer costs.
+# The formula-escaping rule the admin user export and the dataset CSV export
+# also use (core/csv_safety.py).
 _safe_csv_cell = escape_csv_formula
 
 
@@ -146,15 +142,16 @@ class _AuditExportStream:
                     date_from=self.date_from,
                     date_to=self.date_to,
                     search=self.search,
+                    max_rows=self.max_rows,
                 ):
                     yield log
 
     async def _named_logs(self):
         """Yield ``(log, resource_name)`` with names batch-resolved per chunk.
 
-        fix(#620): name lookups run on their own session -- the log stream
-        holds a server-side cursor that can't execute other statements
-        mid-iteration. Buffering _EXPORT_NAME_CHUNK_ROWS rows bounds memory.
+        Name lookups run on their own session: the log stream holds a
+        server-side cursor that can't execute other statements mid-iteration.
+        Buffering _EXPORT_NAME_CHUNK_ROWS rows bounds memory.
         """
         from app.core.db import async_session
 
@@ -192,8 +189,8 @@ class _AuditExportStream:
                     "resource_id",
                     "ip_address",
                     "details",
-                    # fix(#620): appended last so positional CSV consumers
-                    # of the previous layout keep working.
+                    # Last, so positional CSV consumers of the earlier
+                    # column layout keep working.
                     "resource_name",
                 ]
             )
@@ -244,9 +241,9 @@ class _AuditExportStream:
                     if row_count >= self.max_rows:
                         break
                     row = {
-                        # fix(#1248): the row's own PK, so an archive can be
-                        # checked against the rows a retention run is about
-                        # to delete -- without it, scripts/audit_retention.sh
+                        # The row's own PK, so an archive can be checked
+                        # against the rows a retention run is about to
+                        # delete: without it, scripts/audit_retention.sh
                         # can't tell two same-sized slices from different
                         # tenants apart.
                         "id": str(log.id),
@@ -275,15 +272,19 @@ class _AuditExportStream:
             await self._record_outcome("completed", row_count)
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator -- trailing-slash is
-# canonical (in OpenAPI); no-slash is a hidden alias closing the 404
-# regression from redirect_slashes=False (api/main.py).
+# Trailing slash is canonical (in OpenAPI); the no-slash form is a hidden alias
+# because api/main.py sets redirect_slashes=False.
 @router.get(
     "/audit-logs",
     response_model=AuditLogListResponse,
     include_in_schema=False,
+    summary="List audit log entries",
 )
-@router.get("/audit-logs/", response_model=AuditLogListResponse)
+@router.get(
+    "/audit-logs/",
+    response_model=AuditLogListResponse,
+    summary="List audit log entries",
+)
 async def list_audit_logs(
     user_id: uuid.UUID | None = Query(None),
     action: str | None = Query(None, max_length=200),
@@ -353,9 +354,8 @@ async def list_audit_logs(
             "The CSV file, or a JSON file when the format is json", "text/csv"
         )
     },
-    # fix(scripts/deployed_surface_gate.json#export_audit_op): neutral summary
-    # replacing the auto-derived "Export Audit Logs" banned public-copy id;
-    # operationId/path unchanged.
+    # Neutral summary: the auto-derived "Export Audit Logs" label is banned
+    # public copy; operationId and path unchanged.
     summary="Download audit records",
 )
 async def export_audit_logs(
@@ -373,13 +373,10 @@ async def export_audit_logs(
     db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     """Export up to 100,000 audit log rows as CSV or JSON, newest first."""
-    # fix(#1204): no sort/order here, deliberately -- the list endpoint is
-    # sortable and shares this export's filter params, so the omission reads
-    # like an oversight. It isn't: the export streams through
-    # stream_audit_logs (own created_at DESC, distinct from the list's
-    # query_audit_logs), and an export is an archive the recipient reorders
-    # themselves. Adding sort would reorder every existing consumer's file
-    # for no benefit. Pinned by
+    # No sort/order, unlike the list endpoint that shares these filters: the
+    # export streams through stream_audit_logs (its own created_at DESC), and
+    # an export is an archive the recipient reorders themselves. Adding sort
+    # would reorder every existing consumer's file. Pinned by
     # test_admin_audit_sort.py::test_export_endpoint_takes_no_sort_parameters.
     if format not in FORMAT_HANDLERS:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
@@ -453,10 +450,10 @@ async def export_audit_logs(
     )
 
 
-# SEC-FU-08: Owner-facing column-DDL feed.
 @audit_datasets_router.get(
     "/datasets/{dataset_id}/column-ddl",
     response_model=ColumnDdlFeedResponse,
+    summary="List a dataset's column change history",
 )
 async def get_column_ddl_feed(
     dataset_id: uuid.UUID,
@@ -480,9 +477,10 @@ async def get_column_ddl_feed(
     Surfaces the column-DDL events to dataset owners so they can detect
     editor-initiated schema changes.
 
-    Owners and administrators can read the feed. Other authenticated users
-    receive 404, including readers of a public dataset, because the entries
-    identify editors. Anonymous callers receive 401.
+    Owners and administrators can read the feed, because the entries identify
+    editors. Other authenticated users receive 403 for a dataset they can see,
+    such as a public one, and 404 for one they can't. Anonymous callers
+    receive 401.
 
     The dataset 404-before-auth-query ordering ensures non-existent datasets
     return 404 without leaking audit log details.
@@ -498,7 +496,7 @@ async def get_column_ddl_feed(
         )
 
     # Owner-or-admin gate, matching the column-DDL write endpoints this feed
-    # reports on fix(#458).
+    # reports on.
     await port.check_dataset_write_access(db, dataset, dataset_id, user)
 
     # Preserves the old `offset` param while new clients converge on the

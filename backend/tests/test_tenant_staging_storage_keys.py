@@ -150,7 +150,7 @@ async def test_presigned_upload_uses_physical_key_and_persists_logical_key(monke
     from app.processing.ingest import router
     from app.processing.ingest.schemas import PresignedUploadRequest
 
-    # fix(#1235 review r3): a real created_at, because the presign path now
+    # A real created_at, because the presign path now
     # signs against the job's remaining lifetime. A MagicMock here yields
     # int(MagicMock) == 1 and the assertion below would pin a meaningless TTL.
     job = MagicMock(
@@ -205,14 +205,14 @@ async def test_presigned_completion_reads_physical_and_keeps_logical_job_path(
 
     logical = "staging/job-a/roads.geojson"
     physical = f"tenants/{TENANT_A}/{logical}"
-    # fix(#1202 review): completion freezes the upload to an unwritable key
+    # Completion freezes the upload to an unwritable key
     # first and judges THAT, so the tenant prefix has to survive the derivation.
     frozen_logical = "staging/job-a/frozen/roads.geojson"
     frozen_physical = f"tenants/{TENANT_A}/{frozen_logical}"
     job = MagicMock(
         id=uuid.uuid4(),
         source_filename="roads.geojson",
-        # fix(#1202 review): completion is one-shot and keys off file_path, so
+        # Completion is one-shot and keys off file_path, so
         # the mock has to start where create_ingest_job leaves a presigned job
         # — empty — rather than with MagicMock's truthy auto-attribute.
         file_path="",
@@ -224,14 +224,14 @@ async def test_presigned_completion_reads_physical_and_keeps_logical_job_path(
         },
     )
     db = AsyncMock()
-    # fix(#1202 review r5): completion re-fetches the row FOR UPDATE before
+    # Completion re-fetches the row FOR UPDATE before
     # reading file_path, so the locked fetch has to yield the SAME job the
     # test configured — a bare AsyncMock returns a fresh mock whose truthy
     # file_path trips the one-shot guard.
     db.get = AsyncMock(return_value=job)
     storage = AsyncMock()
     storage.exists.return_value = True
-    # fix(#1202): completion content-validates from a ranged read of the
+    # Completion content-validates from a ranged read of the
     # physical key, so the fake has to serve bytes rather than a sentinel.
     storage.get_range.return_value = b"{}"
     # The pre-copy size fast path measures the staging object before the
@@ -242,10 +242,10 @@ async def test_presigned_completion_reads_physical_and_keeps_logical_job_path(
     with (
         patch.object(router, "get_job_or_404", AsyncMock(return_value=job)),
         patch.object(router, "get_storage", return_value=storage),
-        # refactor(#1711): the staging delete is _cleanup_saved_upload, which
+        # The staging delete is _cleanup_saved_upload, which
         # resolves the provider itself.
         patch("app.platform.storage.get_storage", return_value=storage),
-        # fix(#1207): the completion sequence moved into presigned.py so both
+        # The completion sequence moved into presigned.py so both
         # doors share it, so verify is patched at its new home.
         patch.object(presigned_module, "verify_completed_presigned_upload", verify),
         patch.object(router.UPLOAD_MAX_SIZE_MB, "get", AsyncMock(return_value=10)),
@@ -281,7 +281,7 @@ async def test_presigned_reupload_round_trip_uses_tenant_provider_key(monkeypatc
     dataset_id = uuid.uuid4()
     user = MagicMock(id=uuid.uuid4())
     dataset = MagicMock(id=dataset_id)
-    # fix(#1207): completion is one-shot and keys off file_path, so the mock
+    # Completion is one-shot and keys off file_path, so the mock
     # starts where create_ingest_job leaves a presigned job — empty.
     job = MagicMock(id=uuid.uuid4(), user_metadata={}, file_path="")
     db = AsyncMock()
@@ -290,7 +290,7 @@ async def test_presigned_reupload_round_trip_uses_tenant_provider_key(monkeypatc
     storage.exists = AsyncMock(return_value=True)
     port = MagicMock()
     port.create_ingest_job = AsyncMock(return_value=job)
-    # fix(#1207): the reupload door reaches the whole completion sequence
+    # The reupload door reaches the whole completion sequence
     # through one port method now; it returns the frozen LOGICAL key.
     port.lock_presigned_job = AsyncMock(return_value=job)
     port.should_assemble_multipart = AsyncMock(return_value=False)
@@ -301,10 +301,10 @@ async def test_presigned_reupload_round_trip_uses_tenant_provider_key(monkeypatc
         return frozen_staging_key(logical_key)
 
     port.finalize_presigned_object = AsyncMock(side_effect=_fake_finalize)
-    # fix(#1235 review r3/r4): a real TTL, for the same reason as above.
+    # A real TTL, for the same reason as above.
     port.require_signable_job_lifetime = MagicMock(return_value=1800)
 
-    # fix(#1235 review r8): the door signs through one port call that computes
+    # The door signs through one port call that computes
     # the expiration inside the signing thread, so this fake has to actually
     # invoke the storage method. A bare MagicMock would put a mock where the
     # URL string belongs and the tenant-key assertion below would never run.
@@ -342,7 +342,7 @@ async def test_presigned_reupload_round_trip_uses_tenant_provider_key(monkeypatc
         logical = f"staging/{job.id}/roads.geojson"
         physical = f"tenants/{TENANT_A}/{logical}"
         assert response.s3_key == physical
-        # fix(#1848): the presigned facts land through a guarded UPDATE rather
+        # The presigned facts land through a guarded UPDATE rather
         # than the ORM instance, so they are read off the statement the door ran.
         bound = db.execute.await_args.args[0].compile().params["user_metadata"]
         assert bound["s3_key"] == logical
@@ -366,7 +366,7 @@ async def test_presigned_reupload_round_trip_uses_tenant_provider_key(monkeypatc
     storage.generate_presigned_put_url.assert_called_once_with(
         physical, "application/octet-stream", 1800
     )
-    # fix(#1207): the door no longer probes storage itself — the existence
+    # The door no longer probes storage itself — the existence
     # check moved inside finalize_presigned_object, which resolves the tenant
     # namespace from the logical key it is handed (asserted below). What stays
     # this door's job is minting the presign against the PHYSICAL key, above,
@@ -375,7 +375,7 @@ async def test_presigned_reupload_round_trip_uses_tenant_provider_key(monkeypatc
     # The door hands finalize the LOGICAL key; the helper resolves the tenant
     # namespace itself, which is what keeps the two doors identical here.
     assert port.finalize_presigned_object.await_args.kwargs["logical_key"] == logical
-    # fix(#1207): the door binds the FROZEN key, not the client-writable
+    # The door binds the FROZEN key, not the client-writable
     # staging one — the whole point of the freeze. Tenant prefix still absent
     # from what is stored, exactly as before.
     assert job.file_path == f"staging/{job.id}/frozen/roads.geojson"
@@ -407,28 +407,28 @@ async def test_cleanup_and_retention_reaper_delete_only_tenant_key(
     monkeypatch.setattr(settings, "upload_staging_dir", str(staging_root))
     monkeypatch.setattr(settings, "ingest_jobs_retention_days", 1)
 
-    # fix(#1234): five sweep statements now — the pending clause is two, one
+    # Five sweep statements now — the pending clause is two, one
     # for unbound rows at 1h and one for bound-but-uncommitted at 24h.
-    # feat(#1219): six, with the abandoned-refresh-run sweep after them.
-    # fix(#1274 review): seven — the refresh-run sweep is two statements,
+    # Six, with the abandoned-refresh-run sweep after them.
+    # Seven — the refresh-run sweep is two statements,
     # the legacy-completion recorder before the abandonment cancel.
-    # fix(#1322 review round 3): eight — the VRT RasterAsset UPDATE split
+    # Eight — the VRT RasterAsset UPDATE split
     # into two (composition-preserving -> 'ready', composition-changed ->
     # 'failed'). Both .scalars() and .all() are set on every result: the
     # VrtGeneration UPDATE in that same sweep reads via .all(), and this
     # fixture doesn't care which statement lands at which index, only that
     # every accessor the sweep might call returns an empty result.
-    # fix(#1709 review r7): nine — the childless-`fanned_out` reconciliation
+    # Nine — the childless-`fanned_out` reconciliation
     # (a fan-out parent whose dispatch died before its first child
     # committed) runs between the running-jobs sweep and the VRT sweep.
-    # fix(#1778 codex r5/r7): nine — the retention purge used to read its
+    # Nine — the retention purge used to read its
     # exempted rows first, the terminal rows that still name an unreaped
     # artifact, which it refused to delete so the record survived for the
     # next sweep to retry. Missing it here shifted every later result by one:
     # the purge's DELETE consumed the survivor SELECT's double, `deleted_paths`
     # came back empty and the tenant-scoped delete this test exists for was
     # never made.
-    # fix(#1778 codex r10): back down to nine — that exempted-rows SELECT
+    # Back down to nine — that exempted-rows SELECT
     # moved OUT of this block entirely, into the unconditional
     # artifact-carrying SELECT that now runs after the purge (see below), so
     # nothing here answers it any more.
@@ -437,19 +437,19 @@ async def test_cleanup_and_retention_reaper_delete_only_tenant_key(
         result.scalars.return_value = []
         result.all.return_value = []
     deleted = MagicMock()
-    # fix(#1202 review r5): the purge's RETURNING is (id, file_path,
+    # The purge's RETURNING is (id, file_path,
     # user_metadata) now — it also reaps the presigned staging key, which
     # needs the row's own id to decide ownership. No s3_key here, so this
     # row still contributes exactly one delete.
     deleted.all.return_value = [(uuid.uuid4(), logical, None)]
     survivors = MagicMock()
     survivors.scalars.return_value = []
-    # fix(#1778 codex r10): the artifact-carrying SELECT, unconditional and
+    # The artifact-carrying SELECT, unconditional and
     # run after the retention block. No rows in this fixture carry an
     # unreaped artifact.
     artifact_rows = MagicMock()
     artifact_rows.all.return_value = []
-    # fix(#1202 review r8): one more SELECT for the post-expiry staging sweep.
+    # One more SELECT for the post-expiry staging sweep.
     post_expiry = MagicMock()
     post_expiry.all.return_value = []
     db = AsyncMock()

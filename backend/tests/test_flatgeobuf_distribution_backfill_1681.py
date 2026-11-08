@@ -69,7 +69,7 @@ def _migration_0054():
 def _revision_below_0054() -> str:
     """The revision 0054 sits on, read from 0054's own ``down_revision``.
 
-    fix(#1383 precedent): a bare ``downgrade -1`` reverts whatever the
+    A bare ``downgrade -1`` reverts whatever the
     CURRENT head is, so it silently steps over 0054 the moment a later
     migration lands on top. Naming the target keeps this test about its own
     migration whatever else is stacked above it.
@@ -221,10 +221,10 @@ class TestFlatgeobufDistributionBackfill:
     async def test_a_users_own_fgb_row_does_not_suppress_the_platform_row(
         self, test_db_session
     ) -> None:
-        """codex review round 2: the NOT EXISTS guard must read auto_generated only.
+        """The NOT EXISTS guard must read auto_generated only.
 
         ``generate_distributions`` deliberately probes only auto-generated
-        rows (fix(#1370)) so a user's own download/fgb entry at some other URL
+        rows so a user's own download/fgb entry at some other URL
         never blocks the platform's own export row — both are meant to
         coexist. A migration that checked ANY row would leave this dataset
         permanently missing the platform row after an upgrade.
@@ -284,7 +284,7 @@ class TestFlatgeobufDistributionBackfill:
     async def test_a_user_row_at_the_template_url_does_not_raise(
         self, test_db_session
     ) -> None:
-        """The collision the narrowed guard reopens (codex review round 2).
+        """The collision the narrowed guard reopens.
 
         A user row at the exact guessable URL the INSERT targets collides on
         ``uq_record_distribution`` once the existence check no longer treats

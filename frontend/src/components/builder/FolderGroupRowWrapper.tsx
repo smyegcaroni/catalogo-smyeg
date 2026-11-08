@@ -1,5 +1,4 @@
-// builder-audit #338 STACK-05: extracted from UnifiedStackPanel.tsx into a sibling
-// file. Sortable wrapper for folder group rows.
+// Sortable wrapper for folder group rows.
 import { memo, useCallback, useMemo } from 'react';
 import { useDndContext } from '@dnd-kit/core';
 import { useSortable } from '@dnd-kit/sortable';
@@ -18,13 +17,13 @@ interface FolderGroupRowWrapperProps {
   onAddLayer: (id: string) => void;
   onUngroup: (id: string) => void;
   onDeleteGroup: (id: string) => void;
-  // Phase 1041: multi-selection
+  // Multi-selection
   isMultiSelected?: boolean;
   isMultiSelectionActive?: boolean;
   onCmdClick?: (id: string) => void;
   onShiftClick?: (id: string) => void;
   onCheckboxClick?: (id: string) => void;
-  // Phase 1201-02 (ENH-07): disable drag while search is active.
+  // Disable drag while search is active.
   dragDisabled?: boolean;
 }
 
@@ -57,7 +56,7 @@ export const FolderGroupRowWrapper = memo(function FolderGroupRowWrapper({
     isOver,
   } = useSortable({ id: layer.id, disabled: dragDisabled });
 
-  // Phase 1040 POL-03: folder group is a drop target for catalog drags.
+  // Folder group is a drop target for catalog drags.
   // data-group-drop-target activates only when a catalog drag is in flight,
   // so intra-stack reorder visuals (insertion line) remain the affordance for
   // intra-stack drags.
@@ -74,8 +73,8 @@ export const FolderGroupRowWrapper = memo(function FolderGroupRowWrapper({
     [onSelectGroup],
   );
 
-  // fix(v1.6.0 audit D7): a fresh object literal here re-broke the row memo on
-  // every wrapper render even when the drag state was unchanged.
+  // A fresh object literal here would re-break the row memo on every wrapper
+  // render even when the drag state is unchanged.
   const dragHandleProps = useMemo(
     () => ({ attributes, listeners, setActivatorNodeRef }),
     [attributes, listeners, setActivatorNodeRef],
@@ -84,9 +83,13 @@ export const FolderGroupRowWrapper = memo(function FolderGroupRowWrapper({
   const displayName = layer.display_name ?? layer.dataset_name;
 
   return (
+    // tabIndex=-1: a programmatic focus target (the page returns focus to the
+    // first remaining row when a layer is removed while its table is open)
+    // without joining the tab order; the row body keeps its own tabIndex.
     <div
       ref={setNodeRef}
       style={style}
+      tabIndex={-1}
       data-group-drop-target={isOver && isCatalogDragActive ? 'true' : undefined}
       data-row-id={layer.id}
     >

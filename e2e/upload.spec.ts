@@ -17,7 +17,7 @@ test.describe('Upload Flow', () => {
     await expect(uploadTab).toBeVisible();
 
     // Upload via hidden file input (react-dropzone renders a hidden input).
-    // fix(#432): files staged during the upload-config boot fetch are queued
+    // Files staged during the upload-config boot fetch are queued
     // and flushed once the config settles, so a single set must stage the row
     // — no reload-retry. This test failing here means the queue regressed.
     const fileInput = page.locator('input[type="file"]');
@@ -35,7 +35,7 @@ test.describe('Upload Flow', () => {
       .click();
 
     // Verify tracking phase (import progress) and compact completion state
-    await expect(page.getByText(/Importing \d+ files/i)).toBeVisible({
+    await expect(page.getByText('Importing 1 file', { exact: true })).toBeVisible({
       timeout: 30_000,
     });
     await expect(page.getByRole('link', { name: 'Open dataset' })).toBeVisible({
@@ -43,8 +43,8 @@ test.describe('Upload Flow', () => {
     });
   });
 
-  // fix(#1712): a tab switch used to unmount UploadForm entirely, dropping
-  // whatever the in-flight upload+preview had produced. The module-scoped
+  // A tab switch must not unmount UploadForm and drop
+  // whatever the in-flight upload+preview has produced. The module-scoped
   // upload-session (api/upload-session.ts) keeps that work reachable, so
   // switching away and back shows the same batch instead of a job-less
   // dropzone.

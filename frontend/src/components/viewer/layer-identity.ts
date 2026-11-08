@@ -18,7 +18,7 @@ function legacyLayerKey(layer: ViewerLayerIdentityInput, index: number): string 
   return `legacy-${layer.sort_order}-${layer.dataset_id}-${tableName}-${index}`;
 }
 
-export function getViewerLayerKey(
+function getViewerLayerKey(
   layer: ViewerLayerIdentityInput,
   index: number,
 ): string {
@@ -35,7 +35,7 @@ export function createViewerLayerEntries<T extends ViewerLayerIdentityInput>(
 }
 
 /**
- * fix(#452): whether the DEM backing `terrain_config` is live-visible in the
+ * Whether the DEM backing `terrain_config` is live-visible in the
  * viewer (legend eye toggle). The ONE definition both the mesh gate
  * (ViewerMap → useViewerTerrain) and the synthetic legend entry (LayerLegend)
  * must share — if they re-derived it independently, a future consumer that
@@ -61,35 +61,34 @@ export function isTerrainBackingLiveVisible<
 }
 
 /**
- * feat(#1472): the distinct credit lines the currently visible layers' datasets
- * require, in stacking order, for MapLibre's attribution control.
- *
- * Scoped to `visibleLayers` — the live eye-toggle state, the same set the
- * legend and the terrain-mesh gate read — rather than the saved `visible`
- * flag, so hiding a layer drops its credit and showing it again restores it.
- * A credit for data nobody can currently see is the wrong claim to make.
- *
- * Deduped by exact string: two layers ingested from one source carry the same
- * line and must credit it once. MapLibre additionally drops any entry that is
- * a substring of another and merges the result with the basemap's own credits,
- * so this returns the raw distinct set rather than trying to pre-compose it.
- */
-/**
  * React `key` for the viewer's AttributionControl, derived from the credit set.
  *
  * react-maplibre's `useControl` builds the control once with `useMemo(…, [])`,
  * so a changed `customAttribution` prop never reaches MapLibre; remounting on a
- * changed key is what makes the prop live. That makes this function's
- * injectivity load-bearing: any two distinct credit sets that collide here are
- * two sets a toggle can move between without the control updating.
+ * changed key makes the prop live. That makes injectivity load-bearing: two
+ * distinct credit sets that collide here are two sets a toggle can move between
+ * without the control updating.
  *
- * fix(#1472 review): `JSON.stringify`, not a `join`. A credit containing the
- * separator collided — `['A|B']` and `['A', 'B']` both yielded `A|B`.
+ * `JSON.stringify`, not a `join`: a credit containing the separator would
+ * collide (`['A|B']` and `['A', 'B']` would both yield `A|B`).
  */
 export function attributionControlKey(credits: string[]): string {
   return `attribution-${JSON.stringify(credits)}`;
 }
 
+/**
+ * The distinct credit lines the currently visible layers' datasets require, in
+ * stacking order, for MapLibre's attribution control.
+ *
+ * Scoped to `visibleLayers` (the live eye-toggle state the legend and the
+ * terrain-mesh gate also read), not the saved `visible` flag, so hiding a layer
+ * drops its credit and showing it restores it.
+ *
+ * Deduped by exact string: two layers ingested from one source carry the same
+ * line and must credit it once. MapLibre drops any entry that is a substring of
+ * another and merges the result with the basemap's own credits, so this
+ * returns the raw distinct set rather than pre-composing it.
+ */
 export function collectLayerAttributions<
   T extends ViewerLayerIdentityInput & { dataset_attribution?: string | null },
 >(layers: T[] | undefined, visibleLayers: Set<string>): string[] {
@@ -97,10 +96,10 @@ export function collectLayerAttributions<
   const credits: string[] = [];
   for (const { layer, key } of createViewerLayerEntries(layers)) {
     if (!visibleLayers.has(key)) continue;
-    // fix(#1472 review): escaped here, not at the control. MapLibre renders
-    // attribution as innerHTML and its sanitizer leaves img/iframe/style
-    // standing — see lib/attribution-safety. Deduping AFTER escaping keeps one
-    // credit one entry regardless of which form it arrived in.
+    // Escaped here, not at the control: MapLibre renders attribution as
+    // innerHTML and its sanitizer leaves img/iframe/style standing (see
+    // lib/attribution-safety). Deduping AFTER escaping keeps one credit one
+    // entry however it arrived.
     const credit = toMapLibreAttribution(layer.dataset_attribution);
     if (!credit || seen.has(credit)) continue;
     seen.add(credit);

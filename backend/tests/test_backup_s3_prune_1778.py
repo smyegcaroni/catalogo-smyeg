@@ -1,4 +1,4 @@
-"""fix(#1778): S3 offsite backups were never pruned.
+"""S3 offsite backups were never pruned.
 
 upload_to_s3 only ever ran `aws s3 cp` — nothing in backup-entrypoint.sh ever
 removed an object from `backups/<prefix>/` — so with BACKUP_S3_ENABLED=true
@@ -23,6 +23,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests.repo_paths import repo_root
 
 REPO_ROOT = repo_root(__file__)
@@ -34,13 +36,13 @@ case "$1 $2" in
         exit 0
         ;;
     "s3api list-objects-v2")
-        # fix(#1778 review round 6, P2): the real script now calls this
+        # The real script now calls this
         # instead of `aws s3 ls` (see s3_list_prefix's comment) — the
         # stub still ignores the actual --bucket/--prefix/--output args
         # and always serves the canned response, same as the old `s3 ls`
         # case did for the s3:// URI argument.
         if [ "${AWS_STUB_LS_EXIT:-0}" != "0" ]; then
-            # fix(#1778 review round 3): a real listing failure writes to
+            # A real listing failure writes to
             # stderr; an empty-prefix "success with no objects" writes
             # NOTHING to either stream. AWS_STUB_LS_STDERR lets each test
             # choose which one it is driving, independent of the exit
@@ -51,13 +53,13 @@ case "$1 $2" in
         cat "${AWS_STUB_LS_FILE}"
         ;;
     "s3 rm")
-        # fix(#1798 review round 11, P2) test support: NUL-terminated, not
+        # Test support: NUL-terminated, not
         # newline-terminated — a deletion target can now itself contain an
-        # embedded newline (POSTGRES_DB="geo\\nlens", decoded per
-        # common.sh's round-10 fix), and `echo`'s own newline terminator
+        # embedded newline (POSTGRES_DB="geo\\nlens", decoded by
+        # common.sh's get_env_value), and `echo`'s own newline terminator
         # would make that one record unreadable back apart from two.
         printf '%s\\0' "$3" >> "${AWS_STUB_DELETED_FILE}"
-        # fix(#1778 review round 3, P2) test support: a uniform
+        # Test support: a uniform
         # AWS_STUB_RM_EXIT can't tell "the dump's own deletion failed" apart
         # from "a companion's deletion was wrongly attempted" — both would
         # just be one more failed rm. AWS_STUB_RM_FAIL_PATTERN fails only
@@ -71,7 +73,7 @@ case "$1 $2" in
         exit "${AWS_STUB_RM_EXIT:-0}"
         ;;
     "s3 cp")
-        # fix(#1778 review round 5, P2) test support: records every upload
+        # Test support: records every upload
         # destination so a test can prove a DAILY artifact reached
         # upload_to_s3 even when the WEEKLY copy step that runs before it
         # (inside backup_staging/backup_globals) failed. Opt-in via
@@ -103,7 +105,7 @@ _LS_LISTING = "\n".join(
 
 
 def _ls_json(listing: str | None) -> str:
-    """fix(#1778 review round 6, P2) test support: the real script now
+    """Test support: the real script now
     calls `aws s3api list-objects-v2 --output json` instead of `aws s3
     ls` — the stub's canned response is JSON, built here from the same
     plain "one bare key per line" fixtures every test already used
@@ -133,14 +135,15 @@ def _extract_function(name: str) -> str:
 def _extract_prune_s3_prefix() -> str:
     # prune_s3_prefix calls two separate functions that must be extracted
     # alongside it or the harness fails with "command not found":
-    # s3_newest_complete_ts (fix(#1778 review round 2, P1) — the S3 analogue
-    # of the local newest-complete-set protection) and s3_list_prefix
-    # (fix(#1778 review round 3, updated round 6 for the aws s3api
-    # list-objects-v2 switch) — distinguishes an empty prefix from a
-    # genuine listing failure).
+    # s3_newest_complete_ts (the S3 analogue of the local
+    # newest-complete-set protection) and s3_list_prefix (reads the prefix
+    # through `aws s3api list-objects-v2` and distinguishes an empty prefix
+    # from a genuine listing failure).
     return (
         f"{_extract_function('s3_list_prefix')}\n"
         f"{_extract_function('s3_newest_complete_ts')}\n"
+        f"{_extract_function('backup_period_key')}\n"
+        f"{_extract_function('mark_retained')}\n"
         f"{_extract_function('prune_s3_prefix')}"
     )
 
@@ -187,8 +190,11 @@ echo '-- fake globals dump'
 exit 0
 """
 
-# fix(#1778 review round 3, P1): same portable shim
-# scripts/tests/test-backup-restore-roundtrip.sh already uses to force a
+# Answers the catalog records check with an empty catalog: no marker moves.
+_PSQL_EMPTY_CATALOG_STUB = "#!/bin/sh\necho '0|0|'\n"
+
+# The same portable shim that scripts/tests/test-backup-restore-roundtrip.sh
+# uses to force a
 # Sunday cycle without depending on the day the test happens to run — only
 # `+%u` is faked, every other format (the real timestamp naming the dump)
 # passes through to a real `date` binary.
@@ -209,12 +215,13 @@ def _run(
     rm_fail_pattern: str = "",
     with_credentials: bool = True,
     ls_names: list[str] | None = None,
+    good: str = "",
 ) -> tuple[subprocess.CompletedProcess, list[str]]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     ls_file = tmp_path / "ls_output.txt"
     if ls_names is not None:
-        # fix(#1798 review round 11, P2) test support: _ls_json's
+        # Test support: _ls_json's
         # `.splitlines()` fixture format is one bare name per line — no
         # good for a name that ITSELF contains a newline, which is
         # exactly what this parameter exists to test. Builds the
@@ -242,7 +249,7 @@ def _run(
         'log() { echo "$@" >&2; }\n'
         f"{creds}"
         f"{_extract_prune_s3_prefix()}\n"
-        f'prune_s3_prefix "daily" "{keep}"\n'
+        f'prune_s3_prefix "daily" "{keep}" day "{good}"\n'
     )
     result = subprocess.run(
         ["bash", "-c", harness],
@@ -275,7 +282,7 @@ def _run_prune_s3_prefix_with_real_log(
     sends every log call to stderr regardless of whether the call site in
     the script does, which would make
     test_listing_failure_diagnostic_reaches_stderr below pass on both fixed
-    and pre-fix code and prove nothing about fix(#1778 review round 3, P2).
+    and pre-fix code and prove nothing about the stderr diagnostic.
     Uses _extract_run_backup_definitions() purely for its real log() (same
     extraction _run_full_cycle uses); S3 credentials are exported directly
     so prune_s3_prefix can run standalone without a full run_backup cycle.
@@ -296,7 +303,7 @@ def _run_prune_s3_prefix_with_real_log(
         'S3_BUCKET="test-bucket"\n'
         'S3_ACCESS_KEY_ID="test-key"\n'
         'S3_SECRET_ACCESS_KEY="test-secret"\n'
-        'prune_s3_prefix "daily" "2"\n'
+        'prune_s3_prefix "daily" "2" day\n'
     )
     return subprocess.run(
         ["bash", "-c", harness],
@@ -316,7 +323,7 @@ def _run_prune_s3_prefix_with_real_log(
 
 
 class TestS3ListPrefixDiagnosticReachesStderr:
-    """fix(#1778 review round 3, P2): scripts/backup-entrypoint.sh:563 —
+    """scripts/backup-entrypoint.sh:563 —
     s3_list_prefix's caller captures its stdout via
     `ls_output="$(s3_list_prefix ...)"`. A `log` call with no explicit
     `>&2` at the call site (the script's real log() is a plain
@@ -384,7 +391,7 @@ class TestPruneS3Prefix:
     def test_protects_newest_complete_set_from_count_based_pruning(
         self, tmp_path: Path
     ):
-        """fix(#1778 review round 2, P1): a partial upload cycle (the dump
+        """A partial upload cycle (the dump
         uploads, the globals upload fails) must not destroy the only
         complete offsite set. 08-01 is the only complete pair (dump +
         globals); 08-02 is a partial cycle (dump only). With
@@ -444,6 +451,42 @@ class TestPruneS3Prefix:
             "s3://test-bucket/backups/daily/globals-20260803_020000.sql" not in deleted
         )
 
+    def test_keeps_the_last_dump_with_records_and_its_companions(self, tmp_path: Path):
+        listing = "\n".join(
+            [
+                "geolens_20261019_020001.dump",
+                "globals-20261019_020001.sql",
+                "staging-20261019_020001.tar.gz",
+                "geolens_20261019_102717.dump",
+                "globals-20261019_102717.sql",
+            ]
+        )
+        result, deleted = _run(
+            tmp_path, keep="1", ls_listing=listing, good="20261019_020001"
+        )
+        assert result.returncode == 0, result.stderr
+        assert deleted == []
+
+    def test_prefers_a_complete_set_before_the_marked_dump(self, tmp_path: Path):
+        listing = "\n".join(
+            [
+                "geolens_20261004_020000.dump",
+                "globals-20261004_020000.sql",
+                "geolens_20261011_020000.dump",
+                "geolens_20261018_020000.dump",
+                "globals-20261018_020000.sql",
+                "geolens_20261025_020000.dump",
+                "globals-20261025_020000.sql",
+            ]
+        )
+        result, deleted = _run(
+            tmp_path, keep="1", ls_listing=listing, good="20261012_020000"
+        )
+        assert result.returncode == 0, result.stderr
+        assert deleted == [
+            "s3://test-bucket/backups/daily/geolens_20261011_020000.dump"
+        ]
+
     def test_empty_prefix_does_not_abort_under_set_e(self, tmp_path: Path):
         """The prefix has zero objects (fresh install, or weekly/ before the
         first Sunday cycle) and `aws s3 ls` exits 0 with empty output.
@@ -456,7 +499,7 @@ class TestPruneS3Prefix:
         assert deleted == []
 
     def test_empty_prefix_aws_cli_exit_1_is_not_a_failure(self, tmp_path: Path):
-        """fix(#1778 review round 3): documented AWS CLI behavior — `aws s3
+        """Documented AWS CLI behavior — `aws s3
         ls` on a prefix with NO objects exits 1 with EMPTY stdout AND empty
         stderr. This is the ordinary shape for backups/weekly/ before the
         first Sunday cycle (CI's "Backup Restore Round-trip" bundled-mode
@@ -505,7 +548,7 @@ class TestPruneS3Prefix:
         assert "S3_BUCKET" in result.stderr
 
     def test_rm_failure_is_reported_and_fails(self, tmp_path: Path):
-        """fix(#1778 review, P2): `aws s3 rm` failing inside either deletion
+        """`aws s3 rm` failing inside either deletion
         loop (retention pruning, then orphaned-companion pruning) used to
         just log an ERROR and continue — both loops run in a `| while`
         subshell, so a `local` failure flag set there never reached this
@@ -522,7 +565,7 @@ class TestPruneS3Prefix:
         assert "could not delete" in result.stderr
 
     def test_failed_dump_deletion_does_not_orphan_its_companions(self, tmp_path: Path):
-        """fix(#1778 review round 3, P2): with keep=2, 08-01 is the single
+        """With keep=2, 08-01 is the single
         retention candidate (08-04 is protected as the newest complete set;
         see test_protects_newest_complete_set_from_count_based_pruning) and
         is pruned along with its globals/staging companions. Here the
@@ -556,7 +599,7 @@ class TestPruneS3Prefix:
     def test_dump_key_containing_a_space_is_pruned_by_its_real_name(
         self, tmp_path: Path
     ):
-        """fix(#1778 review round 5, P2): `s3_list_prefix`'s output was
+        """`s3_list_prefix`'s output was
         parsed with `awk '{print $NF}'` — the LAST whitespace-separated
         field — everywhere a listing line was turned into an object key.
         POSTGRES_DB="geo lens" produces a dump named "geo
@@ -586,7 +629,7 @@ class TestPruneS3Prefix:
     def test_orphaned_companion_key_with_a_space_is_deleted_by_its_real_name(
         self, tmp_path: Path
     ):
-        """fix(#1778 review round 5, P2): the final orphan-companion loop
+        """The final orphan-companion loop
         parsed the SAME listing with the same `awk '{print $NF}'` bug. No
         globals-*.sql/staging-*.tar.gz name in this script embeds a space
         today (POSTGRES_DB only ever reaches the *.dump filename), but the
@@ -614,13 +657,13 @@ class TestPruneS3Prefix:
     def test_dump_key_with_leading_and_internal_spaces_is_pruned_by_its_real_name(
         self, tmp_path: Path
     ):
-        """fix(#1778 review round 6, P2): round 5's fixed-column `read -r
-        _d _t _s name` fixed INTERNAL spaces (it let the last variable
+        """A fixed-column `read -r
+        _d _t _s name` handles INTERNAL spaces (it lets the last variable
         absorb the rest of the line) but `read` ALSO strips LEADING
         whitespace off the field it assigns — POSTGRES_DB=" geo" produces
-        a dump named " geo_<ts>.dump" (leading space), which round 5's own
-        fix still silently turned into "geo_<ts>.dump". This is exactly
-        why round 6 replaced the whitespace-column listing with JSON
+        a dump named " geo_<ts>.dump" (leading space), which that parse
+        would still silently turn into "geo_<ts>.dump". This is exactly
+        why the whitespace-column listing was replaced with JSON
         (s3_list_prefix now shells out to `aws s3api list-objects-v2`) —
         there is no whitespace-splitting step left to lose the leading
         space. With keep=2 and 3 dump-only entries, 08-01 is the single
@@ -644,7 +687,7 @@ class TestPruneS3Prefix:
     def test_dump_key_with_a_leading_tab_and_a_leading_space_is_pruned_by_its_real_name(
         self, tmp_path: Path
     ):
-        """fix(#1798 review round 8, P2): the deletion loop re-encoded each
+        """The deletion loop re-encoded each
         candidate as a "<timestamp>\t<name>" text record and re-parsed it
         with `IFS=$'\t' read -r line_ts line_name`. Tab is classified as
         IFS WHITESPACE, so bash's `read` collapses a RUN of consecutive
@@ -678,12 +721,11 @@ class TestPruneS3Prefix:
     def test_dump_key_with_an_embedded_newline_and_tab_is_pruned_by_its_real_name(
         self, tmp_path: Path
     ):
-        """fix(#1798 review round 11, P2): common.sh's round-10 fix made
-        get_env_value correctly decode Compose's documented \\n/\\r/\\t
+        """common.sh's get_env_value correctly decodes Compose's documented \\n/\\r/\\t
         escapes in a double-quoted .env value — POSTGRES_DB="geo\\nlens"
         is real, legal Compose syntax, and every dump/companion filename
         this script builds from $POSTGRES_DB can now legally contain an
-        embedded NEWLINE, not just a tab (round 8). Before this fix,
+        embedded NEWLINE, not just a tab. Before the fix,
         s3_list_prefix's python emitter used `print(key)` — NEWLINE
         terminated — so a key with an embedded newline was written to the
         listing as what LOOKED like two separate records; every bash
@@ -721,7 +763,7 @@ class TestPruneS3Prefix:
 
 
 def _run_full_cycle(
-    tmp_path: Path, rm_exit: int = 0
+    tmp_path: Path, rm_exit: int = 0, local_marker: str = ""
 ) -> tuple[subprocess.CompletedProcess, Path]:
     """Runs the REAL run_backup() end to end (extracted from
     scripts/backup-entrypoint.sh, same technique as _run above), stubbing
@@ -734,6 +776,9 @@ def _run_full_cycle(
     bin_dir.mkdir()
     backup_dir = tmp_path / "backups"
     staging_dir = tmp_path / "no-such-staging-mount"  # never created: skips cleanly
+    if local_marker:
+        backup_dir.mkdir()
+        (backup_dir / ".last-good-dump").write_text(f"{local_marker}\n")
 
     ls_file = tmp_path / "ls_output.txt"
     ls_file.write_text(_ls_json(_LS_LISTING))
@@ -745,6 +790,7 @@ def _run_full_cycle(
         ("pg_dump", _PG_DUMP_STUB),
         ("pg_restore", _PG_RESTORE_STUB),
         ("pg_dumpall", _PG_DUMPALL_STUB),
+        ("psql", _PSQL_EMPTY_CATALOG_STUB),
     ):
         stub = bin_dir / name
         stub.write_text(content)
@@ -782,8 +828,7 @@ def _run_full_cycle(
 
 
 class TestRunBackupS3PruneFailureMarksCycleFailed:
-    """fix(#1778 review, P2): the fix in TestPruneS3Prefix.
-    test_rm_failure_is_reported_and_fails proves prune_s3_prefix() itself
+    """TestPruneS3Prefix.test_rm_failure_is_reported_and_fails proves prune_s3_prefix() itself
     now returns nonzero on a failed deletion. These tests prove that
     failure actually reaches run_backup()'s caller-visible signal — the
     `.last-success` freshness marker the compose healthcheck reads — by
@@ -802,6 +847,17 @@ class TestRunBackupS3PruneFailureMarksCycleFailed:
         # stdout, not stderr.
         assert "could not delete" in result.stdout
 
+    @pytest.mark.parametrize(
+        ("marker", "kept"), [("20260801_120000", True), ("", False)]
+    )
+    def test_offsite_keeps_the_newest_dump_before_a_local_only_marker(
+        self, tmp_path: Path, marker: str, kept: bool
+    ):
+        result, _ = _run_full_cycle(tmp_path, local_marker=marker)
+        assert result.returncode == 0, result.stderr
+        deleted = (tmp_path / "deleted.txt").read_bytes().split(b"\0")
+        assert bool([d for d in deleted if b"20260801_020000" in d]) is not kept
+
     def test_successful_cycle_still_touches_last_success(self, tmp_path: Path):
         """Positive control: the fix must not make an otherwise-healthy
         cycle report unhealthy."""
@@ -818,9 +874,8 @@ def _run_weekly_copy_failure_cycle(
     LOCAL retention path from the S3 path _run_full_cycle above already
     covers. WEEKLY_DIR is made read-only by default so the weekly dump
     copy's `cp` genuinely fails — the "nearly full volume" case
-    fix(#1778 review round 3, P1) describes — via the shell (not a mock),
-    the same way the CI-failure fix a commit ago used a real `aws s3 ls`
-    rather than stubbing the distinction. Three pre-existing daily dumps
+    — via the shell (not a mock), the same way the other harnesses here use a
+    real `aws s3 ls` rather than stubbing the distinction. Three pre-existing daily dumps
     with no globals companions (so none is a "complete" set eligible for
     newest_complete_ts protection) are seeded old enough that
     BACKUP_RETENTION_DAILY=1 must prune some of them once today's dump is
@@ -833,6 +888,7 @@ def _run_weekly_copy_failure_cycle(
         ("pg_dump", _PG_DUMP_STUB),
         ("pg_restore", _PG_RESTORE_STUB),
         ("pg_dumpall", _PG_DUMPALL_STUB),
+        ("psql", _PSQL_EMPTY_CATALOG_STUB),
     ):
         stub = bin_dir / name
         stub.write_text(content)
@@ -871,7 +927,7 @@ def _run_weekly_copy_failure_cycle(
 
 
 class TestWeeklyCopyFailureStillPrunesDaily:
-    """fix(#1778 review round 3, P1): scripts/backup-entrypoint.sh:155 — a
+    """scripts/backup-entrypoint.sh:155 — a
     Sunday cycle whose weekly copy fails (typically a nearly full volume)
     used to `return` immediately, skipping prune_old_backups/prune_s3_prefix
     for BOTH daily/ and weekly/ entirely. The next cycle then ran out of
@@ -913,7 +969,7 @@ class TestWeeklyCopyFailureStillPrunesDaily:
 def _run_weekly_staging_globals_upload_cycle(
     tmp_path: Path, weekly_dir_writable: bool = False
 ) -> tuple[subprocess.CompletedProcess, list[str]]:
-    """fix(#1778 review round 5, P2) regression harness: a real Sunday
+    """Regression harness: a real Sunday
     run_backup() cycle with BACKUP_S3_ENABLED=true and a non-empty
     STAGING_DIR (so backup_staging does not take its early "not mounted" /
     "empty" skip), while WEEKLY_DIR is read-only by default so the weekly
@@ -931,6 +987,7 @@ def _run_weekly_staging_globals_upload_cycle(
         ("pg_dump", _PG_DUMP_STUB),
         ("pg_restore", _PG_RESTORE_STUB),
         ("pg_dumpall", _PG_DUMPALL_STUB),
+        ("psql", _PSQL_EMPTY_CATALOG_STUB),
         ("aws", _AWS_STUB),
     ):
         stub = bin_dir / name
@@ -982,7 +1039,7 @@ def _run_weekly_staging_globals_upload_cycle(
 
 
 class TestWeeklyCopyFailureStillUploadsDailyArtifact:
-    """fix(#1778 review round 5, P2): scripts/backup-entrypoint.sh:351 — on
+    """scripts/backup-entrypoint.sh:351 — on
     a Sunday with WEEKLY_DIR unwritable but DAILY_DIR fine, backup_staging
     returned after publishing the daily archive but before printing its
     path, so `staging_archive="$(backup_staging "$timestamp")"` came back

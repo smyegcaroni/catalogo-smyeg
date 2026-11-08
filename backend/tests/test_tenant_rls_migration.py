@@ -1,4 +1,4 @@
-"""Migration round-trip + apply_tenancy_rls tests for Phase 1208-02 (ISO-02).
+"""Migration round-trip + apply_tenancy_rls tests.
 
 Tests
 -----
@@ -51,9 +51,28 @@ _RLS_TABLES = [
     "oauth_accounts",
     "audit_logs",
     "ingest_jobs",
+    "groups",
+    "group_members",
+    "dataset_group_grants",
+    "map_group_grants",
+    "stories",
+    "story_maps",
+    "story_assets",
+    "story_group_grants",
 ]
 
 _POLICY_NAMES = [f"tenant_isolation_{t}" for t in _RLS_TABLES]
+# Boundary tables a downgrade below 0006 removes outright.
+_CREATED_AFTER_0005 = {
+    "groups",
+    "group_members",
+    "dataset_group_grants",
+    "map_group_grants",
+    "stories",
+    "story_maps",
+    "story_assets",
+    "story_group_grants",
+}
 
 
 _SKIP_UNDER_OVERLAY = pytest.mark.skipif(
@@ -64,22 +83,30 @@ _SKIP_UNDER_OVERLAY = pytest.mark.skipif(
 
 
 async def _get_rls_state() -> dict[str, dict[str, bool]]:
-    """Return RLS flags for every table in the reviewed boundary."""
+    """Return RLS flags for every existing table in the reviewed boundary."""
     rows = await _fresh_query(
         """
         SELECT relname, relrowsecurity, relforcerowsecurity
         FROM pg_class
         WHERE oid = ANY(
             ARRAY[
-                'catalog.users'::regclass,
-                'catalog.records'::regclass,
-                'catalog.datasets'::regclass,
-                'catalog.maps'::regclass,
-                'catalog.collections'::regclass,
-                'catalog.embed_tokens'::regclass,
-                'catalog.oauth_accounts'::regclass,
-                'catalog.audit_logs'::regclass,
-                'catalog.ingest_jobs'::regclass
+                to_regclass('catalog.users'),
+                to_regclass('catalog.records'),
+                to_regclass('catalog.datasets'),
+                to_regclass('catalog.maps'),
+                to_regclass('catalog.collections'),
+                to_regclass('catalog.embed_tokens'),
+                to_regclass('catalog.oauth_accounts'),
+                to_regclass('catalog.audit_logs'),
+                to_regclass('catalog.ingest_jobs'),
+                to_regclass('catalog.groups'),
+                to_regclass('catalog.group_members'),
+                to_regclass('catalog.dataset_group_grants'),
+                to_regclass('catalog.map_group_grants'),
+                to_regclass('catalog.stories'),
+                to_regclass('catalog.story_maps'),
+                to_regclass('catalog.story_assets'),
+                to_regclass('catalog.story_group_grants')
             ]
         )
         ORDER BY relname
@@ -128,10 +155,16 @@ async def _disable_rls_on_all() -> None:
         async with engine.connect() as conn:
             for table in _RLS_TABLES:
                 await conn.execute(
-                    sa.text(f"ALTER TABLE catalog.{table} NO FORCE ROW LEVEL SECURITY")
+                    sa.text(
+                        f"ALTER TABLE IF EXISTS catalog.{table} "
+                        "NO FORCE ROW LEVEL SECURITY"
+                    )
                 )
                 await conn.execute(
-                    sa.text(f"ALTER TABLE catalog.{table} DISABLE ROW LEVEL SECURITY")
+                    sa.text(
+                        f"ALTER TABLE IF EXISTS catalog.{table} "
+                        "DISABLE ROW LEVEL SECURITY"
+                    )
                 )
     finally:
         await engine.dispose()
@@ -146,7 +179,7 @@ async def _disable_rls_on_all() -> None:
 class TestMigrationRoundTripExitCodes:
     """HEAD migration round-trips reversibly with no subprocess errors.
 
-    Updated for Phase 1209-01 (migration 0007_tenant_data_schemas off 0006_tenant_rls):
+    Updated for migration 0007_tenant_data_schemas off 0006_tenant_rls:
     downgrade -1 now goes from 0007→0006 (not 0006→0005 as originally written).
     The exit-code assertions are unchanged; stderr content assertions updated to
     match the current HEAD migration chain.
@@ -163,8 +196,8 @@ class TestMigrationRoundTripExitCodes:
     def test_downgrade_minus_one_exits_zero(self):
         """alembic downgrade -1 (HEAD → HEAD-1) exits 0.
 
-        Phase 1208-02 original: 0006 → 0005.
-        Phase 1209-01 update: 0007 → 0006 (new HEAD is 0007_tenant_data_schemas).
+        Original: 0006 → 0005.
+        Update: 0007 → 0006 (new HEAD is 0007_tenant_data_schemas).
         """
         r = _run_alembic("downgrade", "-1")
         assert r.returncode == 0, (
@@ -263,7 +296,7 @@ class TestPoliciesAfterUpgrade:
             )
 
     async def test_policies_qual_has_no_is_null_escape(self):
-        """No policy qual contains IS NULL (no fail-open escape — ISO-02 hard rule)."""
+        """No policy qual contains IS NULL (no fail-open escape — hard rule)."""
         rows = await _fresh_query(
             """
             SELECT policyname, qual
@@ -377,8 +410,8 @@ class TestPoliciesRoundTrip:
             assert not found, f"Policies still present after downgrade to 0005: {found}"
 
             state = await _get_rls_state()
-            assert len(state) == len(_RLS_TABLES), (
-                f"Expected {len(_RLS_TABLES)} tables, got: {list(state)}"
+            assert set(state) == set(_RLS_TABLES) - _CREATED_AFTER_0005, (
+                f"Unexpected boundary tables at 0005: {list(state)}"
             )
             for table, flags in state.items():
                 assert flags["relrowsecurity"] is False, (

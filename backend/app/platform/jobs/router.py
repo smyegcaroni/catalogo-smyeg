@@ -1,11 +1,12 @@
 """Job status API endpoints: poll ingestion job progress and retry.
 
-The stale-job recovery/sweep handlers split out into ``sweep.py`` (#1335);
-this module keeps the job CRUD routes and re-exports what it imports from
-there for backward compatibility.
+The stale-job recovery/sweep handlers live in ``sweep.py``; this module
+keeps the job CRUD routes and re-exports what it imports from there.
 """
 
+import asyncio
 import uuid
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
@@ -26,6 +27,7 @@ from app.modules.auth.dependencies import (
 )
 from app.processing.ingest.schemas import UploadResponse
 from app.processing.ingest.service import queue_ingest_job
+from app.platform.request_credential import is_publish_key, refuse_publish_key
 from app.platform.extensions import get_permission_extension
 from app.platform.jobs.ledger import Outcome, cancel, retry
 from app.platform.jobs.models import (
@@ -40,11 +42,16 @@ from app.platform.jobs.models import (
 from app.platform.jobs.schemas import (
     DbfTruncationCollisionWarning,
     JobCancelResponse,
+    JobStatusBatchEntry,
+    JobStatusBatchRequest,
+    JobStatusBatchResponse,
+    JobRefreshRunSummary,
     JobStatusResponse,
     MercatorClipWarning,
     ReservedRenameWarning,
     StaleCleanupResponse,
 )
+from app.platform.refresh.job_runs import latest_runs_for_jobs, stored_review_reasons
 from app.platform.jobs.originals_reconcile import reconcile_orphaned_originals
 from app.platform.jobs.quicklook_reconcile import reconcile_orphaned_quicklooks
 from app.platform.jobs.staging_reconcile import reconcile_orphaned_staging_objects
@@ -72,6 +79,8 @@ log = structlog.get_logger()
 # alias lets ``cast`` narrow dict writes without ruff F821 on Literal strings.
 TemporalParseKey = Literal["temporal_start", "temporal_end"]
 
+_BATCH_STATUS_CONCURRENCY = 10
+
 router = APIRouter(prefix="/jobs", tags=["Admin"], responses=ERROR_RESPONSES_AUTH)
 
 
@@ -89,20 +98,19 @@ async def _can_access_another_users_job(
     the job as ``resource`` lets enterprise extensions apply finer-grained
     policy instead of a hard-coded role-name check.
 
-    ``log_denial`` (fix(#1709)): where this check decides alone
+    ``log_denial``: where this check decides alone
     (``get_job_status``, ``retry_job``), a refusal here IS the request's
     refusal and must be recorded. Where a later arm can still grant
     (cancel's dataset-write arm), logging here would file a denial on every
     SUCCESSFUL cancel — such callers pass ``log_denial=False`` and emit
-    exactly one event once every arm has failed. Default True: a caller
-    that forgets the flag over-reports rather than losing a denial silently.
+    exactly one event once every arm has failed. The batch status read passes
+    ``False`` too and emits one event for the whole request. Default True: a
+    caller that forgets the flag over-reports rather than losing a denial
+    silently.
     """
     # Deferred by design: shared platform code must not import product-domain
-    # policy implementations at module load time (D-17).
-    from app.modules.auth.dependencies import (
-        get_cached_user_roles,
-        log_permission_denial,
-    )
+    # policy implementations at module load time.
+    from app.modules.auth.dependencies import get_cached_user_roles
     from app.modules.auth.permissions import get_effective_permissions
 
     user_roles = await get_cached_user_roles(request, db, user)
@@ -119,17 +127,77 @@ async def _can_access_another_users_job(
         resource=job,
     )
     if not granted and log_denial:
-        log_permission_denial(
-            request,
-            user,
-            "manage_users",
-            user_roles,
-            resource_type="ingest_job",
-        )
+        await _log_job_read_denial(request, db, user)
     return granted
 
 
-@router.post("/cleanup/stale/", response_model=StaleCleanupResponse)
+async def _log_job_read_denial(
+    request: Request, db: AsyncSession, user: Identity
+) -> None:
+    from app.modules.auth.dependencies import (
+        get_cached_user_roles,
+        log_permission_denial,
+    )
+
+    log_permission_denial(
+        request,
+        user,
+        "manage_users",
+        await get_cached_user_roles(request, db, user),
+        resource_type="ingest_job",
+    )
+
+
+async def _may_read_job(
+    request: Request,
+    db: AsyncSession,
+    user: Identity,
+    job: IngestJob,
+    *,
+    log_denial: bool = True,
+) -> bool:
+    """Owners always read their job; anyone else follows the permission policy.
+
+    A publish key reads only its owner's jobs, whatever its owner may read.
+    """
+    if job.created_by == user.id:
+        return True
+    if is_publish_key(db):
+        return False
+    return await _can_access_another_users_job(
+        request, db, user, job, log_denial=log_denial
+    )
+
+
+async def _settle_stale(db: AsyncSession, jobs: Sequence[IngestJob]) -> None:
+    """Settle the jobs among ``jobs`` that are stale, then reload them.
+
+    Clients poll every few seconds. A job inside its lease costs no statement
+    here, and a stale one its queue or children still hold costs one read.
+    """
+    now = datetime.now(timezone.utc)
+    stale = [
+        job
+        for job in jobs
+        if may_be_stale(job, now) and not await is_held_back(db, job)
+    ]
+    if not stale:
+        return
+    outcome = await settle_stale_jobs(db, now, job_ids=tuple(job.id for job in stale))
+    await db.commit()
+    publish_refresh_reconciliation(outcome)
+    # Only after the commit: a reap before it could delete what a
+    # rolled-back settlement still owns.
+    await _reap_committed_staged_paths(outcome)
+    for job in stale:
+        await db.refresh(job)
+
+
+@router.post(
+    "/cleanup/stale/",
+    response_model=StaleCleanupResponse,
+    summary="Fail stale ingest jobs",
+)
 async def cleanup_stale_jobs(
     request: Request,
     user: Identity = Depends(
@@ -207,13 +275,13 @@ async def cleanup_stale_jobs(
         if multi_tenant:
             details = database_details
         else:
-            # fix(#1277): this path passed commit=False, so the sweep
+            # This path passed commit=False, so the sweep
             # deferred its counter to the commit above; the fleet helper
             # (multi-tenant) already publishes its own per tenant.
             publish_refresh_reconciliation(outcome)
             outcome = await _reap_committed_staged_paths(outcome)
             outcome = await _sweep_expired_presigned_staging(db, outcome)
-            # fix(#1249): same object-driven reconciliation the background
+            # Same object-driven reconciliation the background
             # sweeper runs; the fleet helper (multi-tenant) already
             # reconciles per tenant.
             await reconcile_orphaned_staging_objects(db)
@@ -296,7 +364,73 @@ async def cleanup_stale_jobs(
     return StaleCleanupResponse(**details)
 
 
-@router.get("/{job_id}", response_model=JobStatusResponse)
+@router.post(
+    "/status",
+    response_model=JobStatusBatchResponse,
+    include_in_schema=False,
+    summary="Get the status of several ingest jobs",
+)
+@router.post(
+    "/status/",
+    response_model=JobStatusBatchResponse,
+    summary="Get the status of several ingest jobs",
+)
+async def get_job_statuses(
+    body: JobStatusBatchRequest,
+    request: Request,
+    user: Identity = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> JobStatusBatchResponse:
+    """Get the status of up to 100 ingestion jobs in one request.
+
+    Applies the same access rule as `GET /jobs/{id}`: the job creator, or a
+    caller the effective permission policy lets read other users' jobs. An
+    unknown id and a job the caller may not read both come back as
+    `not_found`, so the response does not reveal which jobs exist.
+    """
+    ids = list(dict.fromkeys(body.job_ids))
+    rows = await db.execute(select(IngestJob).where(IngestJob.id.in_(ids)))
+    readable: dict[uuid.UUID, IngestJob] = {}
+    refused = 0
+    for job in rows.scalars():
+        if await _may_read_job(request, db, user, job, log_denial=False):
+            readable[job.id] = job
+        else:
+            refused += 1
+    if refused:
+        await _log_job_read_denial(request, db, user)
+
+    await _settle_stale(db, list(readable.values()))
+
+    runs = await latest_runs_for_jobs(db, list(readable))
+    # A failed job's retry check probes storage; run the probes concurrently
+    # with a bound so one slow store cannot serialize a hundred of them.
+    gate = asyncio.Semaphore(_BATCH_STATUS_CONCURRENCY)
+
+    async def _entry(job: IngestJob) -> JobStatusBatchEntry:
+        async with gate:
+            full = await _job_to_status_response(job, include_detail=True)
+        entry = JobStatusBatchEntry.model_validate(full)
+        run = runs.get(job.id)
+        if run is not None:
+            entry.refresh_run = JobRefreshRunSummary(
+                id=run.id,
+                status=run.status,
+                review_reasons=stored_review_reasons(run.verification),
+            )
+        return entry
+
+    found = dict(zip(readable, await asyncio.gather(*map(_entry, readable.values()))))
+    entries = [
+        found.get(job_id) or JobStatusBatchEntry(id=job_id, status="not_found")
+        for job_id in ids
+    ]
+    return JobStatusBatchResponse(jobs=entries)
+
+
+@router.get(
+    "/{job_id}", response_model=JobStatusResponse, summary="Get an ingest job's status"
+)
 async def get_job_status(
     job_id: uuid.UUID,
     request: Request,
@@ -316,52 +450,41 @@ async def get_job_status(
             detail="Job not found",
         )
 
-    # Owners always retain access. Cross-user access follows the active
-    # capability policy rather than assuming a hard-coded "admin" role.
-    if job.created_by != user.id and not await _can_access_another_users_job(
-        request, db, user, job
-    ):
+    if job.created_by != user.id and is_publish_key(db):
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to view this job",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
+        )
+    if not await _may_read_job(request, db, user, job):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
         )
 
-    now = datetime.now(timezone.utc)
-    # Clients poll every few seconds. A job inside its lease costs no statement
-    # here, and a stale one its queue or children still hold costs one read.
-    if may_be_stale(job, now) and not await is_held_back(db, job):
-        outcome = await settle_stale_jobs(db, now, job_ids=(job.id,))
-        await db.commit()
-        publish_refresh_reconciliation(outcome)
-        # Only after the commit: a reap before it could delete what a
-        # rolled-back settlement still owns.
-        await _reap_committed_staged_paths(outcome)
-        await db.refresh(job)
+    await _settle_stale(db, [job])
 
-    # fix(#1860): this handler already refused non-creators without policy
+    # This handler already refused non-creators without policy
     # access, so every caller here is entitled to the full payload.
     return await _job_to_status_response(job, include_detail=True)
 
 
-# fix(#1710): the run of "this kind of job is not an ordinary import" checks,
-# as an ORDERED table rather than a branch each — the chain had reached the
-# complexity cap, and order is part of the contract (a service refresh job
-# carries both `reupload` and `refresh` and must keep the reupload wording).
+# The "this kind of job is not an ordinary import" checks, as an ORDERED
+# table: order is part of the contract (a service refresh job carries both
+# `reupload` and `refresh` and must keep the reupload wording).
 _UNREPLAYABLE_JOB_MARKERS: tuple[tuple[str, str], ...] = (
     (
         "reupload",
         "Dataset replacement jobs cannot be replayed as ordinary imports. "
         "Start the reupload again.",
     ),
-    # feat(#1265): a registered-PostGIS refresh job carries no file/URL, so
-    # without this it fell through to the import copy, telling the user their
-    # "source" was gone.
+    # A registered-PostGIS refresh job carries no file/URL, so without this
+    # it would get the import copy telling the user their "source" was gone.
     (
         "refresh",
         "Refresh runs cannot be replayed as imports. Refresh the dataset "
         "again from its source panel.",
     ),
-    # fix(#1709): a fan-out parent whose dispatch crashed before any child was
+    # A fan-out parent whose dispatch crashed before any child was
     # queued. Generic retry would re-queue it as ONE default-layer import —
     # the layer selection was never persisted.
     (
@@ -374,28 +497,28 @@ _UNREPLAYABLE_JOB_MARKERS: tuple[tuple[str, str], ...] = (
         "This service import requires fresh credentials. Start the import "
         "again to re-authenticate.",
     ),
-    # ux(#698): analysis jobs carry file_path="" and are not replayable
+    # Analysis jobs carry file_path="" and are not replayable
     # anyway — the drawn clip mask is never persisted.
     (
         "analysis",
         "Analysis runs cannot be replayed as imports. Start the analysis "
         "again from the map builder.",
     ),
-    # fix(#1542): restart via POST /admin/backfill-embeddings/, which re-runs
+    # Restart via POST /admin/backfill-embeddings/, which re-runs
     # its own pre-flight and concurrency guards; retry would skip both.
     (
         EMBEDDING_BACKFILL_METADATA_KEY,
         "Embedding backfill runs cannot be replayed as imports. Start the "
         "backfill again from Settings.",
     ),
-    # fix(#1814): generic retry's failed -> pending CAS skips the manifest
+    # Generic retry's failed -> pending CAS skips the manifest
     # key's advisory lock, risking a second job for a key a re-apply claims.
     (
         "manifest_key",
         "Manifest imports cannot be replayed here. Apply the manifest again, "
         "which is what serializes work on its own keys.",
     ),
-    # fix(#1710): file_path is a download destination the worker never
+    # file_path is a download destination the worker never
     # finished. A truncated CSV or GeoJSON still parses, so replaying it would
     # import an incomplete dataset as a complete one.
     (
@@ -463,11 +586,11 @@ async def get_retry_capability(job: IngestJob) -> tuple[bool, str | None]:
 def _redacted_job_status(job: IngestJob) -> JobStatusResponse:
     """The job payload for a reader with no claim on the job itself.
 
-    fix(#1860): ``GET /jobs/by-dataset/{dataset_id}`` gated on the DATASET
-    being visible but returned the whole job row, leaking another user's
-    failure text and upload filename to any reader of a public/internal
-    dataset. This projection applies the same provenance rule
-    ``list_dataset_refresh_runs`` already applies, decided field by field.
+    ``GET /jobs/by-dataset/{dataset_id}`` gates only on the DATASET being
+    visible, so the whole row would hand another user's failure text and
+    upload filename to any reader of a public/internal dataset. This
+    projection applies the provenance rule ``list_dataset_refresh_runs``
+    applies, decided field by field.
 
     Kept (refresh-runs publishes the same fact to the same audience):
 
@@ -528,15 +651,14 @@ def _redacted_job_status(job: IngestJob) -> JobStatusResponse:
 async def _job_to_status_response(
     job: IngestJob, *, include_detail: bool
 ) -> JobStatusResponse:
-    """Extract warnings + structured metadata from ``user_metadata`` (S3/TYPE-2).
+    """Extract warnings + structured metadata from ``user_metadata``.
 
     Shared by ``get_job_status`` and ``get_job_status_by_dataset`` so the
     warning-parse contract lives in one place.
 
     ``include_detail`` is keyword-only with no default: every call site must
     settle who is reading before serializing a job. True yields the full
-    payload, False the redacted projection on ``_redacted_job_status``. A
-    default here is how this endpoint became a third unguarded door (#1860).
+    payload, False the redacted projection on ``_redacted_job_status``.
 
     Warnings validate through the ``IngestJobWarning`` discriminated union;
     a malformed entry (unknown ``kind``, missing fields) is logged and
@@ -613,7 +735,6 @@ async def _job_to_status_response(
         and QUICKLOOK_ITEM in obligations,
         warning_message=warning_message,
         warnings=warnings,
-        # REMED-02 / ingest-audit P2-07: surface worker-written progress fields.
         progress=job.progress,
         current_step=job.current_step,
         rows_processed=job.rows_processed,
@@ -626,7 +747,11 @@ async def _job_to_status_response(
     )
 
 
-@router.get("/by-dataset/{dataset_id}", response_model=JobStatusResponse | None)
+@router.get(
+    "/by-dataset/{dataset_id}",
+    response_model=JobStatusResponse | None,
+    summary="Get a dataset's latest ingest job",
+)
 async def get_job_status_by_dataset(
     dataset_id: uuid.UUID,
     user: Identity = Depends(get_current_active_user),
@@ -672,7 +797,7 @@ async def get_job_status_by_dataset(
     )
 
     user_roles = await get_user_roles(db, user)
-    # fix(#1860): selects the Record, not Dataset.id, because the provenance
+    # Selects the Record, not Dataset.id, because the provenance
     # predicate reads it — stays correct if that predicate needs a second field.
     dataset_stmt = (
         select(Record)
@@ -703,13 +828,13 @@ async def get_job_status_by_dataset(
         # "no warnings" without a console 404.
         return None
 
-    # fix(#1860): the gate above is a VISIBILITY check — it says nothing
-    # about whose job row this is. The creator keeps the full payload (it's
-    # their run, and the import flow polls this route); everyone else goes
-    # through the same provenance predicate ``list_dataset_refresh_runs``
-    # applies to this text.
-    include_detail = job.created_by == user.id or can_view_dataset_provenance(
-        record, user, user_roles
+    # The gate above is a VISIBILITY check; it says nothing about whose job
+    # row this is. The creator keeps the full payload (the import flow polls
+    # this route); everyone else goes through the provenance predicate
+    # ``list_dataset_refresh_runs`` applies to this text, except a publish key,
+    # which reads only its owner's jobs in full.
+    include_detail = job.created_by == user.id or (
+        not is_publish_key(db) and can_view_dataset_provenance(record, user, user_roles)
     )
     return await _job_to_status_response(job, include_detail=include_detail)
 
@@ -719,6 +844,7 @@ async def get_job_status_by_dataset(
     response_model=UploadResponse,
     status_code=status.HTTP_202_ACCEPTED,
     responses={409: CONFLICT_RESPONSE},
+    summary="Retry a failed ingest job",
 )
 async def retry_job(
     job_id: uuid.UUID,
@@ -743,14 +869,29 @@ async def retry_job(
             detail="Job not found",
         )
 
+    if job.created_by != user.id and is_publish_key(db):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
+        )
+    metadata = job.user_metadata or {}
+    # Asked for by another credential: a publish key's own jobs never make
+    # anything public or change an existing dataset's visibility. A job aimed
+    # at an existing dataset names it in its metadata, since retry clears the
+    # column.
+    targets_dataset = metadata.get("dataset_id") or metadata.get("reupload")
+    if metadata.get("visibility") == "public" or (
+        targets_dataset and "visibility" in metadata
+    ):
+        refuse_publish_key(db, "A publish key can't retry a job that sets visibility")
     # Owners always retain access. Cross-user retries additionally require the
     # effective manage_users capability through PermissionExtension.
     if job.created_by != user.id and not await _can_access_another_users_job(
         request, db, user, job
     ):
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to retry this job",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
         )
 
     if job.status != "failed":
@@ -773,7 +914,7 @@ async def retry_job(
 
     # Reset the job to pending and commit before re-queueing so the
     # orphan guard in queue_ingest_job can flip it back to failed if
-    # the queue is down (RESILIENCE-2).
+    # the queue is down.
     previous_attempt_id = job.attempt_id
     if await retry(db, job) is not Outcome.LANDED:
         await db.rollback()
@@ -829,12 +970,8 @@ def _is_lock_conflict(exc: DBAPIError) -> bool:
 
     Both mean another transaction owns rows this cancel needs, and both are
     safe to report as a retryable 409: nothing was written. 40P01 should be
-    unreachable now that cancel takes locks in the worker's own order (see
-    ``cancel_job``, fix(#1709)), but mapping it costs one tuple
-    member and turns a future ordering regression into a 409, not a 500.
-
-    fix(#1847): moved to ``app.core.db.sqlstate`` for a third caller — a
-    rename, not a policy change.
+    unreachable, since cancel takes locks in the worker's own order, but
+    mapping it turns an ordering regression into a 409, not a 500.
     """
     return is_lock_conflict(exc)
 
@@ -845,15 +982,15 @@ async def _may_cancel_job(
     user: Identity,
     job: IngestJob,
 ) -> bool:
-    """The three authorization arms for cancel (#1677 design §3).
+    """The three authorization arms for cancel.
 
     Arm 1: owners always retain access. Arm 2: the effective cross-user
     capability policy (same as view/retry). Arm 3: dataset write access —
     ``check_dataset_write_access`` raises 404 (not visible) or 403 (visible,
-    not owner/admin); the caller's generic 403 avoids leaking visibility.
+    not owner/admin); the caller's generic 404 avoids leaking visibility.
 
-    fix(#1709): arm 2 runs as a SILENT probe — a losing arm is
-    not a denial when a later arm grants (arm 3, for a dataset owner
+    Arm 2 runs as a SILENT probe: a losing arm is not a denial when a later
+    arm grants (arm 3, for a dataset owner
     cancelling a refresh an admin triggered). The denial fires once, below,
     only after every arm fails; arm 3 emits no telemetry of its own, so the
     deny path's event count stays exactly one.
@@ -894,6 +1031,7 @@ async def _may_cancel_job(
     "/{job_id}/cancel",
     response_model=JobCancelResponse,
     responses={409: CONFLICT_RESPONSE},
+    summary="Cancel an ingest job",
 )
 async def cancel_job(
     job_id: uuid.UUID,
@@ -922,10 +1060,15 @@ async def cancel_job(
             detail="Job not found",
         )
 
+    if job.created_by != user.id and is_publish_key(db):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
+        )
     if not await _may_cancel_job(request, db, user, job):
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to cancel this job",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
         )
 
     if job.status == "cancelled":
@@ -1005,9 +1148,8 @@ async def cancel_job(
 
     # Post-commit, best-effort: ask Procrastinate to cancel a todo row or
     # abort a doing one. Any failure past the commit — row lookup included
-    # (fix(#1709): a dropped connection here used to 500 an
-    # already-durable cancel) — is logged, not surfaced: the fences above
-    # make delivery a no-op either way.
+    # (a dropped connection must not 500 an already-durable cancel) — is
+    # logged, not surfaced: the fences above make delivery a no-op either way.
     try:
         queue_rows = await db.execute(_LIVE_QUEUE_ROWS_SQL, {"job_id": str(job.id)})
         queue_job_ids = list(queue_rows.scalars())

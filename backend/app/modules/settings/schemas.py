@@ -6,12 +6,14 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, Field, field_validator
 
 from app.core.config import validate_privacy_url_shape
+from app.core.config_ai import ClaudePlatform
 from app.core.public_urls import (
     canonical_host_error,
     is_api_base_path,
     is_usable_public_origin,
 )
 from app.modules.auth.schemas import validate_role_name
+from app.platform.story_frames import parse_frame_hosts
 
 
 class BasemapEntry(BaseModel):
@@ -52,7 +54,6 @@ class BasemapEntry(BaseModel):
     def validate_tile_url(cls, v: str) -> str:
         """Allow style JSON URLs (.json), /styles/ paths, tile URLs with
         {z}/{x}/{y} placeholders, or a PMTiles archive URL."""
-        # Strip query string for path-based checks
         base_path = v.split("?")[0].rstrip("/")
         if base_path.endswith(".json"):
             return v
@@ -62,11 +63,11 @@ class BasemapEntry(BaseModel):
         # (e.g. https://tiles.openfreemap.org/styles/bright)
         if "/styles/" in v:
             return v
-        # feat(pmtiles): a single static PMTiles archive, addressed directly
-        # (no style JSON, no tile server) -- bare (https://....pmtiles) or
-        # scheme-prefixed (pmtiles://https://....pmtiles), matching MapLibre's
-        # `pmtiles://` protocol and frontend/src/lib/basemap-utils.ts. The
-        # inner URL must still be a well-formed http(s) URL.
+        # A single static PMTiles archive (no style JSON, no tile server),
+        # bare (https://....pmtiles) or scheme-prefixed
+        # (pmtiles://https://....pmtiles), matching MapLibre's `pmtiles://`
+        # protocol and frontend/src/lib/basemap-utils.ts. The inner URL must
+        # still be a well-formed http(s) URL.
         inner = v.removeprefix("pmtiles://")
         inner_base_path = inner.split("?")[0].rstrip("/")
         if inner_base_path.lower().endswith(".pmtiles"):
@@ -186,7 +187,7 @@ class FeatureFlagsResponse(BaseModel):
 
     enable_dataset_editing: bool = False
     require_metadata_for_publish: bool = False
-    # feat(#1691): when true, only admins may set `visibility: public`; the
+    # When true, only admins may set `visibility: public`; the
     # frontend uses it to hide/disable the Public option for non-admins.
     restrict_public_visibility: bool = False
 
@@ -280,7 +281,14 @@ class ApiKeyStatusResponse(BaseModel):
     """Response for GET /settings/api-key-status/."""
 
     anthropic_configured: bool = Field(
-        description="Whether ANTHROPIC_API_KEY is set in the environment."
+        description=(
+            "Whether Claude's credentials are set for the selected platform: "
+            "ANTHROPIC_API_KEY on Anthropic's API, or that platform's settings on "
+            "Foundry, Bedrock or Vertex. The model is checked separately."
+        )
+    )
+    anthropic_platform: ClaudePlatform = Field(
+        description="Where Claude requests go, from ANTHROPIC_PLATFORM."
     )
     openai_configured: bool = Field(
         description="Whether OPENAI_API_KEY is set in the environment."
@@ -363,7 +371,7 @@ def validate_global_rate_limit(v: Any) -> int:
 
 def validate_ogc_items_max_page_size(v: Any) -> int:
     # Upper bound guards against a mis-set value that would let an anonymous
-    # request build an unbounded FeatureCollection in memory (#665).
+    # request build an unbounded FeatureCollection in memory.
     v = int(v)
     if v < 1 or v > 100_000:
         raise ValueError("ogc_items_max_page_size must be between 1 and 100000")
@@ -406,7 +414,6 @@ def validate_upload_extensions(v: Any) -> str:
 def validate_basemaps(v: Any) -> list[dict]:
     if not isinstance(v, list):
         raise ValueError("basemaps must be a list")
-    # Validate each entry through the Pydantic model
     return [BasemapEntry(**entry).model_dump() for entry in v]
 
 
@@ -455,18 +462,17 @@ def _normalize_absolute_url(v: Any) -> str:
 
 
 def validate_public_app_url(v: Any) -> str:
-    """fix(#1555): one rule, both entry points.
+    """One rule, both entry points.
 
-    This validator and ``is_usable_public_origin`` each held half of what
+    This validator and ``is_usable_public_origin`` each cover half of what
     makes a public app URL usable, so an env ``PUBLIC_APP_URL`` (which skips
     this function) could accept ``https://maps.example.com/api``, while a
     persisted value (which skips the shape rule) could store
     ``https://192.168.1`` and have every reader silently ignore it. The
     ``/api`` clause is checked first only to keep its specific message.
     """
-    # `v is None`, not `not v`: JSON null is a legitimate clear (matching
-    # validate_privacy_url below), but a falsy non-string (False, 0, [], {})
-    # is a type error, not a clear — `not v` wrongly caught those too.
+    # `v is None`, not `not v`: JSON null is a legitimate clear, but a falsy
+    # non-string (False, 0, [], {}) is a type error, not a clear.
     if v is None or (isinstance(v, str) and not v.strip()):
         return ""
     if not isinstance(v, str):
@@ -494,7 +500,7 @@ def validate_public_api_url(v: Any) -> str:
 
 
 def validate_privacy_url(v: Any) -> str:
-    """PRIV-1: the login/register privacy-policy link. Unset clears it.
+    """The login/register privacy-policy link. Unset clears it.
 
     Deliberately NOT ``_normalize_absolute_url`` (above): that helper rejects
     a query string or fragment, but a real policy page (Google Docs, Notion,
@@ -503,16 +509,13 @@ def validate_privacy_url(v: Any) -> str:
     admin-write path agrees with the boot validator and router_public.py's
     read-path defense on what "safe" means for a raw ``<a href>``.
     """
-    # `v is None`, not `not v`: JSON null is a legitimate clear (matching
-    # validate_enabled_plugins), but a falsy non-string (False, 0, [], {})
-    # is a type error, not a clear — `not v` wrongly caught those too.
+    # `v is None`, not `not v`: see validate_public_app_url above.
     if v is None or (isinstance(v, str) and not v.strip()):
         return ""
     if not isinstance(v, str):
         raise ValueError("Value must be a string")
-    # No local re-wrap of the ValueError: the caller
-    # (router.py's _canonicalize_setting_value) already prefixes it with
-    # "Validation error for 'privacy_url': ...".
+    # No local re-wrap: router.py's _canonicalize_setting_value already
+    # prefixes the ValueError with "Validation error for 'privacy_url': ...".
     return validate_privacy_url_shape(v)
 
 
@@ -552,6 +555,17 @@ def validate_refresh_token_expire(v: Any) -> int:
     return _validate_bounded_int(v, "refresh_token_expire_days", 1, 365)
 
 
+AUDIT_RETENTION_MIN_DAYS = 90
+
+
+def validate_audit_retention_days(v: Any) -> int | None:
+    if v is None:
+        return None
+    return _validate_bounded_int(
+        v, "audit_retention_days", AUDIT_RETENTION_MIN_DAYS, 36500
+    )
+
+
 def validate_embedding_dims(v: Any) -> int:
     return _validate_bounded_int(v, "embedding_dims", 1, 4096)
 
@@ -572,10 +586,18 @@ def validate_max_datasets_per_user(v: Any) -> int:
     return _validate_bounded_int(v, "max_datasets_per_user", 0, 10_000_000)
 
 
+def validate_max_story_image_mb_per_user(v: Any) -> int:
+    return _validate_bounded_int(v, "max_story_image_mb_per_user", 0, 10_000_000)
+
+
+def validate_previous_versions_kept(v: Any) -> int:
+    return _validate_bounded_int(v, "previous_versions_kept", 1, 50)
+
+
 def validate_max_ai_tokens_per_user_per_day(v: Any) -> int:
     # 0 = unlimited; reject negatives, which would otherwise persist as
     # "overridden" yet behave as unlimited via the cap>0 guard in
-    # _check_ai_budget — silently disabling the cost cap (codex P3 on #402).
+    # _check_ai_budget — silently disabling the cost cap.
     return _validate_bounded_int(
         v, "max_ai_tokens_per_user_per_day", 0, 9007199254740991
     )
@@ -673,11 +695,15 @@ SETTING_VALIDATORS: dict[str, Any] = {
     "enabled_plugins": validate_enabled_plugins,
     "access_token_expire_minutes": validate_access_token_expire,
     "refresh_token_expire_days": validate_refresh_token_expire,
+    "audit_retention_days": validate_audit_retention_days,
     "embedding_dims": validate_embedding_dims,
     "tile_cache_ttl": validate_tile_cache_ttl,
     "max_storage_bytes_per_user": validate_max_storage_bytes_per_user,
     "max_datasets_per_user": validate_max_datasets_per_user,
+    "max_story_image_mb_per_user": validate_max_story_image_mb_per_user,
+    "previous_versions_kept": validate_previous_versions_kept,
     "max_ai_tokens_per_user_per_day": validate_max_ai_tokens_per_user_per_day,
     "allowed_email_domains": validate_allowed_email_domains,
     "registration_default_role": validate_role_name,
+    "story_frame_hosts": parse_frame_hosts,
 }

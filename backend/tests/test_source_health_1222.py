@@ -110,7 +110,7 @@ def _status_map(mapping: dict[str, int], default: int = 200):
 
 
 def _json_body(payload, status: int = 200):
-    """fix(#1746): handler answering every URL with one JSON document.
+    """Handler answering every URL with one JSON document.
 
     The ArcGIS branch reads the body, so ``_status_map``'s empty response is
     not a usable double for it — an empty body parses as neither an error
@@ -217,7 +217,7 @@ class TestProbeStatusMapping:
             (lambda req: httpx.ConnectError("boom", request=req), NETWORK_ERROR),
             (lambda req: httpx.RemoteProtocolError("boom", request=req), NETWORK_ERROR),
             (lambda req: SSRFError("private range"), BLOCKED_BY_POLICY),
-            # fix(#1271 review): NXDOMAIN is a property of the ORIGIN, not a
+            # NXDOMAIN is a property of the ORIGIN, not a
             # policy refusal — an expired domain must read network_error or
             # an operator goes auditing egress policy for a dead hostname.
             (lambda req: SSRFResolutionError("no such host"), NETWORK_ERROR),
@@ -242,7 +242,7 @@ class TestProbeStatusMapping:
     async def test_stalled_resolution_is_cut_off_by_the_outer_deadline(
         self, monkeypatch
     ) -> None:
-        """fix(#1271 review): the guard transport resolves DNS before
+        """The guard transport resolves DNS before
         httpx's phase timeouts apply, so a stalling resolver would hold the
         probe far beyond the advertised bound without the outer deadline."""
 
@@ -267,7 +267,7 @@ class TestProbeStatusMapping:
         assert result.detail == TIMEOUT
 
     def test_failure_classification_tracks_contact_honestly(self) -> None:
-        """fix(#1271 review): the SSRF shapes report contact from whether a
+        """The SSRF shapes report contact from whether a
         response hop arrived before the failure — a public origin redirecting
         to a blocked target WAS contacted; a first-hop refusal was not. Wire
         attempts (timeout, connect failure) always count."""
@@ -395,7 +395,7 @@ class TestStacItemHrefCapture:
         assert self_link_href(feature, _SEARCH_URL) == _ITEM
 
     def test_relative_self_link_resolves_against_the_search_url(self) -> None:
-        """fix(#1271 review): a relative self href is legal STAC. Dropping it
+        """A relative self href is legal STAC. Dropping it
         left item_href unwritten, so health reported healthy off the asset
         even after the item was withdrawn."""
         feature = {"links": [{"rel": "self", "href": "/collections/c/items/scene"}]}
@@ -453,7 +453,7 @@ class TestStacItemHrefCapture:
 
 
 class TestPinnedUrlRestoration:
-    """fix(#1271 review): the SSRF transport pins the request URL to the
+    """The SSRF transport pins the request URL to the
     validated IP for the duration of the connect, and must restore it after.
     A pinned URL that outlives the hop leaks the IP into relative-redirect
     resolution (next hop connects to the IP with SNI set to the IP — TLS
@@ -866,7 +866,7 @@ class TestStacOriginProbe:
 
 
 class TestArcgisAuthEnvelope:
-    """fix(#1746) finding 12: ArcGIS puts an auth refusal inside an HTTP 200.
+    """ArcGIS puts an auth refusal inside an HTTP 200.
 
     A status-code probe reads 499 "Token Required" as healthy, so an org-only
     layer that GeoLens can no longer read reports as fine. The health VALUE
@@ -895,7 +895,7 @@ class TestArcgisAuthEnvelope:
     async def test_a_public_layer_document_does_not_clear_a_gated_query(
         self, probe_transport
     ) -> None:
-        """fix(#1746 codex r6): the exact deployment the old target missed.
+        """The exact deployment the old target missed.
 
         Serving layer metadata anonymously while requiring a token to run a
         query is an ordinary ArcGIS configuration. The old probe read the
@@ -922,7 +922,7 @@ class TestArcgisAuthEnvelope:
     async def test_a_healthy_count_answer_probes_the_query_operation(
         self, probe_transport
     ) -> None:
-        """fix(#1746 codex r6): the probe asks what the WORKER asks.
+        """The probe asks what the WORKER asks.
 
         ``build_gdal_source`` composes ``<layer>/query?...`` and that is what
         ogr2ogr fetches. A service that serves the layer DOCUMENT publicly and
@@ -1007,7 +1007,7 @@ class TestArcgisAuthEnvelope:
 
         Shaped as a layer with a long field list and coded-value domains,
         because that is the real thing that gets there. The probe asks
-        ``/query`` now (fix #1746 codex r6), whose answer is a single count
+        ``/query`` now (fix #1746), whose answer is a single count
         and could never be this big — which is exactly why an oversized body
         cannot be an auth envelope either, and is read as reachable.
         """
@@ -1036,7 +1036,7 @@ class TestArcgisAuthEnvelope:
     async def test_a_body_too_large_to_parse_is_reachable_not_inaccessible(
         self, probe_transport
     ) -> None:
-        """fix(#1746 codex post-rebase): the false negative that mirrors the bug.
+        """The false negative that mirrors the bug.
 
         ``fetch_json_document`` stops reading at ``MAX_DOCUMENT_BYTES``, a cap
         sized for STAC item documents. A real ArcGIS layer with a long field
@@ -1152,9 +1152,7 @@ class TestArcgisAuthEnvelope:
 
 
 class TestAJsonDepthBombIsAVerdictNotACrash:
-    """fix(#1858, backend audit 2026-09-04 P2-2).
-
-    A balanced nesting 300,000 deep costs two bytes a level, so the document
+    """A balanced nesting 300,000 deep costs two bytes a level, so the document
     is ~600 KB and passes ``fetch_json_document``'s own 2 MiB cap with room to
     spare. ``json.loads`` answers ``RecursionError``, a ``RuntimeError``
     subclass, so it was caught neither by the parse's ``except ValueError``
@@ -1223,10 +1221,9 @@ class TestServiceOriginProbe:
         self, client, admin_auth_header, test_db_session, probe_transport
     ) -> None:
         install, recorded = probe_transport
-        # fix(#1746): the ArcGIS branch reads the body, so the double has to
-        # answer with a real document rather than an empty 200. fix(#1746
-        # codex r6): and the thing asked is the count query, so that is what
-        # comes back.
+        # The ArcGIS branch reads the body, so the double has to
+        # answer with a real document rather than an empty 200. And the thing asked is the
+        # count query, so that is what comes back.
         install(_json_body({"count": 4127}))
         admin_id = await get_user_id(test_db_session, "admin")
         dataset = await _service_dataset(test_db_session, created_by=admin_id)
@@ -1251,7 +1248,7 @@ class TestServiceOriginProbe:
     async def test_mid_probe_rebind_discards_the_stale_verdict(
         self, client, admin_auth_header, test_db_session, monkeypatch
     ) -> None:
-        """fix(#1271 review): the probe awaits a third-party host, and a
+        """The probe awaits a third-party host, and a
         reupload can commit a new origin binding in that window. The old
         origin's verdict must not land on the new binding — for a service
         replaced by an upload it would stick forever, since uploads 409."""
@@ -1267,7 +1264,7 @@ class TestServiceOriginProbe:
             await test_db_session.commit()
             return OriginProbeResult(HEALTHY, None)
 
-        # fix(#1746): every service origin now goes through the one helper
+        # Every service origin now goes through the one helper
         # that picks a probe by service type, so this patches that rather than
         # a specific probe and keeps asserting the rebind property.
         monkeypatch.setattr(
@@ -1288,7 +1285,7 @@ class TestServiceOriginProbe:
     async def test_wfs_probe_targets_the_canonical_service_url(
         self, client, admin_auth_header, test_db_session, probe_transport
     ) -> None:
-        """fix(#1271 review): WFS addresses layers by typename, so the
+        """WFS addresses layers by typename, so the
         enriched ``<base>/<layer name>`` origin_uri is provenance, not an
         endpoint — and the base alone is not enough either, since many
         servers 4xx a request without the capabilities parameters. The probe
@@ -1315,25 +1312,25 @@ class TestServiceOriginProbe:
             str(recorded[0].url)
             == "https://origin.test/wfs?service=WFS&request=GetCapabilities"
         )
-        # fix(#1746): still the ranged GET. Only the ArcGIS branch moved to a
+        # Still the ranged GET. Only the ArcGIS branch moved to a
         # body-reading fetch; a WFS origin has no error envelope to read.
         assert recorded[0].headers["Range"] == "bytes=0-0"
 
     async def test_a_many_param_service_url_still_probes_not_a_500(
         self, client, admin_auth_header, test_db_session, probe_transport
     ) -> None:
-        """fix(#1770 round 47c). `build_capabilities_url`
+        """`build_capabilities_url`
         (`adapters/wfs.py`) is reached here via `origin_probe.py::service_
         probe_target`, with NO surrounding `except ValueError` anywhere on
         this path -- unlike `probe_wfs`'s own caller (`_header_auth_probe`
-        in `probe.py`), which does catch it. Round 47b bound this function's
+        in `probe.py`), which does catch it. An earlier change bounded this function's
         query parse with `max_num_fields`, reasoning every caller degraded
         the refusal gracefully; it checked one caller and this route was the
         one it missed, so a many-param `origin_ref.url` (schema-capped at
         2048 chars, well under the field count that reasoning bound at)
         would have reached this route as a raw 500 rather than the healthy
         (or unhealthy) probe result an ordinary URL gets. Counterfactual:
-        restoring round 47b's `max_num_fields=MAX_QUERY_FIELDS` at
+        restoring the earlier `max_num_fields=MAX_QUERY_FIELDS` at
         `build_capabilities_url` turns this into a 500.
         """
         install, recorded = probe_transport
@@ -1365,7 +1362,7 @@ class TestServiceOriginProbe:
     async def test_legacy_wfs_row_without_a_base_url_refuses_to_probe(
         self, client, admin_auth_header, test_db_session, probe_transport
     ) -> None:
-        """fix(#1271 review): migration 0036's legacy branch leaves
+        """Migration 0036's legacy branch leaves
         origin_ref.url unset when the service base is not derivable. The only
         value on hand is the enriched non-endpoint, and probing it would
         persist a false result — refuse instead, like every pointerless row."""
@@ -1472,7 +1469,7 @@ class TestNotApplicableOrigins:
     async def test_policy_blocked_probe_keeps_the_prior_contact_time(
         self, client, admin_auth_header, test_db_session, probe_transport
     ) -> None:
-        """fix(#1271 review): an SSRF refusal happens before any packet goes
+        """An SSRF refusal happens before any packet goes
         out, so it must not advance the contact clock — stamping it would
         overwrite a real earlier contact time with a policy-check time. The
         verdict itself still persists: "policy now blocks this origin" is
@@ -1503,7 +1500,7 @@ class TestNotApplicableOrigins:
     async def test_successful_probe_invalidates_the_dataset_list_cache(
         self, client, admin_auth_header, test_db_session, probe_transport, monkeypatch
     ) -> None:
-        """fix(#1271 review): GET /datasets/ caches these fields for 60s;
+        """GET /datasets/ caches these fields for 60s;
         every other dataset mutation invalidates, and a probe that skipped it
         left the list serving the pre-probe state after the probe response
         already showed the update."""

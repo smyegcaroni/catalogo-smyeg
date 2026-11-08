@@ -3,7 +3,7 @@ from urllib.parse import urlencode
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,14 +13,22 @@ from app.core.record_types import capabilities
 from app.core.db.tenant_session import current_tenant_var
 from app.core.db.sqlstate import is_caller_type_fault
 from app.core.dependencies import get_db
-from app.core.geo import extent_to_bbox
+from app.core.geo import extent_to_bbox, shown_extent
 from app.core.identity import Identity
 from app.core.persistent_config import OGC_ITEMS_MAX_PAGE_SIZE
 from app.core.public_urls import get_public_api_url, get_public_app_url
 from app.core.tenancy import is_multi_tenant
-from app.core.tile_scope import tile_template_query
-from app.modules.auth.dependencies import get_optional_user
-from app.modules.catalog.authorization import apply_visibility_filter, get_user_roles
+from app.core.tile_scope import tile_template_query, vector_tile_template
+from app.modules.auth.dependencies import (
+    BASIC_CHALLENGE,
+    get_optional_user,
+    get_optional_user_no_security_schema,
+)
+from app.modules.catalog.authorization import (
+    apply_visibility_filter,
+    get_user_roles,
+    visible_vrt_extents,
+)
 from app.modules.catalog.datasets.domain.models import Dataset, DatasetGrant, Record
 from app.modules.catalog.features.schemas import inline_json_schema
 from app.modules.catalog.features.service import (
@@ -58,6 +66,21 @@ from app.standards.ogc.utils import build_url, link_header_value
 logger = structlog.stdlib.get_logger(__name__)
 
 _CRS84_URI = "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+# The spellings of CRS84 a client may send: the canonical URI, its https form
+# and the OGC API Features short form.
+_CRS84_SPELLINGS = frozenset(
+    {_CRS84_URI, _CRS84_URI.replace("http://", "https://", 1), "[OGC:CRS84]"}
+)
+
+
+def _require_crs84(name: str, value: str | None) -> None:
+    """Refuse a CRS parameter other than CRS84; every geometry here is WGS84."""
+    if value is not None and value not in _CRS84_SPELLINGS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported {name} {value!r}: only {_CRS84_URI} is supported.",
+        )
+
 
 # Every route that runs _check_cold_rehydrate can answer 202
 # {status: 'warming', job_id} in multi-tenant mode; declaring it keeps
@@ -220,7 +243,12 @@ async def _get_visible_dataset(
     return dataset
 
 
-@ogc_router.get("/", response_model=LandingPage, responses=ERROR_RESPONSES_PUBLIC)
+@ogc_router.get(
+    "/",
+    response_model=LandingPage,
+    responses=ERROR_RESPONSES_PUBLIC,
+    summary="Get the OGC API landing page",
+)
 async def landing_page(
     request: Request,
     response: Response,
@@ -282,8 +310,40 @@ async def landing_page(
     )
 
 
+@ogc_router.api_route("/desktop", methods=["GET", "HEAD"], include_in_schema=False)
+async def desktop_entry(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: Identity | None = Depends(get_optional_user_no_security_schema),
+) -> RedirectResponse:
+    """Challenge for HTTP Basic, then send a signed-in caller to the landing page.
+
+    ArcGIS Pro sends its saved login only in answer to a Basic challenge, and
+    the landing page serves anonymous callers, so this route asks every caller
+    without a working credential for one, whatever the catalog holds.
+    """
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={
+                "WWW-Authenticate": BASIC_CHALLENGE,
+                "Cache-Control": "no-store",
+            },
+        )
+    public_api_url = await get_public_api_url(db, request=request)
+    return RedirectResponse(
+        build_url("/", base_url=public_api_url),
+        status_code=status.HTTP_302_FOUND,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @ogc_router.get(
-    "/conformance", response_model=ConformanceResponse, responses=ERROR_RESPONSES_PUBLIC
+    "/conformance",
+    response_model=ConformanceResponse,
+    responses=ERROR_RESPONSES_PUBLIC,
+    summary="Get the OGC conformance declaration",
 )
 async def conformance(f: str | None = Query(None)) -> ConformanceResponse:
     """OGC conformance declaration -- lists supported specification classes."""
@@ -325,6 +385,7 @@ async def conformance(f: str | None = Query(None)) -> ConformanceResponse:
     "/collections/{dataset_id}",
     response_model=OGCCollectionMetadata,
     responses=ERROR_RESPONSES_PUBLIC,
+    summary="Get a dataset's OGC feature collection",
 )
 async def get_dataset_collection(
     request: Request,
@@ -344,8 +405,13 @@ async def get_dataset_collection(
             detail=f"Collection '{dataset_id}' is not an OGC API Features collection.",
         )
 
+    vrt_extents = None
+    if dataset.record.record_type == "vrt_dataset":
+        user_roles = await get_user_roles(db, user) if user is not None else set()
+        vrt_extents = await visible_vrt_extents(db, [dataset.id], user, user_roles)
+    spatial_extent = shown_extent(dataset.record, dataset.id, vrt_extents)
     extent = {}
-    bbox = extent_to_bbox(dataset.record.spatial_extent)
+    bbox = extent_to_bbox(spatial_extent)
     if bbox:
         extent["spatial"] = {
             "bbox": [bbox],
@@ -410,6 +476,26 @@ async def get_dataset_collection(
                 title="Queryables",
             )
         )
+        if (
+            capabilities(dataset.record.record_type).tile_token == "vector"
+            and dataset.geometry_type is not None
+        ):
+            links.append(
+                OGCLink(
+                    rel="tiles",
+                    href=build_url(
+                        vector_tile_template(
+                            dataset.table_name,
+                            dataset.tile_cache_version,
+                            dataset.publication_version,
+                        ),
+                        base_url=public_api_url,
+                    ),
+                    type="application/vnd.mapbox-vector-tile",
+                    title="Vector tiles",
+                    templated=True,
+                )
+            )
     else:
         # A coverage collection has no rel=items, so without a
         # replacement link the body would only carry self+root and be a
@@ -455,9 +541,7 @@ async def get_dataset_collection(
         links=links,
     )
 
-    # Emit OGC collection-serve usage event through the
-    # billing-import-free seam so the cloud overlay can update last_accessed_at.
-    # Best-effort fire-and-forget — errors logged, response unaffected.
+    # Usage event for the cloud overlay (best-effort; errors logged).
     if dataset.table_name:
         await _emit_ogc_usage_event(dataset.table_name)
 
@@ -469,6 +553,7 @@ async def get_dataset_collection(
     "/collections/{dataset_id}/queryables",
     response_class=JSONResponse,
     responses={**COLD_WARMING_RESPONSE, **ERROR_RESPONSES_PUBLIC},
+    summary="Get a feature collection's queryables",
 )
 async def get_collection_queryables(
     request: Request,
@@ -604,7 +689,7 @@ FILTER_BAD_REQUEST_RESPONSE = {
         **ERROR_RESPONSES_PUBLIC,
         400: FILTER_BAD_REQUEST_RESPONSE,
     },
-    include_in_schema=False,  # Trailing-slash alias hidden from OpenAPI.
+    include_in_schema=False,  # Trailing-slash alias hidden from OpenAPI., summary="List OGC features"
 )
 @ogc_features_router.get(
     "/collections/{dataset_id}/items",
@@ -621,6 +706,7 @@ FILTER_BAD_REQUEST_RESPONSE = {
         **ERROR_RESPONSES_PUBLIC,
         400: FILTER_BAD_REQUEST_RESPONSE,
     },
+    summary="List OGC features",
 )
 @limiter.limit(
     _FILTERED_ITEMS_RATE_LIMIT,
@@ -693,6 +779,19 @@ async def get_collection_items(
             "(http://www.opengis.net/def/crs/OGC/1.3/CRS84) is supported."
         ),
     ),
+    crs: str | None = Query(
+        None,
+        description=(
+            "CRS of the returned geometries. Only CRS84 "
+            "(http://www.opengis.net/def/crs/OGC/1.3/CRS84, its https form or "
+            "[OGC:CRS84]) is supported; any other value is refused with 400."
+        ),
+    ),
+    bbox_crs: str | None = Query(
+        None,
+        alias="bbox-crs",
+        description="CRS of `bbox`. Only CRS84 is supported, as for `crs`.",
+    ),
     user: Identity | None = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
@@ -726,14 +825,12 @@ async def get_collection_items(
             ),
         )
 
-    # `filter=` is now evaluated server-side (compiled below,
-    # after the cold-rehydrate seam). Filter geometries are WGS84-only —
-    # reject any other filter-crs instead of misinterpreting coordinates.
-    if filter_crs is not None and filter_crs != _CRS84_URI:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported filter-crs: only {_CRS84_URI} is supported.",
-        )
+    # `filter=` is evaluated server-side (compiled below, after the
+    # cold-rehydrate seam). Filter geometries are WGS84-only: reject any other
+    # filter-crs instead of misinterpreting coordinates.
+    _require_crs84("filter-crs", filter_crs)
+    _require_crs84("crs", crs)
+    _require_crs84("bbox-crs", bbox_crs)
 
     bbox_parsed = None
     if bbox:
@@ -755,6 +852,7 @@ async def get_collection_items(
         "f",
         "datetime",
         "crs",
+        "bbox-crs",
         "api_key",
         "include_geometry",
         # The CQL2 filter params bind explicitly above; keep them
@@ -786,32 +884,30 @@ async def get_collection_items(
         if _ogc_cold_result is not None:
             return _ogc_cold_result
 
-    # Reuse existing feature service. Pass the cached feature_count so the
-    # pagination COUNT(*) collapses into a constant-time lookup, and honor
-    # include_geometry so clients that don't need geometry avoid the
-    # ST_AsGeoJSON cost. When after_gid is provided, the service uses keyset pagination and
-    # ignores offset.
-    # The raster/VRT guard above only covers datasets that never
-    # had a backing table. A genuinely-missing VECTOR table (cold-evicted /
-    # partial ingest) still raises here; mirror list_features and return
-    # 503, not an unhandled 500 that holds a DB connection.
-    # Compile the CQL2 filter against the live table schema —
-    # the same schema authority the queryables document publishes. This runs
-    # after the cold-rehydrate seam so a cold table warms (202) instead of
-    # misreporting its columns as unknown queryables.
+    # Pass the cached feature_count so the pagination COUNT(*) is a
+    # constant-time lookup, and honor include_geometry so clients that don't need
+    # geometry avoid the ST_AsGeoJSON cost. With after_gid the service uses keyset
+    # pagination and ignores offset.
+    #
+    # The raster/VRT guard above only covers datasets that never had a backing
+    # table. A genuinely-missing VECTOR table (cold-evicted / partial ingest)
+    # still raises here; mirror list_features and return 503, not an unhandled
+    # 500 that holds a DB connection.
+    #
+    # The CQL2 filter compiles against the live table schema, the same authority
+    # the queryables document publishes, after the cold-rehydrate seam so a cold
+    # table warms (202) instead of misreporting its columns as unknown queryables.
     cql2_where: str | None = None
     cql2_binds: list = []
     if filter_expr is not None:
-        # Ordering is deliberate: a parse failure is the caller's bug (400,
-        # no database access); a missing table
-        # yields an empty live schema, and compiling against it would 400
-        # every attribute filter as an unknown property, so table
-        # availability stays the retryable 503; schema-dependent validation
-        # runs last.
+        # Ordering is deliberate: a parse failure is the caller's bug (a 400
+        # before the table and schema queries); a missing table yields an empty
+        # live schema, and compiling against it would 400 every attribute filter
+        # as an unknown property, so table availability stays the retryable 503;
+        # schema-dependent validation runs last.
         filter_ast = parse_feature_cql2(filter_expr, filter_lang)
-        # The schema-introspection queries carry no
-        # caller input, so any database error here is operational — classify
-        # it exactly like the feature query's 503, not a 500.
+        # The schema-introspection queries carry no caller input, so any database
+        # error here is operational: classify it like the feature query's 503.
         try:
             if not await feature_table_exists(db, dataset.table_name):
                 raise HTTPException(
@@ -976,9 +1072,7 @@ async def get_collection_items(
         links=links,
     )
 
-    # Emit OGC items-serve usage event through the
-    # billing-import-free seam so the cloud overlay can update last_accessed_at.
-    # Best-effort fire-and-forget — errors logged, response unaffected.
+    # Usage event for the cloud overlay (best-effort; errors logged).
     if dataset.table_name:
         await _emit_ogc_usage_event(dataset.table_name)
 
@@ -1009,17 +1103,23 @@ async def get_collection_items(
         **COLD_WARMING_RESPONSE,
         **ERROR_RESPONSES_PUBLIC,
     },
+    summary="Get an OGC feature",
 )
 async def get_collection_item_feature(
     request: Request,
     dataset_id: uuid.UUID,
     feature_id: int,
     f: str | None = Query(None),
+    crs: str | None = Query(
+        None,
+        description="CRS of the returned geometry. Only CRS84 is supported.",
+    ),
     user: Identity | None = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """OGC API Features single feature endpoint -- returns a GeoJSON Feature."""
     _validate_f_param(f)
+    _require_crs84("crs", crs)
     public_api_url = await get_public_api_url(db, request=request)
     dataset = await _get_visible_dataset(db, user, dataset_id)
 
@@ -1037,7 +1137,6 @@ async def get_collection_item_feature(
 
     has_geometry = dataset.geometry_type is not None
 
-    # Cold-rehydrate seam — BEFORE feature-by-id query.
     if dataset.table_name and dataset.record:
         _item_cold_tid = current_tenant_var.get(None)
         _item_cold_result = await _check_cold_rehydrate(

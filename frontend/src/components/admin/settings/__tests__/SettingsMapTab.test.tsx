@@ -11,7 +11,7 @@ import type { BasemapEntry, SettingItem } from '@/api/settings';
  * self-hoster typing a PMTiles archive URL must not be blocked here even
  * though the backend would accept it.
  *
- * codex review (#1688 P1): a bare PMTiles archive is only renderable as a
+ * A bare PMTiles archive is only renderable as a
  * basemap when it's raster (see basemap-utils.ts). `handleAdd` reads the
  * archive header via `pmtiles`'s `PMTiles` class (mocked globally in
  * src/test/setup.ts, defaulting to a raster tileType) before accepting a
@@ -150,9 +150,9 @@ describe('SettingsMapTab custom basemap URL validation', () => {
   });
 });
 
-// fix(#1755): the basemap API key fields are admin secrets, not login
+// The basemap API key fields are admin secrets, not login
 // credentials -- they need the same password-manager opt-out attributes the
-// service-token inputs gained in #1750.
+// service-token inputs carry.
 describe('SettingsMapTab API key fields opt out of password managers', () => {
   function expectOptedOut(input: HTMLElement) {
     expect(input).toHaveAttribute('autocomplete', 'new-password');
@@ -192,7 +192,7 @@ describe('SettingsMapTab API key fields opt out of password managers', () => {
   });
 });
 
-// fix(#1778): the preset toggle, custom-basemap toggle, plugin toggle and
+// The preset toggle, custom-basemap toggle, plugin toggle and
 // per-basemap API-key field paired a bare Label/<p> with a Switch/Input that
 // carried no id, so each announced as an unnamed control to a screen reader.
 describe('SettingsMapTab accessible names (#1778)', () => {

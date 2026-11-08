@@ -1,4 +1,4 @@
-"""Round-trip integration test for both SDKs (Phase 215 / OCSDK-01, OCSDK-02).
+"""Round-trip integration test for both SDKs.
 
 The Python half exercises the SDK directly against the in-process FastAPI app
 via a manually-constructed ``httpx.Client`` that wraps ``ASGITransport(app=app)``
@@ -6,25 +6,24 @@ plus the auth headers built from the SDK's ``AuthenticatedClient`` (no real
 network I/O, no uvicorn subprocess for these tests, ~3s in CI). It exercises
 both Bearer-token AND X-API-Key auth modes, closing the empirical gap that
 ``OAuth2PasswordBearer`` is the only security scheme advertised in the OpenAPI
-snapshot but ``X-API-Key`` works through the hand-written wrapper (RESEARCH
-Pitfall 4).
+snapshot but ``X-API-Key`` works through the hand-written wrapper.
 
 The TypeScript half spawns a Node subprocess that runs against a uvicorn
 instance bound to a free port on 127.0.0.1. If Node is unavailable on the
 test runner OR the SDK has not been built (``dist/index.js`` missing), the
-test skips with a clear reason (RESEARCH Assumption A3). The CI workflow
+test skips with a clear reason. The CI workflow
 ensures both are present.
 
-ROADMAP SC#1/SC#2 require round-trip against three endpoints. The actual
+The round-trip covers three endpoints. The actual
 operationIds in the OpenAPI snapshot (verified 2026-04-27) are:
     GET  /search/datasets/         search_datasets_endpoint_search_datasets_get
     GET  /datasets/{dataset_id}    get_single_dataset_datasets_dataset_id_get
     POST /ingest/upload            upload_file_ingest_upload_post
 (Single-underscore separators per generator naming, NOT the double-underscore
-prose paths from the ROADMAP — RESEARCH Pitfall 5.)
+prose paths in earlier notes.)
 
 Note: ``GeolensClient`` is imported from ``geolens.auth`` (its definition
-module). Plan 05 also added ``__init__.py`` to the Makefile cp-stash so
+module). The Makefile cp-stash also carries ``__init__.py`` so
 ``from geolens import GeolensClient`` works for SDK consumers; the
 explicit submodule path is kept here for test stability across regenerations.
 """
@@ -32,6 +31,8 @@ explicit submodule path is kept here for test stability across regenerations.
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import json
 import os
 import re
@@ -80,7 +81,7 @@ from geolens.models.service_auth_request import ServiceAuthRequest  # noqa: E402
 from geolens.models.stac_item_summary import StacItemSummary  # noqa: E402
 from geolens.types import UNSET  # noqa: E402
 
-# Phase 278 TEST-09: lift the 3 TypeScript-round-trip skip preconditions to
+# Lift the 3 TypeScript-round-trip skip preconditions to
 # module-level constants so the conditional skips become @pytest.mark.skipif
 # decorators (collected at gather-time). All three checks are pure (no
 # side effects, no network).
@@ -129,11 +130,214 @@ def _wire_asgi_transport(sdk: GeolensClient, app) -> None:
     underlying.set_async_httpx_client(async_httpx_client)
 
 
+@contextlib.asynccontextmanager
+async def _serving_over_http(app):
+    """Serve ``app`` on a free 127.0.0.1 port and yield its base URL.
+
+    The sync SDK calls and the TypeScript SDK need a real socket: httpx's
+    ASGITransport has no sync counterpart.
+    """
+    import uvicorn
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app, host="127.0.0.1", port=port, log_level="error", lifespan="off"
+        )
+    )
+    serve_task = asyncio.create_task(server.serve())
+    try:
+        for _ in range(50):
+            await asyncio.sleep(0.1)
+            if server.started:
+                break
+        else:
+            pytest.fail("uvicorn server did not start within 5s")
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        try:
+            await asyncio.wait_for(serve_task, timeout=5)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            serve_task.cancel()
+
+
+def _collection(names: list[str]) -> bytes:
+    """A point FeatureCollection with one feature per name.
+
+    Compact and in the key order ``JSON.stringify`` gives the TypeScript
+    script's copy, so both SDKs' uploads compare byte for byte.
+    """
+    return json.dumps(
+        {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "Point", "coordinates": [i, i]},
+                    "properties": {"name": name},
+                }
+                for i, name in enumerate(names)
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def _png(width: int = 8, height: int = 8) -> bytes:
+    """A valid solid-colour RGBA PNG."""
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    rows = b"".join(b"\x00" + b"\xff\x00\x00\xff" * width for _ in range(height))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b"")
+    )
+
+
+class _InlineWorker:
+    """Runs a queued ingest or reupload task in the test process.
+
+    GDAL is replaced by a loader that reads the staged file itself, so the
+    rows that land are the rows the SDK uploaded; ``received`` keeps the bytes
+    the worker was handed.
+    """
+
+    def __init__(self, session) -> None:
+        self.session = session
+        self.received: list[bytes] = []
+
+    async def _fake_ogrinfo(self, file_path, *args, **kwargs):
+        features = json.loads(Path(file_path).read_bytes())["features"]
+        return {
+            "srid": 4326,
+            "geometry_type": "Point",
+            "layer_name": "rt",
+            "feature_count": len(features),
+            "columns": [{"name": "name", "type": "String"}],
+        }
+
+    async def _fake_ogr2ogr(self, file_path, table_name, db_conn_str, *, schema, **kw):
+        from sqlalchemy import text
+
+        import app.core.db as db_module
+
+        raw = Path(file_path).read_bytes()
+        self.received.append(raw)
+        async with db_module.async_session() as session:
+            await session.execute(
+                text(
+                    f'CREATE TABLE "{schema}"."{table_name}" '
+                    "(gid serial PRIMARY KEY, geom geometry(Point, 4326), name text)"
+                )
+            )
+            for feature in json.loads(raw)["features"]:
+                x, y = feature["geometry"]["coordinates"]
+                await session.execute(
+                    text(
+                        f'INSERT INTO "{schema}"."{table_name}" (geom, name) '
+                        "VALUES (ST_SetSRID(ST_MakePoint(:x, :y), 4326), :name)"
+                    ),
+                    {"x": x, "y": y, "name": feature["properties"]["name"]},
+                )
+            await session.commit()
+
+    async def run(self, task, job_id, **extra) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from sqlalchemy import select
+
+        from app.platform.jobs.models import IngestJob
+
+        self.session.expire_all()
+        job = (
+            await self.session.execute(select(IngestJob).where(IngestJob.id == job_id))
+        ).scalar_one()
+        with (
+            patch("app.processing.ingest.ogr.run_ogrinfo", new=self._fake_ogrinfo),
+            patch("app.processing.ingest.ogr.run_ogr2ogr", new=self._fake_ogr2ogr),
+            patch(
+                "app.processing.ingest.tasks_reupload._validate_upload_file_safety",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.processing.ingest.publish_followups.invalidate_catalog_cache",
+                new=AsyncMock(),
+            ),
+            patch("app.processing.embeddings.helpers.defer_embedding", new=AsyncMock()),
+        ):
+            await task.func(
+                job_id=str(job.id),
+                file_path=job.file_path,
+                user_id=str(job.created_by),
+                attempt_id=str(job.attempt_id),
+                **extra,
+            )
+
+
+@contextlib.contextmanager
+def _commits_stay_queued():
+    """Lets the import and reupload commit routes run without a task queue."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from app.modules.catalog.datasets.api import router_reupload
+
+    queued = MagicMock()
+    queued.defer_async = AsyncMock()
+    queued.configure.return_value.defer_async = AsyncMock()
+    port = router_reupload.get_catalog_port()
+    with (
+        patch("app.processing.ingest.router.queue_ingest_job", new=AsyncMock()),
+        patch.object(router_reupload, "get_catalog_port", return_value=port),
+        patch.object(port, "reupload_file_task", return_value=queued),
+    ):
+        yield
+
+
+@pytest.fixture
+async def ingested_datasets(client, admin_auth_header):
+    """Dataset ids a test created; each is deleted with its table afterwards."""
+    from sqlalchemy import select
+
+    from app.core.db import async_session
+    from app.modules.catalog.datasets.domain.models import Dataset, Record
+
+    ids: list = []
+    yield ids
+    for dataset_id in ids:
+        async with async_session() as session:
+            title = (
+                await session.execute(
+                    select(Record.title)
+                    .join(Dataset, Dataset.record_id == Record.id)
+                    .where(Dataset.id == dataset_id)
+                )
+            ).scalar_one_or_none()
+        if title is not None:
+            await client.request(
+                "DELETE",
+                f"/datasets/{dataset_id}",
+                json={"confirm_title": title},
+                headers=admin_auth_header,
+            )
+
+
 # --------------------------- Unit tests (no network) ---------------------------
 
 
 class TestPythonAuthWrapperUnit:
-    """7 unit tests for ``GeolensClient`` — no network I/O."""
+    """Unit tests for ``GeolensClient`` — no network I/O."""
 
     def test_construct_with_bearer(self) -> None:
         c = GeolensClient(base_url="http://x", bearer_token="abc")
@@ -176,6 +380,69 @@ class TestPythonAuthWrapperUnit:
     def test_client_property(self) -> None:
         c = GeolensClient(base_url="http://x", bearer_token="abc")
         assert c.client is c._client
+
+    @pytest.mark.parametrize(
+        "auth", [{}, {"bearer_token": "abc"}, {"api_key": "key123"}]
+    )
+    def test_client_options_reach_the_generated_client(self, auth: dict) -> None:
+        import httpx
+
+        timeout = httpx.Timeout(7.0)
+        c = GeolensClient(
+            base_url="http://x", timeout=timeout, headers={"X-Probe": "1"}, **auth
+        )
+        assert c.client.get_httpx_client().timeout == timeout
+        assert c.client.get_httpx_client().headers["X-Probe"] == "1"
+
+    def test_a_credential_swap_does_not_carry_the_old_credential_over(self) -> None:
+        c = GeolensClient(
+            base_url="http://x", api_key="key123", headers={"X-Probe": "1"}
+        )
+        c.client.get_httpx_client()
+        c.set_bearer_token("tok")
+        for headers in (
+            c.client.get_httpx_client().headers,
+            c.client.get_async_httpx_client().headers,
+        ):
+            assert headers["Authorization"] == "Bearer tok"
+            assert "X-API-Key" not in headers
+            assert headers["X-Probe"] == "1"
+
+    @pytest.mark.parametrize("auth", ["bearer_token", "api_key"])
+    def test_the_callers_options_are_not_mutated(self, auth: str) -> None:
+        headers = {"X-Probe": "1"}
+        httpx_args = {"trust_env": False}
+        c = GeolensClient(
+            base_url="http://x", headers=headers, httpx_args=httpx_args, **{auth: "k"}
+        )
+        c.client.get_httpx_client()
+        c.set_api_key("k2")
+        c.client.get_httpx_client()
+        c.set_bearer_token("t2")
+        c.client.get_async_httpx_client()
+        assert headers == {"X-Probe": "1"}
+        assert httpx_args == {"trust_env": False}
+
+    @pytest.mark.parametrize(
+        "auth", [{}, {"bearer_token": "abc"}, {"api_key": "key123"}]
+    )
+    def test_every_client_reads_restricted_map_visibility(self, auth: dict) -> None:
+        c = GeolensClient(base_url="http://x", **auth)
+        clients = [c.client]
+        c.set_api_key("k2")
+        clients.append(c.client)
+        for client in clients:
+            for http in (client.get_httpx_client(), client.get_async_httpx_client()):
+                assert http.headers["X-GeoLens-Map-Visibility"] == "restricted"
+
+    @pytest.mark.parametrize("setter", ["set_bearer_token", "set_api_key"])
+    def test_client_options_survive_a_credential_swap(self, setter: str) -> None:
+        import httpx
+
+        timeout = httpx.Timeout(7.0)
+        c = GeolensClient(base_url="http://x", timeout=timeout)
+        getattr(c, setter)("secret")
+        assert c.client.get_httpx_client().timeout == timeout
 
 
 # ------------------- Model field compatibility (older server) -------------------
@@ -406,6 +673,42 @@ class TestTiles3dFileDownload:
         for result in (synced, awaited):
             assert isinstance(result, File)
             assert result.payload.read() == body
+
+
+class TestRasterTileForbidden:
+    """A refused raster tile parses as a ProblemDetail rather than None."""
+
+    def test_sync_and_detailed_parse_the_403(self) -> None:
+        from geolens.api.tiles import (
+            raster_tile_proxy_tiles_raster_proxy_dataset_id_z_x_y_fmt_get as tile,
+        )
+        from geolens.models import ProblemDetail
+
+        problem = {
+            "type": "about:blank",
+            "title": "Forbidden",
+            "status": 403,
+            "detail": "Invalid or expired signature",
+        }
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                403, json=problem, headers={"Content-Type": "application/problem+json"}
+            )
+
+        client = Client(
+            base_url="http://sdk.test",
+            httpx_args={"transport": httpx.MockTransport(respond)},
+        )
+        args = {"dataset_id": uuid4(), "z": 0, "x": 0, "y": 0, "fmt": "png"}
+
+        synced = tile.sync(**args, client=client)
+        detailed = tile.sync_detailed(**args, client=client)
+        awaited = asyncio.run(tile.asyncio(**args, client=client))
+
+        for result in (synced, detailed.parsed, awaited):
+            assert isinstance(result, ProblemDetail)
+            assert result.detail == "Invalid or expired signature"
 
 
 class TestCogAndExportNotModified:
@@ -839,7 +1142,7 @@ class TestCogDownloadRedirect:
 
 
 class TestOptionalRequestBodyIsOmitted:
-    """fix(#1277 review): an omitted body must not reach httpx as UNSET.
+    """An omitted body must not reach httpx as UNSET.
 
     openapi-python-client emits ``else: _kwargs["json"] = body`` for an
     optional request body. The ``else`` is right for an explicit ``None`` — a
@@ -1048,12 +1351,10 @@ class TestPythonRoundTrip:
         sdk = GeolensClient(base_url="http://test", bearer_token=token)
         _wire_asgi_transport(sdk, app)
 
-        # fix(#1666): this used to need an explicit body=None. The endpoint
-        # declared `keywords` as an optional list BODY on a GET, so the generated
-        # _get_kwargs unconditionally set _kwargs["json"] = body and httpx could
-        # not serialize the SDK's UNSET sentinel. `keywords` is a query parameter
-        # now, the generated function takes no body at all, and the call is
-        # simply the call.
+        # `keywords` is a query parameter, so the generated function takes no
+        # body and needs no explicit body=None (an optional list BODY on a GET
+        # would make _get_kwargs set _kwargs["json"] to the UNSET sentinel,
+        # which httpx cannot serialize).
         resp = await search_datasets_endpoint_search_datasets_get.asyncio_detailed(
             client=sdk.client,
         )
@@ -1094,6 +1395,36 @@ class TestPythonRoundTrip:
         # 404 (not 401/403) confirms the auth path succeeded and the SDK
         # reached the route handler. We don't need a real dataset for SC.
         assert resp.status_code == 404, resp.content
+
+    @pytest.mark.anyio
+    async def test_an_oversized_dry_run_parses_as_a_413_problem(
+        self, client, admin_auth_header
+    ) -> None:
+        """The body limit's 413 is a declared answer, even for a strict client."""
+        from app.api.main import app
+        from app.api.middleware.body_limit import FEATURE_WRITE_BODY_LIMIT_BYTES
+        from geolens.api.features import (
+            dry_run_create_feature_datasets_dataset_id_features_dry_run_post as dry_run,
+        )
+        from geolens.models.feature_create import FeatureCreate
+        from geolens.models.problem_detail import ProblemDetail
+
+        token = admin_auth_header["Authorization"].removeprefix("Bearer ")
+        sdk = GeolensClient(
+            base_url="http://test", bearer_token=token, raise_on_unexpected_status=True
+        )
+        _wire_asgi_transport(sdk, app)
+        body = FeatureCreate.from_dict(
+            {
+                "geometry": {"type": "Point", "coordinates": [0, 0]},
+                "properties": {"name": "x" * FEATURE_WRITE_BODY_LIMIT_BYTES},
+            }
+        )
+
+        parsed = await dry_run.asyncio(dataset_id=uuid4(), client=sdk.client, body=body)
+
+        assert isinstance(parsed, ProblemDetail), parsed
+        assert parsed.status == 413
 
     @pytest.mark.anyio
     async def test_ingest_upload(
@@ -1183,6 +1514,110 @@ class TestPythonRoundTrip:
         assert resp.status_code == 404, resp.content
 
     @pytest.mark.anyio
+    async def test_ingest_and_reupload_reach_a_terminal_state_with_the_rows(
+        self, client, admin_auth_header, test_db_session, ingested_datasets
+    ) -> None:
+        """Both commits run to ``complete``; the dataset holds the uploaded rows."""
+        from app.api.main import app
+        from app.processing.ingest.tasks_reupload import reupload_file
+        from app.processing.ingest.tasks_vector import ingest_file
+        from geolens.api.admin import get_job_status_jobs_job_id_get as get_job
+        from geolens.api.datasets import (
+            commit_import_ingest_commit_job_id_post as commit_import,
+        )
+        from geolens.api.datasets import (
+            get_single_dataset_datasets_dataset_id_get as get_dataset,
+        )
+        from geolens.api.datasets import upload_file_ingest_upload_post
+        from geolens.api.datasets_reupload import (
+            reupload_commit_datasets_dataset_id_reupload_job_id_commit_post as commit_reupload,
+        )
+        from geolens.api.datasets_reupload import (
+            reupload_dataset_datasets_dataset_id_reupload_post as reupload,
+        )
+        from geolens.api.features import (
+            get_features_geojson_z_endpoint_datasets_dataset_id_features_geojson_get as features,
+        )
+        from geolens.models.body_reupload_dataset_datasets_dataset_id_reupload_post import (
+            BodyReuploadDatasetDatasetsDatasetIdReuploadPost,
+        )
+        from geolens.models.body_upload_file_ingest_upload_post import (
+            BodyUploadFileIngestUploadPost,
+        )
+        from geolens.models.commit_request import CommitRequest
+        from geolens.types import File
+
+        token = admin_auth_header["Authorization"].removeprefix("Bearer ")
+        sdk = GeolensClient(base_url="http://test", bearer_token=token)
+        _wire_asgi_transport(sdk, app)
+        worker = _InlineWorker(test_db_session)
+
+        async def assert_complete_with(job_id, names: list[str], sent: bytes):
+            job = await get_job.asyncio_detailed(job_id=job_id, client=sdk.client)
+            assert job.status_code == 200, job.content
+            assert job.parsed.status == "complete", job.parsed.error_message
+            dataset_id = job.parsed.dataset_id
+            dataset = await get_dataset.asyncio_detailed(
+                dataset_id=dataset_id, client=sdk.client
+            )
+            assert dataset.parsed.feature_count == len(names)
+            rows = await features.asyncio_detailed(
+                dataset_id=dataset_id, client=sdk.client
+            )
+            assert rows.status_code == 200, rows.content
+            assert sorted(
+                f["properties"]["name"] for f in rows.parsed.to_dict()["features"]
+            ) == sorted(names)
+            assert worker.received[-1] == sent
+            return dataset_id
+
+        first = _collection(["a", "b", "c"])
+        uploaded = await upload_file_ingest_upload_post.asyncio_detailed(
+            client=sdk.client,
+            body=BodyUploadFileIngestUploadPost(
+                file=File(payload=BytesIO(first), file_name="rt.geojson")
+            ),
+        )
+        assert uploaded.status_code == 201, uploaded.content
+        with _commits_stay_queued():
+            committed = await commit_import.asyncio_detailed(
+                job_id=uploaded.parsed.job_id,
+                client=sdk.client,
+                body=CommitRequest(title=f"sdk-rt-{uuid4().hex[:8]}"),
+            )
+        assert committed.status_code == 202, committed.content
+        await worker.run(ingest_file, uploaded.parsed.job_id)
+        dataset_id = await assert_complete_with(
+            uploaded.parsed.job_id, ["a", "b", "c"], first
+        )
+        ingested_datasets.append(dataset_id)
+
+        second = _collection(["d", "e"])
+        replaced = await reupload.asyncio_detailed(
+            dataset_id=dataset_id,
+            client=sdk.client,
+            body=BodyReuploadDatasetDatasetsDatasetIdReuploadPost(
+                file=File(payload=BytesIO(second), file_name="rt2.geojson")
+            ),
+        )
+        assert replaced.status_code == 201, replaced.content
+        with _commits_stay_queued():
+            recommitted = await commit_reupload.asyncio_detailed(
+                dataset_id=dataset_id,
+                job_id=replaced.parsed.job_id,
+                client=sdk.client,
+                body=ReuploadCommitRequest(),
+            )
+        assert recommitted.status_code == 202, recommitted.content
+        await worker.run(
+            reupload_file, replaced.parsed.job_id, dataset_id=str(dataset_id)
+        )
+        assert (
+            await assert_complete_with(replaced.parsed.job_id, ["d", "e"], second)
+            == dataset_id
+        )
+
+    @pytest.mark.anyio
     async def test_icon_upload_and_png_endpoints_return_bytes(
         self, client, admin_auth_header, test_db_session
     ) -> None:
@@ -1240,6 +1675,80 @@ class TestPythonRoundTrip:
             await test_db_session.commit()
 
     @pytest.mark.anyio
+    @pytest.mark.skipif(not _UVICORN_AVAILABLE, reason="uvicorn not installed")
+    @pytest.mark.parametrize("call", ["asyncio", "sync"])
+    async def test_png_icon_and_sprite_bytes_in_both_call_styles(
+        self, client, admin_auth_header, test_db_session, call: str
+    ) -> None:
+        """The icon asset and the sprite come back as the PNG bytes the server sent.
+
+        ``sync`` goes over a real socket: ASGITransport has no sync counterpart.
+        """
+        from sqlalchemy import text
+
+        from app.api.main import app
+        from geolens.api.maps import (
+            get_geolens_sprite_png_endpoint_maps_sprites_geolens_png_get as sprite_png,
+        )
+        from geolens.api.maps import (
+            get_map_icon_asset_endpoint_maps_icons_icon_id_asset_get as icon_asset,
+        )
+        from geolens.api.maps import upload_map_icon_endpoint_maps_icons_post
+        from geolens.models.body_upload_map_icon_endpoint_maps_icons_post import (
+            BodyUploadMapIconEndpointMapsIconsPost,
+        )
+        from geolens.types import File
+
+        token = admin_auth_header["Authorization"].removeprefix("Bearer ")
+        sdk = GeolensClient(base_url="http://test", bearer_token=token)
+        _wire_asgi_transport(sdk, app)
+
+        icon_png = _png()
+        created = await upload_map_icon_endpoint_maps_icons_post.asyncio_detailed(
+            client=sdk.client,
+            body=BodyUploadMapIconEndpointMapsIconsPost(
+                file=File(
+                    payload=BytesIO(icon_png),
+                    file_name="dot.png",
+                    mime_type="image/png",
+                )
+            ),
+        )
+        assert created.status_code == 201, created.content
+        icon_id = created.parsed.id
+        try:
+            async with _serving_over_http(app) as base_url:
+                if call == "sync":
+                    over_http = GeolensClient(base_url=base_url, bearer_token=token)
+                    served = await asyncio.to_thread(
+                        icon_asset.sync_detailed,
+                        icon_id=icon_id,
+                        client=over_http.client,
+                    )
+                    sheet = await asyncio.to_thread(
+                        sprite_png.sync_detailed, client=over_http.client
+                    )
+                else:
+                    served = await icon_asset.asyncio_detailed(
+                        icon_id=icon_id, client=sdk.client
+                    )
+                    sheet = await sprite_png.asyncio_detailed(client=sdk.client)
+
+            assert served.status_code == 200
+            assert served.content == icon_png
+            assert served.parsed.payload.read() == icon_png
+            assert sheet.status_code == 200
+            assert sheet.content.startswith(b"\x89PNG\r\n\x1a\n")
+            assert sheet.parsed.payload.read() == sheet.content
+        finally:
+            await test_db_session.rollback()
+            await test_db_session.execute(
+                text("DELETE FROM catalog.map_icon_assets WHERE id = :id"),
+                {"id": icon_id},
+            )
+            await test_db_session.commit()
+
+    @pytest.mark.anyio
     async def test_a_tileset_upload_body_carries_its_kind(
         self, client, admin_auth_header, test_db_session
     ) -> None:
@@ -1283,7 +1792,7 @@ class TestPythonRoundTrip:
 
     @pytest.mark.anyio
     async def test_api_key_auth_mode(self, client, admin_auth_header) -> None:
-        """Closes Pitfall 4: X-API-Key works via the wrapper despite not being
+        """X-API-Key works via the wrapper despite not being
         in the OpenAPI spec (only OAuth2PasswordBearer is advertised)."""
         from app.api.main import app
         from geolens.api.search import (
@@ -1331,47 +1840,18 @@ async def test_typescript_round_trip(
     """Spawn a Node subprocess that exercises the TypeScript SDK against a
     uvicorn instance bound to a free port on 127.0.0.1.
 
-    Per RESEARCH Assumption A3: skip preconditions (node availability, TS SDK
+    Skip preconditions (node availability, TS SDK
     built, uvicorn importable) are evaluated at module import time and
-    expressed as @pytest.mark.skipif decorators (Phase 278 TEST-09). The CI
+    expressed as @pytest.mark.skipif decorators. The CI
     workflow ensures all three are present.
     """
-    # `node` resolves to the path discovered at module import; node executable
-    # location does not change during the test run.
     node = shutil.which("node")
 
-    import uvicorn
     from sqlalchemy import text
 
     from app.api.main import app
 
-    # Pick a free port (race window acceptable for a one-shot test)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-
-    config = uvicorn.Config(
-        app, host="127.0.0.1", port=port, log_level="error", lifespan="off"
-    )
-    server = uvicorn.Server(config)
-    serve_task = asyncio.create_task(server.serve())
-
-    # Wait for server-up
-    for _ in range(50):
-        await asyncio.sleep(0.1)
-        if server.started:
-            break
-    else:
-        server.should_exit = True
-        try:
-            await asyncio.wait_for(serve_task, timeout=5)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            serve_task.cancel()
-        pytest.fail("uvicorn server did not start within 5s")
-
-    try:
-        base_url = f"http://127.0.0.1:{port}"
+    async with _serving_over_http(app) as base_url:
         token = admin_auth_header["Authorization"].removeprefix("Bearer ")
         env = os.environ.copy()
         env["GEOLENS_BASE_URL"] = base_url
@@ -1418,9 +1898,142 @@ async def test_typescript_round_trip(
                 text("DELETE FROM catalog.ingest_jobs WHERE id = :id"), {"id": job_id}
             )
             await test_db_session.commit()
+
+
+# ------------------- Ingest and PNG round trips (TypeScript) -------------------
+
+
+@pytest.mark.skipif(
+    not os.environ.get("GEOLENS_REQUIRE_TS_SDK"),
+    reason="CI sets GEOLENS_REQUIRE_TS_SDK where the TypeScript tests must run",
+)
+def test_typescript_round_trip_prerequisites_are_present() -> None:
+    """Where CI requires the TypeScript tests, a missing prerequisite fails."""
+    assert _NODE_AVAILABLE, "node is not on PATH"
+    assert _TS_SDK_BUILT, "sdks/typescript/dist/index.js is not built"
+    assert _UVICORN_AVAILABLE, "uvicorn is not installed"
+
+
+def _needs_typescript_sdk(test):
+    for mark in (
+        pytest.mark.skipif(not _NODE_AVAILABLE, reason="node not available"),
+        pytest.mark.skipif(not _TS_SDK_BUILT, reason="TypeScript SDK not built"),
+        pytest.mark.skipif(not _UVICORN_AVAILABLE, reason="uvicorn not installed"),
+        pytest.mark.anyio,
+    ):
+        test = mark(test)
+    return test
+
+
+async def _run_ts_phase(base_url: str, token: str, *argv: str) -> str:
+    """Run one phase of ingest_round_trip.test.mjs and return its stdout."""
+    result = await asyncio.to_thread(
+        subprocess.run,
+        [
+            shutil.which("node"),
+            str(
+                _REPO_ROOT
+                / "sdks"
+                / "typescript"
+                / "test"
+                / "ingest_round_trip.test.mjs"
+            ),
+            *argv,
+        ],
+        env={**os.environ, "GEOLENS_BASE_URL": base_url, "GEOLENS_TOKEN": token},
+        cwd=_REPO_ROOT / "sdks" / "typescript",
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"TS phase {argv} failed (exit {result.returncode}):\n"
+        f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+    return result.stdout
+
+
+def _printed(stdout: str, key: str) -> str:
+    match = re.search(rf"^{key}=(\S+)$", stdout, re.MULTILINE)
+    assert match, f"TS phase printed no {key}:\n{stdout}"
+    return match.group(1)
+
+
+@_needs_typescript_sdk
+async def test_typescript_ingest_and_reupload_reach_a_terminal_state(
+    client, admin_auth_header, test_db_session, ingested_datasets
+) -> None:
+    from app.api.main import app
+    from app.processing.ingest.tasks_reupload import reupload_file
+    from app.processing.ingest.tasks_vector import ingest_file
+
+    token = admin_auth_header["Authorization"].removeprefix("Bearer ")
+    worker = _InlineWorker(test_db_session)
+    async with _serving_over_http(app) as base_url:
+        with _commits_stay_queued():
+            uploaded = await _run_ts_phase(base_url, token, "upload")
+        job_id = _printed(uploaded, "UPLOAD_JOB_ID")
+        await worker.run(ingest_file, job_id)
+        verified = await _run_ts_phase(base_url, token, "verify", job_id, "a,b,c")
+        dataset_id = _printed(verified, "DATASET_ID")
+        ingested_datasets.append(dataset_id)
+        assert worker.received[-1] == _collection(["a", "b", "c"])
+
+        with _commits_stay_queued():
+            replaced = await _run_ts_phase(
+                base_url, token, "reupload", dataset_id, "d,e"
+            )
+        reupload_job_id = _printed(replaced, "REUPLOAD_JOB_ID")
+        await worker.run(reupload_file, reupload_job_id, dataset_id=dataset_id)
+        await _run_ts_phase(base_url, token, "verify", reupload_job_id, "d,e")
+        assert worker.received[-1] == _collection(["d", "e"])
+
+
+@_needs_typescript_sdk
+async def test_typescript_png_icon_and_sprite_bytes(
+    client, admin_auth_header, test_db_session
+) -> None:
+    from sqlalchemy import text
+
+    from app.api.main import app
+
+    token = admin_auth_header["Authorization"].removeprefix("Bearer ")
+    icon_png = _png()
+    uploaded = await client.post(
+        "/maps/icons",
+        files={"file": ("dot.png", icon_png, "image/png")},
+        headers=admin_auth_header,
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    icon_id = uploaded.json()["id"]
+    try:
+        async with _serving_over_http(app) as base_url:
+            await _run_ts_phase(
+                base_url, token, "png", icon_id, base64.b64encode(icon_png).decode()
+            )
     finally:
-        server.should_exit = True
-        try:
-            await asyncio.wait_for(serve_task, timeout=5)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            serve_task.cancel()
+        await test_db_session.rollback()
+        await test_db_session.execute(
+            text("DELETE FROM catalog.map_icon_assets WHERE id = :id"), {"id": icon_id}
+        )
+        await test_db_session.commit()
+
+
+def test_the_python_sdk_accepts_a_revalidated_story_image() -> None:
+    """A 304 for a story image is a success, even for a strict client."""
+    from geolens.api.stories import (
+        get_story_asset_endpoint_stories_story_id_assets_asset_id_get as get_image,
+    )
+
+    def not_modified(request: httpx.Request) -> httpx.Response:
+        assert request.headers["if-none-match"] == '"etag"'
+        return httpx.Response(304, headers={"ETag": '"etag"'})
+
+    client = Client(
+        base_url="http://test",
+        raise_on_unexpected_status=True,
+        headers={"If-None-Match": '"etag"'},
+        httpx_args={"transport": httpx.MockTransport(not_modified)},
+    )
+    response = get_image.sync_detailed(uuid4(), uuid4(), client=client)
+    assert response.status_code == 304

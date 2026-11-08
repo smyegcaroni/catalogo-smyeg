@@ -56,8 +56,7 @@ export function clusterFeatureCoordinates(feature: ClusterFeatureLike): [number,
 }
 
 function sourceLabel(kind: ClusterSourceStrategyKind) {
-  // fix(#438): I18N-02 — these strings render in the cluster popup ('source'
-  // field); they were hardcoded English.
+  // Rendered in the cluster popup ('source' field).
   if (kind === 'server-tile') return i18n.t('builder:cluster.sourceServerTile');
   if (kind === 'bounded-geojson') return i18n.t('builder:cluster.sourceBoundedGeojson');
   return i18n.t('builder:cluster.sourceFallback');
@@ -86,10 +85,9 @@ export function clusterAggregateFeatureInfo(
   return {
     properties: aggregateProperties,
     layerName: options.layerName,
-    // fix(#438): I18N-02 — was `Cluster: N feature(s)` with manual English
-    // pluralization; now an i18next plural key.
+    // An i18next plural key, not manual English pluralization.
     title: i18n.t('builder:cluster.popupTitle', { count, countLabel }),
-    // fix(#586): only list keys actually present — the popup's
+    // Only list keys actually present — the popup's
     // no-schema fallback renders configured-but-absent fields as '--', which
     // would surface a meaningless "Expansion Zoom: --" on clusters without one.
     visibleFields: ['feature_count', 'source', 'expansion_zoom', 'cluster_id']
@@ -140,21 +138,20 @@ export async function activateClusterFeature(
   const center = clusterFeatureCoordinates(feature);
   if (!center) return false;
   const target = await clusterExpansionZoom(map, feature, sourceId);
-  // fix(#893): ease to the expansion zoom only when it is deeper than where we
-  // already are. Two ways it is not. At CLUSTER_ZOOM_CEILING with
-  // cluster_max_zoom=22 the server's now-honest value (#882) IS the current
-  // zoom. And a parent cluster tile still drawn overzoomed while its
-  // replacement loads reports the shallow expansion zoom of the level it was
-  // cut at, which used to ease the user BACKWARDS out of the view they were
-  // zooming into. Falling back to the current zoom recentres without moving the
-  // zoom — at the ceiling no zoom can split the cluster, so recentring is the
-  // whole honest response, and a click can never lose ground.
+  // Ease to the expansion zoom only when it is deeper than where we already
+  // are. Two ways it is not: at CLUSTER_ZOOM_CEILING with cluster_max_zoom=22
+  // the server's value IS the current zoom, and a parent cluster tile still
+  // drawn overzoomed while its replacement loads reports the shallow expansion
+  // zoom of the level it was cut at, which would ease the user BACKWARDS out of
+  // the view they were zooming into. Falling back to the current zoom recentres
+  // without moving the zoom: at the ceiling no zoom can split the cluster, so
+  // recentring is the whole honest response, and a click can never lose ground.
   const currentZoom = map.getZoom?.() ?? 0;
   const zoom = target > currentZoom ? target : currentZoom;
   map.easeTo({
     center,
     zoom,
-    // fix(#438): A11Y-08 — instant under prefers-reduced-motion.
+    // Instant under prefers-reduced-motion.
     duration: motionDuration(500),
   });
   return true;

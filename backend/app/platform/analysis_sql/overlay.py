@@ -26,25 +26,22 @@ MASK_SUBDIVIDE_MAX_VERTICES = 256
 
 
 def render_clip_layer_join(mask_table_ref: str, *, src: str) -> tuple[str, str, str]:
-    """Clip against a mask LAYER (fix(#693)); used by preview AND materialize.
+    """Clip against a mask LAYER; used by preview AND materialize.
 
     Returns ``(cte, lateral_subquery, where_clause)`` for a source table
     aliased ``src``.
 
-    fix(#719): a single whole-layer ``ST_Union`` loses to per-row
-    ``ST_Intersection`` against subdivided mask pieces — per-row intersection
-    against one giant union is superlinear in mask complexity. Benchmark
-    (22,324 Manhattan buildings vs a 972-polygon/249,804-vertex mask, same
-    12,291-row result): union 33.2s, this shape 3.4s. At the union rate a
-    ~250k-row source exceeds the 300s CTAS timeout, which is how a
-    sub-second preview clip could fail on "Create dataset".
+    Per-row ``ST_Intersection`` against subdivided mask pieces beats one
+    whole-layer ``ST_Union``: intersecting against a giant union is
+    superlinear in mask complexity (33.2s vs 3.4s on a 250k-vertex mask), and
+    at the union rate a ~250k-row source exceeds the 300s CTAS timeout.
 
-    Three parts, each benchmarked on the same masks:
+    Three parts:
 
     - ``_mask_pieces`` subdivides the mask's polygonal parts into bounded
-      chunks ONCE (MATERIALIZED): a 100k-vertex mask drops 87.9s -> 0.36s.
-      Polygonal-only (fix(#682)): the catalog's ``geometry_type`` is
-      classified from the first feature, so a "POLYGON" mask can still hold
+      chunks ONCE (MATERIALIZED). Polygonal-only: the catalog's
+      ``geometry_type`` is classified from the first feature, so a "POLYGON"
+      mask can still hold
       point/line rows, and ``ST_MakeValid`` can shed line remnants from
       degenerate polygons — either would let point/line source features
       outside every polygon survive the clip. No usable polygonal geometry
@@ -54,8 +51,8 @@ def render_clip_layer_join(mask_table_ref: str, *, src: str) -> tuple[str, str, 
       row; aggregate subqueries cannot be pulled up, so this needs no
       OFFSET 0 fence — the inner one only pins extract/makevalid to once
       per mask row). ``ST_LineMerge`` on single-part LineString sources
-      ONLY (fix(#719)): ``ST_Union`` re-dissolves adjacent polygons
-      but does not sew line segments, so a LineString crossing a piece or
+      ONLY: ``ST_Union`` re-dissolves adjacent polygons but does not sew
+      line segments, so a LineString crossing a piece or
       mask-row seam fragments where the whole-mask intersection stayed one
       continuous LineString. The test is ``GeometryType(...) = 'LINESTRING'``,
       NOT ``ST_Dimension(...) = 1``: over two touching mask polygons, a
@@ -66,8 +63,7 @@ def render_clip_layer_join(mask_table_ref: str, *, src: str) -> tuple[str, str, 
     - The EXISTS row filter probes the RAW mask table, not the CTE: the
       union CTE reaches the outer query as an InitPlan Param and blinds the
       selectivity estimator; the un-indexed piece CTE costs a linear scan
-      per source row (2.4s vs 0.25s when the mask sits at the high end of
-      the gid order).
+      per source row.
     """
     cte = (
         f"WITH _mask_pieces AS MATERIALIZED ("
@@ -93,7 +89,7 @@ def render_clip_layer_join(mask_table_ref: str, *, src: str) -> tuple[str, str, 
     return cte, lateral, where
 
 
-# fix(#956): overlay rows don't map 1:1 to source rows, so the CTAS uses a
+# Overlay rows don't map 1:1 to source rows, so the CTAS uses a
 # generated gid (like dissolve) and carries the source gid as an ordinary
 # attribute, traceable back to the source feature it came from.
 INTERSECT_SOURCE_GID_COLUMN = "source_gid"
@@ -108,7 +104,7 @@ def render_intersect_pairs(
     mask_columns: Sequence[str] = (),
     bbox: list[float] | None = None,
 ) -> str:
-    """One row per intersecting (source feature, overlay feature) PAIR (#956).
+    """One row per intersecting (source feature, overlay feature) PAIR.
 
     This is what separates an overlay from a clip: ``render_clip_layer_join``
     aggregates every mask piece back to ONE geometry per source row, but an
@@ -127,9 +123,9 @@ def render_intersect_pairs(
       across the layer — grouping by piece instead of feature would
       quadruple output for a mask polygon split into four pieces.
     - ``ST_MakeValid`` on the source is hoisted into an ``OFFSET 0`` lateral
-      to run once per source row, not once per candidate pair — inlined it
-      is #953's 28.4s-vs-0.2s trap, worse here since this shape probes every
-      piece of every overlapping mask feature.
+      to run once per source row, not once per candidate pair (28.4s vs 0.2s
+      measured), which matters more here since this shape probes every piece
+      of every overlapping mask feature.
     - The aggregate groups by the two gids, and everything else it reads
       from the source is an aggregate too. Source and overlay attributes are
       joined back by gid afterwards: a registered table's gid can be unique
@@ -149,9 +145,9 @@ def render_intersect_pairs(
     full overlay before its cap applies, bounded by the sandbox statement
     timeout rather than the row limit.
 
-    ``bbox`` (fix(#727)) is PREVIEW-ONLY: it filters which
-    ``_src`` rows enter the join, so the materialize worker must never pass
-    it — a saved dataset is the whole overlay, not what was on screen.
+    ``bbox`` is PREVIEW-ONLY: it filters which ``_src`` rows enter the join,
+    so the materialize worker must never pass it — a saved dataset is the
+    whole overlay, not what was on screen.
     Applied inside the inner subquery before ``GROUP BY``, so it also
     shrinks the ``_mask_pieces`` join's candidate set.
     """
@@ -207,7 +203,7 @@ def render_intersect_preview(
     geojson_precision: int,
     bbox: list[float] | None = None,
 ) -> str:
-    """The preview projection over ``render_intersect_pairs`` (fix(#956)).
+    """The preview projection over ``render_intersect_pairs``.
 
     An overlay is a JOIN with a GROUP BY, not a per-row expression, so it
     doesn't fit the lateral template the other operations share — it renders
@@ -222,10 +218,9 @@ def render_intersect_preview(
     expensive part twice. Selected last, outside the caller's extra-column
     list, so it never lands in the properties zip.
 
-    ``bbox`` (fix(#727)) passes through to
-    ``render_intersect_pairs`` (preview-only there). Without it, intersect
-    was the one operation ``build_preview_sql``'s viewport scoping silently
-    skipped, so a capped preview kept clustering in gid order.
+    ``bbox`` passes through to ``render_intersect_pairs`` so viewport
+    scoping applies here too; without it a capped preview clusters in gid
+    order.
     """
     pairs = render_intersect_pairs(src_table_ref, mask_table_ref, bbox=bbox)
     return (
@@ -239,7 +234,7 @@ def render_intersect_preview(
 
 
 def render_select_by_location_where(mask_table_ref: str, *, src: str) -> str:
-    """Row filter for select-by-location against a mask LAYER (fix(#955)).
+    """Row filter for select-by-location against a mask LAYER.
 
     A selection keeps whole source geometries — no intersection lateral
     downstream — so this EXISTS is the entire operation and has to be exact
@@ -253,19 +248,17 @@ def render_select_by_location_where(mask_table_ref: str, *, src: str) -> str:
 
     Both operands are RAW columns: ``ST_Intersects`` accepts invalid geometry
     (unlike ``ST_Intersection``) and agrees with the repaired answer, so no
-    ``ST_MakeValid`` is needed — and adding one would be actively harmful
-    here, since inside a correlated subquery it re-evaluates per candidate
-    pair (measured 28.4s vs 0.2s on #953's join before that hoist), with
-    nothing here to hoist it to.
+    ``ST_MakeValid`` is needed. Adding one would hurt: inside a correlated
+    subquery it re-evaluates per candidate pair (28.4s vs 0.2s measured), and
+    there is nothing here to hoist it to.
 
     Like clip, the probe targets the RAW mask table rather than a subdivided
-    CTE, for the same indexing/statistics reason (2.4s vs 0.25s when the
-    mask sits at the high end of the gid order).
+    CTE, for the same indexing/statistics reason.
 
     ``ST_Dimension(...) = 2`` keeps the mask polygonal per ROW. Though
     ``_load_mask_dataset`` already rejects a non-polygonal mask DATASET, the
-    catalog classifies ``geometry_type`` from the first feature (fix(#682)),
-    so a "POLYGON" layer can still hold point/line rows, which clip drops in
+    catalog classifies ``geometry_type`` from the first feature, so a
+    "POLYGON" layer can still hold point/line rows, which clip drops in
     ``_mask_pieces``. Without this term, select and clip would disagree
     about what the mask is. It does not catch a degenerate polygon
     ``ST_MakeValid`` would shed to a line — that needs the per-row repair
@@ -285,13 +278,11 @@ def render_select_by_location_where(mask_table_ref: str, *, src: str) -> str:
 def render_select_by_location_count(
     src_table_ref: str, *, mask_table_ref: str | None, mask: dict[str, Any] | None
 ) -> str:
-    """Exact selected-record total, uncapped by the preview's 500-row limit
-    (fix(#955)).
+    """Exact selected-record total, uncapped by the preview's 500-row limit.
 
     Rebuilds the filter by calling the SAME renderer the preview uses for
     whichever mask path is in play, rather than restating the predicate, so
-    the count and the features on the map can't describe different sets —
-    #953's lesson, where a separately written count statement drifted.
+    the count and the features on the map can't describe different sets.
 
     The trailing not-NULL/not-empty pair mirrors ``NOT_EMPTY_PREDICATE``,
     restated against the source column since a selection's lateral is the
@@ -332,7 +323,7 @@ def render_clip_expr(mask: dict[str, Any] | None) -> tuple[str, str]:
 
 
 def render_select_by_location_expr(mask: dict[str, Any] | None) -> tuple[str, str]:
-    """The drawn-mask half of select-by-location (fix(#955)).
+    """The drawn-mask half of select-by-location.
 
     Geometry is the source feature verbatim (NOT ST_MakeValid'd, like
     spatial_join and measure), so the operation is entirely its WHERE.
@@ -346,7 +337,7 @@ def render_select_by_location_expr(mask: dict[str, Any] | None) -> tuple[str, st
 
     ``render_select_by_location_count`` calls this directly rather than
     through ``render_geometry_expr``, so count and preview render the same
-    predicate via the family that owns it (fix(#1089)).
+    predicate via the family that owns it.
     """
     mask_expr = render_mask_expr(mask or {})
     return (

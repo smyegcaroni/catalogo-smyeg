@@ -137,7 +137,7 @@ function toFileEntry(
   };
 }
 
-// GPKG-03 Phase 1058: per-layer result shape for the fan-out results modal.
+// Per-layer result shape for the fan-out results modal.
 type FanOutResult = {
   layerName: string;
   status: 'fulfilled' | 'rejected';
@@ -168,21 +168,19 @@ export function UploadForm({ onPhaseChange, onOutcomeChange }: UploadFormProps) 
   const [canTrack, setCanTrack] = useState(false);
   // Batch-level quota notice (the "X of Y datasets used" detail), shown once.
   const [quotaNotice, setQuotaNotice] = useState<string | null>(null);
-  // GPKG-03 Phase 1058: results modal state for the multi-layer fan-out
+  // Results modal state for the multi-layer fan-out
   const [fanOutResults, setFanOutResults] = useState<{
     entryId: string;
     results: FanOutResult[];
   } | null>(null);
   // Files dropped while the quota query is still fetching (initial load OR the
   // refetch-on-mount refresh) are held here and processed once it settles.
-  // Disabling the dropzone during that window (the previous design) made
-  // react-dropzone silently swallow drops with no feedback and no same-page
-  // recovery (PR #274 follow-up).
+  // Disabling the dropzone instead made react-dropzone silently swallow drops
+  // with no feedback.
   const [pendingFiles, setPendingFiles] = useState<File[] | null>(null);
-  // isFetching (not just isPending) so drops during the refetchOnMount
-  // background refresh are also deferred — otherwise the cached-but-stale
-  // quota would briefly apply on remount before the live GET lands (Codex P2
-  // on PR #274).
+  // isFetching (not just isPending), so drops during the refetchOnMount refresh
+  // are also deferred; otherwise the cached-but-stale quota would briefly apply
+  // on remount before the live GET lands.
   const { data: uploadConfig, isFetching: configFetching } = useUploadConfig();
   const [chosenKind, setChosenKind] = useState<UploadKind | null>(null);
 
@@ -220,11 +218,11 @@ export function UploadForm({ onPhaseChange, onOutcomeChange }: UploadFormProps) 
     // An explicit reset means the user is done with this batch; a commit
     // still in flight for it settles into nothing.
     clearUploadBatch();
-    // fix(#1832): same reasoning for the config-fetch queue.
+    // Same reasoning for the config-fetch queue.
     clearPendingUploadFiles();
     // Refresh remaining_dataset_quota so "Upload More" after an import reflects
-    // the new dataset count instead of the cached pre-import value (Codex P2 on
-    // PR #274). invalidate matches the user-scoped key by prefix.
+    // the new dataset count instead of the cached pre-import value on
+    // remount. The invalidation matches the user-scoped key by prefix.
     queryClient.invalidateQueries({ queryKey: queryKeys.ingest.uploadConfig });
   }, [setPhase, queryClient]);
 
@@ -253,18 +251,16 @@ export function UploadForm({ onPhaseChange, onOutcomeChange }: UploadFormProps) 
       showBatch(adopted);
       setPhase(adopted.entries.some(isUploadInFlight) ? 'uploading' : 'reviewing');
     }
-    // fix(#1832): rehydrate a drop that was still waiting on the
-    // upload-config query when this form unmounted — see
-    // `queuePendingUploadFiles`'s doc comment in upload-session.ts for the
-    // race this closes. The flush effect below re-runs on this same mount
-    // once `pendingFiles` becomes non-null here, so no separate flush call
-    // is needed at this site.
+    // Rehydrate a drop that was still waiting on the upload-config query when
+    // this form unmounted (see `queuePendingUploadFiles` in upload-session.ts).
+    // The flush effect below re-runs on this mount once `pendingFiles` becomes
+    // non-null here, so no separate flush call is needed.
     const queued = peekPendingUploadFiles();
     if (queued && queued.length > 0) {
       setPendingFiles(queued);
       setChosenKind(peekPendingUploadKind());
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only rehydration of queued files
   }, []);
 
   // The session owns progress and settlement; the form mirrors it for its
@@ -277,11 +273,9 @@ export function UploadForm({ onPhaseChange, onOutcomeChange }: UploadFormProps) 
     });
   }, [showBatch]);
 
-  // IMPORT-03 (Phase 1054): phase transitions were inlined inside setEntries
-  // updaters, which violates React 19's "no setState during another
-  // component's render" rule and fires the verbatim warning the audit
-  // captured. Moving them into a single effect dep'd on `entries` runs the
-  // transition AFTER React commits the entries change.
+  // Phase transitions run in one effect dep'd on `entries`, after React commits
+  // the change; inside setEntries updaters they would violate React 19's "no
+  // setState during another component's render" rule.
   useEffect(() => {
     if (phase === 'uploading' && entries.length > 0) {
       if (!entries.some(isUploadInFlight)) setPhase('reviewing');
@@ -304,7 +298,6 @@ export function UploadForm({ onPhaseChange, onOutcomeChange }: UploadFormProps) 
     if (phase !== 'idle') return;
     setQuotaNotice(null);
 
-    // Duplicate detection against existing entries
     const existing = new Set(
       entries.map((e) => `${e.fileName}|${e.file?.size ?? ''}|${e.file?.lastModified ?? ''}`),
     );
@@ -338,12 +331,12 @@ export function UploadForm({ onPhaseChange, onOutcomeChange }: UploadFormProps) 
     setEntries(newEntries);
     setPhase('uploading');
 
-    // fix(#1712): the upload+preview work for each entry now runs at module
-    // scope (`upload-session.ts`), not in this closure — so it keeps running,
-    // and its outcome stays reachable, if this form unmounts before it
-    // settles. The subscription effect above mirrors updates back into
-    // `entries` (and the one just below flips the phase once every entry in
-    // the batch is terminal), so nothing here awaits the batch directly.
+    // The upload+preview work for each entry runs at module scope
+    // (`upload-session.ts`), not in this closure, so it keeps running and its
+    // outcome stays reachable if this form unmounts before it settles. The
+    // subscription effect above mirrors updates into `entries` (and the one
+    // below flips the phase once every entry is terminal), so nothing here
+    // awaits the batch.
     const presigned = !!uploadConfig?.presigned_uploads;
     for (const entry of newEntries) {
       startUploadEntry(entry.id, entry.file!, presigned, uploadKind);
@@ -352,13 +345,12 @@ export function UploadForm({ onPhaseChange, onOutcomeChange }: UploadFormProps) 
 
   // Queue drops that land mid-fetch instead of processing them against an
   // unresolved/stale quota; merge (not replace) so a second drop in the same
-  // window can't swallow the first (PR #274 follow-up).
+  // window can't swallow the first.
   //
-  // fix(#1832): the queue itself is now module-scoped (`upload-session.ts`),
-  // not just this component's state — a tab switch that unmounts the form
-  // before `configFetching` settles used to discard the drop outright, since
-  // nothing had reached `startUploadEntry`'s session yet for a remount to
-  // adopt. `setPendingFiles` still runs too, so this mount's own render
+  // The queue is also module-scoped (`upload-session.ts`): a tab switch that
+  // unmounts the form before `configFetching` settles would otherwise discard
+  // the drop, since nothing has reached `startUploadEntry`'s session for a
+  // remount to adopt. `setPendingFiles` still runs so this mount's render
   // reflects the queue immediately; the module copy is what a remount reads.
   const handleFilesAccepted = (files: File[]) => {
     if (phase !== 'idle') return;
@@ -369,20 +361,19 @@ export function UploadForm({ onPhaseChange, onOutcomeChange }: UploadFormProps) 
     void processFiles(files);
   };
 
-  // Flush queued drops once the quota query settles, re-applying every gate
-  // the dropzone validated against nothing (or stale values) during the fetch
+  // Flush queued drops once the quota query settles, re-applying every gate the
+  // dropzone validated against nothing (or stale values) during the fetch
   // window: extension and per-file size are re-checked per file with the same
-  // rejection toast react-dropzone shows (Codex P2 round 2 on PR #432), then
-  // the batch cap with the fresh quota. Over-cap batches are trimmed to the
-  // cap and the overflow rejected per file, matching react-dropzone v19's
-  // maxFiles behavior (v19 accepts files up to the limit instead of
-  // rejecting the batch wholesale).
+  // rejection toast react-dropzone shows, then the batch cap with the fresh
+  // quota. Over-cap batches are trimmed to the cap and the overflow rejected
+  // per file, matching react-dropzone v19's maxFiles behavior (it accepts files
+  // up to the limit instead of rejecting the batch wholesale).
   useEffect(() => {
     if (configFetching || !pendingFiles || phase !== 'idle') return;
     setPendingFiles(null);
-    // fix(#1832): release the module-scoped copy in step with the local
-    // one — this effect is the only consumer, so nothing else needs it
-    // once the flush it is about to do below has claimed the files.
+    // Release the module-scoped copy in step with the local one; this effect is
+    // the only consumer, so nothing else needs it once the flush below has
+    // claimed the files.
     clearPendingUploadFiles();
     const files = pendingFiles.filter((f) => {
       if (
@@ -443,11 +434,11 @@ export function UploadForm({ onPhaseChange, onOutcomeChange }: UploadFormProps) 
     setEntries((prev) => prev.filter((e) => e.id !== entryId));
     removeUploadSessionEntry(entryId);
     // Phase transition (reviewing → idle when empty) is handled by the
-    // useEffect dep'd on `entries` (IMPORT-03).
+    // useEffect dep'd on `entries`.
   };
 
   const quotaBanner = quotaNotice ? (
-    <div className="flex items-start gap-2.5 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+    <div role="alert" className="flex items-start gap-2.5 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
       <AlertCircle className="mt-0.5 size-4 shrink-0" />
       <div>
         <p className="font-medium">{t('upload.quotaBannerTitle')}</p>
@@ -477,7 +468,7 @@ export function UploadForm({ onPhaseChange, onOutcomeChange }: UploadFormProps) 
           onCommitAllAsVrt={handleCommitAllAsVrt}
           onRemove={removeEntry}
           onSheetChange={handleSheetChange}
-          // GPKG-03 Phase 1058: wire fan-out handler
+          // Wire fan-out handler
           onIngestAllLayers={handleIngestAllLayers}
           isCommitting={entries.some((e) => e.status === 'committing')}
         />
@@ -485,7 +476,7 @@ export function UploadForm({ onPhaseChange, onOutcomeChange }: UploadFormProps) 
           {t('upload.startOver')}
         </Button>
 
-        {/* GPKG-03 Phase 1058: results modal shown after fan-out settles */}
+        {/* Results modal shown after fan-out settles */}
         {fanOutResults && (
           <Dialog
             open
@@ -512,7 +503,7 @@ export function UploadForm({ onPhaseChange, onOutcomeChange }: UploadFormProps) 
                       <AlertCircle className="size-4 text-destructive shrink-0" />
                     )}
                     <span className="font-mono text-xs">{r.layerName}</span>
-                    {r.error && <span className="text-xs text-destructive">{r.error}</span>}
+                    {r.error && <span role="alert" className="text-xs text-destructive">{r.error}</span>}
                   </li>
                 ))}
               </ul>
@@ -538,17 +529,16 @@ export function UploadForm({ onPhaseChange, onOutcomeChange }: UploadFormProps) 
     return <BulkTrackingList entries={entries} onReset={reset} autoOpenVrt={autoOpenVrt} onOutcomeChange={onOutcomeChange} />;
   }
 
-  // idle. The dropzone stays enabled while the quota query fetches — disabling
-  // it made react-dropzone silently swallow drops (PR #274 follow-up). Drops in
-  // that window queue in pendingFiles and flush with the fresh quota, so we
-  // still never *act* on an unresolved/stale quota (Codex P2 on PR #274). Once
-  // a fetch settles, success carries the live remaining quota; an error
-  // degrades to permissive — consistent with allowedExtensions/maxSizeMb.
-  // While fetching, every config-derived gate is permissive (quota null,
-  // extensions/size undefined): react-dropzone enforces accept/maxSize/maxFiles
-  // at drop time, so cached stale values would reject files the fresh config
-  // allows before they could queue — the flush validates all three against the
-  // settled config instead (Codex P2 rounds 1-3 on PR #432).
+  // idle. The dropzone stays enabled while the quota query fetches (disabling it
+  // made react-dropzone silently swallow drops). Drops in that window queue in
+  // pendingFiles and flush with the fresh quota, so we never *act* on an
+  // unresolved/stale quota. Once a fetch settles, success carries the live
+  // remaining quota; an error degrades to permissive, consistent with
+  // allowedExtensions/maxSizeMb. While fetching, every config-derived gate is
+  // permissive (quota null, extensions/size undefined): react-dropzone enforces
+  // accept/maxSize/maxFiles at drop time, so stale cached values would reject
+  // files the fresh config allows before they could queue; the flush validates
+  // all three against the settled config instead.
   return (
     <div className="space-y-4">
       {/* Locked while a drop waits on the config, so it uploads as the kind it was dropped as. */}

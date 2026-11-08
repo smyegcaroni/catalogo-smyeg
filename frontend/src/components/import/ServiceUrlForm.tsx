@@ -52,30 +52,27 @@ type ServiceStep =
   | 'committing'
   | 'tracking';
 
-// Plan section 3.1: for an ArcGIS FeatureServer/MapServer URL, the import
-// wizard offers a three-way authentication choice instead of one optional
-// token field. 'none' is the default and is an explicit choice ("this
-// service is public"), not a blank state.
+// For an ArcGIS FeatureServer/MapServer URL the wizard offers a three-way
+// authentication choice. 'none' is an explicit choice ("this service is
+// public"), not a blank state.
 type ArcgisAuthMethod = 'none' | 'token' | 'signin';
 
-// feat(#1746 B4, plan 3.1): for a non-ArcGIS-shaped URL (WFS, OGC API
-// Features), B2b widened the door beyond a bearer token to the same
-// four-way choice the backend's CredentialMethod enum names. ArcGIS itself
-// stays bearer-only (an ArcGIS token is percent-encoded into the query, so
-// build_credential_header refuses to compose a header for it), which is why
-// this is a separate type from ArcgisAuthMethod above rather than a shared
-// one — the two select different sets of methods for reasons that live in
-// the transport, not in this form.
+// For a non-ArcGIS-shaped URL (WFS, OGC API Features) the door offers the
+// four-way choice the backend's CredentialMethod enum names. ArcGIS stays
+// bearer-only (its token is percent-encoded into the query, so
+// build_credential_header refuses to compose a header for it), hence a
+// separate type from ArcgisAuthMethod rather than a shared one.
 type ServiceCredentialMethod = 'none' | 'bearer' | 'basic' | 'header';
 
-// codex review #1757 round 4 P2: the ONE margin shared by the proactive
-// timer (scheduleExpiryTimer) and the synchronous fallback (isPast,
-// checked by expireStaleTokenIfPast/isTokenExpiredOrPast). The timer
-// used to retire a token 30 seconds early while the synchronous check
-// compared against the raw expires_at, so a tab resuming inside that
-// 30-second window could still forward a token the component had
-// already decided to retire.
+// The ONE margin shared by the proactive timer (scheduleExpiryTimer) and the
+// synchronous fallback (msUntilExpiry, checked by
+// expireStaleTokenIfPast/isTokenExpiredOrPast), so a tab resuming inside the
+// window can't forward a token the component already decided to retire.
 const EXPIRY_MARGIN_MS = 30_000;
+
+function msUntilExpiry(isoTime: string): number {
+  return new Date(isoTime).getTime() - EXPIRY_MARGIN_MS - Date.now();
+}
 
 export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
   const { t } = useTranslation('import');
@@ -86,8 +83,12 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
   const [previewData, setPreviewData] = useState<ServicePreviewResponse | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The probe's 403 is the only failure that blames the credential; matching
+  // on the message lets any later setError() clear it without extra resets.
+  const [credentialRefusal, setCredentialRefusal] = useState<string | null>(null);
+  const credentialInvalid = error !== null && error === credentialRefusal;
 
-  // ArcGIS sign-in (plan 3.2 / lane A2).
+  // ArcGIS sign-in.
   const [arcgisAuthMethod, setArcgisAuthMethod] = useState<ArcgisAuthMethod>('none');
   const [portalUrl, setPortalUrl] = useState('');
   const [username, setUsername] = useState('');
@@ -97,10 +98,10 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
   const [signinError, setSigninError] = useState<string | null>(null);
   const [tokenExpired, setTokenExpired] = useState(false);
 
-  // Non-ArcGIS credential method (plan 3.1 / lane B4). `token` above is
-  // reused for the bearer branch here, same as it is for ArcGIS's own
-  // 'token' method — the two are mutually exclusive branches of the same
-  // ternary below, so nothing can read the other's value into a request.
+  // Non-ArcGIS credential method. `token` above is reused for the bearer
+  // branch, as for ArcGIS's 'token' method; the two are mutually exclusive
+  // branches of the ternary below, so neither can read the other's value into
+  // a request.
   const [serviceCredentialMethod, setServiceCredentialMethod] =
     useState<ServiceCredentialMethod>('none');
   const [basicUsername, setBasicUsername] = useState('');
@@ -109,20 +110,18 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
   const [headerValue, setHeaderValue] = useState('');
   const [credentialsReset, setCredentialsReset] = useState(false);
 
-  // codex review #1757 P1: a stale in-flight sign-in response must never
-  // resurrect a token or run after the auth context it belongs to is gone.
-  // Bumped on every full auth-state reset below (method switch, URL origin
-  // change, or the wizard's own reset()); handleArcgisSignin captures the
-  // value at send time and ignores its own response if it no longer matches.
+  // A stale in-flight sign-in response must never resurrect a token or run
+  // after its auth context is gone. Bumped on every full auth-state reset
+  // (method switch, URL origin change, the wizard's reset()); handleArcgisSignin
+  // captures it at send time and ignores its response if it no longer matches.
   const signinGenerationRef = useRef(0);
   const authOrigin = originOf(url);
   const isArcGisShaped = looksLikeArcGisServiceUrl(url);
   const isArcGisPortalShaped = looksLikeArcGisPortalUrl(url);
-  // fix(#1712): guards every `setState` reached after an `await` in the
-  // preview/commit session helpers below, mirroring UrlImportForm's
-  // identical ref (`url-import-session.ts`'s consumer) — the module-scoped
-  // session keeps running regardless of mount state, but this component
-  // must not write into a tree that is no longer live.
+  // Guards every `setState` after an `await` in the preview/commit helpers
+  // below, as in UrlImportForm: the module-scoped session keeps running
+  // regardless of mount state, but this component must not write into a tree
+  // that is no longer live.
   const mountedRef = useRef(false);
   useEffect(() => {
     mountedRef.current = true;
@@ -133,11 +132,9 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
   const lastAuthOriginRef = useRef(authOrigin);
   const lastAuthShapeRef = useRef(isArcGisShaped);
 
-  // codex review #1757 round 2: a minted token stops being usable 30
-  // seconds before ArcGIS actually expires it (a safety margin, not a
-  // display nicety), even if the wizard is left open. This timer is the
-  // single place that enforces that; `expireStaleTokenIfPast` below is the
-  // belt-and-suspenders check for the case a backgrounded tab throttled it.
+  // A minted token stops being usable 30 seconds before ArcGIS expires it (a
+  // safety margin), even if the wizard is left open. This timer enforces that;
+  // `expireStaleTokenIfPast` below covers a backgrounded tab that throttled it.
   const expiryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const clearExpiryTimer = useCallback(() => {
@@ -147,16 +144,13 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
     }
   }, []);
 
-  // codex review #1757 round 2 P2: a minted token is bound to the method,
-  // origin, portal URL, username, and password that produced it. Any of
-  // those changing (a method switch, a URL origin change, an edit to the
-  // portal URL/username/password after a mint, or the wizard's own
-  // reset()) must not leave the old token, or its "valid until" claim,
-  // looking current, and must invalidate any sign-in still in flight for
-  // the context being replaced. A password edit clears the mint too, for
-  // symmetry: a new password means a new attempt, not a continuation of
-  // the old one. The expiry timer below reuses this same function. Lane
-  // A3 applies the identical rule to its own credential block.
+  // A minted token is bound to the method, origin, portal URL, username and
+  // password that produced it. Changing any of them (or the wizard's reset())
+  // must not leave the old token or its "valid until" claim looking current,
+  // and must invalidate any sign-in in flight for the replaced context. A
+  // password edit clears the mint too: a new password is a new attempt. The
+  // expiry timer below reuses this function; ArcgisCredentialBlock applies the
+  // identical rule.
   const invalidateMintedCredential = useCallback(() => {
     signinGenerationRef.current += 1;
     clearExpiryTimer();
@@ -165,17 +159,11 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
     setTokenExpired(false);
   }, [clearExpiryTimer]);
 
-  function isPast(isoTime: string): boolean {
-    return new Date(isoTime).getTime() - EXPIRY_MARGIN_MS <= Date.now();
-  }
-
-  // codex review #1757 round 2: the timer above is the normal path; this
-  // is the fallback for a throttled background tab whose setTimeout fired
-  // late (or never, before the user comes back and tries to submit).
-  // Called at the top of every place that would otherwise forward `token`
-  // to the backend. Returns true when it just refused a stale submission.
+  // Fallback for a throttled background tab whose setTimeout fired late (or
+  // never). Called at the top of every place that would forward `token` to the
+  // backend. Returns true when it just refused a stale submission.
   function expireStaleTokenIfPast(): boolean {
-    if (token && tokenExpiresAt && isPast(tokenExpiresAt)) {
+    if (token && tokenExpiresAt && msUntilExpiry(tokenExpiresAt) <= 0) {
       signinGenerationRef.current += 1;
       clearExpiryTimer();
       setToken('');
@@ -186,29 +174,23 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
     return false;
   }
 
-  // codex review #1757 round 3 P2: the expiry timer's own `expire()` (and
-  // expireStaleTokenIfPast above) both clear `token` and `tokenExpiresAt`
-  // together, so once either has already run, `expireStaleTokenIfPast`
-  // can no longer tell "expired" apart from "never had one" (`token` is
-  // already ''). `tokenExpired` is the marker that survives that clear;
-  // checking it first (with expireStaleTokenIfPast staying as the
-  // fallback for a token that is past its deadline but has not been
-  // cleared yet, e.g. a throttled background tab) is what lets a step
-  // AFTER the credential form still tell the two apart and refuse with
-  // the reconnect message instead of silently proceeding anonymously.
+  // The expiry timer's `expire()` and expireStaleTokenIfPast both clear
+  // `token` and `tokenExpiresAt`, after which "expired" can't be told from
+  // "never had one". `tokenExpired` survives that clear; checking it first
+  // (expireStaleTokenIfPast stays as the fallback for a token past its deadline
+  // but not yet cleared) lets a step after the credential form refuse with the
+  // reconnect message instead of silently proceeding anonymously.
   function isTokenExpiredOrPast(): boolean {
     return tokenExpired || expireStaleTokenIfPast();
   }
 
-  // codex review #1757 round 2: schedule the token's own expiry 30 seconds
-  // ahead of ArcGIS's stated deadline, so a wizard left open does not go on
-  // submitting a token the service is about to (or already does) reject.
-  // Guarded by the generation it was minted under: if the auth context
-  // moved on before this fires, `invalidateMintedCredential` already
-  // cleared everything and this is a no-op.
+  // Schedule the token's expiry 30 seconds ahead of ArcGIS's stated deadline,
+  // so a wizard left open doesn't submit a token the service is about to
+  // reject. Guarded by the generation it was minted under: if the auth context
+  // moved on, `invalidateMintedCredential` already cleared everything.
   function scheduleExpiryTimer(expiresAt: string, generation: number): void {
     clearExpiryTimer();
-    const delay = new Date(expiresAt).getTime() - EXPIRY_MARGIN_MS - Date.now();
+    const delay = msUntilExpiry(expiresAt);
     const expire = () => {
       expiryTimerRef.current = null;
       if (signinGenerationRef.current !== generation) return;
@@ -224,17 +206,14 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
     expiryTimerRef.current = setTimeout(expire, delay);
   }
 
-  // codex review #1757 P1 / round 3: a credential entered for one auth
-  // CONTEXT must never survive being pointed at a different one. Origin is
-  // one axis (a pasted token for a non-ArcGIS URL that becomes ArcGIS, or a
-  // minted ArcGIS token for one portal surviving a swap to another); the
-  // service SHAPE is the other (a token typed for a non-ArcGIS URL, e.g.
-  // a WFS field, surviving a path-only edit that turns the same origin
-  // into an ArcGIS FeatureServer URL, where it would otherwise sit hidden
-  // behind a select showing "No authentication" and still get forwarded).
-  // Editing only the path within the SAME origin AND the same shape (e.g.
-  // switching between two FeatureServer layers on one ArcGIS org) is not a
-  // credential hazard, so that alone does not reset.
+  // A credential entered for one auth CONTEXT must never survive being pointed
+  // at another. Origin is one axis (a pasted token for a non-ArcGIS URL that
+  // becomes ArcGIS, or a minted token surviving a swap to another portal); the
+  // service SHAPE is the other (a token typed for a WFS URL surviving a
+  // path-only edit that turns the same origin into an ArcGIS FeatureServer URL,
+  // where it would sit hidden behind a select showing "No authentication" and
+  // still be forwarded). Editing only the path within the same origin and shape
+  // (two FeatureServer layers on one org) is not a hazard and doesn't reset.
   useEffect(() => {
     const originChanged = authOrigin !== lastAuthOriginRef.current;
     const shapeChanged = isArcGisShaped !== lastAuthShapeRef.current;
@@ -255,23 +234,18 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
     setUsername('');
     setPassword('');
     setSigninError(null);
-    // fix(#1746 B4): the non-ArcGIS credential branch is the other half of
-    // the same hazard — a username/password or header key typed for one
-    // origin or shape must not survive being pointed at another, same as
-    // the ArcGIS fields above. `token` itself is already covered by
-    // invalidateMintedCredential.
+    // The non-ArcGIS credential branch is the other half of the same hazard: a
+    // username/password or header key typed for one origin or shape must not
+    // survive another. `token` is covered by invalidateMintedCredential.
     setServiceCredentialMethod('none');
     setBasicUsername('');
     setBasicPassword('');
     setHeaderName('');
     setHeaderValue('');
-    // invalidateMintedCredential is a fresh closure each render, and the
-    // ref checks above already guard this effect so it does real work
-    // only on a genuine origin or shape change; including it here is for
-    // correctness (react-hooks/exhaustive-deps), not because it can
-    // change what this effect does.
-    // The ref guards above make this a no-op unless the origin or shape changed, so
-    // depending on the credential fields does not re-run the reset as they change.
+    // invalidateMintedCredential is a fresh closure each render; including it
+    // satisfies react-hooks/exhaustive-deps. The ref guards above make this a
+    // no-op unless the origin or shape changed, so depending on the credential
+    // fields doesn't re-run the reset as they change.
   }, [
     authOrigin,
     isArcGisShaped,
@@ -287,16 +261,13 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
     headerValue,
   ]);
 
-  // codex review #1757 round 2: the expiry timer must not outlive the
-  // component (a backgrounded/unmounted tab has no business scheduling
-  // state updates). The wizard's own reset() also invalidates the mint
-  // and so clears the timer, so this effect only needs to cover unmount.
+  // The expiry timer must not outlive the component. The wizard's reset() also
+  // invalidates the mint and clears the timer, so this only covers unmount.
   useEffect(() => clearExpiryTimer, [clearExpiryTimer]);
 
-  // fix(#1712): mirrors url-import-session.ts's identical guard — reset is
-  // available from every terminal state, but clearing the session mid-commit
-  // orphans a commit that then succeeds untracked, with nothing left to
-  // adopt it back.
+  // As in url-import-session.ts: reset is available from every terminal state,
+  // but clearing the session mid-commit orphans a commit that then succeeds
+  // untracked, with nothing left to adopt it.
   const commitInFlight = step === 'committing';
 
   const reset = () => {
@@ -324,8 +295,8 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
   };
 
   // Switching methods discards the other branches' fields rather than
-  // half-honouring them, same rule as handleAuthMethodChange below (plan
-  // 3.4 / the backend's own oneOf-shaped `auth` object).
+  // half-honouring them, as handleAuthMethodChange below (the backend's `auth`
+  // object is oneOf-shaped).
   const handleServiceCredentialMethodChange = (next: ServiceCredentialMethod) => {
     setCredentialsReset(false);
     setServiceCredentialMethod(next);
@@ -336,12 +307,10 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
     setHeaderValue('');
   };
 
-  // The `ServiceAuthRequest` this form's non-ArcGIS credential branch
-  // currently describes, or undefined for 'none' or an incomplete method
-  // (mirrors the backend's own requirement that basic/header be complete —
-  // rather than send a body the door will 422, this just stays anonymous
-  // until both fields are filled, the same way the plain optional token
-  // field always behaved when left blank).
+  // The `ServiceAuthRequest` the non-ArcGIS credential branch currently
+  // describes, or undefined for 'none' or an incomplete method (the backend
+  // requires basic/header to be complete). It stays anonymous rather than send
+  // a body the door will 422, until both fields are filled.
   function buildServiceAuth(): ServiceAuthRequest | undefined {
     switch (serviceCredentialMethod) {
       case 'bearer':
@@ -360,9 +329,8 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
   }
 
   // Switching methods discards the other branch's fields rather than
-  // half-honouring them (mirrors the backend's own `auth` object rule,
-  // plan 3.4). A stale password or a stale pasted token left over from the
-  // method the user just backed out of must never ride along silently.
+  // half-honouring them (the backend's `auth` object rule): a stale password
+  // or pasted token from the method the user backed out of must never ride along.
   const handleAuthMethodChange = (next: ArcgisAuthMethod) => {
     setCredentialsReset(false);
     invalidateMintedCredential();
@@ -374,12 +342,10 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
   };
 
   const handleArcgisSignin = async () => {
-    // codex review #1757 P1: capture the generation this request belongs to.
-    // If the auth context resets (method switch, URL origin change, or the
-    // wizard resetting) before this resolves, applying its result would
-    // resurrect a token or error message the user already backed away
-    // from, so only the token/expiry/error application below is gated on
-    // it.
+    // Capture the generation this request belongs to. If the auth context
+    // resets before this resolves, applying its result would resurrect a token
+    // or error the user backed away from, so only the token/expiry/error
+    // application below is gated on it.
     const generation = signinGenerationRef.current;
     setSigningIn(true);
     setSigninError(null);
@@ -402,27 +368,21 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
         );
       }
     } finally {
-      // codex review #1757 P2: the credential inputs stay enabled while a
-      // sign-in is pending (only the method select and the Sign in button
-      // disable), so the user can correct the portal URL, username, or
-      // password before this settles. That edit already bumped the
-      // generation via invalidateMintedCredential, and may have put a new
-      // password in state for the next attempt; clearing unconditionally
-      // here would wipe that edit out from under the user when this
-      // superseded request settles. Gate it on the same generation check
-      // the success and error branches use above.
+      // The credential inputs stay enabled while a sign-in is pending (only the
+      // method select and the Sign in button disable), so the user can edit the
+      // portal URL, username or password before this settles. That edit bumped
+      // the generation and may have put a new password in state; clearing
+      // unconditionally would wipe it when this superseded request settles. Gate
+      // on the same generation check as the success and error branches.
       if (signinGenerationRef.current === generation) {
-        // Clear the password from state the instant the attempt settles,
-        // success or failure alike, and never retry automatically. ArcGIS
-        // locks an account after five failed sign-ins in fifteen minutes,
-        // and a retry loop here could do that to a real customer's
-        // account.
+        // Clear the password the instant the attempt settles, success or failure,
+        // and never retry automatically: ArcGIS locks an account after five
+        // failed sign-ins in fifteen minutes.
         setPassword('');
       }
-      // Unlike the password, this always runs regardless of generation:
-      // the button and the select both stay disabled while signingIn is
-      // true, and this is the only sign-in that can be in flight at once,
-      // so nothing else will ever flip it back to false if this does not.
+      // Unlike the password, this always runs: the button and select stay
+      // disabled while signingIn, and this is the only sign-in that can be in
+      // flight, so nothing else would flip it back to false.
       setSigningIn(false);
     }
   };
@@ -430,28 +390,19 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
   const handleConnect = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    // codex review #1757 round 2 / round 3 P2: the timer above should
-    // already have cleared an expired token, but a backgrounded tab can
-    // throttle setTimeout, and by the time either it or the timer HAS run,
-    // `token` state itself is already ''. Either way, calling
-    // isTokenExpiredOrPast() here only schedules its side effects for the
-    // NEXT render; `token` in this closure is still whatever it was when
-    // this handler started running. `currentToken` is the corrected value
-    // for the rest of THIS invocation, so Probe below can never forward a
-    // token that just got invalidated (round 3 caught this: the discarded
-    // boolean this used to check, then ignore, still let a stale `token`
-    // reach probeService).
+    // The timer should already have cleared an expired token, but a
+    // backgrounded tab can throttle setTimeout, and once it or the timer has
+    // run, `token` state is already ''. isTokenExpiredOrPast() only schedules
+    // its side effects for the NEXT render, so `token` in this closure is
+    // stale. `currentToken` is the corrected value for the rest of THIS
+    // invocation, so Probe can never forward a just-invalidated token.
     const currentToken = isTokenExpiredOrPast() ? '' : token;
 
-    // codex review #1757 round 2 P2: the sign-in fields live inside this
-    // same <form> (a <form> cannot nest inside another), so pressing Enter
-    // in the username or password field submitted straight to Probe
-    // instead of signing in, sending the service a request under a
-    // credential block that had never actually authenticated. While sign
-    // in is the chosen method and no token has been minted yet (using the
-    // corrected value above, not the possibly-stale `token`), route ANY
-    // submission of this form (Enter in a field, or a click on the same
-    // submit button) to sign-in instead of Probe.
+    // The sign-in fields live inside this same <form> (forms can't nest), so
+    // pressing Enter in the username or password field would submit straight to
+    // Probe under a credential block that never authenticated. While sign-in is
+    // the chosen method and no token has been minted yet (using the corrected
+    // value above), route ANY submission of this form to sign-in instead.
     if (isArcGisShaped && arcgisAuthMethod === 'signin' && !currentToken) {
       if (!signingIn && portalUrl.trim() && username.trim() && password) {
         void handleArcgisSignin();
@@ -466,9 +417,8 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
     setError(null);
 
     try {
-      // fix(#1746 B4): ArcGIS keeps forwarding a bare bearer token the way
-      // it always has; a non-ArcGIS-shaped URL now forwards the structured
-      // `auth` object instead, since it can also describe basic or a named
+      // ArcGIS forwards a bare bearer token; a non-ArcGIS-shaped URL forwards
+      // the structured `auth` object, which can also describe basic or a named
       // header.
       const result = isArcGisShaped
         ? await probeService(trimmed, currentToken || undefined)
@@ -477,16 +427,16 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
       setStep('layer-select');
     } catch (err) {
       const msg = err instanceof ApiError ? err.message : t('serviceUrl.connectFailed');
+      setCredentialRefusal(err instanceof ApiError && err.status === 403 ? msg : null);
       setError(msg);
       setStep('idle');
       toast.error(msg);
     }
   };
 
-  // fix(#1712): the session is owned by the module (`service-url-session.ts`),
-  // so a tab switch mid-preview cannot strand the job. Everything below only
-  // decides what THIS mount displays; `session.promise` keeps running
-  // regardless. Mirrors UrlImportForm's `runSession` (`url-import-session.ts`).
+  // The session is owned by the module (`service-url-session.ts`), so a tab
+  // switch mid-preview cannot strand the job. This only decides what THIS mount
+  // displays; `session.promise` keeps running regardless.
   const runPreviewSession = useCallback(
     async (session: ServiceImportSession) => {
       setStep('previewing');
@@ -504,11 +454,10 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
             const title = body.existing_title ?? t('serviceUrl.unknownDataset');
             const msg = t('serviceUrl.alreadyRegistered', { title });
             setError(msg);
-            // fix(#1712): `probeResult` is only available when THIS mount
-            // started the preview — a mount adopting a session that failed
-            // while unmounted never probed, so there is no layer list to go
-            // back to. Falls back to idle rather than rendering a
-            // layer-select with no layers.
+            // `probeResult` exists only when THIS mount started the preview; a
+            // mount adopting a session that failed while unmounted never probed,
+            // so there is no layer list to go back to. Fall back to idle rather
+            // than render a layer-select with no layers.
             setStep(probeResult ? 'layer-select' : 'idle');
             toast.error(msg, {
               action: {
@@ -531,12 +480,10 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
   const handleLayerSelect = async (layer: LayerInfo) => {
     if (!probeResult) return;
 
-    // codex review #1757 round 2 / round 3: this step is past the
-    // credential form, so there is no method select left to route a retry
-    // through. Refuse the preview outright and point the user back to
-    // reconnect. isTokenExpiredOrPast also catches the case the expiry
-    // timer already fired (and so already cleared `token` itself) while
-    // this step was open, which expireStaleTokenIfPast alone cannot see.
+    // This step is past the credential form, so there is no method select to
+    // route a retry through. Refuse the preview and point the user back to
+    // reconnect. isTokenExpiredOrPast also catches an expiry timer that already
+    // fired and cleared `token`, which expireStaleTokenIfPast alone cannot see.
     if (isTokenExpiredOrPast()) {
       setError(
         t('serviceUrl.arcgisTokenExpiredMidImport', {
@@ -547,10 +494,9 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
       return;
     }
 
-    // fix(#1746 B4): same split as Probe above — ArcGIS forwards its bearer
-    // token under the deprecated `token` field, a non-ArcGIS service under
-    // the structured `auth` object. The two are mutually exclusive on the
-    // wire (`reject_service_auth_conflict`), so only one is ever set here.
+    // Same split as Probe: ArcGIS forwards its bearer token under the deprecated
+    // `token` field, a non-ArcGIS service under the structured `auth` object.
+    // The two are mutually exclusive on the wire (`reject_service_auth_conflict`).
     const request: ServicePreviewRequest = {
       url: probeResult.url,
       service_type: probeResult.service_type,
@@ -562,7 +508,7 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
       object_id_field: layer.object_id_field,
     };
 
-    // fix(#1835): pairs the minted token with its expiry in the session.
+    // Pairs the minted token with its expiry in the session.
     await runPreviewSession(
       startServicePreview(request, isArcGisShaped, isArcGisShaped ? tokenExpiresAt : null),
     );
@@ -571,10 +517,8 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
   const handleCommit = async (metadata: CommitImportRequest) => {
     if (!previewData) return;
 
-    // codex review #1757 round 2 / round 3: same reasoning as
-    // handleLayerSelect, refusing rather than forwarding a token that
-    // expired while this dialog was open, including the case the expiry
-    // timer already fired and cleared `token` before this ran.
+    // As in handleLayerSelect: refuse rather than forward a token that expired
+    // while this dialog was open, including after the timer already cleared it.
     if (isTokenExpiredOrPast()) {
       setError(
         t('serviceUrl.arcgisTokenExpiredMidImport', {
@@ -587,7 +531,7 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
 
     setStep('committing');
 
-    // fix(#1746 B4): same split as Probe/Preview above.
+    // Same split as Probe/Preview above.
     const auth = isArcGisShaped ? undefined : buildServiceAuth();
 
     const commitPromise = commitImport(previewData.job_id, {
@@ -595,9 +539,8 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
       ...(isArcGisShaped && token ? { token } : {}),
       ...(auth ? { auth } : {}),
     });
-    // fix(#1712): attached BEFORE this awaits, so an unmount mid-commit
-    // still leaves the operation reachable for the next mount to subscribe
-    // to — mirrors `attachUrlImportCommit` (`url-import-session.ts`).
+    // Attached BEFORE the await, so an unmount mid-commit still leaves the
+    // operation reachable for the next mount (as `attachUrlImportCommit`).
     attachServiceCommit(commitPromise);
 
     try {
@@ -615,32 +558,26 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
     }
   };
 
-  // fix(#1834 round 1 P2): restore the credential CONTEXT a resumed
-  // session was requested under — `url`, the ArcGIS/non-ArcGIS shape, and
-  // whichever of `token`/`auth` that shape used — so a commit issued AFTER
-  // this remount rebuilds the same request the original mount would have
-  // sent, instead of `buildServiceAuth()`/`isArcGisShaped` reading fresh
-  // component defaults.
+  // Restore the credential CONTEXT a resumed session was requested under (`url`,
+  // the ArcGIS/non-ArcGIS shape, and whichever of `token`/`auth` it used) so a
+  // commit after this remount rebuilds the original request instead of reading
+  // fresh component defaults.
   //
   // The origin/shape-change effect below (`lastAuthOriginRef`/
-  // `lastAuthShapeRef`) exists to WIPE credential state exactly when `url`
-  // changes across a render — the correct behavior for a user EDITING the
-  // URL. Restoring `url` here would trigger the very same effect and undo
-  // this restoration in the next render, so the refs are seeded to the
-  // resumed URL's origin/shape FIRST: by the time that effect's own
-  // `authOrigin`/`isArcGisShaped` (computed from the just-set `url` state)
-  // are compared against these refs, they already agree, and the effect
-  // sees no change to react to.
+  // `lastAuthShapeRef`) wipes credential state when `url` changes across a
+  // render. Restoring `url` here would trigger it and undo this restoration, so
+  // the refs are seeded to the resumed URL's origin/shape first and the effect
+  // sees no change.
   const restoreSessionCredential = useCallback((session: ServiceImportSession) => {
     lastAuthOriginRef.current = originOf(session.url);
     lastAuthShapeRef.current = session.isArcGisShaped;
     setUrl(session.url);
     if (session.isArcGisShaped) {
       setToken(session.token ?? '');
-      // fix(#1835): a restored token with no expiry check reads as
-      // never-expiring — re-check and reschedule instead of trusting it.
+      // A restored token with no expiry check reads as never-expiring; re-check
+      // and reschedule instead of trusting it.
       if (session.token && session.tokenExpiresAt) {
-        if (isPast(session.tokenExpiresAt)) {
+        if (msUntilExpiry(session.tokenExpiresAt) <= 0) {
           setToken('');
           setTokenExpiresAt(null);
           setTokenExpired(true);
@@ -668,15 +605,14 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
       setHeaderName(auth.header_name ?? '');
       setHeaderValue(auth.header_value ?? '');
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only restore of the in-flight session's credentials
   }, []);
 
-  // fix(#1712): re-attach to a preview or commit that was running (or
-  // finished) while this form was unmounted — a tab switch away and back.
-  // Without this, the job id the server returned to a dead component would
-  // be unreachable, plus a pending commit issued against it. Mount-only,
-  // mirroring UrlImportForm's identical effect: a later session start is
-  // driven by user actions, not by this effect re-running.
+  // Re-attach to a preview or commit that was running (or finished) while this
+  // form was unmounted. Otherwise the job id the server returned to a dead
+  // component would be unreachable, plus a pending commit issued against it.
+  // Mount-only, as in UrlImportForm: a later session start is driven by user
+  // actions.
   useEffect(() => {
     const session = peekServiceImport();
     if (!session) return;
@@ -691,11 +627,10 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
           setStep('tracking');
         } catch (err) {
           if (!mountedRef.current) return;
-          // The commit failed, so the job is still `pending` and genuinely
-          // previewable: rebuild review from the session's own retained
-          // preview data (no re-fetch needed — it never changes once the
-          // preview succeeded) rather than stranding the user on a
-          // committing spinner for a job nothing will finish.
+          // The commit failed, so the job is still `pending` and previewable:
+          // rebuild review from the session's retained preview data (it never
+          // changes once the preview succeeded) rather than strand the user on
+          // a committing spinner for a job nothing will finish.
           const msg = err instanceof ApiError ? err.message : t('serviceUrl.commitFailed');
           setError(msg);
           if (session.previewData) {
@@ -709,10 +644,9 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
       return;
     }
     void runPreviewSession(session);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only; later sessions start from user actions
   }, [restoreSessionCredential]);
 
-  // ── Loading states ──
   if (step === 'probing' || step === 'previewing') {
     const loadingLabel = step === 'probing' ? t('serviceUrl.connecting') : t('serviceUrl.loadingPreview');
     return (
@@ -741,7 +675,6 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
       .filter(Boolean)
       .join(' · ');
 
-  // ── Layer selection with probe result ──
   if (step === 'layer-select' && probeResult) {
     return (
       <div className="space-y-5">
@@ -793,18 +726,15 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
               </p>
             )}
             {probeResult.layers.map((layer) => {
-              // D-10 (Phase 1057 CLASS-07): consume backend-classified layer.kind directly.
-              // Previously re-derived from geometry_type string contents, which failed
-              // when geometry_type is null (the post-D-05 default for OGC API / WFS layers).
+              // Consume backend-classified layer.kind directly; geometry_type is
+              // null for OGC API / WFS layers.
               const unsupported = layer.importable === false;
               return (
                 <button
-                  // fix(#1746): keyed by layer_id, not layer.name — two
-                  // layers in the same service can share a display name
-                  // (e.g. two ArcGIS sublayers both titled
-                  // REC_PassiveConservedAccessScore), and a name-keyed list
-                  // collapses/misrenders duplicates. layer_id is what the
-                  // backend already dedupes on.
+                  // Keyed by layer_id, not layer.name: two layers in a service can
+                  // share a display name (e.g. two ArcGIS sublayers titled
+                  // REC_PassiveConservedAccessScore), and a name key would
+                  // collapse duplicates. The backend dedupes on layer_id.
                   key={layer.layer_id ?? layer.name}
                   onClick={() => handleLayerSelect(layer)}
                   disabled={unsupported}
@@ -835,19 +765,18 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
           </div>
 
           {error && (
-            <p className="border-t border-border px-5 py-3 text-sm text-destructive">{error}</p>
+            <p role="alert" className="border-t border-border px-5 py-3 text-sm text-destructive">{error}</p>
           )}
         </div>
       </div>
     );
   }
 
-  // ── Review and commit ──
   if ((step === 'review' || step === 'committing') && previewData) {
     return (
       <div className="space-y-4">
         <ImportPreview preview={previewData} source="service" />
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
         <ImportMetadataForm
           defaultName={previewData.source_filename ?? previewData.layer_name}
           detectedCrs={previewData.crs}
@@ -861,17 +790,15 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
     );
   }
 
-  // ── Job tracking ──
   if (step === 'tracking' && jobId) {
     return <JobProgress jobId={jobId} onReset={reset} />;
   }
 
-  // ── Idle — URL input form ──
   return (
     <div className="rounded-xl border border-border bg-card p-5">
       <form onSubmit={handleConnect} className="space-y-5">
         <div>
-          <label className="eyebrow mb-2.5 block">
+          <label htmlFor="service-url" className="eyebrow mb-2.5 block">
             {t('serviceUrl.label', { defaultValue: 'Service URL — we\'ll auto-detect the type' })}
           </label>
           <div className="flex items-stretch overflow-hidden rounded-lg border-[1.5px] border-border bg-surface-0 transition-colors focus-within:border-primary">
@@ -880,7 +807,10 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
               URL
             </span>
             <input
+              id="service-url"
               type="url"
+              aria-invalid={error && !credentialInvalid ? true : undefined}
+              aria-describedby={error && !credentialInvalid ? 'service-url-error' : undefined}
               placeholder={t('serviceUrl.placeholder')}
               value={url}
               onChange={(e) => setUrl(e.target.value)}
@@ -967,17 +897,18 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
                   placeholder={t('serviceUrl.tokenPlaceholder')}
                   value={token}
                   onChange={(e) => setToken(e.target.value)}
+                  aria-invalid={credentialInvalid ? true : undefined}
+                  aria-describedby={credentialInvalid ? 'access-token-help service-url-error' : 'access-token-help'}
                   className="font-mono text-sm"
-                  // fix(#1746): this is a request-only service token, not a
-                  // login credential, and autocomplete="off" alone does not
-                  // stop Chrome from offering a saved password here, so opt
-                  // out of every password manager explicitly.
+                  // A request-only service token, not a login credential, and
+                  // autocomplete="off" alone doesn't stop Chrome offering a saved
+                  // password here, so opt out of every password manager.
                   autoComplete="new-password"
                   data-1p-ignore
                   data-lpignore="true"
                   data-bwignore
                 />
-                <p className="text-xs text-muted-foreground">
+                <p id="access-token-help" className="text-xs text-muted-foreground">
                   {t('serviceUrl.arcgisTokenHelpText', {
                     defaultValue:
                       "Use an API key if your account can create one; Viewer accounts and accounts using single sign-on or multi-factor authentication can't. Otherwise, generate one from your portal's Sharing API with client=referer. Tokens last at most 15 days.",
@@ -1036,12 +967,12 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
                       setPassword(e.target.value);
                       invalidateMintedCredential();
                     }}
+                    aria-invalid={signinError ? true : undefined}
+                    aria-describedby={signinError ? 'arcgis-signin-error' : undefined}
                     className="text-sm"
-                    // This is a genuine third-party ArcGIS login, not a
-                    // GeoLens one, and a password manager offering to save it
-                    // would save it against the GeoLens origin, which is
-                    // misleading, so opt every manager out the same way the
-                    // token field does (#1750).
+                    // A third-party ArcGIS login, not a GeoLens one; a password
+                    // manager would save it against the GeoLens origin, which is
+                    // misleading, so opt every manager out as the token field does.
                     autoComplete="new-password"
                     data-1p-ignore
                     data-lpignore="true"
@@ -1050,7 +981,7 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
                 </div>
 
                 {signinError && (
-                  <p className="text-sm text-destructive">{signinError}</p>
+                  <p id="arcgis-signin-error" role="alert" className="text-sm text-destructive">{signinError}</p>
                 )}
 
                 <div className="flex flex-wrap items-center gap-3">
@@ -1073,7 +1004,7 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
                     </span>
                   )}
                   {tokenExpired && (
-                    <span className="text-xs text-destructive">
+                    <span role="alert" className="text-xs text-destructive">
                       {t('serviceUrl.tokenExpired', {
                         defaultValue: 'Token expired, sign in again',
                       })}
@@ -1092,9 +1023,8 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
                       readOnly
                       value={token}
                       className="font-mono text-sm"
-                      // Same request-only-credential opt-outs as the pasted
-                      // token field above (#1746); this one just displays
-                      // a value GeoLens minted rather than one the user typed.
+                      // Same password-manager opt-outs as the pasted token
+                      // field above; this one displays a value GeoLens minted.
                       autoComplete="new-password"
                       data-1p-ignore
                       data-lpignore="true"
@@ -1156,16 +1086,17 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
                 <Input
                   id="service-credential-token"
                   type="password"
+                  aria-invalid={credentialInvalid ? true : undefined}
+                  aria-describedby={credentialInvalid ? 'service-url-error' : undefined}
                   placeholder={t('serviceUrl.credentialTokenPlaceholder', {
                     defaultValue: 'Paste your bearer token',
                   })}
                   value={token}
                   onChange={(e) => setToken(e.target.value)}
                   className="font-mono text-sm"
-                  // fix(#1746): this is a request-only service token, not a login
-                  // credential — autocomplete="off" alone does not stop Chrome from
-                  // offering a saved password here, so opt out of every password
-                  // manager explicitly.
+                  // A request-only service token, not a login credential, and
+                  // autocomplete="off" alone doesn't stop Chrome offering a saved
+                  // password here, so opt out of every password manager.
                   autoComplete="new-password"
                   data-1p-ignore
                   data-lpignore="true"
@@ -1201,10 +1132,9 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
                     value={basicPassword}
                     onChange={(e) => setBasicPassword(e.target.value)}
                     className="text-sm"
-                    // A genuine service login, same reasoning as the ArcGIS
-                    // sign-in fields above (#1750): opt every password
-                    // manager out rather than let it offer to save a
-                    // third-party credential against the GeoLens origin.
+                    // A service login, as the ArcGIS sign-in fields above: opt
+                    // every password manager out rather than let it offer to save
+                    // a third-party credential against the GeoLens origin.
                     autoComplete="new-password"
                     data-1p-ignore
                     data-lpignore="true"
@@ -1261,7 +1191,11 @@ export function ServiceUrlForm({ initialUrl = '' }: { initialUrl?: string }) {
           </div>
         )}
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <p id="service-url-error" role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        )}
       </form>
     </div>
   );

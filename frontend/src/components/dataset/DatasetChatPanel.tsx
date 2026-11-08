@@ -8,12 +8,26 @@ import { streamDatasetChatMessage } from '@/api/maps';
 import { useCreateMap } from '@/hooks/use-maps';
 import { useAIAvailability } from '@/hooks/use-ai-availability';
 import { usePermissions } from '@/hooks/use-permissions';
+import type { BuilderEntryIntent } from '@/hooks/use-builder-entry-intent';
 import { QueryResultTable, type QueryResult } from '@/components/viewer/ViewerChatPanel';
 import { stashChatResult, toChatResultHandoff, type ChatResultHandoff } from '@/lib/chat-result-handoff';
 import { chatOverlayCompleteness, overlayFeatureCount } from '@/lib/chat-result-completeness';
 import { cn } from '@/lib/utils';
 import type { ChatAction, ChatHistoryMessage } from '@/types/api';
 import { randomId } from '@/lib/random-id';
+
+/** Set on the document root while the Ask AI launcher is showing. */
+const FLOATING_DOCK_INSET_VAR = '--floating-dock-inset';
+/** Width the launcher covers from the inline end edge, for rows it floats over. */
+const FLOATING_DOCK_REACH_VAR = '--floating-dock-reach';
+
+// Launcher offset (bottom-10, or bottom-44 when lifted above the pending-edits bar) plus its height and a margin.
+const DOCK_INSET = '5.5rem';
+const LIFTED_DOCK_INSET = '14rem';
+// The launcher's end-16 offset plus a margin, added to its measured width.
+const DOCK_END_GAP = '4.5rem';
+// Used when the launcher can't be measured.
+const DOCK_REACH = '12rem';
 
 const prefersReducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false;
 
@@ -62,10 +76,10 @@ function toQueryResult(action: ChatAction): QueryResult | undefined {
 interface DatasetChatPanelProps {
   datasetId: string;
   datasetTitle: string;
-  /** fix(#531): non-spatial tables can chat but have no map-layer flow —
+  /** Non-spatial tables can chat but have no map-layer flow —
    * the rest of the UI (AddToMapButton) hides builder handoffs for them. */
   showOpenInBuilder: boolean;
-  /** fix(#583): notifies the page when the panel opens/closes so it can pad
+  /** Notifies the page when the panel opens/closes so it can pad
    * its content clear of the fixed panel (which otherwise covers the sticky
    * detail tabs and other controls). */
   onOpenChange?: (open: boolean) => void;
@@ -74,15 +88,15 @@ interface DatasetChatPanelProps {
 }
 
 /**
- * Dataset-scoped "Ask AI" (dataset-chat v1).
+ * Dataset-scoped "Ask AI".
  *
  * Mirrors ViewerChatPanel's read-only chat UX for the dataset detail page:
- * questions go to `/ai/chat/dataset/stream/` (query_data-only tool set, all
- * dataset context resolved server-side), the streamed answer renders inline,
- * and `show_query_result` shows the compact table. There is no map on this
- * page, so instead of a flyover the panel offers "Open in builder" — a new
- * map is created and the builder opens with this dataset staged via the
- * existing `?add_dataset=` flow (AddToMapButton precedent).
+ * questions go to `/ai/chat/dataset/stream/` (query_data-only tool set, dataset
+ * context resolved server-side), the streamed answer renders inline, and
+ * `show_query_result` shows the compact table. With no map on this page, the
+ * panel offers "Open in builder" instead of a flyover: a new map is created
+ * and the builder opens with this dataset staged via the add-dataset entry
+ * intent AddToMapButton uses.
  *
  * Self-gates on `useAIAvailability` (token + `use_ai_chat` + AI configured),
  * so anonymous or unpermitted visitors render nothing.
@@ -123,15 +137,31 @@ export function DatasetChatPanel({
     if (open) requestAnimationFrame(() => inputRef.current?.focus());
   }, [open]);
 
-  // fix(#583): keep the page informed so it can reflow content clear of the
-  // fixed panel. Effect (not inline in the setOpen calls) so unmount while
-  // open also reports closed. ANDed with availability — if AI availability
-  // flips off while open, the render below bails to null but the component
-  // stays mounted, and the page must not keep padding for an invisible panel.
+  // Keep the page informed so it can reflow clear of the fixed panel. An effect
+  // (not inline in the setOpen calls) so unmount while open also reports
+  // closed. ANDed with availability: if AI availability flips off while open,
+  // the render below bails to null but the component stays mounted, and the
+  // page must not keep padding for an invisible panel.
   useEffect(() => {
     onOpenChange?.(open && isAIAvailable);
     return () => onOpenChange?.(false);
   }, [open, isAIAvailable, onOpenChange]);
+
+  // The launcher floats over the page bottom; the page reads this to keep its last content clear of it.
+  const launcherVisible = isAIAvailable && !open;
+  const dockRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!launcherVisible) return undefined;
+    const root = document.documentElement;
+    root.style.setProperty(FLOATING_DOCK_INSET_VAR, abovePendingBar ? LIFTED_DOCK_INSET : DOCK_INSET);
+    // The label's width differs by language.
+    const width = dockRef.current?.getBoundingClientRect().width ?? 0;
+    root.style.setProperty(FLOATING_DOCK_REACH_VAR, width > 0 ? `calc(${width}px + ${DOCK_END_GAP})` : DOCK_REACH);
+    return () => {
+      root.style.removeProperty(FLOATING_DOCK_INSET_VAR);
+      root.style.removeProperty(FLOATING_DOCK_REACH_VAR);
+    };
+  }, [launcherVisible, abovePendingBar, i18n.resolvedLanguage]);
 
   const handleSend = useCallback(async () => {
     const userMsg = input.trim();
@@ -149,6 +179,7 @@ export function DatasetChatPanel({
     let streamed = '';
     let queryResult: QueryResult | undefined;
     let spatialResult: ChatResultHandoff | undefined;
+    let modelUnsupported = false;
     try {
       for await (const { event, data } of streamDatasetChatMessage(datasetId, userMsg, i18n.language, history, controller.signal)) {
         if (event === 'token') {
@@ -160,15 +191,14 @@ export function DatasetChatPanel({
             if (action.type === 'show_query_result') {
               const qr = toQueryResult(action);
               if (qr) {
-                // Keep table and spatial payload PAIRED: both come from the
-                // same accepted action, so "Open in builder" never carries
-                // geometry from an earlier result than the table shown (#533).
+                // Keep table and spatial payload PAIRED: both come from the same
+                // accepted action, so "Open in builder" never carries geometry
+                // from an earlier result than the table shown.
                 queryResult = qr;
-                // feat(#1241 codex r1): carry the completeness pair and the
-                // question with the geometry. The builder can now save a
-                // carried result as a dataset, so a handoff that arrives
-                // without them looks like a complete answer to every guard on
-                // the other side.
+                // Carry the completeness pair and the question with the geometry:
+                // the builder can save a carried result as a dataset, so a handoff
+                // without them would look like a complete answer to every guard
+                // on the other side.
                 const carried = toChatResultHandoff(action.geojson, action.bbox);
                 spatialResult = carried
                   ? {
@@ -189,6 +219,7 @@ export function DatasetChatPanel({
           if (typeof data.status === 'number') {
             throw new ApiError(typeof data.message === 'string' ? data.message : '', data.status);
           }
+          if (data.code === 'model_requires_responses_api') modelUnsupported = true;
           throw new Error(typeof data.message === 'string' ? data.message : '');
         }
       }
@@ -201,7 +232,12 @@ export function DatasetChatPanel({
       } else {
         setMessages((prev) => [
           ...prev,
-          { id: randomId(), role: 'error', content: t('common:viewer.ai.error'), retryMessage: userMsg },
+          {
+            id: randomId(),
+            role: 'error',
+            content: t(modelUnsupported ? 'common:viewer.ai.errorModelUnsupported' : 'common:viewer.ai.error'),
+            retryMessage: userMsg,
+          },
         ]);
       }
     } finally {
@@ -225,7 +261,8 @@ export function DatasetChatPanel({
       const name = t('addToMap.newMapName', { title: datasetTitle });
       const newMap = await createMap.mutateAsync({ name });
       const carried = spatial ? stashChatResult(spatial) : false;
-      navigate(`/maps/${newMap.id}?add_dataset=${datasetId}${carried ? '&chat_result=1' : ''}`);
+      const state: BuilderEntryIntent = { addDatasetId: datasetId, ...(carried ? { chatResult: true } : {}) };
+      navigate(`/maps/${newMap.id}`, { state });
     } catch {
       // useCreateMap reports the failure.
     }
@@ -238,6 +275,7 @@ export function DatasetChatPanel({
   // Only the dialog and launcher take clicks; the empty corners must not block the bar.
   return (
     <div
+      ref={dockRef}
       data-testid="dataset-chat-dock"
       className={cn(
         'pointer-events-none fixed end-16 z-40 flex flex-col items-end gap-2',
@@ -340,7 +378,7 @@ export function DatasetChatPanel({
           </div>
 
           <div className="flex items-end gap-2 border-t px-3 py-2">
-            {/* Raw textarea kept for the auto-growing chat composer (fix(#438) DS-03). */}
+            {/* Raw textarea kept for the auto-growing chat composer. */}
             <textarea
               ref={inputRef}
               value={input}

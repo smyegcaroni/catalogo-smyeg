@@ -16,7 +16,7 @@ from unittest.mock import patch
 import pytest
 from httpx import AsyncClient
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.modules.audit.models import AuditLog
 from app.modules.auth.models import User
@@ -559,7 +559,7 @@ class TestMapLayerDatasetVisibilityLeak:
     async def test_anon_get_map_hides_private_dataset_layer(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ):
-        """REG-1: anon GET /maps/{id} omits a private-dataset layer (no table_name/
+        """Anon GET /maps/{id} omits a private-dataset layer (no table_name/
         column_info/sample_values leak). Fails on main (unfiltered fetch)."""
         map_id, ds = await self._public_map_with_layer(
             client, admin_auth_header, test_db_session, dataset_visibility="private"
@@ -573,7 +573,7 @@ class TestMapLayerDatasetVisibilityLeak:
     async def test_anon_style_json_omits_private_dataset_source(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ):
-        """REG-2: anon GET /maps/{id}/style.json omits the private dataset's source
+        """Anon GET /maps/{id}/style.json omits the private dataset's source
         (and its replayable signed .pbf URL). Fails on main."""
         map_id, ds = await self._public_map_with_layer(
             client, admin_auth_header, test_db_session, dataset_visibility="private"
@@ -583,6 +583,89 @@ class TestMapLayerDatasetVisibilityLeak:
         assert f"geolens-{ds.id}" not in resp.json()["sources"], (
             "private dataset source with replayable signed tile URL leaked anonymously"
         )
+
+    async def test_style_json_glyphs_are_absolute_and_on_instance(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """External style consumers fetch label fonts from this instance, not a
+        third-party CDN, through an absolute URL."""
+        map_id, _ = await self._public_map_with_layer(
+            client, admin_auth_header, test_db_session, dataset_visibility="public"
+        )
+        resp = await client.get(f"/maps/{map_id}/style.json")
+        assert resp.status_code == 200, resp.text
+        glyphs = resp.json()["glyphs"]
+        assert glyphs.startswith(("http://", "https://")), glyphs
+        assert glyphs.endswith("/fonts/{fontstack}/{range}.pbf"), glyphs
+        assert "openfreemap" not in glyphs
+
+    @pytest.fixture
+    def pin_public_urls(self, monkeypatch):
+        """Set the configured public app URL, ignoring any persisted override."""
+        from app.core import public_urls
+        from app.core.config import settings
+
+        async def _no_persisted_overrides(_db):
+            return {}
+
+        monkeypatch.setattr(
+            public_urls, "_load_public_url_overrides", _no_persisted_overrides
+        )
+
+        def _pin(app_url: str | None) -> None:
+            monkeypatch.setattr(settings, "public_app_url", app_url)
+            monkeypatch.setattr(settings, "public_api_url", None)
+            monkeypatch.setattr(settings, "public_base_url", None)
+            public_urls.invalidate_public_url_cache()
+
+        public_urls.invalidate_public_url_cache()
+        yield _pin
+        public_urls.invalidate_public_url_cache()
+
+    async def test_style_json_tile_and_sprite_urls_are_absolute(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        pin_public_urls,
+    ):
+        """A client outside the app (QGIS, a MapLibre page) can load the style."""
+        pin_public_urls("https://gis.example.org")
+        map_id, ds = await self._public_map_with_layer(
+            client, admin_auth_header, test_db_session, dataset_visibility="public"
+        )
+        style = (await client.get(f"/maps/{map_id}/style.json")).json()
+        tile = style["sources"][f"geolens-{ds.id}"]["tiles"][0]
+        assert tile.startswith(
+            f"https://gis.example.org/api/tiles/data.{ds.table_name}/"
+        )
+        assert style["sprite"][0]["url"] == (
+            "https://gis.example.org/api/maps/sprites/geolens"
+        )
+        assert (
+            style["glyphs"] == "https://gis.example.org/fonts/{fontstack}/{range}.pbf"
+        )
+
+    async def test_style_json_urls_follow_the_request_without_a_public_url(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        pin_public_urls,
+    ):
+        """With no public URL configured, the URLs are absolute on the request's
+        own origin; the API path depends on how the deployment is mounted."""
+        pin_public_urls(None)
+        map_id, ds = await self._public_map_with_layer(
+            client, admin_auth_header, test_db_session, dataset_visibility="public"
+        )
+        style = (await client.get(f"/maps/{map_id}/style.json")).json()
+        tile = style["sources"][f"geolens-{ds.id}"]["tiles"][0]
+        assert tile.startswith("http://test/")
+        assert f"/tiles/data.{ds.table_name}/" in tile
+        sprite = style["sprite"][0]["url"]
+        assert sprite.startswith("http://test/")
+        assert sprite.endswith("/maps/sprites/geolens")
 
     async def test_style_json_fails_closed_without_multi_tenant_context(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
@@ -606,7 +689,7 @@ class TestMapLayerDatasetVisibilityLeak:
     async def test_anon_keeps_public_dataset_layer(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ):
-        """REG-3 (control): a PUBLIC dataset layer is STILL visible to anon on both
+        """A PUBLIC dataset layer is STILL visible to anon on both
         endpoints — guards against over-filtering."""
         map_id, ds = await self._public_map_with_layer(
             client, admin_auth_header, test_db_session, dataset_visibility="public"
@@ -623,7 +706,7 @@ class TestMapLayerDatasetVisibilityLeak:
     async def test_owner_still_sees_own_private_layer(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ):
-        """REG-4: the owner/admin STILL sees their own private layer (the filter must
+        """The owner/admin STILL sees their own private layer (the filter must
         honor the owner/admin bypass, not strip legitimate access)."""
         map_id, ds = await self._public_map_with_layer(
             client, admin_auth_header, test_db_session, dataset_visibility="private"
@@ -806,6 +889,85 @@ class TestUpdateMap:
         assert fetched.status_code == 200
         assert fetched.json()["notes"] == "Keep these notes"
 
+    async def test_map_notes_are_returned_only_to_owner_and_admin(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        editor_auth_header: dict,
+        viewer_auth_header: dict,
+    ):
+        """GET /maps/{id} returns notes to the owner and admins, and null to other readers."""
+        created = await _create_map(client, editor_auth_header)
+        map_id = created["id"]
+        resp = await client.put(
+            f"/maps/{map_id}",
+            json={"notes": "Owner-only notes", "visibility": "public"},
+            headers=editor_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+
+        for headers, expected in (
+            (editor_auth_header, "Owner-only notes"),
+            (admin_auth_header, "Owner-only notes"),
+            (viewer_auth_header, None),
+            ({}, None),
+        ):
+            fetched = await client.get(f"/maps/{map_id}", headers=headers)
+            assert fetched.status_code == 200, fetched.text
+            assert fetched.json()["notes"] == expected
+
+    async def test_owner_without_edit_permission_still_reads_notes(
+        self,
+        client: AsyncClient,
+        viewer_auth_header: dict,
+        test_db_session,
+    ):
+        """An owner whose role can't edit maps still gets their map's notes."""
+        me = await client.get("/auth/me/", headers=viewer_auth_header)
+        map_obj = Map(
+            name=f"Owned by viewer {uuid.uuid4().hex[:6]}",
+            notes="Still mine",
+            created_by=uuid.UUID(me.json()["id"]),
+        )
+        test_db_session.add(map_obj)
+        await test_db_session.commit()
+
+        fetched = await client.get(f"/maps/{map_obj.id}", headers=viewer_auth_header)
+        assert fetched.status_code == 200, fetched.text
+        assert fetched.json()["notes"] == "Still mine"
+
+    async def test_fork_keeps_notes_only_for_the_source_owner(
+        self,
+        client: AsyncClient,
+        editor_auth_header: dict,
+        viewer_auth_header: dict,
+    ):
+        """A fork copies the source's notes only when the forker owns the source."""
+        created = await _create_map(client, editor_auth_header)
+        map_id = created["id"]
+        resp = await client.put(
+            f"/maps/{map_id}",
+            json={"notes": "Owner-only notes", "visibility": "public"},
+            headers=editor_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+
+        foreign = await client.post(
+            f"/maps/{map_id}/duplicate/", headers=viewer_auth_header
+        )
+        assert foreign.status_code == 201, foreign.text
+        assert foreign.json()["notes"] is None
+        refetched = await client.get(
+            f"/maps/{foreign.json()['id']}", headers=viewer_auth_header
+        )
+        assert refetched.json()["notes"] is None
+
+        own = await client.post(
+            f"/maps/{map_id}/duplicate/", headers=editor_auth_header
+        )
+        assert own.status_code == 201, own.text
+        assert own.json()["notes"] == "Owner-only notes"
+
     async def test_update_map_viewport(
         self, client: AsyncClient, admin_auth_header: dict
     ):
@@ -852,7 +1014,7 @@ class TestUpdateMap:
         admin_auth_header: dict,
         editor_auth_header: dict,
     ):
-        """PUT /maps/{id} as editor who doesn't own the map returns 403."""
+        """PUT /maps/{id} as an editor who can't read the private map returns 404."""
         created = await _create_map(client, admin_auth_header)
         map_id = created["id"]
 
@@ -861,7 +1023,7 @@ class TestUpdateMap:
             json={"name": "Hijack"},
             headers=editor_auth_header,
         )
-        assert resp.status_code == 403
+        assert resp.status_code == 404
 
     async def test_update_map_rejects_public_with_non_public_datasets(
         self,
@@ -974,7 +1136,7 @@ class TestUpdateMap:
     async def test_update_map_round_trips_basemap_opacity_field(
         self, client: AsyncClient, admin_auth_header: dict
     ):
-        """Explicit opacity round-trip: PUT 0.55 -> GET 0.55 (covers PB-A3)."""
+        """Explicit opacity round-trip: PUT 0.55 -> GET 0.55."""
         created = await _create_map(client, admin_auth_header)
         map_id = created["id"]
 
@@ -1275,7 +1437,7 @@ class TestMapHistory:
             f"/maps/{map_id}/history",
             headers=editor_auth_header,
         )
-        assert editor_resp.status_code == 403
+        assert editor_resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -1318,12 +1480,12 @@ class TestDeleteMap:
         admin_auth_header: dict,
         editor_auth_header: dict,
     ):
-        """DELETE /maps/{id} as editor who doesn't own the map returns 403."""
+        """DELETE /maps/{id} as an editor who can't read the private map returns 404."""
         created = await _create_map(client, admin_auth_header)
         map_id = created["id"]
 
         resp = await client.delete(f"/maps/{map_id}", headers=editor_auth_header)
-        assert resp.status_code == 403
+        assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -1564,17 +1726,17 @@ class TestDuplicateMap:
 
         created = await _create_map(client, admin_auth_header, "Draft Layer Map")
         map_id = created["id"]
-        await client.put(
-            f"/maps/{map_id}",
-            json={"visibility": "public"},
-            headers=admin_auth_header,
-        )
         add_resp = await client.post(
             f"/maps/{map_id}/layers",
             json={"dataset_id": str(draft_ds.id)},
             headers=admin_auth_header,
         )
         assert add_resp.status_code == 201, add_resp.text
+        # Publishing refuses a draft layer; this state predates that check.
+        await test_db_session.execute(
+            update(Map).where(Map.id == uuid.UUID(map_id)).values(visibility="public")
+        )
+        await test_db_session.commit()
 
         resp = await client.post(
             f"/maps/{map_id}/duplicate/", headers=viewer_auth_header
@@ -1864,6 +2026,55 @@ class TestShareToken:
         assert "share_url" in data
         assert data["is_active"] is True
 
+    async def test_share_response_carries_absolute_links(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        """Create returns the relative share_url unchanged plus absolute links."""
+        map_id = (await _create_map(client, admin_auth_header))["id"]
+        await client.put(
+            f"/maps/{map_id}", json={"visibility": "public"}, headers=admin_auth_header
+        )
+
+        created = (
+            await client.post(f"/maps/{map_id}/share/", headers=admin_auth_header)
+        ).json()
+        assert created["share_url"] == f"/m/{created['token']}"
+        assert created["share_url_absolute"].startswith("http")
+        assert created["share_url_absolute"].endswith(created["share_url"])
+        assert created["viewer_url"].startswith("http")
+        assert created["viewer_url"].endswith(f"/maps/{map_id}")
+
+        # The raw token is only ever returned on create.
+        fetched = (
+            await client.get(f"/maps/{map_id}/share/", headers=admin_auth_header)
+        ).json()
+        assert fetched["share_url_absolute"] is None
+        assert fetched["viewer_url"] == created["viewer_url"]
+
+    async def test_share_url_lookup_failure_does_not_strand_a_token(
+        self, client: AsyncClient, admin_auth_header: dict, monkeypatch
+    ):
+        """The only readable copy of the raw token is the create response, so
+        the app URL is resolved before the token is committed."""
+        map_id = (await _create_map(client, admin_auth_header))["id"]
+        await client.put(
+            f"/maps/{map_id}", json={"visibility": "public"}, headers=admin_auth_header
+        )
+
+        async def _fail(*_args, **_kwargs):
+            raise RuntimeError("public URL lookup failed")
+
+        monkeypatch.setattr(
+            "app.modules.catalog.maps.router_sharing.get_browser_reachable_app_url",
+            _fail,
+        )
+        with pytest.raises(RuntimeError):
+            await client.post(f"/maps/{map_id}/share/", headers=admin_auth_header)
+        monkeypatch.undo()
+
+        fetched = await client.get(f"/maps/{map_id}/share/", headers=admin_auth_header)
+        assert fetched.json() is None
+
     async def test_share_expiration_allowed(
         self,
         client: AsyncClient,
@@ -2121,6 +2332,56 @@ class TestSharedMap:
         assert resp.status_code == 200
         assert resp.json()["basemap_config"] == BASEMAP_CONFIG_PAYLOAD
 
+    @pytest.mark.parametrize("with_layer", [False, True])
+    @pytest.mark.parametrize(
+        "view",
+        [
+            None,
+            {"center_lng": 0.0, "center_lat": 0.0, "zoom": 0.0},
+            {"center_lng": -73.9, "center_lat": 40.7, "zoom": 10.0},
+        ],
+        ids=["no-view", "stored-zero", "stored-view"],
+    )
+    async def test_get_shared_map_reports_saved_view(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        with_layer: bool,
+        view: dict | None,
+    ):
+        """has_saved_view tells a stored camera from defaults; a stored 0 is kept."""
+        created = await _create_map(client, admin_auth_header)
+        map_id = created["id"]
+        if with_layer:
+            admin_id = await get_user_id(test_db_session, "admin")
+            ds = await create_dataset(test_db_session, created_by=admin_id)
+            layer_resp = await client.post(
+                f"/maps/{map_id}/layers",
+                json={"dataset_id": str(ds.id)},
+                headers=admin_auth_header,
+            )
+            assert layer_resp.status_code == 201
+        put_resp = await client.put(
+            f"/maps/{map_id}",
+            json={"visibility": "public", **(view or {})},
+            headers=admin_auth_header,
+        )
+        assert put_resp.status_code == 200
+        share_resp = await client.post(
+            f"/maps/{map_id}/share/", headers=admin_auth_header
+        )
+        token = share_resp.json()["token"]
+
+        resp = await client.get(f"/maps/shared/{token}")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["layers"]) == (1 if with_layer else 0)
+        camera = view or {"center_lng": 0.0, "center_lat": 0.0, "zoom": 2.0}
+        assert {key: data[key] for key in camera} == camera
+        assert data["has_saved_view"] is (view is not None)
+
     async def test_get_shared_map_invalid_token(self, client: AsyncClient):
         """GET /maps/shared/{bogus_token} returns 404."""
         resp = await client.get("/maps/shared/bogus_token_12345")
@@ -2220,6 +2481,33 @@ class TestMapLayers:
         assert data["visible"] is True
         assert data["opacity"] == 1.0
         assert "id" in data
+
+    @pytest.mark.parametrize("tile_columns", [None, [], ["name"]])
+    async def test_layer_response_carries_dataset_tile_columns(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        tile_columns,
+    ):
+        admin_id = await get_user_id(test_db_session, "admin")
+        ds = await create_dataset(test_db_session, created_by=admin_id)
+        ds.tile_columns = tile_columns
+        await test_db_session.commit()
+        created = await _create_map(client, admin_auth_header)
+        map_id = created["id"]
+
+        added = await client.post(
+            f"/maps/{map_id}/layers",
+            json={"dataset_id": str(ds.id)},
+            headers=admin_auth_header,
+        )
+        assert added.status_code == 201, added.text
+        assert added.json()["dataset_tile_columns"] == tile_columns
+
+        loaded = await client.get(f"/maps/{map_id}", headers=admin_auth_header)
+        assert loaded.status_code == 200, loaded.text
+        assert loaded.json()["layers"][0]["dataset_tile_columns"] == tile_columns
 
     @pytest.mark.parametrize("paint", MALFORMED_STOPS_PAINTS)
     async def test_add_layer_rejects_malformed_stops(
@@ -2829,6 +3117,37 @@ class TestMapLayers:
         assert data["style_config"] == {
             "builder": {"outline_color": "#1d4ed8", "outline_width": 1}
         }
+
+    async def test_a_sent_paint_gets_no_default_builder_outline(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        admin_id = await get_user_id(test_db_session, "admin")
+        ds = await create_dataset(test_db_session, created_by=admin_id)
+        created = await _create_map(client, admin_auth_header)
+
+        resp = await client.put(
+            f"/maps/{created['id']}",
+            json={
+                "layers": [
+                    {
+                        "dataset_id": str(ds.id),
+                        "paint": {
+                            "fill-color": "#22c55e",
+                            "fill-outline-color": "#14532d",
+                        },
+                    }
+                ]
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        (layer,) = resp.json()["layers"]
+        builder = (layer["style_config"] or {}).get("builder") or {}
+        assert "outline_color" not in builder
+        assert layer["paint"]["fill-outline-color"] == "#14532d"
 
     async def test_update_map_layers_moves_legacy_builder_paint_to_style_config(
         self,
@@ -4312,7 +4631,7 @@ async def test_update_map_layers_round_trip_sort_order(
     """PUT layers with sort_order=[2, 0, 1] -> response layers must be [0, 1, 2].
 
     Locks MapLayer.sort_order ordering through the PUT round-trip after the
-    PERF-6 service-level refactor (build response from in-session state).
+    refactor that builds the response from in-session state.
     Existing tests use dict[str, str] keyed by dataset_id (e.g.
     test_layer_type_auto_detect_via_put) and lose list order, so a focused
     list-order assertion is required.

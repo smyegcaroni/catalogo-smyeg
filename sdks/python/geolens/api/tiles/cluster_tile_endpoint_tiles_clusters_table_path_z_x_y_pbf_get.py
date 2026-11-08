@@ -24,8 +24,10 @@ def _get_kwargs(
     exp: int | None | Unset = UNSET,
     scope: None | str | Unset = UNSET,
     cols: None | str | Unset = UNSET,
+    cols_only: bool | Unset = False,
     cluster_radius: int | Unset = 48,
     cluster_max_zoom: int | Unset = 14,
+    filter_: None | str | Unset = UNSET,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
@@ -58,9 +60,18 @@ def _get_kwargs(
         json_cols = cols
     params["cols"] = json_cols
 
+    params["cols_only"] = cols_only
+
     params["cluster_radius"] = cluster_radius
 
     params["cluster_max_zoom"] = cluster_max_zoom
+
+    json_filter_: None | str | Unset
+    if isinstance(filter_, Unset):
+        json_filter_ = UNSET
+    else:
+        json_filter_ = filter_
+    params["filter"] = json_filter_
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -149,10 +160,12 @@ def sync_detailed(
     exp: int | None | Unset = UNSET,
     scope: None | str | Unset = UNSET,
     cols: None | str | Unset = UNSET,
+    cols_only: bool | Unset = False,
     cluster_radius: int | Unset = 48,
     cluster_max_zoom: int | Unset = 14,
+    filter_: None | str | Unset = UNSET,
 ) -> Response[File | ProblemDetail]:
-    """Cluster Tile Endpoint
+    """Get a clustered vector tile
 
      Serve a server-side clustered vector tile for a point dataset.
 
@@ -163,11 +176,12 @@ def sync_detailed(
     dataset needs valid signature parameters (``sig``, ``exp``, ``scope``), an
     embed token scoped to it, or an API key (``X-Api-Key`` header or
     ``api_key`` query parameter) or bearer token for a caller with access to
-    it. It answers 403 to a request carrying none of these and 404 to a caller
-    without access. A public dataset that is not yet published is readable by
-    its owner, by an admin, with an embed token, or with valid signature
-    parameters, and answers 404 to other callers, so a refusal keeps its
-    existence undisclosed. An unknown table is 404 too.
+    it. A public dataset that is not yet published is readable by its owner,
+    by an admin, with an embed token, or with valid signature parameters. A
+    caller who cannot see the dataset gets the answer an unknown table gets,
+    so a refusal never discloses that the table exists: 403 when an embed
+    token, or an anonymous request's signature parameters, did not authorize
+    it, and 404 otherwise.
 
     A request that no capability authorized and that carried a credential which
     did not resolve is refused with 401 rather than served as an anonymous
@@ -176,7 +190,10 @@ def sync_detailed(
 
     ``cluster_radius`` is a screen-pixel distance, the same units MapLibre's
     ``clusterRadius`` uses, and ``cluster_max_zoom`` is the last zoom at which
-    features are grouped. ``cols`` works as it does on the vector route, and
+    features are grouped. ``filter`` is an optional CQL2-JSON expression over
+    the dataset's attribute columns, as the OGC items ``filter`` takes; only the
+    points it keeps are clustered. An invalid expression responds 400. ``cols``
+    works as it does on the vector route, and
     the named columns are projected onto the unclustered features, so
     data-driven styling and popups keep working here too.
 
@@ -184,12 +201,16 @@ def sync_detailed(
     a malformed table path or an out-of-range tile coordinate.
 
     A tile holding no features answers 204, and a repeat request whose
-    ``If-None-Match`` matches answers 304. Where a deployment runs cold storage,
+    ``If-None-Match`` matches answers 304. When more than 100,000 points fall
+    in or next to the tile, or it would hold more than 50,000 features, it
+    holds a fixed sample and carries ``X-GeoLens-Tile-Sampled: true``. Where a deployment runs cold
+    storage,
     a dataset still being restored answers 202 with a job id to poll. Requests
     answer 429 with ``Retry-After`` when the per-process capacity for uncached
-    renders is full, tile-pool acquisition times out, a tile query exceeds the
-    pool's per-command timeout, or the configured per-tenant concurrency limit
-    is exceeded. Any other failure serving the tile answers 503.
+    renders stays full for a short wait, tile-pool acquisition times out, or the
+    configured per-tenant concurrency limit is exceeded. A tile query that
+    exceeds the pool's per-command timeout answers 503 without ``Retry-After``
+    and is not cached, as does any other failure serving the tile.
 
     Args:
         table_path (str):
@@ -200,8 +221,11 @@ def sync_detailed(
         exp (int | None | Unset):
         scope (None | str | Unset):
         cols (None | str | Unset):
+        cols_only (bool | Unset): Carry only the columns named by `cols`, at every zoom. Default:
+            False.
         cluster_radius (int | Unset):  Default: 48.
         cluster_max_zoom (int | Unset):  Default: 14.
+        filter_ (None | str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -220,8 +244,10 @@ def sync_detailed(
         exp=exp,
         scope=scope,
         cols=cols,
+        cols_only=cols_only,
         cluster_radius=cluster_radius,
         cluster_max_zoom=cluster_max_zoom,
+        filter_=filter_,
     )
 
     response = client.get_httpx_client().request(
@@ -242,10 +268,12 @@ def sync(
     exp: int | None | Unset = UNSET,
     scope: None | str | Unset = UNSET,
     cols: None | str | Unset = UNSET,
+    cols_only: bool | Unset = False,
     cluster_radius: int | Unset = 48,
     cluster_max_zoom: int | Unset = 14,
+    filter_: None | str | Unset = UNSET,
 ) -> File | ProblemDetail | None:
-    """Cluster Tile Endpoint
+    """Get a clustered vector tile
 
      Serve a server-side clustered vector tile for a point dataset.
 
@@ -256,11 +284,12 @@ def sync(
     dataset needs valid signature parameters (``sig``, ``exp``, ``scope``), an
     embed token scoped to it, or an API key (``X-Api-Key`` header or
     ``api_key`` query parameter) or bearer token for a caller with access to
-    it. It answers 403 to a request carrying none of these and 404 to a caller
-    without access. A public dataset that is not yet published is readable by
-    its owner, by an admin, with an embed token, or with valid signature
-    parameters, and answers 404 to other callers, so a refusal keeps its
-    existence undisclosed. An unknown table is 404 too.
+    it. A public dataset that is not yet published is readable by its owner,
+    by an admin, with an embed token, or with valid signature parameters. A
+    caller who cannot see the dataset gets the answer an unknown table gets,
+    so a refusal never discloses that the table exists: 403 when an embed
+    token, or an anonymous request's signature parameters, did not authorize
+    it, and 404 otherwise.
 
     A request that no capability authorized and that carried a credential which
     did not resolve is refused with 401 rather than served as an anonymous
@@ -269,7 +298,10 @@ def sync(
 
     ``cluster_radius`` is a screen-pixel distance, the same units MapLibre's
     ``clusterRadius`` uses, and ``cluster_max_zoom`` is the last zoom at which
-    features are grouped. ``cols`` works as it does on the vector route, and
+    features are grouped. ``filter`` is an optional CQL2-JSON expression over
+    the dataset's attribute columns, as the OGC items ``filter`` takes; only the
+    points it keeps are clustered. An invalid expression responds 400. ``cols``
+    works as it does on the vector route, and
     the named columns are projected onto the unclustered features, so
     data-driven styling and popups keep working here too.
 
@@ -277,12 +309,16 @@ def sync(
     a malformed table path or an out-of-range tile coordinate.
 
     A tile holding no features answers 204, and a repeat request whose
-    ``If-None-Match`` matches answers 304. Where a deployment runs cold storage,
+    ``If-None-Match`` matches answers 304. When more than 100,000 points fall
+    in or next to the tile, or it would hold more than 50,000 features, it
+    holds a fixed sample and carries ``X-GeoLens-Tile-Sampled: true``. Where a deployment runs cold
+    storage,
     a dataset still being restored answers 202 with a job id to poll. Requests
     answer 429 with ``Retry-After`` when the per-process capacity for uncached
-    renders is full, tile-pool acquisition times out, a tile query exceeds the
-    pool's per-command timeout, or the configured per-tenant concurrency limit
-    is exceeded. Any other failure serving the tile answers 503.
+    renders stays full for a short wait, tile-pool acquisition times out, or the
+    configured per-tenant concurrency limit is exceeded. A tile query that
+    exceeds the pool's per-command timeout answers 503 without ``Retry-After``
+    and is not cached, as does any other failure serving the tile.
 
     Args:
         table_path (str):
@@ -293,8 +329,11 @@ def sync(
         exp (int | None | Unset):
         scope (None | str | Unset):
         cols (None | str | Unset):
+        cols_only (bool | Unset): Carry only the columns named by `cols`, at every zoom. Default:
+            False.
         cluster_radius (int | Unset):  Default: 48.
         cluster_max_zoom (int | Unset):  Default: 14.
+        filter_ (None | str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -314,8 +353,10 @@ def sync(
         exp=exp,
         scope=scope,
         cols=cols,
+        cols_only=cols_only,
         cluster_radius=cluster_radius,
         cluster_max_zoom=cluster_max_zoom,
+        filter_=filter_,
     ).parsed
 
 
@@ -330,10 +371,12 @@ async def asyncio_detailed(
     exp: int | None | Unset = UNSET,
     scope: None | str | Unset = UNSET,
     cols: None | str | Unset = UNSET,
+    cols_only: bool | Unset = False,
     cluster_radius: int | Unset = 48,
     cluster_max_zoom: int | Unset = 14,
+    filter_: None | str | Unset = UNSET,
 ) -> Response[File | ProblemDetail]:
-    """Cluster Tile Endpoint
+    """Get a clustered vector tile
 
      Serve a server-side clustered vector tile for a point dataset.
 
@@ -344,11 +387,12 @@ async def asyncio_detailed(
     dataset needs valid signature parameters (``sig``, ``exp``, ``scope``), an
     embed token scoped to it, or an API key (``X-Api-Key`` header or
     ``api_key`` query parameter) or bearer token for a caller with access to
-    it. It answers 403 to a request carrying none of these and 404 to a caller
-    without access. A public dataset that is not yet published is readable by
-    its owner, by an admin, with an embed token, or with valid signature
-    parameters, and answers 404 to other callers, so a refusal keeps its
-    existence undisclosed. An unknown table is 404 too.
+    it. A public dataset that is not yet published is readable by its owner,
+    by an admin, with an embed token, or with valid signature parameters. A
+    caller who cannot see the dataset gets the answer an unknown table gets,
+    so a refusal never discloses that the table exists: 403 when an embed
+    token, or an anonymous request's signature parameters, did not authorize
+    it, and 404 otherwise.
 
     A request that no capability authorized and that carried a credential which
     did not resolve is refused with 401 rather than served as an anonymous
@@ -357,7 +401,10 @@ async def asyncio_detailed(
 
     ``cluster_radius`` is a screen-pixel distance, the same units MapLibre's
     ``clusterRadius`` uses, and ``cluster_max_zoom`` is the last zoom at which
-    features are grouped. ``cols`` works as it does on the vector route, and
+    features are grouped. ``filter`` is an optional CQL2-JSON expression over
+    the dataset's attribute columns, as the OGC items ``filter`` takes; only the
+    points it keeps are clustered. An invalid expression responds 400. ``cols``
+    works as it does on the vector route, and
     the named columns are projected onto the unclustered features, so
     data-driven styling and popups keep working here too.
 
@@ -365,12 +412,16 @@ async def asyncio_detailed(
     a malformed table path or an out-of-range tile coordinate.
 
     A tile holding no features answers 204, and a repeat request whose
-    ``If-None-Match`` matches answers 304. Where a deployment runs cold storage,
+    ``If-None-Match`` matches answers 304. When more than 100,000 points fall
+    in or next to the tile, or it would hold more than 50,000 features, it
+    holds a fixed sample and carries ``X-GeoLens-Tile-Sampled: true``. Where a deployment runs cold
+    storage,
     a dataset still being restored answers 202 with a job id to poll. Requests
     answer 429 with ``Retry-After`` when the per-process capacity for uncached
-    renders is full, tile-pool acquisition times out, a tile query exceeds the
-    pool's per-command timeout, or the configured per-tenant concurrency limit
-    is exceeded. Any other failure serving the tile answers 503.
+    renders stays full for a short wait, tile-pool acquisition times out, or the
+    configured per-tenant concurrency limit is exceeded. A tile query that
+    exceeds the pool's per-command timeout answers 503 without ``Retry-After``
+    and is not cached, as does any other failure serving the tile.
 
     Args:
         table_path (str):
@@ -381,8 +432,11 @@ async def asyncio_detailed(
         exp (int | None | Unset):
         scope (None | str | Unset):
         cols (None | str | Unset):
+        cols_only (bool | Unset): Carry only the columns named by `cols`, at every zoom. Default:
+            False.
         cluster_radius (int | Unset):  Default: 48.
         cluster_max_zoom (int | Unset):  Default: 14.
+        filter_ (None | str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -401,8 +455,10 @@ async def asyncio_detailed(
         exp=exp,
         scope=scope,
         cols=cols,
+        cols_only=cols_only,
         cluster_radius=cluster_radius,
         cluster_max_zoom=cluster_max_zoom,
+        filter_=filter_,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -421,10 +477,12 @@ async def asyncio(
     exp: int | None | Unset = UNSET,
     scope: None | str | Unset = UNSET,
     cols: None | str | Unset = UNSET,
+    cols_only: bool | Unset = False,
     cluster_radius: int | Unset = 48,
     cluster_max_zoom: int | Unset = 14,
+    filter_: None | str | Unset = UNSET,
 ) -> File | ProblemDetail | None:
-    """Cluster Tile Endpoint
+    """Get a clustered vector tile
 
      Serve a server-side clustered vector tile for a point dataset.
 
@@ -435,11 +493,12 @@ async def asyncio(
     dataset needs valid signature parameters (``sig``, ``exp``, ``scope``), an
     embed token scoped to it, or an API key (``X-Api-Key`` header or
     ``api_key`` query parameter) or bearer token for a caller with access to
-    it. It answers 403 to a request carrying none of these and 404 to a caller
-    without access. A public dataset that is not yet published is readable by
-    its owner, by an admin, with an embed token, or with valid signature
-    parameters, and answers 404 to other callers, so a refusal keeps its
-    existence undisclosed. An unknown table is 404 too.
+    it. A public dataset that is not yet published is readable by its owner,
+    by an admin, with an embed token, or with valid signature parameters. A
+    caller who cannot see the dataset gets the answer an unknown table gets,
+    so a refusal never discloses that the table exists: 403 when an embed
+    token, or an anonymous request's signature parameters, did not authorize
+    it, and 404 otherwise.
 
     A request that no capability authorized and that carried a credential which
     did not resolve is refused with 401 rather than served as an anonymous
@@ -448,7 +507,10 @@ async def asyncio(
 
     ``cluster_radius`` is a screen-pixel distance, the same units MapLibre's
     ``clusterRadius`` uses, and ``cluster_max_zoom`` is the last zoom at which
-    features are grouped. ``cols`` works as it does on the vector route, and
+    features are grouped. ``filter`` is an optional CQL2-JSON expression over
+    the dataset's attribute columns, as the OGC items ``filter`` takes; only the
+    points it keeps are clustered. An invalid expression responds 400. ``cols``
+    works as it does on the vector route, and
     the named columns are projected onto the unclustered features, so
     data-driven styling and popups keep working here too.
 
@@ -456,12 +518,16 @@ async def asyncio(
     a malformed table path or an out-of-range tile coordinate.
 
     A tile holding no features answers 204, and a repeat request whose
-    ``If-None-Match`` matches answers 304. Where a deployment runs cold storage,
+    ``If-None-Match`` matches answers 304. When more than 100,000 points fall
+    in or next to the tile, or it would hold more than 50,000 features, it
+    holds a fixed sample and carries ``X-GeoLens-Tile-Sampled: true``. Where a deployment runs cold
+    storage,
     a dataset still being restored answers 202 with a job id to poll. Requests
     answer 429 with ``Retry-After`` when the per-process capacity for uncached
-    renders is full, tile-pool acquisition times out, a tile query exceeds the
-    pool's per-command timeout, or the configured per-tenant concurrency limit
-    is exceeded. Any other failure serving the tile answers 503.
+    renders stays full for a short wait, tile-pool acquisition times out, or the
+    configured per-tenant concurrency limit is exceeded. A tile query that
+    exceeds the pool's per-command timeout answers 503 without ``Retry-After``
+    and is not cached, as does any other failure serving the tile.
 
     Args:
         table_path (str):
@@ -472,8 +538,11 @@ async def asyncio(
         exp (int | None | Unset):
         scope (None | str | Unset):
         cols (None | str | Unset):
+        cols_only (bool | Unset): Carry only the columns named by `cols`, at every zoom. Default:
+            False.
         cluster_radius (int | Unset):  Default: 48.
         cluster_max_zoom (int | Unset):  Default: 14.
+        filter_ (None | str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -494,7 +563,9 @@ async def asyncio(
             exp=exp,
             scope=scope,
             cols=cols,
+            cols_only=cols_only,
             cluster_radius=cluster_radius,
             cluster_max_zoom=cluster_max_zoom,
+            filter_=filter_,
         )
     ).parsed

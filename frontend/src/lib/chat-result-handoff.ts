@@ -1,10 +1,9 @@
 /**
- * feat(#531 follow-up): session-scoped handoff of a chat query result into
- * the map builder.
+ * Session-scoped handoff of a chat query result into the map builder.
  *
  * DatasetChatPanel has no map, so "Open in builder" creates a map and
- * navigates with `?add_dataset=<id>&chat_result=1`. The spatial result
- * payload (too large for a URL) rides sessionStorage under a single key;
+ * navigates with a `chatResult` entry intent (use-builder-entry-intent.ts).
+ * The spatial result payload rides sessionStorage under a single key;
  * MapBuilderPage takes it exactly once after the map instance exists and
  * renders it through the existing ephemeral-layer mechanism
  * (use-ephemeral-layers.ts).
@@ -17,14 +16,11 @@
 export interface ChatResultHandoff {
   geojson: GeoJSON.FeatureCollection;
   bbox: [number, number, number, number];
-  /** feat(#1241 codex r1): whether the overlay holds the whole answer, and of
-   *  how many. Geometry alone was enough while the builder could only draw and
-   *  dismiss a carried result; now it can also be saved as a dataset, and a
-   *  handoff that drops the completeness pair arrives looking complete. */
+  /** Whether the overlay holds the whole answer, and of how many. The result can
+   *  be saved as a dataset, so a handoff that drops this pair would look complete. */
   truncated?: true;
   totalCount?: number;
-  /** feat(#1241): the question this result answers, so the builder can suggest
-   *  a name for it. Absent handoffs fall back to a generic title. */
+  /** The question this result answers, used to suggest a map name. */
   prompt?: string;
 }
 
@@ -33,11 +29,8 @@ const KEY = 'geolens-chat-result';
 /**
  * Validate a show_query_result-style geojson/bbox pair. Mirrors
  * ViewerChatPanel's flyover guard: finite, WGS84-bounded, non-inverted bbox
- * (fix(#527 B-054/C-06) — NaN/inverted bounds throw in fitBounds).
- *
- * Geometry only: the completeness pair and the prompt are added by the caller
- * that has them, so this stays the one place that decides whether a payload is
- * drawable at all.
+ * (NaN/inverted bounds throw in fitBounds). Geometry only: the caller adds the
+ * completeness pair and prompt.
  */
 export function toChatResultHandoff(geojson: unknown, bbox: unknown): ChatResultHandoff | null {
   if (

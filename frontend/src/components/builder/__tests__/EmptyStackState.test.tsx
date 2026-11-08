@@ -90,7 +90,7 @@ describe('EmptyStackState', () => {
     render(<EmptyStackState {...defaultProps()} />);
 
     expect(screen.getByText('Add your first layer')).toBeInTheDocument();
-    // fix(#780): the body copy must not point at a starter list stock installs
+    // The body copy must not point at a starter list stock installs
     // (SUGGESTED_DATASETS=[]) never render.
     expect(screen.getByText('Search the catalog to find datasets for your map.')).toBeInTheDocument();
   });
@@ -258,7 +258,7 @@ describe('EmptyStackState', () => {
     });
   });
 
-  // Phase 1042 Plan 04: AUD-23 + AUD-24 + AUD-02 assertions
+  // Assertions
   it('Test 11 (AUD-23): suggest card rest background is --surface-0, not --surface-1', () => {
     render(<EmptyStackState {...defaultProps()} />);
     // Find the suggest card container (the clickable div wrapping each card)
@@ -295,5 +295,11 @@ describe('EmptyStackState', () => {
     expect(module.eyebrowClassName).toContain('text-2xs');
     expect(module.eyebrowClassName).toContain('font-semibold');
     expect(module.eyebrowClassName).toContain('tracking-wide');
+  });
+
+  it('tells the user Enter runs the search and ties the hint to the input', () => {
+    render(<EmptyStackState onOpenAddData={vi.fn()} onAddDataset={vi.fn()} />);
+
+    expect(screen.getByRole('searchbox')).toHaveAccessibleDescription('Press Enter to search');
   });
 });

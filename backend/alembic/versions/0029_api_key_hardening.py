@@ -1,6 +1,6 @@
 """API-key hardening: optional expiry and owner key_epoch snapshot.
 
-fix(#821): API keys had no expiry and no staleness check, so a key lived
+API keys had no expiry and no staleness check, so a key lived
 forever unless manually revoked and a security event on the owner (role
 change, password change) left previously minted keys working.
 
@@ -33,7 +33,7 @@ down_revision: Union[str, None] = "0028_oauth_email_verified_backfill"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-# fix(#1016): the state the downgrade would silently discard.
+# The state the downgrade would silently discard.
 #
 # ``users.key_epoch > 1`` is the right coarse test for revocation state:
 # ``api_keys.key_epoch`` is a mint-time snapshot of the owner's value, so if no
@@ -81,19 +81,19 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # fix(#1016): refuse rather than drop. Both columns carry security state and
+    # Refuse rather than drop. Both columns carry security state and
     # losing them fails in the unsafe direction — an expired key comes back as a
     # permanent one, and a key revoked by an epoch bump comes back live. Neither
     # raises: the downgrade succeeds, the schema is valid, and the deployment is
     # quietly less secure than the operator believes.
     #
-    # This matters despite downgrades being rare, because the one documented
-    # procedure that reaches this migration is the multi-tenant fresh-cluster DR
-    # path (`alembic downgrade 0016`, RUNBOOK § disaster recovery) — run on
-    # someone's worst day, usually for the first time. It is also not covered by
-    # the later refusals: several migrations between here and 0020 do index work
-    # inside `autocommit_block()`, which commits the DDL preceding it, so a
-    # refusal at 0021 does not roll back what 0029 already dropped.
+    # This matters despite downgrades being rare: `alembic downgrade 0016` is
+    # the step an operator reaches for when recovering a multi-tenant fresh
+    # cluster, on their worst day and usually for the first time. This
+    # migration is also not covered by the later refusals: several migrations
+    # between here and 0020 do index work inside `autocommit_block()`, which
+    # commits the DDL preceding it, so a refusal at 0021 does not roll back
+    # what 0029 already dropped.
     bind = op.get_bind()
     # Lock before counting, or the count is only a snapshot: the ACCESS SHARE
     # a SELECT takes does not block an API-key insert or a key_epoch update, so

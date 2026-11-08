@@ -5,7 +5,13 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.csv_safety import numeric_column_names
 from app.processing.ai.chat_constants import _get_ramp_colors
+from app.processing.ai.chat_style_guards import (
+    finish_data_driven_result,
+    outline_only_error,
+    record_polygon_mode,
+)
 from app.processing.ai.schemas import ChatMapLayer
 
 if TYPE_CHECKING:
@@ -17,9 +23,8 @@ def _get_color_property(
 ) -> str:
     """Determine the correct MapLibre color paint property for the layer.
 
-    Heatmap layers share the source's Point geometry but require the
-    heatmap-color paint property, not circle-color — check layer_type
-    first so a heatmap-typed layer with Point geometry routes correctly.
+    Heatmap layers share the source's Point geometry but need heatmap-color,
+    not circle-color, so layer_type is checked first.
     """
     if layer_type and "heatmap" in layer_type.lower():
         return "heatmap-color"
@@ -47,7 +52,9 @@ async def _build_data_driven_style(
     mode = tool_input["mode"]
     column = tool_input["column"]
     default_ramp = "Set2" if mode == "categorical" else "YlOrRd"
-    ramp = tool_input.get("ramp", default_ramp)
+    ramp = tool_input.get("ramp")
+    if not isinstance(ramp, str) or not ramp:
+        ramp = default_ramp
     method = tool_input.get("method", "quantile")
     class_count = tool_input.get("class_count", 5)
     class_count = max(2, min(class_count, 9))
@@ -56,6 +63,28 @@ async def _build_data_driven_style(
 
     if not target_layer:
         return {"error": f"Layer {layer_id} not found"}
+    render_mode = (target_layer.style_config or {}).get("render_mode")
+    if render_mode == "heatmap":
+        return {
+            "error": "A heatmap's colour follows point density, not a column. "
+            "To weight it by a column, use set_style with a heatmap-weight expression."
+        }
+    if render_mode == "symbol":
+        return {
+            "error": "Symbol layers draw icons, so a column can't colour them. "
+            "Switch the layer to point first to colour it by a column."
+        }
+    if render_mode == "cluster":
+        return {
+            "error": "Cluster bubbles aggregate many features, so a column can't "
+            "colour them. Switch the layer to point first to colour it by a column."
+        }
+
+    color_prop = _get_color_property(
+        target_layer.geometry_type, layer_type=target_layer.layer_type
+    )
+    if error := outline_only_error(target_layer, color_prop):
+        return {"error": error}
 
     table_name = target_layer.dataset_table_name
 
@@ -66,15 +95,11 @@ async def _build_data_driven_style(
                 "error": f"Column '{column}' not found in layer. Available columns: {', '.join(sorted(col_names)[:10])}"
             }
 
-    color_prop = _get_color_property(
-        target_layer.geometry_type, layer_type=target_layer.layer_type
-    )
-
-    # Build allowed_tables from the validated layer set for defense-in-depth
+    # Defense in depth: queries stay within the validated layer set.
     allowed_tables = {layer.dataset_table_name for layer in layers}
 
     if mode == "categorical":
-        return await _build_categorical_style(
+        result = await _build_categorical_style(
             session,
             table_name,
             column,
@@ -84,18 +109,20 @@ async def _build_data_driven_style(
             allowed_tables=allowed_tables,
             port=port,
         )
-    return await _build_graduated_style(
-        session,
-        table_name,
-        column,
-        ramp,
-        method,
-        class_count,
-        color_prop,
-        layer_id,
-        allowed_tables=allowed_tables,
-        port=port,
-    )
+    else:
+        result = await _build_graduated_style(
+            session,
+            table_name,
+            column,
+            ramp,
+            method,
+            class_count,
+            color_prop,
+            layer_id,
+            allowed_tables=allowed_tables,
+            port=port,
+        )
+    return finish_data_driven_result(result, layers)
 
 
 async def _build_categorical_style(
@@ -119,22 +146,27 @@ async def _build_categorical_style(
     )
     colors = _get_ramp_colors(ramp, len(values))
 
-    # Build MapLibre match expression: ["match", ["get", column], val1, color1, ..., fallback]
-    match_expr: list = ["match", ["get", column]]
+    # ["match", ["get", column], val1, color1, ..., fallback]. MapLibre rejects
+    # boolean match labels, so a boolean column is matched on its "true"/"false"
+    # string form. Other types keep native labels.
+    match_input: list = ["get", column]
+    if any(isinstance(v, bool) for v in values):
+        match_input = ["to-string", match_input]
+        values = [str(v).lower() if isinstance(v, bool) else str(v) for v in values]
+    match_expr: list = ["match", match_input]
     categories = []
     for i, val in enumerate(values):
         match_expr.append(val)
         match_expr.append(colors[i])
         categories.append({"value": val, "color": colors[i]})
 
-    # Fallback color (gray)
     match_expr.append("#cccccc")
 
     paint: dict = {color_prop: match_expr}
-    # Ensure fill is visible when applying data-driven color to polygons
+    # Keep polygon fills visible under data-driven color.
     if color_prop == "fill-color":
         paint["fill-opacity"] = 0.7
-        paint["_outline-color"] = "#374151"  # neutral dark gray outline
+        paint["_outline-color"] = "#374151"
 
     return {
         "type": "set_data_driven_style",
@@ -176,7 +208,6 @@ async def _build_graduated_style(
     if min_val is None or max_val is None:
         return {"error": f"No numeric data for column {column}"}
 
-    # Compute breaks
     if method == "equal_interval":
         if max_val == min_val:
             breaks = [min_val]
@@ -186,13 +217,13 @@ async def _build_graduated_style(
                 for i in range(1, class_count)
             ]
     else:
-        # quantile: use the dynamically-computed quantiles from stats
+        # quantile
         breaks = stats.get("quantiles", [])
 
     # MapLibre requires strictly increasing finite stops. Deduplicate quantiles
-    # server-side because frontend validation cannot repair generated expressions.
-    # Drop non-finite values to keep JSON valid, then resample colours so the
-    # remaining stops span the full ramp.
+    # here because frontend validation cannot repair generated expressions, and
+    # drop non-finite values to keep JSON valid. Colours are resampled below to
+    # match the remaining stops.
     breaks = sorted(
         {
             float(b)
@@ -208,7 +239,7 @@ async def _build_graduated_style(
 
     colors = _get_ramp_colors(ramp, len(breaks) + 1)
 
-    # Build MapLibre step expression: ["step", ["get", column], color0, break1, color1, ...]
+    # ["step", ["get", column], color0, break1, color1, ...]
     step_expr: list = ["step", ["get", column], colors[0]]
     break_entries = []
     for i, brk in enumerate(breaks):
@@ -222,10 +253,10 @@ async def _build_graduated_style(
         )
 
     paint: dict = {color_prop: step_expr}
-    # Ensure fill is visible when applying data-driven color to polygons
+    # Keep polygon fills visible under data-driven color.
     if color_prop == "fill-color":
         paint["fill-opacity"] = 0.7
-        paint["_outline-color"] = "#374151"  # neutral dark gray outline
+        paint["_outline-color"] = "#374151"
 
     return {
         "type": "set_data_driven_style",
@@ -239,3 +270,78 @@ async def _build_graduated_style(
             "breaks": break_entries,
         },
     }
+
+
+# Mirrors RENDERER_CAPABILITIES in frontend components/builder/renderAs.ts.
+_RENDER_AS_BY_FAMILY = {
+    "point": ("point", "symbol", "heatmap", "cluster"),
+    "line": ("line", "arrow"),
+    "polygon": ("fill", "stroke", "fill-stroke", "extrusion-3d"),
+}
+_RENDER_AS_STORED_AS_RENDER_MODE = {"symbol", "heatmap", "cluster", "arrow"}
+
+
+def apply_render_as(tool_input: dict, layers: list[ChatMapLayer]) -> dict:
+    """Validate a set_render_as call and record the new mode on its layer.
+
+    The layer's style_config is updated in place so set_style later in the
+    same turn validates paint against the new render mode.
+    """
+    target = next((lyr for lyr in layers if lyr.id == tool_input.get("layer_id")), None)
+    if target is None:
+        return {"error": "That layer is not on this map."}
+    if target.layer_type == "raster_geolens":
+        return {"error": "Raster layers have one render type and cannot be switched."}
+    gt = (target.geometry_type or "").upper()
+    family = next((f for f in ("point", "line", "polygon") if f.upper() in gt), None)
+    allowed = _RENDER_AS_BY_FAMILY.get(family or "", ())
+    render_as = tool_input.get("render_as")
+    if render_as not in allowed:
+        return {
+            "error": f"'{render_as}' is not available for this layer. "
+            f"Choose one of: {', '.join(allowed) or 'none'}."
+        }
+    # Mirrors canUseClusterSource in frontend components/builder/cluster-source.ts.
+    if render_as == "cluster" and target.layer_type not in (
+        None,
+        "vector_geolens",
+        "geojson",
+    ):
+        return {"error": "Only vector layers can be clustered."}
+    if render_as == "cluster" and target.feature_count is None:
+        return {"error": "Cluster needs the layer's feature count, which is unknown."}
+    if render_as == "extrusion-3d":
+        numeric = numeric_column_names(target.column_info)
+        height_column = tool_input.get("height_column")
+        builder = (target.style_config or {}).get("builder") or {}
+        current = builder.get("heightColumn") or (target.paint or {}).get(
+            "_height_column"
+        )
+        if height_column is None and current not in numeric:
+            # Name the column here: the client's fallback type check is looser.
+            height_column = next(
+                (
+                    c["name"]
+                    for c in target.column_info or []
+                    if isinstance(c, dict) and c.get("name") in numeric
+                ),
+                None,
+            )
+            if height_column is None:
+                return {
+                    "error": "This layer has no numeric column to take 3D heights from."
+                }
+            tool_input = {**tool_input, "height_column": height_column}
+        elif height_column is not None and height_column not in numeric:
+            return {
+                "error": f"'{height_column}' is not a numeric column on this layer."
+            }
+    style = dict(target.style_config or {})
+    if family == "polygon":
+        record_polygon_mode(target, style, render_as, tool_input.get("height_column"))
+    if render_as in _RENDER_AS_STORED_AS_RENDER_MODE:
+        style["render_mode"] = render_as
+    else:
+        style.pop("render_mode", None)
+    target.style_config = style
+    return {"type": "set_render_as", **tool_input}

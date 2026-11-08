@@ -24,16 +24,14 @@ class AuditLogResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    # Phase 279 ADMIN-05 (L-02/Rule 1): nullable (FK ondelete='SET NULL') --
-    # a hard-deleted user's audit rows survive with user_id=None. The
-    # previous non-nullable typing raised a ValidationError serializing
-    # those rows.
+    # Nullable (FK ondelete='SET NULL'): a hard-deleted user's audit rows
+    # survive with user_id=None.
     user_id: uuid.UUID | None
     username: str | None = None
     action: str
     resource_type: str
     resource_id: uuid.UUID | None
-    # fix(#620): display name of the target resource (dataset/map/collection
+    # Display name of the target resource (dataset/map/collection
     # title, user username), resolved at query time. None when the resource
     # was deleted or its type has no canonical name.
     resource_name: str | None = None
@@ -45,9 +43,6 @@ class AuditLogResponse(BaseModel):
 class AuditLogListResponse(BaseModel):
     logs: list[AuditLogResponse]
     total: int
-
-
-# SEC-FU-08: Column DDL feed response models.
 
 
 class ColumnDdlEntry(BaseModel):

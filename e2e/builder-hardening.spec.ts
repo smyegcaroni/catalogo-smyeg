@@ -3,19 +3,11 @@ import {
   test,
   type APIRequestContext,
   type Page,
-  type Response,
   AUTH_FILE,
-  getAuthToken,
 } from './helpers/session';
+import { authHeaders, createMap as createMapNamed, deleteMap, isMapUpdateResponse, waitForBuilder } from './helpers/maps';
 
 const BASE_URL = process.env.E2E_BASE_URL ?? 'http://localhost:8080';
-
-function isMapUpdateResponse(response: Response, mapId: string): boolean {
-  return (
-    response.request().method() === 'PUT' &&
-    new URL(response.url()).pathname === `/api/maps/${mapId}`
-  );
-}
 
 interface DatasetListItem {
   id: string;
@@ -42,17 +34,6 @@ interface ConsoleGate {
   warnings: string[];
 }
 
-function authHeaders() {
-  return {
-    Authorization: `Bearer ${getAuthToken()}`,
-    'Content-Type': 'application/json',
-  };
-}
-
-async function waitForBuilder(page: Page) {
-  await expect(page.locator('canvas.maplibregl-canvas')).toBeVisible({ timeout: 20_000 });
-  await expect(page.getByTestId('builder-sidebar')).toBeVisible({ timeout: 15_000 });
-}
 
 function attachConsoleGate(page: Page): ConsoleGate {
   const errors: string[] = [];
@@ -64,7 +45,7 @@ function attachConsoleGate(page: Page): ConsoleGate {
   return { errors, warnings };
 }
 
-// fix(#524 B-036): status-0 AJAXErrors are network-level aborts of in-flight
+// Status-0 AJAXErrors are network-level aborts of in-flight
 // tile fetches (page reload / source teardown mid-request), not server or app
 // failures. MapLibre surfaces them as console errors during the
 // save-and-reload flows this suite drives, and BuilderMap's DEV error handler
@@ -99,19 +80,8 @@ async function getDatasets(request: APIRequestContext): Promise<DatasetListItem[
   return payload.datasets ?? payload.items ?? [];
 }
 
-async function createMap(request: APIRequestContext, name: string): Promise<string> {
-  const response = await request.post(`${BASE_URL}/api/maps/`, {
-    headers: authHeaders(),
-    data: { name, description: 'Temporary map for builder hardening coverage' },
-  });
-  expect(response.ok(), `Create map failed: ${response.status()} ${await response.text()}`).toBe(true);
-  return ((await response.json()) as { id: string }).id;
-}
-
-async function deleteMap(request: APIRequestContext, mapId: string) {
-  await request.delete(`${BASE_URL}/api/maps/${mapId}`, {
-    headers: { Authorization: `Bearer ${getAuthToken()}` },
-  });
+function createMap(request: APIRequestContext, name: string): Promise<string> {
+  return createMapNamed(request, name, 'Temporary map for builder hardening coverage');
 }
 
 async function addLayer(request: APIRequestContext, mapId: string, datasetId: string) {
@@ -322,7 +292,14 @@ test.describe('Builder residual-risk hardening', () => {
 
     const { mapId } = await createLayeredMap(request, `E2E Builder Network ${Date.now()}`, 1);
     try {
+      // A flag, not unroute: unroute sends a tile still waiting in the handler
+      // to the network, and the handler's fulfill then throws.
+      let failTiles = true;
       await page.route('**/tiles/**', async (route) => {
+        if (!failTiles) {
+          await route.fallback();
+          return;
+        }
         await new Promise((resolve) => setTimeout(resolve, 150));
         await route.fulfill({ status: 503, body: '' });
       });
@@ -331,7 +308,7 @@ test.describe('Builder residual-risk hardening', () => {
       await waitForBuilder(page);
       await expect(page.locator('text=Something went wrong')).toHaveCount(0);
 
-      await page.unroute('**/tiles/**');
+      failTiles = false;
       let failedOnce = false;
       await page.route(`**/api/maps/${mapId}`, async (route) => {
         if (route.request().method() === 'PUT' && !failedOnce) {
@@ -370,7 +347,7 @@ test.describe('Builder residual-risk hardening', () => {
   test('public share, embed, and read-only map viewers work while unauthenticated editing stays protected', async ({ browser, request, browserName }, testInfo) => {
     test.skip(browserName !== 'chromium', 'permission/share variants are covered in the primary browser project');
 
-    // fix(#1778): browser.newContext() does not inherit the project's
+    // browser.newContext() does not inherit the project's
     // `use.colorScheme` -- that option only applies to the default
     // context/page fixtures Playwright builds for a test, not one created
     // manually here for an unauthenticated storageState. Read the active

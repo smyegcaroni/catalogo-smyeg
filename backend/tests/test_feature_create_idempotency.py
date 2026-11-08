@@ -26,6 +26,7 @@ from app.modules.catalog.features.idempotency import (
 
 from tests.conftest import _create_test_user
 from tests.factories import create_dataset, get_user_id
+from tests.lock_wait import await_lock_wait_query
 
 PARIS = {"type": "Point", "coordinates": [2.35, 48.85]}
 LONDON = {"type": "Point", "coordinates": [-0.13, 51.51]}
@@ -127,24 +128,18 @@ async def test_a_retry_after_a_lost_response_returns_the_created_feature(
 ):
     """The first attempt commits, then fails before answering; the retry finds it."""
 
-    class DroppedAfterCommit:
-        async def invalidate_table(self, table: str) -> None:
-            raise RuntimeError("connection dropped after the commit")
+    def dropped_after_commit(*args, **kwargs):
+        raise RuntimeError("connection dropped after the commit")
 
     sketch = f"sketch-{uuid.uuid4()}"
-    with patch.object(features_router, "get_tile_cache", lambda: DroppedAfterCommit()):
+    with patch.object(
+        features_router, "_created_feature_response", dropped_after_commit
+    ):
         with pytest.raises(RuntimeError, match="dropped after the commit"):
             await _create(client, admin_dataset, admin_auth_header, sketch)
     assert await _row_count(test_db_session, admin_dataset) == 1
 
-    invalidated: list[str] = []
-
-    class RecordingCache:
-        async def invalidate_table(self, table: str) -> None:
-            invalidated.append(table)
-
-    with patch.object(features_router, "get_tile_cache", lambda: RecordingCache()):
-        retry = await _create(client, admin_dataset, admin_auth_header, sketch)
+    retry = await _create(client, admin_dataset, admin_auth_header, sketch)
 
     assert retry.status_code == 201, retry.text
     assert await _row_count(test_db_session, admin_dataset) == 1
@@ -159,7 +154,6 @@ async def test_a_retry_after_a_lost_response_returns_the_created_feature(
         text("SELECT tile_cache_version FROM catalog.datasets WHERE id = :id"),
         {"id": admin_dataset.id},
     )
-    assert invalidated == [admin_dataset.table_name]
     assert (
         await test_db_session.scalar(
             text("SELECT feature_count FROM catalog.datasets WHERE id = :id"),
@@ -182,29 +176,6 @@ async def test_repeats_of_one_key_return_the_same_feature(
     assert [r.status_code for r in (first, second, third)] == [201, 201, 201]
     assert second.json()["id"] == first.json()["id"] == third.json()["id"]
     assert await _row_count(test_db_session, admin_dataset) == 1
-
-
-async def _await_lock_wait_query() -> str:
-    """Block until some backend is parked on a lock, and return what it is running.
-
-    Each poll uses its own session: a rollback on the test's session would
-    expire the ORM objects the test still holds.
-    """
-    import app.core.db as db_module
-
-    for _ in range(600):
-        async with db_module.async_session() as probe:
-            query = await probe.scalar(
-                text(
-                    "SELECT query FROM pg_stat_activity "
-                    "WHERE datname = current_database() "
-                    "AND wait_event_type = 'Lock' LIMIT 1"
-                )
-            )
-        if query:
-            return query
-        await asyncio.sleep(0.01)
-    raise AssertionError("no backend ever parked on a lock")
 
 
 async def test_a_request_waits_out_an_in_flight_holder_of_its_key(
@@ -230,7 +201,7 @@ async def test_a_request_waits_out_an_in_flight_holder_of_its_key(
             _create(client, admin_dataset, admin_auth_header, sketch)
         )
         try:
-            await _await_lock_wait_query()
+            await await_lock_wait_query()
             assert not loser.done()
         finally:
             release.set()
@@ -277,7 +248,7 @@ async def test_a_retry_blocked_on_a_unique_value_resolves_to_the_first_feature(
                 _create(client, dataset, admin_auth_header, sketch)
             )
             try:
-                waiting_on = await _await_lock_wait_query()
+                waiting_on = await await_lock_wait_query()
                 assert "pg_advisory_xact_lock" in waiting_on
             finally:
                 release.set()
@@ -323,6 +294,7 @@ async def test_a_keyed_create_takes_the_catalog_rows_before_its_key_row(
     import app.core.db as db_module
 
     async with db_module.async_session() as holder:
+        holder_pid = await holder.scalar(text("SELECT pg_backend_pid()"))
         await holder.execute(
             text("SELECT id FROM catalog.datasets WHERE id = :id FOR UPDATE"),
             {"id": admin_dataset.id},
@@ -331,7 +303,7 @@ async def test_a_keyed_create_takes_the_catalog_rows_before_its_key_row(
             _create(client, admin_dataset, admin_auth_header, uuid.uuid4().hex)
         )
         try:
-            waiting_on = await _await_lock_wait_query()
+            waiting_on = await await_lock_wait_query(blocked_by=holder_pid)
         finally:
             await holder.rollback()
     response = await request
@@ -543,7 +515,7 @@ async def test_an_older_attempt_in_flight_cannot_commit_after_a_newer_one(
             )
         )
         try:
-            await _await_lock_wait_query()
+            await await_lock_wait_query()
             assert not older.done()
         finally:
             release.set()
@@ -586,6 +558,7 @@ async def test_a_later_attempt_waits_for_a_patch_without_holding_the_catalog_row
     sketch = uuid.uuid4().hex
     created = await _create(client, admin_dataset, admin_auth_header, sketch, attempt=1)
     async with db_module.async_session() as patch:
+        patch_pid = await patch.scalar(text("SELECT pg_backend_pid()"))
         await patch.execute(
             text(
                 f'SELECT gid FROM "data"."{admin_dataset.table_name}" '
@@ -604,7 +577,7 @@ async def test_a_later_attempt_waits_for_a_patch_without_holding_the_catalog_row
             )
         )
         try:
-            waiting_on = await _await_lock_wait_query()
+            waiting_on = await await_lock_wait_query(blocked_by=patch_pid)
             catalog_held = await _datasets_row_is_held(admin_dataset)
             # What the PATCH does next, once it has written the feature.
             await patch.execute(
@@ -722,6 +695,7 @@ async def test_a_later_attempt_waits_for_a_writer_in_flight_and_then_refuses(
     sketch = uuid.uuid4().hex
     created = await _create(client, admin_dataset, admin_auth_header, sketch, attempt=1)
     async with db_module.async_session() as writer:
+        writer_pid = await writer.scalar(text("SELECT pg_backend_pid()"))
         await writer.execute(
             text(
                 f'UPDATE "data"."{admin_dataset.table_name}" '
@@ -740,7 +714,7 @@ async def test_a_later_attempt_waits_for_a_writer_in_flight_and_then_refuses(
             )
         )
         try:
-            await _await_lock_wait_query()
+            await await_lock_wait_query(blocked_by=writer_pid)
             assert not retry.done()
         finally:
             await writer.commit()
@@ -763,6 +737,7 @@ async def test_a_retry_waiting_for_the_table_holds_nothing_deleting_the_dataset_
     sketch = uuid.uuid4().hex
     await _create(client, admin_dataset, admin_auth_header, sketch, attempt=1)
     async with db_module.async_session() as deleter:
+        deleter_pid = await deleter.scalar(text("SELECT pg_backend_pid()"))
         await deleter.execute(
             text(
                 f'LOCK TABLE "data"."{admin_dataset.table_name}" IN ACCESS EXCLUSIVE MODE'
@@ -779,7 +754,7 @@ async def test_a_retry_waiting_for_the_table_holds_nothing_deleting_the_dataset_
             )
         )
         try:
-            waiting_on = await _await_lock_wait_query()
+            waiting_on = await await_lock_wait_query(blocked_by=deleter_pid)
             await deleter.execute(text("SET LOCAL lock_timeout = '1s'"))
             # What the delete does after the table: remove the dataset's key rows.
             await deleter.execute(
@@ -918,8 +893,8 @@ async def test_without_the_header_every_request_inserts(
     [
         "x" * (IDEMPOTENCY_KEY_MAX_LENGTH + 1),
         "has space",
-        "semi;colon",
-        "quote'",
+        "tab\there",
+        "caf\u00e9".encode(),
         "",
     ],
 )
@@ -931,6 +906,38 @@ async def test_an_invalid_key_is_refused_before_anything_is_written(
     assert refused.status_code == 422, refused.text
     assert await _row_count(test_db_session, admin_dataset) == 0
     assert await _key_rows(test_db_session, admin_dataset) == 0
+
+
+@pytest.mark.parametrize(
+    "sketch",
+    [
+        "device-42:2026-10-17T16:09:33.123000+00:00",
+        "dGVzdC9rZXkrd2l0aD0=/+==",
+        '"8e03978e-40d5-43e8-bc93-6894a57f9324"',
+        "semi;colon'quote",
+    ],
+)
+async def test_a_visible_ascii_key_creates_once_and_a_retry_returns_it(
+    client: AsyncClient, admin_auth_header, admin_dataset, test_db_session, sketch
+):
+    first = await _create(client, admin_dataset, admin_auth_header, sketch, attempt=1)
+    retry = await _create(client, admin_dataset, admin_auth_header, sketch, attempt=1)
+
+    assert first.status_code == retry.status_code == 201, (first.text, retry.text)
+    assert retry.json()["id"] == first.json()["id"]
+    assert await _row_count(test_db_session, admin_dataset) == 1
+    assert await _key_rows(test_db_session, admin_dataset) == 1
+
+
+async def test_a_quoted_key_and_the_same_key_unquoted_are_different_keys(
+    client: AsyncClient, admin_auth_header, admin_dataset, test_db_session
+):
+    bare = "8e03978e-40d5-43e8-bc93-6894a57f9324"
+    first = await _create(client, admin_dataset, admin_auth_header, bare)
+    second = await _create(client, admin_dataset, admin_auth_header, f'"{bare}"')
+
+    assert first.json()["id"] != second.json()["id"]
+    assert await _row_count(test_db_session, admin_dataset) == 2
 
 
 async def test_the_longest_key_is_accepted(

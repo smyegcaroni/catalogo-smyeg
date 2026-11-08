@@ -160,10 +160,10 @@ SERVICE_UNAVAILABLE_RESPONSE = {
     "description": "Service unavailable — required publication metadata is missing",
 }
 
-# fix(#1550): a 503 from a queue dispatch failure is a different condition
-# from the publication-metadata one above, and the description ships to
-# clients in the committed OpenAPI document and both generated SDKs.
-# Reusing the constant told every SDK consumer the wrong reason.
+# A 503 from a queue dispatch failure is a different condition from the
+# publication-metadata one above; the description ships to clients in the
+# committed OpenAPI document and both generated SDKs, so it must name the
+# right reason.
 QUEUE_UNAVAILABLE_RESPONSE = {
     **PROBLEM_RESPONSE,
     "description": "Service unavailable — the background job queue could not be reached",
@@ -269,7 +269,7 @@ def _is_standards_path(request: Request) -> bool:
 def _allow_header_with_head(headers: dict[str, str] | None) -> dict[str, str] | None:
     """Add HEAD to a 405's ``Allow`` header when GET is already listed.
 
-    fix(#1470): ``_register_standards_head_routes`` serves HEAD beside
+    ``_register_standards_head_routes`` serves HEAD beside
     every standards GET as a SEPARATE route (FastAPI derives operation
     ids from name+path, not method, so one route carrying ``{GET, HEAD}``
     emits duplicate ids). Cost: starlette builds a 405's ``Allow`` from
@@ -409,8 +409,7 @@ def register_error_handlers(app: FastAPI) -> None:
 
         # Prefer the middleware-generated UUID stashed on request.state — this
         # is the same ID bound to structlog contextvars and emitted by the
-        # access log, so client errors correlate cleanly with server logs
-        # (RESILIENCE-9). Fall back to client-supplied header for legacy compat.
+        # access log, so client errors correlate cleanly with server logs. Fall back to client-supplied header for legacy compat.
         request_id = (
             getattr(request.state, "request_id", None)
             or request.headers.get("x-request-id")
@@ -425,9 +424,8 @@ def register_error_handlers(app: FastAPI) -> None:
 
         logger.exception(
             "Unhandled error",
-            # fix(#1778): same capability-in-the-path rule the access log
-            # follows since #821 — without it, a 500 on
-            # /api/maps/shared/{token} would log the token verbatim.
+            # Same capability-in-the-path rule the access log follows: without it, a
+            # 500 on /api/maps/shared/{token} would log the token verbatim.
             path=safe_access_log_path(request.url.path),
             method=request.method,
             query=redact_query_credentials(str(request.url.query))
@@ -439,7 +437,7 @@ def register_error_handlers(app: FastAPI) -> None:
             exc_type=type(exc).__name__,
         )
         # Echo the request ID on the error response so clients can include
-        # it in support tickets (RESILIENCE-5).
+        # it in support tickets.
         headers = {"X-Request-ID": request_id} if request_id else {}
         return JSONResponse(
             status_code=500,

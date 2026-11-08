@@ -1,19 +1,18 @@
-"""fix(#1485): production exception logging must never reach rich.
+"""Production exception logging must never reach rich.
 
 `structlog.dev.ConsoleRenderer` picks `RichTracebackFormatter(show_locals=True)`
 as its exception formatter whenever rich is importable, and rich is in the
 backend's transitive dependency set. Rendering a frame's locals costs time
 proportional to the `repr()` of each one, and rich's line splitting is
 quadratic in the length of a single long line — so an exception raised with
-SQLAlchemy objects in scope spent minutes of synchronous CPU inside the
+SQLAlchemy objects in scope would spend minutes of synchronous CPU inside the
 logging call. That call happens on the event loop in the request path, and
-the production compose default is one uvicorn worker, so the whole API was
+the production compose default is one uvicorn worker, so the whole API would be
 unavailable for the duration.
 
-These tests pin both halves of the fix: the production configuration cannot
+These tests pin both halves: the production configuration cannot
 route an exception through rich, and what it emits for an exception does not
-depend on the size of any local variable. Measured on the middleware case
-below, the same request went from 83,062 bytes of log output to 3,675.
+depend on the size of any local variable.
 
 Nothing here asserts on elapsed time. The property under test is that the
 work is not proportional to local size, which the emitted record shows
@@ -30,6 +29,7 @@ import pytest
 import structlog
 
 import app.api.middleware.logging as logging_mw
+from app.core.logging_config import _redact_rendered_line
 from tests._logging_state import configured_logging
 
 # Appears only inside the repr of a frame local — never in an exception
@@ -110,7 +110,7 @@ def test_production_config_has_no_rich_traceback_renderer(json_logs: bool) -> No
     settings. The reported incident ran with ENVIRONMENT=production and the
     compose default LOG_JSON=false, which is the console branch.
     """
-    with configured_logging(json_logs=json_logs, production=True):
+    with configured_logging(json_logs=json_logs):
         assert _rich_formatters_in_play() == []
 
 
@@ -121,8 +121,9 @@ def test_production_console_renderer_uses_plain_traceback() -> None:
     source lines and no locals, so its cost tracks stack depth rather than the
     size of anything the frames happen to hold.
     """
-    with configured_logging(json_logs=False, production=True):
-        renderer = _current_formatter().processors[-1]
+    with configured_logging(json_logs=False):
+        *_, renderer, redact_rendered_line = _current_formatter().processors
+        assert redact_rendered_line is _redact_rendered_line
 
         assert isinstance(renderer, structlog.dev.ConsoleRenderer)
         assert renderer.exception_formatter is structlog.dev.plain_traceback
@@ -135,7 +136,7 @@ def test_production_resolves_exc_info_before_the_renderer(json_logs: bool) -> No
     This is the structural half of the fix. It also covers stdlib records,
     because the same list is the ProcessorFormatter's `foreign_pre_chain`.
     """
-    with configured_logging(json_logs=json_logs, production=True):
+    with configured_logging(json_logs=json_logs):
         chain = structlog.get_config()["processors"]
         foreign_chain = _current_formatter().foreign_pre_chain
 
@@ -144,10 +145,10 @@ def test_production_resolves_exc_info_before_the_renderer(json_logs: bool) -> No
 
 
 def test_development_console_renderer_uses_plain_traceback_too() -> None:
-    """fix(#1746 codex r10): dev no longer keeps rich at all, locals-off or not.
+    """Dev no longer keeps rich at all, locals-off or not.
 
-    Superseded by a stronger fix, not merely a stricter test: round 10
-    retired dev's rich-with-locals-off compromise (the previous version of
+    Superseded by a stronger fix, not merely a stricter test: a later
+    change retired dev's rich-with-locals-off compromise (the previous version of
     this test) entirely. `format_exc_info` now runs unconditionally, so an
     `exception` field is always pre-rendered before any renderer sees it --
     and a non-plain formatter meeting a pre-rendered `exception` field is
@@ -155,8 +156,9 @@ def test_development_console_renderer_uses_plain_traceback_too() -> None:
     about, not merely a perf compromise. Dev and production now build this
     renderer identically.
     """
-    with configured_logging(json_logs=False, production=False):
-        renderer = _current_formatter().processors[-1]
+    with configured_logging(json_logs=False):
+        *_, renderer, redact_rendered_line = _current_formatter().processors
+        assert redact_rendered_line is _redact_rendered_line
 
         assert isinstance(renderer, structlog.dev.ConsoleRenderer)
         assert renderer.exception_formatter is structlog.dev.plain_traceback
@@ -184,7 +186,7 @@ async def test_middleware_exception_logs_plain_traceback(capsys) -> None:
     app = Starlette(routes=[Route("/boom", boom)])
     app.add_middleware(logging_mw.RequestLoggingMiddleware)
 
-    with configured_logging(json_logs=False, log_level="INFO", production=True):
+    with configured_logging(json_logs=False, log_level="INFO"):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as http:
@@ -219,7 +221,7 @@ def test_emitted_traceback_is_independent_of_local_size() -> None:
 
     def render_traceback(repeats: int) -> str:
         stream = StringIO()
-        with configured_logging(json_logs=False, log_level="INFO", production=True):
+        with configured_logging(json_logs=False, log_level="INFO"):
             logging.getLogger().handlers[0].setStream(stream)
             try:
                 _raise_with_fat_local(repeats)

@@ -1,4 +1,4 @@
-"""fix(#1963): a publication change retires a dataset's tile signatures.
+"""A publication change retires a dataset's tile signatures.
 
 A signature bound only ``scope`` and ``exp``, and neither carried the state
 that granted it, so a template minted while a dataset was published and public
@@ -151,7 +151,8 @@ class TestUnpublishRetiresOutstandingSignatures:
             params={"dataset_id": str(dataset.id), **params},
         )
 
-        assert resp.status_code == 404, resp.text
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["detail"] == "Invalid or expired signature"
 
     async def test_vector_refuses_a_signature_minted_before_the_unpublish(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
@@ -168,7 +169,8 @@ class TestUnpublishRetiresOutstandingSignatures:
                 f"/tiles/data.{dataset.table_name}/0/0/0.pbf", params=params
             )
 
-            assert resp.status_code == 404, resp.text
+            assert resp.status_code == 403, resp.text
+            assert resp.json()["detail"] == "Invalid or expired signature"
         finally:
             await _drop_table(test_db_session, dataset.table_name)
 
@@ -187,7 +189,8 @@ class TestUnpublishRetiresOutstandingSignatures:
                 f"/tiles/clusters/data.{dataset.table_name}/0/0/0.pbf", params=params
             )
 
-            assert resp.status_code == 404, resp.text
+            assert resp.status_code == 403, resp.text
+            assert resp.json()["detail"] == "Invalid or expired signature"
         finally:
             await _drop_table(test_db_session, dataset.table_name)
 
@@ -228,7 +231,8 @@ class TestUnpublishRetiresOutstandingSignatures:
                 f"/tiles/data.{dataset.table_name}/0/0/0.pbf", params=params
             )
 
-            assert resp.status_code == 404, resp.text
+            assert resp.status_code == 403, resp.text
+            assert resp.json()["detail"] == "Invalid or expired signature"
         finally:
             await _drop_table(test_db_session, dataset.table_name)
 
@@ -257,7 +261,8 @@ class TestUnpublishRetiresOutstandingSignatures:
             },
         )
 
-        assert resp.status_code == 404, resp.text
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["detail"] == "Invalid or expired signature"
 
 
 @pytest.mark.usefixtures("_init_tile_pool_for_tests")
@@ -289,7 +294,8 @@ class TestGoingPrivateRetiresOutstandingSignatures:
             },
         )
 
-        assert resp.status_code == 401, resp.text
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["detail"] == "Invalid or expired signature"
 
     @pytest.mark.parametrize("route", ["data", "clusters/data"])
     async def test_vector_routes_refuse_a_signature_minted_while_public(
@@ -317,7 +323,7 @@ class TestGoingPrivateRetiresOutstandingSignatures:
             )
 
             assert resp.status_code == 403, resp.text
-            assert "Scope mismatch" in resp.json()["detail"]
+            assert resp.json()["detail"] == "Invalid or expired signature"
         finally:
             await _drop_table(test_db_session, dataset.table_name)
 
@@ -416,7 +422,7 @@ class TestRepublishDoesNotResurrect:
             )
 
             assert after.status_code == 403, after.text
-            assert "Scope mismatch" in after.json()["detail"]
+            assert after.json()["detail"] == "Invalid or expired signature"
             assert reminted.status_code == 200, reminted.text
         finally:
             await _drop_table(test_db_session, dataset.table_name)
@@ -448,7 +454,7 @@ class TestRepublishDoesNotResurrect:
             )
 
             assert after.status_code == 403, after.text
-            assert "Scope mismatch" in after.json()["detail"]
+            assert after.json()["detail"] == "Invalid or expired signature"
             assert reminted.status_code == 200, reminted.text
         finally:
             await _drop_table(test_db_session, dataset.table_name)
@@ -514,7 +520,10 @@ class TestEveryPublicationStateWriterIsAccountedFor:
         """A new entry means: decide whether that write must roll the counter.
 
         ``tasks_common.py`` stamps an initial status on a dataset that does not
-        exist yet, which no outstanding signature can name.
+        exist yet, which no outstanding signature can name. ``service_groups.py``
+        writes a map's visibility, ``stories/router.py`` and ``stories/groups.py``
+        a story's, and ``group_sharing.py`` either's; no tile signature names a
+        map or a story.
         """
         import pathlib
 
@@ -529,6 +538,10 @@ class TestEveryPublicationStateWriterIsAccountedFor:
                 "attr:record_status",
                 "attr:visibility",
             ],
+            "modules/catalog/group_sharing.py": ["values:visibility"],
+            "modules/catalog/maps/service_groups.py": ["attr:visibility"],
+            "modules/catalog/stories/groups.py": ["attr:visibility"],
+            "modules/catalog/stories/router.py": ["attr:visibility"],
             "processing/ingest/tasks_common.py": ["attr:record_status"],
         }
 
@@ -631,7 +644,7 @@ class TestASharedCacheIsNotACapabilityChannel:
         [
             ("public", "published", "public", 200),
             ("public", "internal", "private", 404),
-            ("private", "published", "private", 403),
+            ("private", "published", "private", 404),
         ],
     )
     async def test_public_cache_scope_implies_anonymous_readability(
@@ -669,7 +682,7 @@ class TestASharedCacheIsNotACapabilityChannel:
         [
             ("public", "published", "public", 200),
             ("public", "internal", "private", 404),
-            ("private", "published", "private", 401),
+            ("private", "published", "private", 404),
         ],
     )
     async def test_raster_cache_status_implies_anonymous_readability(

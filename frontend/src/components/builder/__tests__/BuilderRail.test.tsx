@@ -7,7 +7,8 @@ import { useAuthStore } from '@/stores/auth-store';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (_key: string, options?: { defaultValue?: string }) => options?.defaultValue ?? _key,
+    t: (_key: string, options?: { defaultValue?: string; count?: number }) =>
+      options?.defaultValue ?? (options?.count === undefined ? _key : `${_key}:${options.count}`),
   }),
 }));
 
@@ -19,6 +20,20 @@ vi.mock('@/components/builder/HistoryPanel', () => ({
 
 vi.mock('@/components/builder/ChatPanel', () => ({
   ChatPanel: () => <div data-testid="chat-panel" />,
+}));
+
+vi.mock('@/components/builder/DashboardEditorPanel', () => ({
+  DashboardEditorPanel: ({
+    draft,
+    onChange,
+  }: {
+    draft: { panel: string; widgets: unknown[] };
+    onChange: (draft: { panel: string; widgets: unknown[] }) => void;
+  }) => (
+    <button type="button" onClick={() => onChange({ ...draft, panel: 'bottom' })}>
+      {`editor ${draft.panel}`}
+    </button>
+  ),
 }));
 
 vi.mock('@/components/builder/AnalysisPanel', () => ({
@@ -53,7 +68,7 @@ vi.mock('@/stores/auth-store', async () => {
   return { useAuthStore: store };
 });
 
-// fix(#816): the Settings CTA gates on can('manage_settings') — the
+// The Settings CTA gates on can('manage_settings') — the
 // capability the /admin/settings route enforces — not the isAdmin flag.
 const permMocks = vi.hoisted(() => ({ capabilities: new Set<string>() }));
 vi.mock('@/hooks/use-permissions', () => ({
@@ -62,7 +77,7 @@ vi.mock('@/hooks/use-permissions', () => ({
   }),
 }));
 
-// fix(#817): the CTA gate goes through useSettingsAdmin, which composes
+// The CTA gate goes through useSettingsAdmin, which composes
 // usePermissions with useEdition — mock the edition side too.
 const editionMocks = vi.hoisted(() => ({ isMultiTenant: false }));
 vi.mock('@/hooks/use-edition', () => ({
@@ -94,6 +109,27 @@ function RailHarness({ showRail = true, aiAvailable = true }: { showRail?: boole
 }
 
 describe('BuilderRail', () => {
+  it('opens the dashboard editor on the draft and passes its edits up', async () => {
+    const onDashboardChange = vi.fn();
+    render(
+      <BuilderRail
+        activePanel="dashboard"
+        onPanelChange={vi.fn()}
+        aiAvailable
+        notes=""
+        onNotesChange={vi.fn()}
+        dashboard={{ panel: 'right', widgets: [] }}
+        onDashboardChange={onDashboardChange}
+        mapId="map-1"
+        layers={[]}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'dock.dashboard' })).toHaveAttribute('aria-pressed', 'true');
+    fireEvent.click(await screen.findByRole('button', { name: 'editor right' }));
+    expect(onDashboardChange).toHaveBeenCalledWith({ panel: 'bottom', widgets: [] });
+  });
+
   it('opens and closes the history panel from the icon rail', () => {
     render(<RailHarness />);
 
@@ -193,7 +229,7 @@ describe('BuilderRail', () => {
   });
 });
 
-describe('fix(#783) — focus restoration on panel close', () => {
+describe('focus restoration on panel close', () => {
   it('returns focus to the rail button when the close button dismisses the panel', async () => {
     render(<RailHarness />);
     const historyButton = screen.getByRole('button', { name: 'History' });
@@ -219,7 +255,7 @@ describe('fix(#783) — focus restoration on panel close', () => {
   });
 });
 
-describe('fix(#788 item 5) — named aside landmarks', () => {
+describe('named aside landmarks', () => {
   it('names the icon rail and the expanded panel', () => {
     render(<RailHarness />);
     expect(
@@ -231,6 +267,36 @@ describe('fix(#788 item 5) — named aside landmarks', () => {
     expect(
       screen.getByRole('complementary', { name: 'History' }),
     ).toBeInTheDocument();
+  });
+});
+
+describe('Dashboard presence indicator', () => {
+  const widget = { id: 'w', type: 'indicator' } as never;
+  const renderRail = (widgets: unknown[]) =>
+    render(
+      <BuilderRail
+        activePanel={null}
+        onPanelChange={vi.fn()}
+        aiAvailable
+        notes=""
+        onNotesChange={vi.fn()}
+        dashboard={{ panel: 'right', widgets: widgets as never[] }}
+        onDashboardChange={vi.fn()}
+        mapId="map-1"
+        layers={[]}
+      />,
+    );
+
+  it('counts the widgets in the button name and shows the dot', () => {
+    renderRail([widget, widget, widget]);
+    const button = screen.getByRole('button', { name: 'rail.dashboardButtonWithWidgets:3' });
+    expect(button.querySelector('[aria-hidden="true"].bg-primary')).not.toBeNull();
+  });
+
+  it('keeps the plain name and no dot without widgets', () => {
+    renderRail([]);
+    const button = screen.getByRole('button', { name: 'dock.dashboard' });
+    expect(button.querySelector('.bg-primary')).toBeNull();
   });
 });
 
@@ -362,7 +428,7 @@ describe('BuilderRail — disabled-state taxonomy (Phase 1135 AI-02)', () => {
     render(<BuilderRail activePanel="ai" onPanelChange={vi.fn()} aiAvailable={false} notes="" onNotesChange={vi.fn()} />);
     expect(screen.getByText(/AI is disabled/i)).toBeInTheDocument();
     const cta = screen.getByRole('link', { name: /go to settings/i });
-    // fix(#816): the ?tab=ai form bounced to the General tab via the bare-path redirect.
+    // The ?tab=ai form bounced to the General tab via the bare-path redirect.
     expect(cta).toHaveAttribute('href', '/admin/settings/ai');
   });
 
@@ -379,7 +445,7 @@ describe('BuilderRail — disabled-state taxonomy (Phase 1135 AI-02)', () => {
     expect(screen.queryByRole('link', { name: /go to settings/i })).not.toBeInTheDocument();
   });
 
-  // fix(#817): in multi-tenant mode the /admin/settings route (and the
+  // In multi-tenant mode the /admin/settings route (and the
   // settings API behind it) requires manage_tenants, not manage_settings —
   // the CTA must follow the same mode-aware gate.
   it('multi-tenant: NO CTA for a manage_settings-only per-tenant admin', () => {

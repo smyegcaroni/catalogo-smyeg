@@ -18,9 +18,9 @@ interface MockMap {
   once: (event: string, cb: () => void) => void;
   on: (event: string, cb: () => void) => void;
   off: (event: string, cb: () => void) => void;
-  /** fix(#394) LM-02/B-028: registered style.load handlers — call to simulate a basemap/style reload. */
+  /** Registered style.load handlers — call to simulate a basemap/style reload. */
   styleLoadHandlers: Array<() => void>;
-  /** fix(#533 follow-up): one-shot idle handlers — call to simulate the map settling. */
+  /** One-shot idle handlers — call to simulate the map settling. */
   idleHandlers: Array<() => void>;
   fitBounds: (bounds: unknown, options: unknown) => void;
 }
@@ -120,6 +120,22 @@ describe('useEphemeralLayers', () => {
     expect(map.fitBoundsCalls[0].bounds).toEqual([[-1, -1], [1, 1]]);
   });
 
+  // MapLibre's globe fit returns no camera for a zero-size box.
+  it('fits a single-point result with a box that has width and height', () => {
+    const map = createMockMap();
+    const ref = { current: map as unknown as MaplibreMap };
+    const { result } = renderHook(() => useEphemeralLayers(ref));
+
+    act(() => {
+      result.current.handleQueryResult(sampleGeoJSON(), [12.5, 48.1, 12.5, 48.1]);
+    });
+
+    expect(map.fitBoundsCalls).toHaveLength(1);
+    const [[west, south], [east, north]] = map.fitBoundsCalls[0].bounds as [[number, number], [number, number]];
+    expect(east - west).toBeGreaterThan(0);
+    expect(north - south).toBeGreaterThan(0);
+  });
+
   it('handleDismissEphemeral removes all ephemeral layers and source', () => {
     const map = createMockMap();
     const ref = { current: map as unknown as MaplibreMap };
@@ -178,7 +194,7 @@ describe('useEphemeralLayers', () => {
   });
 });
 
-describe('fix(#394) LM-02/B-028: overlay survives style reloads', () => {
+describe('overlay survives style reloads', () => {
   it('re-adds the overlay on style.load without re-zooming', () => {
     const map = createMockMap();
     const ref = { current: map as unknown as MaplibreMap };
@@ -206,7 +222,7 @@ describe('fix(#394) LM-02/B-028: overlay survives style reloads', () => {
     expect(map.fitBoundsCalls).toHaveLength(1);
   });
 
-  it('fix(#533 follow-up): retries on idle when the style is transiently not loaded', () => {
+  it('retries on idle when the style is transiently not loaded', () => {
     const map = createMockMap();
     // Reproduce the cold-load pickup race: style transiently reports
     // not-loaded and the initial style.load has already fired (so the
@@ -236,7 +252,7 @@ describe('fix(#394) LM-02/B-028: overlay survives style reloads', () => {
     expect(map.fitBoundsCalls[0].bounds).toEqual([[-1, -1], [1, 1]]);
   });
 
-  it('fix(#533 follow-up): unsubscribes the idle handler on dismiss', () => {
+  it('unsubscribes the idle handler on dismiss', () => {
     const map = createMockMap();
     map.styleLoaded = false;
     const ref = { current: map as unknown as MaplibreMap };

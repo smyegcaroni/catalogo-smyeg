@@ -19,13 +19,13 @@ type BuilderTranslator = (key: string, options?: Record<string, unknown>) => str
 const defaultBuilderTranslator: BuilderTranslator = (key, options) =>
   i18n.t(key, { ns: 'builder', ...options }) as string;
 
-export type BuilderBasemapSublayerId =
+type BuilderBasemapSublayerId =
   | 'basemap:roads'
   | 'basemap:labels'
   | 'basemap:buildings'
   | 'basemap:boundaries';
 
-export interface BuilderBasemapSublayer {
+interface BuilderBasemapSublayer {
   id: BuilderBasemapSublayerId;
   name: string;
   visible: boolean;
@@ -33,14 +33,14 @@ export interface BuilderBasemapSublayer {
   kind: 'vector';
 }
 
-export interface BuilderBasemapStateInput {
+interface BuilderBasemapStateInput {
   basemapStyle: string | null | undefined;
   showBasemapLabels: boolean | null | undefined;
   basemapConfig: MapBasemapConfig | null | undefined;
   terrainConfig: MapTerrainConfig | null | undefined;
 }
 
-export interface BuilderBasemapState {
+interface BuilderBasemapState {
   basemapStyle: string;
   showBasemapLabels: boolean;
   hasVisibleBasemap: boolean;
@@ -239,16 +239,6 @@ export function toggleBasemapSublayerVisibility(
   return {};
 }
 
-export function setBasemapLabelsVisible(
-  state: BuilderBasemapState,
-  visible: boolean,
-): BuilderBasemapPatch {
-  return {
-    showBasemapLabels: visible,
-    basemapConfig: { ...state.config, label_mode: modeFromVisible(visible) },
-  };
-}
-
 function pruneOverride(override: MapSublayerOverride): MapSublayerOverride | null {
   return Object.values(override).every((value) => value == null) ? null : override;
 }
@@ -319,32 +309,30 @@ export function resetBasemapSublayer(
 }
 
 export function resetBasemapAppearance(): BuilderBasemapPatch {
-  // fix(#654, codex round 2): also restore label visibility. Labels are the
-  // one sublayer whose visibility persists outside basemap_config
-  // (showBasemapLabels), so clearing the config alone reset roads/buildings/
-  // boundaries but left labels hidden — inconsistent with the sibling eye
-  // toggles and with resetBasemapSublayer('basemap:labels').
+  // Also restore label visibility. Labels are the one sublayer whose visibility
+  // persists outside basemap_config (showBasemapLabels), so clearing the config
+  // alone would leave labels hidden, inconsistent with the sibling eye toggles
+  // and resetBasemapSublayer('basemap:labels').
   return { basemapConfig: null, showBasemapLabels: true };
 }
 
-// fix(#585): true when resetting appearance (basemap_config → null) would
-// actually change the normalized config — the "Reset appearance" enable
-// signal. Stored configs are often materialized all-defaults objects, so a
-// non-null check alone reads every map as customized. Null-valued keys are
-// stripped before comparing because the normalizer includes optional keys
-// (e.g. sublayer_overrides: null) only when present on the input, and null
-// means "default" for every appearance field.
-// Known gap: an empty-but-present sublayer_overrides ({}) still reads as
-// custom — fails safe (Reset stays enabled), refine if it ever matters.
+// True when resetting appearance (basemap_config → null) would change the
+// normalized config: the "Reset appearance" enable signal. Stored configs are
+// often materialized all-defaults objects, so a non-null check alone reads every
+// map as customized. Null-valued keys are stripped before comparing because the
+// normalizer includes optional keys (e.g. sublayer_overrides: null) only when
+// present on the input, and null means "default" for every appearance field.
+// Known gap: an empty-but-present sublayer_overrides ({}) still reads as custom;
+// that fails safe (Reset stays enabled).
 export function hasCustomBasemapAppearance(
   basemapConfig: MapBasemapConfig | null | undefined,
   showBasemapLabels: boolean | null | undefined,
 ): boolean {
   const labels = showBasemapLabels ?? true;
-  // codex P2 on #654: explicit default-valued optional metadata must read as
-  // clean too — dragging the basemap back to bottom writes basemap_position:
-  // 'bottom', and 'mercator' is the projection default; the null baseline
-  // omits both keys, so keeping them would flag an all-defaults map as custom.
+  // Explicit default-valued optional metadata must read as clean too: dragging
+  // the basemap back to bottom writes basemap_position: 'bottom', and
+  // 'mercator' is the projection default; the null baseline omits both keys, so
+  // keeping them would flag an all-defaults map as custom.
   const OPTIONAL_DEFAULTS: Record<string, unknown> = {
     basemap_position: 'bottom',
     projection: 'mercator',
@@ -357,22 +345,9 @@ export function hasCustomBasemapAppearance(
         ),
       ),
     );
-  // fix(#654, codex round 2): the baseline is the TRUE default (labels on),
-  // not the current labels flag — reset restores label visibility, so a
-  // labels-only-hidden map must read as custom or Reset disables itself on
-  // exactly the state it exists to undo.
+  // The baseline is the true default (labels on), not the current labels flag:
+  // reset restores label visibility, so a labels-only-hidden map must read as
+  // custom or Reset disables itself on exactly the state it exists to undo.
   return canonical(normalizedConfig(basemapConfig, labels))
     !== canonical(normalizedConfig(null, true));
-}
-
-export function setTerrainExaggeration(
-  terrainConfig: MapTerrainConfig | null | undefined,
-  value: number,
-): BuilderBasemapPatch {
-  const exaggeration = normalizeTerrainExaggeration(value);
-  return {
-    terrainConfig: terrainConfig
-      ? { ...terrainConfig, exaggeration }
-      : { enabled: false, source_dataset_id: null, exaggeration },
-  };
 }

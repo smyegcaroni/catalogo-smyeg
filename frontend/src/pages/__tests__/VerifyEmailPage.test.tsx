@@ -87,6 +87,22 @@ describe('VerifyEmailPage', () => {
     });
   });
 
+  it('(a2) verified but awaiting approval: says so and stays off the sign-in page', async () => {
+    mockedVerifyEmail.mockResolvedValue({
+      message: 'Email verified. Your account is awaiting admin approval.',
+      next_step: 'await_approval',
+    });
+
+    const Wrapper = makeWrapper('/verify-email?token=approval-mode-token');
+    render(<VerifyEmailPage />, { wrapper: Wrapper });
+
+    await screen.findByText(/administrator will review your account/i);
+    vi.advanceTimersByTime(2000);
+
+    expect(screen.queryByText('LOGIN PAGE')).not.toBeInTheDocument();
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
   it('(b) invalid token: renders error card with working resend control', async () => {
     mockedVerifyEmail.mockRejectedValue(new Error('Invalid or expired verification link'));
     mockedResendVerification.mockResolvedValue({ message: 'If an unverified account with that email exists, a new verification link has been sent.' });
@@ -118,7 +134,7 @@ describe('VerifyEmailPage', () => {
   it('(c) resend confirmation is generic — does not reveal existence of the email', async () => {
     mockedVerifyEmail.mockRejectedValue(new Error('Invalid or expired verification link'));
     // The backend always returns the same body regardless of whether the email
-    // is registered — frontend must show a generic confirmation (T-1231-11).
+    // is registered — frontend must show a generic confirmation.
     mockedResendVerification.mockResolvedValue({
       message: 'If an unverified account with that email exists, a new verification link has been sent.',
     });

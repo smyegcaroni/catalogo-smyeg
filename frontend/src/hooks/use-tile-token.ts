@@ -1,5 +1,5 @@
 import { useCallback, useMemo } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/query-keys';
 import { getTileToken, getTileTokensBatch } from '@/api/tiles';
 import type { TileToken, TileTokenError } from '@/api/tiles';
@@ -10,7 +10,7 @@ function isToken(v: TileToken | TileTokenError | undefined): v is TileToken {
 }
 
 /**
- * fix(#438): BLD-04 — a stable callback that drops every cached tile token
+ * A stable callback that drops every cached tile token
  * (single + batch), forcing a re-mint. Map hosts pass it to useWebGLRecovery so
  * a GPU context restore re-fetches tokens that may have expired during the outage.
  */
@@ -41,25 +41,19 @@ export function useTileToken(datasetId: string | undefined) {
       return Math.max(d.expires_in * 800, 30_000);
     },
     staleTime: 60_000,
-    // fix(#908): explicit because it is the whole hidden-tab policy — a hidden
-    // tab must not refresh, since MapLibre drops the resulting setTiles reload
-    // while the source's TileManager is paused (fix(#584)). It matched the
-    // TanStack default before, which is exactly what made the #755 403 burst
-    // guaranteed rather than probabilistic.
+    // Explicit because it is the whole hidden-tab policy: a hidden tab must not
+    // refresh, since MapLibre drops the resulting setTiles reload while the
+    // TileManager is paused (the default would make the tab-return 403 burst certain).
     refetchIntervalInBackground: false,
   });
 }
 
 /**
- * Fetch tile tokens for multiple datasets in a single batched request
- * (PERF-N5). Previously this spawned N parallel useQuery calls — a 20-layer
- * map meant 20 HTTP requests + 20 RBAC checks + 20 HMAC signatures on every
- * mount. The new implementation issues one POST /tiles/tokens/ with all
- * dataset IDs; errors for individual datasets are reported per-entry rather
- * than failing the whole query.
- *
- * The return shape is a tuple-like array matching the old useQueries shape
- * so callers (`BuilderMap`, `ViewerMap`) don't need to change.
+ * Fetch tile tokens for multiple datasets in one batched POST /tiles/tokens/
+ * (instead of N requests, RBAC checks and HMAC signatures per mount). Errors
+ * for individual datasets are reported per entry rather than failing the whole
+ * query. The return is a tuple-like array matching `useQueries`' shape for
+ * `BuilderMap` and `ViewerMap`.
  */
 export function useTileTokens(datasetIds: string[]) {
   const uniqueIds = useMemo(
@@ -67,20 +61,21 @@ export function useTileTokens(datasetIds: string[]) {
     [datasetIds],
   );
 
-  // Cache key includes the sorted unique set so queries are stable across
-  // layer reorder but invalidated when the set changes.
+  // The sorted unique set keeps the key stable across layer reorder.
   const sortedKey = useMemo(() => [...uniqueIds].sort().join(','), [uniqueIds]);
 
-  // Choose the shortest expires_in among returned vector tokens to drive
-  // refetch — every token in the batch has similar lifetime, so refreshing
-  // them together is fine and avoids per-dataset refresh churn.
+  // Refetch on the shortest expires_in among vector tokens; the batch shares a
+  // similar lifetime, so refreshing together avoids per-dataset churn.
   const batchQuery = useQuery({
     queryKey: queryKeys.tileTokens.batch(sortedKey),
     queryFn: () => getTileTokensBatch(uniqueIds),
     enabled: uniqueIds.length > 0,
     staleTime: 60_000,
-    // GAP-004: bounded backoff retry — 3 attempts with exponential delay so a
-    // transient network hiccup recovers without spamming the server.
+    // Tokens from the previous id set stay usable while the new set loads, so
+    // removing a layer does not blank the map. They are replaced within one
+    // round trip, well inside their refresh window.
+    placeholderData: keepPreviousData,
+    // Bounded backoff: 3 attempts with exponential delay.
     retry: 3,
     refetchInterval: (query) => {
       const data = query.state.data?.tokens;
@@ -94,25 +89,22 @@ export function useTileTokens(datasetIds: string[]) {
       if (!isFinite(minVectorExpiry)) return false;
       return Math.max(minVectorExpiry * 800, 30_000);
     },
-    // fix(#908): see useTileToken above — the hidden-tab policy is stated at
-    // every site rather than inherited from the TanStack default.
+    // Hidden-tab policy: see useTileToken above.
     refetchIntervalInBackground: false,
   });
 
-  // Adapt the batch result into the { data, isLoading, isError } shape that
-  // callers iterate over (they index by the position of uniqueIds).
+  // Adapt to the { data, isLoading, isError } shape callers index by uniqueIds position.
   return useMemo(() => {
     return uniqueIds.map((id) => {
       const entry = batchQuery.data?.tokens?.[id];
       const isTokenEntry = isToken(entry);
-      // fix(#438): BLD-05 — a requested dataset absent from a settled batch used
-      // to yield {data: undefined, isError: false}, i.e. a silently blank layer.
-      // Treat a missing entry after a successful load as an error so callers can
-      // surface it rather than render nothing.
-      const missingAfterLoad = batchQuery.isSuccess && entry === undefined;
+      // A requested dataset absent from a settled batch is an error, not a
+      // silently blank layer.
+      const missingAfterLoad =
+        batchQuery.isSuccess && !batchQuery.isPlaceholderData && entry === undefined;
       return {
         data: isTokenEntry ? (entry as TileToken) : undefined,
-        isLoading: batchQuery.isLoading,
+        isLoading: batchQuery.isLoading || (batchQuery.isPlaceholderData && entry === undefined),
         isError: batchQuery.isError || (!isTokenEntry && !!entry) || missingAfterLoad,
         error:
           batchQuery.error ??
@@ -123,5 +115,5 @@ export function useTileTokens(datasetIds: string[]) {
               : null),
       };
     });
-  }, [uniqueIds, batchQuery.data, batchQuery.isLoading, batchQuery.isError, batchQuery.isSuccess, batchQuery.error]);
+  }, [uniqueIds, batchQuery.data, batchQuery.isLoading, batchQuery.isError, batchQuery.isSuccess, batchQuery.isPlaceholderData, batchQuery.error]);
 }

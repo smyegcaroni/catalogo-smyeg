@@ -13,18 +13,14 @@ export function resolveTileBaseUrl(
 
 /**
  * First-party vs third-party request classification for map tile/style
- * requests. chore(#835): extracted from ViewerMap's inline classifier so all
- * three map surfaces share one implementation.
+ * requests, shared by all three map surfaces.
  *
- * First-party means: our own origin, or the configured tile CDN origin
- * (`cdn_base_url` / `TILE_BASE_URL`, resolved via the same
- * `resolveTileBaseUrl()` helper used to build tile URLs) — self-hosted
- * deployments commonly serve tiles from a separate CDN origin, so same-origin
- * alone would misclassify them. When no url is available, default to
- * first-party to preserve prior behavior. A relative path (single leading
- * slash) is always first-party; a protocol-relative URL (`//host/path`) is
- * normalized with the current protocol before the origin check so it isn't
- * misread as a relative path.
+ * First-party means our own origin or the configured tile CDN origin
+ * (`cdn_base_url` / `TILE_BASE_URL`, via `resolveTileBaseUrl()`); self-hosted
+ * deployments commonly serve tiles from a separate CDN origin. With no url,
+ * default to first-party. A relative path (single leading slash) is always
+ * first-party; a protocol-relative URL (`//host/path`) is normalized with the
+ * current protocol before the origin check so it isn't misread as relative.
  */
 export function isThirdPartyTileUrl(
   url: string | undefined,
@@ -41,7 +37,7 @@ export function isThirdPartyTileUrl(
       try {
         if (requestOrigin === new URL(tileBaseUrl, window.location.origin).origin) return false;
       } catch {
-        // Malformed configured tile base URL — fall through to third-party classification.
+        // Malformed configured tile base URL: classify as third-party.
       }
     }
     return true;
@@ -50,12 +46,17 @@ export function isThirdPartyTileUrl(
   }
 }
 
-export interface TileTransformRequestOptions {
+interface TileTransformRequestOptions {
   /** Viewer embed surface: attach `X-Embed-Token` to first-party requests. */
   embedToken?: string;
   /** Read the CURRENT tile config at request time (pass a ref-reader so a
    *  late-arriving `cdn_base_url` is honored without re-registering). */
   getTileConfig?: () => { cdn_base_url?: string | null } | null | undefined;
+}
+
+/** A site-relative tile URL made absolute against this page, as MapLibre requests it. */
+export function absoluteTileUrl(url: string): string {
+  return url.startsWith('/') && !url.startsWith('//') ? `${window.location.origin}${url}` : url;
 }
 
 /**
@@ -71,13 +72,10 @@ export function buildTileTransformRequest(
   options: TileTransformRequestOptions = {},
 ): (url: string) => { url: string; headers?: Record<string, string> } {
   return (url: string) => {
-    // fix(#1688 follow-up): absolutify ONLY site-relative paths. The old
-    // `startsWith('http')` predicate origin-prefixed every other scheme, and
-    // transformRequest runs BEFORE MapLibre's custom-protocol dispatch, so a
-    // `pmtiles://…` basemap source became `http://<origin>pmtiles://…` and
-    // never reached the registered pmtiles protocol handler.
-    const absUrl =
-      url.startsWith('/') && !url.startsWith('//') ? `${window.location.origin}${url}` : url;
+    // Absolutify only site-relative paths: a `startsWith('http')` predicate would
+    // origin-prefix other schemes, and transformRequest runs before MapLibre's
+    // custom-protocol dispatch, so `pmtiles://…` would never reach its handler.
+    const absUrl = absoluteTileUrl(url);
     const tileConfig = options.getTileConfig?.() ?? null;
     const headers: Record<string, string> = {};
     if (options.embedToken && !isThirdPartyTileUrl(url, tileConfig)) {
@@ -103,7 +101,7 @@ export function buildTileTransformRequest(
 }
 
 /**
- * builder-audit #338 P1-01: the single MVT `source-layer` name helper.
+ * The single MVT `source-layer` name helper.
  *
  * The MapLibre vector source-layer name must match the layer name the tile
  * server emits inside the MVT payload AND the URL path used to sign tiles. The
@@ -137,14 +135,14 @@ export function isMvtSourceLayerConfigReady(
  * When tileToken is provided, appends sig/exp/scope as query params.
  * When tileToken is null (public dataset), returns URL without params.
  *
- * `extraCols` (2026-05-18): runtime opt-in column names that any
- * layer rendering from this source needs at all zoom levels —
- * typically data-driven styling columns (`style_config.column`,
- * heatmap weight column, etc.). Without these, Phase 269 H-23's
- * z<10 attribute budget strips the data from MVT tiles and
- * data-driven paint expressions fall to their default branch.
- * Names are joined with a comma and sorted for cache-key stability;
- * the server validates each against the dataset's column_info.
+ * `extraCols`: runtime opt-in column names that any layer rendering from this
+ * source needs at all zoom levels, typically data-driven styling columns. Without
+ * them the z<10 attribute budget strips the data from MVT tiles and data-driven
+ * paint expressions fall to their default branch. Names are joined with a comma
+ * and sorted for cache-key stability; the server validates each against the
+ * dataset's column_info.
+ *
+ * `colsOnly`: ask the server for exactly `extraCols` at every zoom (`cols_only=true`).
  */
 export function buildSignedTileUrl(
   tableName: string,
@@ -152,13 +150,17 @@ export function buildSignedTileUrl(
   tileBaseUrl?: string | null,
   tileVersion?: string | number | null,
   extraCols?: string[] | null,
+  colsOnly = false,
 ): string {
   const base = tileBaseUrl
     ? tileBaseUrl.replace(/\/$/, '')
     : `${window.location.origin}/api`;
   const url = `${base}/tiles/${getMvtSourceLayerName(tableName)}/{z}/{x}/{y}.pbf`;
   const cols = normalizeExtraCols(extraCols);
-  return appendTileParams(url, tileToken, tileVersion, cols ? { cols } : {});
+  return appendTileParams(url, tileToken, tileVersion, {
+    ...(cols ? { cols } : {}),
+    ...(colsOnly ? { cols_only: 'true' } : {}),
+  });
 }
 
 /** Sort + dedupe + filter falsy entries so the same set always serializes to
@@ -199,40 +201,39 @@ export function buildClusterTileUrl(
   tileToken: { sig: string; exp: number; scope: string } | null,
   tileBaseUrl?: string | null,
   tileVersion?: string | number | null,
-  options: { clusterRadius?: number; clusterMaxZoom?: number } = {},
+  options: { clusterRadius?: number; clusterMaxZoom?: number; filter?: string } = {},
   extraCols?: string[] | null,
+  colsOnly = false,
 ): string {
   const base = tileBaseUrl
     ? tileBaseUrl.replace(/\/$/, '')
     : `${window.location.origin}/api`;
   const url = `${base}/tiles/clusters/${getMvtSourceLayerName(tableName)}/{z}/{x}/{y}.pbf`;
-  // fix(#403): unclustered features (past cluster_max_zoom / single-point
-  // buckets) need the data-driven styling + popup columns projected, exactly
-  // like the plain vector path — without cols= the server used to emit
-  // attribute-less features and categorical paint/popups silently broke.
+  // Unclustered features need the data-driven styling + popup columns projected,
+  // like the plain vector path; without cols= the server emits attribute-less
+  // features and categorical paint/popups break.
   const cols = normalizeExtraCols(extraCols);
   return appendTileParams(url, tileToken, tileVersion, {
     cluster_radius: options.clusterRadius,
     cluster_max_zoom: options.clusterMaxZoom,
+    filter: options.filter,
     ...(cols ? { cols } : {}),
+    ...(colsOnly ? { cols_only: 'true' } : {}),
   });
 }
 
 /**
- * fix(#907): reload every raster/DEM source's tiles after the session JWT has
- * been renewed.
+ * Reload every raster/DEM source's tiles after the session JWT has been renewed.
  *
- * Renewing the credential is not enough on its own. MapLibre resumes its own
- * tile fetches the moment the tab is visible, which races the refresh round
- * trip, so some raster requests still go out with the old Bearer and 401. A
- * raster descriptor does not change across a refresh (its `tile_url` is stable
- * and auth rides the Authorization header), so nothing in the token→setTiles
- * plumbing fires and those errored tiles are never retried — the map keeps the
- * holes until the user pans.
+ * Renewing the credential isn't enough: MapLibre resumes its tile fetches the
+ * moment the tab is visible, racing the refresh, so some raster requests go out
+ * with the old Bearer and 401. A raster descriptor doesn't change across a
+ * refresh (auth rides the Authorization header), so nothing in the
+ * token→setTiles plumbing retries them and the map keeps holes until the user pans.
  *
- * `refreshTiles` is MapLibre's own reload-in-place API (the same one #584 uses
- * to survive a paused TileManager) and needs no URL change, so this is
- * idempotent and safe to call when nothing failed.
+ * `refreshTiles` is MapLibre's reload-in-place API (it survives a paused
+ * TileManager) and needs no URL change, so this is idempotent and safe to call
+ * when nothing failed.
  */
 export function refreshRasterTileSources(map: MaplibreMapLike | null | undefined): number {
   if (!map) return 0;
@@ -256,7 +257,17 @@ export function refreshRasterTileSources(map: MaplibreMapLike | null | undefined
 }
 
 /** The structural subset of the MapLibre map that `refreshRasterTileSources` uses. */
-export interface MaplibreMapLike {
+interface MaplibreMapLike {
   getStyle?: () => { sources?: Record<string, unknown> } | undefined;
   refreshTiles?: (sourceId: string) => void;
+}
+
+/**
+ * The row `gid` of a feature picked from a vector tile. The tile server writes
+ * each feature's `gid` as its MVT feature id, so MapLibre reports it as
+ * `feature.id`; undefined for anything else, such as a cluster or a feature
+ * whose id is not a safe integer.
+ */
+export function featureGid(feature: { id?: unknown }): number | undefined {
+  return typeof feature.id === 'number' && Number.isSafeInteger(feature.id) ? feature.id : undefined;
 }

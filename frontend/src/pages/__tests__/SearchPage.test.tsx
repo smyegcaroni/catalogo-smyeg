@@ -10,7 +10,7 @@ import type { OGCRecordResponse } from '@/types/api';
 
 vi.mock('@/components/search/hooks/use-search', () => ({
   useSearchResults: vi.fn(),
-  // fix(#430 V-08): SearchPage now also calls useMapSearchResults — stub it so
+  // SearchPage now also calls useMapSearchResults — stub it so
   // the parallel maps section is inert (no maps) unless a test overrides it.
   useMapSearchResults: vi.fn(() => ({ data: undefined })),
 }));
@@ -69,6 +69,7 @@ function makeFeature(id: string, title: string): OGCRecordResponse {
     type: 'Feature',
     id,
     geometry: null,
+    time: {},
     properties: {
       type: 'dataset',
       title,
@@ -78,11 +79,15 @@ function makeFeature(id: string, title: string): OGCRecordResponse {
       updated: '2026-04-02T00:00:00Z',
       updated_by_display: 'editor',
       never_edited: false,
+      themes: [],
+      time: {},
+      source_freshness: 'unknown',
+      source_health: 'unknown',
       crs: null,
       geometry_type: null,
       feature_count: 10,
-      contacts: null,
-      license: null,
+      contacts: [],
+      license: 'proprietary',
       source_organization: 'GeoLens',
       quality_detail: null,
       record_type: 'vector_dataset',
@@ -119,6 +124,7 @@ function setAuthenticatedUser() {
         is_active: true,
         status: 'active',
         last_login_at: null,
+        can_reset_password: true,
         created_at: '2026-04-01T00:00:00Z',
         roles: ['editor'],
       },
@@ -418,7 +424,7 @@ describe('SearchPage', () => {
     expect(screen.getAllByTestId('filter-panel')[0]).toHaveAttribute('data-all-total', '0');
   });
 
-  // fix(#430 codex r4): a query matching maps but zero datasets must show the
+  // A query matching maps but zero datasets must show the
   // map cards WITHOUT the contradictory dataset empty state below them.
   it('map-only match renders map cards and suppresses the empty state', () => {
     setAnonymousUser();

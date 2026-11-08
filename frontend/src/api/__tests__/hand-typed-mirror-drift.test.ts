@@ -1,4 +1,4 @@
-// GAP-023: ~30 API response types in `src/api/*.ts` are hand-typed mirrors of
+// ~30 API response types in `src/api/*.ts` are hand-typed mirrors of
 // backend Pydantic models with NO codegen and NO compile-time guard. When the
 // backend schema changes a field name or its required/optional-ness, the mirror
 // silently desyncs — the documented "silent-422 / undefined-field" class.
@@ -72,7 +72,7 @@ const MIRRORS: MirrorShape[] = [
   {
     schema: 'ApiKeyStatusResponse',
     source: 'settings.ts ApiKeyStatusResponse',
-    required: ['anthropic_configured', 'openai_configured'],
+    required: ['anthropic_configured', 'anthropic_platform', 'openai_configured'],
     optional: [],
   },
   {
@@ -80,7 +80,7 @@ const MIRRORS: MirrorShape[] = [
     source: 'settings.ts BasemapEntry',
     required: ['id', 'label', 'url', 'enabled', 'is_preset'],
     optional: ['attribution'],
-    // GAP-023 documented deviation: the mirror keeps an optional `api_key` for
+    // Documented deviation: the mirror keeps an optional `api_key` for
     // the admin shape, but GET /settings/basemaps/ returns BasemapPublicResponse
     // which intentionally EXCLUDES api_key. Allowed extra on the mirror only.
     allowExtraOnMirror: ['api_key'],
@@ -88,13 +88,13 @@ const MIRRORS: MirrorShape[] = [
   {
     schema: 'VectorTileToken',
     source: 'tiles.ts VectorTileToken',
-    required: ['kind', 'sig', 'exp', 'scope', 'expires_in'],
+    required: ['kind', 'sig', 'exp', 'scope', 'expires_in', 'tile_url_template'],
     optional: [],
   },
   {
     schema: 'RasterTileToken',
     source: 'tiles.ts RasterTileToken',
-    // fix(#688): sig/exp/scope/expires_in are REQUIRED, matching the schema.
+    // sig/exp/scope/expires_in are REQUIRED, matching the schema.
     // The unsigned local shape lives in its own type
     // (`UnsignedRasterTileTemplate`) rather than as optional fields here — this
     // mirror describes what the API sends, and check 3 would reject them as

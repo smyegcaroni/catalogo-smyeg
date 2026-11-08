@@ -1,6 +1,6 @@
 """Tenancy MODE axis helper.
 
-TSEAM-03 (Phase 1207-02): tenancy mode is orthogonal to the binary
+Tenancy mode is orthogonal to the binary
 Community/Enterprise edition — it controls deployment tenancy posture
 independently. Read by tenancy-aware code only.
 
@@ -9,16 +9,16 @@ Usage::
     from app.core.tenancy import is_multi_tenant
 
     if is_multi_tenant():
-        # multi_tenant path — requires cloud overlay + 1208 RLS
+        # multi_tenant path — requires cloud overlay + tenant RLS layer
         ...
 """
 
 from __future__ import annotations
 
-#: Literal value for single-tenant mode (default; byte-identical to pre-1207 behavior).
+#: Literal value for single-tenant mode (default).
 TENANCY_MODE_SINGLE = "single_tenant"
 
-#: Literal value for multi-tenant mode (requires cloud overlay + 1208 RLS).
+#: Literal value for multi-tenant mode (requires cloud overlay + tenant RLS layer).
 TENANCY_MODE_MULTI = "multi_tenant"
 
 

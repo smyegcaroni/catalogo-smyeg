@@ -1,15 +1,10 @@
-"""Unit tests for Phase 1069 export hardening:
-- IA-P1-04: validate_where_clause rejects statement terminators, comments,
-  and unbalanced single-quotes (in addition to v1014 SEC-S09 AST allowlist).
-- IA-P1-01: export_dataset_endpoint depends on require_permission("export")
+"""Unit tests for export hardening:
+- validate_where_clause rejects statement terminators, comments,
+  and unbalanced single-quotes (in addition to the AST allowlist).
+- export_dataset_endpoint depends on require_permission("export")
   instead of get_current_active_user, closing the capability-matrix gap.
-
-Phase 1071 (v1016) follow-up:
-- KNOWN-05: TestExportRevokedViewerParity — live 403-for-revoked-viewer
-  regression test, closing the v1015 Phase 1069 IA-P1-01 verification gap.
-
-Requirements: IA-P1-04, IA-P1-01, KNOWN-05
-Phase: 1069, 1071
+- TestExportRevokedViewerParity: live 403-for-revoked-viewer
+  regression test.
 """
 
 import os
@@ -27,7 +22,7 @@ from tests.factories import create_dataset, get_user_id
 
 
 # ---------------------------------------------------------------------------
-# IA-P1-04: where-clause rejects meta-SQL tokens
+# where-clause rejects meta-SQL tokens
 # ---------------------------------------------------------------------------
 
 
@@ -61,7 +56,7 @@ class TestWhereClauseInjectionRejection:
         assert "quote" in str(exc.value).lower()
 
     def test_classic_or_injection_blocked_by_ast(self):
-        """The AST layer (v1014 SEC-S09) blocks UNION/subquery injection."""
+        """The AST layer blocks UNION/subquery injection."""
         with pytest.raises(ValueError) as exc:
             validate_where_clause(
                 "name = 'a' OR '1'='1' UNION SELECT password FROM users",
@@ -72,15 +67,15 @@ class TestWhereClauseInjectionRejection:
 
     def test_balanced_string_literal_accepted(self):
         """A legitimate WHERE with properly-quoted string literals passes the
-        IA-P1-04 checks (statement terminator / comment / unbalanced quote)
-        and the v1014 SEC-S09 AST allowlist.
+        checks (statement terminator / comment / unbalanced quote)
+        and the AST allowlist.
 
-        fix(#1870): word-shaped values are covered by
+        Word-shaped values are covered by
         TestWhereClauseStringLiterals below; these two stay as the
-        numeric-shaped IA-P1-04 cases they were written as."""
-        # Numeric-only string (passes identifier check, passes IA-P1-04).
+        numeric-shaped cases."""
+        # Numeric-only string (passes the identifier and string-level checks).
         validate_where_clause("name = '42'", COLS)
-        # SQL-escaped doubled quote — IA-P1-04 must accept (collapses to even).
+        # SQL-escaped doubled quote — must accept (collapses to even).
         validate_where_clause("name = '42'' '", COLS)
 
     def test_numeric_comparison_accepted(self):
@@ -89,7 +84,7 @@ class TestWhereClauseInjectionRejection:
 
 
 # ---------------------------------------------------------------------------
-# fix(#1870): a string VALUE is not a column reference
+# A string VALUE is not a column reference
 # ---------------------------------------------------------------------------
 
 
@@ -225,7 +220,7 @@ class TestMaskQuotedLiterals:
 
 
 # ---------------------------------------------------------------------------
-# IA-P1-01: capability gate on export_dataset_endpoint
+# Capability gate on export_dataset_endpoint
 # ---------------------------------------------------------------------------
 
 
@@ -259,7 +254,7 @@ class TestExportEndpointCapabilityGate:
 
 class TestExportFileTouchedBeforeStreaming:
     def test_export_endpoint_touches_the_file_before_filereponse(self):
-        """fix(#1435 codex round 2): the periodic and boot-time export sweeps
+        """The periodic and boot-time export sweeps
         both read an export's mtime as its "last activity" signal. ogr2ogr's
         writes keep the file fresh while it is being generated, but the
         mtime freezes the moment ogr2ogr closes it — including for the rest
@@ -275,12 +270,11 @@ class TestExportFileTouchedBeforeStreaming:
         pin more directly, and the behavioral effect (mtime freshness) is
         exercised by test_worker_exports_sweep.py's sweep-algorithm tests.
 
-        fix(#1532 review, internal): the response is a StreamingResponse over
-        the temp file now, not a FileResponse — starlette parses `Range` inside
-        the latter and answered a resuming client with a slice of a fresh
-        conversion. The invariant is unchanged and so is the reason for it: the
-        sweep still reads the temp directory's mtime, and this response still
-        streams that file for as long as the client takes.
+        The response is a StreamingResponse over
+        the temp file, not a FileResponse — starlette parses `Range` inside
+        the latter and would answer a resuming client with a slice of a fresh
+        conversion. The sweep reads the temp directory's mtime, and this
+        response streams that file for as long as the client takes.
         """
         import inspect
 
@@ -300,10 +294,10 @@ class TestExportFileTouchedBeforeStreaming:
 
 
 # ---------------------------------------------------------------------------
-# KNOWN-05 (Phase 1071): live 403-for-revoked-viewer parity with v1014 SEC-S04
+# Live 403-for-revoked-viewer parity
 # ---------------------------------------------------------------------------
 #
-# v1015 Phase 1069 IA-P1-01 verified the dependency via signature inspection
+# The dependency was previously verified via signature inspection
 # (TestExportEndpointCapabilityGate above) plus a live 401-for-anonymous
 # Playwright MCP smoke. The 403-for-revoked-viewer path — the actual
 # capability-matrix branch that runs in production — was never exercised by a
@@ -315,7 +309,7 @@ class TestExportFileTouchedBeforeStreaming:
 # app/processing/export/router.py:47). This is a regression pin.
 
 
-# Default matrix payload — viewer.export=True (the v1014 SEC-S04 baseline).
+# Default matrix payload — viewer.export=True (the baseline).
 # Used to restore the permission state after revoke tests so leakage
 # into other tests is prevented. (The clean_tables fixture does NOT
 # truncate the persistent_config table, so manual restore is needed.)

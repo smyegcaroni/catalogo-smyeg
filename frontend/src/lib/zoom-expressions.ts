@@ -2,7 +2,7 @@ import type { ZoomExpression, ZoomExpressionKind } from '@/types/api';
 
 export type { ZoomExpression, ZoomExpressionKind } from '@/types/api';
 
-export interface ZoomStop {
+interface ZoomStop {
   zoom: number;
   value: number;
 }
@@ -13,31 +13,27 @@ export interface ZoomExpressionDraft {
   stops: ZoomStop[];
 }
 
-export interface ZoomExpressionValidationResult {
+interface ZoomExpressionValidationResult {
   ok: boolean;
   errors: string[];
 }
 
-// builder-audit #338 DRY-03: exported so ZoomExpressionEditor imports this one copy
-// instead of redefining an identical local guard.
+// Exported so ZoomExpressionEditor shares this one guard.
 export function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
 /**
- * builder-audit #338 DRY-04: shared low-level pair walker for the `[..., a0, b0, a1,
- * b1, ...]` tail of step / interpolate / line-gradient expressions. Zips from
- * `startIndex` in steps of 2 and returns one entry per first-element; `hasSecond`
- * is false for a dangling final element (odd-length tail).
+ * Shared low-level pair walker for the `[..., a0, b0, a1, b1, ...]` tail of
+ * step / interpolate / line-gradient expressions. Zips from `startIndex` in
+ * steps of 2 and returns one entry per first-element; `hasSecond` is false for
+ * a dangling final element (odd-length tail).
  *
- * It intentionally applies NO number-check, no early-break, and no
- * drop-first/keep-all stop semantics — each caller layers its own validation and
- * stop convention on top (parseStepOrInterpolate drops the first interpolate stop
- * as the "< X" bucket; parseZoomExpression and lineGradientExpressionToStops keep
- * all stops). This keeps the three walkers in sync without flattening their
- * deliberately-different domain semantics.
+ * It applies NO number-check, early-break or stop convention; each caller layers
+ * its own (parseStepOrInterpolate drops the first interpolate stop as the "< X"
+ * bucket; parseZoomExpression and lineGradientExpressionToStops keep all stops).
  */
-export interface ExpressionPair {
+interface ExpressionPair {
   first: unknown;
   second: unknown;
   hasSecond: boolean;
@@ -65,7 +61,7 @@ function allNumbers(values: unknown[]): values is number[] {
 }
 
 function pairsToStops(values: number[]): ZoomStop[] {
-  // DRY-04: keep-all stop semantics over the shared pair walker. `values` is
+  // Keep-all stop semantics over the shared pair walker. `values` is
   // already validated (even length, all finite numbers) by the caller.
   return walkExpressionPairs(values, 0).map((pair) => ({
     zoom: pair.first as number,
@@ -100,10 +96,6 @@ export function parseZoomExpression(value: unknown): ZoomExpressionDraft | null 
   }
 
   return null;
-}
-
-export function isSupportedZoomExpression(value: unknown): value is ZoomExpression {
-  return parseZoomExpression(value) !== null;
 }
 
 export function validateZoomExpressionDraft(draft: ZoomExpressionDraft): ZoomExpressionValidationResult {

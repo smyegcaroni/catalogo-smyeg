@@ -1,5 +1,6 @@
 import fs from 'fs'
 import { defineConfig } from 'vitest/config'
+import type { Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
@@ -68,8 +69,87 @@ function manualChunks(id: string) {
   return undefined
 }
 
+// Exported styles name these fonts, so another origin's map must be able to
+// fetch them, and a range that isn't shipped must 404 rather than fall through
+// to the SPA page, which MapLibre would parse as a glyph PBF. nginx does the
+// same in production.
+const fontsCors: Plugin = {
+  name: 'geolens-fonts-cors',
+  configureServer(server) {
+    const fontsDir = path.join(server.config.publicDir, 'fonts')
+    const mount = `${new URL(server.config.base, 'http://base.invalid').pathname.replace(/\/?$/, '/')}fonts/`
+    server.middlewares.use(mount, (req, res, next) => {
+      let file = ''
+      try {
+        file = path.join(fontsDir, decodeURIComponent((req.url ?? '').split('?')[0]))
+      } catch {
+        // A malformed escape names no file.
+      }
+      if (!file.startsWith(fontsDir + path.sep) || !fs.existsSync(file)) {
+        res.statusCode = 404
+        res.end()
+        return
+      }
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      next()
+    })
+  },
+}
+
+const licenseJson = 'third-party-licenses.json'
+
+interface LicenseEntry {
+  name: string
+  version: string
+  identifier: string
+  text?: string
+}
+
+function shippedLicenseText(name: string): string {
+  const root = path.resolve(__dirname, 'node_modules', name)
+  const file = fs.existsSync(root) && fs.readdirSync(root).find((f) => /^licen[cs]e/i.test(f))
+  const source = file ? path.join(root, file) : path.resolve(__dirname, 'licenses', `${name}.txt`)
+  return fs.existsSync(source) ? fs.readFileSync(source, 'utf-8').trim() : ''
+}
+
+// build.license lists only packages that JavaScript imports, and leaves the
+// text empty when a package names its license file differently or ships none.
+// This writes the served notices from its JSON, adds the packages index.css
+// imports (fonts, Tailwind) and fills the gaps from the package or licenses/.
+const thirdPartyLicenses: Plugin = {
+  name: 'geolens-third-party-licenses',
+  apply: 'build',
+  writeBundle({ dir = 'dist' }) {
+    const jsonPath = path.join(dir, licenseJson)
+    const entries: LicenseEntry[] = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'))
+    fs.rmSync(jsonPath)
+    const css = fs.readFileSync(path.resolve(__dirname, 'src/index.css'), 'utf-8')
+    for (const [, name] of css.matchAll(/@import\s+['"]((?:@[^/'"]+\/)?[^./'"][^/'"]*)/g)) {
+      const pkg = JSON.parse(
+        fs.readFileSync(path.resolve(__dirname, 'node_modules', name, 'package.json'), 'utf-8'),
+      )
+      if (!entries.some((e) => e.name === name)) {
+        entries.push({ name, version: pkg.version, identifier: pkg.license })
+      }
+    }
+    const missing: string[] = []
+    const sections = entries.map(({ name, version, identifier, text }) => {
+      const body = text?.trim() || shippedLicenseText(name)
+      if (!body) missing.push(name)
+      return `## ${name} - ${version} (${identifier})\n\n${body}\n`
+    })
+    if (missing.length) {
+      throw new Error(`No license text for ${missing.join(', ')}; add frontend/licenses/<name>.txt`)
+    }
+    fs.writeFileSync(
+      path.join(dir, 'third-party-licenses.txt'),
+      `# Licenses\n\nThe app bundles dependencies which contain the following licenses:\n\n${sections.join('\n')}`,
+    )
+  },
+}
+
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), fontsCors, thirdPartyLicenses],
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
   },
@@ -169,6 +249,8 @@ export default defineConfig({
     // warning above the current GIS engine chunk so build output only warns when
     // that explicit budget grows materially.
     chunkSizeWarningLimit: 1300,
+    // Minification strips the license headers that MIT and BSD notices require.
+    license: { fileName: licenseJson },
     rollupOptions: {
       output: {
         manualChunks,

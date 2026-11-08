@@ -1,8 +1,6 @@
 import { apiFetch } from './client';
 
-// --- Types matching backend config_ops schemas ---
-
-export interface ConfigExport {
+interface ConfigExport {
   version: string;
   exported_at: string;
   settings: Record<string, unknown>;
@@ -16,7 +14,7 @@ export interface ConfigImportRequest {
   oauth_providers?: Record<string, unknown>[] | null;
 }
 
-export interface SettingChange {
+interface SettingChange {
   key: string;
   current: unknown;
   imported: unknown;
@@ -25,7 +23,7 @@ export interface SettingChange {
   reason_code?: string | null;
 }
 
-export interface OAuthProviderChange {
+interface OAuthProviderChange {
   slug: string;
   action: 'create' | 'update' | 'no_change' | 'delete' | 'replace';
   changed_fields?: string[] | null;
@@ -55,8 +53,6 @@ export interface ImportResult {
   oauth_accounts_deleted: number;
 }
 
-// --- API functions ---
-
 export async function exportConfig(): Promise<ConfigExport> {
   return apiFetch<ConfigExport>('/config-ops/export/');
 }
@@ -84,8 +80,6 @@ export async function importConfig(
     body: JSON.stringify(data),
   });
 }
-
-// --- Connectivity validation types and API function ---
 
 export interface ServiceProbeResult {
   name: string;

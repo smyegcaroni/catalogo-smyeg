@@ -134,7 +134,7 @@ def _project(epsg: int, lonlat_bounds: tuple[float, float, float, float]):
 def _dst_x_offs(vrt_path: str) -> list[float]:
     """Destination x offsets — float, because they are legitimately fractional.
 
-    Both writers keep sub-pixel offsets (fix(#887)), so this must not coerce to
+    Both writers keep sub-pixel offsets, so this must not coerce to
     int; `50.0 == 50` keeps whole-pixel assertions readable.
     """
     root = parse_vrt(vrt_path).getroot()
@@ -544,7 +544,7 @@ class TestSeamFrameOrigin:
 class TestSeamDecisionOpensNothing:
     """The seam decision comes from the built XML, never from opening sources.
 
-    fix(#887), codex round 9: an earlier cut probed every source with
+    An earlier cut probed every source with
     ``rasterio.open`` before the build. ``build_vrt`` runs inside
     ``asyncio.to_thread`` and Python threads are not killable, so a stalled
     ``/vsis3/`` read pinned a pool thread with none of ``run_gdal``'s wall-clock
@@ -696,7 +696,7 @@ def _plain_vrt_xml(
 ) -> str:
     """A gdalbuildvrt-shaped VRT with the given per-source DstRects.
 
-    fix(#887): the seam decision is read from this XML, so a test asserting
+    The seam decision is read from this XML, so a test asserting
     "left alone" needs a fixture that genuinely does not straddle the seam —
     stubbing seam XML and non-crossing source paths would assert nothing.
     """
@@ -1248,7 +1248,7 @@ class TestSeamFrameRewriteAgainstRealGdal:
         assert "<DstRect" in Path(raw).read_text()
 
     def test_nodata_and_pixels_survive_a_seam_build(self, tmp_path):
-        """The assertion that would have caught the round-2 P1."""
+        """The assertion that would have caught the original bug."""
         sources = [
             self._nodata_tile(
                 tmp_path / "w.tif", bounds=(175.0, 0.0, 180.0, 5.0), value=7
@@ -1382,7 +1382,7 @@ class TestSeamFrameRewriteAgainstRealGdal:
             assert set(ds.read(2)[:, 50:].ravel().tolist()) == {9}
 
     def test_rewritten_vrt_still_accepts_the_stor03_source_rewrite(self, tmp_path):
-        """``rewrite_vrt_sources`` runs after this at the store site (STOR-03)."""
+        """``rewrite_vrt_sources`` runs after this at the store site."""
         sources = [
             self._nodata_tile(
                 tmp_path / "sw.tif", bounds=(175.0, 0.0, 180.0, 5.0), value=7
@@ -1626,7 +1626,7 @@ async def _seed_raster(
 class TestRasterTokenAcrossTheSeam:
     """Every test here MUST take ``clean_tables``.
 
-    fix(#887): ``test_db_session`` does not roll back — the worker's database is
+    ``test_db_session`` does not roll back — the worker's database is
     shared across the whole session and isolation is by explicit cleanup. A
     committed two-ring extent that outlives its test breaks
     ``test_record_translations_migration``, whose alembic round-trip downgrades

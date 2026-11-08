@@ -1,10 +1,10 @@
 """Shared bootstrap helper for API lifespan and worker startup.
 
-WORK-01: ``bootstrap()`` is the ONE shared extension-load + edition-init +
+``bootstrap()`` is the ONE shared extension-load + edition-init +
 storage/cache-init sequence, called from both ``api/main.py`` lifespan and
 ``worker.main()`` so the two entrypoints cannot drift into different states.
 
-WORK-02: ``assert_enterprise_ports_resolved()`` asserts, post-bootstrap, that
+``assert_enterprise_ports_resolved()`` asserts, post-bootstrap, that
 each overlay tier's single-slot ports resolved to a non-Default impl
 (enterprise ports under a resolved enterprise edition; cloud ports under
 ``GEOLENS_TENANCY_MODE=multi_tenant``) — else it raises ``RuntimeError`` and
@@ -51,11 +51,10 @@ _ENTERPRISE_PORT_CHECKS: list[tuple[str, str]] = [
 ]
 
 #: Single-slot ports that ONLY the cloud (multi-tenant) overlay registers.
-#: WORK-02 fix: the enterprise overlay never registers processing_port /
-#: catalog_port, so a bare enterprise worker legitimately runs the community
-#: defaults for these — demanding them under GEOLENS_EDITION=enterprise
-#: crash-looped the worker while the API served fine. Required only when
-#: multi-tenant, the same signal that already requires the cloud overlay.
+#: The enterprise overlay never registers processing_port / catalog_port, so
+#: a bare enterprise worker legitimately runs the community defaults for
+#: these. Required only when multi-tenant, the same signal that already
+#: requires the cloud overlay.
 #:
 #: entitlement is included because DefaultEntitlementPort is fail-OPEN
 #: (grant-all); without this check a multi-tenant worker could boot green
@@ -96,9 +95,8 @@ def assert_enterprise_ports_resolved() -> None:
       covered) requires the enterprise-overlay ports: permission, identity,
       workflow.
     * ``GEOLENS_TENANCY_MODE=multi_tenant`` additionally requires
-      processing_port, catalog_port, entitlement, and data_serving — ports
-      the enterprise overlay never registers (WORK-02: demanding them under
-      bare enterprise crash-looped the worker while the API served fine).
+      processing_port, catalog_port, entitlement, and data_serving, ports
+      the enterprise overlay never registers.
 
     If any required port is still the Default impl, raises ``RuntimeError``
     naming every still-Default port and pointing at the build-time-bake
@@ -127,7 +125,6 @@ def assert_enterprise_ports_resolved() -> None:
         "workflow": get_workflow_extension,
     }
 
-    # Resolve every known port once — for the observability log AND the assertion.
     resolved: dict[str, str] = {
         key: type(getter()).__name__ for key, getter in _port_getters.items()
     }
@@ -143,7 +140,6 @@ def assert_enterprise_ports_resolved() -> None:
         required += _CLOUD_PORT_CHECKS
 
     if not required:
-        # Community, single-tenant — no overlay ports are required.
         return
 
     still_default_keys = [
@@ -178,24 +174,21 @@ def assert_enterprise_ports_resolved() -> None:
 def register_builtin_notification_sinks() -> None:
     """Register EnvConfiguredNotificationSink into the notification_sinks slot.
 
-    IN-01: without this call, notify() only fans out to DefaultNotificationSink
+    Without this call, notify() only fans out to DefaultNotificationSink
     (no-op) and every event silently drops. Calling this from the shared
     bootstrap() ensures the real sink is present in both the API process and
     the worker, closing a split-brain by construction.
 
-    Uses setdefault+append (NOTIF-01) to preserve sinks an overlay already
+    Uses setdefault+append to preserve sinks an overlay already
     appended, and is idempotent — it returns early if an
     EnvConfiguredNotificationSink is already in the slot.
     """
-    # Deferred import — Phase 214 discipline; avoids circular module-load at startup.
+    # Deferred import avoids a circular module load at startup.
     from app.platform.extensions import _extensions
     from app.platform.extensions.defaults import DefaultNotificationSink
     from app.platform.notifications.env_sink import EnvConfiguredNotificationSink
 
-    # Acquire (or initialise) the additive slot without replacing existing entries.
     sinks = _extensions.setdefault("notification_sinks", [DefaultNotificationSink()])
-
-    # Idempotency guard: do not append a second EnvConfiguredNotificationSink.
     if any(isinstance(s, EnvConfiguredNotificationSink) for s in sinks):
         return
 
@@ -210,11 +203,11 @@ async def bootstrap(*, app: "FastAPI | None" = None) -> EditionInfo:
     """Shared bootstrap sequence for BOTH API lifespan and worker startup.
 
     Performs IN ORDER: load extensions; fail loud if GEOLENS_EDITION=enterprise
-    but no overlay loaded (BUG-003); resolve + log the edition; include
+    but no overlay loaded; resolve + log the edition; include
     extension routers (API mode only); init storage (after extensions, so
     overlay storage providers register first); S3 health probe; billing
     extensions' ``on_startup(app)`` dispatch (API mode only); init cache;
-    init the binary tile cache (in-memory fallback is API-only, fix(#1315)).
+    init the binary tile cache (in-memory fallback is API-only).
 
     Returns the ``EditionInfo`` from ``get_edition()``.
 
@@ -224,47 +217,35 @@ async def bootstrap(*, app: "FastAPI | None" = None) -> EditionInfo:
     """
     from app.core.config import settings
 
-    # Step 1: Discover + load overlay extensions.
     load_extensions()
 
-    # Step 2 (BUG-003): fail loud if enterprise is requested but overlay
-    # absent. Uses _overlay_extension_names() so core builtins (e.g. the
-    # notification sink) never read as an enterprise overlay.
+    # _overlay_extension_names() so core builtins (e.g. the notification
+    # sink) never read as an enterprise overlay.
     check_enterprise_overlay_requested(_overlay_extension_names())
-
-    # Step 2b (GUARD-01): fail loud if multi_tenant is configured but no
-    # tenancy-providing overlay is loaded.
     check_tenancy_mode_supported(_overlay_extension_names())
 
-    # Step 3: Resolve the edition singleton from loaded OVERLAY extensions.
     init_edition(_overlay_extension_names())
     edition_info = get_edition()
 
-    # Step 4: Log detected edition.
     logger.info(
         "Edition detected",
         edition=edition_info.edition,
         features=list(edition_info.features),
     )
 
-    # Step 4b: register the built-in notification sink AFTER edition
-    # resolution — CRITICAL ordering. It writes into the same `_extensions`
-    # registry that init_edition()/check_enterprise_overlay_requested() read
-    # to detect the edition; registering it BEFORE init_edition made
-    # `list_extensions()` non-empty, so a plain community deployment
-    # mis-detected as `enterprise`. Runs unconditionally for both API and
-    # worker so the sink is present in both processes (IN-01).
+    # AFTER edition resolution: the sink writes into the same `_extensions`
+    # registry edition detection reads, so registering it earlier would make
+    # a plain community deployment mis-detect as `enterprise`. Runs in both
+    # API and worker so the sink is present in both processes.
     register_builtin_notification_sinks()
 
-    # Step 5 (API mode only): include extension routers into the app.
     if app is not None:
         for ext_router in get_extension_routers():
             app.include_router(ext_router)
 
-    # Step 6: Initialize storage (after extensions so provider overlays register).
+    # After extensions, so provider overlays register first.
     init_storage()
 
-    # Step 7: S3 connectivity / health probe.
     if settings.storage_provider == "s3":
         from app.platform.storage import get_storage
 
@@ -294,10 +275,8 @@ async def bootstrap(*, app: "FastAPI | None" = None) -> EditionInfo:
             )
             raise RuntimeError(f"S3 health check failed: {exc}") from exc
 
-    # Step 8 (API mode only): billing extension on_startup dispatch.
-    # Community's DefaultBillingExtension.on_startup is a no-op. Each
-    # extension gets a 10s timeout and its own try/except, so one failing
-    # extension can't block startup or take down another's dispatch.
+    # Each billing extension gets a 10s timeout and its own try/except, so
+    # one failing extension can't block startup or another's dispatch.
     if app is not None:
         for ext in get_billing_extensions():
             try:
@@ -322,23 +301,17 @@ async def bootstrap(*, app: "FastAPI | None" = None) -> EditionInfo:
 
         warn_if_credential_store_unconfigured()
 
-    # Step 9: Initialize cache.
     init_cache()
 
-    # fix(#1315): initialize the binary tile cache here too. It used to live
-    # in the API lifespan alone, so get_tile_cache() returned None in the
-    # worker and every post-swap MVT purge (fix(#394) B-019 — reupload_file,
-    # reupload_service, refresh_postgis) evicted nothing from the worker.
-    # The worker gets no in-memory fallback: it never reads tiles, so a
-    # process-local LRU there would be a purge that evicts nothing and says
-    # it worked. `app is not None` is the right discriminator because the
-    # FastAPI app is the only process a process-local cache could ever serve.
+    # The worker purges tiles after a swap, so it needs the tile cache too,
+    # but no in-memory fallback: it never reads tiles, so a process-local LRU
+    # there would be a purge that evicts nothing and says it worked.
     init_tile_cache(in_memory_fallback=app is not None)
 
-    # Step 10 (ISO-02): mode-gated idempotent RLS enablement. In
-    # single_tenant: no-op. In multi_tenant: enables + FORCEs RLS on the
-    # tenant-shared tables so the 0006_tenant_rls FORCE policies become
-    # active. Checks pg_class flags before any ALTER TABLE, so concurrent
+    # Mode-gated idempotent RLS enablement. In single_tenant: no-op. In
+    # multi_tenant: enables + FORCEs RLS on the tenant-shared tables so the
+    # 0006_tenant_rls FORCE policies become active. Checks pg_class flags
+    # before any ALTER TABLE, so concurrent
     # multi-worker boots don't contend on ACCESS EXCLUSIVE locks. A mode
     # flip needs no new migration — this enables the already-present policies.
     from app.core.db.rls import apply_tenancy_rls_from_engine  # noqa: E402

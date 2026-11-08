@@ -1,23 +1,24 @@
-"""Live AI provider probe (fix(#627)).
+"""Live AI provider probe.
 
 The admin ai-status endpoint reports whether a provider key is CONFIGURED;
 this module answers whether it WORKS. A key rotated or expired upstream
 otherwise fails invisibly, with every status surface still showing green.
 
-Opt-in only: each probe issues a real (if minimal) provider API call, so
-it must never run implicitly or on a dashboard poll — gated behind an
-explicit ``?probe=true``.
+Opt-in only: each probe issues a real (if minimal) provider API call, so it
+never runs implicitly or on a dashboard poll; it needs an explicit
+``?probe=true``.
 """
 
 import structlog
 
+from app.core.ai_credentials import builtin_providers_configured
 from app.core.config import settings
 from app.processing.ai.schemas import AIProbeCheck, AIProbeReport
 
 logger = structlog.stdlib.get_logger(__name__)
 
-# The cached SDK clients carry long chat timeouts; a probe must never hang
-# the admin endpoint that long, so every probe request gets its own cap.
+# The cached SDK clients carry long chat timeouts; every probe request gets its
+# own cap so the admin endpoint never hangs that long.
 _PROBE_TIMEOUT_SECONDS = 15.0
 
 _STATUS_REASONS = {
@@ -33,7 +34,7 @@ def _sanitized_failure(exc: Exception) -> tuple[int | None, str]:
 
     The response must never carry exception text: provider error bodies can
     include request URLs, deployment names, or key fragments. The full detail
-    is logged server-side instead (operators own the logs already).
+    is logged server-side instead.
     """
     cause: BaseException | None = exc
     while cause is not None:
@@ -49,13 +50,12 @@ def _sanitized_failure(exc: Exception) -> tuple[int | None, str]:
 
 
 async def _probe_chat(db) -> AIProbeCheck:  # type: ignore[no-untyped-def]
-    """One-token completion through the SELECTED chat provider extension.
+    """Minimal completion through the SELECTED chat provider extension.
 
-    Dispatches via ``get_ai_provider(name).complete(...)`` with no tools
-    and ``max_rounds=1`` — the same seam sql_generator uses — so ``ok``
-    means the real chat route would authenticate, and overlay providers
-    are probed through their own registered extension (no hardcoded
-    provider branches in processing/).
+    Dispatches via ``get_ai_provider(name).complete(...)`` with no tools and
+    ``max_rounds=1``, the same seam sql_generator uses, so ``ok`` means the
+    real chat route would authenticate and overlay providers are probed
+    through their own registered extension.
     """
     import asyncio
 
@@ -63,15 +63,11 @@ async def _probe_chat(db) -> AIProbeCheck:  # type: ignore[no-untyped-def]
     from app.processing.ai.llm_loop import noop_tool_executor, resolve_provider
 
     provider, model, runtime_config = await resolve_provider(db)
-    # Same configured-predicate as the chat route (_check_ai_available): the
-    # SELECTED provider's key. Overlay providers aren't in this map — if one
-    # is selected it is treated as configured and the probe call itself
-    # surfaces any auth failure.
-    keys = {
-        "anthropic": settings.anthropic_api_key,
-        "openai_compatible": settings.openai_api_key,
-    }
-    if provider in keys and not keys[provider]:
+    # Same configured-predicate as the chat route (_check_ai_available).
+    # Overlay providers aren't in this map: a selected one counts as configured
+    # and the probe call itself surfaces any auth failure.
+    keys = builtin_providers_configured()
+    if (provider in keys and not keys[provider]) or not model:
         return AIProbeCheck(configured=False)
 
     provider_ext = get_ai_provider(provider)
@@ -83,10 +79,10 @@ async def _probe_chat(db) -> AIProbeCheck:  # type: ignore[no-untyped-def]
                 system_prompt="Connectivity probe. Reply with a single character.",
                 user_message="ping",
                 tools=[],
-                # tools=[] + max_rounds=1: the loop exits before any tool call.
                 tool_executor=noop_tool_executor,
                 max_rounds=1,
-                max_tokens=1,
+                # Reasoning models answer a 1-token limit with a 400.
+                max_tokens=16,
                 temperature=0.0,
                 base_url=runtime_config.get("base_url"),
             ),
@@ -123,16 +119,16 @@ async def _probe_embeddings(db) -> AIProbeCheck:  # type: ignore[no-untyped-def]
     provider_ext = get_embedding_provider("openai_compatible")
     runtime_config = await provider_ext.resolve_runtime_config(db)
     model = await EMBEDDING_MODEL.get(db) or runtime_config.get("default_model")
-    # fix(#627): same dims resolution as production embedding
-    # generation (generate_embeddings_batch) — probing with dimensions=None
-    # (the model's natural size) would pass while a configured-but-unsupported
-    # EMBEDDING_DIMS still breaks every real backfill/search call.
+    # Same dims resolution as production embedding generation
+    # (generate_embeddings_batch): probing with dimensions=None would pass while
+    # a configured-but-unsupported EMBEDDING_DIMS still breaks every real
+    # backfill and search call.
     dims = await EMBEDDING_DIMS.get(db) or runtime_config.get("default_dims")
 
     try:
-        # Outer wait_for, same as the chat probe: the provider's embed() runs
-        # its own retry loop (2 attempts + backoff), so the per-attempt
-        # timeout= alone would let the probe block for ~2x the cap.
+        # Outer wait_for as in the chat probe: embed() runs its own retry loop
+        # (2 attempts + backoff), so the per-attempt timeout= alone would let
+        # the probe block for ~2x the cap.
         await asyncio.wait_for(
             provider_ext.embed(
                 texts=["ping"],

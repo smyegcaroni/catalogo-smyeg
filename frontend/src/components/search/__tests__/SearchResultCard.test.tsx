@@ -14,6 +14,7 @@ function makeFeature(
   return {
     type: 'Feature',
     id: 'dataset-1',
+    time: {},
     geometry: {
       type: 'Polygon',
       coordinates: [[
@@ -33,11 +34,17 @@ function makeFeature(
       updated: '2026-03-02T00:00:00Z',
       updated_by_display: 'editor-user',
       never_edited: false,
+      record_type: 'vector_dataset',
+      themes: [],
+      time: {},
+      source_freshness: 'unknown',
+      source_health: 'unknown',
+      has_quicklook: false,
       crs: 'EPSG:4326',
       geometry_type: 'Polygon',
       feature_count: 195,
-      contacts: null,
-      license: null,
+      contacts: [],
+      license: 'proprietary',
       source_organization: 'Natural Earth',
       quality_detail: null,
       ...propertyOverrides,
@@ -157,10 +164,10 @@ describe('SearchResultCard', () => {
             {
               type: 'collection',
               title: 'Collection',
-              description: null,
+              description: '',
               record_type: 'collection',
               dataset_count: 1,
-              keywords: null,
+              keywords: [],
               geometry_type: null,
               feature_count: null,
               crs: null,
@@ -246,6 +253,28 @@ describe('SearchResultCard', () => {
       expect(specs).toHaveTextContent('3 bands');
     });
 
+    it.each([5, 1])('shows a source count of %i', (count) => {
+      render(
+        <SearchResultCard
+          feature={makeFeature({ record_type: 'vrt_dataset', description: '', geometry_type: null, vrt_type: 'mosaic', source_count: count })}
+        />,
+      );
+
+      expect(screen.getByTestId('dataset-card-specs')).toHaveTextContent(count === 1 ? '1 source' : `${count} sources`);
+      expect(screen.getByText(new RegExp(`with ${count} source`))).toBeInTheDocument();
+    });
+
+    it.each([0, null])('leaves the count out when source_count is %s', (count) => {
+      render(
+        <SearchResultCard
+          feature={makeFeature({ record_type: 'vrt_dataset', description: '', geometry_type: null, vrt_type: 'mosaic', source_count: count })}
+        />,
+      );
+
+      expect(screen.getByTestId('dataset-card-specs')).toHaveTextContent('Mosaic');
+      expect(screen.queryByText(/\bsources?\b/i)).not.toBeInTheDocument();
+    });
+
     it('renders band_stack as "Band Stack"', () => {
       render(
         <SearchResultCard
@@ -275,7 +304,7 @@ describe('SearchResultCard', () => {
               description: 'A set of datasets',
               record_type: 'collection',
               dataset_count: 7,
-              keywords: null,
+              keywords: [],
               geometry_type: null,
               feature_count: null,
               crs: null,
@@ -301,10 +330,10 @@ describe('SearchResultCard', () => {
             {
               type: 'collection',
               title: 'My Collection',
-              description: null,
+              description: '',
               record_type: 'collection',
               dataset_count: 5,
-              keywords: null,
+              keywords: [],
               geometry_type: null,
               feature_count: null,
               crs: null,
@@ -332,7 +361,7 @@ describe('SearchResultCard', () => {
               description: 'This is a detailed description',
               record_type: 'collection',
               dataset_count: 3,
-              keywords: null,
+              keywords: [],
               geometry_type: null,
               feature_count: null,
               crs: null,
@@ -538,8 +567,31 @@ describe('SearchResultCard', () => {
       expect(screen.getByTestId('dataset-card-description')).toHaveTextContent('A real description');
     });
 
+    it('falls back to the generated description when the description repeats the title', () => {
+      render(<SearchResultCard feature={makeFeature({ title: 'World Countries', description: 'World Countries' })} />);
+
+      expect(screen.getAllByText('World Countries')).toHaveLength(1);
+      expect(screen.getByTestId('dataset-card-description')).not.toHaveTextContent('World Countries');
+      expect(screen.getByTestId('dataset-card-description')).toHaveTextContent(/195/);
+    });
+
+    it('prints a collection title once when the description repeats it', () => {
+      render(
+        <SearchResultCard
+          feature={makeFeature({
+            record_type: 'collection',
+            title: 'Parks',
+            description: 'Parks',
+            geometry_type: null,
+          })}
+        />,
+      );
+
+      expect(screen.getAllByText('Parks')).toHaveLength(1);
+    });
+
     it('renders auto-description when description is null', () => {
-      render(<SearchResultCard feature={makeFeature({ description: null })} />);
+      render(<SearchResultCard feature={makeFeature({ description: '' })} />);
 
       const desc = screen.getByTestId('dataset-card-description');
       expect(desc).toBeInTheDocument();
@@ -553,7 +605,7 @@ describe('SearchResultCard', () => {
       render(
         <SearchResultCard
           feature={makeFeature({
-            description: null,
+            description: '',
             record_type: 'raster_dataset',
             band_count: 4,
             gsd: 10,
@@ -572,7 +624,7 @@ describe('SearchResultCard', () => {
       render(
         <SearchResultCard
           feature={makeFeature({
-            description: null,
+            description: '',
             record_type: 'tiles3d_dataset',
             geometry_type: null,
             feature_count: null,
@@ -591,10 +643,10 @@ describe('SearchResultCard', () => {
             {
               type: 'collection',
               title: 'My Collection',
-              description: null,
+              description: '',
               record_type: 'collection',
               dataset_count: 5,
-              keywords: null,
+              keywords: [],
               geometry_type: null,
               feature_count: null,
               crs: null,
@@ -624,7 +676,7 @@ describe('SearchResultCard', () => {
               description: 'A collection',
               record_type: 'collection',
               dataset_count: 10,
-              keywords: null,
+              keywords: [],
               geometry_type: null,
               feature_count: null,
               crs: null,
@@ -648,7 +700,7 @@ describe('SearchResultCard', () => {
             {
               type: 'collection',
               title: 'Tagged Collection',
-              description: null,
+              description: '',
               record_type: 'collection',
               dataset_count: 3,
               keywords: ['should', 'not', 'appear'],
@@ -677,10 +729,10 @@ describe('SearchResultCard', () => {
             {
               type: 'collection',
               title: 'Org Collection',
-              description: null,
+              description: '',
               record_type: 'collection',
               dataset_count: 1,
-              keywords: null,
+              keywords: [],
               geometry_type: null,
               feature_count: null,
               crs: null,
@@ -757,11 +809,11 @@ describe('SearchResultCard', () => {
             {
               type: 'collection',
               title: 'Collection',
-              description: null,
+              description: '',
               record_type: 'collection',
               record_status: 'draft',
               dataset_count: 1,
-              keywords: null,
+              keywords: [],
               geometry_type: null,
               feature_count: null,
               crs: null,

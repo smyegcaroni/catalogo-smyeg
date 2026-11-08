@@ -4,15 +4,15 @@ In ``platform/`` because ``modules/catalog/sources/preview.py`` calls these
 and ``modules/catalog/`` may not import ``app.processing.*``
 (``test_layering.py``). The raster VSI clamps stay in
 ``processing/raster/vrt.py``, which re-exports both of these; the Rule 2 gate
-credits either import path (#1857 item 3).
+credits either import path.
 """
 
 import os
 
 from app.platform.egress_proxy import ServiceEgress
 
-# fix(#1846, GHSA-hrf5-v3cq-frx5): several OGR drivers treat their input
-# bytes as instructions, not data — OGR_VRT follows <SrcDataSource> to any
+# Several OGR drivers treat their input bytes as instructions, not data:
+# OGR_VRT follows <SrcDataSource> to any
 # local path or URL, and WFS identifies on content alone regardless of file
 # name, then fetches whatever <URL> says. A staged upload is a local path,
 # so the path alone doesn't bound where the read lands. GDAL_SKIP unloads
@@ -52,7 +52,7 @@ _NETWORK_AND_POINTER_DRIVERS: tuple[str, ...] = (
 _SERVICE_KEPT_DRIVERS = frozenset({"WFS", "OAPIF"})
 
 
-# fix(#1828): at YES the GML driver fetches every `xs:import` location of a
+# At YES the GML driver fetches every `xs:import` location of a
 # schema, and the schema a GetFeature response points at, credential header
 # attached. Both are NO by value here so an operator's env cannot flip them.
 _SCHEMA_FETCH_CLAMP: dict[str, str] = {

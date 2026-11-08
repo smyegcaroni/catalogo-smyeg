@@ -45,6 +45,56 @@ beforeEach(() => {
   sessionStorage.clear();
 });
 
+describe('floating dock inset', () => {
+  const readInset = () => document.documentElement.style.getPropertyValue('--floating-dock-inset');
+
+  const readReach = () => document.documentElement.style.getPropertyValue('--floating-dock-reach');
+
+  it('is set only while the launcher shows', async () => {
+    setAvailable(true);
+    const { unmount } = renderPanel();
+    expect(readInset()).toBe('5.5rem');
+    expect(readReach()).toBe('12rem');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+    expect(readInset()).toBe('');
+    expect(readReach()).toBe('');
+
+    unmount();
+    expect(readInset()).toBe('');
+    expect(readReach()).toBe('');
+  });
+
+  it('reserves the measured width of the launcher', () => {
+    setAvailable(true);
+    const spy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ width: 176 } as DOMRect);
+    renderPanel();
+    expect(readReach()).toBe('calc(176px + 4.5rem)');
+    spy.mockRestore();
+  });
+
+  it('reserves the lifted launcher position above the pending-edits bar', () => {
+    setAvailable(true);
+    render(
+      <DatasetChatPanel datasetId="ds-1" datasetTitle="NY Parks" showOpenInBuilder abovePendingBar />,
+    );
+    expect(readInset()).toBe('14rem');
+  });
+
+  it('is not set when AI is unavailable', () => {
+    setAvailable(false);
+    renderPanel();
+    expect(readInset()).toBe('');
+  });
+
+  it('is removed on unmount while the launcher shows', () => {
+    setAvailable(true);
+    const { unmount } = renderPanel();
+    unmount();
+    expect(readInset()).toBe('');
+  });
+});
+
 describe('DatasetChatPanel', () => {
   it('renders nothing when AI is unavailable (anon / no use_ai_chat)', () => {
     setAvailable(false);
@@ -68,6 +118,25 @@ describe('DatasetChatPanel', () => {
 
     await screen.findByText('There are 1,200 parks.');
     expect(mockStream).toHaveBeenCalledWith('ds-1', 'how many parks?', expect.any(String), [], expect.any(AbortSignal));
+  });
+
+  it('explains a model that needs the Responses API', async () => {
+    setAvailable(true);
+    mockStream.mockImplementation(async function* () {
+      yield {
+        event: 'error',
+        data: { message: 'English server text', code: 'model_requires_responses_api' },
+      };
+    });
+
+    renderPanel();
+    await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+    await userEvent.type(screen.getByPlaceholderText('Ask about this data...'), 'how many parks?');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await screen.findByText(
+      "This site's AI model needs the OpenAI Responses API. Ask an administrator to turn it on or choose a different model.",
+    );
   });
 
   it('renders a show_query_result table with an open-in-builder action', async () => {
@@ -100,14 +169,14 @@ describe('DatasetChatPanel', () => {
 
     await userEvent.click(screen.getByRole('button', { name: /Open in builder/i }));
     expect(mockMutateAsync).toHaveBeenCalledWith({ name: 'NY Parks Map' });
-    // No spatial payload in the result — plain add_dataset URL, nothing stashed.
-    expect(mockNavigate).toHaveBeenCalledWith('/maps/map-9?add_dataset=ds-1');
+    // No spatial payload in the result, so nothing is stashed.
+    expect(mockNavigate).toHaveBeenCalledWith('/maps/map-9', { state: { addDatasetId: 'ds-1' } });
     expect(sessionStorage.getItem('geolens-chat-result')).toBeNull();
   });
 
   it('carries a spatial query result into the builder via sessionStorage', async () => {
     setAvailable(true);
-    // feat(#1241 codex r1): one feature for one matched row — the overlay is
+    // One feature for one matched row — the overlay is
     // complete, so nothing about truncation rides along. The server never
     // emits an empty FeatureCollection (_extract_geojson returns None when no
     // row is mappable), so a features:[] fixture would exercise a state that
@@ -145,8 +214,10 @@ describe('DatasetChatPanel', () => {
     await screen.findByText('Found 1 result.');
     await userEvent.click(screen.getByRole('button', { name: /Open in builder/i }));
 
-    expect(mockNavigate).toHaveBeenCalledWith('/maps/map-9?add_dataset=ds-1&chat_result=1');
-    // feat(#1241): the prompt rides along so the builder can suggest a name if
+    expect(mockNavigate).toHaveBeenCalledWith('/maps/map-9', {
+      state: { addDatasetId: 'ds-1', chatResult: true },
+    });
+    // The prompt rides along so the builder can suggest a name if
     // the carried result is saved as a dataset.
     expect(JSON.parse(sessionStorage.getItem('geolens-chat-result')!)).toEqual({
       geojson,
@@ -155,7 +226,7 @@ describe('DatasetChatPanel', () => {
     });
   });
 
-  // feat(#1241 codex r1): the builder can now SAVE a carried result, so the
+  // The builder can now SAVE a carried result, so the
   // handoff must say whether it is the whole answer. Geometry alone let a
   // clipped result arrive looking complete.
   it('carries the completeness pair when the overlay is clipped', async () => {
@@ -245,7 +316,7 @@ describe('DatasetChatPanel', () => {
     await userEvent.click(screen.getByRole('button', { name: /Open in builder/i }));
 
     // The shown table is the count — the earlier geometry must not ride along.
-    expect(mockNavigate).toHaveBeenCalledWith('/maps/map-9?add_dataset=ds-1');
+    expect(mockNavigate).toHaveBeenCalledWith('/maps/map-9', { state: { addDatasetId: 'ds-1' } });
     expect(sessionStorage.getItem('geolens-chat-result')).toBeNull();
   });
 

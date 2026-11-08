@@ -6,17 +6,25 @@ so multiple calls can batch into one transaction.
 """
 
 import uuid
+from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
+from app.core.db.sqlstate import is_lock_conflict
 from app.core.geo import rollup_bbox, rollup_bbox_columns
 from app.core.identity import Identity
-from app.modules.catalog.authorization import apply_visibility_filter, get_user_roles
+from app.modules.catalog.authorization import (
+    apply_visibility_filter,
+    get_user_roles,
+    visible_extent_column,
+)
 from app.modules.catalog.collections.models import Collection, CollectionDataset
 from app.modules.catalog.datasets.domain.models import Dataset, DatasetGrant, Record
+from app.modules.catalog.write_recheck import admit_writer, recheck_admitted_writer
 
 
 async def create_collection(
@@ -96,6 +104,11 @@ async def get_collection(
     return result.scalar_one_or_none()
 
 
+COLLECTION_WRITE_DENIED = (
+    "Only the collection owner or an admin may modify this collection."
+)
+
+
 async def check_collection_ownership(
     session: AsyncSession,
     collection: Collection,
@@ -105,15 +118,67 @@ async def check_collection_ownership(
 
     Only mutation (rename/delete/membership) is gated; reads stay open.
     Collections with no recorded owner (``created_by`` is NULL) are admin-only.
+    ``lock_collection_for_write`` checks the caller again.
     """
-    if collection.created_by is not None and collection.created_by == user.id:
-        return
-    user_roles = await get_user_roles(session, user)
-    if "admin" in user_roles:
-        return
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="Only the collection owner or an admin may modify this collection.",
+    owner = collection.created_by is not None and collection.created_by == user.id
+    if not owner and "admin" not in await get_user_roles(session, user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=COLLECTION_WRITE_DENIED
+        )
+    admit_writer(session, ("collection", collection.id), user)
+
+
+_COLLECTION_LOCK_TIMEOUT = "2s"
+
+
+async def lock_collection_for_write(
+    session: AsyncSession, collection_id: uuid.UUID
+) -> None:
+    """Take the collection row before its membership rows, held through the
+    caller's commit, and re-check the writer ``check_collection_ownership``
+    admitted.
+
+    Only the wait is bounded; one that outlasts the bound answers 409. The
+    lock leaves the row's key shareable, so membership inserts still pass
+    their foreign-key check.
+    """
+    await session.execute(
+        text("SELECT set_config('lock_timeout', :timeout, true)"),
+        {"timeout": _COLLECTION_LOCK_TIMEOUT},
+    )
+    try:
+        await session.execute(
+            select(Collection.id)
+            .where(Collection.id == collection_id)
+            .with_for_update(key_share=True)
+        )
+    except DBAPIError as exc:
+        if not is_lock_conflict(exc):
+            raise
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Another change to this collection is in progress. Retry shortly.",
+        ) from exc
+    await session.execute(text("RESET lock_timeout"))
+
+    async def enforce(user: Identity, row: Any) -> None:
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found"
+            )
+        owner = row.created_by is not None and row.created_by == user.id
+        if not row.active or (not owner and "admin" not in row.roles):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail=COLLECTION_WRITE_DENIED
+            )
+
+    await recheck_admitted_writer(
+        session,
+        ("collection", collection_id),
+        (Collection.created_by,),
+        Collection.id == collection_id,
+        enforce,
     )
 
 
@@ -164,7 +229,7 @@ async def add_datasets_to_collection(
     )
     existing_ids = {row[0] for row in existing_result.all()}
 
-    # fix(#430): dedupe request ids or a repeated pair violates the composite PK -> 500.
+    # Dedupe request ids or a repeated pair violates the composite PK -> 500.
     new_ids = [did for did in dict.fromkeys(dataset_ids) if did not in existing_ids]
     for dataset_id in new_ids:
         session.add(
@@ -226,7 +291,7 @@ async def get_collection_datasets(
     total_result = await session.execute(count_stmt)
     total = total_result.scalar_one()
 
-    # fix(#1778): sort_order and added_at both default/tie within a batch
+    # sort_order and added_at both default/tie within a batch
     # INSERT, so OFFSET/LIMIT paging needs a third column; dataset_id is
     # unique per collection's rows.
     paginated_stmt = (
@@ -277,13 +342,13 @@ async def batch_collection_extents(
     if not collection_ids:
         return {}
 
-    # fix(#886): bbox aggregated in two longitude domains so a collection
+    # Bbox aggregated in two longitude domains so a collection
     # spanning the antimeridian keeps the narrower range instead of folding
     # to a global bbox.
     stmt = (
         select(
             CollectionDataset.collection_id,
-            *rollup_bbox_columns(Record.spatial_extent),
+            *rollup_bbox_columns(visible_extent_column(user, user_roles)),
             func.min(Record.temporal_start).label("temporal_start"),
             func.max(Record.temporal_end).label("temporal_end"),
         )
@@ -301,7 +366,7 @@ async def batch_collection_extents(
     extents: dict[uuid.UUID, dict] = {}
     for row in rows:
         extents[row.collection_id] = {
-            # fix(#1006): RFC 7946 §5.2 form (west > east on a crossing),
+            # RFC 7946 §5.2 form (west > east on a crossing),
             # matching the sibling per-dataset extent_bbox so BBoxPreview's
             # crossing guard sees one contract from both fields.
             "extent_bbox": rollup_bbox(row[1:7]),

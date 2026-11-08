@@ -96,6 +96,77 @@ generate_password() {
   printf 'Aa%s_1\n' "$(generate_jwt_secret)"
 }
 
+# get_env_value with the matching quotes stripped, as Compose reads .env.
+get_env_value_decoded() {
+  get_env_value "$1" | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+# Compose prefers the installer's own environment over .env, so exported cache
+# settings would make anything written to .env moot.
+cache_env_exported() {
+  if [ "${REDIS_URL+x}${VALKEY_PASSWORD+x}${COMPOSE_PROFILES+x}" = "" ]; then
+    return 1
+  fi
+  warn "REDIS_URL, VALKEY_PASSWORD or COMPOSE_PROFILES is set in this shell and takes precedence over .env; leaving the cache settings alone. Set those three lines in .env yourself."
+}
+
+# True when the URL's host is the bundled service (case-insensitive, any port,
+# with or without credentials or a path).
+is_bundled_cache_url() {
+  cache_host="${1#*://}"
+  cache_host="${cache_host%%/*}"
+  cache_host="${cache_host##*@}"
+  cache_host="${cache_host%%:*}"
+  [ "$(printf '%s' "$cache_host" | tr 'A-Z' 'a-z')" = "valkey" ]
+}
+
+# Token-protected service imports hand the token to the worker through a shared
+# cache, so a stock install runs the bundled Valkey (docker-compose.prod.yml,
+# profile `cache`). An operator-supplied REDIS_URL is left alone, and the
+# bundled service starts only when that URL points at it.
+enable_bundled_cache() {
+  if cache_env_exported; then
+    return 0
+  fi
+  if [ -z "$(get_env_value_decoded REDIS_URL)" ]; then
+    cache_pw="$(get_env_value_decoded VALKEY_PASSWORD)"
+    if [ -z "$cache_pw" ]; then
+      cache_pw="$(generate_jwt_secret)"
+      update_env_value VALKEY_PASSWORD "$cache_pw"
+    fi
+    update_env_value REDIS_URL "redis://:${cache_pw}@valkey:6379/0"
+  fi
+  if ! is_bundled_cache_url "$(get_env_value_decoded REDIS_URL)"; then
+    return 0
+  fi
+  profiles="$(get_env_value_decoded COMPOSE_PROFILES)"
+  case ",${profiles}," in
+    *,cache,*) ;;
+    *) update_env_value COMPOSE_PROFILES "${profiles:+${profiles},}cache" ;;
+  esac
+}
+
+# docker-compose.yml's valkey is passwordless and runs only under `cloud-dev`,
+# so a REDIS_URL written for the prebuilt install's bundled cache points nowhere
+# once the install falls back to the source build.
+drop_bundled_cache_url() {
+  if cache_env_exported; then
+    return 0
+  fi
+  redis_url="$(get_env_value_decoded REDIS_URL)"
+  is_bundled_cache_url "$redis_url" || return 0
+  case "$redis_url" in
+    *@*) ;;
+    *)
+      case ",$(get_env_value_decoded COMPOSE_PROFILES)," in
+        *,cloud-dev,*) return 0 ;;
+      esac
+      ;;
+  esac
+  update_env_value REDIS_URL ""
+  warn "The source build does not run the bundled cache; cleared REDIS_URL. Imports from token-protected services need a cache, so set REDIS_URL to your own Valkey/Redis."
+}
+
 check_port() {
   port="$1"
   if command -v lsof >/dev/null 2>&1 && lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
@@ -182,12 +253,11 @@ prompt_value() {
 
 # Wait up to 300s for the stack to become healthy. The migrate one-shot must
 # exit 0; every healthcheck-having service must report (healthy). A migrate
-# failure is a real failure (return 1, with its log tail). A timeout is NOT
+# failure is a real failure (return 1, with its log tail). A timeout is not
 # (return 2): on hosts that emulate amd64 (Apple Silicon and other ARM
 # machines) the database image runs under QEMU and first boot can outlast any
-# reasonable budget while still converging — treating that as a dead stack
-# false-alarmed real installs. fix(#441): budget raised from 90s and the
-# timeout softened to "still starting" guidance.
+# reasonable budget while still converging, so a timeout gets "still starting"
+# guidance instead of a dead-stack alarm.
 wait_for_healthy() {
   attempts=60
   sleep_s=5
@@ -229,12 +299,12 @@ wait_for_healthy() {
 
   printf '\n' >&2
 
-  # fix(#446): distinguish genuinely-still-starting from stuck. A service that is
+  # Distinguish genuinely-still-starting from stuck. A service that is
   # crash-looping (Restarting) or sitting in a non-zero Exited state after the full
   # timeout is not converging (bad image, OOM-kill, broken config) — fail with its
   # logs like the migrate path, instead of the exit-0 "still starting" guidance
   # below. `Exited (0)` and `starting`/`health: starting` are excluded, so the
-  # ARM/QEMU first-boot case (#441) stays non-fatal (return 2).
+  # ARM/QEMU first-boot case stays non-fatal (return 2).
   stuck=$(compose ps --format '{{.Service}}|{{.Status}}' 2>/dev/null \
     | grep -E '\|(Restarting|Exited \([1-9])' || true)
   if [ -n "$stuck" ]; then
@@ -255,7 +325,7 @@ wait_for_healthy() {
   return 2
 }
 
-# GAP-025: the entire imperative install sequence lives in main() and is
+# The entire imperative install sequence lives in main() and is
 # invoked by a single `main "$@"` on the LAST line. `sh` parses the whole
 # function body before executing it, so a truncated `curl ... | sh` download
 # (a connection drop mid-stream) yields a syntax error at EOF instead of
@@ -279,7 +349,7 @@ main() {
   # actually present.
   docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required. Install Docker Desktop or the docker compose plugin."
 
-  # fix(#441): warn when Docker has less memory than the stack's compose
+  # Warn when Docker has less memory than the stack's compose
   # limits assume (worker 4g + api 2g + db 2g + titiler 1g). A low-RAM Docker
   # Desktop otherwise OOM-kills services with no explanation. Warn-only: a
   # light catalog can run smaller. Threshold is 7 GiB so a host that gives
@@ -406,7 +476,7 @@ main() {
     fi
   fi
 
-  # POSTGRES_PASSWORD (SEC-010): .env.example ships the publicly-known default
+  # POSTGRES_PASSWORD: .env.example ships the publicly-known default
   # `geolens`. On a FRESH install replace it with a strong value so the database
   # is initialized with a real password. On a re-run we must NOT rotate it — the
   # pgdata volume is already initialized with the existing value and changing it
@@ -426,7 +496,7 @@ main() {
   generated_admin_pw=false
   if [ -z "$existing_admin_user" ] || [ -z "$existing_admin_pass" ]; then
     admin_user="$(prompt_value 'Admin username' 'admin' false GEOLENS_ADMIN_USERNAME)"
-    # Password (SEC-011): honor an explicitly-provided GEOLENS_ADMIN_PASSWORD;
+    # Password: honor an explicitly-provided GEOLENS_ADMIN_PASSWORD;
     # interactively let the operator type one (blank = generate). Otherwise
     # GENERATE a strong password — never silently default to 'admin', which a
     # headless `curl | sh` install would otherwise do for an internet-facing app.
@@ -465,13 +535,13 @@ main() {
   db_port="$(get_env_value DB_PORT)"
   api_port="$(get_env_value API_PORT)"
   fe_port="$(get_env_value FRONTEND_PORT)"
-  # fix(#444): when a key is missing from .env, defaulting only this shell
-  # variable made the installer probe (and later print) a port compose would
-  # never bind — compose falls back to its own no-.env baseline of 5432/8000,
-  # which is a deliberate, separately pinned decision. Persist the documented
-  # value instead, so the port we check, the port compose binds, and the port
-  # we print to the operator are the same one. A verbatim install is
-  # unaffected: .env.example already ships all three keys.
+  # When a key is missing from .env, compose falls back to its own no-.env
+  # baseline of 5432/8000, a deliberate, separately pinned decision, so
+  # defaulting only this shell variable would make the installer probe (and
+  # print) a port compose never binds. Persist the documented value instead,
+  # so the port we check, the port compose binds, and the port we print are
+  # the same. A verbatim install is unaffected: .env.example already ships
+  # all three keys.
   if [ -z "$db_port" ]; then
     db_port=5434
     update_env_value DB_PORT "$db_port"
@@ -500,7 +570,7 @@ main() {
     esac
   fi
 
-  # UPG-02: on a RE-RUN of an existing install, check whether a newer release
+  # On a RE-RUN of an existing install, check whether a newer release
   # tag exists upstream and offer / route to the upgrade. Fresh installs (just
   # cloned at the latest tag) skip this — there is nothing newer to detect.
   if [ "$EXISTING_INSTALL" = "true" ]; then
@@ -577,6 +647,7 @@ main() {
       # docker-compose.yml (the dev source-build file) and silently rebuilds.
       update_env_value GEOLENS_VERSION "$RELEASE_VERSION"
       update_env_value COMPOSE_FILE "docker-compose.prod.yml"
+      enable_bundled_cache
     else
       warn "Could not pull prebuilt images; building from source instead."
       COMPOSE_FILE="docker-compose.yml"
@@ -584,6 +655,7 @@ main() {
       # Overwrite any stale prod pin from a previous run so bare `docker compose`
       # matches the source build we actually ran.
       update_env_value COMPOSE_FILE "docker-compose.yml"
+      drop_bundled_cache_url
     fi
   fi
 
@@ -618,7 +690,7 @@ main() {
     say "  docker compose ps"
   fi
 
-  # fix(#572): repeat the generated-password hint in the final banner — the
+  # Repeat the generated-password hint in the final banner — the
   # one-time note printed mid-install scrolls away, and a piped `curl | sh`
   # first-timer otherwise dead-ends at the login screen.
   if [ "${generated_admin_pw:-false}" = "true" ]; then
@@ -631,7 +703,7 @@ main() {
     fi
   fi
 
-  # BKP-01 (Phase 1247): backups are DEFAULT-ON. A plain `docker compose up`
+  # Backups are DEFAULT-ON. A plain `docker compose up`
   # runs the backup container (no --profile flag needed). Surface the active
   # mode: S3 offload when BACKUP_S3_ENABLED=true, otherwise local retention.
   _backup_s3="${BACKUP_S3_ENABLED:-false}"

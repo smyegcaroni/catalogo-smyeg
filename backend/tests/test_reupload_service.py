@@ -66,7 +66,7 @@ async def _create_service_reupload_job(
             "service_type": "WFS 2.0.0",
             "layer_id": None,
             "source_type": "service_url",
-            # fix(#1746): router_refresh stamps this; reupload_commit does
+            # router_refresh stamps this; reupload_commit does
             # not. It is the only thing separating the two doors inside a
             # task that serves both.
             **({"refresh": True} if refresh else {}),
@@ -203,6 +203,7 @@ class TestServiceReuploadWorker:
             *,
             schema: str,
             on_spawn=None,
+            keep_z: bool = False,
         ) -> None:
             # Mirrors the real runner: a successful spawn fires on_spawn
             # (fix #1271 review — the contact-stamp signal).
@@ -244,7 +245,7 @@ class TestServiceReuploadWorker:
         }
 
         with (
-            # Phase 1066 IA-P0-03 (commit f8c91297) added a defense-in-depth
+            # commit f8c91297 added a defense-in-depth
             # SSRF re-validation of ``source_url`` at the top of the
             # ``reupload_service`` worker body (tasks_reupload.py:373-378)
             # via a LAZY from-import inside the function body:
@@ -255,8 +256,8 @@ class TestServiceReuploadWorker:
             # ``services.example.com`` fails DNS resolution in the test
             # sandbox, which is unrelated to this test's contract
             # (identity preservation + version increment), so we no-op
-            # the gate via AsyncMock. Same fix shape as Plan 1075-03
-            # closed in test_ingest.py:1369-1372.
+            # the gate via AsyncMock. Same fix shape as in
+            # test_ingest.py.
             patch(
                 "app.platform.security.validate_url_for_ssrf",
                 new=AsyncMock(),
@@ -341,7 +342,7 @@ class TestServiceReuploadWorker:
         assert dataset.source_format == "wfs"
         assert dataset.source_filename == "roads_wfs"
 
-        # fix(#1746): the swap records that the pull needed a credential, as a
+        # The swap records that the pull needed a credential, as a
         # boolean. True or ABSENT, never False — a token-less success stores
         # the ref shape it stored before the key existed, which is also how a
         # service that went public gets un-marked. The token itself is never
@@ -416,7 +417,7 @@ class TestServiceReuploadWorker:
         refresh: bool,
         expected: str,
     ):
-        """fix(#1746): the copy names the door the operator actually used.
+        """The copy names the door the operator actually used.
 
         One task serves the refresh endpoint and the re-upload commit, and the
         old string said "Retry commit" on both — advice about a door half the
@@ -424,7 +425,7 @@ class TestServiceReuploadWorker:
         it, since a credential is request-only and there is nothing to
         un-expire.
 
-        fix(#1746 B2b review r1): that field is the `auth` object rather than
+        That field is the `auth` object rather than
         the deprecated `token`, which always means a bearer credential and so
         could not authenticate the basic or named-key origin that produced this
         failure.
@@ -441,11 +442,11 @@ class TestServiceReuploadWorker:
         )
 
         with (
-            # Phase 1066 IA-P0-03: same SSRF defense-in-depth as the first
+            # Same SSRF defense-in-depth as the first
             # worker test. Fixture URL ``protected.example.com`` fails DNS
             # in the sandbox; mock the gate so the test exercises its actual
             # contract (401-retry guidance message from IngestionError).
-            # Plan 1075-03 / test_ingest.py:1369 is the canonical pattern.
+            # test_ingest.py:1369 is the canonical pattern.
             patch(
                 "app.platform.security.validate_url_for_ssrf",
                 new=AsyncMock(),

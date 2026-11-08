@@ -41,7 +41,7 @@ def tenant_data_schema(tenant_id: str | None) -> str:
 
     single_tenant: ``"data"`` (the shared schema); ``tenant_id`` may be
     ``None``. multi_tenant: requires a tenant id (fails closed, no fallback to
-    shared storage) and returns ``data_t_{id}``. IN-02: normalized to
+    shared storage) and returns ``data_t_{id}``. The id is normalized to
     lowercase first, since quoted identifiers are case-sensitive and the
     provisioned schema is always lowercase.
 
@@ -58,7 +58,7 @@ def tenant_data_schema(tenant_id: str | None) -> str:
         )
 
     normalized = tenant_id.lower()
-    if not _TENANT_ID_RE.match(normalized):
+    if not _TENANT_ID_RE.fullmatch(normalized):
         raise ValueError(f"tenant_data_schema: invalid tenant_id: {tenant_id!r}")
 
     # All identifiers derive from the validated UUID — string formatting is safe.
@@ -70,7 +70,7 @@ def tenant_reader_role(tenant_id: str | None) -> str:
 
     single_tenant: ``"geolens_reader"``, ``tenant_id`` may be ``None``.
     multi_tenant: requires a valid UUID tenant id (fails closed) and returns
-    ``geolens_reader_t_{id}``; IN-02: normalized to lowercase first so a
+    ``geolens_reader_t_{id}``; the id is normalized to lowercase first so a
     mixed-case UUID can't diverge from the provisioned role name.
     """
     from app.core.tenancy import is_multi_tenant
@@ -83,7 +83,7 @@ def tenant_reader_role(tenant_id: str | None) -> str:
         )
 
     normalized = tenant_id.lower()
-    if not _TENANT_ID_RE.match(normalized):
+    if not _TENANT_ID_RE.fullmatch(normalized):
         raise ValueError(f"tenant_reader_role: invalid tenant_id: {tenant_id!r}")
 
     # All identifiers derive from the validated UUID — string formatting is safe.
@@ -182,7 +182,7 @@ async def apply_tenant_data_schema_from_engine(tenant_id: str) -> None:
     no-op. The SECURITY DEFINER function runs in one ordinary transaction;
     tenant creation paths must instead pass their existing session directly.
     """
-    # fix(#909): façade import — see the note in rls.py.
+    # façade import — see the note in rls.py.
     from app.core.db import engine
 
     async with engine.begin() as conn:
@@ -190,10 +190,10 @@ async def apply_tenant_data_schema_from_engine(tenant_id: str) -> None:
 
 
 def tenant_shard_id(tenant_id: str | None) -> str | None:
-    """Look up the shard routing key for a tenant (Phase-1214 routing primitive).
+    """Look up the shard routing key for a tenant (routing primitive).
 
-    Reserved for Phase 1214's promote/rebalance; intentionally NOT wired into
-    the Plans 02/03 read/write hot paths, which use ``tenant_data_schema`` /
+    Reserved for promote/rebalance; intentionally NOT wired into
+    the read/write hot paths, which use ``tenant_data_schema`` /
     ``tenant_reader_role`` directly since there is nothing to route at one
     shard.
 
@@ -211,7 +211,7 @@ def tenant_shard_id(tenant_id: str | None) -> str | None:
     from sqlalchemy import text as sa_text
     from sqlalchemy.pool import NullPool
 
-    # fix(#909): façade import — see the note in rls.py.
+    # façade import — see the note in rls.py.
     from app.core.db import engine as _engine
 
     async def _fetch() -> str:
@@ -251,7 +251,7 @@ def tenant_shard_id(tenant_id: str | None) -> str | None:
         logger.warning(
             "tenant_shard_id: lookup failed, returning default shard",
             tenant_id=tenant_id,
-            exc_info=True,  # WR-01: surface stack trace so failures are diagnosable
+            exc_info=True,  # Surface stack trace so failures are diagnosable
         )
         return "shard-0"
 
@@ -259,7 +259,7 @@ def tenant_shard_id(tenant_id: str | None) -> str | None:
 async def schema_exists(session, schema: str) -> bool:
     """True when *schema* exists in the current database.
 
-    fix(#435): `42P01` (undefined_table) is ambiguous — Postgres returns it
+    `42P01` (undefined_table) is ambiguous — Postgres returns it
     both for a missing schema and for a raster dataset's synthetic table in a
     schema that exists. Read-side callers degrading `42P01` to an empty page
     must probe first, or a never-provisioned (or restore-lost) tenant schema

@@ -10,11 +10,14 @@ export default defineConfig({
   expect: { timeout: 10_000 },
   fullyParallel: false,
   retries: process.env.CI ? 2 : 0,
+  // Ends the run before the e2e-test job's cap, so the json summary still
+  // names the failing specs instead of the job being cancelled.
+  globalTimeout: process.env.CI ? 30 * 60_000 : 0,
   workers: 1,
-  // fix(#896): the json reporter feeds the nightly failure report, which
+  // The json reporter feeds the nightly failure report, which
   // names the failing SPECS in the tracking issue instead of only saying
-  // "e2e-test: failure" — a deterministic six-day-old spec break and a
-  // one-off flake used to be indistinguishable without downloading traces.
+  // "e2e-test: failure" — a deterministic spec break and a
+  // one-off flake are otherwise indistinguishable without downloading traces.
   reporter: process.env.CI
     ? [
         ['github'],
@@ -47,7 +50,7 @@ export default defineConfig({
         storageState: 'playwright/.auth/user.json',
         // Enable WebGL via SwiftShader so MapLibre can render in headless mode.
         // Without these flags MapLibre throws webglcontextcreationerror and the
-        // showcase smoke spec sees no canvas (218-05).
+        // showcase smoke spec sees no canvas.
         launchOptions: {
           args: [
             '--enable-unsafe-swiftshader',

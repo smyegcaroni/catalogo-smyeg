@@ -9,17 +9,21 @@ backend/app/modules/auth/dependencies.py):
     header X-API-Key  > JWT Bearer (Authorization)  > anonymous
 
 The query-parameter `?api_key=<key>` fallback that the backend supports for
-browser/embed contexts is NOT exposed by this SDK wrapper (D-11). Use one
+browser/embed contexts is NOT exposed by this SDK wrapper. Use one
 of the two header modes via the constructor or the set_* helpers.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from .client import AuthenticatedClient, Client
 
 __all__ = ["GeolensClient"]
+
+#: Sent on every request, so maps read with their ``restricted`` visibility. A
+#: client without it reads a restricted map as ``private``.
+_MAP_VISIBILITY_OPT_IN = {"X-GeoLens-Map-Visibility": "restricted"}
 
 
 class GeolensClient:
@@ -34,6 +38,11 @@ class GeolensClient:
             e.g. https://geolens.example.com/api
         bearer_token: JWT bearer token. Sent as `Authorization: Bearer <token>`.
         api_key: API key. Sent as `X-API-Key: <key>` (no prefix).
+        client_options: Passed to the generated client, e.g. ``timeout=httpx.Timeout(30)``,
+            ``verify_ssl``, ``headers``, ``httpx_args`` or ``raise_on_unexpected_status``.
+            ``headers`` may override the map visibility opt-in every client sends.
+            They also apply to the client built by ``set_bearer_token`` and ``set_api_key``.
+            Without ``timeout`` requests never time out.
 
     Raises:
         ValueError: if both bearer_token and api_key are provided.
@@ -51,16 +60,19 @@ class GeolensClient:
         *,
         bearer_token: Optional[str] = None,
         api_key: Optional[str] = None,
+        **client_options: Any,
     ) -> None:
         if bearer_token and api_key:
             raise ValueError("Provide either bearer_token or api_key, not both.")
         self._base_url = base_url
+        self._client_options = dict(client_options)
         self._client: Union[AuthenticatedClient, Client]
         if bearer_token:
             self._client = AuthenticatedClient(
                 base_url=base_url,
                 token=bearer_token,
                 # prefix defaults to "Bearer", auth_header_name to "Authorization"
+                **self._options(),
             )
         elif api_key:
             self._client = AuthenticatedClient(
@@ -68,9 +80,21 @@ class GeolensClient:
                 token=api_key,
                 prefix="",
                 auth_header_name="X-API-Key",
+                **self._options(),
             )
         else:
-            self._client = Client(base_url=base_url)
+            self._client = Client(base_url=base_url, **self._options())
+
+    def _options(self) -> dict[str, Any]:
+        # The generated AuthenticatedClient writes its auth header into the
+        # headers dict it receives, so each client needs its own copies or one
+        # credential would leak into the next client and the caller's dict.
+        options = dict(self._client_options)
+        for name in ("headers", "httpx_args"):
+            if name in options:
+                options[name] = dict(options[name])
+        options["headers"] = {**_MAP_VISIBILITY_OPT_IN, **options.get("headers", {})}
+        return options
 
     @property
     def client(self) -> Union[AuthenticatedClient, Client]:
@@ -78,17 +102,25 @@ class GeolensClient:
         return self._client
 
     def set_bearer_token(self, token: str) -> None:
-        """Replace the underlying client with one configured for Bearer auth."""
+        """Replace the underlying client with one configured for Bearer auth.
+
+        A ``client`` obtained earlier keeps its old credentials.
+        """
         self._client = AuthenticatedClient(
             base_url=self._base_url,
             token=token,
+            **self._options(),
         )
 
     def set_api_key(self, key: str) -> None:
-        """Replace the underlying client with one configured for X-API-Key auth."""
+        """Replace the underlying client with one configured for X-API-Key auth.
+
+        A ``client`` obtained earlier keeps its old credentials.
+        """
         self._client = AuthenticatedClient(
             base_url=self._base_url,
             token=key,
             prefix="",
             auth_header_name="X-API-Key",
+            **self._options(),
         )

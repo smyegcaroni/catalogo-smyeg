@@ -15,6 +15,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from app.core.auth_settings import AuthSettings
+from app.core.config_ai import ClaudeSettings, OpenAISettings
 
 
 def reveal(secret: SecretStr | None) -> str | None:
@@ -61,7 +62,7 @@ def libpq_value(value: object) -> str:
 
 
 def validate_privacy_url_shape(v: str) -> str:
-    r"""PRIV-1: shape check for the login/register privacy-policy link.
+    r"""Shape check for the login/register privacy-policy link.
 
     Security control, not a formatting nit: the value renders as an
     unauthenticated ``<a href>``, so a ``javascript:``/``data:``/
@@ -72,12 +73,11 @@ def validate_privacy_url_shape(v: str) -> str:
     Shared by three entry points that must agree on "safe": this module's
     env-value boot validator, the admin-write validator in
     ``app.modules.settings.schemas``, and the read-path defense in
-    ``app.modules.settings.router_public`` (a value stored before this
-    check existed must not reach the login page unvalidated). Lives here
-    rather than ``app.core.public_urls`` to avoid a circular import through
-    that module's ``settings`` singleton; the hostname check below is a
-    self-contained allowlist rather than a call to its
-    ``canonical_host_error``, which answers a near-identical question.
+    ``app.modules.settings.router_public`` (a value stored earlier must not
+    reach the login page unvalidated). Lives here rather than
+    ``app.core.public_urls`` to avoid a circular import through that module's
+    ``settings`` singleton, so the hostname check below is a self-contained
+    allowlist.
 
     Deliberately stricter than a browser everywhere below (fail-closed, not
     a gap): STD3 rules reject ``_`` and a leading/trailing hyphen (a
@@ -107,10 +107,8 @@ def validate_privacy_url_shape(v: str) -> str:
     try:
         parsed = urlsplit(stripped)
     except ValueError as exc:
-        # CPython 3.13+ already raises here for some malformed bracketed
-        # authorities (e.g. IPv4-in-brackets), but not every shape
-        # `_is_valid_privacy_url_host` rejects -- an early-exit, not a
-        # substitute for that check.
+        # Early exit only: CPython 3.13+ rejects some malformed bracketed
+        # authorities, not every shape `_is_valid_privacy_url_host` refuses.
         raise ValueError(f"is not a valid URL ({exc})") from exc
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("must be an absolute http(s) URL")
@@ -165,8 +163,7 @@ def _is_valid_privacy_url_host(hostname: str, *, bracketed: bool) -> bool:
     accepted outright. Everything else is UTS46-mapped to ASCII first via
     ``idna.encode(hostname, uts46=True, std3_rules=True)`` (idna is pinned
     in pyproject.toml for a CVE) -- the same order a browser's host parser
-    uses. This one call replaces a former hand-rolled DNS-label regex,
-    Unicode-label check, and punycode round-trip, and covers STD3
+    uses. This one call covers STD3
     restrictions, hyphen placement, the 63/253-char length limits (idna
     accepts 253, rejects 254, matching the length check kept below as a
     second line of defense), empty labels, and the disallowed/combining-mark
@@ -202,18 +199,15 @@ def _is_valid_privacy_url_host(hostname: str, *, bracketed: bool) -> bool:
         ascii_host = idna.encode(hostname, uts46=True, std3_rules=True).decode("ascii")
     except idna.IDNAError:
         return False
-    # A single trailing dot is the valid DNS root separator; idna.encode
-    # leaves it in rather than raising, so strip it here before the
-    # ends-in-a-number check. Two+ dots is an empty label, already refused
-    # above by idna.encode.
+    # One trailing dot is the DNS root separator and idna.encode keeps it;
+    # strip it before the ends-in-a-number check.
     h = ascii_host.removesuffix(".")
     if not h:
         return False
     last = h.rsplit(".", 1)[-1]
-    # ascii_host is lowercase and pure ASCII (idna's ToASCII + the
-    # .decode("ascii") above), so a plain ASCII class is safe here --
-    # str.isdigit() would also match non-ASCII digit code points. "0x"
-    # with no hex digits after it still reads as "a number" to a browser.
+    # ascii_host is pure ASCII, so an ASCII class is safe (str.isdigit() also
+    # matches non-ASCII digits). "0x" with no hex digits still reads as a number
+    # to a browser.
     if re.fullmatch(r"[0-9]+|0x[0-9a-f]*", last):
         try:
             return str(ipaddress.IPv4Address(h)) == h
@@ -235,7 +229,7 @@ KNOWN_BAD_JWT_SECRET = "demo-only-do-not-use-in-production-change-me"
 KNOWN_BAD_ADMIN_PASSWORD = "demodemo"
 KNOWN_BAD_POSTGRES_PASSWORD = "geolens-demo-2026"
 
-# Phase 268 H-28: documentation-default values the JWT length validator would
+# Documentation-default values the JWT length validator would
 # otherwise accept; rejected in all modes, no demo opt-in, since any of these
 # on a real deployment lets an attacker forge tokens trivially.
 KNOWN_BAD_JWT_SECRETS = frozenset(
@@ -249,7 +243,7 @@ KNOWN_BAD_JWT_SECRETS = frozenset(
     }
 )
 
-# fix(#1871): every literal this repo treats as public knowledge, in one place,
+# Every literal this repo treats as public knowledge, in one place,
 # so a new secret-bearing setting refuses all of them rather than the subset
 # whoever added it remembered (Rule 3).
 KNOWN_PUBLIC_CREDENTIALS = frozenset(
@@ -257,34 +251,80 @@ KNOWN_PUBLIC_CREDENTIALS = frozenset(
     | KNOWN_BAD_JWT_SECRETS
 )
 
-# fix(#1871): shown by every SECRET_ENCRYPTION_KEY* boot failure. A Fernet key
+# Shown by every SECRET_ENCRYPTION_KEY* boot failure. A Fernet key
 # is url-safe base64 of 32 random bytes, so `openssl rand -hex 32` (the hint on
 # JWT_SECRET_KEY) does NOT produce one.
 FERNET_KEY_HINT = (
     " Generate a fresh value with `openssl rand -base64 32 | tr '+/' '-_'`."
 )
 
-# fix(#1778): bcrypt's input limit, restated here since `core/` may not import
+# bcrypt's input limit, restated here since `core/` may not import
 # `app.modules.*` (test_layering.py); canonical definition is beside the
 # hasher in app/modules/auth/password_policy.py, pinned equal by test_password_policy.py.
 BCRYPT_MAX_PASSWORD_BYTES = 72
 
 
-# fix(#1235): shortest presigned-upload window worth issuing; must be this
+# Shortest presigned-upload window worth issuing; must be this
 # exact number since it's `pending_job_timeout_seconds`'s lower bound.
 # Lives here, not by its consumer `require_signable_job_lifetime` in
 # processing/ingest/presigned.py, because core must never import processing.
 MIN_SIGNABLE_JOB_LIFETIME_SECONDS = 60
 
-# fix(#1236): the SigV4 ceiling. No presigned URL can outlive `created_at`
+# The SigV4 ceiling. No presigned URL can outlive `created_at`
 # plus this many seconds, whatever `pending_job_timeout_seconds` was set to
 # when it was signed; the post-expiry sweep in
-# `_sweep_expired_presigned_staging` (platform/jobs/router.py) uses it as the
+# `_sweep_expired_presigned_staging` (platform/jobs/sweep.py) uses it as the
 # age past which a marked-reaped row is safe to consider settled for good.
 MAX_PRESIGNED_URL_LIFETIME_SECONDS = 604800
 
 
-class Settings(AuthSettings, BaseSettings):
+def canonical_service_host(host: str) -> str | None:
+    """*host* in one spelling, or None when it isn't a usable host.
+
+    An IP literal (brackets optional for IPv6, no zone ID) in its compressed
+    form; otherwise a DNS name UTS46-mapped to lowercase punycode by the
+    validator ``_is_valid_privacy_url_host`` uses, with no trailing dot.
+    """
+    bare = host.lower().removeprefix("[").removesuffix("]")
+    if "%" not in bare:
+        try:
+            return ipaddress.ip_address(bare).compressed
+        except ValueError:
+            pass
+    if bare != host.lower() or bare.endswith("."):
+        return None
+    if not _is_valid_privacy_url_host(bare, bracketed=False):
+        return None
+    return idna.encode(bare, uts46=True, std3_rules=True).decode("ascii")
+
+
+def parse_http_credential_hosts(value: str) -> list[tuple[str, int | None]]:
+    """``SERVICE_CREDENTIALS_ALLOW_HTTP_HOSTS`` as (canonical host, port or None).
+
+    Raises ValueError for an entry that isn't a bare host or host:port.
+    """
+    hosts: list[tuple[str, int | None]] = []
+    for entry in filter(None, (raw.strip() for raw in value.split(","))):
+        host = None
+        try:
+            parts = urlsplit(f"//{entry}")
+            port = parts.port
+            if parts.netloc == entry and not entry.endswith(":") and "@" not in entry:
+                host = canonical_service_host(
+                    entry.rsplit(":", 1)[0] if port else entry
+                )
+        except ValueError:
+            pass
+        if host is None:
+            raise ValueError(
+                "SERVICE_CREDENTIALS_ALLOW_HTTP_HOSTS takes host or host:port "
+                "entries, comma-separated"
+            )
+        hosts.append((host, port))
+    return hosts
+
+
+class Settings(AuthSettings, ClaudeSettings, OpenAISettings, BaseSettings):
     postgres_user: str = "geolens"
     postgres_password: SecretStr
     postgres_host: str = "localhost"
@@ -296,29 +336,27 @@ class Settings(AuthSettings, BaseSettings):
     jwt_algorithm: Literal["HS256"] = "HS256"
     access_token_expire_minutes: int = Field(default=15, gt=0)
     refresh_token_expire_days: int = Field(default=7, gt=0)
-    # fix(#621): how long a just-rotated refresh token stays usable so
+    # How long a just-rotated refresh token stays usable so
     # concurrent refreshes (multi-tab) don't strand the losers of the
     # rotation race. 0 restores instant single-use revocation.
     refresh_rotation_grace_seconds: int = Field(default=30, ge=0)
 
-    # fix(#1871): Fernet key for secrets stored at rest (SSO client secrets,
+    # Fernet key for secrets stored at rest (SSO client secrets,
     # SAML IdP certificates). Unset, they are encrypted under a key derived
     # from JWT_SECRET_KEY, so a JWT rotation makes every one of them unreadable.
     secret_encryption_key: SecretStr | None = None
     # The key it replaced. Read-only, until rotate_secrets.py has swept the rows.
     secret_encryption_key_previous: SecretStr | None = None
 
-    # SEC-S16: password_require_classes counts how many of the four character
+    # password_require_classes counts how many of the four character
     # classes (lowercase, uppercase, digit, symbol) must be present.
     password_min_length: int = Field(default=12, ge=8)
     password_require_classes: int = Field(default=3, ge=1, le=4)
     geolens_admin_username: str
     geolens_admin_password: SecretStr
-    # FRONT-01 (Phase 1223): when True the root route redirects anonymous
-    # visitors to the login page as the product landing surface.
-    # Default False — self-hosters see zero change on upgrade.
+    # When True the root route redirects anonymous visitors to the login page.
     landing_first: bool = False
-    # fix(#838): with ENV_ONLY_CONFIG=true the admin UI cannot store
+    # With ENV_ONLY_CONFIG=true the admin UI cannot store
     # overrides, so these env vars are the only way to show the banner.
     banner_enabled: bool = False
     banner_text: str = ""
@@ -335,44 +373,41 @@ class Settings(AuthSettings, BaseSettings):
     # has stored an override keep their stored list and must add new
     # extensions (e.g. .parquet) themselves in Admin → Storage.
     upload_allowed_extensions: str = ".zip,.gpkg,.geojson,.json,.csv,.tif,.tiff,.xlsx,.xls,.parquet,.fgb,.kml,.kmz,.3tz,.laz"
-    # fix(#1236): capped at S3's single-PUT hard limit (5GiB). The invariant
-    # that actually matters is enforced in code, not config -- see the clamp
-    # in `recheck_transfer_margin_seconds()` (platform/jobs/router.py).
+    # Capped at S3's single-PUT hard limit (5GiB). The invariant that
+    # actually matters is enforced in code, not config -- see
+    # `_RECHECK_TRANSFER_MARGIN_SECONDS` (platform/jobs/sweep.py).
     presigned_multipart_threshold_mb: int = Field(default=100, gt=0, le=5120)
-    # fix(#1234): a presigned job is abandoned after this long, and its part
-    # URLs must not outlive it. Lives here (not platform/jobs) because
-    # platform/storage must read it too and platform/jobs already imports
-    # platform/storage, so the reverse import would cycle.
+    # A presigned job is abandoned after this long, and its part URLs must not
+    # outlive it. Lives here because platform/storage must read it and
+    # platform/jobs already imports platform/storage.
     #
-    # fix(#1235): bounded at MAX_PRESIGNED_URL_LIFETIME_SECONDS (the SigV4
-    # ceiling) and floored above MIN_SIGNABLE_JOB_LIFETIME_SECONDS (where
-    # `require_signable_job_lifetime` always refuses to sign) -- either
-    # extreme boots clean but makes every upload fail. The floor only
-    # guarantees no value is self-defeating by construction; a slow request
-    # can still eat the remaining lifetime at any setting.
+    # Bounded at MAX_PRESIGNED_URL_LIFETIME_SECONDS (the SigV4 ceiling) and
+    # floored above MIN_SIGNABLE_JOB_LIFETIME_SECONDS (where
+    # `require_signable_job_lifetime` always refuses to sign); either extreme
+    # boots clean but makes every upload fail. A slow request can still eat the
+    # remaining lifetime at any setting.
     #
-    # Lowering it mid-flight is not a leak: issued URLs keep their old
-    # lifetime, and the sweep's re-check pass (fix(#1236),
-    # `_sweep_expired_presigned_staging` in platform/jobs/router.py)
-    # revisits anything reaped once MAX_PRESIGNED_URL_LIFETIME_SECONDS has
-    # passed since creation -- the latest any such URL can still be live.
+    # Lowering it mid-flight is not a leak: issued URLs keep their old lifetime,
+    # and the re-check pass in `_sweep_expired_presigned_staging`
+    # (platform/jobs/sweep.py) revisits anything reaped once
+    # MAX_PRESIGNED_URL_LIFETIME_SECONDS has passed since creation.
     pending_job_timeout_seconds: int = Field(
         default=3600,
         gt=MIN_SIGNABLE_JOB_LIFETIME_SECONDS,
         le=MAX_PRESIGNED_URL_LIFETIME_SECONDS,
     )
-    # feat(#1710): wall clock for one URL-import download, now that the fetch
-    # runs on the worker and no proxy or client deadline bounds it. The
-    # running lease is renewed by the task's heartbeat, so this may exceed
-    # JOB_TIMEOUT_SECONDS; the ceiling only stops a typo parking a worker
-    # slot for a week. Consumer: `fetch_url_to_path` in processing/ingest/url_fetch.py.
+    # Wall clock for one URL-import download. The fetch runs on the worker with no
+    # proxy or client deadline; the running lease is renewed by the task's
+    # heartbeat, so this may exceed JOB_TIMEOUT_SECONDS. The ceiling only stops a
+    # typo parking a worker slot for a week. Consumer: `fetch_url_to_path` in
+    # processing/ingest/url_fetch.py.
     url_import_fetch_max_seconds: int = Field(default=1800, ge=30, le=86400)
     procrastinate_schema: str = "catalog"
 
     public_app_url: str | None = None
     public_api_url: str | None = None
     public_base_url: str | None = None
-    # PRIV-1: privacy-policy link shown on the login/register pages. Unset by
+    # Privacy-policy link shown on the login/register pages. Unset by
     # default so a self-hosted instance never links to another operator's
     # privacy page; set this to the operator's own policy URL to show the link.
     privacy_url: str | None = None
@@ -388,9 +423,9 @@ class Settings(AuthSettings, BaseSettings):
     log_json: bool = False
     log_level: str = "INFO"
 
-    # SEC-005: explicit deployment environment, controlling API docs exposure
+    # Explicit deployment environment, controlling API docs exposure
     # (/docs, /redoc), the Secure flag on the OAuth session cookie
-    # (SessionMiddleware https_only), and, fix(#1485), plain traceback
+    # (SessionMiddleware https_only), and plain traceback
     # rendering (rich's frame-locals tables made one exception a
     # multi-minute event-loop stall). Unset falls back to LOG_JSON. Set
     # ENVIRONMENT=production on any public, TLS-terminated deployment.
@@ -401,27 +436,11 @@ class Settings(AuthSettings, BaseSettings):
     # falling back to community behavior.
     geolens_edition: Literal["community", "enterprise"] | None = None
 
-    # TSEAM-03 (Phase 1207-02): orthogonal tenancy MODE axis.
-    # Edition stays binary (community|enterprise); mode controls the tenancy
-    # posture of the deployment.
-    #   "single_tenant" (default) -> Community/Enterprise byte-identical behavior;
-    #                                tenant_id is NULL everywhere, no isolation.
-    #   "multi_tenant"            -> Requires the cloud overlay + 1208 RLS layer;
-    #                                boot guard (GUARD-01) fails loud without them.
-    # An invalid value raises a Pydantic ValidationError at boot.
+    # Tenancy mode, orthogonal to edition.
+    #   "single_tenant" (default): tenant_id is NULL everywhere, no isolation.
+    #   "multi_tenant": requires the cloud overlay and tenant row-level security;
+    #                   the boot guard fails loud without them.
     geolens_tenancy_mode: Literal["single_tenant", "multi_tenant"] = "single_tenant"
-
-    anthropic_api_key: SecretStr | None = None
-    llm_model: str = "claude-sonnet-5"
-
-    openai_api_key: SecretStr | None = None
-    openai_model: str = "gpt-4o"
-    # Light model for SQL generation / metadata. Unset defaults to openai_model
-    # so it always points at a model the provider actually serves -- for Azure
-    # OpenAI / gateways a hardcoded default 404s if it doesn't match a real
-    # deployment name.
-    openai_model_light: str | None = None
-    openai_base_url: str | None = None
 
     embedding_model: str = "text-embedding-3-small"
     embedding_dims: int = Field(default=1536, ge=1, le=4096)
@@ -443,14 +462,13 @@ class Settings(AuthSettings, BaseSettings):
     # Ambient AWS credential markers, injected by the runtime not an operator:
     # EKS IRSA/Pod Identity set AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE;
     # ECS/EKS container providers set one of the AWS_CONTAINER_CREDENTIALS_*
-    # pair. Fields (not os.environ) per CONF-03/CONF-04; read only by
+    # pair. Fields (not os.environ); read only by
     # has_ambient_aws_credentials below -- boto3/GDAL resolve credentials themselves.
     aws_role_arn: str | None = None
     aws_web_identity_token_file: str | None = None
     aws_container_credentials_full_uri: str | None = None
     aws_container_credentials_relative_uri: str | None = None
 
-    # Azure Blob Storage (STOR-01 / Phase 1210)
     azure_storage_container: str | None = None
     azure_storage_connection_string: SecretStr | None = (
         None  # for Azurite: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;..."
@@ -458,7 +476,7 @@ class Settings(AuthSettings, BaseSettings):
     azure_storage_account_url: str | None = (
         None  # for live: "https://<account>.blob.core.windows.net"
     )
-    # CR-04: when connection_string is absent and only account_url is given,
+    # When connection_string is absent and only account_url is given,
     # AzureBlobStorageProvider needs this key to authenticate --
     # BlobServiceClient(account_url=..., credential=None) otherwise falls
     # through to Entra ID, which silently fails for most deployments.
@@ -473,7 +491,7 @@ class Settings(AuthSettings, BaseSettings):
     redis_url: str | None = None  # unset refuses token-protected service dispatch
     cdn_base_url: str | None = None
     tile_signing_secret: SecretStr | None = None
-    tile_cache_ttl: int = Field(default=300, ge=0)
+    tile_cache_ttl: int = Field(default=3600, ge=0)
 
     database_url_override: str | None = None
     # Opt-in single-tenant runtime login. Empty preserves the legacy connection;
@@ -490,32 +508,30 @@ class Settings(AuthSettings, BaseSettings):
     database_ssl_ca_cert: str | None = None
     database_pool_pre_ping: bool = True
 
-    # CONF-03 (Phase 277 / M-38): replaces raw os.environ.get("WORKER_SHUTDOWN_TIMEOUT") in worker.py
     worker_shutdown_timeout: int = Field(default=30, gt=0)
 
-    # fix(#448): Procrastinate parallel job slots per worker process. A
+    # Procrastinate parallel job slots per worker process. A
     # default of 1 head-of-line-blocks every queued upload behind a long COG
     # conversion; 2-3 suits multi-core hosts, keep 1 on 2-vCPU boxes.
     worker_concurrency: int = Field(default=1, ge=1)
-    # fix(#448): queues this worker listens to, so a deployment can run a
+    # Queues this worker listens to, so a deployment can run a
     # second worker dedicated to e.g. WORKER_QUEUES=raster so long raster
-    # jobs never stall vector ingests. fix(#1812): "ingest-auth-v2" is
+    # jobs never stall vector ingests. "ingest-auth-v2" is
     # consumer-only -- nothing enqueues there; drop the name once drained.
-    # fix(#1710): "download" carries the URL-import fetch, whose runtime is a
+    # "download" carries the URL-import fetch, whose runtime is a
     # remote origin's to decide; pin a second worker to it to keep a slow
     # transfer off the ingest slot.
     worker_queues: str = "priority,ingest,raster,download,ingest-auth-v2"
 
-    # CONF-04 (Phase 277 / M-39): replaces raw os.environ.get("ENV_ONLY_CONFIG") in core/public_urls.py
-    # Security-relevant: when true, the PersistentConfig DB layer is bypassed for reads
-    # and writes return 403. Keep in sync with .env.example.
+    # Security-relevant: when true, the PersistentConfig DB layer is bypassed for
+    # reads and writes return 403.
     env_only_config: bool = False
 
     db_use_external_pooler: bool = False
-    # fix(#2045): the worker count the compose files export as UVICORN_WORKERS;
+    # The worker count the compose files export as UVICORN_WORKERS;
     # under an external pooler sandbox_bounds divides the query budget by it.
     uvicorn_workers: int = 1
-    # fix(#2045 codex r1): a process cannot see how many API replicas share the
+    # A process cannot see how many API replicas share the
     # pooler, so this states the per-process sandbox share outright when set.
     sandbox_query_slots: int | None = Field(default=None, ge=1)
     db_pool_size: int = Field(default=10, ge=1)
@@ -526,65 +542,59 @@ class Settings(AuthSettings, BaseSettings):
 
     tile_pool_min_size: int = Field(default=2, ge=1)
     tile_pool_max_size: int = Field(default=10, ge=1)
+    raster_timeout_slot_grace_seconds: int = Field(default=5, ge=0)
 
-    # SEED-02 (Phase 1054): GDAL_HTTP_TIMEOUT for ogr2ogr service ingest, raised
-    # from the 120s hardcoded default that timed out 50% of AGO layers in M001-7n8vpc.
-    # Set INGEST_HTTP_TIMEOUT_SECONDS in the api service env to override.
+    # GDAL_HTTP_TIMEOUT for ogr2ogr service ingest. Large service layers exceed
+    # GDAL's 120s default.
     ingest_http_timeout_seconds: int = Field(default=300, gt=0)
 
-    # fix(#1013): the materialize CTAS budget, applied as SET LOCAL
-    # statement_timeout before the CREATE TABLE AS. 300 seconds covers
-    # roughly 150k-600k buffered polygon rows, so a one-million-parcel
-    # buffer fails.
+    # Hosts (host or host:port, comma-separated) a service credential may reach
+    # over plain http, for intranet services without TLS. Empty refuses them all.
+    service_credentials_allow_http_hosts: str = ""
+
+    # The materialize CTAS budget, applied as SET LOCAL statement_timeout before
+    # the CREATE TABLE AS. 300 seconds covers roughly 150k-600k buffered polygon
+    # rows, so a one-million-parcel buffer fails.
     #
-    # gt=0 is load-bearing: PostgreSQL reads statement_timeout='0' as no
-    # timeout, so 0 here would silently produce the unbounded statement the
-    # budget exists to prevent -- rejected at boot instead.
-    #
-    # Without an admission gate a longer budget just holds the job slot
-    # longer; the work still runs, it fails later. Pairs with #691's
-    # heartbeat lease and #701's pre-flight gates. One scalar for all
-    # operations (a centroid needs seconds, a dissolve far more) is a
-    # deliberate compromise; per-operation budgets are the natural follow-up.
+    # gt=0 is load-bearing: PostgreSQL reads statement_timeout='0' as no timeout,
+    # so 0 would silently produce the unbounded statement the budget exists to
+    # prevent. A longer budget just holds the job slot longer. One scalar for all
+    # operations (a centroid needs seconds, a dissolve far more) is a deliberate
+    # compromise.
     analysis_materialize_timeout_seconds: int = Field(default=300, gt=0)
 
-    # fix(#1013): promoted alongside the CTAS budget -- the commit that makes
-    # the output durable ends the transaction (and its SET LOCAL) with it, so
-    # registration needs its own budget (#692) for the full-scan metadata
-    # extraction. Raising the CTAS ceiling for a large dataset needs this
+    # Registration needs its own budget: the commit that makes the output durable
+    # ends the transaction and its SET LOCAL, and the full-scan metadata
+    # extraction follows. Raising the CTAS ceiling for a large dataset needs this
     # raised too.
     analysis_registration_timeout_seconds: int = Field(default=600, gt=0)
 
-    # fix(#1012): per-slot work_mem budget for the materialize CTAS, in MB.
-    # Configurable because the safe value depends on two things this process
-    # cannot see: DB_MEM_LIMIT (a compose `mem_limit`, never passed into the
-    # api/worker env, and operator-tunable -- prod compose documents 1.5g, an
-    # external PostgreSQL may be smaller) and how many worker replicas run
-    # against the `ingest` queue, since each would claim the budget
+    # Per-slot work_mem budget for the materialize CTAS, in MB. The safe value
+    # depends on DB_MEM_LIMIT (never passed into the api/worker env; prod compose
+    # documents 1.5g, an external PostgreSQL may be smaller) and on how many worker
+    # replicas run against the `ingest` queue, each claiming the budget
     # independently.
     #
-    # The default is conservative, not optimal: work_mem is per operation AND
-    # per backend, so one materialize can allocate this value times the
-    # memory-hungry plan nodes (at most 2 for these shapes) times the backends
-    # running it (2, since max_parallel_workers_per_gather is 1). At 64MB
-    # that's 256MB per replica, so two replicas stay inside the default 2GB
-    # alongside shared_buffers (512MB) and maintenance_work_mem (128MB).
-    # Raise it only with checked headroom (a larger DB_MEM_LIMIT or a single
-    # worker service); lower it for a smaller DB container or more replicas.
+    # The default is conservative: work_mem is per operation AND per backend, so
+    # one materialize can allocate this value times the memory-hungry plan nodes
+    # (at most 2 for these shapes) times the backends running it (2, since
+    # max_parallel_workers_per_gather is 1). At 64MB that is 256MB per replica, so
+    # two replicas stay inside the default 2GB alongside shared_buffers (512MB) and
+    # maintenance_work_mem (128MB). Raise it only with checked headroom; lower it
+    # for a smaller DB container or more replicas.
     #
-    # 0 disables the override (no SET LOCAL; pre-#1012 behaviour), since this
-    # process cannot read the connected cluster's work_mem and so cannot know
-    # whether a floor would preserve it or quietly raise it. Positive values
-    # are applied as given.
+    # 0 disables the override (no SET LOCAL), since this process cannot read the
+    # cluster's work_mem and so cannot know whether a floor would preserve it.
+    # Positive values are applied as given.
     analysis_materialize_work_mem_mb: int = Field(default=64, ge=0)
 
-    # fix(#434): terminal jobs (complete/failed/cancelled/fanned_out) older
+    # Terminal jobs (complete/failed/cancelled/fanned_out) older
     # than this many days are purged by the 5-minute lifespan sweeper, except
     # each dataset's most recent complete job (backs /jobs/by-dataset
     # warning metadata). 0 disables the purge (keep history forever).
     ingest_jobs_retention_days: int = Field(default=30, ge=0)
 
-    # fix(#1778): statement deadline for the API, in seconds; 0 disables it.
+    # Statement deadline for the API, in seconds; 0 disables it.
     # Applied to every transaction the API process opens (handlers open
     # request-scoped sessions directly in 20+ modules, not just get_db), as
     # SET LOCAL never a startup parameter so DB_USE_EXTERNAL_POOLER=true
@@ -602,21 +612,18 @@ class Settings(AuthSettings, BaseSettings):
     # `reconcile_orphaned_staging_objects`, `reconcile_orphaned_local_uploads`.
     staging_orphan_min_age_seconds: int = Field(default=86400, ge=3600)
 
-    # Outbound Notification channels (NOTIF-02/03/05). All defaults are
-    # OFF/None so existing deployments are byte-identical on upgrade
-    # (NOTIF-04). Secrets are SecretStr so they never render in logs/repr().
-    # These are real wired fields, not inert knobs.
+    # Outbound notification channels. All default to OFF/None. Secrets are
+    # SecretStr so they never render in logs/repr().
     #
-    # NOT registered in persistent_config.py: notification secrets must NOT live
-    # in the app_settings DB table (persistent_config.py:80-83 prohibition).
+    # Not registered in persistent_config.py: notification secrets must not live in
+    # the app_settings DB table (see the prohibition there).
 
-    # Master toggle: when False (default), notify() is a fast no-op regardless
-    # of whether SMTP / webhook env vars are set. Set NOTIFICATIONS_ENABLED=true
-    # to activate channels.
+    # Master toggle: when False (default), notify() is a fast no-op regardless of
+    # whether SMTP / webhook env vars are set.
     notifications_enabled: bool = False
 
-    # SMTP channel (NOTIF-02): configure with SMTP_HOST + SMTP_USERNAME +
-    # SMTP_PASSWORD + SMTP_FROM_ADDRESS to send email notifications.
+    # SMTP channel: needs SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD and
+    # SMTP_FROM_ADDRESS.
     smtp_host: str | None = None
     smtp_port: int = Field(default=587, ge=1, le=65535)
     smtp_username: str | None = None
@@ -624,13 +631,12 @@ class Settings(AuthSettings, BaseSettings):
     smtp_from_address: str | None = None
     smtp_use_tls: bool = True
 
-    # Webhook channel (NOTIF-03): configure with NOTIFICATION_WEBHOOK_URL to POST
-    # JSON notifications to a generic incoming-webhook endpoint (Slack, Teams,
-    # custom). NOTIFICATION_WEBHOOK_SECRET is used for HMAC signing (optional).
+    # Webhook channel: POSTs JSON to a generic incoming-webhook endpoint (Slack,
+    # Teams, custom). NOTIFICATION_WEBHOOK_SECRET optionally HMAC-signs the body.
     notification_webhook_url: str | None = None
     notification_webhook_secret: SecretStr | None = None
 
-    # EVENT-05 per-event opt-in toggles (default OFF), still gated behind
+    # Per-event opt-in toggles (default OFF), still gated behind
     # notifications_enabled=True + at least one configured channel. Not
     # registered in persistent_config.py -- env knobs, not DB settings.
     notify_on_signup: bool = False
@@ -638,16 +644,12 @@ class Settings(AuthSettings, BaseSettings):
     notify_on_ingest_failed: bool = False
     notify_on_health_alert: bool = False
 
-    # Admin recipient for event notifications (non-secret — appears in Notification.data["to"]).
-    # Falls back to smtp_from_address when not set (see events.py build_event_notification).
-    # Add NOTIFICATION_ADMIN_EMAIL=admin@example.com to direct all event alerts to one address.
+    # Admin recipient for event notifications (non-secret; appears in
+    # Notification.data["to"]). Falls back to smtp_from_address (see events.py
+    # build_event_notification).
     notification_admin_email: str | None = None
 
     @field_validator(
-        "anthropic_api_key",
-        "openai_api_key",
-        "openai_model_light",
-        "openai_base_url",
         "embedding_base_url",
         "redis_url",
         "cdn_base_url",
@@ -669,16 +671,16 @@ class Settings(AuthSettings, BaseSettings):
         "s3_addressing_style",
         "database_ssl_ca_cert",
         "tile_signing_secret",
-        # fix(#1871): an uncommented-but-empty .env line arrives as "", which
+        # An uncommented-but-empty .env line arrives as "", which
         # would otherwise reach validate_known_bad_credentials' Fernet check
-        # and fail boot on a config shape that means "not set" (INST-01 class).
+        # and fail boot on a config shape that means "not set".
         "secret_encryption_key",
         "secret_encryption_key_previous",
         "azure_storage_container",
         "azure_storage_connection_string",
         "azure_storage_account_url",
         "azure_storage_account_key",
-        # Phase 1229 notification str | None fields — blank env values normalize to None
+        # Notification str | None fields — blank env values normalize to None
         "smtp_host",
         "smtp_username",
         "smtp_password",
@@ -686,11 +688,11 @@ class Settings(AuthSettings, BaseSettings):
         "notification_webhook_url",
         "notification_webhook_secret",
         "notification_admin_email",
-        # fix(#441): compose passes ENVIRONMENT through as "${ENVIRONMENT:-}",
+        # Compose passes ENVIRONMENT through as "${ENVIRONMENT:-}",
         # so an unset value arrives as "" — normalize to None (LOG_JSON fallback)
         # instead of failing the Literal validation at boot.
         "environment",
-        # fix(#2045 codex r1): compose passes "${SANDBOX_QUERY_SLOTS:-}"; "" is unset.
+        # Compose passes "${SANDBOX_QUERY_SLOTS:-}"; "" is unset.
         "sandbox_query_slots",
         mode="before",
     )
@@ -752,10 +754,21 @@ class Settings(AuthSettings, BaseSettings):
             normalized.append(host)
         return ",".join(dict.fromkeys(normalized))
 
+    @field_validator("service_credentials_allow_http_hosts", mode="after")
+    @classmethod
+    def validate_service_credentials_allow_http_hosts(cls, v: str) -> str:
+        """Each entry is a host or host:port, with no scheme, path or wildcard."""
+        parse_http_credential_hosts(v)
+        return v
+
+    @property
+    def http_credential_hosts(self) -> list[tuple[str, int | None]]:
+        return parse_http_credential_hosts(self.service_credentials_allow_http_hosts)
+
     @field_validator("embedding_dims", mode="before")
     @classmethod
     def empty_embedding_dims_to_default(cls, v: object) -> object:
-        # fix(#512): the one-shot migrate service deliberately preserves an
+        # The one-shot migrate service deliberately preserves an
         # unset host value as "" so migration 0012 can distinguish it from an
         # explicitly configured 1536. Settings is imported before the revision,
         # so normalize only the application-facing value to its existing default.
@@ -800,7 +813,7 @@ class Settings(AuthSettings, BaseSettings):
         if not parsed.path or parsed.path == "/":
             raise ValueError("DATABASE_URL_OVERRIDE must include a database name")
 
-        # fix(#1770): DATABASE_URL_OVERRIDE is an operator-supplied BOOT-TIME
+        # DATABASE_URL_OVERRIDE is an operator-supplied BOOT-TIME
         # env var, never a runtime service-advertised value -- see
         # `bounded_parse_qsl`'s docstring (`platform/service_endpoints.py`)
         # for the sites that DO need the field-count bound.
@@ -819,7 +832,7 @@ class Settings(AuthSettings, BaseSettings):
     @field_validator("privacy_url", mode="after")
     @classmethod
     def validate_privacy_url_env(cls, v: str | None) -> str | None:
-        """PRIV-1: fail boot on an unsafe PRIVACY_URL rather than silently
+        """Fail boot on an unsafe PRIVACY_URL rather than silently
         rendering it as an <a href> on the login/register page. This is the
         ONLY validation an ENV_ONLY_CONFIG deployment ever runs for this
         value — the admin-write validator in modules/settings/schemas.py
@@ -877,7 +890,7 @@ class Settings(AuthSettings, BaseSettings):
                 "JWT_SECRET_KEY must be at least 32 characters. "
                 "Generate one with: openssl rand -hex 32"
             )
-        # Phase 268 H-28: reject known-public example values that pass the
+        # Reject known-public example values that pass the
         # length check but are committed in .env.example / docs.
         if raw in KNOWN_BAD_JWT_SECRETS:
             raise ValueError(
@@ -909,7 +922,7 @@ class Settings(AuthSettings, BaseSettings):
 
     @model_validator(mode="after")
     def validate_materialize_work_mem_budget(self) -> "Settings":
-        """fix(#1012): refuse a budget that cannot be divided into legal shares.
+        """Refuse a budget that cannot be divided into legal shares.
 
         The budget is split across WORKER_CONCURRENCY slots. If a share falls
         below PostgreSQL's 64kB minimum for work_mem there is no honest
@@ -1075,7 +1088,7 @@ class Settings(AuthSettings, BaseSettings):
 
     @model_validator(mode="after")
     def validate_admin_credentials_nonempty(self) -> "Settings":
-        # fix(#668): .env.example ships these keys empty and compose passes
+        # .env.example ships these keys empty and compose passes
         # "" straight through, so without this guard a verbatim-template
         # install silently seeds the initial admin with empty credentials.
         if not self.geolens_admin_username.strip():
@@ -1089,7 +1102,7 @@ class Settings(AuthSettings, BaseSettings):
                 "GEOLENS_ADMIN_PASSWORD must not be empty. Generate one "
                 "with `openssl rand -base64 16` and set it in your .env."
             )
-        # fix(#1778): bound it at boot, where the message can name the
+        # Bound it at boot, where the message can name the
         # variable. seed_initial_admin() hashes this with bcrypt, which
         # refuses input over 72 bytes, and nothing upstream validates it --
         # an unbounded value produced a bare bcrypt ValueError inside a
@@ -1133,7 +1146,7 @@ class Settings(AuthSettings, BaseSettings):
                 "project's git history." + hint
             )
 
-        # fix(#1871): fail here, not at the first SSO login. A bad value in
+        # Fail here, not at the first SSO login. A bad value in
         # either key is only noticed when someone tries to sign in, and by then
         # the failure looks like a broken identity provider.
         from cryptography.fernet import Fernet
@@ -1213,7 +1226,7 @@ class Settings(AuthSettings, BaseSettings):
         """Whether to enforce the production posture (API docs hidden, Secure
         session cookie, plain tracebacks).
 
-        SEC-005: driven by the explicit ENVIRONMENT setting; when unset, falls
+        Driven by the explicit ENVIRONMENT setting; when unset, falls
         back to LOG_JSON so no existing deployment silently loses its
         hardened posture. An explicit ENVIRONMENT decouples fully.
         """
@@ -1226,7 +1239,7 @@ class Settings(AuthSettings, BaseSettings):
         from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
         parts = urlsplit(url)
-        # fix(#1770): same reasoning as `database_url_override`'s validator
+        # Same reasoning as `database_url_override`'s validator
         # above -- operator-supplied boot-time config.
         params = parse_qs(parts.query, keep_blank_values=True)  # parse_qs: unbounded
         params.pop("sslmode", None)
@@ -1334,7 +1347,7 @@ class Settings(AuthSettings, BaseSettings):
                 raw = raw.replace("postgres://", "postgresql://", 1)
             parsed = urlparse(raw)
             parts = []
-            # fix(#1770): same reasoning as `database_url_override`'s
+            # Same reasoning as `database_url_override`'s
             # validator -- operator boot-time config.
             host = (
                 parsed.hostname
@@ -1348,49 +1361,44 @@ class Settings(AuthSettings, BaseSettings):
                 parts.append(f"port={parsed.port}")
             if parsed.path and parsed.path != "/":
                 parts.append(f"dbname={libpq_value(parsed.path.lstrip('/'))}")
-            # unquote on the credentials ONLY: SQLAlchemy decodes username and
-            # password but leaves the database name percent-encoded, so decoding
-            # dbname here would make these two clients target a DIFFERENT
-            # database than the API (#1617).
+            # unquote on the credentials ONLY: SQLAlchemy leaves the database name
+            # percent-encoded, so decoding dbname would target a different database
+            # than the API.
             if parsed.username:
                 parts.append(f"user={libpq_value(unquote(parsed.username))}")
             if parsed.password:
                 parts.append(f"password={libpq_value(unquote(parsed.password))}")
             if self.database_ssl_mode != "disable":
                 parts.append(f"sslmode={self.database_ssl_mode}")
-            # verify-full ONLY: libpq treats sslmode=require as verify-ca once
-            # a root CA file is present, so emitting this under `require`
-            # would verify the server cert here while database_connect_args
-            # disables that check for the API (#1617).
+            # verify-full ONLY: libpq treats sslmode=require as verify-ca once a root
+            # CA file is present, so emitting this under `require` would verify the
+            # server cert here while database_connect_args skips that check for the API.
             if self.database_ssl_mode == "verify-full" and self.database_ssl_ca_cert:
                 parts.append(f"sslrootcert={libpq_value(self.database_ssl_ca_cert)}")
-            # BUG-002: the override branch had dropped this search_path
-            # option, breaking the job queue on managed Postgres. Re-add it,
-            # preserving any caller-supplied ?options= -- ours applied last
-            # so it always wins.
-            search_path_opt = f"-c search_path={self.procrastinate_schema},public"
-            # fix(#1770): same reasoning -- operator boot-time config, not a
-            # runtime service-advertised value.
+            # Operator boot-time config, not a runtime service-advertised value.
             caller_options = parse_qs(parsed.query).get(  # parse_qs: unbounded
                 "options", [""]
             )[0]
-            combined_options = (
-                f"{caller_options} {search_path_opt}".strip()
-                if caller_options.strip()
-                else search_path_opt
-            )
-            parts.append(f"options='{combined_options}'")
-            return " ".join(parts)
-        parts = [
-            f"host={libpq_value(self.postgres_host)}",
-            f"port={self.postgres_port}",
-            f"dbname={libpq_value(self.postgres_db)}",
-            f"user={libpq_value(self.postgres_user)}",
-            f"password={libpq_value(self.postgres_password.get_secret_value())}",
-        ]
-        parts += libpq_ssl_parts(self.database_ssl_mode, self.database_ssl_ca_cert)
-        parts.append(f"options='-c search_path={self.procrastinate_schema},public'")
+        else:
+            caller_options = ""
+            parts = [
+                f"host={libpq_value(self.postgres_host)}",
+                f"port={self.postgres_port}",
+                f"dbname={libpq_value(self.postgres_db)}",
+                f"user={libpq_value(self.postgres_user)}",
+                f"password={libpq_value(self.postgres_password.get_secret_value())}",
+            ]
+            parts += libpq_ssl_parts(self.database_ssl_mode, self.database_ssl_ca_cert)
+        # Last, so it wins. Behind a pooler the queue connector sets it, and an
+        # empty value keeps libpq from sending PGOPTIONS, which a pooler refuses.
+        if not self.db_use_external_pooler:
+            caller_options += f" -c search_path={self.procrastinate_search_path}"
+        parts.append(f"options={libpq_value(caller_options.strip())}")
         return " ".join(parts)
+
+    @property
+    def procrastinate_search_path(self) -> str:
+        return f"{self.procrastinate_schema},public"
 
     @property
     def ogr_connection_string(self) -> str:
@@ -1406,7 +1414,7 @@ class Settings(AuthSettings, BaseSettings):
                 raw = raw.replace("postgres://", "postgresql://", 1)
             parsed = urlparse(raw)
             parts = ["PG:"]
-            # fix(#1770): same reasoning as `database_url_override`'s
+            # Same reasoning as `database_url_override`'s
             # validator -- operator boot-time config.
             host = (
                 parsed.hostname
@@ -1420,28 +1428,22 @@ class Settings(AuthSettings, BaseSettings):
                 parts.append(f"port={parsed.port}")
             if parsed.path and parsed.path != "/":
                 parts.append(f"dbname={libpq_value(parsed.path.lstrip('/'))}")
-            # unquote on the credentials ONLY: SQLAlchemy decodes username and
-            # password but leaves the database name percent-encoded, so decoding
-            # dbname here would make these two clients target a DIFFERENT
-            # database than the API (#1617).
+            # unquote on the credentials ONLY: SQLAlchemy leaves the database name
+            # percent-encoded, so decoding dbname would target a different database
+            # than the API.
             if parsed.username:
                 parts.append(f"user={libpq_value(unquote(parsed.username))}")
             if parsed.password:
                 parts.append(f"password={libpq_value(unquote(parsed.password))}")
             if self.database_ssl_mode not in ("disable", "prefer"):
                 parts.append(f"sslmode={self.database_ssl_mode}")
-            # ogr2ogr reaches PostGIS through libpq, which resolves the CA
-            # from the DSN or ~/.postgresql/root.crt -- it cannot see
-            # DATABASE_SSL_CA_CERT, which only reaches asyncpg as an
-            # SSLContext. Without this, verify-full sends libpq looking for
-            # a root.crt not in the image, and every vector ingest fails
-            # while other paths (which never shell out) stay healthy.
-            # Emitted whenever a CA is configured; libpq ignores it under
-            # the modes that don't verify.
-            # verify-full ONLY: libpq treats sslmode=require as verify-ca once
-            # a root CA file is present, so emitting this under `require`
-            # would verify the server cert here while database_connect_args
-            # disables that check for the API (#1617).
+            # ogr2ogr reaches PostGIS through libpq, which cannot see
+            # DATABASE_SSL_CA_CERT (it only reaches asyncpg as an SSLContext) and would
+            # look for ~/.postgresql/root.crt under verify-full, failing every vector
+            # ingest.
+            # verify-full ONLY: libpq treats sslmode=require as verify-ca once a root
+            # CA file is present, so emitting this under `require` would verify the
+            # server cert here while database_connect_args skips that check for the API.
             if self.database_ssl_mode == "verify-full" and self.database_ssl_ca_cert:
                 parts.append(f"sslrootcert={libpq_value(self.database_ssl_ca_cert)}")
             return " ".join(parts)

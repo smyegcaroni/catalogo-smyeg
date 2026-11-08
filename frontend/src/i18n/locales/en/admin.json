@@ -30,8 +30,6 @@
     "byVisibility": "Datasets by Visibility",
     "noDatasets": "No datasets yet",
     "totalUsers": "Total Users",
-    "usersByStatus": "Users by Status",
-    "noUsers": "No users yet",
     "errorLoading": "Failed to load statistics: {{message}}"
   },
   "users": {
@@ -226,7 +224,7 @@
     }
   },
   "audit": {
-    "title": "Audit Logs",
+    "title": "Audit Log",
     "loading": "Loading audit logs...",
     "errorLoading": "Failed to load audit logs: {{message}}",
     "searchPlaceholder": "User / Action",
@@ -236,11 +234,6 @@
       "user": "User",
       "allUsers": "All users",
       "allActions": "All Actions",
-      "datasetView": "Dataset View",
-      "datasetExport": "Dataset Export",
-      "metadataEdit": "Metadata Edit",
-      "datasetCreate": "Dataset Create",
-      "datasetDelete": "Dataset Delete",
       "action": "Action",
       "userId": "User ID",
       "resourceType": "Resource type",
@@ -285,14 +278,8 @@
     "tileCache": "Tile Cache",
     "type": "Type",
     "status": "Status",
-    "latency": "Latency",
-    "ttl": "TTL",
     "cdn": "CDN",
-    "pooler": "Pooler",
-    "connected": "Connected",
-    "disconnected": "Disconnected",
     "configured": "Configured",
-    "notConfigured": "Not Configured",
     "loading": "Loading infrastructure status...",
     "errorLoading": "Failed to load infrastructure status",
     "allOperational": "All Systems Operational",
@@ -385,6 +372,8 @@
     "openaiKeyRequired": "OPENAI_API_KEY is not set. Embedding generation requires an OpenAI-compatible API key, even when using Anthropic for inference.",
     "keyConfigured": "configured",
     "keyNotSet": "not set",
+    "claudePlatformConfigured": "Claude on {{platform}}: configured",
+    "claudePlatformNotConfigured": "Claude on {{platform}}: not configured",
     "testConnection": "Test Connection",
     "testing": "Testing…",
     "testConnectionDescription": "Runs a live call against each configured provider to verify keys and connectivity. Uses a small number of provider tokens.",
@@ -416,6 +405,20 @@
     "scope": "Scope",
     "scopeFull": "Full access",
     "scopeReadOnly": "Read only",
+    "scopePublish": "Publish",
+    "scopePublishDescription": "Adds your own data and maps, edits your datasets' details and replaces uploaded datasets, keeping their previous versions. It can't make anything public or widen a dataset's visibility, update an existing map, replace raster datasets or ones bound to a service, STAC item or table, write features, or delete anything.",
+    "scopeDatasetWrite": "One dataset",
+    "scopeDatasetAppend": "One dataset, add only",
+    "expiry": "Expires",
+    "expiryOptions": {
+      "never": "Never expires",
+      "30d": "30 days",
+      "90d": "90 days",
+      "1y": "1 year"
+    },
+    "expired": "Expired",
+    "expiresOn": "Expires {{date}}",
+    "expiredOn": "Expired {{date}}",
     "creating": "Creating...",
     "createError": "Failed to create key",
     "loadingKeys": "Loading keys...",
@@ -446,8 +449,9 @@
   },
   "apiKeyReveal": {
     "title": "API Key Created",
-    "description": "Copy this key now. It will not be shown again.",
+    "description": "Copy this key now.",
     "warning": "This key will not be shown again. Make sure to copy it now.",
+    "copy": "Copy API key",
     "done": "Done"
   },
   "sharedMaps": {
@@ -510,8 +514,6 @@
     "tableLabel": "Embed tokens"
   },
   "settings": {
-    "copySPEntityId": "Copy SP Entity ID",
-    "copyAcsUrl": "Copy ACS URL",
     "page": {
       "title": "Settings",
       "loadFailed": "Failed to load settings: {{message}}",
@@ -554,6 +556,7 @@
         "upload": "Upload Datasets",
         "create_layers": "Create Layers",
         "export": "Export Data",
+        "exportDescription": "Download dataset files and, together with Upload Datasets, save analysis results as new datasets. Anyone can still download published public datasets, and anyone who can view a dataset can read its features through the API, map tiles and the attribute table.",
         "edit_metadata": "Edit Metadata",
         "manage_collections": "Manage Collections",
         "use_ai_chat": "AI Chat",
@@ -568,12 +571,9 @@
       "descriptionSuffix": "to enable admin overrides."
     },
     "saved": "Settings saved",
-    "saveFailed": "Failed to save settings",
     "resetDefaults": "Reset to Defaults",
     "general": {
       "title": "General",
-      "cardTitle": "Feature Toggles",
-      "cardDescription": "Enable or disable platform features.",
       "registration": "Self-Registration",
       "registrationDescription": "Lets people create their own accounts, by signing up with a password or by signing in through an enabled SSO provider. SSO accounts are active at once with the provider's default role. Password sign-ups activate after email verification (needs SMTP), otherwise after admin approval.",
       "landingFirst": "Login as Landing Page",
@@ -589,7 +589,7 @@
       "bannerEnabled": "Enable Site Banner",
       "bannerEnabledDescription": "Show the announcement banner to all visitors. The banner text below must also be set.",
       "bannerText": "Site Banner Text",
-      "bannerTextDescription": "Announcement banner shown to all visitors at the top of the app. Leave empty for no banner.",
+      "bannerTextDescription": "Announcement banner shown to all visitors at the top of the app. Leave empty for no banner. Link text: [label](https://example.org).",
       "bannerColor": "Site Banner Color",
       "bannerColorDescription": "Color of the announcement banner.",
       "bannerColorWarning": "Warning (amber)",
@@ -607,7 +607,11 @@
       "logJsonLabel": "Log Format (JSON)",
       "logJsonDescription": "Output logs in structured JSON format.",
       "saved": "Settings saved",
-      "saveFailed": "Failed to save settings"
+      "auditRetentionDays": "Audit log retention (days)",
+      "auditRetentionDaysDescription": "Audit records older than this many days are deleted automatically. Leave empty to keep them forever.",
+      "auditRetentionKeepForever": "Keep forever",
+      "auditRetentionInvalid": "Enter a whole number of days ({{min}} to {{max}}), or leave the field empty.",
+      "auditRetentionComplianceWarning": "Some compliance regimes require audit records to be kept for at least {{days}} days."
     },
     "basemaps": {
       "title": "Basemaps",
@@ -630,8 +634,7 @@
       "checkingUrl": "Checking…",
       "removeBasemap": "Remove basemap",
       "add": "Add",
-      "saved": "Basemaps saved",
-      "saveFailed": "Failed to save basemaps"
+      "saved": "Basemaps saved"
     },
     "mapDefaults": {
       "title": "Map Defaults",
@@ -641,9 +644,7 @@
       "longitude": "Longitude",
       "zoomLevel": "Zoom Level",
       "preview": "Preview",
-      "useCurrentView": "Use current view",
-      "saved": "Map defaults saved",
-      "saveFailed": "Failed to save map defaults"
+      "saved": "Map defaults saved"
     },
     "plugins": {
       "title": "Map Plugins",
@@ -686,8 +687,6 @@
     },
     "security": {
       "title": "Security",
-      "cardTitle": "Login Rate Limiting",
-      "cardDescription": "Control the maximum number of login attempts per minute per IP address.",
       "loginRateLimit": "Login attempts per minute",
       "accessTokenExpire": "Access Token Lifetime (minutes)",
       "refreshTokenExpire": "Session idle timeout (days)",
@@ -695,7 +694,6 @@
       "tokenLifetimeNote": "Token lifetime changes apply to newly issued tokens only.",
       "loginRateLimitDescription": "Maximum number of login requests allowed per minute from a single IP address (1–1000).",
       "saved": "Security settings saved",
-      "saveFailed": "Failed to save security settings",
       "passwordLogin": "Allow Password Login",
       "passwordLoginDescription": "Allow users to sign in with a username and password. Disabling this requires users to sign in via an SSO provider, so enable one first. Administrators can still sign in with a password as a break-glass.",
       "emailVerificationRequired": "Require Email Verification",
@@ -711,14 +709,16 @@
     },
     "uploads": {
       "title": "Upload Settings",
-      "cardTitle": "Upload Limits",
-      "cardDescription": "Configure maximum file size and allowed file extensions for dataset uploads.",
       "maxSizeMb": "Maximum file size (MB)",
       "maxSizeMbDescription": "Maximum upload file size in megabytes (1-10,000). Changes take effect on the next upload without restart.",
       "allowedExtensions": "Allowed extensions",
       "allowedExtensionsDescription": "Comma-separated list of allowed file extensions (e.g. .zip,.gpkg,.geojson,.json,.csv,.tif,.tiff,.xlsx,.xls).",
       "tileCacheTtl": "Tile Cache TTL (seconds)",
       "tileCacheTtlDescription": "Time in seconds before tile cache entries expire (0 = no cache).",
+      "previousVersionsKept": "Previous versions kept per dataset",
+      "previousVersionsKeptDescription": "How many replaced versions of each dataset stay restorable, from 1 to 50. Lowering it frees storage at each dataset's next replacement or restore.",
+      "invalidPreviousVersionsKept": "Enter a whole number from 1 to 50.",
+      "previousVersionsStorage": "Kept versions currently use {{size}}.",
       "perUserLimitsTitle": "Per-user limits",
       "perUserLimitsDescription": "Caps applied to every user, enforced when they upload. Set 0 for unlimited.",
       "maxStoragePerUser": "Max storage per user",
@@ -729,8 +729,9 @@
       "invalidStorageQuantity": "Enter a quantity that equals a whole number of bytes.",
       "maxDatasetsPerUser": "Max Datasets per User",
       "maxDatasetsPerUserDescription": "Maximum number of datasets each user can create (0 = unlimited).",
-      "saved": "Upload settings saved",
-      "saveFailed": "Failed to save upload settings"
+      "maxStoryImageMbPerUser": "Max story image storage per user (MB)",
+      "maxStoryImageMbPerUserDescription": "The total size of images one user's stories can hold, in megabytes (0 = unlimited). Images already stored stay; only new uploads and copies are refused.",
+      "saved": "Upload settings saved"
     },
     "oauth": {
       "title": "OAuth Providers",
@@ -824,6 +825,20 @@
       "registrationAdminConfirmDescription": "Every password sign-up that verifies its email will become an administrator. Make sure that is what you want.",
       "signupAdminActivationDescription": "After this change, people who sign up can become administrators without an administrator approving them. Make sure that is what you want.",
       "verificationNeedsRegistration": "Applies when Self-Registration is on."
+    },
+    "storyFrames": {
+      "title": "Story embeds and videos",
+      "description": "Sites whose pages and video players stories may show in a frame. Readers' browsers load them straight from these sites. With no sites, embed and video blocks are off.",
+      "empty": "No sites yet, so embed and video blocks are off.",
+      "hostLabel": "Site host name",
+      "add": "Add site",
+      "invalid": "Enter a host name such as media.example.org, without https:// or a path. Wildcards aren't accepted.",
+      "duplicate": "That site is already on the list.",
+      "full": "The list holds at most {{max}} sites.",
+      "sameOrigin": "Keep the site's origin",
+      "sameOriginHint": "Some video players need their own origin to play. The frame keeps that origin wherever the site sends it, so any other approved site it opens gets it too. Turn it on only for a site you trust with every approved site.",
+      "remove": "Remove {{host}}",
+      "reloadHint": "Pages already open pick up the list after a reload."
     }
   },
   "saml": {
@@ -833,8 +848,7 @@
       "title": "SAML SSO",
       "description": "Not available in this build.",
       "heading": "SAML is not available",
-      "body": "This GeoLens build supports local accounts and OAuth providers such as Google, GitHub, and generic OIDC.",
-      "docsLink": "SAML is not available in this build"
+      "body": "This GeoLens build supports local accounts and OAuth providers such as Google, GitHub, and generic OIDC."
     },
     "addProvider": "Add SAML Provider",
     "loading": "Loading SAML providers...",
@@ -894,5 +908,66 @@
   "sortable": {
     "sortAscending": "sort ascending",
     "sortDescending": "sort descending"
+  },
+  "groups": {
+    "title": "Groups",
+    "listHeading": "Sharing groups",
+    "errorLoading": "Failed to load groups: {{message}}",
+    "nameLabel": "Group name",
+    "actionsFor": "Actions for group {{name}}",
+    "table": {
+      "name": "Name",
+      "members": "Members",
+      "created": "Created",
+      "actions": "Actions",
+      "manageMembers": "Members",
+      "memberCount_one": "{{count}} member",
+      "memberCount_other": "{{count}} members"
+    },
+    "empty": {
+      "title": "No groups yet",
+      "hint": "Create a group, add people to it, then share datasets, maps and stories with it."
+    },
+    "create": {
+      "button": "Create group",
+      "title": "Create group",
+      "description": "Groups let you share restricted datasets, maps and stories with a set of people."
+    },
+    "rename": {
+      "button": "Rename",
+      "title": "Rename group",
+      "description": "Choose a new name for {{name}}."
+    },
+    "delete": {
+      "title": "Delete {{name}}?",
+      "description_one": "This group has {{count}} member. They lose access to datasets, maps and stories shared with the group right away. This can't be undone.",
+      "description_other": "This group has {{count}} members. They lose access to datasets, maps and stories shared with the group right away. This can't be undone.",
+      "deleting": "Deleting..."
+    },
+    "members": {
+      "title": "Members of {{name}}",
+      "description": "People in this group can open the datasets, maps and stories shared with it.",
+      "addLabel": "Add a person",
+      "listHeading_one": "{{count}} member",
+      "listHeading_other": "{{count}} members",
+      "listLabel": "Members of {{name}}",
+      "removeLabel": "Remove {{name}} from {{group}}",
+      "empty": "This group has no members yet.",
+      "added": "{{name}} added",
+      "removed": "{{name}} removed",
+      "errorLoading": "Failed to load members: {{message}}",
+      "needsUserManagement": "Adding people needs user management permission. You can still see and remove members."
+    },
+    "picker": {
+      "placeholder": "Search by username",
+      "noMatches": "No matching people",
+      "results_one": "{{count}} person available",
+      "results_other": "{{count}} people available"
+    },
+    "toasts": {
+      "created": "Group created",
+      "renamed": "Group renamed",
+      "deleted": "Group deleted"
+    }
   }
 }

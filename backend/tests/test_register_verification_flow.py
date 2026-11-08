@@ -1,4 +1,4 @@
-"""Phase 1231 Plan 02 — Full-matrix integration tests for email-verified self-serve signup.
+"""Full-matrix integration tests for email-verified self-serve signup.
 
 Covers the eight-case behaviour matrix:
 
@@ -24,6 +24,10 @@ Covers the eight-case behaviour matrix:
 (5) resend enumeration safety
     → POST /auth/resend-verification returns SAME 200 body for known unverified
       email AND for unknown email; known one triggers a second send.
+
+(5b) admin-approval mode, or sign-ups closed
+    → resend sends nothing and answers with the same body; a link still held
+      confirms the address but leaves the account pending with no role.
 
 (6) pre-verification user blocked from protected endpoint
     → GET /auth/me with invalid/pre-verify creds rejected.
@@ -52,7 +56,7 @@ from unittest.mock import AsyncMock
 # Helpers
 # ---------------------------------------------------------------------------
 
-_STRONG_PASSWORD = "StrongPass1234!"  # meets SEC-S16 policy
+_STRONG_PASSWORD = "StrongPass1234!"  # meets policy
 _TEST_SMTP_PASSWORD = "smtp-super-secret-pass"
 
 
@@ -213,7 +217,7 @@ async def test_signup_off_returns_403_no_email(
     captured_send_email: list,
     set_persistent_config,
 ) -> None:
-    """SIGNUP-06: when REGISTRATION_ENABLED is off, register returns 403 and no email is sent."""
+    """When REGISTRATION_ENABLED is off, register returns 403 and no email is sent."""
     from app.core.persistent_config import REGISTRATION_ENABLED
 
     await set_persistent_config(REGISTRATION_ENABLED, False)
@@ -243,7 +247,7 @@ async def test_signup_on_verification_required_emails_registrant(
     test_db_session,
     set_persistent_config,
 ) -> None:
-    """SIGNUP-03: register with verification on sends 1 email to the registrant."""
+    """Register with verification on sends 1 email to the registrant."""
     from app.core.persistent_config import (
         EMAIL_VERIFICATION_REQUIRED,
         REGISTRATION_ENABLED,
@@ -362,7 +366,7 @@ async def test_verify_email_activates_account_and_login_works(
     test_db_session,
     set_persistent_config,
 ) -> None:
-    """SIGNUP-03/04: verify-email with valid token activates the account; login then succeeds."""
+    """verify-email with valid token activates the account; login then succeeds."""
     from app.core.persistent_config import (
         EMAIL_VERIFICATION_REQUIRED,
         REGISTRATION_ENABLED,
@@ -423,7 +427,7 @@ async def test_verify_email_activates_account_and_login_works(
 
 
 # ---------------------------------------------------------------------------
-# CR-01: a valid token must not re-activate an admin-suspended account
+# A valid token must not re-activate an admin-suspended account
 # ---------------------------------------------------------------------------
 
 
@@ -434,7 +438,7 @@ async def test_verify_email_does_not_reactivate_suspended_account(
     test_db_session,
     set_persistent_config,
 ) -> None:
-    """CR-01: if an admin suspends a still-pending account within the token's
+    """If an admin suspends a still-pending account within the token's
     validity window, clicking the verification link must consume the token but
     must NOT silently re-activate the account."""
     from sqlalchemy import update
@@ -556,7 +560,7 @@ async def test_resend_verification_enumeration_safe(
     captured_send_email: list,
     set_persistent_config,
 ) -> None:
-    """SIGNUP-05: resend returns same 200 body for known and unknown email."""
+    """Resend returns same 200 body for known and unknown email."""
     from app.core.persistent_config import (
         EMAIL_VERIFICATION_REQUIRED,
         REGISTRATION_ENABLED,
@@ -621,6 +625,133 @@ async def test_resend_verification_enumeration_safe(
 
 
 # ---------------------------------------------------------------------------
+# Case (5b): a verification link never stands in for admin approval
+# ---------------------------------------------------------------------------
+
+
+async def _pending_signup(client: AsyncClient) -> tuple[str, str]:
+    username = _unique_username()
+    email = _unique_email()
+    resp = await client.post(
+        "/auth/register/",
+        json={"username": username, "password": _STRONG_PASSWORD, "email": email},
+    )
+    assert resp.status_code == 201, resp.text
+    return username, email
+
+
+async def _assert_still_awaiting_approval(
+    client: AsyncClient, test_db_session, username: str
+) -> None:
+    from app.modules.auth.models import User, UserRole
+
+    test_db_session.expire_all()
+    user = (
+        await test_db_session.execute(select(User).where(User.username == username))
+    ).scalar_one()
+    assert user.email_verified is True
+    assert (user.status, user.is_active) == ("pending", False)
+    roles = await test_db_session.scalar(
+        select(UserRole.role_id).where(UserRole.user_id == user.id)
+    )
+    assert roles is None
+    login = await client.post(
+        "/auth/login", data={"username": username, "password": _STRONG_PASSWORD}
+    )
+    assert login.status_code == 403, login.text
+
+
+@pytest.mark.anyio
+async def test_resend_sends_nothing_in_admin_approval_mode(
+    client: AsyncClient,
+    captured_send_email: list,
+    set_persistent_config,
+) -> None:
+    """With verification off, resend mails no link and keeps the generic body."""
+    from app.core.persistent_config import (
+        EMAIL_VERIFICATION_REQUIRED,
+        REGISTRATION_ENABLED,
+    )
+
+    await set_persistent_config(REGISTRATION_ENABLED, True)
+    await set_persistent_config(EMAIL_VERIFICATION_REQUIRED, False)
+    _, email = await _pending_signup(client)
+    assert captured_send_email == []
+
+    known = await client.post("/auth/resend-verification/", json={"email": email})
+    unknown = await client.post(
+        "/auth/resend-verification/", json={"email": _unique_email()}
+    )
+
+    assert known.status_code == unknown.status_code == 200
+    assert known.content == unknown.content
+    assert captured_send_email == []
+
+
+@pytest.mark.anyio
+async def test_verify_email_in_admin_approval_mode_does_not_activate(
+    client: AsyncClient,
+    captured_send_email: list,
+    test_db_session,
+    set_persistent_config,
+) -> None:
+    """A link redeemed with verification off confirms the address only."""
+    from app.core.persistent_config import (
+        EMAIL_VERIFICATION_REQUIRED,
+        REGISTRATION_ENABLED,
+    )
+    from app.modules.auth.models import User
+    from app.modules.auth.verification import issue_verification_token
+
+    await set_persistent_config(REGISTRATION_ENABLED, True)
+    await set_persistent_config(EMAIL_VERIFICATION_REQUIRED, False)
+    username, _ = await _pending_signup(client)
+    user_id = await test_db_session.scalar(
+        select(User.id).where(User.username == username)
+    )
+    raw_token = await issue_verification_token(test_db_session, user_id)
+    await test_db_session.commit()
+
+    verify = await client.post("/auth/verify-email/", json={"token": raw_token})
+
+    assert verify.status_code == 200, verify.text
+    assert verify.json()["next_step"] == "await_approval"
+    await _assert_still_awaiting_approval(client, test_db_session, username)
+
+
+@pytest.mark.anyio
+async def test_verify_email_after_signups_close_does_not_activate(
+    client: AsyncClient,
+    captured_send_email: list,
+    test_db_session,
+    set_persistent_config,
+) -> None:
+    """A link mailed while sign-ups were open no longer activates once they close."""
+    from app.core.persistent_config import (
+        EMAIL_VERIFICATION_REQUIRED,
+        REGISTRATION_ENABLED,
+    )
+
+    await set_persistent_config(REGISTRATION_ENABLED, True)
+    await set_persistent_config(EMAIL_VERIFICATION_REQUIRED, True)
+    username, email = await _pending_signup(client)
+    token_match = re.search(r"token=([A-Za-z0-9_\-]+)", captured_send_email[0].body)
+    assert token_match
+    await set_persistent_config(REGISTRATION_ENABLED, False)
+
+    resend = await client.post("/auth/resend-verification/", json={"email": email})
+    verify = await client.post(
+        "/auth/verify-email/", json={"token": token_match.group(1)}
+    )
+
+    assert resend.status_code == 200
+    assert len(captured_send_email) == 1
+    assert verify.status_code == 200, verify.text
+    assert verify.json()["next_step"] == "await_approval"
+    await _assert_still_awaiting_approval(client, test_db_session, username)
+
+
+# ---------------------------------------------------------------------------
 # Case (6): pre-verification user blocked from protected endpoint
 # ---------------------------------------------------------------------------
 
@@ -631,7 +762,7 @@ async def test_unverified_user_blocked_from_protected_endpoint(
     captured_send_email: list,
     set_persistent_config,
 ) -> None:
-    """SIGNUP-04: an inactive/unverified user cannot reach /auth/me."""
+    """An inactive/unverified user cannot reach /auth/me."""
     from app.core.persistent_config import (
         EMAIL_VERIFICATION_REQUIRED,
         REGISTRATION_ENABLED,
@@ -673,7 +804,7 @@ async def test_smtp_failure_returns_clear_non_leaky_error(
     set_persistent_config,
     monkeypatch,
 ) -> None:
-    """T-1231-07: SMTP failure → clear HTTP error, secret never in response body."""
+    """SMTP failure → clear HTTP error, secret never in response body."""
     import smtplib
 
     from app.core.persistent_config import (
@@ -748,7 +879,7 @@ async def test_cloud_gate_preserved(
     set_persistent_config,
     monkeypatch,
 ) -> None:
-    """T-1231-08: cloud mode 403 gate is preserved; global self-signup stays disabled."""
+    """Cloud mode 403 gate is preserved; global self-signup stays disabled."""
     from app.core.persistent_config import REGISTRATION_ENABLED
 
     # Turn signup ON so the cloud-gate check is the ONLY reason for the 403
@@ -913,7 +1044,7 @@ async def test_register_collision_response_identical_to_new_user(
     captured_send_email: list,
     set_persistent_config,
 ) -> None:
-    """SEC-012 regression: under verification+SMTP, a swallowed username/email
+    """Regression: under verification+SMTP, a swallowed username/email
     collision returns a response BYTE-IDENTICAL to a genuine new signup (same
     message AND next_step), so account existence cannot be enumerated via the
     register response. (Before the fix the new-user path returned 'verify_email'
@@ -1050,7 +1181,7 @@ async def test_verify_notify_not_called(
     assert resp.status_code == 201, resp.text
 
     # notify() must not have been called for the verification email
-    # (admin EVENT-01 signup notify goes through emit_event_safe which
+    # (admin signup notify goes through emit_event_safe which
     # calls notify() only when the toggle is on; in tests notify_on_signup
     # defaults False, so notify_calls should still be empty)
     email_verif_notify_calls = [

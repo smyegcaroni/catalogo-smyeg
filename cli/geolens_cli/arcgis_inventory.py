@@ -9,27 +9,19 @@ one run and are never written anywhere.
 
 from __future__ import annotations
 
-import email.utils
-import getpass
-import http.client
-import json
-import os
 import re
-import socket
-import ssl
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, quote_plus, unquote_plus, urlencode, urlsplit
+from urllib.parse import quote, urlsplit
 
 from . import arcgis_report as _report
 from . import output as _output
@@ -41,30 +33,25 @@ from ._sdk_helpers import (
     EXIT_SERVER,
     EXIT_USAGE,
 )
+from .arcgis_portal import (
+    PortalClient,
+    PortalError,
+    Redactor,
+    build_opener,
+    portal_root,
+    read_credentials,
+    redact_json,
+    sanitize_url,
+)
 
-# AGOL and Enterprise 10.5.1+ read the token from this header. Not
-# `Authorization`, which a web tier in front of Enterprise may consume.
-ESRI_AUTHORIZATION_HEADER = "X-Esri-Authorization"
 DEFAULT_PORTAL_URL = "https://www.arcgis.com"
 PAGE_SIZE = 100
 DEFAULT_MAX_ITEMS = 10_000
 MAX_CONCURRENCY = 4
 # ArcGIS search pages through only the first 10,000 results of a query.
 SEARCH_RESULT_CEILING = 10_000
-MIN_REQUEST_INTERVAL = 0.1
-SOCKET_TIMEOUT = 10.0
-REQUEST_DEADLINE = 30.0
-MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_DESCRIPTION_BYTES = 64 * 1024
-GET_ATTEMPTS = 3
-MAX_RETRY_AFTER = 60.0
-TOKEN_EXPIRATION_MINUTES = 60
 
-_RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
-_TOKEN_REQUIRED = 499
-_TOKEN_INVALID = 498
-_TOKEN_CHARS = re.compile(r"[\x21-\x7e]+")
-_CREDENTIAL_PARAM = re.compile(r"((?:token|password)=)[^&;#\s]+", re.IGNORECASE)
 # ArcGIS Online hosted services: services.arcgis.com, services1.arcgis.com,
 # services-eu1.arcgis.com, and the same forms for tiles.
 _ARCGIS_ONLINE_HOSTED = re.compile(r"(services|tiles)(-[a-z]+)?\d*\.arcgis\.com")
@@ -177,33 +164,6 @@ _APP_DATA_TYPES = frozenset(
 )
 # Items whose data is a web map's configuration.
 _MAP_CONFIG_TYPES = frozenset({"Web Map", "Web Scene"})
-# One matcher names a credential in a JSON key and in a URL parameter. Names
-# are compared lower-cased with separators removed; the parts below match
-# anywhere in a name, so compound names such as accessToken are covered, and
-# the exact names are too short to match as parts.
-_CREDENTIAL_NAME_PARTS = (
-    "token",
-    "password",
-    "passwd",
-    "passphrase",
-    "secret",
-    "apikey",
-    "accesskey",
-    "subscriptionkey",
-    "saskey",
-    "privatekey",
-    "credential",
-    "authorization",
-    "authcode",
-    "bearer",
-    "signature",
-    "customparameters",
-)
-_CREDENTIAL_NAME_EXACT = frozenset({"sig", "auth", "pwd"})
-_URL_PARAM = re.compile(r"(^|[?&;#,(\s])([^=&;?/\s\"'#]+)=([^&;#\s]+)")
-# A key that is a URL or an assignment holds text to scrub, not a bare name.
-_COMPOUND_KEY = re.compile(r"(?:[a-z][a-z0-9+.-]*:)?//|[=&?]", re.IGNORECASE)
-_URL_USERINFO = re.compile(r"(//)[^/@\s]+@")
 _ITEM_ID = re.compile(r"[0-9A-Za-z]{32}")
 _SAFE_FILENAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _WEB_MAP_TYPE = "Web Map"
@@ -212,622 +172,6 @@ _HIDDEN_STATUSES = frozenset({400, 403})
 _HIDDEN_ITEM_STATUSES = frozenset({400, 401, 403, 404})
 _SERVICE_LAYER_URL = re.compile(r"/(?:Feature|Map)Server/(\d+)/?$")
 _WAB_KEYWORDS = frozenset({"web appbuilder", "wab2d", "wab3d"})
-
-
-class Redactor:
-    """Replaces known secrets, and any ``token=``/``password=`` value, in text."""
-
-    def __init__(self) -> None:
-        self._forms: list[str] = []
-
-    def add(self, secret: str | None) -> None:
-        if not secret:
-            return
-        for form in (secret, quote(secret, safe=""), quote_plus(secret)):
-            if form not in self._forms:
-                self._forms.append(form)
-        self._forms.sort(key=len, reverse=True)
-
-    def __call__(self, text: str) -> str:
-        for form in self._forms:
-            text = text.replace(form, "[REDACTED]")
-        return _CREDENTIAL_PARAM.sub(r"\1[REDACTED]", text)
-
-
-def _is_credential_name(name: str) -> bool:
-    """Whether a JSON key or URL parameter name holds a credential."""
-    normal = re.sub(r"[^a-z0-9]", "", name.lower())
-    return normal in _CREDENTIAL_NAME_EXACT or any(
-        part in normal for part in _CREDENTIAL_NAME_PARTS
-    )
-
-
-def _scrub_param(match: re.Match[str]) -> str:
-    lead, name, value = match.groups()
-    if _is_credential_name(unquote_plus(name)):
-        value = "[REDACTED]"
-    return f"{lead}{name}={value}"
-
-
-_HEADER = re.compile(
-    r"\b((?:proxy-)?authorization|cookie|set-cookie|(?:x[-_]?)?api[-_]?key|x-esri-authorization)"
-    r"(\s*[:=]\s*)[^\r\n]+",
-    re.IGNORECASE,
-)
-_SCHEME_CREDENTIAL = re.compile(
-    r"\b(Bearer|Basic|Token|Digest)(\s+)([A-Za-z0-9._~+/=-]{12,})", re.IGNORECASE
-)
-_JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*")
-_PEM = re.compile(
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)",
-    re.DOTALL,
-)
-_AWS_KEY_ID = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
-_JSON_PAIR = re.compile(r'"([^"\\]{1,64})"(\s*:\s*)"(?:[^"\\]|\\.)*"')
-_MAX_EMBEDDED_DEPTH = 3
-
-
-def _scrub_scheme(match: re.Match[str]) -> str:
-    scheme, space, _ = match.groups()
-    return f"{scheme}{space}[REDACTED]"
-
-
-def _scrub_pair(match: re.Match[str]) -> str:
-    name, colon = match.group(1), match.group(2)
-    return (
-        f'"{name}"{colon}"[REDACTED]"' if _is_credential_name(name) else match.group(0)
-    )
-
-
-def _scrub_text(text: str, redact: Redactor, depth: int = 0) -> str:
-    """*text* with every credential shape this module knows masked.
-
-    JSON held inside a string is parsed and scrubbed like the document around
-    it; any other text goes through the shape patterns, which cover query and
-    assignment forms, URL userinfo, auth headers and schemes, JWTs, private
-    keys and cloud access key ids.
-    """
-    stripped = text.lstrip()
-    if depth < _MAX_EMBEDDED_DEPTH and stripped[:1] in ("{", "["):
-        try:
-            embedded = json.loads(stripped)
-        except (ValueError, RecursionError):
-            embedded = None
-        if isinstance(embedded, dict | list):
-            return json.dumps(_redact_json(embedded, redact, depth + 1))
-    text = redact(text)
-    text = _PEM.sub("[REDACTED]", text)
-    text = _HEADER.sub(r"\1\2[REDACTED]", text)
-    text = _SCHEME_CREDENTIAL.sub(_scrub_scheme, text)
-    text = _JWT.sub("[REDACTED]", text)
-    text = _AWS_KEY_ID.sub("[REDACTED]", text)
-    if "=" in text or "//" in text:
-        text = _URL_PARAM.sub(_scrub_param, text)
-        text = _URL_USERINFO.sub(r"\1[REDACTED]@", text)
-    if '":' in text or '" :' in text:
-        text = _JSON_PAIR.sub(_scrub_pair, text)
-    return text
-
-
-def redact_json(value: Any, redact: Redactor) -> Any:
-    """A copy of *value* that is safe to write to disk (see ``_redact_json``)."""
-    return _redact_json(value, redact, 0)
-
-
-def _redact_json(value: Any, redact: Redactor, depth: int) -> Any:
-    """A copy of *value* that is safe to write to disk.
-
-    The value under any key named like a credential becomes ``[REDACTED]`` at
-    any depth, and every other string passes through *redact*. The walk is
-    iterative so a deeply nested document can't exhaust the stack.
-    """
-    if not isinstance(value, dict | list):
-        return _scrub_text(value, redact, depth) if isinstance(value, str) else value
-    root: Any = {} if isinstance(value, dict) else []
-    stack = [(value, root)]
-    while stack:
-        source, target = stack.pop()
-        pairs = source.items() if isinstance(source, dict) else enumerate(source)
-        for key, item in pairs:
-            if (
-                isinstance(source, dict)
-                and isinstance(key, str)
-                and not _COMPOUND_KEY.search(key)
-                and _is_credential_name(key)
-            ):
-                out: Any = "[REDACTED]"
-            elif isinstance(item, dict | list):
-                out = {} if isinstance(item, dict) else []
-                stack.append((item, out))
-            else:
-                out = (
-                    _scrub_text(item, redact, depth) if isinstance(item, str) else item
-                )
-            if isinstance(source, dict):
-                name = _scrub_text(key, redact, depth) if isinstance(key, str) else key
-                # Two keys can scrub to the same text; keep both values.
-                while name in target:
-                    name = f"{name}#"
-                target[name] = out
-            else:
-                target.append(out)
-    return root
-
-
-class PortalError(Exception):
-    """A portal request failed; ``kind`` picks the exit code.
-
-    The message is redacted when the error is built, so ``str()`` is safe to
-    print anywhere.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        kind: str,
-        http_status: int | None = None,
-        retryable: bool = False,
-        retry_after: float | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.kind = kind
-        self.http_status = http_status
-        self.retryable = retryable
-        self.retry_after = retry_after
-
-
-class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-class _Watchdog:
-    """Shuts a request's connection down when its deadline passes.
-
-    It keeps a duplicate of the connection's descriptor. TLS wrapping
-    detaches the original socket object from the descriptor, but shutting
-    down any descriptor of a connection ends it for every reader, so the
-    duplicate still interrupts a TLS handshake or read.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._dup: socket.socket | None = None
-        self.fired = False
-
-    def attach(self, sock: socket.socket) -> socket.socket:
-        with self._lock:
-            self._close_dup()
-            self._dup = sock.dup()
-            if self.fired:
-                _shutdown(self._dup)
-        return sock
-
-    def fire(self) -> None:
-        with self._lock:
-            self.fired = True
-            if self._dup is not None:
-                _shutdown(self._dup)
-
-    def release(self) -> None:
-        with self._lock:
-            self._close_dup()
-
-    def _close_dup(self) -> None:
-        if self._dup is not None:
-            self._dup.close()
-            self._dup = None
-
-
-def _shutdown(sock: socket.socket) -> None:
-    try:
-        sock.shutdown(socket.SHUT_RDWR)
-    except OSError:
-        pass
-
-
-class _WatchedConnections:
-    """Hands each new connection's socket to the request's watchdog.
-
-    http.client opens the socket through the connection's private
-    ``_create_connection`` attribute, before any TLS wrapping, so the
-    watchdog covers the handshake, status line, headers, chunk framing and
-    body alike.
-    """
-
-    def do_open(self, http_class, req, **kwargs):
-        watchdog = getattr(req, "watchdog", None)
-
-        def connection(host, **conn_kwargs):
-            conn = http_class(host, **conn_kwargs)
-            if watchdog is not None:
-                create = conn._create_connection
-                conn._create_connection = lambda *a, **k: watchdog.attach(
-                    create(*a, **k)
-                )
-            return conn
-
-        return super().do_open(connection, req, **kwargs)
-
-
-class _WatchedHTTPHandler(_WatchedConnections, urllib.request.HTTPHandler):
-    pass
-
-
-class _WatchedHTTPSHandler(_WatchedConnections, urllib.request.HTTPSHandler):
-    pass
-
-
-def build_opener(
-    context: ssl.SSLContext | None = None,
-) -> urllib.request.OpenerDirector:
-    """An opener that refuses redirects and honors per-request deadlines.
-
-    A redirect would carry the credential header to wherever the portal
-    points, so none is followed. *context* overrides the default TLS
-    verification context.
-    """
-    return urllib.request.build_opener(
-        _RefuseRedirects(),
-        _WatchedHTTPHandler(),
-        _WatchedHTTPSHandler(context=context),
-    )
-
-
-class PortalClient:
-    """JSON reads against one portal's ``/sharing/rest`` API."""
-
-    def __init__(
-        self,
-        root_url: str,
-        *,
-        opener: Any,
-        redact: Redactor,
-        token: str | None = None,
-        sleep: Callable[[float], None] = time.sleep,
-        clock: Callable[[], float] = time.monotonic,
-        on_request: Callable[[str, str], None] | None = None,
-    ) -> None:
-        self.root = root_url.rstrip("/")
-        self.token = token
-        self._opener = opener
-        self._redact = redact
-        self._sleep = sleep
-        self._clock = clock
-        self._on_request = on_request
-        self._form_token = False
-        self._referer: str | None = None
-        self._lock = threading.Lock()
-        self._next_slot = 0.0
-
-    def _error(self, message: str, **kwargs: Any) -> PortalError:
-        return PortalError(self._redact(message), **kwargs)
-
-    def get_json(self, path: str, params: Mapping[str, Any] | None = None) -> dict:
-        """GET ``/sharing/rest/<path>`` as JSON, retrying transient failures.
-
-        An error envelope in a 200 body raises ``PortalError``. A 499 "token
-        required", as an envelope or an HTTP status, with the header present
-        means a pre-10.5.1 server ignored it; from then on the token goes in a
-        POST form field, never the URL.
-        """
-        query = {**(params or {}), "f": "json"}
-        url = f"{self.root}/sharing/rest/{path}"
-        sent_as_form = self._form_token
-        try:
-            return self._get_json_once(path, url, query)
-        except PortalError as exc:
-            if exc.http_status != _TOKEN_REQUIRED or not self.token or sent_as_form:
-                raise
-        self._form_token = True
-        return self._get_json_once(path, url, query)
-
-    def switch_to_form_token(self) -> bool:
-        """Send the token as a POST form field from now on; False if it
-        already was, or there is no token."""
-        if not self.token or self._form_token:
-            return False
-        self._form_token = True
-        return True
-
-    def _get_json_once(self, path: str, url: str, query: dict[str, Any]) -> dict:
-        """One read, retrying a transient error envelope like an HTTP status."""
-        for attempt in range(1, GET_ATTEMPTS + 1):
-            data = self._read(url, query)
-            code = _envelope_code(data)
-            if code is None:
-                return data
-            error = self._envelope_error(path, data, code)
-            if not error.retryable or attempt == GET_ATTEMPTS:
-                raise error
-            self._sleep(0.5 * 2 ** (attempt - 1))
-        raise AssertionError("unreachable")
-
-    def generate_token(self, username: str, password: str) -> str:
-        """Mint a 60-minute token bound to the portal origin as its referer.
-
-        Never retried: ArcGIS locks an account after five failed sign-ins in
-        fifteen minutes. Every later request sends that referer, since a
-        portal enforcing the binding rejects the token without it.
-        """
-        referer = _origin(self.root)
-        fields = {
-            "username": username,
-            "password": password,
-            "client": "referer",
-            "referer": referer,
-            "expiration": str(TOKEN_EXPIRATION_MINUTES),
-            "f": "json",
-        }
-        url = f"{self.root}/sharing/rest/generateToken"
-        try:
-            data = self._exchange("POST", url, fields, {}, attempts=1)
-        except PortalError as exc:
-            if exc.kind != "auth":
-                raise
-            data = {}
-        token = data.get("token")
-        if _envelope_code(data) is not None or not isinstance(token, str) or not token:
-            detail = _envelope_message(data, self._redact) or "no token in the response"
-            raise self._error(
-                f"sign-in failed: {detail}. Accounts that sign in through SAML "
-                "or OpenID Connect cannot use a password here; pass a token "
-                "with --token, ARCGIS_TOKEN or --token-stdin instead.",
-                kind="auth",
-            )
-        if not _TOKEN_CHARS.fullmatch(token):
-            raise self._error(
-                "the portal returned a token with unexpected characters",
-                kind="auth",
-            )
-        self._redact.add(token)
-        self.token = token
-        self._referer = referer
-        return token
-
-    def _read(self, url: str, query: dict[str, Any]) -> dict:
-        headers = {"Referer": self._referer} if self._referer else {}
-        if self.token and self._form_token:
-            return self._exchange(
-                "POST",
-                url,
-                {**query, "token": self.token},
-                headers,
-                attempts=GET_ATTEMPTS,
-            )
-        if self.token:
-            headers[ESRI_AUTHORIZATION_HEADER] = f"Bearer {self.token}"
-        return self._exchange(
-            "GET", f"{url}?{urlencode(query)}", None, headers, attempts=GET_ATTEMPTS
-        )
-
-    def _exchange(
-        self,
-        method: str,
-        url: str,
-        form: Mapping[str, Any] | None,
-        headers: dict[str, str],
-        *,
-        attempts: int,
-    ) -> dict:
-        body = urlencode(form).encode() if form is not None else None
-        if body is not None:
-            headers = {**headers, "Content-Type": "application/x-www-form-urlencoded"}
-        path = urlsplit(url).path
-        for attempt in range(1, attempts + 1):
-            self._wait_turn()
-            if self._on_request:
-                self._on_request(method, path)
-            request = urllib.request.Request(
-                url,
-                data=body,
-                headers={**headers, "Accept": "application/json"},
-                method=method,
-            )
-            try:
-                raw = self._open_once(request, path)
-            except PortalError as exc:
-                if not exc.retryable or attempt == attempts:
-                    raise
-                delay = exc.retry_after
-                self._sleep(delay if delay is not None else 0.5 * 2 ** (attempt - 1))
-                continue
-            return self._parse(raw, path)
-        raise AssertionError("unreachable")
-
-    def _wait_turn(self) -> None:
-        with self._lock:
-            now = self._clock()
-            wait = self._next_slot - now
-            self._next_slot = max(now, self._next_slot) + MIN_REQUEST_INTERVAL
-        if wait > 0:
-            self._sleep(wait)
-
-    def _open_once(self, request: urllib.request.Request, path: str) -> bytes:
-        """One request, bounded end to end by ``REQUEST_DEADLINE``.
-
-        A timer shuts the socket down at the deadline, so a server that
-        trickles any part of the response can't hold the request open.
-        """
-        deadline = self._clock() + REQUEST_DEADLINE
-        watchdog = _Watchdog()
-        request.watchdog = watchdog
-        timer = threading.Timer(REQUEST_DEADLINE, watchdog.fire)
-        timer.daemon = True
-        timer.start()
-        try:
-            raw = self._open_and_read(request, path, deadline)
-        except Exception:  # broad: a shut socket can surface as any I/O error
-            if watchdog.fired:
-                raise self._deadline_error(path) from None
-            raise
-        finally:
-            timer.cancel()
-            watchdog.release()
-        # A shut socket also reads as a clean end of body, cutting it short.
-        if watchdog.fired:
-            raise self._deadline_error(path)
-        return raw
-
-    def _deadline_error(self, path: str) -> PortalError:
-        return self._error(
-            f"{path} took longer than {REQUEST_DEADLINE:g} s",
-            kind="network",
-            retryable=True,
-        )
-
-    def _open_and_read(
-        self, request: urllib.request.Request, path: str, deadline: float
-    ) -> bytes:
-        try:
-            with self._opener.open(request, timeout=SOCKET_TIMEOUT) as response:
-                return self._read_capped(response, path, deadline)
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            exc.close()
-            if 300 <= status < 400:
-                raise self._error(
-                    f"{path} answered with a redirect (HTTP {status}). Redirects "
-                    "are refused so the credential stays on the portal origin; "
-                    "pass the final portal URL with --portal-url.",
-                    kind="redirect",
-                    http_status=status,
-                ) from None
-            if status in (401, _TOKEN_INVALID, _TOKEN_REQUIRED):
-                kind = "auth"
-            else:
-                kind = "server" if status >= 500 else "refused"
-            raise self._error(
-                f"HTTP {status} from {path}",
-                kind=kind,
-                http_status=status,
-                retryable=status in _RETRYABLE_STATUSES,
-                retry_after=_retry_after(exc.headers),
-            ) from None
-        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
-            reason = getattr(exc, "reason", None) or exc
-            raise self._error(
-                f"network error on {path}: {reason}", kind="network", retryable=True
-            ) from None
-
-    def _read_capped(self, response: Any, path: str, deadline: float) -> bytes:
-        length = response.headers.get("Content-Length")
-        if length and length.isdigit() and int(length) > MAX_RESPONSE_BYTES:
-            raise self._too_large(path)
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            if self._clock() > deadline:
-                raise self._deadline_error(path)
-            # read1 returns after one socket read; read(n) would keep reading
-            # until n bytes arrive.
-            chunk = response.read1(64 * 1024)
-            if not chunk:
-                return b"".join(chunks)
-            total += len(chunk)
-            if total > MAX_RESPONSE_BYTES:
-                raise self._too_large(path)
-            chunks.append(chunk)
-
-    def _too_large(self, path: str) -> PortalError:
-        return self._error(
-            f"{path} is larger than {MAX_RESPONSE_BYTES // (1024 * 1024)} MiB",
-            kind="invalid",
-        )
-
-    def _parse(self, raw: bytes, path: str) -> dict:
-        if not raw.strip():
-            raise self._error(f"{path} returned an empty body", kind="empty")
-        try:
-            data = json.loads(raw)
-        except (ValueError, RecursionError):
-            raise self._error(f"{path} did not return JSON", kind="not_json") from None
-        if not isinstance(data, dict):
-            raise self._error(f"{path} did not return a JSON object", kind="invalid")
-        return data
-
-    def _envelope_error(self, path: str, data: dict, code: int) -> PortalError:
-        message = _envelope_message(data, self._redact) or "no message"
-        if code in (_TOKEN_INVALID, _TOKEN_REQUIRED):
-            kind = "auth"
-        elif code >= 500:
-            kind = "server"
-        else:
-            kind = "refused"
-        return self._error(
-            f"{path} returned error {code}: {message}",
-            kind=kind,
-            http_status=code,
-            retryable=code in _RETRYABLE_STATUSES,
-        )
-
-
-def _envelope_code(data: Mapping[str, Any]) -> int | None:
-    error = data.get("error")
-    if not isinstance(error, dict):
-        return None
-    code = error.get("code")
-    return code if isinstance(code, int) and not isinstance(code, bool) else 0
-
-
-def _envelope_message(data: Mapping[str, Any], redact: Redactor) -> str:
-    """The envelope's message and details, redacted and then shortened.
-
-    Redacting first matters: a cut through a secret leaves a prefix that no
-    longer matches it.
-    """
-    error = data.get("error")
-    if not isinstance(error, dict):
-        return ""
-    parts = [str(error.get("message") or "")]
-    details = error.get("details")
-    if isinstance(details, list):
-        parts.extend(str(d) for d in details if d)
-    return redact(" ".join(p for p in parts if p))[:500]
-
-
-def _retry_after(headers: Any) -> float | None:
-    """Seconds to wait from ``Retry-After`` (delay-seconds or HTTP-date),
-    capped at ``MAX_RETRY_AFTER``; None when absent or unreadable."""
-    value = headers.get("Retry-After") if headers is not None else None
-    if not value:
-        return None
-    value = value.strip()
-    if value.isdigit():
-        seconds = float(value)
-    else:
-        try:
-            when = email.utils.parsedate_to_datetime(value)
-        except (TypeError, ValueError):
-            return None
-        if when.tzinfo is None:
-            when = when.replace(tzinfo=UTC)
-        seconds = (when - datetime.now(tz=UTC)).total_seconds()
-    return min(max(seconds, 0.0), MAX_RETRY_AFTER)
-
-
-def _origin(url: str) -> str:
-    parts = urlsplit(url)
-    return f"{parts.scheme}://{parts.netloc}"
-
-
-def sanitize_url(url: Any) -> str | None:
-    """Scheme, host and path only: a stored service URL can carry a token in
-    its query string or credentials in its userinfo."""
-    if not isinstance(url, str) or not url:
-        return None
-    try:
-        parts = urlsplit(url)
-        host = parts.hostname
-        parts.port  # raises ValueError for a malformed port
-    except ValueError:
-        return None
-    if parts.scheme not in ("http", "https") or not host:
-        return None
-    # netloc rather than hostname keeps template placeholders like
-    # {subDomain} intact; only the userinfo is dropped.
-    return f"{parts.scheme}://{parts.netloc.rpartition('@')[2]}{parts.path}"
 
 
 def classify(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -1014,6 +358,10 @@ class Inventory:
     truncated: bool = False
     search_ceiling: bool = False
     abort: PortalError | None = None
+    # When the reading started, by the portal's clock; None when it gave none.
+    started_at: str | None = None
+    # Every group an item is shared with, with its members; None when not read.
+    groups: list[dict[str, Any]] | None = None
 
 
 def _pages(
@@ -1410,6 +758,40 @@ def _app_references(data: Mapping[str, Any]) -> list[_AppRef] | None:
     return list(unique.values())
 
 
+def _map_widgets(data: Mapping[str, Any]) -> tuple[int, list[str]] | None:
+    """(map widget count, the web map ids they show) of a dashboard, or None
+    when it lists no widgets. One count per widget, even when several show the
+    same web map; a widget Esri copies into the mobile view keeps its id, so it
+    counts once, though a copy that shows another map still adds that map."""
+    desktop = data.get("desktopView")
+    widgets = data.get("widgets")
+    if not isinstance(widgets, list) and isinstance(desktop, dict):
+        widgets = desktop.get("widgets")
+    mobile = data.get("mobileView")
+    mobile_widgets = mobile.get("widgets") if isinstance(mobile, dict) else None
+    if not isinstance(widgets, list) and not isinstance(mobile_widgets, list):
+        return None
+    count = 0
+    seen: set[str] = set()
+    maps: dict[str, None] = {}
+    for widget in [
+        *(widgets if isinstance(widgets, list) else []),
+        *(mobile_widgets if isinstance(mobile_widgets, list) else []),
+    ]:
+        if not isinstance(widget, dict) or widget.get("type") != "mapWidget":
+            continue
+        item_id = widget.get("itemId")
+        if isinstance(item_id, str) and item_id:
+            maps.setdefault(item_id)
+        widget_id = widget.get("id")
+        if isinstance(widget_id, str) and widget_id:
+            if widget_id in seen:
+                continue
+            seen.add(widget_id)
+        count += 1
+    return count, list(maps)
+
+
 def _is_web_map(data: Mapping[str, Any]) -> bool:
     """Whether *data* has a web map's structure: ``baseMap`` is required by the spec."""
     layers = data.get("operationalLayers")
@@ -1531,6 +913,7 @@ class _DepResult:
     errors: list[dict[str, Any]] = field(default_factory=list)
     auth: PortalError | None = None
     saved: bool = False
+    map_widgets: tuple[int, list[str]] | None = None
 
 
 # Reads that carry no usable JSON are an app's normal state, not a failure.
@@ -1578,9 +961,11 @@ def _collect_dependencies(
         """The status of one item's data read; None when it stopped the run."""
         path = f"content/items/{quote(row['id'], safe='')}/data"
         is_map = row["type"] in _MAP_CONFIG_TYPES
+        non_json = row["type"] in _NON_JSON_TYPES
         lenient = row["id"] in best_effort
         try:
-            data = client.get_json(path)
+            # The portal answers a notebook's data with a redirect on its own host.
+            data = client.get_json(path, array_ok=lenient, follow_same_host=non_json)
         except PortalError as exc:
             _detach(exc)
             if exc.kind == "auth":
@@ -1599,7 +984,7 @@ def _collect_dependencies(
                 )
             # An app registered only by URL has no data; a web map always has
             # a configuration, so an empty one is a failed read.
-            not_json_ok = lenient or row["type"] in _NON_JSON_TYPES
+            not_json_ok = lenient or non_json
             tolerated = (
                 (
                     exc.kind in _UNREADABLE_KINDS
@@ -1645,6 +1030,8 @@ def _collect_dependencies(
                 status, dependencies = _extract_dependencies(
                     row, data, index, inv.portal
                 )
+                if row["type"] == "Dashboard":
+                    out.map_widgets = _map_widgets(data)
         except (TypeError, ValueError, AttributeError, KeyError, IndexError) as exc:
             # One corrupt configuration must not sink the whole inventory.
             message = (
@@ -1713,6 +1100,8 @@ def _collect_dependencies(
         for row, out in zip(targets, pool.map(fetch, targets), strict=True):
             row["dependencies_status"] = out.status
             row["data_saved"] = out.saved
+            if out.map_widgets is not None:
+                row["map_widgets"], row["map_widget_maps"] = out.map_widgets
             inv.dependencies.extend(out.dependencies)
             inv.errors.extend(out.errors)
             if out.auth is not None:
@@ -1962,7 +1351,87 @@ def _collect_owners(client: PortalClient, inv: Inventory, concurrency: int) -> N
             inv.abort = inv.abort or out.auth
 
 
-def _external_by_url(url: str | None, portal: Mapping[str, Any]) -> bool | None:
+@dataclass
+class _Members:
+    usernames: list[str] | None = None
+    unread: str | None = None
+    errors: list[dict[str, Any]] = field(default_factory=list)
+    auth: PortalError | None = None
+
+
+def _member_names(data: Mapping[str, Any], redact: Redactor) -> list[str]:
+    owner = data.get("owner")
+    names = [owner] if isinstance(owner, str) else []
+    for key in ("admins", "users"):
+        listed = data.get(key)
+        names += (
+            [n for n in listed if isinstance(n, str)]
+            if isinstance(listed, list)
+            else []
+        )
+    return sorted({redact(n) for n in names if n})
+
+
+def _collect_group_members(
+    client: PortalClient, inv: Inventory, concurrency: int
+) -> None:
+    """Read the members of every group an item is shared with into
+    ``inv.groups``.
+
+    A group that hides its members from everyone but its managers and org
+    admins still answers a member with its owner and managers alone, so for
+    any other reader those members are recorded as unknown, not as the list.
+    """
+    groups: dict[str, dict[str, Any]] = {}
+    for row in inv.items:
+        for group in row["groups"] or []:
+            groups.setdefault(group["id"], dict(group))
+    org_admin = inv.auth.get("role") == "org_admin"
+    stop = threading.Event()
+
+    def fetch(group_id: str) -> _Members:
+        out = _Members()
+        if stop.is_set():
+            return out
+        base = f"community/groups/{quote(group_id, safe='')}"
+        try:
+            info = client.get_json(base)
+            hidden = bool(info.get("hiddenMembers"))
+            if hidden and not org_admin:
+                out.unread = "the group hides its members from the inventory's account"
+                return out
+            out.usernames = _member_names(
+                client.get_json(f"{base}/users"), client._redact
+            )
+        except PortalError as exc:
+            _detach(exc)
+            if exc.kind == "auth":
+                stop.set()
+                out.auth = exc
+                return out
+            out.unread = "the portal didn't list the group's members"
+            if exc.http_status not in _HIDDEN_STATUSES:
+                out.errors.append(_error_row(group_id, "group_members", exc))
+        return out
+
+    ids = sorted(groups)
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        results = dict(zip(ids, pool.map(fetch, ids), strict=True))
+    inv.groups = [
+        {
+            **groups[group_id],
+            "members": results[group_id].usernames,
+            "members_unread": results[group_id].unread,
+        }
+        for group_id in ids
+    ]
+    for out in results.values():
+        inv.errors.extend(out.errors)
+        if out.auth is not None:
+            inv.abort = inv.abort or out.auth
+
+
+def external_by_url(url: str | None, portal: Mapping[str, Any]) -> bool | None:
     """Whether a service URL lies outside the organization's own services."""
     if not url:
         return None
@@ -1971,13 +1440,14 @@ def _external_by_url(url: str | None, portal: Mapping[str, Any]) -> bool | None:
     if host == (urlsplit(portal["url"]).hostname or "").lower():
         return False
     if portal["kind"] == "online":
-        path = parts.path.lower()
-        org = (portal["org_id"] or "").lower()
+        org = portal["org_id"] or ""
         if not org or not _ARCGIS_ONLINE_HOSTED.fullmatch(host):
             return True if org else None
-        return not (
-            path.startswith(f"/{org}/arcgis/rest/services/")
-            or path.startswith(f"/tiles/{org}/arcgis/rest/services/")
+        # Organization ids are case-sensitive; the rest of the path isn't.
+        return not any(
+            parts.path.startswith(prefix)
+            and parts.path[len(prefix) :].lower().startswith("arcgis/rest/services/")
+            for prefix in (f"/{org}/", f"/tiles/{org}/")
         )
     # A federated server sits on any host and publishes in any folder, and the
     # inventory doesn't know the federation, so a host other than the portal's
@@ -2035,7 +1505,7 @@ def _resolve_external(client: PortalClient, inv: Inventory, concurrency: int) ->
         if org and own_org:
             dep["external"] = org != own_org
         else:
-            dep["external"] = _external_by_url(dep["to_url"], inv.portal)
+            dep["external"] = external_by_url(dep["to_url"], inv.portal)
 
 
 def _redact_dependencies(inv: Inventory, redact: Redactor) -> None:
@@ -2053,6 +1523,23 @@ def _signed_in_user(info: Mapping[str, Any]) -> str | None:
     user = info.get("user")
     name = user.get("username") if isinstance(user, dict) else None
     return name if isinstance(name, str) and name else None
+
+
+def _signed_in_role(info: Mapping[str, Any]) -> str | None:
+    user = info.get("user")
+    role = user.get("role") if isinstance(user, dict) else None
+    return role if isinstance(role, str) and role else None
+
+
+def _portal_time(header: str | None) -> str | None:
+    """An HTTP Date header as an ISO time, or None."""
+    try:
+        when = parsedate_to_datetime(header) if header else None
+    except (TypeError, ValueError):
+        return None
+    if when is None or when.tzinfo is None:
+        return None
+    return when.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _mark_not_fetched(inv: Inventory) -> None:
@@ -2080,6 +1567,7 @@ def run_inventory(
     kept for a partial report.
     """
     info = client.get_json("portals/self")
+    started_at = _portal_time(client.server_date)
     username = _signed_in_user(info)
     # A server or web tier that ignores the header answers anonymously
     # rather than with a 499, so a token without an identity gets one
@@ -2106,17 +1594,18 @@ def run_inventory(
         raise PortalError(
             "the portal did not report an organization id. Use the "
             "organization's own URL (https://<org>.maps.arcgis.com, or "
-            "https://<host>/portal for ArcGIS Enterprise).",
+            "https://<host>/portal for a self-hosted portal).",
             kind="usage",
         )
     inv = Inventory(
         portal=portal,
-        auth={"mode": auth_mode, "user": username},
+        auth={"mode": auth_mode, "user": username, "role": _signed_in_role(info)},
         scope={
             "mode": scope,
             "owner": username if scope == "user" else None,
             "org_id": org_id if scope == "org" else None,
         },
+        started_at=started_at,
     )
     try:
         for raw, folder_id in _list_items(client, inv, max_items):
@@ -2133,6 +1622,8 @@ def run_inventory(
     _collect_details(client, inv, concurrency, read_groups and auth_mode != "anonymous")
     if inv.abort is None:
         _collect_owners(client, inv, concurrency)
+    if inv.abort is None and read_groups and auth_mode != "anonymous":
+        _collect_group_members(client, inv, concurrency)
     if inv.abort is not None:
         _mark_not_fetched(inv)
         return inv
@@ -2187,57 +1678,22 @@ _EXIT_BY_KIND = {
 
 def _portal_root(url: str, allow_insecure_http: bool) -> str:
     try:
-        parts = urlsplit(url.strip())
-        host = parts.hostname
-    except ValueError:
-        host = None
-        parts = None
-    if parts is None or not host:
-        raise _UsageError("--portal-url must be an absolute URL")
-    if parts.scheme != "https" and not (parts.scheme == "http" and allow_insecure_http):
-        raise _UsageError(
-            "--portal-url must use https (http only with --allow-insecure-http)"
-        )
-    if parts.username or parts.password or parts.query or parts.fragment:
-        raise _UsageError(
-            "--portal-url must not carry credentials, a query string or a fragment"
-        )
-    path = parts.path.rstrip("/")
-    for suffix in ("/sharing/rest", "/home"):
-        if path.lower().endswith(suffix):
-            path = path[: -len(suffix)]
-    return f"{parts.scheme}://{parts.netloc}{path}"
+        return portal_root(url, allow_insecure_http)
+    except ValueError as exc:
+        raise _UsageError(str(exc)) from None
 
 
 def _resolve_credentials(opts: InventoryOptions) -> tuple[str, str | None, str | None]:
     """(auth mode, token, password)."""
-    token = opts.token or None
-    if opts.token_stdin and token:
-        raise _UsageError("pass the token once: --token/ARCGIS_TOKEN or --token-stdin")
-    if opts.username and (token or opts.token_stdin):
-        raise _UsageError("use either a token or --username, not both")
-    if opts.password_stdin and not opts.username:
-        raise _UsageError("--password-stdin needs --username")
-    if opts.token_stdin:
-        token = sys.stdin.readline().strip()
-        if not token:
-            raise _UsageError("--token-stdin read an empty line")
+    try:
+        token, password = read_credentials(
+            opts.token, opts.token_stdin, opts.username, opts.password_stdin
+        )
+    except ValueError as exc:
+        raise _UsageError(str(exc)) from None
     if token is not None:
-        if not _TOKEN_CHARS.fullmatch(token):
-            raise _UsageError(
-                "the ArcGIS token holds whitespace or non-ASCII characters, "
-                "which no ArcGIS token has"
-            )
         return "token", token, None
     if opts.username:
-        if opts.password_stdin:
-            password = sys.stdin.readline().rstrip("\r\n")
-        else:
-            password = os.environ.get("ARCGIS_PASSWORD") or getpass.getpass(
-                "ArcGIS password: "
-            )
-        if not password:
-            raise _UsageError("an empty password was given")
         return "generateToken", None, password
     if opts.scope == "user":
         raise _UsageError(
@@ -2278,6 +1734,10 @@ def _clock() -> float:
     return time.monotonic()
 
 
+def _iso_now() -> str:
+    return datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
+
+
 def run_cli(fmt: _output.Formatter, opts: InventoryOptions) -> int:
     """Run ``geolens arcgis inventory`` and return its exit code."""
     redact = Redactor()
@@ -2313,6 +1773,7 @@ def _run(fmt: _output.Formatter, opts: InventoryOptions, redact: Redactor) -> in
         clock=_clock,
         on_request=lambda method, path: fmt.debug(redact(f"{method} {path}")),
     )
+    started_at_local = _iso_now()
     try:
         if password is not None and opts.username:
             client.generate_token(opts.username, password)
@@ -2333,7 +1794,8 @@ def _run(fmt: _output.Formatter, opts: InventoryOptions, redact: Redactor) -> in
     report = _report.build_report(
         inv,
         tool_version=_tool_version(),
-        generated_at=datetime.now(tz=UTC).isoformat().replace("+00:00", "Z"),
+        generated_at=_iso_now(),
+        started_at_local=started_at_local,
         max_items=opts.max_items,
         retirements=RETIREMENTS,
         classes=CLASSES,

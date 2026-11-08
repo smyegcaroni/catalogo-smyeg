@@ -87,13 +87,13 @@ class TestManifestApplySchemas:
 
     @pytest.mark.parametrize(
         "extension",
-        [".fgb", ".kml", ".kmz", ".zip"],
+        [".fgb", ".kml", ".kmz", ".zip", ".parquet"],
     )
     def test_accepts_tier1_vector_extensions(self, extension: str):
-        """fix(#1683): manifest sources now accept the same four tier-1
-        vector formats the upload/reupload doors accepted as of #1682
+        """Manifest sources accept the same four tier-1
+        vector formats the upload/reupload doors accept
         (FlatGeobuf, KML, KMZ, and a zipped File Geodatabase — the last one
-        already matched the pre-existing `.zip` entry)."""
+        matches the `.zip` entry)."""
         payload = valid_manifest_payload()
         payload["datasets"][0]["sources"][0]["uri"] = f"./data/roads{extension}"
         del payload["datasets"][0]["sources"][0]["format"]
@@ -138,7 +138,7 @@ class TestManifestApplySchemas:
         assert "checksum" in str(exc.value)
 
     def test_rejects_checksum_with_a_trailing_newline(self):
-        """gh#1773 codex r1: pinned in parity with the CLI's JSON Schema test
+        """Pinned in parity with the CLI's JSON Schema test
         of the same name. Python's `re` module treats `$` as matching just
         before a trailing newline, which let a YAML literal-scalar checksum
         (which can carry one) through the CLI's jsonschema-based validator.
@@ -154,13 +154,13 @@ class TestManifestApplySchemas:
             ManifestApplyRequest.model_validate(payload)
 
     def test_openapi_contract_carries_the_checksum_length_bound(self):
-        """gh#1773 codex r2: the length bound must also reach the *published*
+        """The length bound must also reach the *published*
         OpenAPI contract, not just this pydantic model. Before min_length/
         max_length were added to the ManifestChecksum Field, a consumer
         validating a request against the generated OpenAPI schema (rather
         than against ManifestApplyRequest directly, e.g. a Python jsonschema
         client) could accept the same trailing-newline checksum the CLI's
-        mirror let through in r1, then get a 422 from the live API. Pins the
+        mirror once let through, then get a 422 from the live API. Pins the
         contract and the CLI's JSON Schema mirror (which carries the same
         71-length bound) to agree.
         """
@@ -187,11 +187,12 @@ class TestManifestApplySchemas:
             ("vector", "./rasters/tile.tif", "requires one of"),
             ("raster_cog", "./data/roads.geojson", "requires one of"),
             ("raster_cog", "./rasters/mosaic.vrt", "Standalone VRT"),
-            # fix(#1683): the new tier-1 vector formats are vector-only —
+            # The new tier-1 vector formats are vector-only —
             # keep the mismatch check symmetric with the pre-existing ones.
             ("raster_cog", "./data/roads.fgb", "requires one of"),
             ("raster_cog", "./data/roads.kml", "requires one of"),
             ("raster_cog", "./data/roads.kmz", "requires one of"),
+            ("raster_cog", "./data/roads.parquet", "requires one of"),
         ],
     )
     def test_rejects_source_type_extension_mismatch(
@@ -266,10 +267,10 @@ class TestManifestApplySchemas:
         assert "at most 100 items" in str(exc.value)
 
     def test_publication_intent_is_not_pinned_to_an_enum(self):
-        """fix(#1201): the request schema cannot know the live status set.
+        """The request schema cannot know the live status set.
 
         An intent is a catalog record_status, and those come from the workflow
-        extension's status_order() (#1183) — an enum here rejected an
+        extension's status_order() — an enum here would reject an
         overlay-defined status the API itself accepts. The live set is checked
         at apply time; the schema keeps only the shape bounds.
         """

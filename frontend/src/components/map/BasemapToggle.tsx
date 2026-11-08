@@ -13,7 +13,7 @@ interface BasemapToggleProps {
 
 const POPOVER_ID = 'basemap-toggle-popover';
 
-/** Basemap selector — keyboard-complete disclosure (PR #330: aria-expanded/controls,
+/** Basemap selector — keyboard-complete disclosure (aria-expanded/controls,
  *  aria-current on options, Escape-to-close, focus-return to trigger). */
 export function BasemapToggle({ value, onChange, title = 'Change basemap', className }: BasemapToggleProps) {
   const { data: basemaps } = useBasemaps();
@@ -71,7 +71,7 @@ export function BasemapToggle({ value, onChange, title = 'Change basemap', class
         aria-expanded={open}
         aria-controls={open ? POPOVER_ID : undefined}
       >
-        {/* fix(#438): A11Y-10 — the button's aria-label already names the control,
+        {/* The button's aria-label already names the control,
             so the thumbnail is decorative (was double-announced). Also dropped
             aria-haspopup="menu": the popover is a role="group" disclosure, not a
             menu, and aria-expanded already conveys the disclosure. */}
@@ -108,7 +108,7 @@ export function BasemapToggle({ value, onChange, title = 'Change basemap', class
                 )}
                 aria-label={b.label}
               >
-                {/* fix(#438): A11Y-10 — decorative; the visible label text and the
+                {/* Decorative; the visible label text and the
                     button aria-label already name this option. */}
                 <img
                   src={basemapThumbnail(b.id)}

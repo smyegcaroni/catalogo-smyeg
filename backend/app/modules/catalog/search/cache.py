@@ -1,4 +1,4 @@
-"""Anonymous response cache for search hot-path endpoints (PERF-2, PERF-7)."""
+"""Anonymous response cache for search hot-path endpoints."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from app.platform.cache import (
 
 logger = structlog.stdlib.get_logger(__name__)
 
-SEARCH_CACHE_TTL = 30  # seconds — CONTEXT.md decision
+SEARCH_CACHE_TTL = 30  # seconds
 _COLLECTION_META_CACHE: dict[str, tuple[float, dict]] = {}
 _COLLECTION_META_TTL = 60
 _COLLECTION_META_MAX_SIZE = 200
@@ -31,7 +31,7 @@ EndpointKind = Literal["search", "facets"]
 def is_anon_cacheable(user: Identity | None) -> bool:
     """True if ``user`` should use the anon cache: ``user is None`` and the
     tenant cache context is available. API-key-authed users with empty role
-    sets are NOT anon and must bypass the cache (RESEARCH.md §1)."""
+    sets are NOT anon and must bypass the cache."""
     return user is None and tenant_cache_context_available()
 
 
@@ -80,11 +80,11 @@ def build_cache_key(
 ) -> str:
     """Build a deterministic ``catalog:search:<endpoint>:<sha1 of canonical JSON>`` key.
 
-    ``default=str`` silently swallows non-determinism outside date/UUID —
+    ``default=str`` silently swallows non-determinism outside date/UUID, so
     audit ``SearchFilters`` when adding fields. ``semantic_enabled`` is keyed
-    so facets match the results' candidate set (fix(#1855)); ``public_app_url``
-    is keyed because raster_tiles hrefs use the app origin (fix(#315)).
-    ``filters.keywords`` order is preserved — do NOT sort it here.
+    so facets match the results' candidate set; ``public_app_url`` is keyed
+    because raster_tiles hrefs use the app origin. ``filters.keywords`` order
+    is preserved, not sorted.
     """
     payload: dict[str, object] = {
         "filters": dataclasses.asdict(filters),

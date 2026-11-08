@@ -72,37 +72,37 @@ def test_api_suffix_helpers_preserve_existing_path_prefixes() -> None:
 
 def test_request_origin_prefers_origin_then_referer_then_forwarded_host() -> None:
     assert (
-        public_urls._request_origin(
+        public_urls._request_origin_decision(
             _make_request(headers={"origin": " https://catalog.example.com/ "})
-        )
+        )[0]
         == "https://catalog.example.com"
     )
     assert (
-        public_urls._request_origin(
+        public_urls._request_origin_decision(
             _make_request(
                 headers={"referer": "https://catalog.example.com/search?q=roads"}
             )
-        )
+        )[0]
         == "https://catalog.example.com"
     )
     assert (
-        public_urls._request_origin(
+        public_urls._request_origin_decision(
             _make_request(
                 headers={
                     "x-forwarded-proto": "http",
                     "x-forwarded-host": "forwarded.example.com:8443",
                 }
             )
-        )
+        )[0]
         == "http://forwarded.example.com:8443"
     )
 
 
 def test_request_origin_returns_none_without_host() -> None:
     assert (
-        public_urls._request_origin(
+        public_urls._request_origin_decision(
             _make_request(headers={}, netloc="", scheme="https")
-        )
+        )[0]
         is None
     )
 
@@ -254,7 +254,7 @@ async def test_get_public_urls_uses_db_overrides_when_env_only_disabled(
     loader = AsyncMock(
         return_value={public_urls.PUBLIC_APP_URL_KEY: "https://catalog.example.com/"}
     )
-    # CONF-04 (Phase 277): _is_env_only() now reads settings.env_only_config;
+    # _is_env_only() now reads settings.env_only_config;
     # patch the Settings attribute directly instead of mutating os.environ.
     monkeypatch.setattr(public_urls.settings, "env_only_config", False, raising=False)
     monkeypatch.setattr(public_urls, "_load_public_url_overrides", loader)
@@ -276,7 +276,7 @@ async def test_get_public_urls_skips_db_when_env_only_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     loader = AsyncMock()
-    # CONF-04 (Phase 277): _is_env_only() now reads settings.env_only_config;
+    # _is_env_only() now reads settings.env_only_config;
     # patch the Settings attribute directly instead of mutating os.environ.
     monkeypatch.setattr(public_urls.settings, "env_only_config", True, raising=False)
     monkeypatch.setattr(public_urls, "_load_public_url_overrides", loader)
@@ -466,12 +466,12 @@ async def test_public_url_wrappers_delegate_to_get_public_urls(
 
 
 # ---------------------------------------------------------------------------
-# Phase 268 H-27: for_external_use=True must reject request-origin fallback
+# for_external_use=True must reject request-origin fallback
 # ---------------------------------------------------------------------------
 
 
 def test_resolve_public_api_url_for_external_use_rejects_header_fallback() -> None:
-    """H-27: when no PUBLIC_*_URL is configured, the for_external_use=True
+    """When no PUBLIC_*_URL is configured, the for_external_use=True
     path must NOT fall back to attacker-controllable request headers."""
     request = _make_request(
         headers={"x-forwarded-host": "attacker.com", "x-forwarded-proto": "https"}
@@ -483,7 +483,7 @@ def test_resolve_public_api_url_for_external_use_rejects_header_fallback() -> No
 
 
 def test_resolve_public_api_url_for_external_use_rejects_origin_header() -> None:
-    """H-27: ``Origin`` header alone is not enough for external-use URLs."""
+    """``Origin`` header alone is not enough for external-use URLs."""
     request = _make_request(headers={"origin": "https://attacker.com"})
     with pytest.raises(public_urls.PublicUrlNotConfiguredError):
         public_urls.resolve_public_api_url(
@@ -492,7 +492,7 @@ def test_resolve_public_api_url_for_external_use_rejects_origin_header() -> None
 
 
 def test_resolve_public_app_url_for_external_use_rejects_header_fallback() -> None:
-    """H-27: same gate applies to the app URL resolver."""
+    """Same gate applies to the app URL resolver."""
     request = _make_request(headers={"origin": "https://attacker.com"})
     with pytest.raises(public_urls.PublicUrlNotConfiguredError):
         public_urls.resolve_public_app_url(
@@ -501,7 +501,7 @@ def test_resolve_public_app_url_for_external_use_rejects_header_fallback() -> No
 
 
 def test_resolve_public_api_url_for_external_use_accepts_explicit_app_url() -> None:
-    """H-27: when PUBLIC_APP_URL is configured, the resolver succeeds even
+    """When PUBLIC_APP_URL is configured, the resolver succeeds even
     with for_external_use=True. The URL is derived from config, not headers."""
     request = _make_request(headers={"x-forwarded-host": "attacker.com"})
     result = public_urls.resolve_public_api_url(
@@ -513,7 +513,7 @@ def test_resolve_public_api_url_for_external_use_accepts_explicit_app_url() -> N
 
 
 def test_resolve_public_api_url_for_external_use_accepts_explicit_api_url() -> None:
-    """H-27: PUBLIC_API_URL is also acceptable explicit configuration."""
+    """PUBLIC_API_URL is also acceptable explicit configuration."""
     request = _make_request(headers={"origin": "https://attacker.com"})
     result = public_urls.resolve_public_api_url(
         None,
@@ -526,7 +526,7 @@ def test_resolve_public_api_url_for_external_use_accepts_explicit_api_url() -> N
 
 
 def test_resolve_public_app_url_for_external_use_accepts_explicit_config() -> None:
-    """H-27: app URL resolver also succeeds with explicit config."""
+    """App URL resolver also succeeds with explicit config."""
     request = _make_request(headers={"origin": "https://attacker.com"})
     result = public_urls.resolve_public_app_url(
         "https://app.example.com",
@@ -551,14 +551,14 @@ def test_resolve_public_api_url_default_path_still_uses_request_origin() -> None
 async def test_get_public_api_url_propagates_for_external_use_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """H-27: the async wrapper must thread for_external_use through to
+    """The async wrapper must thread for_external_use through to
     the resolver. Otherwise the OAuth router's protection is silently
     a no-op."""
     monkeypatch.setattr(public_urls.settings, "public_app_url", None, raising=False)
     monkeypatch.setattr(public_urls.settings, "public_api_url", None, raising=False)
     monkeypatch.setattr(public_urls.settings, "public_base_url", None, raising=False)
     loader = AsyncMock(return_value={})
-    # CONF-04 (Phase 277): _is_env_only() reads settings.env_only_config now.
+    # _is_env_only() reads settings.env_only_config now.
     monkeypatch.setattr(public_urls.settings, "env_only_config", False, raising=False)
     monkeypatch.setattr(public_urls, "_load_public_url_overrides", loader)
 
@@ -568,3 +568,112 @@ async def test_get_public_api_url_propagates_for_external_use_flag(
         await public_urls.get_public_api_url(
             AsyncMock(), request=request, for_external_use=True
         )
+
+
+@pytest.mark.parametrize(
+    ("configured", "headers", "expected"),
+    [
+        # The shipped default on a remote install: the host the request reached.
+        (
+            "http://localhost:8080",
+            {"host": "maps.example.com"},
+            "https://maps.example.com",
+        ),
+        # A sub-path install keeps its path when only the host is replaced.
+        (
+            "http://localhost:8080/geolens",
+            {"host": "maps.example.com"},
+            "https://maps.example.com/geolens",
+        ),
+        # Local dev: the caller is on the same machine, so loopback is right.
+        ("http://localhost:8080", {"host": "localhost:8080"}, "http://localhost:8080"),
+        # Internal container hostnames aren't reachable from outside.
+        ("http://localhost:8080", {"host": "api:8000"}, "http://localhost:8080"),
+        (None, {"host": "api:8000"}, None),
+        # Unset: a cross-origin consumer's Origin and Referer never win.
+        (
+            None,
+            {
+                "host": "maps.example.com",
+                "origin": "https://consumer.example",
+                "referer": "https://consumer.example/editor",
+            },
+            "https://maps.example.com",
+        ),
+        (
+            "http://localhost:8080",
+            {
+                "host": "api:8000",
+                "x-forwarded-host": "maps.example.com",
+                "x-forwarded-proto": "https",
+                "origin": "https://consumer.example",
+            },
+            "https://maps.example.com",
+        ),
+        # A real configured URL always wins, sub-path included.
+        (
+            "https://example.com/geolens",
+            {"host": "other.example.com"},
+            "https://example.com/geolens",
+        ),
+    ],
+)
+async def test_browser_reachable_app_url(
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str | None,
+    headers: dict[str, str],
+    expected: str | None,
+) -> None:
+    monkeypatch.setattr(public_urls.settings, "env_only_config", True, raising=False)
+    monkeypatch.setattr(
+        public_urls.settings, "public_app_url", configured, raising=False
+    )
+    monkeypatch.setattr(public_urls.settings, "public_api_url", None, raising=False)
+    monkeypatch.setattr(public_urls.settings, "public_base_url", None, raising=False)
+    monkeypatch.setattr(public_urls.settings, "cors_allowed_origins", "", raising=False)
+
+    url = await public_urls.get_browser_reachable_app_url(
+        AsyncMock(), request=_make_request(netloc="api:8000", headers=headers)
+    )
+
+    assert url == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("api_url", "app_url", "expected"),
+    [
+        # Loopback default: the reachable app origin replaces it, keeping /api.
+        (
+            "http://localhost:8080/api",
+            "https://gis.example.org",
+            "https://gis.example.org/api",
+        ),
+        # An API served at its root keeps no /api path.
+        ("http://localhost:8000", "https://api.example.org", "https://api.example.org"),
+        (
+            "http://localhost:8080/gl/api",
+            "https://gis.example.org/gl",
+            "https://gis.example.org/gl/api",
+        ),
+        # A real configured API URL is never replaced.
+        (
+            "https://api.example.org/api",
+            "https://gis.example.org",
+            "https://api.example.org/api",
+        ),
+        # Nothing reachable to swap in: the configured value stands.
+        ("http://localhost:8080/api", None, "http://localhost:8080/api"),
+    ],
+)
+async def test_browser_reachable_api_url(monkeypatch, api_url, app_url, expected):
+    async def _api(*_a, **_k):
+        return api_url
+
+    async def _app(*_a, **_k):
+        return app_url
+
+    monkeypatch.setattr(public_urls, "get_public_api_url", _api)
+    monkeypatch.setattr(public_urls, "get_browser_reachable_app_url", _app)
+
+    assert await public_urls.get_browser_reachable_api_url(AsyncMock()) == expected

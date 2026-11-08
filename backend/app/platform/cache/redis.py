@@ -9,20 +9,47 @@ import redis.asyncio as redis_async
 import structlog
 
 from app.platform.cache.memory import InMemoryCacheProvider
+from app.platform.redis_protocol import REDIS_PROTOCOL
 
 logger = structlog.stdlib.get_logger(__name__)
 
-# fix(#1778): caps queued authoritative writes so a long outage under a
+# Caps queued authoritative writes so a long outage under a
 # revocation storm can't grow the process unbounded. Drops the OLDEST
 # first -- it's nearest its own TTL expiry, so replaying it would no-op.
 _MAX_PENDING_AUTHORITATIVE = 512
 
 
+# Compare and mutate inside Redis so a replica cannot replace the token in between.
+_COMPARE_AND_SET = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+    return 1
+end
+return 0
+"""
+_COMPARE_AND_DELETE = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+def _encode_value(value: Any) -> str:
+    """Canonicalize sortable keys without narrowing the legacy JSON key domain."""
+    # Sorted keys compare independently of order; unsortable keys keep legacy order.
+    try:
+        return json.dumps(value, default=str, sort_keys=True)
+    except TypeError:
+        return json.dumps(value, default=str)
+
+
 class RedisCacheProvider:
     """Redis/Valkey cache provider with circuit breaker and graceful fallback.
 
-    Every method wraps Redis calls in try/except, logs a warning, and falls
-    back to an in-memory cache -- Redis failure never crashes the app.
+    Cache operations isolate Redis failures, using an in-memory fallback
+    where their contract permits it. Conditional mutations answer False on
+    a Redis error rather than applying the mutation to another store.
 
     Circuit breaker: after ``max_failures`` consecutive errors, stop
     contacting Redis for ``cooldown_seconds`` and route to the fallback.
@@ -30,7 +57,7 @@ class RedisCacheProvider:
     failure re-opens it. ``health_check()`` always bypasses the breaker so
     ``/health`` reflects actual Redis state.
 
-    Which writes survive an outage (fix(#1778)):
+    Which writes survive an outage:
 
     * ``set_authoritative`` -- REPLAYED. It overrides a value that may still
       be live in Redis, so a dropped write would let the outage undo a
@@ -54,7 +81,7 @@ class RedisCacheProvider:
       delete can't tell a stale entry from one a legitimate writer made
       after the outage, so it would evict live data to fix stale data.
 
-    None of that is enough alone (fix(#1778)): the fallback and replay queue
+    None of that is enough alone: the fallback and replay queue
     are PROCESS-local, and production runs several workers -- worker A can
     revoke and queue a denial while worker B still holds a Redis positive,
     and after recovery B can read that stale positive before A's replay
@@ -84,7 +111,9 @@ class RedisCacheProvider:
         max_failures: int = 5,
         cooldown_seconds: int = 30,
     ) -> None:
-        self._client = redis_async.from_url(url, decode_responses=True)
+        self._client = redis_async.from_url(
+            url, decode_responses=True, protocol=REDIS_PROTOCOL
+        )
         self._max_failures = max_failures
         self._cooldown_seconds = cooldown_seconds
         self._failure_count = 0
@@ -97,6 +126,13 @@ class RedisCacheProvider:
         )
         self._replay_lock = asyncio.Lock()
 
+    @property
+    def shared(self) -> bool:
+        """Whether calls reach Redis, which every process sees, rather than this
+        process's own fallback. Once the circuit opens it stays False until a
+        call reaches Redis again; an expired cooldown alone doesn't flip it."""
+        return self._failure_count < self._max_failures
+
     def _is_circuit_open(self) -> bool:
         if self._failure_count < self._max_failures:
             return False
@@ -105,7 +141,7 @@ class RedisCacheProvider:
     async def _circuit_open(self) -> bool:
         """``_is_circuit_open``, plus the drain on the transition back to closed.
 
-        fix(#1778): every public method asks through here, so whichever call
+        Every public method asks through here, so whichever call
         first observes Redis as usable again -- a read included -- replays the
         queued authoritative writes before being served itself.
         """
@@ -173,9 +209,7 @@ class RedisCacheProvider:
                     self._pending_authoritative.pop(key, None)
                     continue
                 try:
-                    await self._client.set(
-                        key, json.dumps(value, default=str), ex=remaining
-                    )
+                    await self._client.set(key, _encode_value(value), ex=remaining)
                 except (
                     Exception
                 ):  # broad: redis unreachable; leave entries queued for next drain
@@ -203,7 +237,7 @@ class RedisCacheProvider:
     async def get(self, key: str, *, security: bool = False) -> Any | None:
         circuit_open = await self._circuit_open()
 
-        # fix(#1778): a queued authoritative write outranks BOTH stores until
+        # A queued authoritative write outranks BOTH stores until
         # replayed, or the circuit-close/drain window could re-serve a stale
         # Redis positive. Applies to security reads too: a queued entry is a
         # revocation, and refusing on stale data is fail-closed.
@@ -212,7 +246,7 @@ class RedisCacheProvider:
             return pending_value
 
         if circuit_open:
-            # fix(#1778): the fallback is THIS WORKER's memory -- not enough
+            # The fallback is THIS WORKER's memory -- not enough
             # for an authorization decision another worker may have revoked.
             # None sends the caller to the database, the only shared store.
             if security:
@@ -236,13 +270,13 @@ class RedisCacheProvider:
     ) -> None:
         """Cache an answer. Not replayed after an outage; see the class docstring."""
         if await self._circuit_open():
-            # fix(#1778): a security entry in the fallback can never be served
+            # A security entry in the fallback can never be served
             # (see `get`) -- writing one only invites a future reader to trust it.
             if not security:
                 await self._fallback.set(key, value, ttl)
             return
         try:
-            await self._client.set(key, json.dumps(value, default=str), ex=ttl)
+            await self._client.set(key, _encode_value(value), ex=ttl)
             self._record_success()
         except Exception:  # broad: redis circuit breaker — any Redis error falls back to in-memory cache
             logger.warning("redis_cache_set_failed", key=key, exc_info=True)
@@ -251,12 +285,12 @@ class RedisCacheProvider:
                 await self._fallback.set(key, value, ttl)
 
     async def set_authoritative(self, key: str, value: Any, ttl: int = 300) -> None:
-        """fix(#1778): write BOTH stores, in either circuit state.
+        """Write BOTH stores, in either circuit state.
 
         ``set`` routes to whichever store the circuit says is live -- wrong
-        for a value that overrides a cached answer (a positive left in the
-        fallback during an outage outlived a Redis-only revocation and got
-        served again on the next blip). The fallback is written first and
+        for a value that overrides a cached answer, since a positive left in
+        the fallback during an outage would outlive a Redis-only revocation.
+        The fallback is written first and
         unconditionally, so a Redis failure can't leave the override applied
         nowhere; when Redis can't be reached, the override queues for replay
         instead of being dropped, since Redis may still hold the very value
@@ -268,7 +302,7 @@ class RedisCacheProvider:
             self._queue_authoritative_replay(key, value, ttl)
             return
         try:
-            await self._client.set(key, json.dumps(value, default=str), ex=ttl)
+            await self._client.set(key, _encode_value(value), ex=ttl)
             self._record_success()
         except Exception:  # broad: redis circuit breaker — any Redis error falls back to in-memory cache
             logger.warning(
@@ -280,7 +314,7 @@ class RedisCacheProvider:
     async def set_if_absent(
         self, key: str, value: Any, ttl: int = 300, *, security: bool = False
     ) -> bool:
-        """fix(#1778): SET NX. True when this call is the one that stored it.
+        """SET NX. True when this call is the one that stored it.
 
         A Redis error answers False rather than falling back to the in-memory
         store: a process-local copy can't be overridden by a concurrent
@@ -301,15 +335,13 @@ class RedisCacheProvider:
         if await self._fallback.get(key) is not None:
             return False
         if circuit_open:
-            # fix(#1778): an authorization positive is never published into
+            # An authorization positive is never published into
             # this worker's memory. False costs one DB re-derivation next time.
             if security:
                 return False
             return await self._fallback.set_if_absent(key, value, ttl)
         try:
-            stored = await self._client.set(
-                key, json.dumps(value, default=str), ex=ttl, nx=True
-            )
+            stored = await self._client.set(key, _encode_value(value), ex=ttl, nx=True)
             self._record_success()
             return bool(stored)
         except Exception:  # broad: redis circuit breaker — any Redis error falls back to in-memory cache
@@ -317,13 +349,52 @@ class RedisCacheProvider:
             self._record_failure()
             return False
 
-    # fix(#1778): reads/writes route to ONE store (whichever the circuit says
-    # is live), but eviction must not: a validation cached in the fallback
-    # during an outage can outlive a revoke that only reached Redis once the
-    # circuit closes, serving a revoked embed token on the next blip. So
-    # every eviction hits BOTH stores in BOTH circuit states (the fallback
-    # call is free) and also discards any queued authoritative write for the
-    # key, so a queued override can't resurrect an entry just deleted.
+    async def compare_and_set(
+        self, key: str, expected: Any, value: Any, ttl: int = 300
+    ) -> bool:
+        """Atomically replace a matching value in the active store; never replay."""
+        if await self._circuit_open():
+            return await self._fallback.compare_and_set(key, expected, value, ttl)
+        try:
+            stored = await self._client.eval(
+                _COMPARE_AND_SET,
+                1,
+                key,
+                _encode_value(expected),
+                _encode_value(value),
+                ttl,
+            )
+            self._record_success()
+            return bool(stored)
+        except Exception:  # broad: a conditional write cannot be replayed safely
+            logger.warning("redis_cache_compare_and_set_failed", key=key, exc_info=True)
+            self._record_failure()
+            return False
+
+    async def compare_and_delete(self, key: str, expected: Any) -> bool:
+        """Atomically delete a matching value in the active store; never replay."""
+        if await self._circuit_open():
+            return await self._fallback.compare_and_delete(key, expected)
+        try:
+            deleted = await self._client.eval(
+                _COMPARE_AND_DELETE, 1, key, _encode_value(expected)
+            )
+            self._record_success()
+            return bool(deleted)
+        except Exception:  # broad: a conditional delete cannot be replayed safely
+            logger.warning(
+                "redis_cache_compare_and_delete_failed", key=key, exc_info=True
+            )
+            self._record_failure()
+            return False
+
+    # Reads and writes route to ONE store (whichever the circuit says is
+    # live), but eviction must not: a validation cached in the fallback during
+    # an outage can outlive a revoke that only reached Redis, serving a revoked
+    # embed token on the next blip. So every eviction clears the fallback and
+    # discards any queued authoritative write for the key in both circuit
+    # states, so a queued override can't resurrect an entry just deleted; Redis
+    # itself is tried only while the circuit allows it.
 
     async def delete(self, key: str) -> None:
         await self._fallback.delete(key)
@@ -338,7 +409,7 @@ class RedisCacheProvider:
             self._record_failure()
 
     async def delete_many(self, *keys: str) -> None:
-        # fix(#1543): DEL is variadic -- one round-trip, so no concurrent
+        # DEL is variadic -- one round-trip, so no concurrent
         # client can observe the batch half-applied (unlike looping `delete`).
         if not keys:
             return

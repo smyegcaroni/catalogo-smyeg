@@ -1,114 +1,148 @@
 """LLM provider runtime helpers.
 
-The tool-calling loop bodies (``_loop_anthropic`` / ``_loop_openai``) live in
-``DefaultAnthropicProvider.complete`` and ``DefaultOpenAICompatibleProvider.complete``
-in ``app.platform.extensions.defaults``. What remains here:
+The tool-calling loops live in ``DefaultAnthropicProvider.complete`` and
+``DefaultOpenAICompatibleProvider.complete`` (``app.platform.extensions``).
+What remains here:
 
-  - SDK client cache helpers (``get_anthropic_client``, ``get_openai_client``) —
-    kept as module-level utilities so streaming.py / sql_generator.py /
-    metadata_service.py can import them without going through the registry.
-  - ``add_tool_cache_control`` — pure Anthropic-format helper used by streaming.py.
-  - ``ToolLoopResult`` / ``ToolLoopExhaustedError`` / ``ToolExecutor`` / ``ActionCollector``
-    — type machinery forward-referenced from ``platform/extensions/protocols.py``.
-  - ``resolve_provider(db)`` — returns ``(name, model, runtime_config)`` by
-    delegating ``runtime_config`` resolution to the named provider's
-    ``resolve_runtime_config(db)`` method.
-  - ``build_history_messages(history)`` — provider-agnostic role filter.
+  - SDK client cache helpers (``get_anthropic_client``, ``get_openai_client``).
+  - ``add_tool_cache_control``, a pure Anthropic-format helper.
+  - ``ToolLoopResult`` / ``ToolLoopExhaustedError`` / ``ToolExecutor`` /
+    ``ActionCollector``, forward-referenced from
+    ``platform/extensions/protocols.py``.
+  - ``resolve_provider(db)``, which returns ``(name, model, runtime_config)``
+    with ``runtime_config`` supplied by the named provider's
+    ``resolve_runtime_config(db)``.
+  - ``build_history_messages(history)``, a provider-agnostic role filter.
 """
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-import httpx
 import structlog
+from pydantic import BaseModel
 
 from app.core.config import reveal, settings
 from app.core.persistent_config import LLM_MODEL, LLM_PROVIDER
 
 if TYPE_CHECKING:
-    # Provider SDK types referenced in annotations only.
-    # Runtime imports are deferred to factory functions (open-core boundary —
-    # SDK packages must not be loaded at module-import time within processing/).
+    # Annotations only: SDK packages are imported inside the factory functions,
+    # not at module import time within processing/.
     from anthropic import AsyncAnthropic
     from openai import AsyncOpenAI
 
-# Timeout for individual LLM API calls (prevents indefinite hangs)
-_LLM_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+# Timeout for individual LLM API calls (prevents indefinite hangs). Callers
+# build the SDK's own Timeout from these: the SDKs reject an httpx.Timeout.
+_LLM_TIMEOUT_SECONDS = 120.0
+_LLM_CONNECT_TIMEOUT_SECONDS = 10.0
 
 logger = structlog.stdlib.get_logger(__name__)
 
 # Cache state lives on DefaultAnthropicProvider._client and
-# DefaultOpenAICompatibleProvider._clients class attributes; these functions
-# remain as module-level utilities so streaming.py / metadata_service.py
-# keep their existing import path.
+# DefaultOpenAICompatibleProvider._clients class attributes.
 
 
 def get_anthropic_client() -> AsyncAnthropic:
-    """Return the cached Anthropic SDK client.
+    """Return the cached Claude SDK client for ``ANTHROPIC_PLATFORM``.
 
-    Cache lives on DefaultAnthropicProvider._client; used by streaming.py
-    and metadata_service.py directly (deferred-scope dispatch, not through
-    the provider Protocol). Surfaces the missing-key failure as a clear
-    ValueError rather than an opaque AuthenticationError, mirroring the
-    guard at DefaultAnthropicProvider.complete().
+    The one construction site for every Claude call: the tool loop, streamed
+    chat and structured output. Cache lives on DefaultAnthropicProvider._client.
+    Missing settings raise a clear ValueError rather than an opaque
+    AuthenticationError on the first request.
     """
-    if not settings.anthropic_api_key:
-        raise ValueError("Anthropic API key not configured")
+    from app.core.ai_credentials import anthropic_unconfigured_reason
 
-    # Deferred imports:
-    #   - DefaultAnthropicProvider — avoids module-import cycle
-    #     (llm_loop -> defaults -> imports _LLM_TIMEOUT etc. from llm_loop)
-    #   - AsyncAnthropic — keeps the SDK out of module-import scope so
-    #     `processing/` carries zero top-level provider-SDK imports
-    from anthropic import AsyncAnthropic
+    if reason := anthropic_unconfigured_reason():
+        raise ValueError(reason)
+
+    # Deferred import: the provider module imports _LLM_TIMEOUT_SECONDS etc.
+    # from here, so a top-level import would be a cycle.
     from app.platform.extensions.defaults import DefaultAnthropicProvider
 
     if DefaultAnthropicProvider._client is None:
-        DefaultAnthropicProvider._client = AsyncAnthropic(
-            api_key=reveal(settings.anthropic_api_key),
-            timeout=_LLM_TIMEOUT,
-            max_retries=2,
-        )
+        DefaultAnthropicProvider._client = _build_anthropic_client()
     return DefaultAnthropicProvider._client
+
+
+def _build_anthropic_client() -> AsyncAnthropic:
+    # SDK classes are imported here so `processing/` carries no top-level
+    # provider-SDK imports. The platform clients aren't all AsyncAnthropic
+    # subclasses, but they serve the same messages API.
+    import anthropic
+
+    from app.core.ai_credentials import bedrock_credentials
+
+    # No redirects: an endpoint that answers a Messages call with a 3xx could
+    # otherwise carry the credential header to another origin. Operators may
+    # point a gateway at a private host, so the SSRF-guarded client won't do.
+    common: dict[str, Any] = {
+        "timeout": anthropic.Timeout(
+            _LLM_TIMEOUT_SECONDS, connect=_LLM_CONNECT_TIMEOUT_SECONDS
+        ),
+        "max_retries": 2,
+        "http_client": anthropic.DefaultAsyncHttpxClient(follow_redirects=False),
+    }
+    platform = settings.anthropic_platform
+    if platform == "foundry":
+        return anthropic.AsyncAnthropicFoundry(
+            api_key=reveal(settings.anthropic_foundry_api_key),
+            resource=settings.anthropic_foundry_resource,
+            **common,
+        )
+    if platform == "bedrock":
+        return anthropic.AsyncAnthropicBedrock(
+            aws_region=settings.anthropic_bedrock_aws_region,
+            **bedrock_credentials(),
+            **common,
+        )
+    if platform == "vertex":
+        return anthropic.AsyncAnthropicVertex(
+            region=settings.cloud_ml_region,
+            project_id=settings.anthropic_vertex_project_id,
+            **common,
+        )
+    # Explicit even when unset: Compose passes a blank ANTHROPIC_BASE_URL,
+    # which the SDK would otherwise read as the URL.
+    return anthropic.AsyncAnthropic(
+        api_key=reveal(settings.anthropic_api_key),
+        base_url=settings.anthropic_base_url or "https://api.anthropic.com",
+        **common,
+    )
 
 
 def get_openai_client(base_url: str) -> AsyncOpenAI:
     """Return the cached OpenAI-compatible SDK client for ``base_url``.
 
-    Cache lives on DefaultOpenAICompatibleProvider._clients; used by
-    streaming.py directly (deferred-scope). Surfaces the missing-key
-    failure as a clear ValueError rather than an opaque
-    AuthenticationError, mirroring the guard at
-    DefaultOpenAICompatibleProvider.complete().
+    Cache lives on DefaultOpenAICompatibleProvider._clients. A missing key
+    raises a clear ValueError rather than an opaque AuthenticationError,
+    mirroring the guard in DefaultOpenAICompatibleProvider.complete().
     """
     if not settings.openai_api_key:
         raise ValueError("OpenAI-compatible API key not configured")
 
-    # Re-check at the SDK boundary.  Runtime config normally validates this
+    # Re-check at the SDK boundary: runtime config normally validates this
     # first, but direct callers and stale imported DB rows must fail before a
     # client can attach the environment credential to an untrusted URL.
     from app.core.ai_credentials import bind_openai_credential_base_url
 
     base_url = bind_openai_credential_base_url(base_url, purpose="chat")
 
-    # Deferred imports — see get_anthropic_client() rationale.
-    from openai import AsyncOpenAI
+    # Deferred imports, as in get_anthropic_client().
+    from openai import AsyncOpenAI, Timeout
     from app.platform.extensions.defaults import DefaultOpenAICompatibleProvider
 
     if base_url not in DefaultOpenAICompatibleProvider._clients:
         DefaultOpenAICompatibleProvider._clients[base_url] = AsyncOpenAI(
             api_key=reveal(settings.openai_api_key),
             base_url=base_url,
-            timeout=_LLM_TIMEOUT,
+            timeout=Timeout(_LLM_TIMEOUT_SECONDS, connect=_LLM_CONNECT_TIMEOUT_SECONDS),
             max_retries=2,
         )
     return DefaultOpenAICompatibleProvider._clients[base_url]
 
 
-# Type aliases for callbacks
 ToolExecutor = Callable[[str, dict], Awaitable[dict]]
 ActionCollector = Callable[[str, dict, dict], dict | None]
 
@@ -116,11 +150,10 @@ ActionCollector = Callable[[str, dict, dict], dict | None]
 async def noop_tool_executor(name: str, args: dict) -> dict:
     """Shared ToolExecutor for no-tools calls (``tools=[]`` + ``max_rounds=1``).
 
-    Never actually invoked (``tools=[]`` means the loop never reaches a
-    tool_use branch) but AIProviderExtension.complete()/stream() requires
-    a real callable. Shared by every no-tools call site
-    (sql_generator.generate_sql, the admin AI probe, service's map-spec
-    retry/repair rounds) instead of each building its own throwaway closure.
+    Never invoked (``tools=[]`` means the loop never reaches a tool_use
+    branch), but AIProviderExtension.complete()/stream() requires a real
+    callable. Used by sql_generator.generate_sql, the admin AI probe and
+    service's map-spec retry/repair rounds.
     """
     return {}
 
@@ -128,17 +161,15 @@ async def noop_tool_executor(name: str, args: dict) -> dict:
 class ToolLoopExhaustedError(Exception):
     """Raised when the tool-calling loop exceeds the maximum number of rounds.
 
-    fix(#1778): carries the tokens the loop had already spent. The blocking
-    loop discarded per-round counts on every failure exit, so its most
-    expensive requests (all eight rounds, budget-blown, or wall-clock hit)
-    were billed by the provider but recorded zero in
-    ``catalog.ai_token_usage`` — and MAX_AI_TOKENS_PER_USER_PER_DAY sums
-    that table, so a caller who reliably exhausted the loop spent real
+    Carries the tokens the loop had already spent. The provider bills them
+    even when the loop exhausts its rounds, budget or wall clock, and
+    MAX_AI_TOKENS_PER_USER_PER_DAY sums ``catalog.ai_token_usage``, so they
+    must be recorded or a caller who reliably exhausts the loop spends real
     money at a recorded balance of zero.
 
     The counts ride here rather than on a new ``complete()`` parameter
-    because that signature is an extension Protocol — adding a keyword
-    forces an EXTENSION_API_VERSION bump on every overlay.
+    because that signature is an extension Protocol: a new keyword forces an
+    EXTENSION_API_VERSION bump on every overlay.
     """
 
     def __init__(
@@ -156,22 +187,33 @@ class ToolLoopExhaustedError(Exception):
 class UserFacingAIError(ValueError):
     """A message deliberately written for the end user.
 
-    fix(#1778): a plain "pass every ValueError through" reasoning is an
-    open set, not closed — ``OpenAICredentialDestinationError`` is a
-    ValueError too, and names the configured provider endpoint. Only a
-    message raised as THIS type reaches a viewer; every other ValueError
-    gets generic text and keeps its detail in the log.
+    Passing every ValueError through would be an open set:
+    ``OpenAICredentialDestinationError`` is a ValueError too, and names the
+    configured provider endpoint. Only a message raised as THIS type reaches a
+    viewer; every other ValueError gets generic text and keeps its detail in
+    the log.
 
     Subclasses ``ValueError`` so existing ``except ValueError`` handlers
-    keep working unchanged.
+    keep working unchanged. ``code``, when set, is a stable identifier the
+    client localizes instead of showing the English message.
     """
+
+    code: str | None = None
 
 
 def safe_stream_error_message(exc: BaseException) -> str:
-    """The text an SSE ``error`` frame may carry for ``exc`` (fix(#1778))."""
+    """The text an SSE ``error`` frame may carry for ``exc``."""
     if isinstance(exc, UserFacingAIError):
         return str(exc)
     return "An unexpected error occurred. Please try again."
+
+
+def stream_error_event(exc: BaseException) -> dict[str, str]:
+    """The SSE ``error`` frame for an exception raised inside a stream."""
+    event = {"type": "error", "message": safe_stream_error_message(exc)}
+    if isinstance(exc, UserFacingAIError) and exc.code:
+        event["code"] = exc.code
+    return event
 
 
 def attach_token_usage(
@@ -179,11 +221,10 @@ def attach_token_usage(
 ) -> None:
     """Stamp the tokens a tool loop had already spent onto the error it raised.
 
-    fix(#1778): attaching only to ``ToolLoopExhaustedError`` left every
-    other exit unaccounted — a provider that fails after one billed round,
-    or a tool executor that raises after one, otherwise spends real money
-    with the daily quota unchanged. Every exit from both provider loops
-    routes through here.
+    Every exit from both provider loops routes through here, not only
+    ``ToolLoopExhaustedError``: a provider that fails after one billed round,
+    or a tool executor that raises after one, otherwise spends real money with
+    the daily quota unchanged.
 
     Cancellation is stamped too: ``asyncio.wait_for`` raises ``TimeoutError``
     ``from`` the ``CancelledError``, so counts survive on ``__cause__`` and
@@ -199,9 +240,31 @@ def attach_token_usage(
         pass
 
 
-# Depth bound on the __cause__/__context__ walk below. Three hops covers
-# wait_for's TimeoutError -> CancelledError and one layer of re-raise; the
-# bound exists so a self-referential or very deep chain cannot spin.
+def parse_structured_reply(
+    response_model: type[BaseModel],
+    text: str,
+    *,
+    stopped_early: str | None,
+    input_tokens: int,
+    output_tokens: int,
+) -> BaseModel:
+    """Validate a structured reply the provider billed.
+
+    Raises when ``stopped_early`` names why the reply is partial, or when
+    ``text`` does not validate; either error carries the reply's usage.
+    """
+    try:
+        if stopped_early:
+            raise ValueError(stopped_early)
+        return response_model.model_validate_json(text)
+    except Exception as exc:  # broad: a stop or parse failure still billed
+        attach_token_usage(exc, input_tokens, output_tokens)
+        raise
+
+
+# Depth bound on the __cause__/__context__ walk below. wait_for's
+# TimeoutError -> CancelledError plus a re-raise or two fit well inside it; the
+# bound keeps a very deep chain from spinning.
 _TOKEN_USAGE_CHAIN_DEPTH = 5
 
 
@@ -238,6 +301,9 @@ class ToolLoopResult:
     actions: list[dict] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
+    # The final reply stopped early (token limit or content filter), so its
+    # text is partial and nothing in it should be acted on.
+    truncated: bool = False
 
 
 async def resolve_provider(db) -> tuple[str, str, dict[str, object]]:

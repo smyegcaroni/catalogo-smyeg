@@ -2,20 +2,19 @@
 
 Wraps the synchronous azure-storage-blob SDK in `asyncio.to_thread` so callers
 can await uploads/downloads without blocking the event loop. Uses the native
-Azure SDK, not a MinIO S3 gateway shim (STOR-01).
+Azure SDK, not a MinIO S3 gateway shim.
 
 Auth: connection_string, or account_url + credential (SAS token or account
-key). fix(#836): azure-identity credentials are not supported.
+key). ``azure-identity`` credentials are not supported.
 
 Key prefixes (tenants/{tenant_id}/) and VSI paths (vsis3/vsiaz) are built by
-titiler_url.resolve_open_path (STOR-02); this class stores keys verbatim.
+titiler_url.resolve_open_path; this class stores keys verbatim.
 """
 
 from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator, BinaryIO
 
@@ -23,22 +22,11 @@ from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient
 
 from app.core.async_io import run_in_thread_draining
-from app.platform.storage.provider import StoredObject
+from app.platform.storage.provider import StoredObject, as_utc
 
 
 # Resume points remembered per provider; a pass walks at most a few hundred pages.
 _MAX_RESUME_TOKENS = 512
-
-
-def _as_utc(value: datetime) -> datetime:
-    """Normalize a timestamp to timezone-aware UTC (feat #1249).
-
-    Azure already returns aware datetimes; this pins the ``StoredObject``
-    contract that reconciliation's cutoff comparison depends on.
-    """
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
 
 
 class AzureBlobStorageProvider:
@@ -70,8 +58,8 @@ class AzureBlobStorageProvider:
     async def put(self, key: str, data: BinaryIO | bytes) -> str:
         """Store data at key. Returns az://container/key URI.
 
-        fix(#1532): drained on cancellation — a bare ``to_thread`` would return
-        while the upload kept running, racing cleanup (undo-delete, closed
+        Drained on cancellation: a bare ``to_thread`` would return while the
+        upload kept running, racing cleanup (undo-delete, closed
         source handle, orphaned staged blocks).
         """
 
@@ -91,7 +79,6 @@ class AzureBlobStorageProvider:
                 downloader = blob.download_blob()
                 return downloader.readall()
             except ResourceNotFoundError as e:
-                # fix(#430): normalize missing-object to FileNotFoundError.
                 raise FileNotFoundError(key) from e
 
         return await asyncio.to_thread(_get)
@@ -113,7 +100,6 @@ class AzureBlobStorageProvider:
             try:
                 dest.start_copy_from_url(source.url, requires_sync=True)
             except ResourceNotFoundError as e:
-                # fix(#430): normalize missing-object to FileNotFoundError.
                 raise FileNotFoundError(src_key) from e
 
         await asyncio.to_thread(_copy)
@@ -126,7 +112,6 @@ class AzureBlobStorageProvider:
             try:
                 return blob.download_blob(offset=start, length=length).readall()
             except ResourceNotFoundError as e:
-                # fix(#430): normalize missing-object to FileNotFoundError.
                 raise FileNotFoundError(key) from e
 
         return await asyncio.to_thread(_get_range)
@@ -134,9 +119,8 @@ class AzureBlobStorageProvider:
     async def get_stream(self, key: str) -> AsyncIterator[bytes]:
         """Stream a whole blob from ONE ``download_blob`` call.
 
-        fix(#1532): this method IS reachable (managed assets take the LOCAL
-        branch, whose GET calls this) — never reintroduce a NotImplementedError
-        here. Raising mid-iteration would truncate an in-flight
+        Reachable: managed assets take the LOCAL branch, whose GET calls
+        this. Raising mid-iteration would truncate an in-flight
         ``StreamingResponse`` instead of failing cleanly.
         """
         blob = self._client.get_blob_client(container=self.container, blob=key)
@@ -145,7 +129,6 @@ class AzureBlobStorageProvider:
             try:
                 return blob.download_blob()
             except ResourceNotFoundError as e:
-                # fix(#430): normalize missing-object to FileNotFoundError.
                 raise FileNotFoundError(key) from e
 
         downloader = await asyncio.to_thread(_open)
@@ -163,7 +146,7 @@ class AzureBlobStorageProvider:
     ) -> AsyncIterator[bytes]:
         """Stream a byte window from ONE ``download_blob`` call.
 
-        fix(#1540): avoids the per-1-MiB-chunk amplification ``get_range``
+        Avoids the per-1-MiB-chunk amplification ``get_range``
         looping would cause. One call for the window; the SDK may still split
         a window past ``max_single_get_size`` into several requests, but that
         is its own transfer strategy, not a loop this code writes.
@@ -174,7 +157,6 @@ class AzureBlobStorageProvider:
             try:
                 return blob.download_blob(offset=start, length=length)
             except ResourceNotFoundError as e:
-                # fix(#430): normalize missing-object to FileNotFoundError.
                 raise FileNotFoundError(key) from e
             except HttpResponseError as e:
                 # Azure raises InvalidRange past EOF where S3/local read empty
@@ -241,7 +223,6 @@ class AzureBlobStorageProvider:
             try:
                 props = blob.get_blob_properties()
             except ResourceNotFoundError as e:
-                # fix(#430): normalize missing-object to FileNotFoundError.
                 raise FileNotFoundError(key) from e
             size = getattr(props, "size", None)
             if size is None:
@@ -270,7 +251,7 @@ class AzureBlobStorageProvider:
     ) -> AsyncIterator[list[StoredObject]]:
         """Yield blob pages under a prefix, each entry with its last-modified.
 
-        ``by_page()`` (fix(#1249)) so a consumer that stops early stops the
+        ``by_page()`` so a consumer that stops early stops the
         service round trips with it. Azure's flat listing takes a name prefix,
         not a start marker, so ``start_after`` resumes from the continuation
         token of the remembered page that contains it and is filtered
@@ -305,13 +286,13 @@ class AzureBlobStorageProvider:
                     continue
                 last_modified = getattr(blob, "last_modified", None)
                 if last_modified is None:
-                    # feat(#1249): skip undatable blobs here so the caller
+                    # Skip undatable blobs here so the caller
                     # never has to treat one as "old enough to delete".
                     continue
                 page.append(
                     StoredObject(
                         key=blob.name,
-                        last_modified=_as_utc(last_modified),
+                        last_modified=as_utc(last_modified),
                     )
                 )
             # A one-page listing has nothing to resume, and would evict the

@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import uuid
+from datetime import timedelta
 
 import structlog
 from fastapi import (
@@ -29,7 +30,12 @@ from app.platform.catalog_locks import (
 )
 from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
 from app.modules.audit.schemas import AuditLogListResponse, AuditLogResponse
-from app.modules.audit.service import AuditEvent, audit_emit, query_audit_logs
+from app.modules.audit.service import (
+    AuditEvent,
+    audit_emit,
+    query_audit_logs,
+    recently_audited,
+)
 from app.modules.auth.dependencies import (
     get_current_active_user,
     get_optional_user,
@@ -40,10 +46,13 @@ from app.modules.catalog.authorization import (
     check_dataset_access_or_anonymous,
     check_dataset_write_access,
     check_public_visibility_allowed,
+    check_vrt_serves,
     get_user_roles,
     visible_lineage_summary,
+    visible_vrt_extents,
 )
 from app.modules.catalog.datasets.domain.helpers import (
+    DatasetNotFoundError,
     WorkflowTransitionDenied,
     dataset_to_response,
     _load_actor_identities,
@@ -69,6 +78,7 @@ from app.platform.http.ranges import if_none_match_matches
 from app.platform.cache.tiles import invalidate_catalog_cache
 from app.modules.catalog.collections.service import get_dataset_collections
 from app.modules.catalog.features.service import lock_catalog_rows_for_write
+from app.modules.catalog.write_recheck import refuse_stale_write
 from app.modules.catalog.ownership import (
     require_transfer_admin,
     transfer_dataset_owner,
@@ -87,33 +97,37 @@ from app.modules.catalog.datasets.domain.service import (
 )
 from app.core.dependencies import get_db
 from app.core.public_urls import get_dataset_service_url
+from app.platform.request_credential import refuse_publish_key
 from app.platform.storage import get_storage
 from app.platform.extensions import get_catalog_port
 from app.standards.ogc.errors import ERROR_RESPONSES_WRITE, FORBIDDEN_RESPONSE
 
 logger = structlog.get_logger()
 
+_DATASET_VIEW_AUDIT_WINDOW = timedelta(minutes=15)
+
 router = APIRouter(
     prefix="/datasets", tags=["Datasets"], responses=ERROR_RESPONSES_WRITE
 )
 
 
-# ROUTE-01: dual-shape decorator -- both trailing-slash and no-trailing-slash
-# variants register against the same handler. Slash form stays canonical
-# (already in OpenAPI); no-slash is a hidden alias closing the 404
-# regression introduced by redirect_slashes=False (api/main.py).
+# Dual-shape decorator: the no-slash variant is a hidden alias of the canonical
+# slash form (already in OpenAPI), closing the 404 from redirect_slashes=False
+# (api/main.py).
 @router.get(
     "",
     response_model=DatasetListResponse,
     include_in_schema=False,
     responses={403: FORBIDDEN_RESPONSE},
+    summary="List datasets",
 )
 @router.get(
     "/",
     response_model=DatasetListResponse,
-    # fix(getgeolens.com#86): read-gated (visibility filtering inside
-    # get_datasets_list), not write-gated -- see get_single_dataset below.
+    # Read-gated (visibility filtering inside get_datasets_list), not
+    # write-gated -- see get_single_dataset below.
     responses={403: FORBIDDEN_RESPONSE},
+    summary="List datasets",
 )
 async def list_all_datasets(
     request: Request,
@@ -132,7 +146,10 @@ async def list_all_datasets(
 
 
 @router.post(
-    "/create/", response_model=DatasetResponse, status_code=status.HTTP_201_CREATED
+    "/create/",
+    response_model=DatasetResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create an empty dataset",
 )
 async def create_empty_dataset_endpoint(
     body: CreateEmptyDatasetRequest,
@@ -156,12 +173,12 @@ async def create_empty_dataset_endpoint(
         dataset,
         actors_by_id=actors_by_id,
         base_url=await get_dataset_service_url(db, request=request),
-        # fix(#1103): access-checked prose. A dataset created here has no
+        # Access-checked prose. A dataset created here has no
         # provenance to redact, and the helper says so without a query.
         lineage_summary=await visible_lineage_summary(
             db, dataset.record, user, await get_user_roles(db, user)
         ),
-        # feat(#1316): the caller is the dataset's own creator — always owner.
+        # The caller is the dataset's own creator — always owner.
         can_view_provenance=True,
     )
 
@@ -169,10 +186,11 @@ async def create_empty_dataset_endpoint(
 @router.get(
     "/{dataset_id}",
     response_model=DatasetResponse,
-    # fix(getgeolens.com#86): read-gated (check_dataset_access_or_anonymous
-    # below), not write-gated -- same override on every other read-gated
-    # GET in this file (quicklook, history, refresh-runs).
+    # Read-gated (check_dataset_access_or_anonymous below), not write-gated
+    # -- same override on every other read-gated GET in this file (quicklook,
+    # history, refresh-runs).
     responses={403: FORBIDDEN_RESPONSE},
+    summary="Get a dataset",
 )
 async def get_single_dataset(
     dataset_id: uuid.UUID,
@@ -191,8 +209,15 @@ async def get_single_dataset(
     # Visibility check — returns resolved user_roles to avoid duplicate DB query
     user_roles = await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
 
-    # Log dataset access for authenticated users only
-    if user is not None:
+    # Authenticated views only; a repeat view inside the window writes nothing
+    # to any sink, which keeps a reloading page from flooding the audit log.
+    if user is not None and not await recently_audited(
+        db,
+        user_id=user.id,
+        action="dataset.view",
+        resource_id=dataset_id,
+        within=_DATASET_VIEW_AUDIT_WINDOW,
+    ):
         await audit_emit(
             db,
             AuditEvent(
@@ -205,7 +230,6 @@ async def get_single_dataset(
         )
         await db.commit()
 
-    # Fetch collection memberships for detail view
     colls = await get_dataset_collections(db, dataset_id)
     collections_data = [{"id": str(c.id), "name": c.name} for c in colls]
 
@@ -237,6 +261,7 @@ _QUICKLOOK_READ_ATTEMPTS = 3
         200: binary_response("The quicklook image", "image/png"),
         403: FORBIDDEN_RESPONSE,
     },
+    summary="Get a dataset quicklook image",
 )
 async def get_quicklook(
     dataset_id: uuid.UUID,
@@ -260,6 +285,9 @@ async def get_quicklook(
         )
 
     await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
+
+    # A VRT quicklook is drawn from its members' pixels, so it follows the tile rule.
+    await check_vrt_serves(db, dataset)
 
     record_type = getattr(dataset.record, "record_type", None)
 
@@ -326,9 +354,9 @@ async def get_quicklook(
     record = dataset.record
     if not is_publicly_cacheable(record.visibility, record.record_status):
         headers = {"Cache-Control": "private, no-store"}
-    elif record_type == "vector_dataset":
-        # A replacement redraws the image under the same URL, so a cache
-        # revalidates every use against a tag of the bytes.
+    elif record_type in ("vector_dataset", "vrt_dataset"):
+        # A vector replacement redraws the image under the same URL, and a VRT
+        # stops serving when a member narrows, so a cache revalidates every use.
         etag = '"' + hashlib.sha256(data).hexdigest() + '"'
         headers = {"Cache-Control": "public, no-cache", "ETag": etag}
         if if_none_match_matches(request.headers.get("if-none-match"), etag):
@@ -338,7 +366,19 @@ async def get_quicklook(
     return Response(content=data, media_type="image/png", headers=headers)
 
 
-@router.patch("/{dataset_id}", response_model=DatasetResponse)
+async def _refuse_stale_write(
+    db: AsyncSession, dataset, meta: DatasetMetaUpdate
+) -> None:
+    await lock_catalog_rows_for_write(
+        db, dataset, with_raster_asset="is_dem" in meta.model_fields_set
+    )
+    await db.refresh(dataset.record, ["updated_at"])
+    refuse_stale_write(dataset.record.updated_at, meta.expected_updated_at)
+
+
+@router.patch(
+    "/{dataset_id}", response_model=DatasetResponse, summary="Update dataset metadata"
+)
 async def update_dataset_metadata(
     dataset_id: uuid.UUID,
     meta: DatasetMetaUpdate,
@@ -356,25 +396,30 @@ async def update_dataset_metadata(
             detail="Dataset not found",
         )
     user_roles = await check_dataset_write_access(db, dataset, dataset_id, user)
+    if "owner_id" in meta.model_fields_set:
+        refuse_publish_key(db, "A publish key can't transfer dataset ownership")
     owner_id = (
         require_transfer_admin(user_roles, meta.owner_id)
         if "owner_id" in meta.model_fields_set
         else None
     )
-    # feat(#1691): a non-admin may not move a dataset TO public when the
+    # A non-admin may not move a dataset TO public when the
     # restrict_public_visibility instance setting is on.
     await check_public_visibility_allowed(
         db, user, meta.visibility, user_roles=user_roles
     )
 
-    # fix(#458): capture the pre-update value so a PATCH that echoes the
+    # Capture the pre-update value so a PATCH that echoes the
     # same tile_columns doesn't roll the tile version / purge the tile
-    # cache. fix(#528): None and [] captured distinctly -- None means
+    # cache. None and [] are captured distinctly -- None means
     # per-zoom defaults, [] means "never project attributes", so a
     # None<->[] flip IS a tile-content change.
     tile_columns_before = (
         list(dataset.tile_columns) if dataset.tile_columns is not None else None
     )
+
+    if meta.expected_updated_at is not None:
+        await _refuse_stale_write(db, dataset, meta)
 
     if owner_id is not None:
         # Before the metadata update, so its visibility and audience checks
@@ -389,9 +434,11 @@ async def update_dataset_metadata(
             owner_id,
             actor=user,
             ip_address=request.client.host if request.client else None,
+            visibility=meta.visibility,
+            record_status=meta.record_status,
         )
 
-    # feat(#1070): advisory warnings from the metadata chokepoint, e.g. a
+    # Advisory warnings from the metadata chokepoint, e.g. a
     # visibility/status change exposing inherited keywords beyond the
     # analysis source's audience. Attached to the response below.
     metadata_warnings: list[str] = []
@@ -409,20 +456,19 @@ async def update_dataset_metadata(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=e.detail,
         )
+    except DatasetNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found",
+        )
     except ValueError as e:
-        msg = str(e)
-        if "not found" in msg.lower():
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Dataset not found",
-            )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=msg,
+            detail=str(e),
         )
     # A transfer has its own audit row, so a body naming only owner_id is
     # not also a metadata edit.
-    if meta.model_fields_set != {"owner_id"}:
+    if meta.model_fields_set - {"expected_updated_at"} != {"owner_id"}:
         await audit_emit(
             db,
             AuditEvent(
@@ -435,19 +481,21 @@ async def update_dataset_metadata(
                 # serialized with stdlib json.dumps, which cannot take the
                 # vintage dates and would roll back the UPDATE at flush.
                 details=meta.model_dump(
-                    mode="json", exclude_unset=True, exclude={"owner_id"}
+                    mode="json",
+                    exclude_unset=True,
+                    exclude={"owner_id", "expected_updated_at"},
                 ),
                 ip_address=request.client.host if request.client else None,
             ),
         )
-    # fix(#458): only when the value actually changed; a no-op echo must
+    # Only when the value actually changed; a no-op echo must
     # not purge every cached tile for the table.
     tile_columns_changed = (
         "tile_columns" in meta.model_fields_set
         and dataset.tile_columns != tile_columns_before
     )
     if tile_columns_changed:
-        # fix(#1902): evaluated at write time, so a counter read before the
+        # Evaluated at write time, so a counter read before the
         # lock wait is never written back over a peer's commit.
         await bump_tile_cache_version_on(db, dataset)
     await db.commit()
@@ -467,14 +515,15 @@ async def update_dataset_metadata(
     response = dataset_to_response(
         dataset,
         actors_by_id=actors_by_id,
+        vrt_extents=await visible_vrt_extents(db, [dataset_id], user, user_roles),
         base_url=await get_dataset_service_url(db, request=request),
-        # fix(#1103): "owner of the output" does not imply access to what
+        # "owner of the output" does not imply access to what
         # it was derived from -- a grant on the source can be revoked
         # after the analysis ran.
         lineage_summary=await visible_lineage_summary(
             db, dataset.record, user, user_roles
         ),
-        # feat(#1316): reached only after check_dataset_write_access, the
+        # Reached only after check_dataset_write_access, the
         # owner-or-admin gate itself.
         can_view_provenance=True,
     )
@@ -536,12 +585,20 @@ async def _rollback_failed_item(db: AsyncSession, user) -> None:
         await db.refresh(user)
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — both trailing-slash and
-# no-trailing-slash variants register against the same handler. Slash form
-# stays canonical (already in OpenAPI); no-slash is a hidden alias closing
-# the 404 regression introduced by redirect_slashes=False (api/main.py).
-@router.post("/bulk-delete", response_model=BulkDeleteResponse, include_in_schema=False)
-@router.post("/bulk-delete/", response_model=BulkDeleteResponse)
+# Dual-shape decorator: the no-slash variant is a hidden alias of the canonical
+# slash form (already in OpenAPI), closing the 404 from redirect_slashes=False
+# (api/main.py).
+@router.post(
+    "/bulk-delete",
+    response_model=BulkDeleteResponse,
+    include_in_schema=False,
+    summary="Delete several datasets",
+)
+@router.post(
+    "/bulk-delete/",
+    response_model=BulkDeleteResponse,
+    summary="Delete several datasets",
+)
 async def bulk_delete_datasets_endpoint(
     body: BulkDeleteRequest,
     request: Request,
@@ -555,7 +612,7 @@ async def bulk_delete_datasets_endpoint(
 
     for item in body.datasets:
         try:
-            # Phase 1061 SEC-S02: per-item resource-level access check.
+            # Per-item resource-level access check.
             item_dataset = await get_dataset(db, item.dataset_id)
             if item_dataset is None:
                 results.append(
@@ -597,10 +654,10 @@ async def bulk_delete_datasets_endpoint(
             # Commit per item so one item's failure cannot roll back the rows
             # of the items before it.
             await db.commit()
-            # fix(#1847): the reap is deferred past both invalidations below;
+            # The reap is deferred past both invalidations below;
             # awaiting object storage here would delay them per item.
             pending_reaps.append(deletion)
-            # fix(#1429): only now is the delete visible to a concurrent
+            # Only now is the delete visible to a concurrent
             # tile request, so only now can the table_name -> metadata map
             # be evicted without a request re-caching the deleted row.
             notify_table_invalidated(table_name)
@@ -609,7 +666,7 @@ async def bulk_delete_datasets_endpoint(
             )
             deleted += 1
         except CatalogLockConflict as exc:
-            # fix(#1847): per item, not raised -- the batch commits per
+            # Per item, not raised -- the batch commits per
             # item, so aborting would discard already-committed results.
             await _rollback_failed_item(db, user)
             results.append(
@@ -621,10 +678,21 @@ async def bulk_delete_datasets_endpoint(
                 )
             )
             continue
+        except HTTPException as exc:
+            # The write guard's re-check under the catalog lock refuses here.
+            await _rollback_failed_item(db, user)
+            results.append(
+                BulkDeleteResultItem(
+                    dataset_id=item.dataset_id,
+                    status="error",
+                    detail=str(exc.detail),
+                )
+            )
+            continue
         except Exception as exc:  # broad: per-item bulk-delete is isolated — any failure is recorded per-item without aborting the batch
             await _rollback_failed_item(db, user)
             if is_lock_conflict(exc):
-                # fix(#1847): a wait after the acquisition (the record cascade on
+                # A wait after the acquisition (the record cascade on
                 # a held child) is the same contended row, so the same code.
                 results.append(
                     BulkDeleteResultItem(
@@ -654,7 +722,7 @@ async def bulk_delete_datasets_endpoint(
     if deleted > 0:
         await invalidate_catalog_cache()
 
-    # fix(#1847): last, so no storage round trip can delay or skip the
+    # Last, so no storage round trip can delay or skip the
     # invalidations above for any item in the batch.
     await _reap_after_commit(*pending_reaps)
 
@@ -663,7 +731,9 @@ async def bulk_delete_datasets_endpoint(
     )
 
 
-@router.delete("/{dataset_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{dataset_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete a dataset"
+)
 async def delete_dataset_endpoint(
     dataset_id: uuid.UUID,
     body: DatasetDeleteRequest,
@@ -731,16 +801,15 @@ async def delete_dataset_endpoint(
     await db.commit()
 
     await invalidate_catalog_cache()
-    # fix(#1429): only now is the delete visible to a concurrent tile
-    # request, so only now can the table_name -> metadata map be evicted
-    # without re-caching the deleted row -- that map decides visibility, and
-    # a stale entry would authorize a successor under the deleted dataset's
-    # rules.
+    # Only now is the delete visible to a concurrent tile request, so only now
+    # can the table_name -> metadata map be evicted without re-caching the
+    # deleted row. That map decides visibility; a stale entry would authorize a
+    # successor under the deleted dataset's rules.
     notify_table_invalidated(table_name)
 
-    # fix(#1847): after both invalidations -- the reap awaits object
-    # storage, so a slow backend or cancellation would delay/skip them,
-    # leaving search and the tile map serving a deleted dataset until TTL.
+    # After both invalidations: the reap awaits object storage, so a slow
+    # backend or cancellation would delay or skip them and leave search and the
+    # tile map serving a deleted dataset until TTL.
     await _reap_after_commit(deletion)
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -750,6 +819,7 @@ async def delete_dataset_endpoint(
     "/{dataset_id}/history",
     response_model=AuditLogListResponse,
     responses={403: FORBIDDEN_RESPONSE},
+    summary="List a dataset's audit history",
 )
 async def get_dataset_history(
     dataset_id: uuid.UUID,
@@ -806,6 +876,7 @@ async def get_dataset_history(
     "/{dataset_id}/refresh-runs",
     response_model=DatasetRefreshRunListResponse,
     responses={403: FORBIDDEN_RESPONSE},
+    summary="List a dataset's refresh runs",
 )
 async def list_dataset_refresh_runs(
     dataset_id: uuid.UUID,

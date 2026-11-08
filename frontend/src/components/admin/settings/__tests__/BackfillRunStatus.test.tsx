@@ -2,7 +2,7 @@ import { render, screen } from '@/test/test-utils';
 import type { EmbeddingStatsResponse } from '@/types/api';
 import { BackfillRunStatus } from '../BackfillRunStatus';
 
-// fix(#2025): an operator could not see how far a backfill had got, what
+// An operator could not see how far a backfill had got, what
 // earlier runs did, or how long one would take before starting it.
 
 const base: EmbeddingStatsResponse = {
@@ -19,6 +19,12 @@ const base: EmbeddingStatsResponse = {
 describe('BackfillRunStatus', () => {
   it('renders nothing when there is no run, history or estimate', () => {
     const { container } = render(<BackfillRunStatus stats={base} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('renders nothing when the stats omit the run history', () => {
+    const { recent_runs: _omitted, ...withoutRuns } = base;
+    const { container } = render(<BackfillRunStatus stats={withoutRuns} />);
     expect(container).toBeEmptyDOMElement();
   });
 
@@ -43,7 +49,7 @@ describe('BackfillRunStatus', () => {
     expect(screen.getByTestId('backfill-progress-bar')).toHaveStyle({ width: '32%' });
   });
 
-  // fix(#2025 review): the bar is a styled div. Without these the run advances
+  // The bar is a styled div. Without these the run advances
   // every four seconds and a screen reader is told nothing.
   it('exposes the run to assistive technology as it advances', () => {
     render(
@@ -160,7 +166,7 @@ describe('BackfillRunStatus', () => {
     ).not.toBeInTheDocument();
   });
 
-  // fix(#2025 review): `complete` with rejections is not a clean success. The
+  // `complete` with rejections is not a clean success. The
   // run reached every record it counted; some of them kept their old vector.
   it('says a finished run left gaps rather than reporting it clean', () => {
     render(

@@ -117,9 +117,9 @@ async def _create_wkt_dataset(
 ):
     """Create a one-row dataset holding exactly ``wkt``.
 
-    fix(#697): every other fixture in this suite sits at low latitude and low
-    longitude, which is why antimeridian output went unnoticed. Callers pass the
-    seam and high-latitude coordinates the analysis operations have to survive.
+    Every other fixture in this suite sits at low latitude and low
+    longitude, so callers pass the seam and high-latitude coordinates the
+    analysis operations have to survive.
     ``column_type`` is the PostGIS typmod (``Point`` / ``MultiPoint`` / ...) and
     ``geometry_type`` the catalog's uppercase classification.
     """
@@ -167,7 +167,7 @@ async def _create_point_dataset_at(
 async def _create_empty_dataset(session: AsyncSession, *, created_by: uuid.UUID):
     """Create a real, correctly shaped data table holding zero rows.
 
-    fix(#699): distinct from an empty *result* — the table and its catalog rows
+    Distinct from an empty *result* — the table and its catalog rows
     exist and the operation is legal, there is simply nothing to operate on.
     """
     table_name = f"ds_{uuid.uuid4().hex[:12]}"
@@ -200,7 +200,7 @@ async def _create_raster_dataset(
 ):
     """Create a real raster record: Record + Dataset + RasterAsset.
 
-    fix(#699): the analysis suite rejected non-vector sources only through a
+    Non-vector sources must not be rejected only through a
     synthetic ``geometry_type=None`` dataset, which is a shape no ingest path
     produces. This is the row shape ``tasks_raster._register_raster`` actually
     writes — ``record_type='raster_dataset'``, a ``raster_``-prefixed
@@ -274,10 +274,10 @@ def _preview_url(dataset_id) -> str:
 
 
 class TestPreviewGlobalBound:
-    """fix(#1014): previews are bounded globally, not only per user."""
+    """Previews are bounded globally, not only per user."""
 
     def test_bound_is_sized_from_the_configured_pool(self, monkeypatch):
-        """fix(#1014 review): the bound must track DB_POOL_SIZE/DB_MAX_OVERFLOW.
+        """The bound must track DB_POOL_SIZE/DB_MAX_OVERFLOW.
 
         A hardcoded 4 against the supported small-pool configuration
         (DB_POOL_SIZE=2, DB_MAX_OVERFLOW=0) would admit twice as many previews
@@ -292,30 +292,30 @@ class TestPreviewGlobalBound:
         # request session, so those previews cost two slots each.
         monkeypatch.setattr(settings, "db_pool_size", 10)
         monkeypatch.setattr(settings, "db_max_overflow", 3)
-        assert service_analysis._preview_bound() == 3
+        assert service_analysis.preview_slot_bound() == 3
 
         monkeypatch.setattr(settings, "db_pool_size", 2)
         monkeypatch.setattr(settings, "db_max_overflow", 0)
-        assert service_analysis._preview_bound() == 1
+        assert service_analysis.preview_slot_bound() == 1
 
         # -1 means "unlimited overflow"; it must not shrink the budget.
         monkeypatch.setattr(settings, "db_pool_size", 8)
         monkeypatch.setattr(settings, "db_max_overflow", -1)
-        assert service_analysis._preview_bound() == 2
+        assert service_analysis.preview_slot_bound() == 2
 
         # Never zero — a semaphore of zero would refuse every preview.
         monkeypatch.setattr(settings, "db_pool_size", 1)
         monkeypatch.setattr(settings, "db_max_overflow", 0)
-        assert service_analysis._preview_bound() == 1
+        assert service_analysis.preview_slot_bound() == 1
 
         # With an external pooler the engine uses NullPool, so DB_POOL_SIZE and
         # DB_MAX_OVERFLOW are ignored and deriving from them would be
         # arithmetic on numbers that no longer mean anything.
         monkeypatch.setattr(settings, "db_use_external_pooler", True)
-        assert service_analysis._preview_bound() == 3
+        assert service_analysis.preview_slot_bound() == 3
         monkeypatch.setattr(settings, "db_pool_size", 400)
         monkeypatch.setattr(settings, "db_max_overflow", 400)
-        assert service_analysis._preview_bound() == 3
+        assert service_analysis.preview_slot_bound() == 3
 
     async def test_previews_never_exceed_the_global_bound(
         self,
@@ -426,12 +426,12 @@ class TestPreviewGlobalBound:
         test_db_session: AsyncSession,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        """fix(#1097 review): the second sandbox query counts against the bound.
+        """The second sandbox query counts against the bound.
 
         Operations that report an exact total run TWO sandbox statements, each
-        opening its own connection. The count used to run after the semaphore
-        was released, so a preview could admit the next caller while still
-        holding a connection — the bound would stop describing how many
+        opening its own connection. The count must run before the semaphore
+        is released: otherwise a preview could admit the next caller while
+        still holding a connection, and the bound would stop describing how many
         connections previews can hold, which is the only reason it exists.
 
         The count is the likelier of the two to still be running when the
@@ -492,7 +492,7 @@ class TestAnalysisPreviewEndpoint:
         test_db_session: AsyncSession,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        """fix(#716): a preview must cost ONE pool connection, not two.
+        """A preview must cost ONE pool connection, not two.
 
         `execute_safe` opens its own connection (it needs READ ONLY + SET LOCAL
         ROLE, which it cannot get on the caller's session). If the handler still
@@ -539,7 +539,7 @@ class TestAnalysisPreviewEndpoint:
         self,
         test_db_session: AsyncSession,
     ):
-        """fix(#716 review): the release must stay OPT-IN.
+        """The release must stay OPT-IN.
 
         The rollback that returns the connection expires EVERY ORM instance on
         the session, not just `dataset` — including the authenticated User.
@@ -759,8 +759,7 @@ class TestAnalysisPreviewEndpoint:
             # so a preview fired while a chat query holds it must read as
             # "try again", not as a server fault.
             ("query_busy", 429),
-            # fix(#789): #1014 added a second 429 category after this test
-            # landed covering only four. Server-at-capacity is deliberately
+            # Server-at-capacity is deliberately
             # distinct from query_busy so the message is not relabelled as the
             # per-user one — same status, different text, so the pair only
             # stays honest if both are exercised.
@@ -768,9 +767,10 @@ class TestAnalysisPreviewEndpoint:
             ("query_timeout", 422),
             ("query_data_error", 422),
             ("result_too_large", 422),
+            ("query_unavailable", 503),
             # Anything unmapped falls through the .get default. query_failed
-            # also covers connection loss and role-binding failures, which are
-            # server faults rather than bad requests.
+            # covers role-binding failures and other server faults rather than
+            # bad requests.
             ("query_failed", 500),
         ],
     )
@@ -782,9 +782,9 @@ class TestAnalysisPreviewEndpoint:
         category: str,
         expected_status: int,
     ):
-        """fix(#789): _SANDBOX_STATUS is the only thing standing between a
-        sandbox failure category and the status the caller sees, and it was
-        untested — tests/test_sandbox.py asserts the category the sandbox
+        """SANDBOX_STATUS is the only thing standing between a
+        sandbox failure category and the status the caller sees.
+        tests/test_sandbox.py asserts the category the sandbox
         raises, not what the route does with it.
 
         Patches the name `router_analysis` imported, not the definition in
@@ -804,21 +804,23 @@ class TestAnalysisPreviewEndpoint:
                 headers=admin_auth_header,
             )
         assert resp.status_code == expected_status, resp.text
+        assert ("Retry-After" in resp.headers) == (category == "query_unavailable")
         # user_message is the sandbox's already-sanitized text, so it is what
         # the caller reads on every branch including the 500 fallback.
         assert resp.json()["detail"] == message
 
     def test_every_sandbox_status_category_is_parametrized(self):
-        """fix(#789): the parametrize above is a hand-kept list, so #1014's new
-        category joined the mapping and simply went untested — four of five,
-        still green. Pin the mapping's key set: adding a category now fails
-        here until it is given a case above."""
-        assert set(router_analysis._SANDBOX_STATUS) == {
+        """The parametrize above is a hand-kept list, so a category
+        added to the mapping could go untested while the suite stays green. Pin
+        the mapping's key set: adding a category fails here until it is given a
+        case above."""
+        assert set(router_analysis.SANDBOX_STATUS) == {
             "query_busy",
             "query_at_capacity",
             "query_timeout",
             "query_data_error",
             "result_too_large",
+            "query_unavailable",
         }
 
     async def test_truncation_at_feature_cap(
@@ -968,7 +970,7 @@ class TestAnalysisPreviewEndpoint:
         admin_auth_header: dict,
         test_db_session: AsyncSession,
     ):
-        """fix(#682): mask/mask_dataset_id are clip-only; a stray (even
+        """mask/mask_dataset_id are clip-only; a stray (even
         nonexistent) mask dataset riding along on a buffer request must not
         be loaded, let alone 404 the whole call."""
         admin_id = await get_user_id(test_db_session, "admin")
@@ -992,7 +994,7 @@ class TestAnalysisPreviewEndpoint:
         admin_auth_header: dict,
         test_db_session: AsyncSession,
     ):
-        """fix(#680 review): 550 low-gid rows only graze the mask boundary
+        """550 low-gid rows only graze the mask boundary
         (they pass ST_Intersects but extract to EMPTY). The empties must be
         filtered inside the SQL row cap, or they exhaust the 500-row preview
         budget and hide the one real intersection at gid 551."""
@@ -1110,7 +1112,7 @@ class TestAnalysisPreviewEndpoint:
         admin_auth_header: dict,
         test_db_session: AsyncSession,
     ):
-        """Denominator case 3 (fix(#727)): clip stays null WITH a bbox too —
+        """Denominator case 3: clip stays null WITH a bbox too —
         a row-filtering operation's total is unknowable from the source count
         whether or not the preview is viewport-scoped."""
         admin_id = await get_user_id(test_db_session, "admin")
@@ -1159,7 +1161,7 @@ class TestAnalysisPreviewEndpoint:
         admin_auth_header: dict,
         test_db_session: AsyncSession,
     ):
-        """fix(#693): the preview semi-joins the mask per row instead of
+        """The preview semi-joins the mask per row instead of
         unioning the layer per request; two OVERLAPPING mask rows must still
         yield one merged feature per source row (intersection distributes
         over union), not duplicates or double-counted slivers."""
@@ -1193,7 +1195,7 @@ class TestAnalysisPreviewEndpoint:
         admin_auth_header: dict,
         test_db_session: AsyncSession,
     ):
-        """fix(#693): the materialize path unions the mask layer whole and
+        """The materialize path unions the mask layer whole and
         the preview subdivides every mask row per request — gate on the
         cached feature_count when the mask dataset loads."""
         admin_id = await get_user_id(test_db_session, "admin")
@@ -1270,7 +1272,7 @@ class TestAnalysisPreviewEndpoint:
         admin_auth_header: dict,
         test_db_session: AsyncSession,
     ):
-        """fix(#682): ST_MakeValid collapses a zero-area mask polygon to
+        """ST_MakeValid collapses a zero-area mask polygon to
         LINESTRING(0 0, 0.002 0); without polygon extraction in the mask
         union, the point source at (0.001, 0) sits on that line and would
         survive the clip despite being outside every real polygon."""
@@ -1310,7 +1312,7 @@ class TestAnalysisPreviewEndpoint:
 
 
 class TestBboxScopedPreview:
-    """Live-DB behavior for a viewport-scoped preview (fix(#727)): the row
+    """Live-DB behavior for a viewport-scoped preview: the row
     filter actually restricts which rows the cap sees, the 1:1 denominator
     switches from the cached snapshot to a live bbox-scoped count, and the
     live count runs before the connection-releasing rollback."""
@@ -1442,13 +1444,13 @@ class TestBboxScopedPreview:
         test_db_session: AsyncSession,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        """fix(#727 codex P1 round 1): the bbox-scoped count runs through
-        execute_safe now (not a bare db.execute before the semaphore), so it
+        """The bbox-scoped count runs through
+        execute_safe (not a bare db.execute before the semaphore), so it
         counts against the SAME global preview bound as the geometry query —
         otherwise N concurrent viewport-scoped previews could each hold a
         connection open for an unbounded, unmetered count query, exhausting
-        the pool the semaphore exists to protect (the exact class fix(#716)/
-        fix(#1014) already cover for the geometry query). Modeled on
+        the pool the semaphore exists to protect (the class of failure the geometry query is
+        already covered for). Modeled on
         test_the_exact_count_query_holds_a_slot_too's `.locked()` probe
         against a one-slot semaphore."""
         import asyncio
@@ -1495,7 +1497,7 @@ class TestBboxScopedPreview:
         test_db_session: AsyncSession,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        """fix(#727 codex P2 round 1): a bbox-scoped denominator that could not
+        """A bbox-scoped denominator that could not
         be computed within the query budget must come back null, not a
         LIMIT-capped number dressed up as exact — the response's documented
         contract for both source_feature_count and match_count."""
@@ -1533,7 +1535,7 @@ class TestBboxScopedPreview:
 
 
 # ---------------------------------------------------------------------------
-# Source-shape and parameter-bound edges (fix(#699))
+# Source-shape and parameter-bound edges
 # ---------------------------------------------------------------------------
 
 
@@ -1695,7 +1697,7 @@ class TestBboxRequestValidation:
     """AnalysisPreviewRequest.bbox: shape, finiteness, ordering, and — the
     acceptance criterion this class exists to pin — that it is NOT owned by
     any single operation, so _drop_params_for_other_operations never strips
-    it (fix(#727))."""
+    it."""
 
     def test_bbox_absent_from_analysis_param_owners(self):
         from app.modules.catalog.datasets.domain.schemas import (
@@ -1775,7 +1777,7 @@ class TestBuildPreviewSql:
     def test_buffer_sql(self):
         req = AnalysisPreviewRequest(operation="buffer", distance_meters=500)
         sql = build_preview_sql('"data"."t1"', req)
-        # fix(#891): the validated source is hoisted behind an OFFSET 0 fence so
+        # The validated source is hoisted behind an OFFSET 0 fence so
         # the projection guard can read it, so the buffer takes `_pb.g` rather
         # than the column expression.
         assert "SELECT ST_MakeValid(geom_4326) AS g OFFSET 0) AS _pb" in sql
@@ -1784,13 +1786,13 @@ class TestBuildPreviewSql:
         assert "ORDER BY gid" in sql
 
     def test_buffer_sql_is_dateline_safe(self):
-        """fix(#697): buffer output must go through the ±180 split, and only
+        """Buffer output must go through the ±180 split, and only
         buffer — clip and dissolve cannot introduce a wrap the source lacked,
         and adding the guard there would be dead cost on every row."""
         from app.platform.analysis_sql import render_geometry_expr
 
         buffer_expr, _ = render_geometry_expr("buffer", distance_meters=500)
-        # fix(#883 review): the split decision is per polygon component, not on
+        # The split decision is per polygon component, not on
         # the envelope of the whole buffer — one feature can hold components at
         # both seams, which want opposite treatment.
         assert "ST_Dump" in buffer_expr
@@ -1812,21 +1814,19 @@ class TestBuildPreviewSql:
         # ST_ShiftLongitude must run BEFORE ST_MakeValid: validating the
         # wrapped ring first nodes the seam into slivers.
         assert "ST_MakeValid(ST_ShiftLongitude" not in buffer_expr
-        # The buffer and each component's shifted copy stay behind an OFFSET 0
-        # fence, so neither is re-evaluated per CASE reference (fix(#700
-        # review)). fix(#891) adds a second projection strategy, so both the
-        # buffer and the seam pass now have two rendered call sites — one per
-        # branch of the projection CASE, never both on the same row. EXPLAIN
-        # ANALYZE over a 2 000-row mix (285 wide multipart rows, 1 715
-        # single-part) put the per-component SubPlan at loops=285 and the
-        # whole-input SubPlan at loops=1715.
+        # The buffer and each component's shifted copy stay behind an OFFSET 0 fence, so
+        # neither is re-evaluated per CASE reference. The second projection strategy
+        # means both the buffer and the seam pass have two rendered call sites — one per
+        # branch of the projection CASE, never both on the same row. EXPLAIN ANALYZE
+        # over a 2 000-row mix (285 wide multipart rows, 1 715 single-part) put the
+        # per-component SubPlan at loops=285 and the whole-input SubPlan at loops=1715.
         assert buffer_expr.count("ST_Buffer(") == 2
-        # fix(#902 codex r1-r3): beyond the two dateline-safe passes, the
+        # Beyond the two dateline-safe passes, the
         # sliced branch shifts per component (1) and per segment on the
         # jump-carrying fallback (3: the CASE tests the shifted copy twice
         # and emits it once).
         assert buffer_expr.count("ST_ShiftLongitude(") == 6
-        # fix(#902): the sliced branch adds a fence for the per-component
+        # The sliced branch adds a fence for the per-component
         # unwrap of the segmentized copy.
         assert buffer_expr.count("OFFSET 0") == 6
 
@@ -1838,7 +1838,7 @@ class TestBuildPreviewSql:
             assert "ST_ShiftLongitude" not in other_expr
 
     def test_buffer_sql_slices_wide_inputs_into_local_projections(self):
-        """fix(#891)/fix(#902): ``ST_Buffer(...::geography, d)`` picks ONE
+        """``ST_Buffer(...::geography, d)`` picks ONE
         planar SRID for the whole input, so anything spanning more than one UTM
         zone — a spread multipart OR a single wide component — is buffered in
         a projection local to at most part of it. The wide branch slices the
@@ -1859,15 +1859,15 @@ class TestBuildPreviewSql:
             f"ST_XMax(_pb.g) - ST_XMin(_pb.g) >= {BUFFER_LOCAL_SRID_SPAN_DEG}"
             in buffer_expr
         )
-        # fix(#902): the ST_NumGeometries(...) > 1 half of the old gate is
-        # deliberately gone — a single 90°-wide component fell to world
-        # Mercator exactly like a spread multipart did.
+        # The gate deliberately has no ST_NumGeometries(...) > 1 half — a
+        # single 90°-wide component would fall to world Mercator exactly like
+        # a spread multipart.
         assert "ST_NumGeometries" not in buffer_expr
         # Edges are densified BEFORE the planar band cut: lineal components
         # along great circles (geography buffers geodesic edges — cutting the
         # bare planar chord buffered a different line, 141.7e9 m² vs the
         # 134.1e9 truth on the 90° fixture), polygonal components PLANAR-ly
-        # (fix(#902 codex r4): geography-segmentizing a ring moved the region
+        # (geography-segmentizing a ring moved the region
         # itself).
         from app.platform.analysis_sql import BUFFER_SLICE_SEGMENTIZE_PLANAR_DEG
 
@@ -1880,7 +1880,7 @@ class TestBuildPreviewSql:
             in buffer_expr
         )
         assert "ST_Dimension(_pb_d0.c0) >= 2" in buffer_expr
-        # fix(#902 codex r5): the shifted domain must win by the shared
+        # The shifted domain must win by the shared
         # longitude epsilon in BOTH the per-component and per-segment
         # unwraps, or ±360 float noise on a tied span tears a
         # Greenwich-crossing ring via the per-vertex shift.
@@ -1893,7 +1893,7 @@ class TestBuildPreviewSql:
         assert f"({BUFFER_LOCAL_SRID_SPAN_DEG} - 0.001)" in buffer_expr
         assert "generate_series" in buffer_expr
         assert "ST_Intersection(_pb_g.uc," in buffer_expr
-        # fix(#902 codex r3): a component still carrying a >180-degree planar
+        # A component still carrying a >180-degree planar
         # segment (it crosses BOTH meridians, so no whole-component unwrap
         # exists) bypasses band slicing and buffers per segment instead.
         assert "ST_DumpSegments(_pb_g.uc)" in buffer_expr
@@ -1909,7 +1909,7 @@ class TestBuildPreviewSql:
         split_at = buffer_expr.index("ST_WrapX(ST_MakeValid(_pb_m_c.s)")
         assert union_at < split_at
         # The common path is a bare ELSE: the whole-input buffer, wrapped in the
-        # fix(#883) seam pass and nothing else — no slicing, no re-collect, no
+        # seam pass and nothing else — no slicing, no re-collect, no
         # dissolve.
         else_at = buffer_expr.index("ELSE (SELECT CASE WHEN ST_XMax(_dl.g)")
         assert buffer_expr.count("ST_UnaryUnion(") == 1
@@ -1945,12 +1945,12 @@ class TestBuildPreviewSql:
         assert sql.count("'") == 6
 
     def test_preview_sql_evaluates_expression_once_per_row(self):
-        """fix(#700 review): the geometry expression lives in a LATERAL
+        """The geometry expression lives in a LATERAL
         subquery (OFFSET 0 blocks pull-up), so the three geom_out references
         don't triple-evaluate it — while the base table stays a plain FROM
         item whose pkey index can satisfy ORDER BY and early-terminate at
         the sandbox row cap."""
-        # fix(#891): buffer renders TWO ST_Buffer call sites — one per branch of
+        # Buffer renders TWO ST_Buffer call sites — one per branch of
         # the projection CASE — and exactly one of them is reachable on any given
         # row, which EXPLAIN ANALYZE confirms (a 2 000-row mix put the
         # per-component SubPlan at loops=285 and the whole-input SubPlan at
@@ -1974,8 +1974,8 @@ class TestBuildPreviewSql:
             assert sql.endswith("ORDER BY gid")
 
     def test_clip_by_layer_sql_subdivides_instead_of_unioning(self):
-        """fix(#693): a layer-sourced clip preview must not union the whole
-        mask layer per request — that shape made realistic masks time out
+        """A layer-sourced clip preview must not union the whole
+        mask layer per request — that shape makes realistic masks time out
         inside the 10s sandbox budget. The preview subdivides the mask into
         bounded pieces once per statement, joins the pieces per source row,
         and row-filters via an EXISTS probe of the raw (GIST-indexed) mask
@@ -2032,7 +2032,7 @@ class TestBuildPreviewSql:
         assert sql.endswith("ORDER BY gid")
         # The prefilter must land in the SAME WHERE as NOT_EMPTY_PREDICATE,
         # not a wrapping subquery — that is what keeps ORDER BY gid able to
-        # ride the pkey index (fix(#700 review)).
+        # ride the pkey index.
         assert sql.count("WHERE") == 1
 
     def test_bbox_applies_to_clip_by_layer_and_select_by_location(self):
@@ -2053,7 +2053,7 @@ class TestBuildPreviewSql:
             assert sql.endswith("ORDER BY gid")
 
     def test_bbox_threaded_into_intersect(self):
-        """fix(#727 codex round 2): intersect renders through a separate
+        """Intersect renders through a separate
         JOIN+GROUP BY pipeline (render_intersect_preview/render_intersect_pairs)
         that does not share build_preview_sql's WHERE composition, so it needs
         its own explicit bbox plumbing — this pins that it actually receives
@@ -2077,7 +2077,7 @@ class TestBuildPreviewSql:
         assert sql.index("_src.geom_4326 && ST_MakeEnvelope") < sql.index("GROUP BY")
 
     def test_bbox_not_threaded_into_intersect_materialize(self):
-        """fix(#727 codex round 2): render_intersect_pairs's bbox param is
+        """render_intersect_pairs's bbox param is
         PREVIEW-ONLY. A saved dataset must be the WHOLE overlay, not whatever
         was on screen when Create dataset was clicked — the materialize
         worker's call site (processing/analysis/tasks.py) must keep omitting
@@ -2089,7 +2089,7 @@ class TestBuildPreviewSql:
         assert "ST_MakeEnvelope" not in sql
 
     def test_bbox_threaded_into_spatial_join_match_count(self):
-        """fix(#727 codex round 5): spatial_join's match_count is a SEPARATE
+        """spatial_join's match_count is a SEPARATE
         statement from the geometry preview (unlike intersect's, which rides
         the same one), so it needs its own explicit bbox plumbing too — the
         schema's contract says match_count is bbox-scoped for this operation,
@@ -2127,7 +2127,7 @@ class TestBuildPreviewSql:
             build_preview_sql('"data"."t1"', req)
 
     def test_materialize_request_drops_other_operations_params(self):
-        """fix(#682): the defer builds worker kwargs from the parsed model, so
+        """The defer builds worker kwargs from the parsed model, so
         stray clip/dissolve params on a buffer request must parse to None or
         the worker would resolve a mask dataset the operation never uses."""
         from app.modules.catalog.datasets.domain.schemas import (

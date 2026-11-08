@@ -6,13 +6,15 @@ that ship **inside the backend and worker container images** and whose license
 obligations attach on distribution. It is not a full dependency inventory: every
 other package in the image, and every published GeoLens artifact (the `geolens`
 CLI, the Python and TypeScript SDKs, the MCP server, and the frontend bundle),
-is permissively licensed and needs no notice beyond the ones its own package
-carries.
+is permissively licensed. Those packages carry their own notices, except in the
+frontend bundle, where minification strips them; its build writes them to
+`third-party-licenses.txt`, which the frontend image serves at
+`/third-party-licenses.txt`.
 
 The license texts referenced below sit next to this file, and the whole
 directory lands at `/app/licenses/` in the image.
 
-## psycopg 3.3.4, psycopg-pool 3.3.0 — LGPL-3.0-only
+## psycopg 3.3.6, psycopg-pool 3.3.0 — LGPL-3.0-only
 
 PostgreSQL driver and connection pool. Copyright © The Psycopg Team.
 `psycopg-pool` arrives both directly and through `procrastinate[pool]`.
@@ -88,7 +90,7 @@ the answer to that finding.
 **Guard:** never enable `python-slugify`'s `[unidecode]` extra. It pulls
 `Unidecode`, which is GPL-only, and no election is available there.
 
-## certifi 2026.2.25 — MPL-2.0
+## certifi 2026.10.19 — MPL-2.0
 
 Mozilla's CA root certificate bundle. Reaches the image through `httpx`,
 `httpcore`, `requests`, `rasterio` and `sentry-sdk` — effectively every
@@ -102,21 +104,9 @@ The package ships unmodified. MPL-2.0 is file-level copyleft: the obligation
 attaches to the MPL-licensed files, not to GeoLens code that merely imports
 them, and §3.3 explicitly permits distributing a Larger Work under other terms.
 Obligations discharged here: the license text is included, the files are
-unmodified, and the corresponding source is `certifi==2026.2.25` from PyPI,
+unmodified, and the corresponding source is `certifi==2026.10.19` from PyPI,
 identifiable from `/app/uv.lock` and installable with
-`uv pip download certifi==2026.2.25 --no-binary :all:`.
-
-## tqdm 4.67.3 — MPL-2.0 AND MIT
-
-Progress-bar library. Reaches the image through `openai`.
-
-License text: `tqdm-LICENCE.txt`, reproduced verbatim because it is what carries
-the file-level split — most of the work is MIT, with `MPL-2.0 2015-2026 (c)
-Casper da Costa-Luis` covering `*` and specific files listed individually.
-`MPL-2.0.txt` holds the referenced MPL text.
-
-Ships unmodified; same MPL-2.0 analysis and same source-availability answer as
-certifi above.
+`uv pip download certifi==2026.10.19 --no-binary :all:`.
 
 ## Scope
 

@@ -1,14 +1,16 @@
-"""Turning a stored export artifact into a 200, a 206 or a 416 (fix(#1532)).
+"""Turning a stored export artifact into a 200, a 206 or a 416.
 
 A Range is honoured only when the artifact already existed; otherwise the
 whole representation goes back with 200 (RFC 9110 14.2) — a ``/vsicurl/``
 client sends no If-Range, so a rebuild can't tell it's a different file,
 and only a whole 200 can't splice two representations together.
 
-Exceptions: a Range starting at byte 0 is honoured on a fresh build (#1585,
-GDAL vsicurl's first request); ranges are answered whole for one TTL after
-a URL's bytes change; and a matching ``If-Range`` (RFC 9110 13.1.5) is
-always honoured, since it proves what bytes the client already holds.
+Exceptions: a rebuild that reproduced the only bytes the URL holds is
+sliced like the artifact it replaces; a Range starting at byte 0 is honoured
+on a fresh build (GDAL vsicurl's first request); ranges are answered
+whole for one TTL after a URL's bytes change; and a matching ``If-Range``
+(RFC 9110 13.1.5) is always honoured, since it proves what bytes the client
+already holds.
 """
 
 import asyncio
@@ -34,8 +36,8 @@ _FILE_CHUNK_BYTES = 1024 * 1024
 def artifact_headers(artifact: ExportArtifact) -> dict[str, str]:
     """Headers every response describing a stored artifact carries.
 
-    ``ETag`` is the artifact's digest, not a mtime-derived tag (#1532:
-    mtime changed between conversions of unchanged data). Uses
+    ``ETag`` is the artifact's digest, not a mtime-derived tag, which changed
+    between conversions of unchanged data. Uses
     ``file_response_content_disposition``, not ``safe_content_disposition``,
     so HEAD and GET agree byte for byte.
     """
@@ -50,7 +52,7 @@ def head_response(artifact: ExportArtifact) -> Response:
     """HEAD, answered from the artifact: a real Content-Length, no conversion.
 
     Without a real length, ``/vsicurl/`` retries with a ranged GET to learn
-    the size instead — costing a round trip and, before this fix, a rebuild.
+    the size, costing a round trip.
     """
     return Response(
         status_code=status.HTTP_200_OK,
@@ -71,19 +73,18 @@ def read_response(
 ) -> Response:
     """The GET: a 206 slice, a 416, or the whole artifact.
 
-    ``may_serve_range``: true only if the artifact existed before this
+    ``may_serve_range``: true only if these bytes were served before this
     request (gates the splice in the module docstring). ``leading_slice_ok``
     is the byte-0 exception, set only for a fresh build with no other live
-    representation. ``background`` must run AFTER the response (fix(#435)).
+    representation. ``background`` must run after the response.
     """
     headers = artifact_headers(artifact)
 
-    # fix(#1532): evaluate If-Range before slicing — a client naming
-    # the previous artifact must not get a slice of the current one. Strong
-    # comparison, ignore-on-mismatch, per RFC 9110 13.1.5.
-    #
-    # fix(#1532): a MATCHING If-Range outranks `may_serve_range`,
-    # since it proves what a bare Range after a rebuild cannot.
+    # If-Range is evaluated before slicing: a client naming the previous
+    # artifact must not get a slice of the current one. Strong comparison,
+    # ignore-on-mismatch, per RFC 9110 13.1.5. A matching If-Range outranks
+    # `may_serve_range`, since it proves what a bare Range after a rebuild
+    # cannot.
     proven = if_range is not None and range_bound_to_this_version(
         if_range, artifact.etag
     )
@@ -138,26 +139,24 @@ def temp_file_response(
     if_range: str | None = None,
     background: BackgroundTask | None = None,
 ) -> Response:
-    """Serve a just-converted file, without letting starlette see the Range.
+    """Serve a just-converted file that wasn't published.
 
-    fix(#1532): replaces ``FileResponse`` when publication doesn't
-    happen — starlette's own Range handling repeats #1532's splice on this
-    degraded path, and its mtime ETag disagreed with the artifact path's.
+    Not ``FileResponse``: starlette's own Range handling would slice a
+    conversion no later request can find, and its mtime ETag disagrees with
+    the artifact path's.
 
-    ``etag`` is the SAME validator the artifact path sends; None when the
-    file couldn't be hashed (no validator beats a wrong one).
-
-    fix(#1532): a matching ``If-Range`` gets a 206 from the local
-    file (export is byte-deterministic); a bare or mismatched one gets the
-    whole file, since this request BUILT it.
+    These bytes are never recorded, so nothing could later tell a resume of
+    them from one of another version: the response says ``Accept-Ranges:
+    none`` and carries no ETag, leaving a client nothing to resume against.
+    ``etag`` (the digest, None when unhashable) only proves an ``If-Range``
+    the client took from an artifact of the same bytes, which gets a 206 from
+    the local file; a bare or mismatched one gets the whole file.
     """
     size = os.path.getsize(file_path)
     headers = {
-        "accept-ranges": "bytes",
+        "accept-ranges": "none",
         "content-disposition": file_response_content_disposition(filename),
     }
-    if etag is not None:
-        headers["etag"] = etag
 
     proven = (
         etag is not None
@@ -166,7 +165,7 @@ def temp_file_response(
     )
     byte_range = parse_byte_range(range_header, size) if proven else None
     if byte_range == RANGE_UNSATISFIABLE:
-        raise _unsatisfiable(size, etag)
+        raise _unsatisfiable(size, None, accept_ranges="none")
     if byte_range is not None:
         start, end = byte_range
         return StreamingResponse(
@@ -188,10 +187,12 @@ def temp_file_response(
     )
 
 
-def _unsatisfiable(size: int, etag: str | None) -> HTTPException:
+def _unsatisfiable(
+    size: int, etag: str | None, *, accept_ranges: str = "bytes"
+) -> HTTPException:
     """The 416, built once for both the stored and the local representation."""
     headers = {
-        "accept-ranges": "bytes",
+        "accept-ranges": accept_ranges,
         # Size is the point of a 416 (how a client learns the real length).
         # No Content-Disposition: this body is a JSON error, not the export.
         "content-range": f"bytes */{size}",
@@ -243,9 +244,8 @@ def _whole(
 ) -> Response:
     """The complete representation, streamed from one provider read.
 
-    Uses ``get_stream`` rather than looping ``get_range``: fix(#1540 review
-    P1) found a per-chunk loop turns one download into one object-store
-    request per megabyte.
+    Uses ``get_stream`` rather than looping ``get_range``: a per-chunk loop
+    turns one download into one object-store request per megabyte.
     """
     return StreamingResponse(
         storage.get_stream(artifact.key),

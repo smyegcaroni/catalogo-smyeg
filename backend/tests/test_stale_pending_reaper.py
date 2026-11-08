@@ -1,8 +1,8 @@
-"""fix(#724): the pending reaper must not fail jobs that are genuinely queued.
+"""The pending reaper must not fail jobs that are genuinely queued.
 
 ``fail_stale_jobs`` marked every ``pending`` IngestJob older than
 ``stale_pending_cutoff_seconds`` as failed with "never queued". That conflated two
-different states, and since fix(#695) deferred analysis to priority -10 —
+different states, and since analysis is deferred to priority -10 —
 where waiting behind a steady upload stream is by design and unbounded — the
 wrong one became reachable in normal operation.
 
@@ -51,7 +51,7 @@ def _user(user_id: uuid.UUID) -> SimpleNamespace:
 def _dispatched_metadata() -> dict:
     """The `user_metadata` a row carries once a dispatch has been attempted.
 
-    fix(#1744): `defer_with_orphan_guard` stamps `commit_attempted_at` before
+    `defer_with_orphan_guard` stamps `commit_attempted_at` before
     every defer, so a row that reached the queue at all has this key. Its
     absence is now what makes the sweep read a row as an abandoned upload, so
     a fixture describing "the defer never landed" has to carry it or it
@@ -217,11 +217,11 @@ async def _make_pending_job(
 ):
     """A pending job aged past a cutoff, with file_path as given.
 
-    fix(#1556): `presigned` is now a parameter because it discriminates two
+    `presigned` is now a parameter because it discriminates two
     classes that both reach the unbound half. Default True keeps every existing
     caller describing the presigned upload it already described.
 
-    fix(#1744): `commit_attempted` is what discriminates them now. Default
+    `commit_attempted` is what discriminates them now. Default
     False, because the rows these fixtures describe are mostly ones nobody
     dispatched; a caller that means "the defer never landed" passes True.
     """
@@ -259,7 +259,7 @@ async def _make_pending_job(
 
 
 class TestBoundPendingSweep:
-    """fix(#1234): the 1h abandonment clause must not race a completion.
+    """The 1h abandonment clause must not race a completion.
 
     A presigned completion sets `file_path` and then commits. Between those the
     row is `pending` WITH a `file_path`, and the 1h sweep used to fail it out
@@ -331,7 +331,7 @@ class TestBoundPendingSweep:
     async def test_an_unbound_job_is_still_settled_at_1h(self, test_db_session) -> None:
         """The policy itself is deliberate and stays.
 
-        fix(#1556): the TERMINAL STATE moved for this row and only this row —
+        The TERMINAL STATE moved for this row and only this row —
         a presigned upload with nothing bound is an abandonment, not a failed
         ingest. The 1h clause, the class it selects and the sites that apply it
         are all untouched; see TestAbandonedUploadsAreCancelled for the split.
@@ -353,7 +353,7 @@ class TestBoundPendingSweep:
         backfill also carries `file_path=""`, and a dispatch that never landed
         is a real failure of something the user asked for.
 
-        fix(#1744): the row says so itself now. Both of those doors reach the
+        The row says so itself now. Both of those doors reach the
         queue through the guard that stamps `commit_attempted_at`, so a defer
         that died still leaves the stamp behind."""
         from app.platform.jobs.router import fail_stale_jobs
@@ -411,7 +411,7 @@ class TestBoundPendingSweep:
 
 
 def test_put_url_ttl_cannot_outlive_the_job() -> None:
-    """fix(#1234, #1235 r2): the one-shot PUT URL needed the clamp too.
+    """The one-shot PUT URL needed the clamp too.
 
     Its 3600 default happens to equal today's default timeout, which is what
     hid it: configure the timeout lower and the URL silently outlives the job.
@@ -437,7 +437,7 @@ def test_put_url_ttl_cannot_outlive_the_job() -> None:
 
 
 def test_part_url_ttl_cannot_outlive_the_job() -> None:
-    """fix(#1234): the server was selling 7200s part URLs on a 3600s lifetime."""
+    """The server was selling 7200s part URLs on a 3600s lifetime."""
     from app.core.config import settings
     from app.platform.storage.s3 import S3StorageProvider
 
@@ -459,7 +459,7 @@ def test_part_url_ttl_cannot_outlive_the_job() -> None:
 
 
 class TestPollingPathHonoursTheSameGuard:
-    """fix(#1235 review r2): the POLL is the path that actually fires.
+    """The POLL is the path that actually fires.
 
     `get_job_status`'s own comment says so — the frontend polls it every 2s for
     any job it is tracking. #1234 guarded the background sweep and left this
@@ -494,7 +494,7 @@ class TestPollingPathHonoursTheSameGuard:
     ) -> None:
         """The 1h abandonment policy is deliberate and stays on this path too.
 
-        fix(#1556): terminal state only — this row is a presigned upload with
+        Terminal state only — this row is a presigned upload with
         nothing bound, so the poll settles it `cancelled` exactly as the
         background sweep does. The non-presigned twin below keeps `failed`.
         """
@@ -529,7 +529,7 @@ class TestPollingPathHonoursTheSameGuard:
     async def test_a_poll_still_fails_a_local_path_bound_job_at_1h(
         self, client, admin_auth_header, test_db_session
     ) -> None:
-        """fix(#1235 review r2 refinement): the protected class is the
+        """The protected class is the
         `staging/` PREFIX, not "file_path is set".
 
         A direct upload whose dispatch failed binds an ABSOLUTE local path and
@@ -571,7 +571,7 @@ class TestPollingPathHonoursTheSameGuard:
 
 
 class TestAbandonedUploadsAreCancelled:
-    """fix(#1556): a presigned upload nobody ever bound bytes to is not a
+    """A presigned upload nobody ever bound bytes to is not a
     failed ingest.
 
     On the public demo two rows (uls.csv, 2026-08-18) sat in the admin jobs
@@ -632,7 +632,7 @@ class TestAbandonedUploadsAreCancelled:
         """#1235's absolute-path class, unchanged: a real file exists and
         retry matters, so the row must stay `failed`.
 
-        fix(#1744): what keeps it failed is the stamp, not the path. The same
+        What keeps it failed is the stamp, not the path. The same
         absolute path with no stamp is an upload nobody committed, which the
         test below covers."""
         from app.platform.jobs.router import fail_stale_jobs
@@ -723,7 +723,7 @@ class TestAbandonedUploadsAreCancelled:
     async def test_the_outcome_counts_cancellations_apart_from_failures(
         self, test_db_session
     ) -> None:
-        """fix(#1556 review, codex P2): settling the row was only half of it.
+        """Settling the row was only half of it.
 
         `pending_failed` is read as a failure count by the admin cleanup
         response, by its `job.cleanup_stale` audit event and by the sweeper's
@@ -818,7 +818,7 @@ class TestAbandonedUploadsAreCancelled:
 
 
 def test_the_published_cleanup_response_drops_the_new_count_without_raising() -> None:
-    """fix(#1556 review, codex P2): the boundary, pinned deliberately.
+    """The boundary, pinned deliberately.
 
     `pending_cancelled` reaches the audit event's `details` (a JSONB blob with
     no schema) and the multi-tenant fleet totals. It stops at
@@ -860,7 +860,7 @@ def test_the_published_cleanup_response_drops_the_new_count_without_raising() ->
 
 
 class TestUrlExpiryAnchorsToTheJobDeadline:
-    """fix(#1235 review r3): URL expiry anchored at SIGNING time while the job
+    """URL expiry anchored at SIGNING time while the job
     deadline anchors at created_at, so the two drifted by the in-request time
     between the job INSERT and each signature — and the part loop signs
     sequentially, so a many-part file's last URLs drifted furthest. In that gap
@@ -902,7 +902,7 @@ class TestUrlExpiryAnchorsToTheJobDeadline:
         assert 3595 <= ttl <= 3600, ttl
 
     def test_a_job_past_its_deadline_reports_a_negative_remainder(self) -> None:
-        """fix(#1235 review r4): the helper must not launder a dead job into a
+        """The helper must not launder a dead job into a
         live URL. It used to floor at 1, which reads as "expired on arrival" and
         is the opposite: ExpiresIn is relative to SIGNING time, so 1 buys the
         client one more usable second past the deadline."""
@@ -930,7 +930,7 @@ class TestUrlExpiryAnchorsToTheJobDeadline:
 
 
 class TestEveryLifetimeTimerDerivesFromTheOneSetting:
-    """fix(#1235 review r4): #1234 made the pending lifetime configurable and
+    """Making the pending lifetime configurable (#1234)
     converted only some of the consumers of the numbers that used to be its
     fixed value. Each survivor broke differently once an operator moved it, so
     what is asserted here is the closure — every lifetime-derived timer moves
@@ -965,7 +965,7 @@ class TestEveryLifetimeTimerDerivesFromTheOneSetting:
             assert stale_pending_cutoff_seconds(completion_bound=True) == 86400
 
     def test_the_post_expiry_sweep_waits_out_the_configured_url(self) -> None:
-        """fix(#1235 review r4): this cutoff derived from a fixed 3600. With a
+        """This cutoff derived from a fixed 3600. With a
         longer timeout the sweep ran while the PUT URL was still live, and the
         reaped marker takes the row out of every later pass — so an object
         recreated after it survived forever."""
@@ -978,7 +978,7 @@ class TestEveryLifetimeTimerDerivesFromTheOneSetting:
 
 
 class TestPresignRefusesRatherThanSigningADeadWindow:
-    """fix(#1235 review r4): there is no ExpiresIn that means "already dead".
+    """There is no ExpiresIn that means "already dead".
 
     The helper used to floor the remaining lifetime at 1, described as a URL
     "expired on arrival". ExpiresIn is relative to SIGNING time, so that floor
@@ -1017,7 +1017,7 @@ class TestPresignRefusesRatherThanSigningADeadWindow:
 
 
 class TestThePollPathSkipsUpdatesItCannotMatch:
-    """fix(#1235 review r4): the r2 rewrite dropped the outer elapsed check, so
+    """The earlier rewrite dropped the outer elapsed check, so
     BOTH pending UPDATEs ran on every 2s poll of every pending job. The DB
     predicates remain the authority; the elapsed check is a fast-path skip.
     """
@@ -1054,7 +1054,7 @@ class TestThePollPathSkipsUpdatesItCannotMatch:
         self, test_db_session: AsyncSession
     ) -> None:
         """The skip must not become the guard: past the cutoff the UPDATE runs
-        and the row goes terminal exactly as before (fix(#1556): `cancelled`
+        and the row goes terminal exactly as before (`cancelled`
         for this presigned-and-unbound row)."""
         job = await _make_pending_job(test_db_session, age_seconds=7200, file_path="")
 
@@ -1066,7 +1066,7 @@ class TestThePollPathSkipsUpdatesItCannotMatch:
 
 
 class TestAbandonedDirectUploadsAreCancelled:
-    """fix(#1744): the door #1556 did not reach.
+    """Abandoned direct uploads.
 
     `POST /ingest/upload` says it in its own docstring: it stages the file and
     does NOT auto-queue, so a `pending` row with no Procrastinate job is the
@@ -1215,7 +1215,7 @@ class TestAbandonedDirectUploadsAreCancelled:
 
 
 class TestRetryIsNotAStalePending:
-    """fix(#1556): the retry reopens the pending window, so it has to reset it.
+    """The retry reopens the pending window, so it has to reset it.
 
     ``retry_job`` commits `failed` -> `pending` and only then dispatches, so the
     orphan guard can flip the row back if the queue is down. Between those two

@@ -32,6 +32,7 @@ from app.core.service_tokens import (
     requires_header_token_policy,
 )
 from app.core.db.tenant_session import defer_async_with_tenant
+from app.platform.request_credential import refuse_publish_key
 from app.platform.dataset_origin import set_postgis_origin
 from app.platform.extensions import get_processing_port
 from app.processing.ingest.metadata import (
@@ -70,6 +71,7 @@ from app.platform.jobs.models import (
     commit_attempted_marker,
 )
 from app.platform.storage.titiler_url import resolve_current_storage_key
+from app.platform.upload_filenames import safe_upload_basename
 
 logger = structlog.get_logger(__name__)
 
@@ -77,7 +79,7 @@ logger = structlog.get_logger(__name__)
 # disk, so large uploads don't consume hundreds of MB of heap per request.
 _UPLOAD_SPOOL_MAX_BYTES: int = 16 * 1024 * 1024  # 16 MiB
 
-# fix(#836): lives here, not router.py, so CatalogPort (platform layer) can
+# Lives here, not router.py, so CatalogPort (platform layer) can
 # read it without importing the API edge (which registers routes on import).
 PART_SIZE = 10 * 1024 * 1024  # 10MB per part
 
@@ -174,11 +176,11 @@ async def discover_unregistered_tables(
                 AND d.table_name IS NULL
                 AND t.table_name NOT LIKE '%\\_staging' ESCAPE '\\'
                 AND t.table_name NOT LIKE '%\\_old' ESCAPE '\\'
-                -- fix(#1858): the two patterns above are the swap's names.
+                -- The two patterns above are the swap's names.
                 -- `attempt_scoped_staging_table` produces
                 -- `<base>_staging_<32 hex>`, which ends in neither, so a
-                -- staging table leaked by a worker that died mid-import was
-                -- listed here and permanently registerable. Same expression
+                -- staging table leaked by a worker that died mid-import would
+                -- be listed here and permanently registerable. Same expression
                 -- the registration refusal uses.
                 AND t.table_name !~ :attempt_staging_pattern
                 AND t.table_name !~ :previous_version_pattern
@@ -216,7 +218,8 @@ async def get_job_or_404(
 
     Raises:
         HTTPException 404: Job not found.
-        HTTPException 403: User is not the job creator and is not an admin.
+        HTTPException 403: User is not the job creator and is not an admin, or
+            the request uses a publish key and the job isn't its owner's.
     """
     result = await db.execute(select(IngestJob).where(IngestJob.id == job_id))
     job = result.scalar_one_or_none()
@@ -228,6 +231,7 @@ async def get_job_or_404(
         )
 
     if job.created_by != user.id:
+        refuse_publish_key(db, "A publish key can use only its owner's jobs")
         port = get_processing_port()
         user_roles = await port.get_user_roles(db, user)
         if "admin" not in user_roles:
@@ -297,17 +301,6 @@ async def record_preview_layers(
     await db.commit()
 
 
-def safe_upload_basename(filename: str | None) -> str:
-    """The filename stripped to a basename, which is the only form safe to key on.
-
-    fix(#1290): one consumer used to derive its key from the raw
-    filename. A name carrying path separators then split the derivation —
-    the logical URI kept the directory while the write basenamed it — so
-    cleanup tracked a key nobody had written. One policy, one function.
-    """
-    return Path(filename or "").name or "upload"
-
-
 async def save_upload_file(
     file: UploadFile,
     job_id: str,
@@ -322,8 +315,8 @@ async def save_upload_file(
     checks ``file_size`` declaratively at request time and uses 422. Without
     ``max_size_bytes``, ``file.file`` streams directly to S3.
 
-    In local mode, reads chunks asynchronously (64 KiB) via
-    ``run_in_executor``; a partial file is removed on write failure.
+    In local mode, reads 64 KiB chunks and writes each through a drained
+    worker thread; a partial file is removed on any failure.
 
     Callers MUST validate ``file.filename`` is non-empty before calling, so
     the error surfaces as the route handler's HTTP 400, not a TypeError.
@@ -447,7 +440,7 @@ async def _cleanup_saved_upload(
     S3 failures are logged instead.
     """
     if isinstance(saved_path, Path):
-        # codeql[py/path-injection] fix(#1708): the Path branch only ever receives a staging-rooted path (save_upload_file, or job.file_path the server itself wrote). The URL-import flow reaches this helper with an S3 KEY STRING and so takes the branch below — it is that call which makes the taint visible here.
+        # codeql[py/path-injection] the Path branch only ever receives a staging-rooted path (save_upload_file, or job.file_path the server itself wrote). The URL-import flow reaches this helper with an S3 KEY STRING and so takes the branch below — it is that call which makes the taint visible here.
         saved_path.unlink(missing_ok=True)
         return
     from app.platform.storage import get_storage
@@ -571,13 +564,12 @@ def validate_file_extension(
 # and with only a NOTICE. Slugs are ASCII-transliterated, so bytes == chars.
 _MAX_IDENTIFIER_CHARS = 63
 
-# fix(#1444): the collision walk refuses past this rather than emit a
-# name Postgres would truncate — a truncated `{base}_100` would address the
-# same relation as `{base}_10` while the catalog keeps both untruncated
-# strings, putting two logical names on one table. `_with_collision_suffix`
-# keeps every candidate inside the limit; this bound keeps the tag short
-# enough that `_COLLISION_PROBE_CHARS` stays a prefix of all of them — the
-# two constants must move together.
+# The collision walk refuses past this rather than emit a name Postgres would
+# truncate: a truncated `{base}_100` would address the same relation as
+# `{base}_10` while the catalog keeps both untruncated strings, putting two
+# logical names on one table. `_with_collision_suffix` keeps every candidate
+# inside the limit, and this bound keeps the tag short enough that
+# `_COLLISION_PROBE_CHARS` stays a prefix of all of them.
 _MAX_COLLISION_SUFFIX = 9999
 _COLLISION_PROBE_CHARS = _MAX_IDENTIFIER_CHARS - len(f"_{_MAX_COLLISION_SUFFIX}")
 
@@ -591,7 +583,7 @@ def _with_collision_suffix(base: str, suffix: int) -> str:
 def _retired_tenant_scope(RetiredORM: Any, tenant_id: str | uuid.UUID | None) -> Any:
     """Which retired names bind for ``tenant_id``: its own, plus the NULL ones.
 
-    ``current_tenant_var`` carries the id as a STRING against a
+    ``current_tenant_var`` carries the id as a string against a
     ``UUID(as_uuid=True)`` column; coercion is explicit because a silent
     mismatch reads as "no name is retired" and hands one straight back.
     """
@@ -631,11 +623,11 @@ async def generate_table_name(
 
     base_slug = slug
     collision_warning: str | None = None
-    # fix(#1444): probe on the base trimmed to _COLLISION_PROBE_CHARS,
-    # not the full base — a candidate with a long suffix has a shorter base
+    # Probe on the base trimmed to _COLLISION_PROBE_CHARS, not the full base:
+    # a candidate with a long suffix has a shorter base
     # (`_with_collision_suffix` trims to stay inside 63), so a full-base probe
-    # would miss it. Over-matches for longer slugs; under-matching would cost
-    # the collision guarantee.
+    # would miss it. It over-matches for longer slugs; under-matching would
+    # cost the collision guarantee.
     probe_prefix = base_slug[:_COLLISION_PROBE_CHARS]
     result = await session.execute(
         select(DatasetORM.table_name).where(
@@ -644,13 +636,13 @@ async def generate_table_name(
     )
     existing = {row[0] for row in result.all()}
 
-    # fix(#692): also collide against live relations. A worker killed between
-    # committing an output table and registering it leaves a physical table
-    # with no Dataset row; a catalog-only probe would hand out that name
-    # forever. The retry self-heals to a _N suffix — no auto-DROP here.
-    # fix(#700): probe pg_catalog, not information_schema, which
-    # filters to relations the current role has privileges on and can miss
-    # an orphan that never reached grant_reader_access.
+    # Also collide against live relations. A worker killed between committing
+    # an output table and registering it leaves a physical table with no
+    # Dataset row, and a catalog-only probe would hand out that name forever.
+    # The retry self-heals to a _N suffix; nothing is dropped here. pg_catalog,
+    # not information_schema, which filters to relations the current role has
+    # privileges on and can miss an orphan that never reached
+    # grant_reader_access.
     from app.core.db.tenant_schema import tenant_data_schema
     from app.core.db.tenant_session import current_tenant_var
     from app.core.tenancy import is_multi_tenant
@@ -666,21 +658,19 @@ async def generate_table_name(
     )
     existing |= {row[0] for row in info_result.all()}
 
-    # fix(#1443): also collide against RETIRED names. A delete clears both
-    # probes above, so a deleted dataset's name was handed straight back to
-    # the next one with that title — and the tile router's table_name ->
-    # dataset cache could then authorize a caller against the deleted
-    # dataset's visibility while querying the successor's table. Treating a
-    # retired name as a live collision closes that: a deleted `roads`'s
-    # successor gets `roads_2`.
+    # Also collide against retired names. A delete clears both probes above,
+    # so without this a deleted dataset's name would go straight to the next
+    # one with that title, and the tile router's table_name -> dataset cache
+    # could then authorize a caller against the deleted dataset's visibility
+    # while querying the successor's table. A deleted `roads`'s successor
+    # gets `roads_2`.
     #
-    # fix(#1444): tenant-scoped, mirroring migration 0020's per-tenant
-    # uniqueness — names are already per-tenant everywhere it matters, so
-    # retiring one globally would only cost unrelated tenants suffixes (and,
-    # with the _MAX_COLLISION_SUFFIX bound above, could exhaust a shared
-    # budget). NULL-tenant rows count in every scope: that's the
-    # single-tenant namespace and where pre-multi-tenant retirements sit
-    # uncorrected; over-collision there is the cheap direction.
+    # Tenant-scoped, mirroring migration 0020's per-tenant uniqueness: names
+    # are already per-tenant everywhere it matters, so retiring one globally
+    # would only cost unrelated tenants suffixes (and could exhaust the
+    # shared _MAX_COLLISION_SUFFIX budget). NULL-tenant rows count in every
+    # scope: that's the single-tenant namespace and where pre-multi-tenant
+    # retirements sit; over-collision there is the cheap direction.
     RetiredORM = get_processing_port().get_retired_table_name_orm_class()
     retired_result = await session.execute(
         select(RetiredORM.table_name).where(
@@ -715,11 +705,11 @@ def raster_stamped_metadata(
 ) -> dict | None:
     """The ``user_metadata`` that should be persisted for ``filename``.
 
-    fix(#1708): the pure form of ``_stamp_raster_metadata`` in router.py, for
-    the paths that persist via a guarded CAS ``UPDATE`` rather than dirtying
-    the ORM object (which would flush a second, unguarded UPDATE and bypass
-    the CAS). fix(#1710): lives here rather than in the router so the URL
-    fetch task can reach it without importing an HTTP module.
+    The pure form of ``_stamp_raster_metadata`` in router.py, for the paths
+    that persist via a guarded CAS ``UPDATE`` rather than dirtying the ORM
+    object (which would flush a second, unguarded UPDATE and bypass the
+    CAS). Lives here so the URL fetch task can reach it without importing an
+    HTTP module.
     """
     if not (filename or "").lower().endswith((".tif", ".tiff", ".vrt")):
         return user_metadata
@@ -796,26 +786,24 @@ async def register_existing_table(
     ensures the gid and geom_4326 columns and reader access, extracts
     metadata, and creates a Dataset record.
 
-    fix(#1114): registered-table linear-geometry contract. ``geom_4326`` on a
-    registered table must stay linear (no CIRCULARSTRING, COMPOUNDCURVE,
-    CURVEPOLYGON, MULTICURVE, MULTISURFACE). Linearized once at registration
-    (``linearize_existing_4326``); not policed afterward, since registration
-    serves from the live table the owner keeps writing to directly. A later
-    curved row degrades tiles/reads/analysis for that dataset only. STORED
-    GENERATED ``geom_4326`` columns fall under the same contract.
+    Registered-table linear-geometry contract: ``geom_4326`` on a registered
+    table must stay linear (no CIRCULARSTRING, COMPOUNDCURVE, CURVEPOLYGON,
+    MULTICURVE, MULTISURFACE). It is linearized once at registration
+    (``linearize_existing_4326``) and not policed continuously, since
+    registration serves from the live table the owner keeps writing to
+    directly. A later curved row degrades tiles/reads/analysis for that
+    dataset only. STORED GENERATED ``geom_4326`` columns fall under the same
+    contract. Direct writes can also leave ``geom_4326`` stale or NULL,
+    invisible to every reader that filters on it; ``refresh_postgis``
+    re-derives the column, and restores it plus its GiST index and the
+    reader grant if the table was dropped and recreated without them.
 
-    fix(#1738): "not policed afterward" means not policed continuously —
-    direct writes can still leave ``geom_4326`` stale or NULL, invisible to
-    every reader that filters on it. ``refresh_postgis`` is what picks that
-    up: it re-derives the column, and restores it plus its GiST index and
-    the reader grant if the table was dropped and recreated without them.
-
-    fix(#1452): ``managed`` declares the CALLER created the table, so
-    deleting the dataset may drop it again. Defaults False since the two
-    register endpoints take an operator-named table; only the analysis
-    materialize path (CTAS's its own output) passes True. Getting this
-    wrong in the True direction drops a table GeoLens doesn't own — an
-    explicit argument at the one call site that can answer it, not a guess.
+    ``managed`` declares the caller created the table, so deleting the
+    dataset may drop it again. Defaults False since the two register
+    endpoints take an operator-named table; only the analysis materialize
+    path (CTAS's its own output) passes True. Getting this wrong in the True
+    direction drops a table GeoLens doesn't own, so it is an explicit
+    argument at the one call site that can answer it.
     """
     table_name = request.table_name
 
@@ -835,12 +823,12 @@ async def register_existing_table(
     _tid = current_tenant_var.get() if is_multi_tenant() else None
     _schema = tenant_data_schema(_tid)
 
-    # fix(#1858): refused on the NAME alone, before the database is touched.
-    # Discovery hides these but registration takes a name straight from the
-    # caller, so hiding was never the same as refusing: a dataset bound to a
-    # staging table is bound to storage the next import attempt will rename
-    # away. Only the attempt-scoped shape is refused — `parcels_staging` and
-    # `parcels_old` are names an ordinary title can produce.
+    # Refused on the name alone, before the database is touched. Discovery
+    # hides these but registration takes a name straight from the caller, so
+    # hiding is not the same as refusing: a dataset bound to a staging table
+    # is bound to storage the next import attempt will rename away. Only the
+    # attempt-scoped shape is refused; `parcels_staging` and `parcels_old` are
+    # names an ordinary title can produce.
     if is_attempt_scoped_staging_table(table_name):
         raise ValueError(
             f"Table '{table_name}' is an import staging table. It belongs to a "
@@ -850,9 +838,9 @@ async def register_existing_table(
         )
     if is_previous_version_table(table_name):
         raise ValueError(
-            f"Table '{table_name}' holds a dataset's previous version, which "
-            "GeoLens drops or replaces at that dataset's next replacement. "
-            "Rename the table if you mean to keep it."
+            f"Table '{table_name}' holds one of a dataset's kept previous "
+            "versions, which GeoLens drops once the dataset keeps more than its "
+            "limit or is deleted. Rename the table if you mean to keep it."
         )
 
     result = await session.execute(
@@ -874,13 +862,13 @@ async def register_existing_table(
     if existing.scalar_one_or_none() is not None:
         raise ValueError(f"Table '{table_name}' is already registered as a dataset.")
 
-    # fix(#1444): registration takes a table name straight from the
-    # caller instead of generate_table_name, so the retirement probe (see
-    # GH-1443's disclosure) has to repeat here or it's bypassable: recreate a
-    # table under a deleted public dataset's name, register it private, and a
-    # worker still holding the predecessor's metadata authorizes anonymously
-    # against `public` while querying the successor's rows. Refuse rather
-    # than rename — registration serves from the caller's own live table.
+    # Registration takes a table name straight from the caller instead of
+    # generate_table_name, so the retirement probe has to repeat here or it's
+    # bypassable: recreate a table under a deleted public dataset's name,
+    # register it private, and a worker still holding the predecessor's
+    # metadata authorizes anonymously against `public` while querying the
+    # successor's rows. Refuse rather than rename, since registration serves
+    # from the caller's own live table.
     RetiredORM = get_processing_port().get_retired_table_name_orm_class()
     retired = await session.execute(
         select(RetiredORM.id)
@@ -908,12 +896,12 @@ async def register_existing_table(
     has_geom = "geom" in geom_cols
     has_4326 = "geom_4326" in geom_cols
 
-    # fix(#1737): a spatial table whose geometry lives under any other name
-    # used to register SILENTLY as non-spatial, since extract_metadata
-    # reports srid/geometry_type/extent as None for an unrecognized column.
-    # Must be told apart from the deliberate non-spatial path (#1359), where
-    # a table truly has no geometry column. `ogr2ogr -f PostgreSQL` names its
-    # column `wkb_geometry` by default, so this is the ordinary case.
+    # A spatial table whose geometry lives under any other name would
+    # register silently as non-spatial, since extract_metadata reports
+    # srid/geometry_type/extent as None for an unrecognized column. It must be
+    # told apart from a non-spatial table, which truly has no geometry column.
+    # `ogr2ogr -f PostgreSQL` names its column `wkb_geometry` by default, so
+    # this is the ordinary case.
     if not has_geom:
         other_geom = await session.execute(
             text(
@@ -961,11 +949,11 @@ async def register_existing_table(
                     f"Failed to add geom_4326 column to '{table_name}'", exc
                 ) from exc
         else:
-            # fix(#1113): a table registered after migration 0034 is
-            # invisible to its backfill, so a pre-existing geom_4326 written
-            # by someone else could reach readers curved, now that the
-            # per-read ST_CurveToLine wraps are gone. Enforce linearity here,
-            # on the write boundary, instead.
+            # A table registered after migration 0034 is invisible to its
+            # backfill, and readers apply no per-read ST_CurveToLine, so a
+            # pre-existing geom_4326 written by someone else could reach
+            # readers curved. Linearity is enforced here, on the write
+            # boundary.
             try:
                 async with session.begin_nested():
                     await linearize_existing_4326(session, table_name, schema=_schema)
@@ -976,10 +964,10 @@ async def register_existing_table(
 
     await grant_reader_access(session, table_name, schema=_schema, role=_grant_role)
 
-    # fix(#1359): one derivation for every registration, spatial or not — the
-    # non-spatial branch used to skip this and register with column_info and
-    # feature_count NULL. extract_metadata already reports srid/
-    # geometry_type/extent_wkt as None for a table with no geom column.
+    # One derivation for every registration, spatial or not, so a
+    # non-spatial table is not registered with column_info and feature_count
+    # NULL. extract_metadata reports srid/geometry_type/extent_wkt as None for
+    # a table with no geom column.
     metadata = await extract_metadata(session, table_name, schema=_schema)
 
     col_info = metadata.get("column_info", [])
@@ -1003,15 +991,13 @@ async def register_existing_table(
         ingestion=ingestion,
     )
 
-    # feat(#1218): registration serves from the live table, so the origin IS
-    # that table — schema-qualified name only, no host/port/DSN/credential
-    # (no external PostGIS federation in v1).
+    # Registration serves from the live table, so the origin is that table:
+    # schema-qualified name only, no host/port/DSN/credential.
     #
-    # fix(#1218): pass the SAME _schema this function verified,
-    # granted, and extracted metadata in. Reading dataset.tenant_id instead
-    # pointed every multi-tenant registration at `data.<table>`, since the
-    # INSERT sends tenant_id NULL and a trigger fills it in the database —
-    # the ORM attribute never sees the real value.
+    # The schema is the _schema this function verified, granted and extracted
+    # metadata in, not one read from dataset.tenant_id: the INSERT sends
+    # tenant_id NULL and a trigger fills it in the database, so the ORM
+    # attribute never sees the real value.
     set_postgis_origin(dataset, table_name, schema=_schema, managed=managed)
 
     return dataset
@@ -1064,22 +1050,26 @@ async def create_vrt_job(
                 detail=f"Source dataset {sid} not found or not a raster dataset",
             )
 
-    # Authorize EVERY source dataset before mosaicking: the worker compiles
-    # all source pixels into one served asset, so a foreign private source
-    # can't be filtered at read time — authorize at write/link time instead
-    # (check_datasets_access_bulk raises 404). Runs before validate_sources
-    # so a foreign source 404s rather than leaking a 422 about a dataset the
-    # caller can't see.
-    #
-    # fix(#1298): batched — a 500-source request used to cost one round trip
-    # per source.
+    # Every source must be readable by the caller, checked before
+    # validate_sources so an unreadable one gets a 404 rather than a 422 about
+    # it, and by everyone the new VRT reaches once published.
     from app.modules.catalog.authorization import (
         check_datasets_access_bulk,
+        check_vrt_within_member_audience,
         get_user_roles,
     )
+    from app.platform.extensions import RecordAudienceQuery
 
     user_roles = await get_user_roles(db, user)
     await check_datasets_access_bulk(db, request.source_dataset_ids, user, user_roles)
+    new_vrt = RecordAudienceQuery(
+        dataset_id=None,
+        record_id=None,
+        owner_id=user.id,
+        visibility=request.visibility,
+        record_status="published",
+    )
+    await check_vrt_within_member_audience(db, request.source_dataset_ids, new_vrt)
 
     errors = await validate_sources_async(request.vrt_type, list(found_assets))
     if errors:
@@ -1180,12 +1170,12 @@ async def create_fan_out_jobs(
                 "fan_out_parent_id": str(original_job.id),
                 # Each fan-out job creates its own dataset in _finalize_ingest.
                 "dataset_id": None,
-                # fix(#1744): stamped here, not by the guard below, so it
-                # rides the commit that makes the row visible. A process
-                # death in the gap would leave it unstamped, and the stale
-                # sweep would settle it `cancelled` — taking away the only
-                # way to re-run this layer, since the layer selection lives
-                # nowhere but the fan-out request body (#1709 r8).
+                # Stamped here, not by the guard below, so it rides the
+                # commit that makes the row visible. A process death in the
+                # gap would leave it unstamped, and the stale sweep would
+                # settle it `cancelled`, taking away the only way to re-run
+                # this layer: the layer selection lives nowhere but the
+                # fan-out request body.
                 **commit_attempted_marker(),
             },
         )
@@ -1236,18 +1226,17 @@ async def create_fan_out_jobs(
             original_job_id=str(original_job.id),
             error=str(exc),
         )
-        # fix(#1774): reset the session before returning — a
-        # transactional failure in the commit above leaves the session
-        # refusing every later statement, and the caller loops over remaining
-        # layers on this same session then runs
-        # `restore_fan_out_parent_pending`. Without the reset, one layer's
-        # deadlock fails every sibling and strands the parent `fanned_out`.
+        # Reset the session before returning: a transactional failure in the
+        # commit above leaves the session refusing every later statement, and
+        # the caller loops over the remaining layers on this same session,
+        # then runs `restore_fan_out_parent_pending`. Without the reset, one
+        # layer's deadlock fails every sibling and strands the parent
+        # `fanned_out`.
         #
-        # fix(#1774): reload the parent in the same
-        # breath, since the reset expires it — a synchronous read of an
-        # expired attribute on an AsyncSession raises MissingGreenlet, and
-        # both the next layer and `restore_fan_out_parent_pending` read
-        # attributes off this same instance.
+        # The parent is reloaded with it, since the reset expires it: a
+        # synchronous read of an expired attribute on an AsyncSession raises
+        # MissingGreenlet, and both the next layer and
+        # `restore_fan_out_parent_pending` read attributes off this instance.
         parent_job_id = str(original_job.id)
         try:
             await session.rollback()
@@ -1277,16 +1266,16 @@ async def claim_fan_out_parent(
 ) -> bool:
     """CAS the parent ``pending -> fanned_out`` BEFORE any child is dispatched.
 
-    fix(#1709): an earlier shape (children first, terminal CAS
-    after the loop) let a cancel commit mid-loop while an already-deferred
-    fast child claimed and completed before cleanup — the child CAS refused
-    the terminal row, so a 200 cancel still created that child's dataset.
-    This CAS is now the mutex for the whole dispatch: it commits before the
-    first child exists, so only two clean orderings remain — cancel first
-    (zero children ever created, endpoint 409s, nothing to reconcile), or
-    this CAS first (parent terminal, every cancel 409s, each child is its
-    own individually-cancellable job). Committed here rather than riding a
-    later flush, since a fence is only a fence once durable.
+    Dispatching children first and CASing the terminal state after the loop
+    would let a cancel commit mid-loop while an already-deferred fast child
+    claimed and completed before cleanup: the child CAS refused the terminal
+    row, so a 200 cancel still created that child's dataset. This CAS is the
+    mutex for the whole dispatch. It commits before the first child exists,
+    so only two clean orderings remain: cancel first (zero children ever
+    created, endpoint 409s, nothing to reconcile), or this CAS first (parent
+    terminal, every cancel 409s, each child is its own individually
+    cancellable job). Committed here rather than riding a later flush, since
+    a fence is only a fence once durable.
 
     Returns whether the claim landed. The caller renders the refusal.
     """
@@ -1306,17 +1295,17 @@ async def restore_fan_out_parent_pending(
     Retry contract: an all-failed dispatch (e.g. Procrastinate outage) keeps
     the parent ``pending`` so the user can commit again without
     re-uploading. The restore is itself a fenced CAS on the attempt id,
-    undoing only the flip THIS request wrote — a blind write would resurrect
-    a row the round-2 fix removed that bug for.
+    undoing only the flip this request wrote; a blind write would resurrect
+    a row the claim-first dispatch exists to keep terminal.
 
-    fix(#2016): a dispatch loop that outlives ``FAN_OUT_CHILDLESS_GRACE``
-    finds the childless-fanout sweep has already settled the same row
-    ``failed`` with the interrupted marker, which ``_retry_capability``
-    refuses — the re-upload this restore exists to spare the user. So the CAS
-    also accepts that row and drops the marker as it restores. Same row, same
-    attempt, and the sweep only reached it because THIS dispatch was still
-    running; the attempt fence is what keeps another attempt's ``failed`` row
-    out. Only that one key is cleared, off the row's own metadata.
+    A dispatch loop that outlives ``FAN_OUT_CHILDLESS_GRACE`` finds the
+    childless-fanout sweep has already settled the same row ``failed`` with
+    the interrupted marker, which ``_retry_capability`` refuses, forcing the
+    re-upload this restore exists to spare the user. So the CAS also accepts
+    that row and drops the marker as it restores. Same row, same attempt, and
+    the sweep only reached it because this dispatch was still running; the
+    attempt fence keeps another attempt's ``failed`` row out. Only that one
+    key is cleared, off the row's own metadata.
 
     Returns whether the CAS matched, so the caller can report a lost undo.
     """
@@ -1345,18 +1334,18 @@ def job_service_format(job: IngestJob) -> str | None:
 
 
 def _assert_header_token_dispatchable(job: IngestJob, token: str | None) -> None:
-    """fix(#1746): refuse a header-auth token the worker is going to reject.
+    """Refuse a header-auth token the worker is going to reject.
 
-    The import-commit door used to hand any printable, whitespace-free token
-    straight to ``resolve_dispatch_credential``; a WFS/OGC API token
-    containing ``+`` or ``/`` got a 202, spent its single-use credential,
-    then failed deterministically inside ogr2ogr's own charset check. Same
-    422 and policy-only message the refresh door has returned since #1277 —
-    a response body must never echo part of a credential.
+    A printable, whitespace-free token handed straight to
+    ``resolve_dispatch_credential`` can still fail deterministically: a
+    WFS/OGC API token containing ``+`` or ``/`` would get a 202, spend its
+    single-use credential, then fail inside ogr2ogr's own charset check.
+    This gives the same 422 and policy-only message the refresh door
+    returns, since a response body must never echo part of a credential.
 
     ArcGIS is exempt (``requires_header_token_policy``'s call): its token is
     a urlencoded query parameter, never a header line, so the strict charset
-    doesn't apply. Judges the BARE token only, which is what
+    doesn't apply. Judges the bare token only, which is what
     ``ServiceCommitRequest`` carries; composition into a wire value happens
     in ``queue_ingest_job``.
     """
@@ -1408,14 +1397,14 @@ async def queue_ingest_job(
     credential store is not configured or cannot be reached (see
     ``resolve_dispatch_credential``).
 
-    feat(#1746) D2: ``credential`` is the structured spelling of the same
-    thing as ``token``, so a caller with no HTTP layer (e.g. an overlay
-    scheduler holding a resolved stored credential) can queue an
-    authenticated ingest without assembling a request body. Wins over
-    ``token`` when both are set. A method the job's service can't carry is
-    refused with 422 ``unsupported_auth_method`` rather than dispatched
-    unauthenticated — for ArcGIS that means only a username/password or a
-    named API key, since that transport has room for a token and nothing else.
+    ``credential`` is the structured spelling of the same thing as
+    ``token``, so a caller with no HTTP layer (e.g. an overlay scheduler
+    holding a resolved stored credential) can queue an authenticated ingest
+    without assembling a request body. It wins over ``token`` when both are
+    set. A method the job's service can't carry is refused with 422
+    ``unsupported_auth_method`` rather than dispatched unauthenticated; for
+    ArcGIS that means only a username/password or a named API key, since
+    that transport has room for a token and nothing else.
     """
     import os
 
@@ -1445,15 +1434,13 @@ async def queue_ingest_job(
         source_url = job.source_url
         job_failed = make_ingest_job_failed_rollback(job)
 
-        # fix(#1746): before the stash below, so a token the worker will
-        # refuse never burns a single-use credential.
-        #
-        # fix(#1746): only when the flat token is the
-        # credential actually sent — the structured `credential` wins over
-        # `token` when both are given, so checking the losing one could
-        # refuse an in-process D2 caller for a stale token it already
-        # replaced. `wire_credential` below applies the same rule to
-        # whichever spelling is actually dispatched.
+        # Before the stash below, so a token the worker will refuse never
+        # burns a single-use credential. Only when the flat token is the
+        # credential actually sent: the structured `credential` wins over
+        # `token` when both are given, so checking the losing one could refuse
+        # an in-process caller for a stale token it already replaced.
+        # `wire_credential` below applies the same rule to whichever spelling
+        # is dispatched.
         if credential is None:
             _assert_header_token_dispatchable(job, token)
 

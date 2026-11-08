@@ -1,6 +1,6 @@
 """Linearize curved geom_4326 values in existing per-dataset tables.
 
-fix(#1104): WFS ingest admitted curved geometries (MultiSurface /
+WFS ingest admitted curved geometries (MultiSurface /
 CompoundCurve) into ``geom_4326``, and every surface that reads the column
 raises on them: ST_AsMVTGeom (vector tiles), ST_AsGeoJSON (feature reads),
 ``::geography`` and ST_MakeValid (analysis). Ingest now applies
@@ -15,7 +15,7 @@ information_schema: every BASE TABLE with a geometry column named
 tenant schema (multi-tenant, see tenant_data_schema).
 
 The predicate is the union of three tests, because each alone misses a
-stored shape — fix(#1113 review): a curve TYPE with no arc in it
+stored shape: a curve TYPE with no arc in it
 (``MULTISURFACE(((...)))``, a form the curved-sources suite itself uses)
 still breaks every curve-intolerant reader, and ST_HasArc alone skips
 it; a GeometryType list alone misses an arc nested inside a
@@ -66,14 +66,14 @@ def upgrade() -> None:
             WHERE c.column_name = 'geom_4326'
               AND c.udt_name = 'geometry'
               AND t.table_type = 'BASE TABLE'
-              -- fix(#1113 review r7): a STORED GENERATED geom_4326 rejects
+              -- A STORED GENERATED geom_4326 rejects
               -- any UPDATE at parse time (even WHERE false), which would
               -- abort this whole migration. It also cannot be fixed by
               -- UPDATE — its values are decided by its generation
               -- expression — so it is skipped, not repaired (#1114 tracks
               -- externally-defined columns whose expressions yield curves).
               AND c.is_generated = 'NEVER'
-              -- fix(#1113 review): only GeoLens-owned data schemas — 'data'
+              -- Only GeoLens-owned data schemas — 'data'
               -- (single-tenant) or the EXACT per-tenant schemas derived from
               -- catalog.tenants, the same construction as tenant_data_schema()
               -- and migrations 0024/0026. A co-hosted schema that merely
@@ -84,13 +84,13 @@ def upgrade() -> None:
                        SELECT 'data_t_' || pg_catalog.replace(id::text, '-', '_')
                        FROM catalog.tenants
                    ))
-              -- fix(#1113 review r11): REGISTERED datasets only. An operator
+              -- REGISTERED datasets only. An operator
               -- can copy a table into a data schema before registering it
               -- (discover_unregistered_tables exists for exactly that state);
               -- GeoLens serves nothing from it yet, registration now runs its
               -- own linearization, and densifying it here would be
               -- irreversible harm with no surface fixed.
-              -- fix(#1113 review r12): the join is TENANT-SCOPED — migration
+              -- The join is TENANT-SCOPED — migration
               -- 0020's (tenant_id, table_name) unique index permits the same
               -- table name in different tenants, so a name-only join would
               -- sweep tenant B's unregistered twin of tenant A's registered
@@ -110,25 +110,25 @@ def upgrade() -> None:
         )
     ).all()
     for schema, table in tables:
-        # fix(#1113 review r14): EVERY table converts inside its own savepoint.
-        # Review found four distinct DDL shapes that abort the naive loop —
-        # a curved typmod (r4), a dimensional curved typmod (r5), a STORED
-        # GENERATED column (r7, excluded above), and a legacy CHECK-constraint
-        # declaration (r14: geometry_columns reports the constraint-derived
-        # type, the typmod ALTER cannot remove the CHECK, and the linear
-        # UPDATE then violates it) — and that family is open-ended. One
+        # EVERY table converts inside its own savepoint.
+        # Four distinct DDL shapes abort the naive loop — a curved typmod, a
+        # dimensional curved typmod, a STORED GENERATED column (excluded
+        # above), and a legacy CHECK-constraint declaration (geometry_columns
+        # reports the constraint-derived type, the typmod ALTER cannot remove
+        # the CHECK, and the linear UPDATE then violates it) — and that
+        # family is open-ended. One
         # hostile table must degrade to a named skip, never block the
         # deployment; the operator warning carries the cause and the fix
         # stays with the table's owner (#1114).
         try:
             with conn.begin_nested():
-                # fix(#1113 review): a BYO table can declare geom_4326 with a
+                # A BYO table can declare geom_4326 with a
                 # curved TYPMOD — geometry(CurvePolygon, 4326) — and the
                 # linear UPDATE result then violates the declared column
                 # type. Loosen such a column first; only the concrete curve
                 # typmods reject their linear counterparts (abstract
                 # CURVE/SURFACE typmods accept linear subtypes).
-                # fix(#1113 review r5): geometry_columns encodes
+                # geometry_columns encodes
                 # dimensionality two ways — M as a suffix on ``type``
                 # (CURVEPOLYGONM, coord_dimension 3), Z with NO suffix
                 # (coord_dimension 3), ZM with no suffix and coord_dimension
@@ -191,7 +191,7 @@ def upgrade() -> None:
                 exc,
             )
 
-    # fix(#1113 review r9): the loop above must SKIP stored generated columns
+    # The loop above must SKIP stored generated columns
     # (any UPDATE against one aborts at parse time), but an already-registered
     # dataset whose generated expression yields curves stays broken with no
     # signal. Surface those tables to the operator — a SELECT cannot abort the
@@ -214,10 +214,10 @@ def upgrade() -> None:
                        SELECT 'data_t_' || pg_catalog.replace(id::text, '-', '_')
                        FROM catalog.tenants
                    ))
-              -- fix(#1113 review r11): warn only about datasets GeoLens
+              -- Warn only about datasets GeoLens
               -- actually serves; an unregistered table's generated column is
               -- registration's problem when (if) it registers.
-              -- fix(#1113 review r12): tenant-scoped, same as the backfill.
+              -- Tenant-scoped, same as the backfill.
               AND EXISTS (
                   SELECT 1 FROM catalog.datasets d
                   WHERE d.table_name = c.table_name

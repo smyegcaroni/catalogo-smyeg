@@ -1,4 +1,4 @@
-"""SEC-FU-08: Column DDL feed — service helper and endpoint tests.
+"""Column DDL feed — service helper and endpoint tests.
 
 Tests the query_column_ddl_history service helper and the
 GET /api/audit/datasets/{dataset_id}/column-ddl endpoint.
@@ -224,7 +224,7 @@ async def test_query_column_ddl_history_pagination(
 
 
 # ===========================================================================
-# Router-layer tests (Task 3, tests 5–10)
+# Router-layer tests
 # ===========================================================================
 
 
@@ -291,7 +291,7 @@ async def test_column_ddl_feed_owner_sees_history(
 
 
 @pytest.mark.anyio
-async def test_column_ddl_feed_non_owner_gets_403_or_404(
+async def test_column_ddl_feed_non_owner_of_private_dataset_gets_404(
     client: AsyncClient,
     admin_auth_header: dict,
     test_db_session: AsyncSession,
@@ -316,10 +316,7 @@ async def test_column_ddl_feed_non_owner_gets_403_or_404(
         f"/api/audit/datasets/{dataset_id}/column-ddl",
         headers=other_headers,
     )
-    # Non-owner should get 403 or 404 (check_dataset_access raises 404 for private datasets)
-    assert resp.status_code in (403, 404), (
-        f"Expected 403 or 404, got {resp.status_code}: {resp.text}"
-    )
+    assert resp.status_code == 404, resp.text
 
     # Body must NOT contain dataset name or column DDL details
     body_text = resp.text
@@ -442,7 +439,7 @@ async def test_column_ddl_feed_non_owner_public_dataset_denied(
     admin_auth_header: dict,
     test_db_session: AsyncSession,
 ):
-    """fix(#458 E-37): the feed is owner-facing — a PUBLIC dataset must not let
+    """The feed is owner-facing — a PUBLIC dataset must not let
     arbitrary authenticated users enumerate editor usernames/user_ids. The old
     check_dataset_access (read visibility) allowed exactly that."""
     owner_headers, owner_id_str = await _create_test_user(
@@ -465,9 +462,7 @@ async def test_column_ddl_feed_non_owner_public_dataset_denied(
         f"/api/audit/datasets/{dataset_id}/column-ddl",
         headers=other_headers,
     )
-    assert resp.status_code in (403, 404), (
-        f"Expected denial on public dataset for non-owner, got {resp.status_code}: {resp.text}"
-    )
+    assert resp.status_code == 403, resp.text
     assert "layer.add_column" not in resp.text
 
     # The owner still sees it.

@@ -4,22 +4,21 @@ import { isFolderGroupLayer } from '@/lib/layer-capabilities';
 
 export type BuilderEditorScene = 'default' | 'dem' | 'basemap-group' | 'basemap-sublayer' | 'settings' | 'group';
 
-export interface BuilderEditorBasemapGroup {
+interface BuilderEditorBasemapGroup {
   id: string;
   presetName: string;
   sublayers: Array<{ id: string; name: string }>;
 }
 
-export interface BuilderEditorSyntheticLabels {
+interface BuilderEditorSyntheticLabels {
   settingsName: string;
   sublayerFallback: string;
   untitledFallback: string;
   basemapGroupName: (presetName: string) => string;
 }
 
-// Kept pure (no t() call) — matches the current English copy so callers that
-// omit `labels` see unchanged behavior. Real call sites (MapBuilderPage) pass
-// translated labels.
+// Pure (no t() call), matching the English copy for callers that omit `labels`.
+// Real call sites (MapBuilderPage) pass translated labels.
 const DEFAULT_SYNTHETIC_LABELS: BuilderEditorSyntheticLabels = {
   settingsName: 'Settings',
   sublayerFallback: 'Sublayer',
@@ -35,8 +34,8 @@ export function deriveBuilderEditorScene(
   if (expandedLayerId === 'settings') return 'settings';
   if (expandedLayerId === 'basemap-group') return 'basemap-group';
   if (expandedLayerId.startsWith('basemap:')) return 'basemap-sublayer';
-  // fix(#392): folder groups are structural containers, not
-  // stylable layers; never fall through to a real editing scene for them. (audit B-004a/LM-01)
+  // Folder groups are structural containers, not stylable layers; never fall
+  // through to a real editing scene for them.
   if (editingLayer && isFolderGroupLayer(editingLayer)) return 'group';
   if (editingLayer?.is_dem === true) return 'dem';
   return 'default';
@@ -136,9 +135,9 @@ export function useBuilderEditorScene({
     [expandedLayerId, localLayers],
   );
 
-  // fix(#392): a group:folder row IS a member of localLayers,
-  // so without this guard editingLayer would resolve to the group row and bind
-  // the editor to its inherited (phantom) geometry. Treat it as non-editable. (audit B-004a/LM-01)
+  // A group:folder row is a member of localLayers, so without this guard
+  // editingLayer would resolve to the group row and bind the editor to its
+  // inherited (phantom) geometry. Treat it as non-editable.
   const editingLayer = matchedLayer && isFolderGroupLayer(matchedLayer) ? null : matchedLayer;
 
   const editingSavedLayer = useMemo(

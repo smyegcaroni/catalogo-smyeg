@@ -47,10 +47,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { Checkbox } from '@/components/ui/checkbox';
 
-// feat(#1764): the four-way choice the backend's CredentialMethod enum names.
-// A copy rather than a shared component, matching ServiceCredentialBlock's
-// own note that converging the two is a follow-up.
+// The four-way choice the backend's CredentialMethod enum names. A copy rather
+// than a shared component, as ServiceCredentialBlock.
 type StacCredentialMethod = 'none' | 'bearer' | 'basic' | 'header';
 
 type SearchFilters = Pick<
@@ -80,21 +80,19 @@ type Step =
   | 'collections'
   | 'loading-items'
   | 'items'
-  | 'confirm' // EW-05: size-estimate confirmation before committing to fetch
+  | 'confirm' // size-estimate confirmation before committing to fetch
   | 'importing'
   | 'done';
 
 interface AssetAvailability {
   importable: boolean;
   /** Unset when importable. 'no_asset' has no href at all; the other three
-   * mirror the search endpoint's own `data_asset_import_refusal` — the
-   * server's prediction of what `/import`'s `StacImportItem` validator
-   * (stac_router.py) would refuse, so the client screens out exactly what
-   * the door would reject rather than a separate, driftable guess. */
+   * mirror the search endpoint's `data_asset_import_refusal`, the server's
+   * prediction of what `/import`'s `StacImportItem` validator (stac_router.py)
+   * would refuse, so the client screens out exactly what the door rejects. */
   reason?: 'no_asset' | 'not_http' | 'credentials' | 'too_long';
-  /** The href's scheme, lowercase and without the trailing colon — display
-   * only, for the 'not_http' reason's message. Parsing it here decides
-   * nothing: `data_asset_import_refusal` already did. */
+  /** The href's scheme, lowercase and without the trailing colon; display only,
+   * for the 'not_http' message. `data_asset_import_refusal` already decided. */
   scheme?: string;
 }
 
@@ -102,11 +100,9 @@ function assetAvailability(
   item: Pick<StacItemSummary, 'data_asset_href' | 'data_asset_import_refusal'>,
 ): AssetAvailability {
   if (!item.data_asset_href) return { importable: false, reason: 'no_asset' };
-  // Absent (the field's own type allows undefined) is treated the same as
-  // null — importable — rather than as an unknown, disable-it default. The
-  // only way this app's own API omits the field is a server too old to
-  // have it yet, and disabling every item against that server would break
-  // imports that work today for a check it hasn't heard of.
+  // Absent (the field's type allows undefined) is treated as null, importable,
+  // not as unknown. Only a server too old to have the field omits it, and
+  // disabling every item against that server would break working imports.
   if (!item.data_asset_import_refusal) return { importable: true };
   const availability: AssetAvailability = {
     importable: false,
@@ -129,10 +125,9 @@ function assetUnavailableReasonText(
 ): string {
   switch (availability.reason) {
     case 'not_http':
-      // A scheme names the address's actual problem; without one (the
-      // href didn't parse even client-side, e.g. a malformed authority)
-      // there is nothing to name, so fall back to a generic reason rather
-      // than an empty "://" fragment.
+      // A scheme names the address's actual problem; without one (the href
+      // didn't parse, e.g. a malformed authority) fall back to a generic reason
+      // rather than an empty "://" fragment.
       return availability.scheme
         ? t('stac.unsupportedAssetScheme', { scheme: availability.scheme })
         : t('stac.assetUrlInvalid');
@@ -147,6 +142,12 @@ function assetUnavailableReasonText(
 
 export function StacImportForm() {
   const { t } = useTranslation('import');
+  // Per-item failures arrive in a 200 response, outside the client's error localization.
+  const itemErrorText = (error: string) => {
+    if (error === 'import_failed') return t('stac.itemErrorImportFailed');
+    if (error === 'too_long') return t('stac.itemErrorTooLong');
+    return error;
+  };
   const [step, setStep] = useState<Step>('idle');
   const [url, setUrl] = useState('');
   const [credentialMethod, setCredentialMethod] = useState<StacCredentialMethod>('none');
@@ -188,12 +189,11 @@ export function StacImportForm() {
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const importErrorId = useId();
-  // fix(#1712): a mount that STARTED the import must not act on its own
-  // settlement after it unmounts — `handleImport`'s function body keeps
-  // running past an unmount (unlike the request itself, nothing cancels
-  // it), and without this guard it would call setStep/clearStacImport for a
-  // tree that no longer exists, clearing the session before the NEXT mount
-  // ever gets to adopt it. Same pattern as UrlImportForm's mountedRef.
+  // A mount that STARTED the import must not act on its own settlement after
+  // unmounting: `handleImport`'s body keeps running past an unmount (nothing
+  // cancels it), and would call setStep/clearStacImport for a dead tree,
+  // clearing the session before the NEXT mount can adopt it. Same pattern as
+  // UrlImportForm's mountedRef.
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -213,9 +213,9 @@ export function StacImportForm() {
     [items],
   );
 
-  // fix(#1764): a failed Connect returns here with the credential intact, so
-  // editing the URL to another catalog would send the first catalog's key to
-  // the second. Same reset, same reason, as ServiceUrlForm's.
+  // A failed Connect returns here with the credential intact, so editing the
+  // URL to another catalog would send the first catalog's key to the second.
+  // Same reset and reason as ServiceUrlForm's.
   const authOrigin = originOf(url);
   const lastAuthOriginRef = useRef(authOrigin);
   useEffect(() => {
@@ -276,15 +276,11 @@ export function StacImportForm() {
     setProbedSizes({});
     setImportResult(null);
     setError(null);
-    // fix(#1712): defensive symmetry with the success/failure settlement
-    // paths above, which already clear on their own — reset is not
-    // reachable while an import is actually in flight (no control renders
-    // during the 'importing' step), but this keeps the invariant explicit
-    // rather than implicit.
+    // Reset isn't reachable while an import is in flight (no control renders
+    // during 'importing'); clearing here keeps the invariant explicit.
     clearStacImport();
   };
 
-  // ── Step 1: Connect ──
   const handleConnect = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = url.trim();
@@ -318,7 +314,6 @@ export function StacImportForm() {
     }
   };
 
-  // ── Step 2: Select collection and search items ──
   const handleCollectionSelect = async (collection: StacCollectionSummary) => {
     const gen = ++searchGenRef.current;
     setFiltering(false);
@@ -335,8 +330,8 @@ export function StacImportForm() {
     setError(null);
 
     try {
-      // feat(#1764): the same credential the connect step used, so search
-      // sees what connect saw rather than the anonymous view.
+      // The same credential the connect step used, so search sees what connect
+      // saw rather than the anonymous view.
       const auth = buildStacAuth();
       const result = await searchStacItems({
         url: catalogInfo!.url,
@@ -345,7 +340,7 @@ export function StacImportForm() {
         ...(auth ? { auth } : {}),
       });
       if (gen !== searchGenRef.current) return;
-      setSearchResult({ items: result.items, matched: result.matched });
+      setSearchResult({ items: result.items, matched: result.matched ?? null });
       setNextPage(result.next_page ?? null);
       setSelectedItems(new Set());
       setStep('items');
@@ -418,7 +413,7 @@ export function StacImportForm() {
         ...(auth ? { auth } : {}),
       });
       if (!mountedRef.current || gen !== searchGenRef.current) return;
-      setSearchResult({ items: result.items, matched: result.matched });
+      setSearchResult({ items: result.items, matched: result.matched ?? null });
       setNextPage(result.next_page ?? null);
       setAppliedFilters(built.filters);
       setSelectedItems(new Set());
@@ -468,7 +463,6 @@ export function StacImportForm() {
     }
   };
 
-  // ── Step 3: Toggle item selection ──
   const toggleItem = (id: string) => {
     setSelectedItems((prev) => {
       const next = new Set(prev);
@@ -496,7 +490,6 @@ export function StacImportForm() {
     }
   };
 
-  // ── Step 4: Import ──
   const handleImport = async () => {
     if (selectedItems.size === 0) return;
 
@@ -510,17 +503,17 @@ export function StacImportForm() {
         collection: i.collection,
         title: i.title,
         data_asset_href: i.data_asset_href!,
-        // feat(#1266): echo which asset key the href came from. The href is
-        // what an upstream publisher moves; the key is what still names the
-        // same asset afterwards, so a refresh follows the move instead of
-        // re-running the priority list and possibly binding another band.
+        // Echo which asset key the href came from: the href is what an upstream
+        // publisher moves, the key still names the same asset afterwards, so a
+        // refresh follows the move instead of re-running the priority list and
+        // possibly binding another band.
         data_asset_key: i.data_asset_key,
-        // feat(#1692): echo the asset's declared media type so the persisted
-        // origin asset re-advertises it on the STAC items GeoLens serves.
+        // Echo the asset's declared media type so the persisted origin asset
+        // re-advertises it on the STAC items GeoLens serves.
         data_asset_type: i.data_asset_type,
-        // feat(#1222): echo the item's own href back so the dataset's origin
-        // can point at the item, not only its asset. The health probe needs
-        // both to tell "the file is gone" from "the publisher withdrew it".
+        // Echo the item's own href so the dataset's origin can point at the
+        // item, not only its asset; the health probe needs both to tell "the
+        // file is gone" from "the publisher withdrew it".
         item_href: i.item_href,
         bbox: i.bbox,
         epsg: i.epsg,
@@ -529,15 +522,13 @@ export function StacImportForm() {
         keywords: selectedCollection?.keywords ?? [],
       }));
 
-    // fix(#1712): the request lives at module scope so its outcome is not
-    // lost if this form unmounts before it settles (see
-    // api/stac-import-session.ts for why this is the one STAC call worth
-    // protecting). Awaiting the SAME promise the session holds means this
-    // mount still learns the real outcome; only a remount changes anything.
+    // The request lives at module scope so its outcome survives this form
+    // unmounting before it settles (see api/stac-import-session.ts). Awaiting
+    // the SAME promise the session holds means this mount still learns the real
+    // outcome.
     //
-    // fix(codex #1763 r3): the search context travels with the session too,
-    // captured here because this is the last point every one of these
-    // values is still known — an adopted mount has none of its own local
+    // The search context travels with the session, captured here because this
+    // is the last point every value is known; an adopted mount has no local
     // state to fall back on.
     const context: StacImportContext = {
       catalogInfo: catalogInfo!,
@@ -555,9 +546,9 @@ export function StacImportForm() {
       },
       search: { startDate, endDate, bboxText, maxCloud, cloudCoverSeen, appliedFilters, nextPage },
     };
-    // feat(#1764): a boolean, never the credential. `/import` contacts no
-    // catalog, so this is the only way the dataset can learn that browsing
-    // this one needed a credential and its first refresh should ask for one.
+    // A boolean, never the credential. `/import` contacts no catalog, so this is
+    // the only way the dataset learns that browsing needed a credential and its
+    // first refresh should ask for one.
     const session = startStacImport(
       catalogInfo!.url,
       importItems,
@@ -567,9 +558,8 @@ export function StacImportForm() {
     );
     try {
       const result = await session.promise;
-      // fix(#1712): if this mount unmounted while the request was in
-      // flight, the session is now what the NEXT mount adopts — leave it
-      // alone rather than clearing it out from under that adoption.
+      // If this mount unmounted mid-request, the session is what the NEXT mount
+      // adopts: leave it rather than clear it from under that adoption.
       if (!mountedRef.current) return;
       setImportResult({
         created: result.created,
@@ -586,7 +576,9 @@ export function StacImportForm() {
         // No datasets created and at least one failure — surface the first
         // distinct error so the toast isn't a silent "{n} failed".
         const firstError = (result.results ?? []).find((r) => r.status === 'error')?.error;
-        toast.error(firstError ?? t('stac.failedCount', { count: result.errors }));
+        toast.error(
+          firstError ? itemErrorText(firstError) : t('stac.failedCount', { count: result.errors }),
+        );
       }
     } catch (err) {
       if (!mountedRef.current) return;
@@ -598,21 +590,16 @@ export function StacImportForm() {
     }
   };
 
-  // fix(#1712): re-attach to an import that was running (or finished) while
-  // this form was unmounted. Without this, a tab switch mid-import loses
-  // the created/skipped/error counts even though the datasets it created
-  // are real (see the module docstring for why this is milder than the
-  // Upload/Service job-strand case, and worth fixing anyway).
+  // Re-attach to an import that was running (or finished) while this form was
+  // unmounted. Otherwise a tab switch mid-import loses the created/skipped/error
+  // counts even though the datasets it created are real.
   useEffect(() => {
     const session = peekStacImport();
     if (!session) return;
-    // fix(codex #1763 r3): restore the search context the session captured
-    // when the import started, so 'items' (and, from there, 'collections')
-    // can render again if the user reaches them — most directly via
-    // "Back to Results" from the done screen below, which sets `step` back
-    // to 'items' and needs `selectedCollection`/`catalogInfo` to pass that
-    // branch's guard, and from there the collections breadcrumb, which
-    // needs `collections` itself rather than an empty list.
+    // Restore the search context the session captured when the import started,
+    // so 'items' and 'collections' can render again, notably via "Back to
+    // Results" from the done screen, whose guard needs `selectedCollection`/
+    // `catalogInfo`, and the collections breadcrumb, which needs `collections`.
     setCatalogInfo(session.context.catalogInfo);
     setCollections(session.context.collections);
     setSelectedCollection(session.context.selectedCollection);
@@ -636,18 +623,15 @@ export function StacImportForm() {
     searchGenRef.current += 1;
     setStep('importing');
 
-    // fix(codex #1763 r3): the app renders under React.StrictMode
-    // (main.tsx), which in development sets an effect up, tears it down,
-    // and sets it up again — but only the CLEANUP function undoes that,
-    // and this effect had none. Each setup re-read the (unchanged) session
-    // and registered another `session.promise.then(...)`, so when the
-    // import settled, every registered handler ran: duplicate
-    // setImportResult/setStep/clearStacImport calls and a duplicate toast.
-    // `mountedRef` alone doesn't catch this — both handlers belong to the
-    // same still-mounted component, so both read `mountedRef.current` as
-    // true. A cancellation flag scoped to THIS effect instance and flipped
-    // in ITS OWN cleanup is what StrictMode's replay is checking: the
-    // first instance's handler must lose the race to its own teardown.
+    // The app renders under React.StrictMode (main.tsx), which in development
+    // sets an effect up, tears it down and sets it up again; only a CLEANUP
+    // undoes that. Without one, each setup would re-read the unchanged session
+    // and register another `session.promise.then(...)`, so on settlement every
+    // handler would run: duplicate setImportResult/setStep/clearStacImport
+    // calls and a duplicate toast. `mountedRef` doesn't catch this (both handlers belong
+    // to the same mounted component); a cancellation flag scoped to THIS effect
+    // instance and flipped in ITS OWN cleanup makes the first handler lose the
+    // race to its teardown.
     let cancelled = false;
     session.promise.then(
       (result) => {
@@ -666,10 +650,8 @@ export function StacImportForm() {
       },
       (err) => {
         if (!mountedRef.current || cancelled) return;
-        // The context restored above WOULD let this return to 'items' like
-        // the still-mounted path below does — deliberately left at 'idle'
-        // for now, matching the smaller scope of the original fix; revisit
-        // together if a later pass unifies the two failure paths.
+        // The restored context WOULD let this return to 'items' like the
+        // still-mounted path below, but it is deliberately left at 'idle'.
         const msg = err instanceof ApiError ? err.message : t('stac.importFailed');
         setError(msg);
         setStep('idle');
@@ -680,9 +662,8 @@ export function StacImportForm() {
     return () => {
       cancelled = true;
     };
-    // Deliberately mount-only, matching url-import-session.ts's re-attach
-    // effect: re-running on every render would re-enter a session already
-    // being displayed.
+    // Deliberately mount-only, as url-import-session.ts's re-attach effect:
+    // re-running every render would re-enter a session already being displayed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -713,7 +694,7 @@ export function StacImportForm() {
           ...Object.fromEntries(
             // Entries come back in request order; ids can repeat.
             res.sizes.flatMap((s, n) =>
-              missing[n] ? [[missing[n].data_asset_href!, s.size_bytes]] : [],
+              missing[n] ? [[missing[n].data_asset_href!, s.size_bytes ?? null]] : [],
             ),
           ),
         }));
@@ -738,7 +719,6 @@ export function StacImportForm() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step]);
 
-  // ── Confirm step (EW-05) ──
   if (step === 'confirm' && selectedCollection && catalogInfo) {
     const itemsToImport = selectableItems.filter((i) => selectedItems.has(i.id));
     const sizeOf = (i: StacItemSummary) =>
@@ -801,7 +781,6 @@ export function StacImportForm() {
     );
   }
 
-  // ── Loading states ──
   if (step === 'connecting' || step === 'loading-items' || step === 'importing') {
     const label =
       step === 'connecting' ? t('stac.connecting', { defaultValue: 'Connecting to STAC catalog...' })
@@ -815,14 +794,13 @@ export function StacImportForm() {
     );
   }
 
-  // ── Done ──
   if (step === 'done' && importResult) {
     // Group failures by error message so 40 identical SSRF rejects collapse to
     // a single row showing the message + a count, with the failing item ids.
     const failures = (importResult.results ?? []).filter((r) => r.status === 'error');
     const groupedFailures = Array.from(
       failures.reduce((acc, r) => {
-        const message = r.error ?? t('stac.failureUnknown');
+        const message = r.error ? itemErrorText(r.error) : t('stac.failureUnknown');
         const group = acc.get(message) ?? { message, itemIds: [] as string[] };
         group.itemIds.push(r.item_id);
         acc.set(message, group);
@@ -906,7 +884,6 @@ export function StacImportForm() {
     );
   }
 
-  // ── Collections list ──
   if (step === 'collections' && catalogInfo) {
     return (
       <div className="space-y-5">
@@ -989,14 +966,13 @@ export function StacImportForm() {
           </div>
 
           {error && (
-            <p className="border-t border-border px-5 py-3 text-sm text-destructive">{error}</p>
+            <p role="alert" className="border-t border-border px-5 py-3 text-sm text-destructive">{error}</p>
           )}
         </div>
       </div>
     );
   }
 
-  // ── Items list with selection ──
   if (step === 'items' && selectedCollection && catalogInfo) {
     const allSelected = allSelectableSelected;
 
@@ -1087,12 +1063,7 @@ export function StacImportForm() {
         >
           <div className="flex items-center justify-between">
             <label className="flex items-center gap-2 text-xs text-muted-foreground">
-              <input
-                type="checkbox"
-                checked={allSelected}
-                onChange={toggleAll}
-                className="rounded-sm border-border"
-              />
+              <Checkbox checked={allSelected} onCheckedChange={toggleAll} />
               {selectedItems.size > 0
                 ? t('stac.selectedCount', { selected: selectedItems.size, total: selectableItems.length })
                 : t('stac.itemCount', { count: items.length })}
@@ -1144,13 +1115,12 @@ export function StacImportForm() {
                   isSelected && 'bg-primary/5',
                 )}
               >
-                <input
-                  type="checkbox"
+                <Checkbox
                   checked={isSelected}
                   disabled={!availability.importable || (atSelectionCap && !isSelected)}
                   aria-describedby={availability.importable ? undefined : reasonId}
-                  onChange={() => toggleItem(item.id)}
-                  className="rounded-sm border-border shrink-0"
+                  onCheckedChange={() => toggleItem(item.id)}
+                  className="shrink-0"
                 />
 
                 {/* Thumbnail */}
@@ -1216,7 +1186,6 @@ export function StacImportForm() {
     );
   }
 
-  // ── Idle — URL input form ──
   return (
     <div className="rounded-xl border border-border bg-card p-5">
       <form onSubmit={handleConnect} className="space-y-5">
@@ -1294,9 +1263,8 @@ export function StacImportForm() {
                 value={token}
                 onChange={(e) => setToken(e.target.value)}
                 className="font-mono text-sm"
-                // fix(#1746): autocomplete="off" alone does not stop Chrome
-                // offering a saved password on a service credential, so opt
-                // every password manager out explicitly.
+                // autocomplete="off" alone doesn't stop Chrome offering a saved
+                // password on a service credential, so opt every password manager out.
                 autoComplete="new-password"
                 data-1p-ignore
                 data-lpignore="true"
@@ -1388,7 +1356,7 @@ export function StacImportForm() {
           )}
         </div>
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
       </form>
     </div>
   );

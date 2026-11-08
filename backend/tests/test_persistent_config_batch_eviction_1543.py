@@ -1,4 +1,4 @@
-"""fix(#1543): a settings batch evicts its cache keys as one step.
+"""A settings batch evicts its cache keys as one step.
 
 ``update_settings`` commits the whole batch and only then invalidates the cache.
 While that invalidation ran one key at a time, a reader landing in the middle
@@ -262,7 +262,7 @@ def redis_cache():
     provider._failure_count = 0
     provider._circuit_open_until = 0.0
     provider._fallback = InMemoryCacheProvider()
-    # fix(#1778 codex r2): these build the provider through __new__, so the
+    # These build the provider through __new__, so the
     # replay state __init__ sets up has to be seeded here too.
     provider._pending_authoritative = OrderedDict()
     provider._replay_lock = asyncio.Lock()

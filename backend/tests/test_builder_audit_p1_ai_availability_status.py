@@ -1,11 +1,11 @@
-"""builder-audit #338 P1-11 + P1-12: AI availability signal for non-admin editors,
+"""AI availability signal for non-admin editors,
 and admin AI status built from the SELECTED LLM provider.
 
-P1-11: a ``use_ai_chat`` editor can read ``GET /ai/availability/`` (a
+A ``use_ai_chat`` editor can read ``GET /ai/availability/`` (a
 public-safe boolean) while a viewer cannot, and missing provider keys yield a
 graceful ``available=false`` rather than a 403/503.
 
-P1-12: admin status ``configured`` reflects the SELECTED ``LLM_PROVIDER`` key,
+Admin status ``configured`` reflects the SELECTED ``LLM_PROVIDER`` key,
 not "any key exists", so admin status and chat readiness agree for crossed
 provider/key combinations.
 """
@@ -21,7 +21,7 @@ from app.processing.ai import router as ai_router
 
 
 # ---------------------------------------------------------------------------
-# P1-12: admin AI status keyed off the SELECTED provider
+# Admin AI status keyed off the SELECTED provider
 # ---------------------------------------------------------------------------
 
 
@@ -66,7 +66,7 @@ def test_status_openai_selected_but_only_anthropic_key_unconfigured(monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# P1-12: admin status and chat readiness AGREE for crossed combos
+# Admin status and chat readiness AGREE for crossed combos
 # ---------------------------------------------------------------------------
 
 
@@ -136,7 +136,7 @@ async def test_availability_false_when_ai_disabled(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# P1-11: /ai/availability/ permission boundary (editor allowed, viewer denied)
+# /ai/availability/ permission boundary (editor allowed, viewer denied)
 # ---------------------------------------------------------------------------
 
 
@@ -175,10 +175,7 @@ async def test_availability_endpoint_editor_sees_available_when_configured(
 ):
     """Editor sees available=true when AI is enabled + the selected provider has
     a key; a viewer is still forbidden in the same configured state."""
-    monkeypatch.setattr(
-        ai_router.settings, "anthropic_api_key", "sk-ant", raising=False
-    )
-    monkeypatch.setattr(ai_router.settings, "openai_api_key", None, raising=False)
+    _set_keys(monkeypatch, anthropic="sk-ant", openai=None)
     _patch_runtime(monkeypatch, provider="anthropic")
 
     resp = await client.get("/ai/availability/", headers=editor_auth_header)
@@ -195,8 +192,7 @@ async def test_availability_endpoint_editor_disabled_state_no_503(
 ):
     """Missing selected-provider key yields available=false with HTTP 200 (a
     safe disabled state), NOT a 503 that would spam the console."""
-    monkeypatch.setattr(ai_router.settings, "anthropic_api_key", None, raising=False)
-    monkeypatch.setattr(ai_router.settings, "openai_api_key", None, raising=False)
+    _set_keys(monkeypatch, anthropic=None, openai=None)
     _patch_runtime(monkeypatch, provider="anthropic")
 
     resp = await client.get("/ai/availability/", headers=editor_auth_header)

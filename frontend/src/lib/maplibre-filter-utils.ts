@@ -1,15 +1,18 @@
 import type { FilterSpecification } from 'maplibre-gl';
+import { expression as styleExpression } from '@maplibre/maplibre-gl-style-spec';
+import { isTextColumn, TEXT_COLUMN_TYPES } from './column-utils';
 
 /**
- * builder-audit #338 SPEC-09 / DRY-01 / DRY-02 / FILT-01 / FILT-02 / P1-04:
  * Single source of truth for the *editable* MapLibre filter-expression subset
  * the map builder authors and recognizes.
  *
  * Supported grammar subset (deliberate scope — anything else round-trips as an
- * opaque, uneditable filter, see SPEC-09):
- *   - comparisons:        ==, !=, >, <, >=, <=   over ["get", field] or the
- *                         nullable-safe ["to-number", ["get", field], fallback]
- *                         accessor this module emits for numeric columns.
+ * opaque, uneditable filter):
+ *   - comparisons:        ==, !=, >, <, >=, <=   over ["get", field], or the
+ *                         null-safe pair this module emits for numeric columns,
+ *                         ["all", ["!=", ["typeof", ["get", field]], "null"],
+ *                         [op, ["to-number", ["get", field], fallback], n]], and
+ *                         the bare ["to-number", ["get", field], fallback] accessor.
  *   - membership:         ["in", ["get", field], ["literal", [...]]]   (in_list)
  *                         ["!", ["in", ["get", field], ["literal", [...]]]] (not_in_list)
  *   - substring/contains: ["in", <scalar>, ["get", field]]
@@ -20,20 +23,19 @@ import type { FilterSpecification } from 'maplibre-gl';
  *
  * Both the structured editor (LayerFilterEditor) and the chip summarizer
  * (ActiveFilterChips) consume `parseCanonicalFilter` so the two recognizers
- * cannot drift again (the FILT-01 to-number-unwrap and FILT-02 contains-label
- * bugs were direct consequences of two independent hand-rolled walkers).
+ * cannot drift.
  */
 
-// builder-audit #338 DRY-02: the single canonical comparison-operator set. Imported
-// by LayerFilterEditor and ActiveFilterChips instead of re-declared per file.
+// The canonical comparison-operator set, shared by LayerFilterEditor and
+// ActiveFilterChips.
 export const NUMERIC_COMPARISON_OPERATORS = new Set(['==', '!=', '>', '<', '>=', '<=']);
-
-const NUMERIC_LOW_SENTINEL = -1_000_000_000_000;
-const NUMERIC_HIGH_SENTINEL = 1_000_000_000_000;
 
 function isGetExpression(value: unknown): value is ['get', string] {
   return Array.isArray(value) && value[0] === 'get' && typeof value[1] === 'string';
 }
+
+const NUMERIC_LOW_SENTINEL = -1_000_000_000_000;
+const NUMERIC_HIGH_SENTINEL = 1_000_000_000_000;
 
 function numericFallbackForOperator(operator: string, comparisonValue: number) {
   if (operator === '<' || operator === '<=') return NUMERIC_HIGH_SENTINEL;
@@ -41,41 +43,112 @@ function numericFallbackForOperator(operator: string, comparisonValue: number) {
   return NUMERIC_LOW_SENTINEL;
 }
 
-export function buildNullableSafeNumericAccessor(
+/**
+ * A numeric comparison that a null or missing value never satisfies, as in SQL.
+ * `to-number` still reads a numeric string, but it turns null into 0, so the
+ * value's type is checked for null first.
+ */
+export function buildNullSafeNumericComparison(
   field: string,
   operator: string,
   comparisonValue: number,
+  negated = false,
 ) {
-  return ['to-number', ['get', field], numericFallbackForOperator(operator, comparisonValue)];
+  const comparison = [
+    operator,
+    ['to-number', ['get', field], numericFallbackForOperator(operator, comparisonValue)],
+    comparisonValue,
+  ];
+  // The guard stays outside a negation, or `!` would turn a null into a match.
+  return ['all', ['!=', ['typeof', ['get', field]], 'null'], negated ? ['!', comparison] : comparison];
 }
 
-// ---------------------------------------------------------------------------
-// builder-audit #338 FILT-01 / DRY-01: one canonical field extractor + filter parser
-// ---------------------------------------------------------------------------
+interface NumericComparison {
+  field: string;
+  operator: string;
+  value: number;
+}
+
+/** `[op, left, n]` with a number on the right, as its parts, else null. */
+function numericComparisonParts(
+  node: unknown,
+): { operator: string; left: unknown; value: number } | null {
+  if (!Array.isArray(node) || node.length !== 3) return null;
+  const [operator, left, value] = node;
+  return typeof operator === 'string' &&
+    NUMERIC_COMPARISON_OPERATORS.has(operator) &&
+    typeof value === 'number'
+    ? { operator, left, value }
+    : null;
+}
 
 /**
- * Extract the underlying property name a filter operand reads.
- *
- * builder-audit #338 FILT-01: also unwraps the ["to-number", ["get", field], _]
- * accessor the editor emits for every numeric-column comparison — the chip
- * summarizer previously only understood ["get", field] and bare strings, so
- * numeric filters silently produced no chip.
+ * The field of the accessor the editor wrote, `["to-number", ["get", f], fallback]`
+ * with its own fallback: a hand-authored fallback keeps its meaning, so is not it.
  */
-export function extractFilterField(expr: unknown): string | null {
-  if (Array.isArray(expr) && expr[0] === 'get' && typeof expr[1] === 'string') {
-    return expr[1];
-  }
-  if (
-    Array.isArray(expr) &&
-    expr[0] === 'to-number' &&
-    Array.isArray(expr[1]) &&
-    expr[1][0] === 'get' &&
-    typeof expr[1][1] === 'string'
-  ) {
-    return expr[1][1];
-  }
-  if (typeof expr === 'string') return expr;
-  return null;
+function editorAccessorField(left: unknown, operator: string, value: number): string | null {
+  return Array.isArray(left) &&
+    left.length === 3 &&
+    left[0] === 'to-number' &&
+    isGetExpression(left[1]) &&
+    left[2] === numericFallbackForOperator(operator, value)
+    ? left[1][1]
+    : null;
+}
+
+/** `[op, ["get", f] | <editor accessor of f>, n]` as its parts, else null. */
+function bareNumericComparison(node: unknown): NumericComparison | null {
+  const parts = numericComparisonParts(node);
+  if (!parts) return null;
+  const field = isGetExpression(parts.left)
+    ? parts.left[1]
+    : editorAccessorField(parts.left, parts.operator, parts.value);
+  return field === null ? null : { field, operator: parts.operator, value: parts.value };
+}
+
+/** The field of `["!=", ["typeof", ["get", field]], "null"]`, else null. */
+export function nullGuardField(node: unknown): string | null {
+  return Array.isArray(node) &&
+    node.length === 3 &&
+    node[0] === '!=' &&
+    Array.isArray(node[1]) &&
+    node[1][0] === 'typeof' &&
+    isGetExpression(node[1][1]) &&
+    node[2] === 'null'
+    ? node[1][1][1]
+    : null;
+}
+
+const numberTypeGuard = (field: string) => ['==', ['typeof', ['get', field]], 'number'];
+
+/**
+ * The comparison of a `buildNullSafeNumericComparison` pair, else null. A
+ * leading number-type check, which a legacy filter's comparison carries, is
+ * read through.
+ */
+function guardedComparison(node: unknown): NumericComparison | null {
+  if (!Array.isArray(node) || node.length !== 3 || node[0] !== 'all') return null;
+  const inner = guardedComparison(node[2]);
+  if (inner && JSON.stringify(node[1]) === JSON.stringify(numberTypeGuard(inner.field))) return inner;
+  const field = nullGuardField(node[1]);
+  const parts = numericComparisonParts(node[2]);
+  return field !== null &&
+    parts !== null &&
+    editorAccessorField(parts.left, parts.operator, parts.value) === field
+    ? { field, operator: parts.operator, value: parts.value }
+    : null;
+}
+
+/** A `buildNullSafeNumericComparison(..., true)` result, else false. */
+function guardedNegation(node: unknown): boolean {
+  if (!Array.isArray(node) || node.length !== 3 || node[0] !== 'all') return false;
+  const field = nullGuardField(node[1]);
+  const negation = node[2];
+  const inner =
+    Array.isArray(negation) && negation.length === 2 && negation[0] === '!'
+      ? bareNumericComparison(negation[1])
+      : null;
+  return field !== null && inner !== null && inner.field === field;
 }
 
 export interface CanonicalFilterCondition {
@@ -89,14 +162,28 @@ export interface CanonicalFilterCondition {
   listValues?: unknown[];
   /** Read through `to-number`, which turns a missing value into 0. */
   toNumber?: true;
+  /** `toNumber`, behind a null check: a null value never satisfies it. */
+  nullGuarded?: true;
 }
 
-export type CanonicalFilter =
+type CanonicalFilter =
   | { kind: 'editable'; combinator: 'all' | 'any'; conditions: CanonicalFilterCondition[] }
   | { kind: 'opaque'; raw: FilterSpecification };
 
+/** `["all", <scalar check>, ["in", ["get", f], ...]]` as its `in`, else the node itself. */
+function withoutScalarGuard(node: unknown): unknown {
+  if (!Array.isArray(node) || node.length !== 3 || node[0] !== 'all') return node;
+  const test = node[2];
+  const field = Array.isArray(test) && test[0] === 'in' && isGetExpression(test[1]) ? test[1][1] : null;
+  return field !== null && JSON.stringify(node[1]) === JSON.stringify(scalarTypeGuard(field)) ? test : node;
+}
+
 /** Recognize a single (non-combinator) filter node. Returns null if unsupported. */
-function parseSingleCondition(e: unknown): CanonicalFilterCondition | null {
+function parseSingleCondition(node: unknown): CanonicalFilterCondition | null {
+  const e =
+    Array.isArray(node) && node[0] === '!' && node.length === 2
+      ? ['!', withoutScalarGuard(node[1])]
+      : withoutScalarGuard(node);
   if (!Array.isArray(e) || e.length === 0) return null;
 
   // is_null full pattern: ["any", ["!", ["has", f]], ["==", ["get", f], null]]
@@ -146,12 +233,25 @@ function parseSingleCondition(e: unknown): CanonicalFilterCondition | null {
     return { field: e[1], operator: 'has', value: '' };
   }
 
+  // null-safe numeric comparison: ["all", ["!=", ["typeof", ["get", f]], "null"], [op, ["to-number", ["get", f], fb], n]]
+  const guarded = guardedComparison(e);
+  if (guarded) {
+    return {
+      field: guarded.field,
+      operator: guarded.operator,
+      value: String(guarded.value),
+      rawValue: guarded.value,
+      toNumber: true,
+      nullGuarded: true,
+    };
+  }
+
   // standard comparison: [op, ["get", f], value]
   if (Array.isArray(e[1]) && e[1][0] === 'get') {
     return { field: e[1][1] as string, operator: e[0] as string, value: String(e[2] ?? ''), rawValue: e[2] };
   }
 
-  // numeric-safe comparison: [op, ["to-number", ["get", f], fallback], value]  (FILT-01)
+  // numeric-safe comparison: [op, ["to-number", ["get", f], fallback], value]
   if (
     Array.isArray(e[1]) &&
     e[1][0] === 'to-number' &&
@@ -202,9 +302,6 @@ export function parseCanonicalFilter(expr: FilterSpecification | null | undefine
   return { kind: 'opaque', raw: expr };
 }
 
-// ---------------------------------------------------------------------------
-// builder-audit #338 P1-04: raw-JSON filter validator/normalizer
-// ---------------------------------------------------------------------------
 // Mirrors backend/app/modules/catalog/maps/filter_grammar.py:validate_filter so
 // a filter accepted in the raw-JSON editor is accepted, stored, exported, and
 // replayed identically. Accepts None/[] as "clear", normalizes the legacy
@@ -302,7 +399,7 @@ function normalizeFilterNode(node: unknown): unknown {
 }
 
 /**
- * Validate + normalize a raw-JSON MapLibre layer filter (builder-audit #338 P1-04).
+ * Validate + normalize a raw-JSON MapLibre layer filter.
  * `null` and `[]` both clear the filter (return null). A recognized form with
  * invalid arity throws `FilterValidationError`; opaque unsupported filters are
  * preserved verbatim.
@@ -312,34 +409,30 @@ export function validateRawFilter(value: unknown): FilterSpecification | null {
   if (!Array.isArray(value)) {
     throw new FilterValidationError('filter must be a JSON array or null');
   }
-  // EDIT-03: an empty array is not a valid MapLibre filter; treat as clear.
+  // An empty array is not a valid MapLibre filter; treat as clear.
   if (value.length === 0) return null;
   return normalizeFilterNode(value) as FilterSpecification;
 }
 
 function sanitizeFilterNode(node: unknown): unknown {
   if (!Array.isArray(node) || node.length === 0) return node;
-  if (node[0] === 'literal') return node;
+  if (node[0] === 'literal' || guardedComparison(node) || guardedNegation(node)) return node;
 
-  const [operator, left, right] = node;
-  if (
-    typeof operator === 'string' &&
-    NUMERIC_COMPARISON_OPERATORS.has(operator) &&
-    typeof right === 'number' &&
-    isGetExpression(left)
-  ) {
-    return [
-      operator,
-      buildNullableSafeNumericAccessor(left[1], operator, right),
-      right,
-    ];
+  // The bare accessor reads null as 0; the guarded pair does not.
+  const negated = node[0] === '!' && node.length === 2;
+  const comparison = bareNumericComparison(negated ? node[1] : node);
+  if (comparison) {
+    return buildNullSafeNumericComparison(
+      comparison.field,
+      comparison.operator,
+      comparison.value,
+      negated,
+    );
   }
 
-  // fix(#526 B-045): recurse only through combinator/negation wrappers. The
-  // previous fallthrough walked EVERY child, so opaque out-of-subset
-  // expressions (case/match/step/coalesce operands) had nested numeric
-  // comparisons rewritten to the nullable-safe form — breaking the verbatim
-  // round-trip contract for imported/hand-authored advanced filters.
+  // Recurse only through combinator/negation wrappers: walking every child
+  // would rewrite numeric comparisons nested in opaque expressions
+  // (case/match/step/coalesce), breaking their verbatim round-trip.
   if (node[0] === 'all' || node[0] === 'any' || node[0] === '!') {
     return node.map((child, index) => (index === 0 ? child : sanitizeFilterNode(child)));
   }
@@ -350,19 +443,15 @@ export function sanitizeNullableNumericFilter(
   filter: FilterSpecification | null | undefined,
 ): FilterSpecification | null {
   if (!filter) return null;
-  // EDIT-03: an empty array is not a valid maplibre filter — `map.setFilter(id, [])`
+  // An empty array is not a valid maplibre filter — `map.setFilter(id, [])`
   // throws ("filter property expected at least 1 element"). Treat it as "no filter"
   // so it can never be persisted nor reach setFilter via any caller.
   if (Array.isArray(filter) && filter.length === 0) return null;
   const sanitized = sanitizeFilterNode(filter);
-  // fix(#392): preserve input reference when structurally unchanged so the filter editor re-emit guard holds (audit FL-01)
+  // Preserve input reference when structurally unchanged so the filter editor re-emit guard holds
   if (JSON.stringify(sanitized) === JSON.stringify(filter)) return filter;
   return sanitized as FilterSpecification;
 }
-
-// ---------------------------------------------------------------------------
-// Layer filter -> CQL2-JSON, for analysis requests
-// ---------------------------------------------------------------------------
 
 /** A CQL2-JSON expression, as the analysis endpoints and OGC items accept it. */
 export type Cql2Expression = {
@@ -380,7 +469,7 @@ const CQL2_COMPARISON: Record<string, string> = {
 };
 
 /** A dataset column as the catalog lists it, typed by its information_schema name. */
-export interface FilterColumn {
+interface FilterColumn {
   name: string;
   type?: string | null;
 }
@@ -388,9 +477,8 @@ export interface FilterColumn {
 // Mirrors _FEATURE_QUERYABLE_NAME_RE and _PG_TYPE_TO_SCHEMA in
 // backend/app/standards/ogc/filtering.py: the columns a CQL2 filter can read.
 const CQL2_COLUMN_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,62}$/;
-const CQL2_STRING_TYPES = new Set(['text', 'character varying', 'character']);
 const CQL2_QUERYABLE_TYPES = new Set([
-  ...CQL2_STRING_TYPES,
+  ...TEXT_COLUMN_TYPES,
   'smallint',
   'integer',
   'bigint',
@@ -403,6 +491,12 @@ const CQL2_QUERYABLE_TYPES = new Set([
   'timestamp with time zone',
   'uuid',
 ]);
+/** Whether a server-side CQL2 filter can read `column`: one `columns` lists, of a type CQL2 compares. */
+export function isCql2QueryableColumn(column: string, columns: readonly FilterColumn[] | null | undefined): boolean {
+  const type = columns?.find((candidate) => candidate.name === column)?.type;
+  return CQL2_COLUMN_NAME_RE.test(column) && !!type && CQL2_QUERYABLE_TYPES.has(type.toLowerCase());
+}
+
 // The map compares a date or timestamp as the text PostgreSQL wrote into the
 // tile, so only a value in that exact form compares the same way in SQL.
 const DATE_TEXT_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -497,6 +591,31 @@ function isCql2Scalar(value: unknown): value is string | number | boolean {
   );
 }
 
+// Inclusive bounds from backend/app/core/db/pg_ranges.py; BigInt keeps int8 endpoints exact.
+const CQL2_PG_INTEGER_RANGES = new Map<string, readonly [bigint, bigint]>([
+  ['smallint', [-32768n, 32767n]],
+  ['integer', [-2147483648n, 2147483647n]],
+  ['bigint', [-(2n ** 63n), 2n ** 63n - 1n]],
+]);
+const CQL2_FLOAT4_MAX = 3.4028234663852886e38;
+
+/** Check scalar types and numeric ranges using the converter's temporal/UUID rules too. */
+export function isCql2LiteralCompatible(value: unknown, pgType: string | undefined): boolean {
+  if (!isCql2Scalar(value) || cql2Literal(value, pgType) === null) return false;
+  if (isTextColumn(pgType)) return typeof value === 'string';
+  const bounds = CQL2_PG_INTEGER_RANGES.get(pgType ?? '');
+  if (bounds) {
+    // Unsafe integers may already have rounded before the filter is serialized.
+    if (typeof value !== 'number' || !Number.isSafeInteger(value)) return false;
+    const integer = BigInt(value);
+    return integer >= bounds[0] && integer <= bounds[1];
+  }
+  if (pgType === 'real') return typeof value === 'number' && Math.abs(value) <= CQL2_FLOAT4_MAX;
+  if (['double precision', 'numeric'].includes(pgType ?? '')) return typeof value === 'number';
+  if (pgType === 'boolean') return typeof value === 'boolean';
+  return true;
+}
+
 const cql2Property = (field: string) => ({ property: field });
 const cql2IsNull = (field: string): Cql2Expression => ({
   op: 'isNull',
@@ -509,6 +628,63 @@ const cql2OrNull = (field: string, expr: Cql2Expression): Cql2Expression => ({
   op: 'or',
   args: [cql2IsNull(field), expr],
 });
+
+const LEGACY_ORDER_OPERATORS = new Set(['<', '>', '<=', '>=']);
+const LEGACY_NEGATIONS: Record<string, string> = { '!in': 'in', '!=': '==', '!has': 'has' };
+
+const scalarTypeGuard = (field: string) => [
+  'any',
+  ...['null', 'boolean', 'number', 'string'].map((type) => ['==', ['typeof', ['get', field]], type]),
+];
+
+function legacyNode(node: unknown, scalarSafe: boolean): unknown {
+  if (!Array.isArray(node)) return 'unsupported';
+  const [op, key, ...values] = node;
+  if (op === 'all' || op === 'any') {
+    const children = node.slice(1).map((child) => legacyNode(child, scalarSafe));
+    return children.includes('unsupported') ? 'unsupported' : [op, ...children];
+  }
+  if (typeof op === 'string' && Object.hasOwn(LEGACY_NEGATIONS, op)) {
+    const positive = legacyNode([LEGACY_NEGATIONS[op], key, ...values], scalarSafe);
+    return positive === 'unsupported' ? positive : ['!', positive];
+  }
+  if (typeof key !== 'string' || key === '$type' || key === '$id') return 'unsupported';
+  // `in` throws on an array or object, which would turn a negated match into a miss.
+  const membership = (list: unknown[]) => {
+    const test = ['in', ['get', key], ['literal', list]];
+    return scalarSafe ? ['all', scalarTypeGuard(key), test] : test;
+  };
+  if (op === 'in') return membership(values);
+  if (op === 'has') return values.length === 0 ? ['has', key] : 'unsupported';
+  // A legacy null comparison tests for a present null, which expressions can't tell from a missing value.
+  if (values.length !== 1 || !isCql2Scalar(values[0])) return 'unsupported';
+  const [value] = values;
+  if (op === '==') return membership([value]);
+  if (!LEGACY_ORDER_OPERATORS.has(op) || typeof value !== 'number') return 'unsupported';
+  // A legacy order comparison never matches a non-number, numeric strings included.
+  return ['all', numberTypeGuard(key), buildNullSafeNumericComparison(key, op, value)];
+}
+
+function translateLegacy(
+  filter: FilterSpecification | null | undefined,
+  scalarSafe: boolean,
+): FilterSpecification | null | undefined | 'unsupported' {
+  if (!Array.isArray(filter) || filter.length === 0 || styleExpression.isExpressionFilter(filter)) return filter;
+  return legacyNode(filter, scalarSafe) as FilterSpecification | 'unsupported';
+}
+
+/**
+ * A filter in MapLibre's legacy syntax (`["in", key, ...values]`, `!in`,
+ * `!has`, `["==", key, value]`, ...) rewritten as an expression that draws the
+ * same features, or 'unsupported' when part of it has no such form, such as
+ * `none`, `$type`, a null or a text order comparison. Any other filter comes
+ * back unchanged.
+ */
+export function legacyFilterToExpression(
+  filter: FilterSpecification | null | undefined,
+): FilterSpecification | null | undefined | 'unsupported' {
+  return translateLegacy(filter, true);
+}
 
 function compareNumbers(a: number, operator: string, b: number): boolean {
   switch (operator) {
@@ -546,7 +722,7 @@ function conditionToCql2(
   }
   if (c.operator === 'contains') {
     if (typeof c.rawValue !== 'string') return null;
-    if (pgType !== undefined && !CQL2_STRING_TYPES.has(pgType)) return null;
+    if (pgType !== undefined && !isTextColumn(pgType)) return null;
     // MapLibre's `in` is a literal, case-sensitive substring test.
     const literal = c.rawValue.replace(/[\\%_]/g, '\\$&');
     return { op: 'like', args: [cql2Property(c.field), `%${literal}%`] };
@@ -556,7 +732,8 @@ function conditionToCql2(
   if (c.toNumber) {
     if (typeof c.rawValue !== 'number' || !Number.isFinite(c.rawValue)) return null;
     const comparison: Cql2Expression = { op, args: [cql2Property(c.field), c.rawValue] };
-    return compareNumbers(0, c.operator, c.rawValue)
+    // The map reads an unguarded null as 0; SQL drops it from any comparison.
+    return !c.nullGuarded && compareNumbers(0, c.operator, c.rawValue)
       ? cql2OrNull(c.field, comparison)
       : comparison;
   }
@@ -573,29 +750,125 @@ function conditionToCql2(
 }
 
 /**
+ * A filter as the editor's conditions under `all` and `any` groups, which may
+ * nest; a group whose children are all conditions is one editable level.
+ */
+type FilterTree =
+  | { kind: 'conditions'; combinator: 'all' | 'any'; conditions: CanonicalFilterCondition[] }
+  | { kind: 'group'; combinator: 'all' | 'any'; children: FilterTree[] };
+
+function parseFilterTree(expr: unknown): FilterTree | null {
+  const canonical = parseCanonicalFilter(expr as FilterSpecification);
+  if (canonical.kind === 'editable') {
+    return { kind: 'conditions', combinator: canonical.combinator, conditions: canonical.conditions };
+  }
+  if (!Array.isArray(expr) || expr.length < 2 || (expr[0] !== 'all' && expr[0] !== 'any')) return null;
+  const children: FilterTree[] = [];
+  for (const child of expr.slice(1)) {
+    const tree = parseFilterTree(child);
+    if (!tree) return null;
+    children.push(tree);
+  }
+  return { kind: 'group', combinator: expr[0], children };
+}
+
+function treeConditions(tree: FilterTree): CanonicalFilterCondition[] {
+  return tree.kind === 'conditions' ? tree.conditions : tree.children.flatMap(treeConditions);
+}
+
+/**
+ * Every condition of `filter` at any depth of `all`/`any`, or null when part
+ * of it is outside the editor's subset. A legacy filter is read in the forms
+ * `legacyFilterToExpression` gives it.
+ */
+export function filterConditions(
+  filter: FilterSpecification | null | undefined,
+): CanonicalFilterCondition[] | null {
+  const expression = translateLegacy(filter ?? null, false);
+  const tree = expression === 'unsupported' ? null : parseFilterTree(expression);
+  return tree ? treeConditions(tree) : null;
+}
+
+function treeToCql2(tree: FilterTree, types: ReadonlyMap<string, string>): Cql2Expression | null | 'unsupported' {
+  const parts: Cql2Expression[] = [];
+  if (tree.kind === 'conditions') {
+    for (const condition of tree.conditions) {
+      const part = conditionToCql2(condition, types.get(condition.field));
+      if (part === null) return 'unsupported';
+      parts.push(part);
+    }
+  } else {
+    for (const child of tree.children) {
+      const part = treeToCql2(child, types);
+      if (part === 'unsupported') return 'unsupported';
+      // A child with no conditions matches everything, and so does an `any` holding it.
+      if (part === null) {
+        if (tree.combinator === 'any') return null;
+        continue;
+      }
+      parts.push(part);
+    }
+  }
+  // An empty `any` matches nothing on the map, and CQL2 here has no false literal.
+  if (parts.length === 0) return tree.combinator === 'any' ? 'unsupported' : null;
+  if (parts.length === 1) return parts[0];
+  return { op: tree.combinator === 'all' ? 'and' : 'or', args: parts };
+}
+
+/**
  * Translate a layer's MapLibre filter into CQL2-JSON that keeps the same
  * features. Returns null when the layer has no filter, and 'unsupported' when
- * the filter uses a form outside the structured editor's subset or reads a
- * column CQL2 cannot filter. `columns` types the literals; a filter on a
- * column it does not list is sent untyped.
+ * the filter uses a form outside the structured editor's subset, nested
+ * `all`/`any` groups of it included, or reads a column CQL2 cannot filter. A
+ * legacy filter is read in the forms `legacyFilterToExpression` gives it.
+ * `columns` types the literals; a filter on a column it does not list is sent
+ * untyped.
  */
 export function maplibreFilterToCql2(
   filter: FilterSpecification | null | undefined,
   columns?: readonly FilterColumn[] | null,
+  opts?: { requireKnownFields?: boolean },
 ): Cql2Expression | null | 'unsupported' {
-  const canonical = parseCanonicalFilter(filter);
-  if (canonical.kind === 'opaque') return 'unsupported';
+  const expression = translateLegacy(filter, false);
+  if (expression === 'unsupported') return 'unsupported';
+  // The map draws the sanitized filter, so the table and analysis must read the same one.
+  const tree = parseFilterTree(sanitizeNullableNumericFilter(expression));
+  if (!tree) return 'unsupported';
   const types = new Map(
     (columns ?? []).filter((col) => col.type).map((col) => [col.name, String(col.type).toLowerCase()]),
   );
-  const parts: Cql2Expression[] = [];
-  for (const condition of canonical.conditions) {
-    const part = conditionToCql2(condition, types.get(condition.field));
-    if (part === null) return 'unsupported';
-    parts.push(part);
+  // Without column metadata the server reads the live table, but WITH it an
+  // unknown field converts to a filter the rows endpoint must reject — the
+  // drawer asks for this stricter mode so a stale field name falls back to
+  // the all-rows notice instead of a table that cannot load.
+  if (opts?.requireKnownFields && columns) {
+    const known = new Set(columns.map((col) => col.name));
+    for (const condition of treeConditions(tree)) {
+      if (!known.has(condition.field)) return 'unsupported';
+    }
   }
-  // An empty `any` matches nothing on the map, and CQL2 here has no false literal.
-  if (parts.length === 0) return canonical.combinator === 'any' ? 'unsupported' : null;
-  if (parts.length === 1) return parts[0];
-  return { op: canonical.combinator === 'all' ? 'and' : 'or', args: parts };
+  return treeToCql2(tree, types);
+}
+
+/**
+ * A layer's filter as a dataset route that validates CQL2 against the live
+ * table accepts it. Stricter than `maplibreFilterToCql2`: a field `columns`
+ * doesn't list, or one literal its column's type can't hold, inside an `in`
+ * list included, makes the whole filter 'unsupported', because the route
+ * would refuse it with a 400 or 422.
+ */
+export function layerFilterToServerCql2(
+  filter: FilterSpecification | null | undefined,
+  columns: readonly FilterColumn[] | null | undefined,
+): Cql2Expression | null | 'unsupported' {
+  const converted = maplibreFilterToCql2(filter ?? null, columns, { requireKnownFields: true });
+  if (!converted || converted === 'unsupported') return converted;
+  const types = new Map(
+    (columns ?? []).filter((col) => col.type).map((col) => [col.name, String(col.type).toLowerCase()]),
+  );
+  const incompatibleLiteral = (filterConditions(filter) ?? []).some((condition) => {
+    const values = condition.listValues ?? (condition.rawValue == null ? [] : [condition.rawValue]);
+    return values.some((value) => !isCql2LiteralCompatible(value, types.get(condition.field)));
+  });
+  return incompatibleLiteral ? 'unsupported' : converted;
 }

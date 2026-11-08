@@ -1,8 +1,8 @@
-"""fix(#1778): a request that races a revoke must not re-cache the token.
+"""A request that races a revoke must not re-cache the token.
 
-Codebase audit 2026-08-30, "Embed-token revocation invalidates the Redis
-positive cache BEFORE the caller's commit, so a concurrent request can re-cache
-the still-active token and keep it serving for 300s".
+Embed-token revocation invalidates the Redis positive cache BEFORE the
+caller's commit, so a concurrent request can re-cache the still-active token
+and keep it serving for 300s.
 
 The interleaving, in full:
 
@@ -16,7 +16,7 @@ The interleaving, in full:
   5. The revoke commits.
 
 Every later request is served from step 4's entry, because the cache-hit path
-re-checks only expires_at (SEC-014), never is_active. Deleting the key at step 3
+re-checks only expires_at, never is_active. Deleting the key at step 3
 cannot help: step 4 writes after it.
 
 So the revoke stamps a DENIAL under the key and the validator publishes with
@@ -50,7 +50,7 @@ from app.platform.cache.memory import InMemoryCacheProvider
 pytestmark = pytest.mark.anyio
 
 
-# fix(#1778 codex r3): the generation the race cases pin themselves to.
+# The generation the race cases pin themselves to.
 _TEST_GENERATION = 7
 
 
@@ -82,11 +82,22 @@ class RaceCache(InMemoryCacheProvider):
         return await super().get(key, security=security)
 
 
+@pytest.fixture(autouse=True)
+def _minter_reads_every_dataset(monkeypatch):
+    async def _readable(db, dataset_ids, user_id):
+        return set(dataset_ids)
+
+    monkeypatch.setattr(
+        "app.modules.embed_tokens.service.datasets_account_can_read", _readable
+    )
+
+
 def _active_token_row(map_id: uuid.UUID, dataset_id: uuid.UUID):
     """The row the racing select reads: still committed-active."""
     return MagicMock(
         id=uuid.uuid4(),
         map_id=map_id,
+        created_by=uuid.uuid4(),
         token_hash="unused",
         allowed_origins=None,
         scoped_dataset_ids=[str(dataset_id)],
@@ -104,14 +115,14 @@ async def _validate_with(cache, raw, dataset_id, map_id) -> bool:
     with (
         patch("app.modules.embed_tokens.service.get_cache", return_value=cache),
         patch(
-            "app.modules.embed_tokens.service.map_contains_dataset",
+            "app.modules.embed_tokens.service.map_embeds_dataset",
             AsyncMock(return_value=True),
         ),
         patch(
             "app.modules.embed_tokens.service._request_origin_is_allowed",
             AsyncMock(return_value=True),
         ),
-        # fix(#1778 codex r2): neutralise the usage bump by replacing the
+        # Neutralise the usage bump by replacing the
         # COROUTINE it runs, not asyncio.create_task. Patching create_task
         # substitutes an attribute on the shared asyncio module and hands the
         # service a MagicMock, which it then files in the module-level
@@ -125,7 +136,7 @@ async def _validate_with(cache, raw, dataset_id, map_id) -> bool:
             "app.modules.embed_tokens.service._bump_embed_token_usage_detached",
             AsyncMock(return_value=None),
         ),
-        # fix(#1778 codex r3): these cases are about the NX race, not the
+        # These cases are about the NX race, not the
         # revocation generation, and RaceCache's deliberately-missing first read
         # would otherwise be spent on the generation lookup instead of the token.
         # Pinned to a constant so the entry the racer publishes is stamped with
@@ -209,7 +220,7 @@ class TestSetIfAbsent:
 
 
 class TestDenialReachesEveryStore:
-    """fix(#1778 codex r1): the revoke helper's write must be the two-store one.
+    """The revoke helper's write must be the two-store one.
 
     A positive entry that landed in the layered provider's in-memory fallback
     during a Redis outage outlived a denial written after Redis recovered,
@@ -233,7 +244,7 @@ class TestDenialReachesEveryStore:
         provider._failure_count = 0
         provider._circuit_open_until = 0.0
         provider._fallback = InMemoryCacheProvider()
-        # fix(#1778 codex r2): these build the provider through __new__, so the
+        # These build the provider through __new__, so the
         # replay state __init__ sets up has to be seeded here too.
         provider._pending_authoritative = OrderedDict()
         provider._replay_lock = asyncio.Lock()

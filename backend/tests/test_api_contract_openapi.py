@@ -125,8 +125,7 @@ def test_rate_limited_operations_document_problem_429() -> None:
     }
     assert response["headers"]["Retry-After"]["schema"]["type"] == "integer"
     # The shared limiter has a global default, so undecorated routes also expose
-    # 429. Exempt vector routes document their own semaphore/pool-busy 429,
-    # while an exempt raster proxy with no equivalent failure remains outside.
+    # 429. Exempt tile routes document their own render-capacity 429.
     assert "429" in spec["paths"]["/auth/config/"]["get"]["responses"]
     vector = spec["paths"]["/tiles/{table_path}/{z}/{x}/{y}.pbf"]["get"]
     clusters = spec["paths"]["/tiles/clusters/{table_path}/{z}/{x}/{y}.pbf"]["get"]
@@ -135,7 +134,7 @@ def test_rate_limited_operations_document_problem_429() -> None:
     raster_proxy = spec["paths"]["/tiles/raster-proxy/{dataset_id}/{z}/{x}/{y}.{fmt}"][
         "get"
     ]
-    assert "429" not in raster_proxy["responses"]
+    assert "429" in raster_proxy["responses"]
 
 
 def test_global_exception_contracts_cover_reachable_operations() -> None:
@@ -352,10 +351,10 @@ def test_internal_pagination_prefers_skip_with_deprecated_offset_alias() -> None
 def test_direct_route_http_exceptions_are_documented() -> None:
     """Prevent direct handler raises from drifting beyond OpenAPI responses.
 
-    fix(#1778): this used to walk ``app.routes``
-    directly, which fastapi 0.140 stopped flattening for included routers —
-    the walk saw 1 of 265 operations (``/health``, which raises nothing) and
-    stayed green regardless of what the other 264 handlers raised.
+    This must not walk ``app.routes``
+    directly: fastapi 0.140 does not flatten included routers there, so a
+    direct walk sees 1 of 265 operations (``/health``, which raises nothing)
+    and stays green regardless of what the other 264 handlers raise.
     ``_iter_api_routes`` reads the flattened table instead, and the floor
     assertion below turns any future lazy-scan regression into a loud
     failure rather than a silent no-op (same shape as
@@ -469,7 +468,7 @@ def test_config_ops_and_source_health_tags_are_title_case() -> None:
 def _published_post_endpoint(path: str):
     """The handler behind the schema-visible POST operation at *path*.
 
-    Two traps here. The auth routes register twice (ROUTE-01 dual-shape), so
+    Two traps here. The auth routes register twice (dual-shape), so
     ``include_in_schema`` picks the half that reaches the spec. And routes
     included from a router stay NESTED under fastapi 0.140 — a plain scan of
     ``app.routes`` sees almost none of the API — so this walks the flattened
@@ -498,11 +497,11 @@ def _called_helper_names(endpoint, candidates: set[str]) -> set[str]:
 
 
 def test_cookie_session_operations_declare_their_negotiation_headers() -> None:
-    """fix(#1496): the cookie-mode headers are published parameters, not prose.
+    """The cookie-mode headers are published parameters, not prose.
 
-    Before this, the three session-lifecycle operations declared zero
-    parameters, so a generated SDK or the docs request form could not express
-    the inputs that establish, refresh, or revoke a browser cookie session.
+    The three session-lifecycle operations must declare the inputs that
+    establish, refresh, or revoke a browser cookie session; otherwise a
+    generated SDK or the docs request form cannot express them.
 
     The expectation is derived from each handler's own body — which cookies.py
     helper it calls decides which header is an input — so the declaration
@@ -557,7 +556,7 @@ def test_cookie_session_operations_declare_their_negotiation_headers() -> None:
 
 
 def test_inline_json_schema_rejects_recursive_model() -> None:
-    """fix(#569): a self-referential model must fail fast, not loop forever."""
+    """A self-referential model must fail fast, not loop forever."""
     import pytest
     from pydantic import BaseModel
 
@@ -571,7 +570,7 @@ def test_inline_json_schema_rejects_recursive_model() -> None:
 
 
 # ---------------------------------------------------------------------------
-# fix(#1666): the contract must describe what the app returns and accepts, not
+# The contract must describe what the app returns and accepts, not
 # FastAPI's defaults where the app overrides them at runtime.
 # ---------------------------------------------------------------------------
 
@@ -655,7 +654,7 @@ def test_search_operations_declare_filter_lang_under_its_wire_name() -> None:
 
 
 def test_retained_validation_model_keeps_the_schema_it_references() -> None:
-    """fix(#1666 codex P2): never delete a schema a retained one still points at.
+    """Never delete a schema a retained one still points at.
 
     `HTTPValidationError` holds the only `$ref` to `ValidationError`. If an
     operation keeps the container alive, the leaf has to stay too — dropping it
@@ -722,3 +721,23 @@ def test_retained_validation_model_keeps_the_schema_it_references() -> None:
     }
     _drop_unreferenced_validation_models(unreferenced)
     assert set(unreferenced["components"]["schemas"]) == {"Kept"}
+
+
+async def test_snapshot_and_served_openapi_share_the_api_server() -> None:
+    """app.openapi() and the served /openapi.json both list /api once."""
+    from httpx import ASGITransport, AsyncClient
+
+    assert _openapi()["servers"] == [{"url": "/api"}]
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/openapi.json")
+    assert response.status_code == 200
+    assert response.json()["servers"] == [{"url": "/api"}]
+
+
+def test_story_summary_stays_a_published_schema_with_chapter_count():
+    """SDK consumers import StorySummary by name; the list item keeps it."""
+    schemas = _openapi()["components"]["schemas"]
+    assert "chapter_count" in schemas["StorySummary"]["properties"]
+    assert "chapter_count" not in schemas["StoryResponse"]["properties"]

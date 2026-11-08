@@ -1,8 +1,10 @@
-"""Embed token CRUD endpoints for map-scoped tile access.
+"""Embed token CRUD endpoints for map-scoped data access.
 
-An embed token grants tile-level access to a single shared map without
-login; it is DB-backed so revocation is enforced at request time. Scopes:
-a specific map, an Origin allowlist (domain locking), and an expiry.
+An embed token lets viewers of one shared map, without login, read the
+tiles, features and terrain of its layers, and adds those layers to the
+shared-map view. It reaches only datasets its creator can still read, and
+it is DB-backed so revocation is enforced at request time. Scopes: a
+specific map, an Origin allowlist (domain locking), and an expiry.
 
 Kept separate from share tokens (catalog/maps/share_tokens), which grant
 access to map metadata/viewer rendering rather than tiles/features, and
@@ -18,6 +20,11 @@ from app.modules.audit.service import AuditEvent, audit_emit
 from app.core.identity import Identity
 from app.modules.auth.dependencies import require_permission
 from app.core.dependencies import get_db
+from app.modules.catalog.authorization import (
+    ANONYMOUS_MAP_VISIBILITIES,
+    RESTRICTED_MAP_VISIBILITY,
+    check_public_visibility_allowed,
+)
 from app.modules.embed_tokens.schemas import (
     EmbedTokenCreate,
     EmbedTokenCreatedResponse,
@@ -35,7 +42,11 @@ from app.modules.embed_tokens.service import (
     revoke_embed_token,
     update_embed_token,
 )
-from app.modules.catalog.maps.service import check_map_ownership, get_map
+from app.modules.catalog.maps.service import (
+    check_map_ownership,
+    get_map,
+    lock_map_layers,
+)
 from app.standards.ogc.errors import ERROR_RESPONSES_WRITE
 
 router = APIRouter(
@@ -44,25 +55,52 @@ router = APIRouter(
     responses=ERROR_RESPONSES_WRITE,
 )
 
+RESTRICTED_MAP_EMBED_REFUSED = (
+    "A map shared with groups can't have an embed token. Remove its groups first."
+)
 
-# ROUTE-01 (Phase 1092): dual-shape decorator -- trailing-slash is
-# canonical (in OpenAPI); no-slash is a hidden alias closing the 404
-# regression from redirect_slashes=False (api/main.py).
+
+async def _refuse_embed_beyond_map_audience(
+    db: AsyncSession, user: Identity, visibility: str
+) -> None:
+    """Refuse a token that would open a non-public map to anonymous holders
+    when its audience forbids that. Call holding the map row lock.
+
+    A restricted map is for its groups only, so it refuses every caller (409).
+    On any other non-public map the token is the only anonymous way in, so it
+    takes the same gate as making the map public (403 for a non-admin while
+    public visibility is restricted), judged on the caller's roles as
+    committed now.
+    """
+    if visibility == RESTRICTED_MAP_VISIBILITY:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=RESTRICTED_MAP_EMBED_REFUSED
+        )
+    if visibility not in ANONYMOUS_MAP_VISIBILITIES:
+        await check_public_visibility_allowed(db, user, "public")
+
+
+# Trailing slash is canonical (in OpenAPI); the no-slash form is a hidden alias
+# because api/main.py sets redirect_slashes=False.
 @router.post(
     "",
     response_model=EmbedTokenCreatedResponse,
     status_code=status.HTTP_201_CREATED,
     include_in_schema=False,
+    summary="Create an embed token",
 )
 @router.post(
-    "/", response_model=EmbedTokenCreatedResponse, status_code=status.HTTP_201_CREATED
+    "/",
+    response_model=EmbedTokenCreatedResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create an embed token",
 )
 async def create_embed_token_endpoint(
     request: Request,
     map_id: uuid.UUID,
     body: EmbedTokenCreate,
-    # fix(#819): same permission gate as share_map_endpoint -- an embed
-    # token outranks the share link it accompanies.
+    # Same permission gate as share_map_endpoint: an embed token outranks the
+    # share link it accompanies.
     user: Identity = Depends(require_permission("edit_metadata")),
     db: AsyncSession = Depends(get_db),
 ) -> EmbedTokenCreatedResponse:
@@ -79,8 +117,8 @@ async def create_embed_token_endpoint(
         )
     await check_map_ownership(map_obj, user, db)
 
-    # fix(#1548): refuse a lock this deployment can't enforce at
-    # mint time rather than silently later. Shared with PATCH so they can't drift.
+    # Refuse a lock this deployment can't enforce at mint time rather than
+    # failing silently later.
     try:
         await assert_domain_lock_is_enforceable(db, request, body.allowed_origins)
     except DomainLockNotEnforceableError as e:
@@ -89,6 +127,14 @@ async def create_embed_token_endpoint(
             detail=str(e),
         )
 
+    # Before the scope read, so the token freezes the layers the map has now,
+    # and before the revocation's cache denials, which no rollback undoes.
+    await lock_map_layers(db, map_id)
+    # Read under the lock that sharing with groups and visibility changes also
+    # take, so a map going restricted can't gain a token after that revoked its
+    # others.
+    await db.refresh(map_obj, ["visibility"])
+    await _refuse_embed_beyond_map_audience(db, user, map_obj.visibility)
     try:
         token, raw_token = await create_embed_token(
             db,
@@ -98,12 +144,10 @@ async def create_embed_token_endpoint(
             name=body.name,
             allowed_origins=body.allowed_origins,
         )
-    # fix(#1860): the map's layers reach a dataset this caller can no longer
-    # see, so there is no scope they may freeze into an anonymous tile
-    # capability. Same 403 shape as the maps router's sibling refusals
-    # ("Cannot access one or more layer datasets"). Distinct from the 400
-    # licensing refusal below so a client can tell the two apart without
-    # inspecting whether detail is a string or an object.
+    # The map's layers reach a dataset this caller can no longer see, so there
+    # is no scope they may freeze into an anonymous tile capability. Same 403
+    # shape as the maps router's sibling refusals, and distinct from the 400
+    # licensing refusal below so a client can tell the two apart.
     except EmbedScopeNotVisibleError:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -142,9 +186,15 @@ async def create_embed_token_endpoint(
     return EmbedTokenCreatedResponse.model_validate(token_data)
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see POST above.
-@router.get("", response_model=EmbedTokenListResponse, include_in_schema=False)
-@router.get("/", response_model=EmbedTokenListResponse)
+@router.get(
+    "",
+    response_model=EmbedTokenListResponse,
+    include_in_schema=False,
+    summary="List a map's embed tokens",
+)
+@router.get(
+    "/", response_model=EmbedTokenListResponse, summary="List a map's embed tokens"
+)
 async def list_embed_tokens_endpoint(
     map_id: uuid.UUID,
     user: Identity = Depends(require_permission("edit_metadata")),
@@ -166,7 +216,9 @@ async def list_embed_tokens_endpoint(
     )
 
 
-@router.patch("/{token_id}/", response_model=EmbedTokenResponse)
+@router.patch(
+    "/{token_id}/", response_model=EmbedTokenResponse, summary="Update an embed token"
+)
 async def update_embed_token_endpoint(
     request: Request,
     map_id: uuid.UUID,
@@ -187,17 +239,17 @@ async def update_embed_token_endpoint(
         )
     await check_map_ownership(map_obj, user, db)
 
-    # fix(#1548): existence check comes BEFORE the deployment-level
-    # domain-lock precondition -- otherwise a stale/revoked token id got told
-    # to go reconfigure PUBLIC_APP_URL instead of the real 404.
+    # Existence check comes before the deployment-level domain-lock
+    # precondition, so a stale/revoked token id gets the real 404 rather than
+    # advice to reconfigure PUBLIC_APP_URL.
     if await get_active_embed_token(db, token_id, map_id) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Embed token not found",
         )
 
-    # fix(#1548): same gate as the POST handler. Clearing a lock
-    # (allowed_origins=None) is unaffected.
+    # Same gate as the POST handler. Clearing a lock (allowed_origins=None) is
+    # unaffected.
     try:
         await assert_domain_lock_is_enforceable(db, request, body.allowed_origins)
     except DomainLockNotEnforceableError as e:
@@ -206,6 +258,8 @@ async def update_embed_token_endpoint(
             detail=str(e),
         )
 
+    # Before the cache eviction, which no rollback undoes.
+    await lock_map_layers(db, map_id)
     try:
         token = await update_embed_token(db, token_id, map_id, body.allowed_origins)
     except ValueError as e:
@@ -235,7 +289,9 @@ async def update_embed_token_endpoint(
     return EmbedTokenResponse.model_validate(token)
 
 
-@router.delete("/{token_id}/", response_model=EmbedTokenResponse)
+@router.delete(
+    "/{token_id}/", response_model=EmbedTokenResponse, summary="Revoke an embed token"
+)
 async def revoke_embed_token_endpoint(
     map_id: uuid.UUID,
     token_id: uuid.UUID,
@@ -251,6 +307,8 @@ async def revoke_embed_token_endpoint(
         )
     await check_map_ownership(map_obj, user, db)
 
+    # Before the revocation's cache denial, which no rollback undoes.
+    await lock_map_layers(db, map_id)
     token = await revoke_embed_token(db, token_id, map_id)
     if token is None:
         raise HTTPException(

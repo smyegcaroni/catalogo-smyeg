@@ -1,12 +1,12 @@
 #!/bin/sh
-# Regression test for scripts/upgrade.sh (UPG-01) — the prebuilt-image upgrade
+# Regression test for scripts/upgrade.sh, the prebuilt-image upgrade
 # flow. Pure shell with stubbed docker/pg_dump/git on PATH that RECORD CALL
 # ORDER to a log; no real stack, no DB, no network.
 #
 # Asserts:
-#   - fix(#1467): the image pull runs BEFORE api/worker are stopped, so the
+#   - the image pull runs BEFORE api/worker are stopped, so the
 #     outage window does not include the download
-#   - fix(#1467): api/worker stay stopped across the whole migrate step, so a
+#   - api/worker stay stopped across the whole migrate step, so a
 #     data migration cannot race the previous release's writes
 #   - backup (pg_dump) runs after the stop and before migrate
 #   - migrate runs BEFORE the app `up -d` and BEFORE the health gate
@@ -15,15 +15,15 @@
 #     api/worker, leaves the pin alone, and prints the rollback recipe
 #   - a source-build install (COMPOSE_FILE=docker-compose.yml) exits 0 with the
 #     source-build instructions and makes NO compose/pg_dump calls
-#   - test(#826) wait_for_healthy edge cases: a still-starting service passes
+#   - wait_for_healthy edge cases: a still-starting service passes
 #     ONLY while its container AGE (now - StartedAt — not the wait budget,
-#     which lies about a service that restarted mid-wait; Codex P2 round 2)
+#     which lies about a service that restarted mid-wait)
 #     is inside its healthcheck's full tolerance — start_period + timeout +
 #     retries x (interval + timeout), per Docker's verdict semantics: grace
 #     is judged by probe START time, so one in-flight probe's timeout rides
-#     past the boundary (Codex P2 rounds 1+3 on #867) — one that outlived it
+#     past the boundary — one that outlived it
 #     fails the wait; the LIVE Health.Status read in the same inspect wins
-#     over the snapshot AND the tolerance math in both directions (round 4);
+#     over the snapshot AND the tolerance math in both directions;
 #     an (unhealthy) service at budget end fails the wait; unreadable
 #     config, StartedAt, or live status fails open
 set -u
@@ -61,6 +61,7 @@ make_stubs() {
   _migrate_mode="$1"
   CALLLOG="$WORK/calls.log"
   : > "$CALLLOG"
+  : > "$CALLLOG.files"
   GITLOG="$WORK/git.log"
   : > "$GITLOG"
 
@@ -80,11 +81,14 @@ DB_RECREATE_MODE="${DOCKER_DB_RECREATE_MODE:-ok}"
 if [ "$1" = "compose" ]; then
   shift
   # strip "-f <file>"
-  # fix(#1798 review round 16, P2, review 5104847831): compose() now also
+  # compose() now also
   # emits `--project-directory VALUE` (see scripts/lib/common.sh) -- skip
   # any number of "-f VALUE" / "--project-directory VALUE" pairs, in
   # whichever order compose() sends them, before checking the subcommand.
-  while [ "$1" = "-f" ] || [ "$1" = "--project-directory" ]; do shift 2; done
+  while [ "$1" = "-f" ] || [ "$1" = "--project-directory" ]; do
+    [ "$1" = "-f" ] && printf '%s\n' "$2" >> "$LOG.files"
+    shift 2
+  done
   case "$1" in
     version) exit 0 ;;
     stop)    echo "stop_app" >> "$LOG"; [ "$STOP_MODE" = "fail" ] && exit 1; exit 0 ;;
@@ -94,9 +98,9 @@ if [ "$1" = "compose" ]; then
       # Four distinct in-container calls share `compose exec -T db`:
       #   psql       -> the PG-major probe (Step 2.5); answer server_version_num.
       #   pg_dump    -> the backup path; emit non-empty dump bytes to stdout.
-      #   pg_restore -> the end-to-end read-back of that dump (fix(#714)).
+      #   pg_restore -> the end-to-end read-back of that dump.
       #   cat        -> the LIVE postgresql.conf the container is serving
-      #                 (fix(#959)); DOCKER_DB_RUNNING_CONF models a container
+      #                 DOCKER_DB_RUNNING_CONF models a container
       #                 still holding the pre-upgrade inode. Empty output
       #                 models an external/managed DB with no `db` service.
       for a in "$@"; do
@@ -128,11 +132,11 @@ if [ "$1" = "compose" ]; then
       for a in "$@"; do
         if [ "$a" = "migrate" ]; then echo "migrate_up" >> "$LOG"; exit 0; fi
       done
-      # fix(#959): `up -d --force-recreate --no-deps --wait db` applies a synced
+      # `up -d --force-recreate --no-deps --wait db` applies a synced
       # db/postgresql.conf. It is NOT an app up — logging it as one would make
       # the ordering assertions read a config bounce as bringing the app back.
       #
-      # fix(#1467): `up -d --no-deps api worker` is the failure-path restore of
+      # `up -d --no-deps api worker` is the failure-path restore of
       # the PREVIOUS release. Matching on --no-deps is deliberate: the prod
       # compose gives api a `depends_on: migrate:
       # service_completed_successfully` edge, so a restore that dropped
@@ -151,10 +155,9 @@ if [ "$1" = "compose" ]; then
       # `ps -aq migrate` -> a fake container id. `ps --format ...` (the
       # health-gate poll) -> the DOCKER_PS_STATUS table, empty by default so
       # the gate passes immediately. `ps -q <service>` -> a per-service cid
-      # for wait_for_healthy's start_period lookup (test(#826)).
+      # for wait_for_healthy's start_period lookup.
       for a in "$@"; do
         if [ "$a" = "migrate" ]; then
-          # fix(#1798 review round 11 audit, low-confidence item):
           # DOCKER_MIGRATE_CID_MISSING models `compose ps -aq migrate`
           # finding nothing right after `compose up -d --no-deps migrate`
           # just reported success starting it — a Docker-level race the
@@ -171,7 +174,7 @@ if [ "$1" = "compose" ]; then
           exit 0 ;;
         *" -q "*)
           for a in "$@"; do svc="$a"; done
-          # fix(#1798 review round 7, P2): DOCKER_DB_PS_FAIL models `compose
+          # DOCKER_DB_PS_FAIL models `compose
           # ps -q db` itself failing (the db container vanished between the
           # earlier `compose ps` and this one) — only for svc=db, only when
           # explicitly requested, so the 93 other cid-<svc> lookups in this
@@ -185,13 +188,16 @@ if [ "$1" = "compose" ]; then
       exit 0 ;;
     logs) exit 0 ;;
     config)
-      # fix(#1798 review round 7, P2): `compose config --images db` -> the
+      # `compose config --images db` -> the
       # DB_IMAGE_TAG probe in the staleness check. Empty by default (the
       # existing no-op every other test in this file relies on); only
       # DOCKER_DB_IMAGE_TAG opts a test into driving it.
       case "$*" in
         *--images*db*)
           [ -n "${DOCKER_DB_IMAGE_TAG:-}" ] && printf '%s\n' "${DOCKER_DB_IMAGE_TAG}"
+          ;;
+        *)
+          [ -n "${DOCKER_CONFIG_OUT:-}" ] && printf '%b' "${DOCKER_CONFIG_OUT}"
           ;;
       esac
       exit 0 ;;
@@ -201,7 +207,7 @@ fi
 if [ "$1" = "wait" ]; then
   # docker wait <cid> -> block-then-print the migrate one-shot's exit code (0|3).
   #
-  # codex P1 on #1476: this call is the last thing before upgrade.sh pins .env,
+  # This call is the last thing before upgrade.sh pins .env,
   # so it is where the test makes that pin fail for real. Dropping write
   # permission on the install directory means `update_env_value`'s
   # `mv .env.tmp.$$ .env` cannot rename, which is the fallible step that used to
@@ -212,7 +218,7 @@ if [ "$1" = "wait" ]; then
 fi
 if [ "$1" = "inspect" ]; then
   # --format '{{.State.Status}}' -> exited ; '{{.State.ExitCode}}' -> 0|3.
-  # test(#826): the healthcheck format (StartedAt + StartPeriod/Interval/
+  # The healthcheck format (StartedAt + StartPeriod/Interval/
   # Timeout/Retries + live Health.Status fields) -> "<started_at>
   # <start_period> <interval> <timeout> <retries> <live_status>" for the
   # cid-<svc> container, from DOCKER_STARTED_<svc> + DOCKER_HC_<svc> (the HC
@@ -231,7 +237,7 @@ if [ "$1" = "inspect" ]; then
     *State.Status*)
       # The migrate one-shot is `exited` by design. The restored api answers
       # DOCKER_API_STATE (running by default) so the post-restore settle probe
-      # can be driven both ways (codex P1 round 2 on #1476).
+      # can be driven both ways.
       for a in "$@"; do cid="$a"; done
       case "$cid" in
         cid-api) printf '%s\n' "${DOCKER_API_STATE:-running}" ;;
@@ -240,7 +246,7 @@ if [ "$1" = "inspect" ]; then
       exit 0 ;;
     *State.ExitCode*) [ "$MIGRATE_MODE" = "fail" ] && echo 3 || echo 0 ; exit 0 ;;
     *.Image*)
-      # fix(#1798 review round 7, P2): `docker inspect --format '{{.Image}}'
+      # `docker inspect --format '{{.Image}}'
       # <cid>` -> the RUNNING container's image id in the db-staleness
       # check. Only answers for cid-db, and only when
       # DOCKER_DB_RUNNING_IMAGE_ID is set — every other cid is unaffected
@@ -254,7 +260,7 @@ if [ "$1" = "inspect" ]; then
   exit 0
 fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
-  # fix(#1798 review round 7, P2): `docker image inspect --format '{{.Id}}'
+  # `docker image inspect --format '{{.Id}}'
   # <tag>` -> the LOCAL built-image lookup in the db-staleness check.
   # DOCKER_DB_BUILT_IMAGE_MISSING=1 models the tag being pruned locally
   # (nonzero exit, matching the real CLI's "No such image" failure);
@@ -275,17 +281,17 @@ DOCKER
   chmod +x "$SHIM/pg_dump"
 
   # --- sleep stub: wait_for_healthy polls 18 x 5s, so the health-gate cases
-  # (test(#826)) would otherwise take 90 real seconds each. upgrade.sh has no
+  #  would otherwise take 90 real seconds each. upgrade.sh has no
   # other sleep, so a no-op is safe.
   printf '#!/bin/sh\nexit 0\n' > "$SHIM/sleep"
   chmod +x "$SHIM/sleep"
 
   # --- git stub: ls-remote returns a newer tag for auto-resolve. fetch/checkout
-  # (the UPG release-file sync) record to $GIT_LOG so the sync can be asserted
+  # (the release-file sync) record to $GIT_LOG so the sync can be asserted
   # WITHOUT polluting the docker call-order log. rev-parse --git-dir succeeds so
   # upgrade.sh treats the fake tree as a git checkout. Everything else is a no-op.
   #
-  # fix(#959): `show <tag>:db/postgresql.conf` answers per tag, so the config
+  # `show <tag>:db/postgresql.conf` answers per tag, so the config
   # sync can be exercised for real — v1.2.3 is what the install is running,
   # v1.2.4 is what the release ships. `checkout ... db/postgresql.conf` writes
   # the target content, matching what real git does to the worktree.
@@ -296,7 +302,7 @@ DB_CONF_INSTALLED='temp_file_limit = 0
 '
 DB_CONF_TARGET='temp_file_limit = 4GB
 '
-# fix(#1778): GIT_DOCKERFILE_SYNC_TEST switches `show <tag>:db/Dockerfile` to
+# GIT_DOCKERFILE_SYNC_TEST switches `show <tag>:db/Dockerfile` to
 # per-tag content (DOCKERFILE_INSTALLED/DOCKERFILE_TARGET below), the same
 # shape as db/postgresql.conf's pair, so the new sync-and-rebuild path can be
 # exercised for real. Unset (the default), it keeps the ORIGINAL behavior
@@ -325,7 +331,7 @@ case "$1" in
       fi
     done ;;
   # `git show <tag>:db/Dockerfile` -> the target release's bundled db base
-  # image, which the Step 2.5 PG-major guard parses AND (fix(#1778)) the
+  # image, which the Step 2.5 PG-major guard parses AND  the
   # Step 4 sync-and-rebuild content comparison reads.
   show)
     case "$2" in
@@ -362,7 +368,7 @@ ENV
   # compose files referenced by name only (stub never reads them) but keep real.
   printf 'services: {}\n' > "$FAKE/docker-compose.prod.yml"
   printf 'services: {}\n' > "$FAKE/docker-compose.yml"
-  # fix(#959): the bind-mounted Postgres config, seeded to the INSTALLED
+  # the bind-mounted Postgres config, seeded to the INSTALLED
   # release's content ($DB_CONF_INSTALLED in the git stub) so the default case
   # is an untouched file the upgrade may sync. Pass $1 to seed something else
   # and model an operator who tuned it.
@@ -370,7 +376,7 @@ ENV
   printf '%s\n' "${1:-temp_file_limit = 0}" > "$FAKE/db/postgresql.conf"
 }
 
-# fix(#1778): seed db/Dockerfile matching the git stub's DOCKERFILE_INSTALLED
+# seed db/Dockerfile matching the git stub's DOCKERFILE_INSTALLED
 # blob (an untouched file the upgrade may sync), or pass $1 to model an
 # operator who edited it. Only called by tests that also set
 # DOCKERFILE_SYNC_TEST=1 so the git stub answers per-tag for db/Dockerfile;
@@ -407,6 +413,7 @@ run_upgrade() {  # $1=migrate mode, rest=args to upgrade.sh
       GIT_DOCKERFILE_SYNC_TEST="${DOCKERFILE_SYNC_TEST:-}" \
       DOCKER_DB_RECREATE_MODE="${DB_RECREATE_MODE:-ok}" \
       DOCKER_DB_IMAGE_TAG="${DB_IMAGE_TAG:-}" \
+      DOCKER_CONFIG_OUT="${CONFIG_OUT:-}" \
       DOCKER_DB_PS_FAIL="${DB_PS_FAIL:-0}" \
       DOCKER_DB_RUNNING_IMAGE_ID="${DB_RUNNING_IMAGE_ID:-}" \
       DOCKER_DB_BUILT_IMAGE_ID="${DB_BUILT_IMAGE_ID:-}" \
@@ -443,7 +450,7 @@ fi
 
 b="$(pos_of backup)"; p="$(pos_of pull)"; m="$(pos_of migrate_up)"; a="$(pos_of app_up)"
 s="$(pos_of stop_app)"
-# fix(#1467): the download must not be charged to the operator as downtime. The
+# The download must not be charged to the operator as downtime. The
 # pull happens while the previous release is still serving; only stop -> dump ->
 # migrate -> start is the outage.
 if [ -n "$p" ] && [ -n "$s" ] && [ "$p" -lt "$s" ]; then
@@ -469,10 +476,10 @@ fi
 
 # Full expected order: probe_pg, pull, stop_app, backup, verify_backup,
 # db_recreate, migrate_up, app_up. The PG-major probe runs first — it must
-# decide before anything is changed. fix(#1467): the pull sits before the stop,
+# decide before anything is changed. The pull sits before the stop,
 # so the outage is stop -> dump -> migrate -> start and nothing else.
 # db_recreate appears because the git stub reports a db/postgresql.conf that
-# differs from the target tag (fix(#959)); it lands after the dump and before
+# differs from the target tag; it lands after the dump and before
 # migrate, so migrations already run under the release's Postgres settings.
 order="$(tr '\n' ',' < "$WORK/calls.log")"
 expected="probe_pg,pull,stop_app,backup,verify_backup,db_recreate,migrate_up,app_up,"
@@ -482,7 +489,7 @@ else
   bad "unexpected call order: $order"
 fi
 
-# fix(#959): the config bounce must not straddle the migrate step or the app up.
+# The config bounce must not straddle the migrate step or the app up.
 # It also belongs inside the outage — bouncing the database under a running old
 # app would break its connections for nothing.
 d="$(pos_of db_recreate)"
@@ -492,9 +499,9 @@ else
   bad "db config recreate out of place (backup=$b db_recreate=$d migrate=$m)"
 fi
 
-# fix(#714): the rollback dump is read back end-to-end BEFORE the first
+# The rollback dump is read back end-to-end BEFORE the first
 # irreversible step, which is the migrate (the pull only downloads images, and
-# since fix(#1467) the .env pin does not move until migrations have committed).
+# since the .env pin does not move until migrations have committed).
 # A dump truncated by a full disk is non-empty and passes `--list`, so `-s`
 # alone would let the upgrade migrate the schema behind an unrestorable
 # rollback artifact.
@@ -506,14 +513,14 @@ else
 fi
 
 # Writers quiesced BEFORE the dump (so the snapshot loses no acknowledged writes on
-# rollback) and before migrate (Codex P1, and the policy decision in #1467).
+# rollback) and before migrate.
 if [ -n "$s" ] && [ -n "$b" ] && [ -n "$m" ] && [ "$s" -lt "$b" ] && [ "$b" -lt "$m" ]; then
   ok "api/worker stopped before the backup dump and before migrate ($s < $b < $m)"
 else
   bad "writers not quiesced before the dump (stop=$s backup=$b migrate=$m)"
 fi
 
-# fix(#1467): nothing restarts api/worker between the stop and the final app up,
+# Nothing restarts api/worker between the stop and the final app up,
 # so the whole migrate step runs with no application writer alive. A restore_app
 # in the happy path would mean something brought the OLD release back mid-upgrade.
 if [ -z "$(pos_of restore_app)" ]; then
@@ -529,7 +536,7 @@ else
   bad "successful upgrade did not pin the new version: $(grep GEOLENS_VERSION "$FAKE/.env")"
 fi
 
-# UPG release-file sync (Codex P2): the prebuilt flow fetches the target tag and
+# Release-file sync: the prebuilt flow fetches the target tag and
 # checks out the compose/scripts BEFORE pulling images, so new images get the new
 # release's config. (git fetch/checkout are recorded to git.log; both happen in the
 # Step-3 sync, which runs before the docker `pull` logged above.)
@@ -573,7 +580,7 @@ if [ -n "$(pos_of backup)" ] && [ -z "$(pos_of app_up)" ]; then
 else
   bad "backup ordering wrong on the failure path"
 fi
-# fix(#1467): the app was stopped for the migration, so a failed migration must
+# The app was stopped for the migration, so a failed migration must
 # put the PREVIOUS release back. Leaving it stopped turns a failed upgrade into
 # an outage that lasts until the operator notices.
 if [ -n "$(pos_of restore_app)" ]; then
@@ -593,7 +600,7 @@ else
   bad "failed migrate did not warn about a partially applied migration"
   sed 's/^/    # /' "$WORK/out.txt"
 fi
-# fix(#1467): the pin must NOT have moved. It used to move before the migrate,
+# The pin must NOT have moved. It used to move before the migrate,
 # so a re-run read the new version as installed, decided there was nothing to
 # upgrade, and exited 0 with the app still down and the schema unmigrated.
 if grep -q '^GEOLENS_VERSION=1.2.3$' "$FAKE/.env"; then
@@ -613,7 +620,7 @@ else
 fi
 
 # ============================================================================
-# CASE 2c — codex P1 round 2 on #1476: the restored api does not stay up. The
+# CASE 2c — the restored api does not stay up. The
 # api image runs `alembic upgrade heads` on boot, so a failed migration that
 # already committed a revision leaves the OLD image unable to start, and
 # `compose up -d` still exits 0 because the container was created. The script
@@ -644,7 +651,7 @@ else
 fi
 
 # ============================================================================
-# CASE 2d — codex P1 on #1476: migrations commit, then pinning .env fails. The
+# CASE 2d — migrations commit, then pinning .env fails. The
 # automatic restore must already be disarmed, because starting the PREVIOUS
 # release against a fully migrated schema is the state the flag exists to
 # prevent. The docker stub drops write permission on the install directory
@@ -677,12 +684,11 @@ else
 fi
 
 # ============================================================================
-# CASE 2b — fix(#959): a tuned db/postgresql.conf survives the upgrade.
+# CASE 2b — a tuned db/postgresql.conf survives the upgrade.
 # The customization test is CONTENT-based (worktree vs the installed release's
 # blob), not `git diff`-based, so it holds whether or not the operator staged
 # or committed their tuning — an operator who version-controls production
-# tuning would otherwise look clean to git and get silently overwritten
-# (codex review on #959's PR).
+# tuning would otherwise look clean to git and get silently overwritten.
 # ============================================================================
 seed_prod_env 'temp_file_limit = 64GB   # tuned by the operator'
 run_upgrade ok 1.2.4
@@ -714,10 +720,10 @@ else
 fi
 
 # ============================================================================
-# CASE 2c — fix(#959): a retry after an interrupted upgrade still bounces the
+# CASE 2c — a retry after an interrupted upgrade still bounces the
 # db. The earlier attempt already wrote the release's config to disk, so git
 # sees nothing to do; only the RUNNING container knows it is still serving the
-# pre-upgrade inode (codex review on #959's PR).
+# pre-upgrade inode.
 # ============================================================================
 seed_prod_env 'temp_file_limit = 4GB'          # synced by the failed attempt
 DB_RUNNING_CONF='temp_file_limit = 0'          # container still on the old file
@@ -740,7 +746,7 @@ fi
 unset DB_RUNNING_CONF
 
 # ============================================================================
-# CASE 2e — fix(#1778): db is the ONLY locally-built image in a prebuilt
+# CASE 2e — db is the ONLY locally-built image in a prebuilt
 # install (compose pull --ignore-buildable skips it), so a release that
 # bumps db/Dockerfile never reached an existing install through this script.
 # An unmodified db/Dockerfile is synced to the target release AND rebuilt
@@ -749,7 +755,7 @@ unset DB_RUNNING_CONF
 # ============================================================================
 seed_prod_env
 seed_db_dockerfile
-# fix(#1778 review, P1): no build-state marker yet — this is the "never built
+# No build-state marker yet — this is the "never built
 # under the new tracking" starting point every case below is explicit about.
 rm -f "$FAKE/.geolens-db-image-built-from"
 DOCKERFILE_SYNC_TEST=1
@@ -772,7 +778,7 @@ if [ -n "$build_pos" ]; then
 else
   bad "db/Dockerfile was synced but no rebuild was triggered: calls=$(tr '\n' ',' < "$WORK/calls.log")"
 fi
-# fix(#1798 review round 8, P2): compose build db moved to BEFORE Step 6's
+# `compose build db` moved to BEFORE Step 6's
 # stop — a db/Dockerfile base-layer fetch (the one thing --ignore-buildable
 # deliberately skips) used to run inside the outage window, extending it or
 # failing the upgrade after downtime had already begun. It now runs in the
@@ -827,7 +833,7 @@ else
 fi
 
 # ============================================================================
-# CASE 2f — fix(#1778 review, P1): a synced-but-never-built db/Dockerfile on
+# CASE 2f — a synced-but-never-built db/Dockerfile on
 # retry still triggers the build. Before this fix, the rebuild trigger
 # (DB_DOCKERFILE_CHANGED) only tracked whether the SYNC STEP wrote a new file
 # THIS run, not whether the local image was ever actually rebuilt — so a run
@@ -875,7 +881,7 @@ else
 fi
 
 # ============================================================================
-# CASE 2g — fix(#1778 review round 2, P1): build succeeds, the FOLLOW-ON
+# CASE 2g — build succeeds, the FOLLOW-ON
 # recreate fails. Before this fix the marker was written right after
 # `compose build db`, before the separate `compose up --force-recreate`
 # that actually makes the new image live — so a build-ok/recreate-fail run
@@ -968,6 +974,114 @@ else
 fi
 
 # ============================================================================
+# CASE 3b — a COMPOSE_FILE list (prod file + override) is a prebuilt install;
+# every compose call keeps the override.
+# ============================================================================
+seed_prod_env
+printf 'COMPOSE_FILE=docker-compose.prod.yml:override.yml:%s/abs-override.yml\nGEOLENS_VERSION=1.2.3\nPOSTGRES_USER=geolens\nPOSTGRES_DB=geolens\n' "$FAKE" > "$FAKE/.env"
+printf 'services: {}\n' > "$FAKE/override.yml"
+printf 'services: {}\n' > "$FAKE/abs-override.yml"
+run_upgrade ok 1.2.4
+if [ "$(cat "$WORK/code.txt")" = "0" ] && [ -n "$(pos_of migrate_up)" ]; then
+  ok "a COMPOSE_FILE list with the prod file upgrades like a plain prod install"
+else
+  bad "a COMPOSE_FILE list was refused (exit=$(cat "$WORK/code.txt"))"
+  sed 's/^/    # /' "$WORK/out.txt"
+fi
+if grep -q "^$FAKE/override.yml\$" "$CALLLOG.files" \
+   && grep -q "^$FAKE/docker-compose.prod.yml\$" "$CALLLOG.files" \
+   && grep -q "^$FAKE/abs-override.yml\$" "$CALLLOG.files"; then
+  ok "compose is invoked with every file in the list"
+else
+  bad "compose calls dropped the override: $(sort -u "$CALLLOG.files" | tr '\n' ',')"
+fi
+
+# Equivalent spellings of the prod file still classify as a prebuilt install.
+FAKE_ABS="$(cd "$FAKE" && pwd)"
+mkdir -p "$FAKE/overrides"
+for spelling in "./docker-compose.prod.yml" "$FAKE_ABS/docker-compose.prod.yml" "overrides/../docker-compose.prod.yml"; do
+  seed_prod_env
+  printf 'COMPOSE_FILE=%s\nGEOLENS_VERSION=1.2.3\nPOSTGRES_USER=geolens\nPOSTGRES_DB=geolens\n' "$spelling" > "$FAKE/.env"
+  run_upgrade ok 1.2.4
+  if [ "$(cat "$WORK/code.txt")" = "0" ] && [ -n "$(pos_of migrate_up)" ]; then
+    ok "COMPOSE_FILE=$spelling is upgraded as a prebuilt install"
+  else
+    bad "COMPOSE_FILE=$spelling was not treated as the prod file (exit=$(cat "$WORK/code.txt"))"
+  fi
+done
+
+# An override that gives an app service a build definition is neither install
+# type: the later pull skips buildable images and the checkout would run.
+seed_prod_env
+printf 'COMPOSE_FILE=docker-compose.prod.yml:override.yml\nGEOLENS_VERSION=1.2.3\n' > "$FAKE/.env"
+printf 'services: {}\n' > "$FAKE/override.yml"
+CONFIG_OUT='services:\n  db:\n    build:\n      context: db\n  api:\n    build:\n      context: backend\n'
+run_upgrade ok 1.2.4
+CONFIG_OUT=
+if [ "$(cat "$WORK/code.txt")" != "0" ] && grep -q 'build or run from the checkout' "$WORK/out.txt" \
+   && [ -z "$(pos_of backup)" ]; then
+  ok "a COMPOSE_FILE list that makes api buildable is refused before any backup"
+else
+  bad "a buildable api was not refused (exit=$(cat "$WORK/code.txt"))"
+fi
+CONFIG_OUT='services:\n  db:\n    build:\n      context: db\n'
+run_upgrade ok 1.2.4
+CONFIG_OUT=
+if [ "$(cat "$WORK/code.txt")" = "0" ]; then
+  ok "the db service's own build definition does not block an upgrade"
+else
+  bad "a buildable db blocked the upgrade (exit=$(cat "$WORK/code.txt"))"
+fi
+
+CONFIG_OUT='services:\n  api:\n    volumes:\n      - type: bind\n        source: /srv/geolens/backend/app\n        target: /app/app\n'
+run_upgrade ok 1.2.4
+CONFIG_OUT=
+if [ "$(cat "$WORK/code.txt")" != "0" ] && grep -q 'run from the checkout' "$WORK/out.txt" \
+   && [ -z "$(pos_of backup)" ]; then
+  ok "a source bind mount over the app code is refused before any backup"
+else
+  bad "a backend/app bind mount was not refused (exit=$(cat "$WORK/code.txt"))"
+fi
+
+# A glob character in an entry is literal, not a pattern.
+seed_prod_env
+printf 'services: {}\n' > "$FAKE/over[1].yml"
+printf 'services: {}\n' > "$FAKE/over1.yml"
+printf 'COMPOSE_FILE=docker-compose.prod.yml:over[1].yml\nGEOLENS_VERSION=1.2.3\n' > "$FAKE/.env"
+run_upgrade ok 1.2.4
+if [ "$(cat "$WORK/code.txt")" = "0" ] && grep -qF "$FAKE/over[1].yml" "$CALLLOG.files" \
+   && ! grep -qF "$FAKE/over1.yml" "$CALLLOG.files"; then
+  ok "a glob character in a COMPOSE_FILE entry is taken literally"
+else
+  bad "a glob in a COMPOSE_FILE entry was expanded: $(sort -u "$CALLLOG.files" | tr '\n' ',')"
+fi
+rm -f "$FAKE/over[1].yml" "$FAKE/over1.yml"
+
+# Entries with spaces stay copy-pasteable in the recovery hints.
+mkdir -p "$FAKE/my overrides"
+printf 'services: {}\n' > "$FAKE/my overrides/o.yml"
+seed_prod_env
+printf 'COMPOSE_FILE=docker-compose.prod.yml:my overrides/o.yml\nGEOLENS_VERSION=1.2.3\n' > "$FAKE/.env"
+STOP_MODE=ok MIGRATE_FAIL_ON_PURPOSE=1 run_upgrade fail 1.2.4
+if grep -q "docker compose -f docker-compose.prod.yml -f 'my overrides/o.yml' up -d" "$WORK/out.txt"; then
+  ok "recovery commands quote compose paths that contain spaces"
+else
+  bad "recovery commands did not quote a path with a space"
+  sed 's/^/    # /' "$WORK/out.txt" | tail -15
+fi
+rm -rf "$FAKE/my overrides"
+
+rm -f "$FAKE/override.yml" "$FAKE/abs-override.yml"
+seed_prod_env
+printf 'COMPOSE_FILE=docker-compose.prod.yml:override.yml\nGEOLENS_VERSION=1.2.3\n' > "$FAKE/.env"
+run_upgrade ok 1.2.4
+if [ "$(cat "$WORK/code.txt")" != "0" ] && grep -q 'override.yml' "$WORK/out.txt" && [ -z "$(pos_of backup)" ]; then
+  ok "a COMPOSE_FILE entry that does not exist is refused before any backup"
+else
+  bad "a missing override file was not refused (exit=$(cat "$WORK/code.txt"))"
+fi
+
+# ============================================================================
 # CASE 4 — same-version target is a no-op (exit 0, no backup/pull).
 # ============================================================================
 seed_prod_env
@@ -990,7 +1104,7 @@ else
 fi
 
 # ============================================================================
-# CASE 6 — writer quiesce fails: abort BEFORE the backup, restart writers (P1).
+# CASE 6 — writer quiesce fails: abort BEFORE the backup, restart writers.
 # ============================================================================
 seed_prod_env
 STOP_MODE=fail
@@ -1013,7 +1127,7 @@ else
 fi
 
 # ============================================================================
-# CASE 6b — fix(#714): the dump is written but reads back corrupt. Abort before
+# CASE 6b — the dump is written but reads back corrupt. Abort before
 # the first irreversible step, discard the unusable artifact, restart writers.
 # ============================================================================
 seed_prod_env
@@ -1025,8 +1139,8 @@ rm -rf "$FAKE/backups/pre-upgrade"
 VERIFY_MODE=fail
 run_upgrade ok 1.2.4
 VERIFY_MODE=ok
-# The first IRREVERSIBLE step is the migrate; since fix(#1467) the pull happens
-# earlier, outside the outage, and downloading images changes nothing.
+# The first IRREVERSIBLE step is the migrate; the pull happens earlier,
+# outside the outage, and downloading images changes nothing.
 if [ "$(cat "$WORK/code.txt")" != "0" ] && [ -z "$(pos_of migrate_up)" ]; then
   ok "unreadable rollback dump aborts BEFORE the migrate (nothing irreversible ran)"
 else
@@ -1049,7 +1163,7 @@ else
 fi
 
 # ============================================================================
-# CASE 7 — chore(#704): a target release bundling a DIFFERENT PostgreSQL major
+# CASE 7 — a target release bundling a DIFFERENT PostgreSQL major
 # is refused before ANY change (no stop, no dump, no pull), with a RUNBOOK
 # pointer. A PG N volume cannot be opened by a PG N+1 server.
 # ============================================================================
@@ -1089,7 +1203,7 @@ else
   sed 's/^/    # /' "$WORK/out.txt"
 fi
 
-# Codex #707: with DATABASE_URL_OVERRIDE set the app uses an external database,
+# With DATABASE_URL_OVERRIDE set the app uses an external database,
 # but the prod compose still starts the bundled `db`. Probing that stale local
 # container would refuse an upgrade for an operator whose provider is already on
 # the new major, so the check is skipped entirely in that mode.
@@ -1108,7 +1222,7 @@ else
   bad "external database mode still probed the bundled db"
 fi
 
-# #947: the single-tenant runtime role ALSO uses DATABASE_URL_OVERRIDE, but its
+# The single-tenant runtime role ALSO uses DATABASE_URL_OVERRIDE, but its
 # database is still the bundled volume. It must not inherit the external-DB
 # exemption and accidentally cross a PostgreSQL major.
 seed_prod_env
@@ -1173,7 +1287,7 @@ else
   bad "query-host managed runtime mode still probed bundled db"
 fi
 
-# fix(#1287 review): a managed database can use the dedicated runtime role too.
+# A managed database can use the dedicated runtime role too.
 # The hostname, not merely the role flag, distinguishes that path from the
 # bundled `db` service; a stale local db container must not block its upgrade.
 seed_prod_env
@@ -1207,7 +1321,7 @@ else
 fi
 
 # ============================================================================
-# CASE 8 — test(#826) wait_for_healthy: a service still `(health: starting)`
+# CASE 8 — wait_for_healthy: a service still `(health: starting)`
 # at budget end passes ONLY while inside its healthcheck's full tolerance:
 # start_period + timeout + retries x (interval + timeout). The prod backup service
 # declares start_period 10m for its first pg_dump — far beyond the 90s
@@ -1233,7 +1347,7 @@ else
   sed 's/^/    # /' "$WORK/out.txt"
 fi
 
-# Codex P2 (#867): start_period alone is NOT the boundary. After it ends,
+# start_period alone is NOT the boundary. After it ends,
 # failing probes only accumulate toward `retries` consecutive failures, and
 # the service honestly stays `starting` until the streak is exhausted. The
 # prod frontend (start_period 15s, interval 30s, timeout 10s, retries 3) can
@@ -1252,7 +1366,7 @@ else
   sed 's/^/    # /' "$WORK/out.txt"
 fi
 
-# Codex P2 round 2 (#867): a restart-policy service that crashed and
+# A restart-policy service that crashed and
 # restarted mid-wait is seconds old with a freshly reset health clock. Its
 # tolerance (40s) is far below the 90s budget, but its AGE (5s) is inside
 # start_period — comparing tolerance against the spent budget would fail an
@@ -1269,13 +1383,13 @@ else
   sed 's/^/    # /' "$WORK/out.txt"
 fi
 
-# Codex P2 round 3 (#867): grace is judged by probe START time, so a probe
+# Grace is judged by probe START time, so a probe
 # launched just inside start_period can run `timeout` past the boundary
 # before the counted retry cycles begin — the worst-case verdict lands at
 # start_period + timeout + retries x (interval + timeout), one `timeout`
-# later than round 1's bound. A container aged inside that final `timeout`
-# margin (140s: past round 1's 135s bound for 15/30/10/3, inside the true
-# 145s bound) was previously misclassified overdue and must PASS.
+# later than the start_period + retries bound. A container aged inside that
+# final `timeout` margin (140s: past the 135s bound for 15/30/10/3, inside
+# the true 145s bound) was previously misclassified overdue and must PASS.
 seed_prod_env
 PS_STATUS='frontend|Up 2 minutes (health: starting)'
 HC_FRONTEND='15 30 10 3 starting'
@@ -1289,7 +1403,7 @@ else
 fi
 
 # ============================================================================
-# CASE 9 — test(#826): a service whose container AGE is past its FULL
+# CASE 9 — a service whose container AGE is past its FULL
 # tolerance (start_period + timeout + retries x (interval + timeout)) and still
 # `(health: starting)` has outlived every verdict Docker could still be
 # working on. It must FAIL the wait, not ride the converging branch — this
@@ -1318,7 +1432,7 @@ if grep -q 'ROLLBACK' "$WORK/out.txt"; then
 else
   bad "stuck service failure did not print the rollback recipe"
 fi
-# fix(#1467): the automatic restore stops at the migrate boundary. Once
+# The automatic restore stops at the migrate boundary. Once
 # migrations have committed and the pin has moved, starting the PREVIOUS
 # release's containers on top of the new schema is not a rollback — restoring
 # the dump and then re-pinning is, and that stays the operator's call.
@@ -1364,7 +1478,7 @@ else
   sed 's/^/    # /' "$WORK/out.txt"
 fi
 
-# Unparseable StartedAt also fails OPEN (Codex P2 round 2): without a
+# Unparseable StartedAt also fails OPEN: without a
 # trustworthy age, classifying the service overdue could fail a recovering
 # stack — same best-effort posture as unreadable healthcheck config.
 seed_prod_env
@@ -1379,7 +1493,7 @@ else
   sed 's/^/    # /' "$WORK/out.txt"
 fi
 
-# Codex P2 round 4 (#867): the `remaining` table is a snapshot — a probe can
+# The `remaining` table is a snapshot — a probe can
 # complete between that `compose ps` and the per-service inspect and flip
 # the container out of `starting`. The tolerance math must yield to the LIVE
 # status read in the same inspect.
@@ -1415,7 +1529,7 @@ else
 fi
 
 # ============================================================================
-# CASE 10 — test(#826): an (unhealthy) service at budget end takes the broken
+# CASE 10 — an (unhealthy) service at budget end takes the broken
 # branch and fails the wait (previously untested — the stub always answered
 # an empty, instantly-healthy stack).
 # ============================================================================
@@ -1435,7 +1549,7 @@ STARTED_BACKUP=""
 STARTED_FRONTEND=""
 
 # ============================================================================
-# CASE 11 — fix(#1798 review round 7, P2): the db-image-staleness probe
+# CASE 11 — the db-image-staleness probe
 # (`compose ps -q db` / `docker inspect --format '{{.Image}}'` / `docker
 # image inspect --format '{{.Id}}'`) had no `|| printf ''` guard on any of
 # its three lookups, so any of them returning nonzero under `set -eu`
@@ -1525,7 +1639,7 @@ fi
 reset_db_image_probe
 
 # ============================================================================
-# CASE 12 — fix(#1798 review round 11 audit, low-confidence item): `compose
+# CASE 12 — `compose
 # ps -aq migrate` finding NOTHING right after `compose up -d --no-deps
 # migrate` just reported success starting it used to be silently treated
 # as "migrations applied" (the exit-code check was skipped entirely, not

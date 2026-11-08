@@ -1,4 +1,4 @@
-// feat(#1241 codex r1): the overlay-completeness rule, in one place.
+// The overlay-completeness rule, in one place.
 //
 // The defect this exists for: `truncated` is the SQL sandbox's row-cap flag.
 // backend/app/processing/ai/chat_actions.py slices the FeatureCollection to a
@@ -31,7 +31,7 @@ describe('chatOverlayCompleteness', () => {
     });
   });
 
-  // fix(#1076): a clip filters rows, so no source total is reported. The flag
+  // A clip filters rows, so no source total is reported. The flag
   // must survive without one.
   it('keeps a cap that arrives without a total', () => {
     expect(chatOverlayCompleteness({ truncated: true }, 500)).toEqual({ truncated: true });

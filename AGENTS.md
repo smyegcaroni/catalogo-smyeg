@@ -2,9 +2,22 @@
 
 Shared instructions live here; keep `CLAUDE.md` as only `@AGENTS.md`. Retain actionable conventions and traps; link to existing sources for detail.
 
+## Product
+
+GeoLens is a self-hosted spatial data catalog and map builder for one organization. It puts files, database tables, service snapshots and remote assets into one searchable catalog and records where each dataset came from. Teams build and share maps from that catalog and reach the data through open-standard APIs. Context: `README.md`, `EDITIONS.md`, and `CONTEXT.md` for domain vocabulary.
+
+These commitments constrain every change:
+
+- **Open-core boundary.** Everything here is Apache-2.0. Never move an existing open feature behind an edition, license or availability check, and never gate `backend/app/standards/`. Paid and Cloud behavior plugs in through the Protocols in `backend/app/platform/extensions/`, and public code never imports private packages. Changing a Protocol's required members or a registry contract bumps `EXTENSION_API_VERSION` in `backend/app/platform/extensions/version.py`, with a comment on the step.
+- **One organization by default.** Tenant columns, mode-gated RLS, tenant context and extension ports are dormant by design, not dead code. `multi_tenant` mode refuses to start without an isolation overlay.
+- **No telemetry; outbound calls are opt-in.** A new server or browser outbound call needs an admin opt-in and a row in `EGRESS.md`. The frontend CSP keeps `script-src` at `'self'` plus WebAssembly; operators add script hosts with `CSP_SCRIPT_SRC_EXTRA`, so don't widen the default.
+- **Standards are product surfaces.** OGC API Features/Records, STAC, DCAT and the tile endpoints follow their specifications. The GeoLens REST API may change between minor releases: state contract changes in the PR so release notes list them, and when a change breaks callers, keep the old form working for the later of the next minor release and 90 days, and record its removal date under `### Deprecated` in the CHANGELOG. This covers REST routes and fields, map and dashboard JSON that clients write, and CLI commands and flags; SDKs follow the API, and MCP tools are exempt.
+- **AI is optional.** Every workflow works with no AI provider configured. AI features stay off until an admin configures a provider, and they must not hide provenance.
+- **Accessible and localized.** Keep workflows usable with a keyboard and assistive technology. The UI ships in five locales (see Contracts).
+
 ## Project Map
 
-Backend: `backend/app/{api,core,modules,platform,processing,standards}/`; migrations: `backend/alembic/`; tests: `backend/tests/`. React/Vite frontend: `frontend/src/` (builder: `builder/`, colocated Vitest tests); Playwright: `e2e/`. CLI: `cli/geolens_cli/`; read-only MCP server: `mcp/geolens_mcp/`; generated SDKs: `sdks/`; operations: `scripts/`, `db/`, `.github/`.
+Backend: `backend/app/{api,core,modules,platform,processing,standards}/`; migrations: `backend/alembic/`; tests: `backend/tests/`. React/Vite frontend: `frontend/src/` (map builder: `components/builder/`, `builder/` and `lib/builder/`; colocated Vitest tests); Playwright: `e2e/`. CLI: `cli/geolens_cli/`; read-only MCP server: `mcp/geolens_mcp/`; generated SDKs: `sdks/`; operations: `scripts/`, `db/`, `.github/`.
 
 FastAPI serves catalog, standards and vector tiles; Titiler serves COG tiles. The worker runs Procrastinate jobs using PostgreSQL as its queue. Storage defaults to local files, with S3/MinIO and Azure options; Valkey provides caching. See [.github/ARCHITECTURE.md](.github/ARCHITECTURE.md) for topology and extension seams; manifests/lockfiles own dependency versions.
 
@@ -31,19 +44,22 @@ Domain documentation uses the single-context layout. See `docs/agents/domain.md`
 - Inspect relevant code and the working tree; preserve unrelated edits. Build requested behavior with the smallest correct diff; avoid speculative features and unrelated refactors.
 - Prefer project helpers, standard library/native platform features, then installed dependencies. Add a dependency only when these cannot reasonably meet the need; explain why and update its manifest and lockfile together.
 - Avoid abstractions, factories and configuration without a current need. Keep one definition per domain fact; a small copy beats violating a layer boundary.
-- Preserve validation, authorization, SSRF defenses, accessibility and error handling that prevents data loss. Test non-trivial behavior, not implementation trivia.
+- Preserve validation, authorization, SSRF defenses, accessibility and error handling that prevents data loss. Test non-trivial behavior, not implementation trivia. A bug fix carries a regression test that fails without the fix.
 
 ## Commands and Verification
 
 Commands start at the repository root unless specified. Setup: [.github/CONTRIBUTING.md](.github/CONTRIBUTING.md). Reuse existing environments; run `npm ci` in the relevant package when dependencies need installing/syncing.
 
 - Stack: `make dev-init` bootstraps; `make dev` starts; `make down` stops.
-- Schema changes: `make migrate`, then `make alembic-check` against a compatible DB at migration heads.
+- Schema changes: `make migrate`, then `make alembic-check` against a compatible DB at migration heads. `backend/tests/test_migration_upgrade_contract.py` (database-free) checks each `upgrade()` against the rolling-upgrade review rule.
 - Backend: `make test` / `make test-cov` use the API container. Python changes require `cd backend && uv run ruff check . && uv run ruff format --check .`. Coverage floor: 80%; McCabe limit: 15; `backend/pyproject.toml`'s `per-file-ignores` may only shrink.
 - Frontend: `cd frontend && API_PROXY_TARGET=http://localhost:8001 npm run dev`. Gates: `npm run build && npm run lint && npm run typecheck && npm run test:coverage` from `frontend/`; `npx tsc --noEmit` does not check this project. Focused test: `npx vitest run src/path/foo.test.ts`.
-- E2E needs a running stack: `npm run e2e` / `npm run e2e:smoke`; focused: `npx playwright test e2e/foo.spec.ts --project=chromium`. Run relevant smoke groups for user-flow changes; see the contributor guide. For a manual browser check through the Playwright MCP (sign-in, locators, screenshots, cleanup), read `docs/agents/browser-smoke.md`.
+- E2E needs a running stack: `npm run e2e` / `npm run e2e:smoke`; focused: `npx playwright test e2e/foo.spec.ts --project=chromium`. Run relevant smoke groups for user-flow changes: `e2e:smoke:core` gates PRs that touch the stack, and `e2e:smoke:audit` covers accessibility, record detail and the showcase; see the contributor guide. For a manual browser check through the Playwright MCP (sign-in, locators, screenshots, cleanup), read `docs/agents/browser-smoke.md`.
 - Contracts: `make openapi-check`, `make sdks-check` (regenerates files), `make cli-test` (includes DB integration), `make mcp-test`.
+- Rolling upgrades: `scripts/previous-release-compat.sh` (Docker and uv, free ports) runs the newest release and the newest of the previous minor line from their published images, upgrades the schema to this tree's heads under them, and reads a dataset, its OGC items and an ingest. Run it before tagging and for any migration that drops, renames or tightens a column; CI runs it as Previous-Release Compatibility on migration and model changes and on pushes to main.
 - Versions: `make bump VERSION=X.Y.Z`; never edit versions individually. Gate: `make version-check`.
+- Pre-commit: `pre-commit run --files <changed paths>` runs the hooks CI runs: lightweight Rule 1/Rule 2 pattern checks, finding and agent-tag markers, ruff and README assets. The pattern checks don't replace the structural pytest gates listed under Security. Scope it to your files; `--all-files` is slow.
+- Other CI gates, when a change touches their area: new settings or env vars, `make env-doc-check`; public-facing wording, `make public-surface-check`; frontend strings, from `frontend/`: `npm run check:i18n:changed`, `npm run check:i18n:toast-strings` and `npm run check:i18n:api-errors` (which also scans backend `detail=` strings). New Python dependencies face `pip-audit` and `bandit` in the Security Scan job.
 
 Run focused tests during development and affected package gates before completion. Documentation-only edits need link/command checks and `git diff --check`, not application suites. Report failed or unrun checks accurately.
 
@@ -67,7 +83,7 @@ make env-test
 python3 backend/tests/finding_markers.py
 ```
 
-Keep tracked `_MODULE_LOC_CAPS` entries in `test_layering.py` at exact line counts with a brief current rationale, not a history of cap changes; follow its inclusion test for newly oversized modules. `UNANCHORED_MARKER_DEBT` in `finding_markers.py` counts markers, not lines: lower/delete entries when debt is removed; never increase them to pass a gate.
+Keep tracked `_MODULE_LOC_CAPS` entries in `test_layering.py` at exact line counts with a brief current rationale, not a history of cap changes; follow its inclusion test for newly oversized modules.
 
 `make ai-evals` costs live provider tokens and needs the dev DB/provider key (normally `ANTHROPIC_API_KEY`). Ensure `.env.test`, if present, does not override working dev credentials.
 
@@ -91,11 +107,11 @@ Frontend change: from the worktree run `cd frontend && API_PROXY_TARGET=http://l
 
 Apply these rules to data access, URL fetching, ingestion and credential changes. Structural checks supplement behavioral tests; they do not prove every path is authorized.
 
-**Rule 1 — Access control.** Guard each handler's `Dataset`, `Record`, `Map`, `RecordEmbedding` and `IngestJob` fetch using sanctioned domain checks in `backend/tests/test_rule1_structural.py`. Dataset guards live in `backend/app/modules/catalog/authorization.py`:
+**Rule 1 — Access control.** Guard each handler's `Dataset`, `Record`, `Map`, `Story`, `StoryAsset`, `RecordEmbedding` and `IngestJob` fetch using sanctioned domain checks in `backend/tests/test_rule1_structural.py`. Dataset guards live in `backend/app/modules/catalog/authorization.py`:
 
 - Reads: `check_dataset_access_or_anonymous(...)`, or `check_dataset_access(...)` for authenticated callers; denial is 404. The latter checks visibility only and cannot authorize writes.
 - Mutations: `check_dataset_write_access(...)` enforces visibility (404) and owner/admin rights (403).
-- Lists: execute the statement returned by `apply_visibility_filter(...)`; discarding its return provides no protection. Use corresponding sanctioned guards for maps, records and tiles.
+- Lists: execute the statement returned by `apply_visibility_filter(...)`; discarding its return provides no protection. Use corresponding sanctioned guards for maps, stories, records and tiles.
 
 Invalid supplied credentials must not silently become anonymous access; preserve `get_optional_user` behavior and exceptions pinned in `backend/tests/test_optional_auth_failure_mode_1518.py`.
 
@@ -104,7 +120,7 @@ Invalid supplied credentials must not silently become anonymous access; preserve
 GDAL/ogr2ogr/rasterio need structural defenses; never add the ineffective `GDAL_HTTP_FOLLOWLOCATION`:
 
 1. Prefer managed storage (`/vsis3/`, `/vsiaz/`, validated local keys); never probe caller-controlled remote sources in-process.
-2. Remote service imports/previews require URL validation and run GDAL inside `async with service_egress_proxy(idle_seconds=<the GDAL HTTP timeout>) as egress:` (`platform/egress_proxy.py`) with `gdal_service_safe_env(egress)`. The proxy checks and pins every connection, redirect hops included. Never set proxy variables by hand: libcurl honours an inherited `NO_PROXY`, and a GDAL config file can tell GDAL to ignore the environment, so the helper drops the proxy variables and loads no config file.
+2. Remote service imports/previews require URL validation and run GDAL inside `async with service_egress_proxy(idle_seconds=<the GDAL HTTP timeout>, origin=pinned_origin(gdal_source, credential=...)) as egress:` (`platform/egress_proxy.py`) with `gdal_service_safe_env(egress)`. The proxy checks and pins every connection, redirect hops included; `origin` is required, and a run that carries a credential is held to its source's origin. Never set proxy variables by hand: libcurl honours an inherited `NO_PROXY`, and a GDAL config file can tell GDAL to ignore the environment, so the helper drops the proxy variables and loads no config file.
 3. Raster subprocesses/opens use `gdal_safe_env()` / `gdal_safe_open_env()` from `backend/app/processing/raster/vrt.py`. Local vector subprocesses require both `local_input_driver_args()` from `processing/ingest/gdal_drivers.py` and `gdal_vector_safe_env()` from `platform/gdal_env.py` (paths under `backend/app/`). Service drivers use the service environment. `GDAL_SKIP` splits on spaces/commas; unknown driver names only warn.
 4. GPKG/SQLite virtual tables can follow pointers. Preserve `validate_content_directives()` in `processing/ingest/validation.py` at upload and staged-upload GDAL entry points: read raw `sqlite_master.sql` read-only/immutable, allow only sanctioned virtual-table modules, identify SQLite archive members by bytes and reject VRT despite disguised names/BOMs. Run `validate_zip_safety` first under a shared byte budget. `PRAGMA`, `SPATIALITE_SECURITY=strict`, `OGR_SQLITE_LOAD_EXTENSIONS=NONE` and `OGR_SQLITE_LIST_ALL_TABLES=NO` are not substitutes.
 
@@ -114,10 +130,23 @@ Run `backend/tests/test_rule2_structural.py`, `backend/tests/test_service_egress
 
 **CodeQL.** Suppress `py/sql-injection` only where dynamic identifiers are validated. Put `# codeql[py/sql-injection]` on its own line directly above the `text()` site; trailing markers are ignored. A red PR-time CodeQL check on a pure-move refactor usually means the alert locations are new rather than the code: alert identity is rule plus file plus line, and the dismissal step is skipped on `pull_request`, so relocating an already-suppressed site re-reports it. Ask whether each flagged site is byte-identical to one already suppressed on `main` before reading it as a finding. Enabling that step on pull requests does not fix it and is unsafe: `advanced-security/dismiss-alerts` takes no ref input and lists alerts without one, which the REST reference scopes to the default branch, so a PR run would match its SARIF against `main`'s alerts and can reopen them (#1942). Preserve `.github/codeql/python-suppression/` and `.github/workflows/codeql.yml`; verify with `backend/tests/test_codeql_qtable_suppressions.py`.
 
+## Code Review Rules
+
+Reviewers, including the Codex bot, treat these as P1:
+
+- A violation of Rule 1, 2 or 3 above, a new outbound call without an opt-in and an `EGRESS.md` row, or a wider default CSP.
+- An open feature moved behind an edition, license or availability check, or a gated standards endpoint.
+- A migration that can lose existing data.
+- A migration whose `upgrade()` drops or renames a column or table, or narrows a column (type, `NOT NULL`, a tighter check), that the previous release reads. The previous release keeps running during a rolling upgrade: keep the old form for one release and drop it in a later minor.
+- A regression test that would still pass with the fix removed.
+- A user-facing string missing from any of the five locales.
+
+Don't flag generated files (`frontend/src/types/api.generated.ts`, SDK output) unless their source is wrong, or formatting that ruff and ESLint own.
+
 ## Commits and Documentation
 
-Use scoped Conventional Commits and DCO sign-off (`git commit -s`). Follow `.github/PULL_REQUEST_TEMPLATE.md`: describe behavior, link issues, note schema/API/config impacts, list verification and include screenshots for UI work.
+Changes land through pull requests; `main` merges through a merge queue. Use scoped Conventional Commits. Follow `.github/PULL_REQUEST_TEMPLATE.md`: describe behavior, link issues, note schema/API/config impacts, list verification and include screenshots for UI work.
 
-Root docs: `README.md` (overview), `SUPPORT.md`, `CHANGELOG.md` (release notes), `EDITIONS.md` (open-core boundary), `RUNBOOK.md` (recovery). Contributor docs: `.github/`; README images: `.github/assets/`; shared agent configuration: `docs/agents/`; architectural decisions: `docs/adr/`; product docs: docs.getgeolens.com; private notes: ignored `docs-internal/`. Do not add other root `docs/` content or duplicate product docs. Brand assets come from a tagged `geolens-io/branding` release; changes flow branding → this repo → marketing → docs.
+Root docs: `README.md` (overview), `CONTEXT.md` (domain vocabulary), `EDITIONS.md` (open-core boundary), `EGRESS.md` (outbound connections), `CHANGELOG.md` (release notes), `UPGRADING.md`, `RUNBOOK.md` (recovery), `RELEASE.md` (version surfaces), `SUPPORT.md`, `TRADEMARKS.md` and `THIRD_PARTY_DATA.md` (sample-data attribution). Contributor docs: `.github/`; README images: `.github/assets/` (scenarios and provenance in its README); shared agent configuration: `docs/agents/`; architectural decisions: `docs/adr/`, created with the next ADR (ADR-002 predates it in `.github/`); product docs: docs.getgeolens.com; private notes: ignored `docs-internal/`. Keep `docs/` to agent configuration and ADRs, and don't duplicate product docs. New third-party sample data needs a `THIRD_PARTY_DATA.md` entry. Brand assets come from a tagged `geolens-io/branding` release; changes flow branding → this repo → marketing → docs.
 
 Use `.env.example` / `.env.test.example` as templates. Never commit secrets, environments, dependencies, coverage or Playwright output. Keep ignored assistant/internal directories (`.claude/`, `.planning/`, `docs-internal/`) out of tracked changes.

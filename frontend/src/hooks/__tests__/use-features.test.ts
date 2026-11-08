@@ -10,6 +10,7 @@ vi.mock('@/api/features', () => ({
   createFeature: vi.fn(),
   updateFeature: vi.fn(),
   deleteFeature: vi.fn(),
+  deleteFeatures: vi.fn(),
 }));
 
 vi.mock('@/api/datasets', () => ({
@@ -17,12 +18,13 @@ vi.mock('@/api/datasets', () => ({
   dropColumn: vi.fn(),
 }));
 
-import { createFeature, updateFeature, deleteFeature } from '@/api/features';
+import { createFeature, updateFeature, deleteFeature, deleteFeatures } from '@/api/features';
 import { addColumn, dropColumn } from '@/api/datasets';
 import {
   useCreateFeature,
   useUpdateFeature,
   useDeleteFeature,
+  useDeleteFeatures,
   useAddColumn,
   useDropColumn,
 } from '@/hooks/use-features';
@@ -30,10 +32,11 @@ import {
 const mockCreateFeature = vi.mocked(createFeature);
 const mockUpdateFeature = vi.mocked(updateFeature);
 const mockDeleteFeature = vi.mocked(deleteFeature);
+const mockDeleteFeatures = vi.mocked(deleteFeatures);
 const mockAddColumn = vi.mocked(addColumn);
 const mockDropColumn = vi.mocked(dropColumn);
 
-// BUG-038: feature/schema mutations must invalidate the column-values and
+// Feature/schema mutations must invalidate the column-values and
 // column-stats caches (used by data-driven style editors + filter pickers,
 // staleTime 5min). Pre-fix only datasets.detail + datasets.rowsPrefix were
 // invalidated, so the distinct-values/min-max caches stayed stale (dropColumn
@@ -53,6 +56,32 @@ function invalidatedColumnCaches(spy: ReturnType<typeof spyInvalidate>, datasetI
   );
   return { hasValues, hasStats };
 }
+
+describe('dashboard aggregates after a feature edit', () => {
+  beforeEach(() => vi.clearAllMocks());
+  afterEach(() => vi.restoreAllMocks());
+
+  function aggregatesInvalidated(spy: ReturnType<typeof spyInvalidate>) {
+    const keys = spy.mock.calls.map((c) => (c[0] as { queryKey: unknown[] })?.queryKey);
+    return keys.some((key) => JSON.stringify(key) === JSON.stringify(queryKeys.dashboard.aggregatePrefix('ds-9')));
+  }
+
+  it('refetches the dataset\'s dashboard aggregates after an update', async () => {
+    const spy = spyInvalidate();
+    mockUpdateFeature.mockResolvedValueOnce({} as never);
+    const { result } = renderHook(() => useUpdateFeature());
+    await result.current.mutateAsync({ datasetId: 'ds-9', gid: 1, properties: { a: 2 } });
+    expect(aggregatesInvalidated(spy)).toBe(true);
+  });
+
+  it('refetches the dataset\'s dashboard aggregates after a delete', async () => {
+    const spy = spyInvalidate();
+    mockDeleteFeature.mockResolvedValueOnce(undefined as never);
+    const { result } = renderHook(() => useDeleteFeature());
+    await result.current.mutateAsync({ datasetId: 'ds-9', gid: 1 });
+    expect(aggregatesInvalidated(spy)).toBe(true);
+  });
+});
 
 describe('BUG-038: column-value/stats cache invalidation', () => {
   beforeEach(() => vi.clearAllMocks());
@@ -255,5 +284,39 @@ describe('schema error feedback belongs to the current editor', () => {
     const { result } = renderHook(() => useDropColumn());
     await expect(result.current.mutateAsync({ datasetId: 'old-dataset', columnName: 'old_column' })).rejects.toThrow('Drop failed');
     expect(toast.error).not.toHaveBeenCalled();
+  });
+});
+
+describe('useDeleteFeatures', () => {
+  beforeEach(() => vi.clearAllMocks());
+  afterEach(() => vi.restoreAllMocks());
+
+  function invalidatedKeys(spy: ReturnType<typeof spyInvalidate>) {
+    return spy.mock.calls.map((c) => (c[0] as { queryKey: unknown[] })?.queryKey);
+  }
+
+  it('refreshes the dataset and its rows after a delete', async () => {
+    const spy = spyInvalidate();
+    mockDeleteFeatures.mockResolvedValueOnce({ deleted: 2, tile_cache_version: 3 });
+
+    const { result } = renderHook(() => useDeleteFeatures());
+    await result.current.mutateAsync({ datasetId: 'ds-9', gids: [1, 2], tableId: '77' });
+
+    expect(mockDeleteFeatures).toHaveBeenCalledWith('ds-9', [1, 2], '77');
+    const keys = invalidatedKeys(spy);
+    expect(keys).toContainEqual(queryKeys.datasets.detail('ds-9'));
+    expect(keys).toContainEqual(queryKeys.datasets.rowsPrefix('ds-9'));
+  });
+
+  it('refreshes the rows when the batch is refused, since the page is out of date', async () => {
+    const spy = spyInvalidate();
+    mockDeleteFeatures.mockRejectedValueOnce(new Error('refused'));
+
+    const { result } = renderHook(() => useDeleteFeatures());
+    await expect(
+      result.current.mutateAsync({ datasetId: 'ds-9', gids: [1] }),
+    ).rejects.toThrow('refused');
+
+    expect(invalidatedKeys(spy)).toContainEqual(queryKeys.datasets.rowsPrefix('ds-9'));
   });
 });

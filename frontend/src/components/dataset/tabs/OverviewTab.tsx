@@ -192,17 +192,16 @@ export function OverviewTab({
   const isVrt = dataset.record_type === 'vrt_dataset';
   const hasFeatureTable = recordTypeCapabilities(dataset.record_type).featureTable;
 
-  // VRT derivation -- pass empty string for non-VRT so the hook's enabled:!!datasetId
-  // disables the query. fix(#644): also gate on authentication — the endpoint needs
-  // an authenticated user (visibility-checked server-side, not owner-only), so
-  // firing it for anonymous viewers guaranteed 401s on public VRTs (codex P2
-  // on #649: canEdit was too strict — it hid valid read-only data from
-  // signed-in non-owners).
+  // VRT derivation: pass empty string for non-VRT so the hook's
+  // enabled:!!datasetId disables the query. Also gate on authentication: the
+  // endpoint needs an authenticated user (visibility-checked server-side, not
+  // owner-only), so firing it for anonymous viewers guaranteed 401s on public
+  // VRTs; gating on canEdit would hide valid read-only data from signed-in
+  // non-owners.
   const isAuthenticated = useAuthStore((s) => !!s.token);
   const { data: generationsData } = useVrtGenerations(isVrt && isAuthenticated ? dataset.id : '', { limit: 1 });
   const lastGeneration = generationsData?.generations?.[0];
 
-  // ── Sidebar content (right rail) ──
   const sidebar = (
     <aside className="space-y-4">
       {/* Details card — catalog info at a glance. Named "Details" (not "Metadata")
@@ -251,11 +250,6 @@ export function OverviewTab({
         </CardContent>
       </Card>
 
-      {/* Related datasets & where this is used — discovery content kept high in
-          the rail so it isn't buried beneath metadata/tags/provenance */}
-      <RelatedDatasets datasetId={dataset.id} />
-      <UsedInMaps datasetId={dataset.id} />
-
       {/* VRT Derivation card — only for VRT datasets */}
       {isVrt && dataset.raster && (
         <Card density="compact">
@@ -266,7 +260,7 @@ export function OverviewTab({
           </CardHeader>
           <CardContent className="pt-0">
             <div className="divide-y divide-border/60">
-              {dataset.raster.source_count != null && (
+              {!!dataset.raster.source_count && (
                 <SideKV label={t('metadata.sourceCount', { defaultValue: 'Sources' })} value={String(dataset.raster.source_count)} />
               )}
               {dataset.raster.resolution_strategy && (
@@ -488,7 +482,9 @@ export function OverviewTab({
                     {t('overview.dimensions', { defaultValue: 'Dimensions' })}
                   </span>
                   <p className="font-medium">
-                    {dataset.raster.width} x {dataset.raster.height} px
+                    {dataset.raster.width != null && dataset.raster.height != null
+                      ? `${dataset.raster.width} x ${dataset.raster.height} px`
+                      : notAvailableLabel}
                   </p>
                 </div>
               </div>
@@ -544,6 +540,14 @@ export function OverviewTab({
 
         {/* ── Sidebar ── */}
         {sidebar}
+      </div>
+
+      {/* Discovery lists sit below the columns so a long rail doesn't leave a gap
+          under the main column. Either may render nothing: a lone card spans the
+          row, and empty:hidden drops the row's margin when both are empty. */}
+      <div className="mt-8 grid grid-cols-1 gap-4 md:grid-flow-col md:auto-cols-fr empty:hidden">
+        <RelatedDatasets datasetId={dataset.id} />
+        <UsedInMaps datasetId={dataset.id} />
       </div>
     </>
   );

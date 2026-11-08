@@ -1,6 +1,6 @@
-// chore(#835): the single relative-time formatter. Previously written out 4x
-// (provenance-attribution, ReportEntryList, admin ApiKeySection, settings
-// MyApiKeySection) with drifting unit ranges and fallbacks.
+// The single relative-time formatter, shared by provenance-attribution,
+// ReportEntryList, admin ApiKeySection and settings MyApiKeySection so unit
+// ranges and fallbacks cannot drift.
 
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -8,7 +8,7 @@ const DAY_MS = 24 * HOUR_MS;
 const MONTH_MS = 30 * DAY_MS;
 const YEAR_MS = 365 * DAY_MS;
 
-export interface RelativeTimeFormatOptions {
+interface RelativeTimeFormatOptions {
   /** Cap the largest unit rendered. `'hour'` reproduces the problem-report
    *  list behavior (a session-scoped surface where "49 hours ago" beats
    *  switching to days). Default: no cap (up to years). */
@@ -72,9 +72,8 @@ export function formatRelativeTime(
 
 /**
  * i18n-key "time ago" variant used by the API-key tables (admin + settings).
- * Renders via the `admin:apiKeys.*` keys — floor semantics ("1 hour ago" until
- * a full second hour has elapsed), unlike the Intl rounding above; that
- * difference is deliberate and pre-dates the consolidation.
+ * Renders via the `admin:apiKeys.*` keys. Floor semantics ("1 hour ago" until a
+ * full second hour has elapsed), unlike the Intl rounding above, deliberately.
  */
 export function formatLastUsedRelativeTime(
   dateStr: string | null,

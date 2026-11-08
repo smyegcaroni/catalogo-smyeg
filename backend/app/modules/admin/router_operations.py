@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings as app_settings
 from app.core.dependencies import get_client_ip, get_db
+from app.core.identity import Identity
 from app.modules.admin.schemas import (
     AdminApiKeyCreateRequest,
     AdminApiKeyListItem,
@@ -24,7 +25,11 @@ from app.modules.admin.schemas import (
 )
 from app.modules.admin.service import AdminService
 from app.modules.audit.service import AuditEvent, audit_emit
-from app.modules.auth.dependencies import require_mode_permission, require_permission
+from app.modules.auth.dependencies import (
+    require_mode_permission,
+    require_permission,
+    require_session_credential,
+)
 from app.modules.auth.models import ApiKey, User
 from app.platform.ratelimit import limiter
 from app.modules.auth.schemas import ApiKeyCreateResponse
@@ -42,6 +47,7 @@ def _api_key_response(key: ApiKey) -> AdminApiKeyListItem:
         is_active=key.is_active,
         expires_at=key.expires_at,
         scope=key.scope,
+        dataset_id=key.dataset_id,
         created_at=key.created_at,
         last_used_at=key.last_used_at,
     )
@@ -52,32 +58,37 @@ def _api_key_response(key: ApiKey) -> AdminApiKeyListItem:
     response_model=ApiKeyCreateResponse,
     status_code=status.HTTP_201_CREATED,
     include_in_schema=False,
+    summary="Create an API key for a user",
 )
 @router.post(
     "/api-keys/",
     response_model=ApiKeyCreateResponse,
     status_code=status.HTTP_201_CREATED,
-    # fix(#1778): a pending/suspended/deactivated
-    # target user raises 409; the published contract omitted it.
+    # A pending/suspended/deactivated target user raises 409.
     responses={409: CONFLICT_RESPONSE},
+    summary="Create an API key for a user",
 )
 @limiter.limit("30/minute")
 async def create_api_key(
     body: AdminApiKeyCreateRequest,
     request: Request,
     current_user: User = Depends(require_permission("manage_users")),
+    _session: Identity = Depends(require_session_credential),
     db: AsyncSession = Depends(get_db),
 ) -> ApiKeyCreateResponse:
     """Create an API key for a user (admin only).
 
     The raw key is returned only in this response and cannot be retrieved again.
+    Requires a signed-in session: a request that presents an API key gets 403.
     """
     from app.modules.auth.service import (
         ApiKeyTargetUserInactiveError,
         ApiKeyTargetUserNotFoundError,
         create_api_key_for_user,
+        lock_current_session_owner,
     )
 
+    await lock_current_session_owner(db, current_user)
     try:
         api_key, raw_key = await create_api_key_for_user(
             db,
@@ -92,7 +103,7 @@ async def create_api_key(
             detail="User not found",
         ) from exc
     except ApiKeyTargetUserInactiveError as exc:
-        # fix(#821): pending/suspended/deactivated owners cannot receive keys —
+        # Pending/suspended/deactivated owners cannot receive keys:
         # a pre-approval key must not wake up privileged.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -135,11 +146,13 @@ async def create_api_key(
     response_model=AdminApiKeyListResponse,
     dependencies=[Depends(require_permission("manage_users"))],
     include_in_schema=False,
+    summary="List all API keys",
 )
 @router.get(
     "/api-keys/",
     response_model=AdminApiKeyListResponse,
     dependencies=[Depends(require_permission("manage_users"))],
+    summary="List all API keys",
 )
 async def list_api_keys(
     skip: int = Query(0, ge=0),
@@ -154,9 +167,8 @@ async def list_api_keys(
     total = (
         await db.execute(select(func.count()).select_from(stmt.subquery()))
     ).scalar_one()
-    # fix(#1778): without ORDER BY, the planner-chosen page could shift between
-    # refetches. fix(#1805): created_at DESC alone ties for same-timestamp keys
-    # across separate per-page queries; id DESC breaks the tie deterministically.
+    # A total order keeps pages stable across refetches; id DESC breaks
+    # same-timestamp created_at ties.
     stmt = stmt.order_by(ApiKey.created_at.desc(), ApiKey.id.desc())
     keys = (await db.execute(stmt.offset(skip).limit(limit))).scalars().all()
     return AdminApiKeyListResponse(
@@ -164,7 +176,11 @@ async def list_api_keys(
     )
 
 
-@router.delete("/api-keys/{key_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/api-keys/{key_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke any API key",
+)
 @limiter.limit("30/minute")
 async def revoke_api_key(
     key_id: uuid.UUID,
@@ -206,10 +222,12 @@ async def revoke_api_key(
     "/infrastructure",
     response_model=InfrastructureResponse,
     include_in_schema=False,
+    summary="Get infrastructure status",
 )
 @router.get(
     "/infrastructure/",
     response_model=InfrastructureResponse,
+    summary="Get infrastructure status",
 )
 async def get_infrastructure(
     _user: User = Depends(
@@ -248,11 +266,13 @@ async def get_infrastructure(
     response_model=AdminShareTokenListResponse,
     dependencies=[Depends(require_permission("manage_users"))],
     include_in_schema=False,
+    summary="List share tokens",
 )
 @router.get(
     "/share-tokens/",
     response_model=AdminShareTokenListResponse,
     dependencies=[Depends(require_permission("manage_users"))],
+    summary="List share tokens",
 )
 async def list_share_tokens_endpoint(
     skip: int = Query(0, ge=0),
@@ -292,7 +312,11 @@ async def list_share_tokens_endpoint(
     )
 
 
-@router.delete("/share-tokens/{token_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/share-tokens/{token_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke a share token",
+)
 @limiter.limit("30/minute")
 async def admin_revoke_share_token(
     token_id: uuid.UUID,
@@ -301,7 +325,8 @@ async def admin_revoke_share_token(
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     """Revoke a basic share token and cascade to its embed tokens; no quota controls (admin only)."""
-    result = await AdminService(db).revoke_share_token_with_cascade(token_id)
+    admin = AdminService(db)
+    result = await admin.revoke_share_token_with_cascade(token_id, current_user)
     if result is None:
         raise HTTPException(status_code=404, detail="Share token not found")
     revoked_token_id, map_id, cascade_count = result

@@ -1,4 +1,4 @@
-"""Tests for the Phase 269 H-23 tile column allowlist.
+"""Tests for the tile column allowlist.
 
 `_select_tile_columns` resolves the per-zoom default + per-dataset
 override rules without touching the database, so these tests stay as
@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from app.processing.tiles.service import (
     _DEFAULT_NO_ATTR_BELOW_ZOOM,
+    _SAMPLE_ORDER,
+    _TILE_FEATURE_LIMIT,
     _build_attr_columns,
     _build_tile_query,
     _select_tile_columns,
@@ -134,7 +136,7 @@ def test_additional_columns_unioned_below_zoom_threshold():
 
 
 def test_additional_columns_cannot_escape_empty_allowlist():
-    """fix(#1778): allowlist=[] means no attributes, `cols=` included.
+    """allowlist=[] means no attributes, `cols=` included.
 
     Was `test_additional_columns_unioned_with_empty_allowlist`, which pinned
     the opposite. `tile_columns == []` is documented as "never project
@@ -152,7 +154,7 @@ def test_additional_columns_cannot_escape_empty_allowlist():
 
 
 def test_additional_columns_intersected_with_allowlist():
-    """fix(#1778): `cols=` may reorder/extend the zoom budget, not the allowlist."""
+    """`cols=` may reorder/extend the zoom budget, not the allowlist."""
     result = _select_tile_columns(
         _DATASET_COLUMNS,
         14,
@@ -213,15 +215,15 @@ def test_additional_columns_none_or_empty_preserves_legacy_behavior():
 
 
 def test_build_tile_query_orders_before_the_feature_cap():
-    """fix(#1778): the 50k `LIMIT` needs an ORDER BY to be a pure function.
+    """The 50k `LIMIT` needs an ORDER BY to be a pure function.
 
     Without one, a tile whose bbox selects more than `_TILE_FEATURE_LIMIT`
     rows returns an arbitrary subset, so the content-hash ETag flips between
     rebuilds and each uvicorn worker can cache a different rendering.
     """
     query = _build_tile_query("perf_test", _DATASET_COLUMNS)
-    order_at = query.find("ORDER BY t.gid")
-    limit_at = query.find("LIMIT 50000")
+    order_at = query.find(f"ORDER BY {_SAMPLE_ORDER}")
+    limit_at = query.find(f"LIMIT {_TILE_FEATURE_LIMIT + 1}")
     assert order_at != -1, "vector tile query must order before the feature cap"
     assert limit_at != -1
     assert order_at < limit_at, "ORDER BY must precede the LIMIT it makes deterministic"

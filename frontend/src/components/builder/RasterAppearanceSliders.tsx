@@ -4,13 +4,11 @@ import { RASTER_PAINT_DEFAULTS } from './layer-adapters/raster-adapter';
 import { formatNumber } from '@/lib/format';
 
 /**
- * builder-audit #338 DUP-04: the single brightness/contrast/saturation/hue appearance
- * slider surface, previously implemented twice with subtly different step values and
- * formatting. RasterLayerControls (the LayerEditorPanel path) is the only consumer
- * since fix(#915) deleted the unreachable RenderModeSwitch raster editor.
+ * The brightness/contrast/saturation/hue appearance slider surface.
+ * RasterLayerControls (the LayerEditorPanel path) is its only consumer.
  *
- * Fallbacks are read from the adapter's RASTER_PAINT_DEFAULTS (single source of truth)
- * so the editor display and the rendered default cannot diverge.
+ * Fallbacks come from the adapter's RASTER_PAINT_DEFAULTS (single source of
+ * truth), so the editor display and the rendered default can't diverge.
  */
 
 type TFn = (key: string, opts?: Record<string, unknown>) => string;
@@ -31,7 +29,7 @@ function formatRasterValue(value: number, format: RasterValueFormat): string {
   }
 }
 
-export interface RasterSliderRowProps {
+interface RasterSliderRowProps {
   label: string;
   value: number;
   min: number;
@@ -41,7 +39,7 @@ export interface RasterSliderRowProps {
   format?: RasterValueFormat;
 }
 
-/** A single labelled raster slider row, shared by the appearance sliders and the
+/** A labelled raster slider row, shared by the appearance sliders and the
  *  RasterLayerControls opacity control. */
 export function RasterSliderRow({
   label,
@@ -73,7 +71,7 @@ export function RasterSliderRow({
   );
 }
 
-export interface RasterAppearanceSlidersProps {
+interface RasterAppearanceSlidersProps {
   paint: Record<string, unknown>;
   /** Patch a single raster paint key. */
   onPaintProp: (key: string, value: number | string) => void;

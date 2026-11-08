@@ -1,4 +1,4 @@
-"""WORK-04: Overlay resolution probe for api and worker image targets.
+"""Overlay resolution probe for api and worker image targets.
 
 This script asserts that the extension registry resolves non-Default ports
 after loading the dummy overlay. It serves two purposes:
@@ -18,8 +18,6 @@ Why a file instead of ``python -c``?
 A script file is: (a) locally runnable and unit-testable without a container;
 (b) auditable in code review; (c) easier to update than an inline ``python -c``
 string embedded in a YAML file.
-
-References: WORK-04
 """
 
 from __future__ import annotations
@@ -40,7 +38,7 @@ def _install_dummy_overlay_directly() -> None:
     """Install the dummy overlay by directly calling register_extensions.
 
     Used in --with-dummy-overlay mode so the probe works without a real
-    geolens-enterprise package installed (no entry-point registration needed).
+    overlay package installed (no entry-point registration needed).
     The dummy overlay's register_extensions() is called with the live _extensions
     dict — mirrors the conftest save-restore discipline.
 

@@ -2,15 +2,13 @@
  * SAML providers admin CRUD section.
  *
  * Mirrors the shape of `OAuthProvidersSection` (in
- * `frontend/src/components/admin/settings/SettingsAuthTab.tsx`) per Phase
- * 217 PATTERNS Detail 13 Analog B + Anti-Pattern A8 (do NOT pollute
- * SettingsAuthTab with enterprise-only logic).
+ * `frontend/src/components/admin/settings/SettingsAuthTab.tsx`), which stays
+ * free of enterprise-only logic.
  *
- * Uses the SAME backend endpoints as OAuth (`/settings/oauth-providers/...`,
- * D-12) via the SAML wrappers in `@/api/saml`. The update wrapper resolves
- * to HTTP PUT (verified at backend/app/modules/settings/router.py:399).
+ * Uses the SAME backend endpoints as OAuth (`/settings/oauth-providers/...`)
+ * via the SAML wrappers in `@/api/saml`.
  *
- * sp_entity_id pre-fill (Pitfall 14): uses the authoritative
+ * sp_entity_id pre-fill: uses the authoritative
  * `getTileConfig().public_api_url` query as the primary source; falls back
  * to `window.location.origin` only if the API call fails or returns null.
  * Warning text near the field prompts admins that SP entityID must match
@@ -113,9 +111,9 @@ const EMPTY_FORM: SamlFormData = {
 export function SamlProvidersSection() {
   const { t } = useTranslation('admin');
   const queryClient = useQueryClient();
-  // fix(#1117): SAML rows live in the same table as OAuth and are returned by the
-  // login page's /auth/oauth/providers/, so every mutation here also has to refresh
-  // the login buttons — see hooks/use-auth-providers.ts.
+  // SAML rows share a table with OAuth and are returned by the login page's
+  // /auth/oauth/providers/, so every mutation here also has to refresh the
+  // login buttons (see hooks/use-auth-providers.ts).
   const invalidateAuthProviders = useInvalidateAuthProviders();
 
   const {
@@ -127,8 +125,7 @@ export function SamlProvidersSection() {
     queryFn: listSamlProviders,
   });
 
-  // Authoritative public_api_url source for sp_entity_id pre-fill (Pitfall 14).
-  // Falls back to window.location.origin only if this query fails or returns null.
+  // Source for the sp_entity_id pre-fill.
   const { data: tileConfig } = useQuery({
     queryKey: queryKeys.settings.tileConfig,
     queryFn: getTileConfig,
@@ -181,9 +178,7 @@ export function SamlProvidersSection() {
   const mappingRef = useRef<HTMLTextAreaElement>(null);
 
   /**
-   * Build a sensible default sp_entity_id for the current slug, using the
-   * authoritative public_api_url from `getTileConfig()` if available, falling
-   * back to the browser's origin as a last resort. Returns "" when there is no
+   * Default sp_entity_id for the current slug. Returns "" when there is no
    * slug yet so the field stays empty until the admin types one.
    */
   function buildDefaultEntityId(slug: string): string {
@@ -193,15 +188,13 @@ export function SamlProvidersSection() {
     return `${base}/auth/saml/${slug}`;
   }
 
-  // When the slug changes (and we are creating a new provider, NOT editing),
-  // pre-fill sp_entity_id with the recommended default — but only if the admin
-  // hasn't typed their own value yet.
+  // When the slug changes while creating (not editing), pre-fill
+  // sp_entity_id with the recommended default.
   useEffect(() => {
     if (editingProvider) return;
     setForm((prev) => {
       const recommended = buildDefaultEntityId(prev.slug);
-      // Only update if sp_entity_id is empty OR matches the previous recommendation
-      // (so admin overrides aren't clobbered).
+      // Leave a value the admin typed alone.
       if (!prev.sp_entity_id || prev.sp_entity_id.endsWith(`/auth/saml/`)) {
         return { ...prev, sp_entity_id: recommended };
       }

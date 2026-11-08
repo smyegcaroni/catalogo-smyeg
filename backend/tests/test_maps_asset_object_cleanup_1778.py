@@ -1,4 +1,4 @@
-"""fix(#1778): a deleted map must not leave its thumbnail and OG image behind.
+"""A deleted map must not leave its thumbnail and OG image behind.
 
 Codebase audit 2026-08-30 (8dc529f17): ``delete_map`` dropped the row and
 nothing anywhere called ``storage.delete`` for a ``maps/`` key, so both images
@@ -57,7 +57,7 @@ def _storage():
 async def _objects(prefix: str, map_id: str) -> set[str]:
     """Every stored object under ``prefix`` belonging to this map.
 
-    fix(#1778 round 3): keys carry a random component per write now, so the
+    Keys carry a random component per write now, so the
     tests read what is stored instead of reconstructing a name. That is also the
     property under test in several of them: exactly one object survives a
     replacement, and it is not the one that was there before.
@@ -140,7 +140,7 @@ class TestReupload:
     The original finding was the extension flip: the key ended in `.jpg` or
     `.png` after the payload, so a PNG re-upload after a JPEG repointed the
     column and stranded the old object. Keys carry a random component per write
-    now (fix(#1778 round 3)), which makes every re-upload a replacement, so the
+    now, which makes every re-upload a replacement, so the
     same-encoding case is the same case rather than a separate one.
     """
 
@@ -200,7 +200,7 @@ class TestReupload:
 
 
 # ---------------------------------------------------------------------------
-# fix(#1778 round 2): overlapping replacements of one map's asset
+# Overlapping replacements of one map's asset
 # ---------------------------------------------------------------------------
 
 
@@ -212,12 +212,12 @@ class TestOverlappingReplacements:
     `.jpg`, then A commits its URI at `.jpg`, pointing the row at the object B
     just deleted. Both answer 204 and the thumbnail endpoint answers 404.
 
-    fix(#1778 round 9): the block point moved from inside ``storage.put`` to inside
-    ``lock_map_for_asset_write``. Before round 9 the row lock was taken before
+    The block point moved from inside ``storage.put`` to inside
+    ``lock_map_for_asset_write``. Previously the row lock was taken before
     the PUT, so blocking a request after its bytes landed but before it
     returned from ``put`` was also blocking it before it could reach the lock,
     which is what made ``second`` wait on ``SELECT ... FOR UPDATE`` in that
-    window. Round 9 moved the lock to AFTER the PUT specifically so a stalled
+    window. The lock now sits AFTER the PUT specifically so a stalled
     write no longer holds it, so that same block point no longer represents
     "holding the lock". Hooking the lock call itself, calling through to the
     real function so the row lock is genuinely acquired in Postgres and then
@@ -360,7 +360,7 @@ class TestOverlappingReplacements:
 
 
 # ---------------------------------------------------------------------------
-# fix(#1778 round 9): a stalled storage write must not hold the map row locked
+# A stalled storage write must not hold the map row locked
 # ---------------------------------------------------------------------------
 
 
@@ -406,7 +406,7 @@ class TestAStalledUploadDoesNotBlockOtherWriters:
         )
         await asyncio.wait_for(put_entered.wait(), timeout=10)
 
-        # The upload is stuck inside the PUT, which round 9 moved outside the
+        # The upload is stuck inside the PUT, which now sits outside the
         # row lock. A plain rename, which takes no lock_timeout of its own and
         # would previously have queued behind the held row lock for as long
         # as the PUT took, must complete right away instead of waiting on it.
@@ -435,9 +435,8 @@ class TestAStalledUploadDoesNotBlockOtherWriters:
         this also proves two DIFFERENT requests' calls into the same helper
         do not deadlock or serialize on an unrelated stalled write.
 
-        fix(#1809): this used to assert a wall-clock bound (``elapsed < 2``),
-        which failed under CI load with no product bug (2.147s observed on
-        #1798). The property under test isn't "fast" but "does not wait on
+        A wall-clock bound (``elapsed < 2``) fails under CI load with no
+        product bug. The property under test isn't "fast" but "does not wait on
         the stalled PUT", so assert ordering instead: the delete's response
         is observed while the PUT is still parked on ``release_put``, proven
         by the upload task still being unfinished at that point.
@@ -593,14 +592,14 @@ def test_every_cleanup_caller_takes_the_row_lock_1778() -> None:
 
 
 # ---------------------------------------------------------------------------
-# fix(#1778 round 3): the window between the survivor re-read and the delete
+# The window between the survivor re-read and the delete
 # ---------------------------------------------------------------------------
 
 
 class TestCleanupRaceAfterTheLockIsReleased:
     """The row lock ends at the commit, so the cleanup runs unprotected.
 
-    The surviving interleave after round 2: A commits its URI and re-reads the
+    The surviving interleave: A commits its URI and re-reads the
     row, deciding its old key is dead; A is descheduled before the delete; B
     takes the lock, writes and commits; A's delete lands. While the two keys per
     map were reused, B could only ever write one of the same two names, so A's
@@ -783,7 +782,7 @@ class TestTheLockedReadIsNotStale:
 
 
 # ---------------------------------------------------------------------------
-# fix(#1778 round 4): the cleanup's own failures stay inside it
+# The cleanup's own failures stay inside it
 # ---------------------------------------------------------------------------
 
 
@@ -876,7 +875,7 @@ class TestALiveNessReadFailureIsNotTheRequestsProblem:
 
 
 # ---------------------------------------------------------------------------
-# fix(#1778 round 4): an object whose row never commits is rolled back
+# An object whose row never commits is rolled back
 # ---------------------------------------------------------------------------
 
 
@@ -976,7 +975,7 @@ class TestAFailedPublishLeavesNoObject:
         """The third write-object-then-commit-row site in the package.
 
         The failure is placed at the flush, which is after the object write and
-        before the commit. fix(#1778 round 6): a failure of the COMMIT itself is
+        before the commit. A failure of the COMMIT itself is
         a different case, covered below: its outcome is unknowable, so nothing
         is deleted.
         """
@@ -1007,7 +1006,7 @@ class TestAFailedPublishLeavesNoObject:
     async def test_a_commit_that_fails_outright_still_keeps_the_object(
         self, client: AsyncClient, admin_auth_header: dict, monkeypatch
     ) -> None:
-        """The accepted cost of fix(#1778 round 6), written down.
+        """The accepted cost of the per-write key change, written down.
 
         Once the commit has been awaited its outcome is unknowable from the
         exception, so a commit that genuinely failed leaves its object behind
@@ -1038,56 +1037,117 @@ class TestAFailedPublishLeavesNoObject:
         assert len(set(await _storage().list("maps/icons/")) - before) == 1
 
 
-def test_every_object_write_in_the_maps_package_is_published_1778() -> None:
-    """Enumerate the write-object-then-commit-row sites.
+# Each package that writes objects for catalog rows: where it lives, the
+# publication it opens, the provider calls that write an object, the
+# functions that make them, and how many publication blocks it has.
+_LEDGER_PACKAGES = {
+    "maps": (
+        "app/modules/catalog/maps",
+        "map_asset_publication",
+        {"put"},
+        {
+            "router.py::upload_thumbnail",
+            "router.py::upload_og_image",
+            "sprites.py::create_icon_asset",
+        },
+        3,
+    ),
+    "stories": (
+        "app/modules/catalog/stories",
+        "asset_publication",
+        {"put", "copy"},
+        {
+            "router_assets.py::upload_story_asset_endpoint",
+            "assets.py::copy_story_assets",
+        },
+        2,
+    ),
+}
 
-    The reviewer asked for the sweep to be explicit rather than assumed. Walks
-    the package for calls to a storage provider's ``put`` and requires the
-    enclosing function either to open a publication or to record into one it was
-    handed, so a fourth writer cannot appear without a rollback path.
+
+def _package_functions(package: str):
+    """Each module-level function of a package, with every node in its body.
+
+    The body only: `@router.put(...)` is a Call to an attribute named `put`
+    too, and every route decorated with it would otherwise read as an object
+    write. A nested function counts as part of the one it's defined in.
     """
     import ast
     from pathlib import Path
 
-    package = Path(__file__).resolve().parents[1] / "app/modules/catalog/maps"
-    writers: dict[str, set[str]] = {}
-    for path in sorted(package.glob("*.py")):
+    root = Path(__file__).resolve().parents[1] / _LEDGER_PACKAGES[package][0]
+    for path in sorted(root.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                body = [child for stmt in node.body for child in ast.walk(stmt)]
+                yield f"{path.name}::{node.name}", node, body
+
+
+def _object_writes(package: str, body) -> list[int]:
+    import ast
+
+    attributes = _LEDGER_PACKAGES[package][2]
+    return [
+        child.lineno
+        for child in body
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and child.func.attr in attributes
+    ]
+
+
+def _publication_blocks(package: str):
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / _LEDGER_PACKAGES[package][0]
+    opener = _LEDGER_PACKAGES[package][1]
+    for path in sorted(root.glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            # The body only: `@router.put(...)` is a Call to an attribute
-            # named `put` too, and every route decorated with it would
-            # otherwise read as an object write.
-            body = [child for stmt in node.body for child in ast.walk(stmt)]
-            puts = any(
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Attribute)
-                and child.func.attr == "put"
-                for child in body
-            )
-            if not puts:
-                continue
-            names = {child.id for child in body if isinstance(child, ast.Name)} | {
-                child.arg for child in ast.walk(node.args) if isinstance(child, ast.arg)
-            }
-            writers[f"{path.name}::{node.name}"] = names
+            if isinstance(node, ast.AsyncWith) and any(
+                isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Name)
+                and item.context_expr.func.id == opener
+                for item in node.items
+            ):
+                yield f"{path.name}:{node.lineno}", node
 
-    assert set(writers) == {
-        "router.py::upload_thumbnail",
-        "router.py::upload_og_image",
-        "sprites.py::create_icon_asset",
-    }, sorted(writers)
+
+@pytest.mark.parametrize("package", sorted(_LEDGER_PACKAGES))
+def test_every_object_write_in_the_maps_package_is_published_1778(package) -> None:
+    """Enumerate the write-object-then-commit-row sites.
+
+    The reviewer asked for the sweep to be explicit rather than assumed. Walks
+    the package for provider calls that write an object and requires the
+    enclosing function either to open a publication or to record into one it
+    was handed, so a new writer cannot appear without a rollback path.
+    """
+    import ast
+
+    _, opener, _, expected, _ = _LEDGER_PACKAGES[package]
+    writers: dict[str, set[str]] = {}
+    for where, node, body in _package_functions(package):
+        if not _object_writes(package, body):
+            continue
+        names = {child.id for child in body if isinstance(child, ast.Name)} | {
+            child.arg for child in ast.walk(node.args) if isinstance(child, ast.arg)
+        }
+        writers[where] = names
+
+    assert set(writers) == expected, sorted(writers)
     unguarded = [
         where
         for where, names in writers.items()
-        if "map_asset_publication" not in names and "publication" not in names
+        if opener not in names and "publication" not in names
     ]
     assert unguarded == [], unguarded
 
 
-def test_every_object_write_records_before_putting_1778() -> None:
-    """fix(#1778 round 7): the ledger entry precedes the write it covers.
+@pytest.mark.parametrize("package", sorted(_LEDGER_PACKAGES))
+def test_every_object_write_records_before_putting_1778(package) -> None:
+    """The ledger entry precedes the write it covers.
 
     Object storage can durably accept a PUT and still fail the client with a
     timeout or a dropped connection, so a raise from the write says nothing
@@ -1098,52 +1158,33 @@ def test_every_object_write_records_before_putting_1778() -> None:
     nothing wrote.
     """
     import ast
-    from pathlib import Path
 
-    package = Path(__file__).resolve().parents[1] / "app/modules/catalog/maps"
     writers: dict[str, tuple[int, int]] = {}
-    for path in sorted(package.glob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            body = [child for stmt in node.body for child in ast.walk(stmt)]
-            puts = [
-                child.lineno
-                for child in body
-                if isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Attribute)
-                and child.func.attr == "put"
-            ]
-            if not puts:
-                continue
-            records = [
-                child.lineno
-                for child in body
-                if isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Attribute)
-                and child.func.attr == "record"
-            ]
-            writers[f"{path.name}::{node.name}"] = (
-                min(records) if records else -1,
-                min(puts),
-            )
+    for where, _, body in _package_functions(package):
+        writes = _object_writes(package, body)
+        if not writes:
+            continue
+        records = [
+            child.lineno
+            for child in body
+            if isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "record"
+        ]
+        writers[where] = (min(records) if records else -1, min(writes))
 
-    assert set(writers) == {
-        "router.py::upload_thumbnail",
-        "router.py::upload_og_image",
-        "sprites.py::create_icon_asset",
-    }, sorted(writers)
+    assert set(writers) == _LEDGER_PACKAGES[package][3], sorted(writers)
     offenders = [
         where
-        for where, (record_line, put_line) in writers.items()
-        if record_line < 0 or record_line > put_line
+        for where, (record_line, write_line) in writers.items()
+        if record_line < 0 or record_line > write_line
     ]
     assert offenders == [], offenders
 
 
-def test_every_publication_settles_at_the_commit_1778() -> None:
-    """fix(#1778 round 5): the rollback boundary is the commit, not the block.
+@pytest.mark.parametrize("package", sorted(_LEDGER_PACKAGES))
+def test_every_publication_settles_at_the_commit_1778(package) -> None:
+    """The rollback boundary is the commit, not the block.
 
     Keying the rollback on "did the block raise" is not the same question as
     "did the row commit": the icon route's ``session.refresh`` ran after a
@@ -1152,30 +1193,13 @@ def test_every_publication_settles_at_the_commit_1778() -> None:
     commit, and this walks the package to require it as the LAST statement of
     every publication block, so nothing can be appended below it later.
     """
-    import ast
-    from pathlib import Path
-
-    package = Path(__file__).resolve().parents[1] / "app/modules/catalog/maps"
-    blocks = 0
-    offenders: list[str] = []
-    for path in sorted(package.glob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.AsyncWith):
-                continue
-            opens = any(
-                isinstance(item.context_expr, ast.Call)
-                and isinstance(item.context_expr.func, ast.Name)
-                and item.context_expr.func.id == "map_asset_publication"
-                for item in node.items
-            )
-            if not opens:
-                continue
-            blocks += 1
-            if not _calls(node.body[-1], "settled"):
-                offenders.append(f"{path.name}:{node.lineno} does not settle last")
-
-    assert blocks == 3, blocks
+    blocks = list(_publication_blocks(package))
+    offenders = [
+        f"{where} does not settle last"
+        for where, node in blocks
+        if not _calls(node.body[-1], "settled")
+    ]
+    assert len(blocks) == _LEDGER_PACKAGES[package][4], len(blocks)
     assert offenders == [], offenders
 
 
@@ -1208,8 +1232,9 @@ def _awaits_commit(statement) -> bool:
     )
 
 
-def test_every_publication_marks_before_committing_1778() -> None:
-    """fix(#1778 round 6): an indeterminate commit outcome deletes nothing.
+@pytest.mark.parametrize("package", sorted(_LEDGER_PACKAGES))
+def test_every_publication_marks_before_committing_1778(package) -> None:
+    """An indeterminate commit outcome deletes nothing.
 
     A connection lost between PostgreSQL making the commit durable and the
     acknowledgement arriving raises out of the await for a transaction that DID
@@ -1218,50 +1243,30 @@ def test_every_publication_marks_before_committing_1778() -> None:
     case non-destructive, and this requires the three statements to sit in that
     order in every publication block: mark, commit, settle.
     """
-    import ast
-    from pathlib import Path
-
-    package = Path(__file__).resolve().parents[1] / "app/modules/catalog/maps"
     commits = 0
     offenders: list[str] = []
-    for path in sorted(package.glob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.AsyncWith):
-                continue
-            if not any(
-                isinstance(item.context_expr, ast.Call)
-                and isinstance(item.context_expr.func, ast.Name)
-                and item.context_expr.func.id == "map_asset_publication"
-                for item in node.items
-            ):
-                continue
-            where = f"{path.name}:{node.lineno}"
-            committing = [
-                index
-                for index, statement in enumerate(node.body)
-                if _awaits_commit(statement)
-            ]
-            if len(committing) != 1:
-                offenders.append(f"{where} has {len(committing)} commits, expected 1")
-                continue
-            commits += 1
-            index = committing[0]
-            if index == 0 or not _calls(node.body[index - 1], "committing"):
-                offenders.append(f"{where} does not mark immediately before its commit")
-            if index + 1 >= len(node.body) or not _calls(
-                node.body[index + 1], "settled"
-            ):
-                offenders.append(
-                    f"{where} does not settle immediately after its commit"
-                )
+    for where, node in _publication_blocks(package):
+        committing = [
+            index
+            for index, statement in enumerate(node.body)
+            if _awaits_commit(statement)
+        ]
+        if len(committing) != 1:
+            offenders.append(f"{where} has {len(committing)} commits, expected 1")
+            continue
+        commits += 1
+        index = committing[0]
+        if index == 0 or not _calls(node.body[index - 1], "committing"):
+            offenders.append(f"{where} does not mark immediately before its commit")
+        if index + 1 >= len(node.body) or not _calls(node.body[index + 1], "settled"):
+            offenders.append(f"{where} does not settle immediately after its commit")
 
-    assert commits == 3, commits
+    assert commits == _LEDGER_PACKAGES[package][4], commits
     assert offenders == [], offenders
 
 
 # ---------------------------------------------------------------------------
-# fix(#1778 round 5): a failure after the commit must not roll anything back
+# A failure after the commit must not roll anything back
 # ---------------------------------------------------------------------------
 
 
@@ -1377,7 +1382,7 @@ class TestAFailureAfterTheCommitKeepsTheObject:
 
 
 # ---------------------------------------------------------------------------
-# fix(#1778 round 6): an indeterminate commit outcome deletes nothing
+# An indeterminate commit outcome deletes nothing
 # ---------------------------------------------------------------------------
 
 
@@ -1550,7 +1555,7 @@ class TestAnIndeterminateCommitKeepsTheObject:
 
 
 # ---------------------------------------------------------------------------
-# fix(#1778 round 7): a write whose outcome is ambiguous is still rolled back
+# A write whose outcome is ambiguous is still rolled back
 # ---------------------------------------------------------------------------
 
 
@@ -1667,7 +1672,7 @@ class TestAnAmbiguousWriteIsRolledBack:
 
 
 # ---------------------------------------------------------------------------
-# fix(#1778 round 8): a contended map row fails fast, not slow
+# A contended map row fails fast, not slow
 # ---------------------------------------------------------------------------
 
 
@@ -1733,7 +1738,7 @@ class TestLockMapForAssetWriteFailsFast:
     async def test_the_icon_route_holds_no_per_map_lock(self) -> None:
         """The finding does not apply to icons: confirmed, not assumed.
 
-        Icons are deliberately global (fix(#1621), see ``sprites.py``) and
+        Icons are deliberately global (see ``sprites.py``) and
         ``create_icon_asset`` never calls ``lock_map_for_asset_write`` or takes
         any ``with_for_update()`` of its own. There is no per-map row for an
         icon upload to contend on, so it has nothing to bound.

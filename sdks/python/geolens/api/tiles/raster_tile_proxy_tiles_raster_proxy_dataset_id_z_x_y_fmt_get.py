@@ -115,6 +115,11 @@ def _parse_response(
 
         return response_401
 
+    if response.status_code == 403:
+        response_403 = ProblemDetail.from_dict(response.json())
+
+        return response_403
+
     if response.status_code == 404:
         response_404 = ProblemDetail.from_dict(response.json())
 
@@ -124,6 +129,11 @@ def _parse_response(
         response_422 = ProblemDetail.from_dict(response.json())
 
         return response_422
+
+    if response.status_code == 429:
+        response_429 = ProblemDetail.from_dict(response.json())
+
+        return response_429
 
     if response.status_code == 500:
         response_500 = ProblemDetail.from_dict(response.json())
@@ -170,7 +180,7 @@ def sync_detailed(
     pmax: float | None | Unset = UNSET,
     sigma: float | None | Unset = UNSET,
 ) -> Response[File | ProblemDetail]:
-    """Raster Tile Proxy
+    """Get a raster tile
 
      Render one raster tile and return the image.
 
@@ -185,9 +195,10 @@ def sync_detailed(
     ``stretch`` chooses how pixel values map to the output range. ``minmax``
     keeps the range the dataset already implies: the recorded per-band minimum
     and maximum for a raster imported from a remote source that published
-    statistics, the data range read from band statistics for floating-point
-    data, a range derived from the data type for other integer data, and no
-    rescale parameter for 8-bit data, which needs none. ``percentile`` and
+    statistics, the data range read from band statistics for floating-point and
+    single-band signed integer data, a range derived from the data type for
+    other integer data, and no rescale parameter for 8-bit data, which needs
+    none. ``percentile`` and
     ``stddev`` instead derive a range from band statistics read at request
     time, for up to three bands. A digital elevation model ignores the
     parameter, and so does a request whose band statistics cannot be read,
@@ -199,20 +210,22 @@ def sync_detailed(
     default is used in place of the value sent.
 
     Responds 204 when the tile falls outside the raster, 400 for an
-    unsupported format, 401 when authentication is required, or when a request
-    that no capability authorized carried a credential which did not resolve,
-    403 when the embed token is invalid or expired
-    or a multi-tenant request arrives with no tenant context, 422 for an
-    out-of-range stretch parameter, and 503 when the renderer cannot be
-    reached. A different failure from the renderer is passed through with its
-    own status.
+    unsupported format, 401 when a request that no capability authorized
+    carried a credential which did not resolve, 403 when the embed token is
+    invalid or expired or a multi-tenant request arrives with no tenant
+    context, 422 for an out-of-range stretch parameter, 429 with
+    ``Retry-After`` when the per-process capacity for uncached raster renders
+    stays full for a short wait, and 503 when the renderer cannot be reached. A
+    different failure from the renderer is passed through with its own status.
 
     404 covers more than a missing dataset. A dataset that is unknown, is not a
     raster or has no image answers 404. Where no capability authorized the
-    request, so does a dataset the caller may not read: an authorization denial
-    on a non-public raster, and an unpublished raster asked for by a caller who
-    is neither its owner nor an admin. That is deliberate, so a refusal keeps a
-    dataset's existence undisclosed.
+    request, so does a dataset the caller may not read: a non-public raster
+    asked for anonymously or by a caller without access, and an unpublished
+    raster asked for by a caller who is neither its owner nor an admin. An
+    anonymous request whose signature parameters did not authorize gets 403
+    instead, for a missing dataset as for one it cannot see. Either way a
+    refusal never discloses that the dataset exists.
 
     Args:
         dataset_id (UUID):
@@ -280,7 +293,7 @@ def sync(
     pmax: float | None | Unset = UNSET,
     sigma: float | None | Unset = UNSET,
 ) -> File | ProblemDetail | None:
-    """Raster Tile Proxy
+    """Get a raster tile
 
      Render one raster tile and return the image.
 
@@ -295,9 +308,10 @@ def sync(
     ``stretch`` chooses how pixel values map to the output range. ``minmax``
     keeps the range the dataset already implies: the recorded per-band minimum
     and maximum for a raster imported from a remote source that published
-    statistics, the data range read from band statistics for floating-point
-    data, a range derived from the data type for other integer data, and no
-    rescale parameter for 8-bit data, which needs none. ``percentile`` and
+    statistics, the data range read from band statistics for floating-point and
+    single-band signed integer data, a range derived from the data type for
+    other integer data, and no rescale parameter for 8-bit data, which needs
+    none. ``percentile`` and
     ``stddev`` instead derive a range from band statistics read at request
     time, for up to three bands. A digital elevation model ignores the
     parameter, and so does a request whose band statistics cannot be read,
@@ -309,20 +323,22 @@ def sync(
     default is used in place of the value sent.
 
     Responds 204 when the tile falls outside the raster, 400 for an
-    unsupported format, 401 when authentication is required, or when a request
-    that no capability authorized carried a credential which did not resolve,
-    403 when the embed token is invalid or expired
-    or a multi-tenant request arrives with no tenant context, 422 for an
-    out-of-range stretch parameter, and 503 when the renderer cannot be
-    reached. A different failure from the renderer is passed through with its
-    own status.
+    unsupported format, 401 when a request that no capability authorized
+    carried a credential which did not resolve, 403 when the embed token is
+    invalid or expired or a multi-tenant request arrives with no tenant
+    context, 422 for an out-of-range stretch parameter, 429 with
+    ``Retry-After`` when the per-process capacity for uncached raster renders
+    stays full for a short wait, and 503 when the renderer cannot be reached. A
+    different failure from the renderer is passed through with its own status.
 
     404 covers more than a missing dataset. A dataset that is unknown, is not a
     raster or has no image answers 404. Where no capability authorized the
-    request, so does a dataset the caller may not read: an authorization denial
-    on a non-public raster, and an unpublished raster asked for by a caller who
-    is neither its owner nor an admin. That is deliberate, so a refusal keeps a
-    dataset's existence undisclosed.
+    request, so does a dataset the caller may not read: a non-public raster
+    asked for anonymously or by a caller without access, and an unpublished
+    raster asked for by a caller who is neither its owner nor an admin. An
+    anonymous request whose signature parameters did not authorize gets 403
+    instead, for a missing dataset as for one it cannot see. Either way a
+    refusal never discloses that the dataset exists.
 
     Args:
         dataset_id (UUID):
@@ -385,7 +401,7 @@ async def asyncio_detailed(
     pmax: float | None | Unset = UNSET,
     sigma: float | None | Unset = UNSET,
 ) -> Response[File | ProblemDetail]:
-    """Raster Tile Proxy
+    """Get a raster tile
 
      Render one raster tile and return the image.
 
@@ -400,9 +416,10 @@ async def asyncio_detailed(
     ``stretch`` chooses how pixel values map to the output range. ``minmax``
     keeps the range the dataset already implies: the recorded per-band minimum
     and maximum for a raster imported from a remote source that published
-    statistics, the data range read from band statistics for floating-point
-    data, a range derived from the data type for other integer data, and no
-    rescale parameter for 8-bit data, which needs none. ``percentile`` and
+    statistics, the data range read from band statistics for floating-point and
+    single-band signed integer data, a range derived from the data type for
+    other integer data, and no rescale parameter for 8-bit data, which needs
+    none. ``percentile`` and
     ``stddev`` instead derive a range from band statistics read at request
     time, for up to three bands. A digital elevation model ignores the
     parameter, and so does a request whose band statistics cannot be read,
@@ -414,20 +431,22 @@ async def asyncio_detailed(
     default is used in place of the value sent.
 
     Responds 204 when the tile falls outside the raster, 400 for an
-    unsupported format, 401 when authentication is required, or when a request
-    that no capability authorized carried a credential which did not resolve,
-    403 when the embed token is invalid or expired
-    or a multi-tenant request arrives with no tenant context, 422 for an
-    out-of-range stretch parameter, and 503 when the renderer cannot be
-    reached. A different failure from the renderer is passed through with its
-    own status.
+    unsupported format, 401 when a request that no capability authorized
+    carried a credential which did not resolve, 403 when the embed token is
+    invalid or expired or a multi-tenant request arrives with no tenant
+    context, 422 for an out-of-range stretch parameter, 429 with
+    ``Retry-After`` when the per-process capacity for uncached raster renders
+    stays full for a short wait, and 503 when the renderer cannot be reached. A
+    different failure from the renderer is passed through with its own status.
 
     404 covers more than a missing dataset. A dataset that is unknown, is not a
     raster or has no image answers 404. Where no capability authorized the
-    request, so does a dataset the caller may not read: an authorization denial
-    on a non-public raster, and an unpublished raster asked for by a caller who
-    is neither its owner nor an admin. That is deliberate, so a refusal keeps a
-    dataset's existence undisclosed.
+    request, so does a dataset the caller may not read: a non-public raster
+    asked for anonymously or by a caller without access, and an unpublished
+    raster asked for by a caller who is neither its owner nor an admin. An
+    anonymous request whose signature parameters did not authorize gets 403
+    instead, for a missing dataset as for one it cannot see. Either way a
+    refusal never discloses that the dataset exists.
 
     Args:
         dataset_id (UUID):
@@ -493,7 +512,7 @@ async def asyncio(
     pmax: float | None | Unset = UNSET,
     sigma: float | None | Unset = UNSET,
 ) -> File | ProblemDetail | None:
-    """Raster Tile Proxy
+    """Get a raster tile
 
      Render one raster tile and return the image.
 
@@ -508,9 +527,10 @@ async def asyncio(
     ``stretch`` chooses how pixel values map to the output range. ``minmax``
     keeps the range the dataset already implies: the recorded per-band minimum
     and maximum for a raster imported from a remote source that published
-    statistics, the data range read from band statistics for floating-point
-    data, a range derived from the data type for other integer data, and no
-    rescale parameter for 8-bit data, which needs none. ``percentile`` and
+    statistics, the data range read from band statistics for floating-point and
+    single-band signed integer data, a range derived from the data type for
+    other integer data, and no rescale parameter for 8-bit data, which needs
+    none. ``percentile`` and
     ``stddev`` instead derive a range from band statistics read at request
     time, for up to three bands. A digital elevation model ignores the
     parameter, and so does a request whose band statistics cannot be read,
@@ -522,20 +542,22 @@ async def asyncio(
     default is used in place of the value sent.
 
     Responds 204 when the tile falls outside the raster, 400 for an
-    unsupported format, 401 when authentication is required, or when a request
-    that no capability authorized carried a credential which did not resolve,
-    403 when the embed token is invalid or expired
-    or a multi-tenant request arrives with no tenant context, 422 for an
-    out-of-range stretch parameter, and 503 when the renderer cannot be
-    reached. A different failure from the renderer is passed through with its
-    own status.
+    unsupported format, 401 when a request that no capability authorized
+    carried a credential which did not resolve, 403 when the embed token is
+    invalid or expired or a multi-tenant request arrives with no tenant
+    context, 422 for an out-of-range stretch parameter, 429 with
+    ``Retry-After`` when the per-process capacity for uncached raster renders
+    stays full for a short wait, and 503 when the renderer cannot be reached. A
+    different failure from the renderer is passed through with its own status.
 
     404 covers more than a missing dataset. A dataset that is unknown, is not a
     raster or has no image answers 404. Where no capability authorized the
-    request, so does a dataset the caller may not read: an authorization denial
-    on a non-public raster, and an unpublished raster asked for by a caller who
-    is neither its owner nor an admin. That is deliberate, so a refusal keeps a
-    dataset's existence undisclosed.
+    request, so does a dataset the caller may not read: a non-public raster
+    asked for anonymously or by a caller without access, and an unpublished
+    raster asked for by a caller who is neither its owner nor an admin. An
+    anonymous request whose signature parameters did not authorize gets 403
+    instead, for a missing dataset as for one it cannot see. Either way a
+    refusal never discloses that the dataset exists.
 
     Args:
         dataset_id (UUID):

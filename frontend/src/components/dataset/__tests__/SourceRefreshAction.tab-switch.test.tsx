@@ -6,7 +6,7 @@ import { SourceRefreshAction } from '../SourceRefreshAction';
 import type { DatasetRefreshRequest, DatasetRefreshRunListResponse, DatasetRefreshResponse, DatasetResponse } from '@/types/api';
 
 /**
- * fix(#1285 codex round 4): the root-cause test. SourceRefreshAction used to
+ * The root-cause test. SourceRefreshAction used to
  * own its dispatched-run tracking and poll directly, but it lives inside the
  * "sources" Radix TabsContent, which unmounts on tab switch — a refresh that
  * finished while the user was on another tab never invalidated anything.
@@ -42,6 +42,7 @@ function makeDataset(): DatasetResponse {
     id: 'dataset-1',
     record_id: 'record-1',
     table_name: 'roads',
+    has_generic_geometry: false,
     title: 'Roads',
     summary: null,
     srid: 4326,
@@ -154,7 +155,7 @@ describe('SourceRefreshAction + useDatasetRefreshWatch (tab-switch survival)', (
   });
 
   it('the trigger re-enables after a dispatched run completes while the Source tab was unmounted', async () => {
-    // fix(#831 precedent, VerifyEmailPage.test.tsx): shouldAdvanceTime keeps
+    // shouldAdvanceTime keeps
     // the mocked promise chains progressing while fake timers still control
     // TanStack's refetchInterval; delay: null keeps userEvent synchronous
     // under them.

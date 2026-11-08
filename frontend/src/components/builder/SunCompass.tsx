@@ -1,10 +1,8 @@
 /**
- * builder-audit #338 COMPLEX-01: the hillshade sun-position compass, extracted out of
- * DEMEditorScene's main render where it was ~55 lines of inline-styled absolutely
- * positioned divs. Presentational only — the parent owns the azimuth state and the
- * accessible label.
+ * The hillshade sun-position compass. Presentational only: the parent owns the
+ * azimuth state and the accessible label.
  */
-export interface SunCompassProps {
+interface SunCompassProps {
   /** Illumination direction in degrees (0–360); drives the needle rotation. */
   azimuth: number;
   /** Accessible label, e.g. "Sun azimuth: 135°". */

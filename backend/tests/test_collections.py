@@ -52,7 +52,7 @@ async def _create_dataset(
 
 
 # ---------------------------------------------------------------------------
-# SC1: Create collection (COLL-01)
+# SC1: Create collection
 # ---------------------------------------------------------------------------
 
 
@@ -157,7 +157,7 @@ class TestCreateCollection:
 
 
 # ---------------------------------------------------------------------------
-# SC2: Edit and delete (COLL-02)
+# SC2: Edit and delete
 # ---------------------------------------------------------------------------
 
 
@@ -278,7 +278,7 @@ class TestUpdateDeleteCollection:
 
 
 # ---------------------------------------------------------------------------
-# SC3: Multi-membership (COLL-03)
+# SC3: Multi-membership
 # ---------------------------------------------------------------------------
 
 
@@ -334,7 +334,7 @@ class TestCollectionMembership:
         admin_auth_header: dict,
         test_db_session,
     ):
-        """GAP-014: editor cannot link ANOTHER user's PRIVATE dataset.
+        """Editor cannot link ANOTHER user's PRIVATE dataset.
 
         manage_collections gates the action but not the link target. Without the
         write-time per-dataset re-auth (mirroring the FK-relationship / VRT
@@ -388,7 +388,7 @@ class TestCollectionMembership:
         admin_auth_header: dict,
         test_db_session,
     ):
-        """GAP-014 GUARD: linking a PUBLIC dataset still succeeds for an editor.
+        """GUARD: linking a PUBLIC dataset still succeeds for an editor.
 
         The new write-time authz must not over-block legitimate links.
         """
@@ -557,7 +557,7 @@ class TestCollectionMembership:
 
 
 # ---------------------------------------------------------------------------
-# SC4: Aggregated extent (COLL-05)
+# SC4: Aggregated extent
 # ---------------------------------------------------------------------------
 
 
@@ -618,15 +618,12 @@ class TestCollectionExtent:
         admin_auth_header: dict,
         test_db_session,
     ):
-        """fix(#1006): the collections sibling of #1004, same cause and fix.
+        """A seam-crossing collection keeps the RFC 7946 bbox, west > east.
 
-        ``rollup_span_bbox`` collapses a crossing rollup to
-        ``[-180, s, 180, n]`` -- monotonic, and bit-identical to what a
-        genuinely global collection produces -- so ``BBoxPreview``'s #903
-        crossing guard was unreachable and a Fiji-shaped collection drew a
-        dashed band across the whole world on the card and the detail page.
-
-        The fixture is #1004's: points at lon 179.5, -179.5 and 178.44.
+        The monotonic ``[-180, s, 180, n]`` form is identical to a genuinely
+        global collection's bbox, which leaves ``BBoxPreview``'s crossing guard
+        unreachable and draws a band across the whole world on the card and the
+        detail page. The fixture points sit at lon 179.5, -179.5 and 178.44.
         """
         admin_id = await get_user_id(test_db_session, "admin")
         west = await _create_dataset(

@@ -15,16 +15,17 @@ from app.core.url_redaction import redact_url_credentials
 from app.modules.auth.dependencies import require_permission
 from app.modules.quota.service import check_upload_quota
 from app.platform.jobs import ledger
+from app.platform.upload_filenames import (
+    refuse_control_characters,
+    safe_upload_basename,
+)
 from app.processing.ingest.ogr import IngestionError
 from app.processing.ingest.router import (
     _get_allowed_extensions_safely,
     _reject_standalone_vrt,
 )
 from app.processing.ingest.schemas import UploadResponse, UrlUploadRequest
-from app.processing.ingest.service import (
-    safe_upload_basename,
-    validate_file_extension,
-)
+from app.processing.ingest.service import validate_file_extension
 from app.processing.ingest.pointcloud import require_pointcloud_file
 from app.processing.ingest.tileset import require_tileset_archive, tileset_job_metadata
 from app.processing.ingest.url_fetch import (
@@ -62,10 +63,9 @@ def _credential_free_url(url: str) -> str:
 def _url_import_filename(body: UrlUploadRequest) -> str:
     """The staging filename for a URL import, or the endpoint's 400/422.
 
-    fix(#1708): both name sources go through the byte clamp (filesystems cap
-    NAME_MAX in BYTES, not the schema's 255 characters). Callers must invoke
-    this INSIDE their guarded block — urlparse can raise ValueError on a
-    malformed authority.
+    Both name sources go through the byte clamp (filesystems cap NAME_MAX
+    in bytes, not the schema's 255 characters). Call it inside the guarded
+    block: urlparse can raise ValueError on a malformed authority.
     """
     try:
         filename = (
@@ -78,20 +78,9 @@ def _url_import_filename(body: UrlUploadRequest) -> str:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_import_url", "message": f"Invalid URL: {exc}"},
         ) from exc
-    # fix(#1708): NUL and other control characters survive percent-
-    # decoding ('/roads%00.geojson') or arrive verbatim in the override, and
-    # pass every suffix/allowlist check — the filesystem refuses them only at
-    # open(), which sits AFTER the running-commit, and the failed open's
-    # cleanup unlink then raised on the same invalid path. Refuse them here,
-    # before any job row exists.
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in filename):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail={
-                "code": "filename_control_characters",
-                "message": "Filename contains control characters that are not allowed.",
-            },
-        )
+    # Control characters survive percent-decoding ('/roads%00.geojson'), so
+    # the decoded name is checked here, before any job row exists.
+    refuse_control_characters(filename)
     if not filename or not Path(filename).suffix:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -111,12 +100,12 @@ def _url_import_filename(body: UrlUploadRequest) -> str:
     response_model=UploadResponse,
     status_code=status.HTTP_201_CREATED,
     responses={
-        # fix(#1710): 413 stays documented. The download moved to the worker,
-        # but `check_upload_quota` still refuses an over-quota caller here,
-        # and dropping it took the branch out of both SDKs.
+        # The download runs in the worker, but `check_upload_quota` still
+        # refuses an over-quota caller here, so the SDKs keep the 413 branch.
         413: PAYLOAD_TOO_LARGE_RESPONSE,
         502: BAD_GATEWAY_RESPONSE,
     },
+    summary="Import a file from a URL",
 )
 async def upload_from_url(
     body: UrlUploadRequest,
@@ -153,8 +142,7 @@ async def upload_from_url(
     from app.platform.security import SSRFError, validate_url_for_ssrf
     from app.processing.ingest.tasks import fetch_url
 
-    # Exception-safe on malformed input by design (fix(#1119)) — safe to run
-    # before the guarded block below.
+    # Exception-safe on malformed input, so it runs before the guarded block.
     safe_url = redact_url_credentials(body.url)
     try:
         filename = _url_import_filename(body)
@@ -168,18 +156,15 @@ async def upload_from_url(
                 detail=refusal_detail(exc),
             ) from exc
 
-        # fix(#1708): commit here to END the auth-phase transaction before the
-        # DNS await — getaddrinfo has no bound of its own, and holding a
-        # connection through it could exhaust the pool under concurrent imports.
+        # End the auth-phase transaction before the DNS await: holding a
+        # connection through an unbounded getaddrinfo could exhaust the pool
+        # under concurrent imports.
         await db.commit()
 
         # Rule 2, submission gate: refuse private/link-local/reserved targets
         # before anything is queued. The worker's safe client re-validates at
-        # connect time and per redirect hop during the download.
-        #
-        # fix(#1708): bounded at the call site — getaddrinfo has no deadline
-        # of its own; wait_for cancels the to_thread wrapper immediately and
-        # the abandoned resolver thread ends when the OS resolver gives up.
+        # connect time and per redirect hop during the download. The bound
+        # is explained on PREFLIGHT_DNS_MAX_SECONDS.
         try:
             await asyncio.wait_for(
                 validate_url_for_ssrf(body.url),
@@ -218,12 +203,12 @@ async def upload_from_url(
         # Content-Length may be absent or dishonest.
         await check_upload_quota(db, user.id, 0, request)
 
-        # feat(#1710): the row is committed 'running', not 'pending'. The
-        # success state of a URL import IS 'pending' (previewable), so a
-        # pending row would tell the UI the download had finished; and the
-        # stale-PENDING sweep may legally fire at 61s while a download is
-        # allowed url_import_fetch_max_seconds. Running rows are judged by
-        # the worker lease instead, which the task's heartbeat renews.
+        # The row is committed 'running', not 'pending'. A URL import's
+        # success state is 'pending' (previewable), so a pending row would
+        # tell the UI the download had finished, and the stale-pending sweep
+        # may fire at 61s while a download is allowed
+        # url_import_fetch_max_seconds. Running rows are judged by the worker
+        # lease instead, which the task's heartbeat renews.
         job = ledger.create(
             db,
             created_by=user.id,
@@ -274,8 +259,8 @@ async def upload_from_url(
             status="running",
             message="Downloading the file",
         )
-    # N4 (mirrors upload_file): HTTPException before the ValueError fallback,
-    # or every deliberate 4xx above is rewritten as a 400/500.
+    # As in upload_file: HTTPException before the ValueError fallback, or
+    # every deliberate 4xx above is rewritten as a 400/500.
     except HTTPException:
         raise
     except (IngestionError, ValueError) as exc:

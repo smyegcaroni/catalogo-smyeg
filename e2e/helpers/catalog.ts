@@ -162,13 +162,22 @@ export async function seedDataset(titlePrefix = 'E2E Seed Dataset'): Promise<See
 }
 
 /**
- * fix(#451): ingest the single-band Float32 GeoTIFF fixture as a real DEM
+ * Ingest the single-band Float32 GeoTIFF fixture as a real DEM
  * dataset (`is_dem_candidate` in processing/raster/cog.py flags single-band
  * float rasters). Powers the two-switch DEM editor spec. Pair with
  * `deleteDataset()` in `afterAll`.
  */
 export async function seedDemDataset(): Promise<SeededDataset> {
   return seedFixtureDataset('sample-dem.tif', 'image/tiff', `E2E DEM ${Date.now()}`);
+}
+
+/**
+ * Ingest six points in three kinds (park, school, clinic) with a numeric
+ * `height`, for specs that need categories and a distribution. Pair with
+ * `deleteDataset()`.
+ */
+export async function seedCategoryDataset(titlePrefix: string): Promise<SeededDataset> {
+  return seedFixtureDataset('dashboard-points.geojson', 'application/geo+json', `${titlePrefix} ${Date.now()}`);
 }
 
 async function seedFixtureDataset(

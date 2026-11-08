@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal, get_args
 
 from pydantic import AwareDatetime, BaseModel, EmailStr, Field, field_validator
@@ -26,9 +26,9 @@ def validate_role_name(value: object) -> str:
 
 class TokenResponse(BaseModel):
     access_token: str = Field(description="JWT access token for Authorization header")
-    # fix(#1446): required-but-nullable, not optional — omitting `default=`
-    # keeps it in OpenAPI's `required` list so generated SDKs don't get an
-    # `Unset`/absent shape the server never emits.
+    # Required-but-nullable, not optional: omitting `default=` keeps it in
+    # OpenAPI's `required` list so generated SDKs don't get an `Unset`/absent
+    # shape the server never emits.
     refresh_token: str | None = Field(
         description=(
             "Opaque token used to obtain a new access token. Always present for "
@@ -61,21 +61,17 @@ class UserCreate(BaseModel):
     password: str = Field(
         min_length=8,
         max_length=256,
-        # Note on the min_length=8 floor: Pydantic evaluates Field constraints
-        # (BEFORE) @field_validator(mode="after"). Keeping min_length=8 here
-        # provides a fast-fail floor that avoids the database round-trip for
-        # trivially short passwords. The canonical policy (default: 12 chars
-        # + 3-of-4 class diversity) is enforced by validate_password below.
-        # Both errors are 422; the field-level message fires first when the
-        # password is < 8 chars.
+        # min_length=8 is a fast-fail floor: Field constraints run before
+        # @field_validator(mode="after"), and validate_password below enforces
+        # the full policy (default 12 chars + 3-of-4 classes). Both errors are
+        # 422; the field-level one fires first under 8 chars.
         description=(
             "Plaintext password (policy: min 12 chars, 3+ character classes, "
             "at most 72 bytes UTF-8)"
         ),
-        # fix(#1715): deliberately no json_schema_extra example — a published
-        # example password (Rule 3) leaked a fake-but-plausible credential into
-        # openapi.json and both SDKs; no example beats one that invites
-        # copy-paste.
+        # Deliberately no json_schema_extra example (Rule 3): a published
+        # example password lands in openapi.json and both SDKs, and no example
+        # beats one that invites copy-paste.
     )
     email: EmailStr | None = Field(
         default=None,
@@ -87,7 +83,7 @@ class UserCreate(BaseModel):
     @field_validator("password", mode="after")
     @classmethod
     def validate_password(cls, v: str) -> str:
-        """Enforce the application password policy (SEC-S16, Phase 1062-01)."""
+        """Enforce the application password policy."""
         from app.modules.auth.password_policy import validate_password_from_settings  # noqa: PLC0415
 
         validate_password_from_settings(v)
@@ -96,15 +92,18 @@ class UserCreate(BaseModel):
 
 class RegisterResponse(BaseModel):
     message: str
-    # Computed purely from (config + submitted email), so it is IDENTICAL for a
-    # genuine new signup and a swallowed username/email collision — the
-    # collision path must not be distinguishable (SEC-012 enumeration-safety).
+    # On /register it is computed purely from (config + submitted email), so it
+    # is IDENTICAL for a genuine new signup and a swallowed username/email
+    # collision — the collision path must not be distinguishable
+    # (enumeration-safety).
     next_step: Literal["verify_email", "await_approval"] | None = Field(
         default=None,
         description=(
             "Post-registration step for the client to display: 'verify_email' when a "
             "verification email was (or, for a swallowed collision, would have been) sent; "
-            "'await_approval' for the admin-approval path. None on non-register responses."
+            "'await_approval' for the admin-approval path, and from verify-email when the "
+            "address is confirmed but the account still waits for an administrator. "
+            "None otherwise."
         ),
     )
 
@@ -219,9 +218,9 @@ class UserResponse(BaseModel):
 
 
 class RefreshRequest(BaseModel):
-    # fix(#1446): stays required — only the body as a whole is optional (route
-    # signature `RefreshRequest | None = None`). Defaulting this field would
-    # make `{}` a valid body the server can't do anything with.
+    # Stays required: only the body as a whole is optional (route signature
+    # `RefreshRequest | None = None`). Defaulting this field would make `{}` a
+    # valid body the server can't do anything with.
     refresh_token: str = Field(max_length=512)
 
 
@@ -232,7 +231,7 @@ class PermissionsResponse(BaseModel):
 
 
 def validate_future_expiry(value: AwareDatetime | None) -> AwareDatetime | None:
-    """Reject an ``expires_at`` that is not in the future (#821).
+    """Reject an ``expires_at`` that is not in the future.
 
     Shared by the self-service and admin key-mint request schemas so both
     surfaces refuse to mint an already-expired key.
@@ -253,16 +252,66 @@ class ApiKeyCreateRequest(BaseModel):
             "for a non-expiring key; expired keys stop authenticating."
         ),
     )
-    scope: Literal["full", "read_only"] = Field(
+    scope: Literal["full", "read_only", "publish"] = Field(
         default="full",
         description=(
             "Privilege scope. 'full' impersonates the owner completely. "
             "'read_only' authenticates GET, HEAD and "
-            "OPTIONS requests only; any other method is refused with 403."
+            "OPTIONS requests only; any other method is refused with 403. "
+            "'publish' also allows uploads, manifest apply, dataset metadata "
+            "edits and new maps, but no map update, delete, feature write, "
+            "public visibility, admin or key route."
         ),
     )
 
     _expires_at_future = field_validator("expires_at")(validate_future_expiry)
+
+
+# A dataset key usually lives in a third-party webhook's settings, where it is
+# easy to forget, so it must expire and be re-minted at least yearly.
+DATASET_KEY_MAX_LIFETIME = timedelta(days=365)
+
+
+class DatasetApiKeyCreateRequest(BaseModel):
+    name: str = Field(
+        min_length=1, max_length=255, description="Human-readable label for the API key"
+    )
+    expires_at: AwareDatetime = Field(
+        description=(
+            "Expiry timestamp (RFC 3339, timezone-aware), in the future and at "
+            "most 365 days away. Expired keys stop authenticating."
+        ),
+    )
+    scope: Literal["dataset_write", "dataset_append"] = Field(
+        default="dataset_write",
+        description=(
+            "'dataset_write' reads and writes the dataset's features. "
+            "'dataset_append' only creates features, one or a FeatureCollection "
+            "per request, and can't read, change or delete them."
+        ),
+    )
+
+    @field_validator("expires_at")
+    @classmethod
+    def _expires_within_a_year(cls, value: AwareDatetime) -> AwareDatetime:
+        validate_future_expiry(value)
+        if value > datetime.now(timezone.utc) + DATASET_KEY_MAX_LIFETIME:
+            raise ValueError("expires_at must be at most 365 days away")
+        return value
+
+
+_SCOPE_DESCRIPTION = (
+    "Privilege scope: 'full', 'read_only', 'publish' (reads, uploads, manifest "
+    "apply, dataset metadata edits and new maps, but no map updates, deletes, "
+    "feature writes or public visibility), "
+    "'dataset_write' (reads and writes the features of the dataset in "
+    "dataset_id, and nothing else), or 'dataset_append' (only creates features "
+    "in that dataset)"
+)
+_DATASET_ID_DESCRIPTION = (
+    "The dataset a 'dataset_write' or 'dataset_append' key is bound to; null "
+    "for other scopes"
+)
 
 
 class ApiKeyCreateResponse(BaseModel):
@@ -276,8 +325,9 @@ class ApiKeyCreateResponse(BaseModel):
         default=None,
         description="Expiry timestamp; null means the key does not expire",
     )
-    scope: str = Field(
-        description="Privilege scope: 'full' or 'read_only'",
+    scope: str = Field(description=_SCOPE_DESCRIPTION)
+    dataset_id: uuid.UUID | None = Field(
+        default=None, description=_DATASET_ID_DESCRIPTION
     )
     created_at: datetime
 
@@ -293,8 +343,9 @@ class ApiKeyListItem(BaseModel):
         default=None,
         description="Expiry timestamp; null means the key does not expire",
     )
-    scope: str = Field(
-        description="Privilege scope: 'full' or 'read_only'",
+    scope: str = Field(description=_SCOPE_DESCRIPTION)
+    dataset_id: uuid.UUID | None = Field(
+        default=None, description=_DATASET_ID_DESCRIPTION
     )
     created_at: datetime
     last_used_at: datetime | None
@@ -302,6 +353,18 @@ class ApiKeyListItem(BaseModel):
 
 class ApiKeyListResponse(BaseModel):
     items: list[ApiKeyListItem]
+    total: int
+
+
+class DatasetApiKeyListItem(ApiKeyListItem):
+    user_id: uuid.UUID = Field(
+        description="The user who minted the key; it acts as them"
+    )
+    username: str = Field(description="That user's username")
+
+
+class DatasetApiKeyListResponse(BaseModel):
+    items: list[DatasetApiKeyListItem]
     total: int
 
 
@@ -319,8 +382,18 @@ class ChangePasswordRequest(BaseModel):
     @field_validator("new_password", mode="after")
     @classmethod
     def validate_new_password(cls, v: str) -> str:
-        """Enforce the application password policy on the new password (SEC-S16)."""
+        """Enforce the application password policy on the new password."""
         from app.modules.auth.password_policy import validate_password_from_settings  # noqa: PLC0415
 
         validate_password_from_settings(v)
         return v
+
+
+class GroupRef(BaseModel):
+    id: uuid.UUID = Field(description="Unique group identifier.")
+    name: str = Field(description="Group name.")
+
+
+class GroupRefListResponse(BaseModel):
+    groups: list[GroupRef] = Field(description="Page of groups, by name.")
+    total: int = Field(description="Total number of groups (across all pages).")

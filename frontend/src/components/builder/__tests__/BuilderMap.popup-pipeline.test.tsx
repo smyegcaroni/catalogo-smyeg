@@ -1,4 +1,4 @@
-// fix(#943): the BuilderMap click/mousemove hit-test path had no unit test in
+// The BuilderMap click/mousemove hit-test path had no unit test in
 // any of the seven BuilderMap.* files, and #729's consumer half was equally
 // unpinned — the suppression suite covered only the store-flag producer, never
 // the two refs the handlers actually read (`measureActiveRef`, `drawActiveRef`).
@@ -9,12 +9,13 @@
 // produced is readable from the DOM.
 
 import type { ReactNode } from 'react';
-import { act, render, screen } from '@/test/test-utils';
+import { act, cleanup, render, screen } from '@/test/test-utils';
 import type { MapLayerResponse } from '@/types/api';
 import type { VectorTileToken } from '@/api/tiles';
 import { BuilderMap } from '../BuilderMap';
 import { useMapDrawStore } from '@/stores/map-draw-store';
 import { usePluginStore } from '@/stores/map-plugin-store';
+import { useMapSelectionStore } from '@/stores/map-selection-store';
 
 vi.mock('@/hooks/use-settings', () => ({
   useBasemaps: () => ({
@@ -79,6 +80,7 @@ vi.mock('@/components/builder/map-sync', async (importOriginal) => {
 
 type QueriedFeature = {
   layer: { id: string };
+  id?: number | string;
   properties: Record<string, unknown>;
 };
 
@@ -114,6 +116,7 @@ const mapState = vi.hoisted(() => {
     getSource: vi.fn(() => null),
     // Every id the builder asks about exists, so refreshQueryLayerIds keeps them.
     getLayer: vi.fn((id: string) => ({ id })),
+    moveLayer: vi.fn(),
     getStyle: vi.fn(() => ({ layers: [] })),
     fitBounds: vi.fn(),
     getZoom: vi.fn(() => 8),
@@ -209,6 +212,7 @@ function clickMap() {
 
 beforeEach(() => {
   mapState.reset();
+  useMapSelectionStore.getState().clear();
   useMapDrawStore.setState({ drawActive: false });
   usePluginStore.setState({ activePlugins: new Set<string>() });
 });
@@ -221,6 +225,22 @@ describe('BuilderMap popup pipeline (fix #943)', () => {
     clickMap();
 
     expect(screen.getByTestId('feature-popup')).toHaveTextContent('Parcels');
+  });
+
+  it('selects the clicked feature by layer and tile id, and clears the selection with the map', async () => {
+    await renderMap([makeLayer()]);
+    const selection = () => useMapSelectionStore.getState().selection;
+
+    mapState.hits.features = [{ ...featureHit(), id: 'not-a-gid' }];
+    clickMap();
+    expect(selection()).toBeNull();
+
+    mapState.hits.features = [{ ...featureHit(), id: 7 }];
+    clickMap();
+    expect(selection()).toMatchObject({ layerId: 'layer-1', featureId: 7 });
+
+    cleanup();
+    expect(selection()).toBeNull();
   });
 
   it('opens no popup when the layer has popups disabled', async () => {
@@ -278,7 +298,7 @@ describe('BuilderMap popup pipeline (fix #943)', () => {
   });
 });
 
-// fix(#729): a draw mode (the analysis clip mask) owns the pointer while it
+// A draw mode (the analysis clip mask) owns the pointer while it
 // runs. The producer side — the store flag — was already pinned; these cover
 // the two refs the click/mousemove handlers actually read.
 describe('BuilderMap draw and measure guards (fix #943, consumer half of #729)', () => {

@@ -1,11 +1,11 @@
-"""Per-event notification helpers for GeoLens (EVENT-05).
+"""Per-event notification helpers for GeoLens.
 
 Three call-site helpers: ``event_enabled()`` (cheap toggle gate),
 ``build_event_notification()`` (consistent Notification shape), and
 ``emit_event_safe()`` (defensive wrapper — never raises into the caller).
 
 ``notify`` is imported at module level so tests can monkeypatch it here;
-``app_settings`` is imported lazily inside each function (Phase 214) for
+``app_settings`` is imported lazily inside each function for
 the same reason. ``notify()`` takes no DB/session argument by design.
 """
 
@@ -44,7 +44,7 @@ _EVENT_KEY_TO_TOGGLE: dict[str, str] = {
 def event_enabled(event_key: str) -> bool:
     """Return True if the per-event toggle for *event_key* is enabled in settings.
 
-    Reads the matching ``notify_on_*`` field (deferred import, Phase 214).
+    Reads the matching ``notify_on_*`` field (deferred import).
     Unknown keys return False rather than erroring, so a new event type is
     silently suppressed until wired up.
     """
@@ -68,14 +68,13 @@ def build_event_notification(
     """Build a ``Notification`` with a consistent shape for event call sites.
 
     Recipient is ``notification_admin_email or smtp_from_address`` (either
-    may be None) in ``data["to"]``. *reason* (EVENT-03 failure path) is
+    may be None) in ``data["to"]``. *reason* (failure path) is
     appended to *body* and placed in ``data["reason"]`` — it's the job's
-    error_message surfaced to the dataset owner, not a secret (T-1230-01).
+    error_message surfaced to the dataset owner, not a secret.
     A reason the door stored as a code becomes the sentence it stands for.
     *extra* is merged into ``data`` last for structured context (job_id,
     dataset name, etc.).
     """
-    # Deferred import — Phase 214 discipline.
     from app.core.config import settings as app_settings
     from app.core.failure_reason import describe_failure_reason
     from app.platform.extensions.protocols import Notification
@@ -84,9 +83,8 @@ def build_event_notification(
         app_settings, "notification_admin_email", None
     ) or getattr(app_settings, "smtp_from_address", None)
 
-    # fix(#2010): mail is a reader like the web app, and a code is not a
-    # sentence. Mapped here rather than at each call site, so a new event
-    # that carries a reason cannot reintroduce the raw identifier.
+    # Mail is a reader like the web app, and a code is not a sentence. Mapped
+    # here rather than at each call site, so no event mails a raw identifier.
     reason = describe_failure_reason(reason) if reason else reason
 
     final_body = body
@@ -130,11 +128,11 @@ async def emit_event_safe(
     """Defensive async wrapper for firing a single event notification.
 
     Returns immediately if ``event_enabled(event_key)`` is False — no
-    payload built, no I/O (EVENT-05). Otherwise calls ``build()`` then
+    payload built, no I/O. Otherwise calls ``build()`` then
     ``await notify(notification)`` inside one try/except that logs the
     exception type only (never payload/secrets) and swallows it, so a
     thrown *builder* — unlike ``notify()``'s own fail-safety — can never
-    escape to the caller (T-1230-01/T-1230-02). With ``channels`` it sends
+    escape to the caller. With ``channels`` it sends
     to those channels alone. The result is true when nothing failed, a
     disabled event included.
     """
@@ -147,7 +145,7 @@ async def emit_event_safe(
             result = await notify(notification)
         else:
             result = await notify(notification, channels=channels)
-    except Exception as exc:  # noqa: BLE001 — notification must never break callers
+    except Exception as exc:  # broad: notification must never break callers
         # Log only the exception type — never the notification body or any secret.
         logger.warning(
             "emit_event_safe: notification failed; suppressed",

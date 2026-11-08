@@ -6,14 +6,18 @@ from typing import NamedTuple
 
 import structlog
 from fastapi import HTTPException, status
-from sqlalchemy import Select, or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.core.identity import Identity
 from app.core.record_types import capabilities
 from app.modules.auth.models import User
-from app.modules.catalog.authorization import apply_visibility_filter, get_user_roles
+from app.modules.catalog.authorization import (
+    apply_visibility_filter,
+    get_user_roles,
+    visible_vrt_extents,
+)
 from app.modules.catalog.datasets.domain.models import Dataset, DatasetGrant, Record
 from app.modules.catalog.maps.models import Map, MapLayer
 from app.modules.catalog.maps.style_json import (
@@ -41,16 +45,17 @@ class DatasetMeta(NamedTuple):
     dem_vertical_units: str | None
     band_count: int | None
     tile_version: int | None
-    # fix(#1963): the counter the signed tile scope binds, so the saved-map
-    # style document signs at the same version the tile route verifies.
+    # The counter the signed tile scope binds, so the saved-map style document
+    # signs at the version the tile route verifies.
     publication_version: int | None
-    # fix(#430): dataset visibility/status so the builder can flag layers hidden
+    # Dataset visibility/status so the builder can flag layers hidden
     # from a public map's anonymous audience.
     visibility: str | None
     record_status: str | None
-    # feat(#1472): the record's required credit line, for the viewer's
+    # The record's required credit line, for the viewer's
     # attribution control.
     attribution: str | None
+    tile_columns: list[str] | None = None
 
 
 class LayerRow(NamedTuple):
@@ -75,10 +80,11 @@ class LayerRow(NamedTuple):
     dem_vertical_units: str | None
     band_count: int | None
     tile_version: int | None
-    publication_version: int | None = None  # fix(#1963): signed-scope counter
-    visibility: str | None = None  # fix(#430): dataset visibility for audience-badge
+    publication_version: int | None = None  # signed-scope counter
+    visibility: str | None = None  # Dataset visibility for audience-badge
     record_status: str | None = None
-    attribution: str | None = None  # feat(#1472): required credit line
+    attribution: str | None = None  # Required credit line
+    tile_columns: list[str] | None = None
 
 
 def _extract_dem_vertical_units(band_info: object) -> str | None:
@@ -114,14 +120,15 @@ async def get_dataset_meta(
             RasterAsset.is_dem,
             RasterAsset.band_info,
             RasterAsset.band_count,
-            # fix(#525): tile_version reads the dedicated URL cache-buster —
-            # current_version only changes on reupload, so feature edits and
-            # column DDL never rolled the _v= param (stale CDN/browser tiles).
+            # tile_version reads the dedicated URL cache-buster: current_version
+            # only changes on reupload, so feature edits and column DDL would
+            # never roll the _v= param (stale CDN/browser tiles).
             Dataset.tile_cache_version,
             Dataset.publication_version,
             Record.visibility,
             Record.record_status,
             Record.attribution,
+            Dataset.tile_columns,
         )
         .join(Record, Dataset.record_id == Record.id)
         .outerjoin(RasterAsset, RasterAsset.dataset_id == Dataset.id)
@@ -148,6 +155,7 @@ async def get_dataset_meta(
         visibility=row[14],
         record_status=row[15],
         attribution=row[16],
+        tile_columns=row[17],
     )
 
 
@@ -183,8 +191,8 @@ def generate_default_style(geometry_type: str | None) -> dict[str, dict | None]:
             "generate_default_style called with null geometry_type; defaulting to fill"
         )
 
-    # builder-audit #338 STYLE-07: use the shared GeoLens-blue palette constants from
-    # style_json so storage defaults cannot silently diverge from export defaults.
+    # Palette constants come from style_json so storage defaults cannot
+    # diverge from export defaults.
     if "POINT" in gt:
         return {
             "paint": {
@@ -230,9 +238,8 @@ async def _fetch_layer_rows_ordered(
 ) -> list[LayerRow]:
     """Fetch the joined layer-row tuples for a map, ordered by sort_order.
 
-    Map has no relationship() to MapLayer, so the .order_by(MapLayer.sort_order)
-    clause MUST live in the explicit SELECT — there is no relationship-level
-    ordering to leverage.
+    Map has no relationship() to MapLayer, so the ordering lives in the
+    explicit SELECT.
     """
     RasterAsset = get_catalog_port().raster_asset_orm_class()
     stmt = (
@@ -250,21 +257,22 @@ async def _fetch_layer_rows_ordered(
             RasterAsset.is_dem,
             RasterAsset.band_info,
             RasterAsset.band_count,
-            # fix(#525): tile_version reads the dedicated URL cache-buster —
-            # current_version only changes on reupload, so feature edits and
-            # column DDL never rolled the _v= param (stale CDN/browser tiles).
+            # tile_version reads the dedicated URL cache-buster: current_version
+            # only changes on reupload, so feature edits and column DDL would
+            # never roll the _v= param (stale CDN/browser tiles).
             Dataset.tile_cache_version,
             Dataset.publication_version,
             Record.visibility,
             Record.record_status,
             Record.attribution,
+            Dataset.tile_columns,
         )
         .join(Dataset, MapLayer.dataset_id == Dataset.id)
         .join(Record, Dataset.record_id == Record.id)
         .outerjoin(RasterAsset, RasterAsset.dataset_id == Dataset.id)
         .where(MapLayer.map_id == map_id)
-        # fix(#430): concurrent adds can collide on sort_order (non-atomic RMW);
-        # break ties by id so stacking order is at least deterministic.
+        # Concurrent adds can collide on sort_order (the read and write are
+        # not atomic); the id tiebreak keeps stacking order deterministic.
         .order_by(MapLayer.sort_order, MapLayer.id)
     )
     result = await session.execute(stmt)
@@ -288,6 +296,7 @@ async def _fetch_layer_rows_ordered(
             visibility=row[15],
             record_status=row[16],
             attribution=row[17],
+            tile_columns=row[18],
         )
         for row in result.all()
     ]
@@ -300,27 +309,58 @@ async def filter_layer_rows_by_dataset_visibility(
 ) -> list[LayerRow]:
     """Drop layer rows whose backing dataset is not visible to ``user``.
 
-    SEC-A: ``GET /maps/{id}`` and ``/style.json`` gate only the MAP, so a
-    public map referencing a private dataset would otherwise leak its
-    metadata (and, via the signed tile URL, its tiles) to anonymous callers.
-    Mirrors ``get_shared_map``'s per-layer filtering. Layer order is preserved.
+    ``GET /maps/{id}`` and ``/style.json`` gate only the map, so a public map
+    referencing a private dataset would otherwise leak its metadata (and, via
+    the signed tile URL, its tiles) to anonymous callers. Mirrors
+    ``get_shared_map``'s per-layer filtering. Layer order is preserved.
 
-    Do NOT swap for ``bulk_check_dataset_access``: it dereferences ``user.id``
-    (crashes on anonymous ``user is None``) and lacks the published-status
-    nuance.
+    ``bulk_check_dataset_access`` is not a substitute: it dereferences
+    ``user.id`` (crashes on anonymous ``user is None``) and lacks the
+    published-status nuance.
     """
     if not layer_rows:
         return layer_rows
+    visible_ids = await readable_dataset_ids(
+        session, {row.layer.dataset_id for row in layer_rows}, user
+    )
+    return await with_visible_vrt_extents(
+        session,
+        [row for row in layer_rows if row.layer.dataset_id in visible_ids],
+        user,
+    )
+
+
+async def with_visible_vrt_extents(
+    session: AsyncSession, layer_rows: list[LayerRow], user: Identity | None
+) -> list[LayerRow]:
+    """``layer_rows`` with each VRT's extent as ``visible_vrt_extents`` shows it to ``user``."""
+    vrt_ids = [r.layer.dataset_id for r in layer_rows if r.record_type == "vrt_dataset"]
+    if not vrt_ids:
+        return layer_rows
     user_roles = await get_user_roles(session, user) if user is not None else set()
-    layer_dataset_ids = {row.layer.dataset_id for row in layer_rows}
+    extents = await visible_vrt_extents(session, vrt_ids, user, user_roles)
+    return [
+        row._replace(spatial_extent=extents[row.layer.dataset_id])
+        if row.layer.dataset_id in extents
+        else row
+        for row in layer_rows
+    ]
+
+
+async def readable_dataset_ids(
+    session: AsyncSession, dataset_ids: set[uuid.UUID], user: Identity | None
+) -> set[uuid.UUID]:
+    """The ids in ``dataset_ids`` whose dataset map reads show to ``user``."""
+    if not dataset_ids:
+        return set()
+    user_roles = await get_user_roles(session, user) if user is not None else set()
     stmt = (
         select(Dataset.id)
         .join(Record, Dataset.record_id == Record.id)
-        .where(Dataset.id.in_(layer_dataset_ids))
+        .where(Dataset.id.in_(dataset_ids))
     )
     stmt = apply_visibility_filter(stmt, user, user_roles, Record, DatasetGrant)
-    visible_ids = set((await session.execute(stmt)).scalars().all())
-    return [row for row in layer_rows if row.layer.dataset_id in visible_ids]
+    return set((await session.execute(stmt)).scalars().all())
 
 
 async def _resolve_save_response_metadata(
@@ -328,10 +368,10 @@ async def _resolve_save_response_metadata(
 ) -> tuple[str | None, str | None, datetime | None]:
     """Resolve forked_from_name + owner_username + DB-side updated_at via one LEFT JOIN.
 
-    One atomic query; used by update_map/duplicate_map where map_obj is
-    already in-session (get_map_with_layers keeps its own inline query for a
-    2-query read path). Including ``Map.updated_at`` avoids a separate
-    ``session.refresh(map_obj)`` round-trip for the DB-side onupdate value.
+    One atomic query for update_map/duplicate_map, where map_obj is already
+    in-session (get_map_with_layers keeps its own inline query for a 2-query
+    read path). ``Map.updated_at`` avoids a ``session.refresh(map_obj)``
+    round-trip for the DB-side onupdate value.
     """
     ForkedMap = aliased(Map)
     stmt = (
@@ -345,29 +385,6 @@ async def _resolve_save_response_metadata(
     if row is None:
         return None, None, None
     return row[0], row[1], row[2]
-
-
-def _apply_map_visibility_filter(
-    stmt: Select,
-    user_id: uuid.UUID | None,
-    is_admin: bool,
-) -> Select:
-    """Apply RBAC visibility filter to a Map query.
-
-    - Admins see everything (no filter).
-    - Authenticated users see: their own private maps + all internal + all public.
-    - Anonymous users see public only.
-    """
-    if is_admin:
-        return stmt
-    if user_id is not None:
-        return stmt.where(
-            or_(
-                Map.created_by == user_id,
-                Map.visibility.in_(["internal", "public"]),
-            )
-        )
-    return stmt.where(Map.visibility == "public")
 
 
 def _infer_layer_type(record_type: str | None) -> str:

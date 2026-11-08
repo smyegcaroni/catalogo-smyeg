@@ -1,5 +1,5 @@
 /**
- * fix(#1712): a Service-tab import must survive the form unmounting.
+ * A Service-tab import must survive the form unmounting.
  *
  * The Import page renders tabs conditionally, so switching away mid-preview
  * or mid-commit unmounts ServiceUrlForm. The request keeps running
@@ -7,8 +7,8 @@
  * so if the job id lands in dead component state the user is left with an
  * unreachable pending job until the stale-pending sweep collects it.
  *
- * Mirrors UrlImportForm.unmount.test.tsx (#1708) for the module-scoped
- * session this lane adds, `service-url-session.ts`.
+ * Mirrors UrlImportForm.unmount.test.tsx for the module-scoped
+ * session `service-url-session.ts`.
  */
 import { render, screen, waitFor, act } from '@/test/test-utils';
 import userEvent from '@testing-library/user-event';
@@ -80,6 +80,7 @@ const WFS_PROBE: ProbeResponse = {
       layer_type: 'layer',
       layer_id: null,
       object_id_field: null,
+      importable: true,
       kind: 'vector',
     },
   ],
@@ -218,7 +219,7 @@ describe('ServiceUrlForm unmount survival (#1712)', () => {
     expect(mockCommitImport).toHaveBeenCalledTimes(1);
   });
 
-  // fix(#1834 round 1 P2): a remount used to restore only `previewData` —
+  // A remount used to restore only `previewData`
   // `url`, the credential method, and its fields all came back at
   // component defaults, so a resumed review's eventual `handleCommit`
   // rebuilt `auth` from EMPTY state and the recovered import failed
@@ -279,9 +280,9 @@ describe('ServiceUrlForm unmount survival (#1712)', () => {
   });
 });
 
-// fix(#1835): a restored session used to carry the minted ArcGIS token but
-// not its expiry, so isTokenExpiredOrPast() always read `tokenExpiresAt` as
-// null and a commit could forward an expired token silently.
+// A restored session must carry the minted ArcGIS token's expiry, not just
+// the token: otherwise isTokenExpiredOrPast() reads `tokenExpiresAt` as null
+// and a commit could forward an expired token silently.
 describe('ServiceUrlForm resumed ArcGIS token expiry (#1835)', () => {
   const ARCGIS_URL = 'https://services6.arcgis.com/abcd1234/arcgis/rest/services/Foo/FeatureServer';
   const ARCGIS_PROBE: ProbeResponse = {
@@ -297,6 +298,7 @@ describe('ServiceUrlForm resumed ArcGIS token expiry (#1835)', () => {
         layer_type: 'Feature Layer',
         layer_id: 0,
         object_id_field: 'OBJECTID',
+        importable: true,
         kind: 'vector',
       },
     ],

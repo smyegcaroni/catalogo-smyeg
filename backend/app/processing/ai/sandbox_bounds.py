@@ -1,15 +1,12 @@
 """Cost bounds shared by the two surfaces that reach the SQL sandbox.
 
-fix(#1778): ``POST /api/query/`` and the AI chat ``query_data`` tool are gated
+``POST /api/query/`` and the AI chat ``query_data`` tool are gated
 by the same ``use_ai_chat`` permission, run the same validator and executor,
-and draw on the same connection pool. Every bound feat(#565) installed lived in
-``query_router.py`` and applied to one of them, so each one was opt-out by
-asking the chatbot instead of posting SQL. The comments there reasoned about
-not changing chat's behavior, which was the right question for that PR and the
-wrong one for two surfaces behind one permission.
+and draw on the same connection pool. A bound that applied to only one of
+them would be opt-out by using the other, so the shared bounds live here.
 
-What lives here is the bounds that protect a SHARED resource: the connection
-pool (one semaphore, not one per surface -- two would admit twice the
+Only bounds that protect a SHARED resource live here: the connection pool
+(one semaphore, not one per surface, since two would admit twice the
 concurrency the pool can serve) and the planner's worst-case cardinality.
 Per-surface budgets stay with their surface: the raw endpoint keeps its
 tighter statement timeout and its output-amplification denylist, because those
@@ -31,13 +28,13 @@ from app.core.config import settings
 MAX_TABLE_REPEATS = 2
 
 # Cap on inline VALUES rows: a large constant relation cross-joined a few times
-# is a row explosion the base-table fan-out cap cannot see (#565).
+# is a row explosion the base-table fan-out cap cannot see.
 # Generous enough for real lookup lists; the fan-out cap bounds the cross-join.
 MAX_VALUES_ROWS = 256
 
-# fix(#565): repeated plain projections need no function to amplify --
-# SELECT payload, payload, ... (1600x) FROM foo LIMIT 1 fits under the SQL
-# cap and materializes a gigabyte-wide row.
+# Repeated plain projections need no function to amplify:
+# SELECT payload, payload, ... (1600x) FROM foo LIMIT 1 fits under the SQL cap
+# and materializes a gigabyte-wide row.
 MAX_OUTPUT_COLUMNS = 100
 
 
@@ -53,13 +50,13 @@ def capacity_bound() -> int:
     small calc is repeated.
     """
     if settings.db_use_external_pooler:
-        # fix(#2045 codex r1): a process cannot see how many API replicas share
-        # the pooler, so an explicit per-process share wins whenever it is set.
+        # A process cannot see how many API replicas share the pooler, so an
+        # explicit per-process share wins whenever it is set.
         if settings.sandbox_query_slots is not None:
             return settings.sandbox_query_slots
-        # fix(#2045): NullPool, so the budget belongs to PgBouncer/RDS Proxy and
-        # every uvicorn worker draws on that ONE pooler. Divide the default-pool
-        # throttle by the worker count, never below one, instead of per worker.
+        # NullPool: the budget belongs to PgBouncer/RDS Proxy and every uvicorn
+        # worker draws on that ONE pooler, so divide the default-pool throttle
+        # by the worker count (never below one) instead of granting it per worker.
         return max(1, 4 // max(1, settings.uvicorn_workers))
     overflow = max(0, settings.db_max_overflow)
     return max(1, (settings.db_pool_size + overflow) // 3)

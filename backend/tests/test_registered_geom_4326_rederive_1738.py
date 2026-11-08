@@ -1,4 +1,4 @@
-"""fix(#1738): out-of-band writes to a registered table have to become visible.
+"""Out-of-band writes to a registered table have to become visible.
 
 Registering an existing table copies no data: the catalog points at the live
 relation and every read is served from it. ``geom_4326`` is the exception —
@@ -650,6 +650,176 @@ async def test_the_repair_gives_up_its_lock_queue_position_on_a_busy_table(
         await _drop(test_db_session, table_name)
 
 
+async def _server_has_transaction_timeout(session) -> bool:
+    version = await session.scalar(
+        text("SELECT current_setting('server_version_num')::int")
+    )
+    return version >= 170000
+
+
+async def test_the_whole_repair_transaction_is_bounded(
+    client: AsyncClient, admin_auth_header: dict, test_db_session, monkeypatch
+) -> None:
+    """Statements that each beat the statement deadline still add up; the
+    transaction deadline ends the session, and the refresh still measures."""
+    if not await _server_has_transaction_timeout(test_db_session):
+        pytest.skip("transaction_timeout needs PostgreSQL 17 or later")
+    admin_id = await get_user_id(test_db_session, "admin")
+    table_name = f"rd_txn_{uuid.uuid4().hex[:10]}"
+    await _create_source_table(test_db_session, table_name, lon=_HERE[0], lat=_HERE[1])
+
+    # Long statements keep the deadline well inside one: a deadline that fires
+    # between statements reaches an idle asyncpg connection, which drops the 25P04.
+    async def _slow_rederive(session, *args, **kwargs):
+        for _ in range(3):
+            await session.execute(text("SELECT pg_sleep(0.5)"))
+        raise AssertionError("the transaction deadline should have fired")
+
+    try:
+        dataset = await _register(test_db_session, table_name, admin_id)
+        version_before = await _stored_version(test_db_session, dataset.id)
+
+        monkeypatch.setattr(
+            tasks_postgis_refresh, "_REPAIR_STATEMENT_TIMEOUT_MS", 60_000
+        )
+        monkeypatch.setattr(
+            tasks_postgis_refresh, "_REPAIR_TRANSACTION_TIMEOUT_MS", 750
+        )
+        with patch(
+            "app.processing.ingest.metadata.rederive_geom_4326",
+            new=_slow_rederive,
+        ):
+            report = await tasks_postgis_refresh._repair_geom_4326(
+                dataset.id, Dataset, schema="data", role="geolens_reader"
+            )
+            assert report.code == tasks_postgis_refresh._REPAIR_TIMED_OUT
+            assert report.rows_rewritten == 0
+            assert await _stored_version(test_db_session, dataset.id) == version_before
+
+            payload = await _refresh(
+                test_db_session, client, admin_auth_header, dataset.id
+            )
+
+        job = (
+            await test_db_session.execute(
+                select(IngestJob).where(IngestJob.id == uuid.UUID(payload["job_id"]))
+            )
+        ).scalar_one()
+        await test_db_session.refresh(job)
+        assert job.status == "complete"
+    finally:
+        await _drop(test_db_session, table_name)
+
+
+@pytest.mark.parametrize(
+    ("configured", "repair_bound_ms"),
+    [("10min", 500), ("500ms", 60_000)],
+    ids=["longer-is-replaced", "shorter-is-kept"],
+)
+async def test_an_armed_transaction_timeout_meets_the_repair_bound(
+    test_db_session, monkeypatch, configured: str, repair_bound_ms: int
+) -> None:
+    """A role or database transaction_timeout arms its timer when the
+    transaction begins; whichever of it and the repair bound is shorter
+    applies."""
+    if not await _server_has_transaction_timeout(test_db_session):
+        pytest.skip("transaction_timeout needs PostgreSQL 17 or later")
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.core import db as core_db
+
+    # One pinned connection: a session commit would hand a pooled connection
+    # back, and the repair could check out another without the setting. It is
+    # invalidated afterwards so the setting never reaches the pool.
+    @asynccontextmanager
+    async def _session_with_a_configured_timeout():
+        conn = await core_db.engine.connect()
+        try:
+            await conn.execute(
+                text("SELECT set_config('transaction_timeout', :t, false)"),
+                {"t": configured},
+            )
+            await conn.commit()
+            async with AsyncSession(bind=conn, expire_on_commit=False) as session:
+                yield session
+        finally:
+            await conn.invalidate()
+            await conn.close()
+
+    # One statement, so the deadline can't fire between statements, where an
+    # idle asyncpg connection drops the 25P04.
+    async def _slow_rederive(session, *args, **kwargs):
+        await session.execute(text("SELECT pg_sleep(2)"))
+        raise AssertionError("the repair's transaction deadline should have fired")
+
+    admin_id = await get_user_id(test_db_session, "admin")
+    table_name = f"rd_txarm_{uuid.uuid4().hex[:10]}"
+    await _create_source_table(test_db_session, table_name, lon=_HERE[0], lat=_HERE[1])
+    try:
+        dataset = await _register(test_db_session, table_name, admin_id)
+        monkeypatch.setattr(
+            tasks_postgis_refresh, "_REPAIR_STATEMENT_TIMEOUT_MS", 60_000
+        )
+        monkeypatch.setattr(
+            tasks_postgis_refresh, "_REPAIR_TRANSACTION_TIMEOUT_MS", repair_bound_ms
+        )
+        # A context manager, not monkeypatch: monkeypatch can be undone after
+        # the client fixture restores the real factory, and would then put the
+        # test engine's factory back as the module's async_session.
+        with (
+            patch.object(core_db, "async_session", _session_with_a_configured_timeout),
+            patch(
+                "app.processing.ingest.metadata.rederive_geom_4326",
+                new=_slow_rederive,
+            ),
+        ):
+            report = await tasks_postgis_refresh._repair_geom_4326(
+                dataset.id, Dataset, schema="data", role="geolens_reader"
+            )
+        assert report.code == tasks_postgis_refresh._REPAIR_TIMED_OUT
+    finally:
+        await _drop(test_db_session, table_name)
+
+
+async def test_a_lock_wait_cannot_outlast_the_transaction_bound(
+    test_db_session,
+) -> None:
+    """With the lock timeout far above it, only the transaction deadline can
+    end the wait on another session's lock, and the table is left as it was."""
+    if not await _server_has_transaction_timeout(test_db_session):
+        pytest.skip("transaction_timeout needs PostgreSQL 17 or later")
+    admin_id = await get_user_id(test_db_session, "admin")
+    table_name = f"rd_txlock_{uuid.uuid4().hex[:10]}"
+    await _create_source_table(test_db_session, table_name, lon=_HERE[0], lat=_HERE[1])
+
+    try:
+        dataset = await _register(test_db_session, table_name, admin_id)
+        await test_db_session.execute(
+            text(f'ALTER TABLE data."{table_name}" DROP COLUMN geom_4326')
+        )
+        await test_db_session.commit()
+
+        with (
+            patch.object(tasks_postgis_refresh, "_REPAIR_LOCK_TIMEOUT_MS", 60_000),
+            patch.object(tasks_postgis_refresh, "_REPAIR_STATEMENT_TIMEOUT_MS", 60_000),
+            patch.object(tasks_postgis_refresh, "_REPAIR_TRANSACTION_TIMEOUT_MS", 300),
+        ):
+            await test_db_session.execute(text(f'SELECT 1 FROM data."{table_name}"'))  # noqa: S608
+
+            started = time.perf_counter()
+            report = await tasks_postgis_refresh._repair_geom_4326(
+                dataset.id, Dataset, schema="data", role="geolens_reader"
+            )
+            elapsed = time.perf_counter() - started
+
+        assert report.code == tasks_postgis_refresh._REPAIR_TIMED_OUT
+        assert elapsed < 5
+        await test_db_session.rollback()
+        assert not await _column_exists(test_db_session, table_name, "geom_4326")
+    finally:
+        await _drop(test_db_session, table_name)
+
+
 # ---------------------------------------------------------------------------
 # The grant and the index are not conditional on the re-derive
 # ---------------------------------------------------------------------------
@@ -664,9 +834,9 @@ async def test_a_recreated_generated_column_gets_its_index_and_grant_back(
     table recreated with a valid STORED GENERATED `geom_4326` re-derives
     itself on every write, so the repair has nothing to do to the column — and
     gating the other two restorations on the re-derive let exactly that table
-    pass a refresh unreadable by `geolens_reader` (fix(#1738 round 1)) and
+    pass a refresh unreadable by `geolens_reader` and
     with no GiST index behind the `geom_4326 && <envelope>` predicate every
-    reader issues (fix(#1738 round 2)).
+    reader issues.
 
     A generated column is the case that isolates them: it is the one shape
     where the render values are already correct and the two things around
@@ -729,7 +899,7 @@ async def test_a_recreated_generated_column_gets_its_index_and_grant_back(
 async def test_a_registered_non_spatial_table_is_not_a_repair_failure(
     test_db_session,
 ) -> None:
-    """fix(#1738 round 1): `Find_SRID` raises; it does not return NULL.
+    """`Find_SRID` raises; it does not return NULL.
 
     Registration admits tables with no geometry (#1359), and resolving the
     source SRID before knowing whether there IS one turned every refresh of
@@ -780,7 +950,7 @@ async def test_a_registered_non_spatial_table_is_not_a_repair_failure(
 async def test_the_version_bump_does_not_lose_a_concurrent_increment(
     test_db_session,
 ) -> None:
-    """fix(#1738 round 1): the counter is incremented in the database.
+    """The counter is incremented in the database.
 
     The repair holds no lock on the datasets row, and the feature-edit
     routers roll the counter through a plain read-modify-write without one

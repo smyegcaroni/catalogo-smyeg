@@ -1,10 +1,10 @@
 /**
- * feat(#1486): the credit line drawn into every rendered map image.
+ * The credit line drawn into every rendered map image.
  *
  * The fitter is the only piece with real logic, so it carries most of these
  * tests. Its stub context measures LENGTH-PROPORTIONALLY (`chars * 0.5 *
  * fontPx`): a constant-width stub cannot exercise a wrap boundary at all,
- * which is how #1541's dropped credits went unseen at this level.
+ * which would let dropped credits go unseen at this level.
  */
 import { describe, it, expect, vi } from 'vitest';
 import {
@@ -69,7 +69,7 @@ function mapWithControl(text: string | null) {
 }
 
 describe('readRenderedAttribution', () => {
-  /* fix(#1541 codex P2): the credit list is never re-derived by splitting a
+  /* The credit list is never re-derived by splitting a
    * joined string. ` | ` is legal content inside a 5,000-character credit, so
    * any delimiter round-trip can cut one credit into two — or, via the dedupe,
    * delete half of one outright. Structured sources first; the rendered control
@@ -187,7 +187,7 @@ describe('readRenderedAttribution', () => {
     expect(readRenderedAttribution({ ...mapWithControl('   ') })).toEqual([]);
   });
 
-  /* fix(#1541 codex P2 round 3): a credit is HTML — `BasemapEntry.attribution`
+  /* A credit is HTML — `BasemapEntry.attribution`
    * permits it and MapLibre renders it — so a provider may credit itself with a
    * logo. An image's text alternative is not DOM text, so a `textContent` read
    * returned '' and the source was skipped: the interactive map showed the
@@ -234,7 +234,7 @@ describe('readRenderedAttribution', () => {
   });
 
   it('prefers aria-label over alt over title', () => {
-    // fix(#1541 codex P2 round 7): ARIA OVERRIDES the host-language attribute
+    // ARIA OVERRIDES the host-language attribute
     // in the accessible name computation; it does not follow it.
     expect(
       readRenderedAttribution(
@@ -377,13 +377,13 @@ describe('readRenderedAttribution', () => {
     expect(readRenderedAttribution(control('<img src="https://a.example/l.gif" alt="">'))).toEqual([
       '(image credit: a.example)',
     ]);
-    // And so is markup that renders without naming itself (round 8).
+    // And so is markup that renders without naming itself.
     expect(readRenderedAttribution(control('<svg><path d="M0 0h4v4H0z"/></svg>'))).toEqual([
       '(image credit)',
     ]);
   });
 
-  /* fix(#1541 codex P2 round 4): honouring alt="" opened the gap beside it.
+  /* Honouring alt="" opened the gap beside it.
    * The shortcut ran BEFORE the ARIA alternatives, and a source whose whole
    * attribution reduced to nothing was dropped from the list entirely — so it
    * was counted nowhere, marker included. */
@@ -421,7 +421,7 @@ describe('readRenderedAttribution', () => {
     expect(credits).toEqual(['© Named Provider', '(image credit: logo.example.com)']);
   });
 
-  /* fix(#1541 codex P2 round 8): the unnameable-credit fallback recognised
+  /* The unnameable-credit fallback recognised
    * only <img>, so an unlabelled inline <svg> or a CSS-backed logo — both of
    * which MapLibre renders visibly — derived no text, matched no image, and
    * vanished without even reaching the marker. The test is now the question
@@ -455,7 +455,7 @@ describe('readRenderedAttribution', () => {
     expect(readRenderedAttribution(sourcesMap('   ', '\n\t'))).toEqual([]);
   });
 
-  /* feat(#1553 candidate 4): <object>, <embed>, <iframe> and <video> render
+  /* <object>, <embed>, <iframe> and <video> render
    * perfectly visibly in the on-screen control — MapLibre's sanitizer strips
    * only <script>, on* handlers and javascript:/data: URLs — and none of them
    * derives DOM text. They take the same treatment as an unnamed <img>:
@@ -523,7 +523,7 @@ describe('readRenderedAttribution', () => {
     ).toEqual(['(image credit)']);
   });
 
-  /* fix(#1541 codex P1): "no `used` gating — over-crediting is the safe
+  /* "no `used` gating — over-crediting is the safe
    * direction" was true while the band could grow without limit. Once the
    * outputs gained a capacity limit and a prefix fit, an unused credit stopped
    * being extra information and became a credit that DISPLACES a required one,
@@ -612,7 +612,7 @@ describe('readRenderedAttribution', () => {
     expect(credits).toEqual(['© Other', '© Shared']);
   });
 
-  /* fix(#1541 codex P2 round 7): the zoom range is the other half of
+  /* The zoom range is the other half of
    * MapLibre's own `isHidden`, so a visible layer outside its range leaves its
    * source unused — and could displace the credit for what IS rendering. */
 
@@ -690,7 +690,7 @@ describe('readRenderedAttribution', () => {
   });
 
   it('counts a filter-excluded source as shown, exactly as the control does', () => {
-    // feat(#1553 candidate 2), settled by parity rather than by evaluation:
+    // Settled by parity with the control rather than by evaluation:
     // MapLibre sets `used` from `!layer.isHidden(zoom)` alone (verified in the
     // 6.5.0 source), so a layer whose filter matches no feature still puts its
     // source's credit in the on-screen control. Matching the control means
@@ -712,7 +712,7 @@ describe('readRenderedAttribution', () => {
     expect(credits).toEqual(['© Filtered But Credited', '© Plain']);
   });
 
-  /* feat(#1553 candidate 1): the priority set reads MapLibre's OWN live
+  /* The priority set reads MapLibre's OWN live
    * `used`/`usedForTerrain` flags — the exact state the on-screen control
    * renders from (`map.style.tileManagers` in 6.5.0) — whenever the map
    * exposes them, so the partition cannot drift from the control. The modeled
@@ -830,7 +830,7 @@ describe('readRenderedAttribution', () => {
     expect(credits).toEqual(['© Provider']);
   });
 
-  /* fix(#1541 codex P2 round 8): MapLibre's AttributionControl drops an entry
+  /* MapLibre's AttributionControl drops an entry
    * another entry contains whole, so `© Acme` beside `© Acme — CC BY 4.0`
    * showed once on screen and twice in the image. Asymmetric failure: source
    * order could let the redundant fragment take the budget and leave the
@@ -875,7 +875,7 @@ describe('readRenderedAttribution', () => {
   });
 
   it('collapses raw-distinct credits whose rendered text is identical', () => {
-    // chore(#1553 candidate 3): the one DELIBERATE divergence from the
+    // The one DELIBERATE divergence from the
     // control's dedupe, which compares raw HTML and renders `© OSM | © OSM`
     // for two anchors differing only in href. Text is what the image renders,
     // so text-identical credits are visual duplicates here and keep one line.
@@ -905,7 +905,7 @@ describe('readRenderedAttribution', () => {
     ]);
   });
 
-  /* fix(#1541 codex P2 round 6): terrain renders with NO style layer of its
+  /* Terrain renders with NO style layer of its
    * own — `ensureRasterDemTerrainSource` (map-sync.ts) creates an attributed
    * source and lets MapLibre count it through `usedForTerrain` — so defining
    * "shown" as "referenced by a layer" put the credit for plainly visible 3D
@@ -1009,7 +1009,7 @@ describe('readRenderedAttribution', () => {
   });
 });
 
-/* fix(#1541 codex P1 x2): every output used to elide — the export band via a
+/* Every output used to elide — the export band via a
  * two-line budget that contradicted its own docstring, the two crops via
  * `maxLines: 1`. The measured live failure was five credits on a 1056px export
  * losing two, the basemap's included. There is no elision path left, and these
@@ -1147,7 +1147,7 @@ describe('fitAttributionText', () => {
   });
 });
 
-/* fix(#1541 codex P2): mid-STRING wrapping is the one residual limit we allow.
+/* Mid-STRING wrapping is the one residual limit we allow.
  * Mid-CHARACTER is truncation in disguise — a surrogate pair split across two
  * drawn lines renders replacement glyphs where the provider's name should be. */
 describe('grapheme safety in the wrapping path', () => {
@@ -1236,7 +1236,7 @@ describe('drawAttributionOverlay', () => {
     expect(ctx.fillText).toHaveBeenCalledWith('© A | © B', expect.any(Number), expect.any(Number));
   });
 
-  // The second codex P1. These crops cannot grow, so they spend map pixels.
+  // These crops cannot grow, so they spend map pixels.
   it('wraps to multiple lines rather than dropping a credit on the thumbnail', () => {
     const ctx = makeCtx();
     const canvas = makeCanvas(400, 250, ctx);
@@ -1284,7 +1284,7 @@ describe('drawAttributionOverlay', () => {
   });
 });
 
-/* fix(#1541 codex P1): the documented legibility floor, as assertions rather
+/* The documented legibility floor, as assertions rather
  * than as prose. Removing the fitter's elision left exactly one way for a crop
  * to lose a credit — a band taller than the image it annotates — and these pin
  * both where that is and that it is loud when reached. */
@@ -1336,7 +1336,7 @@ describe('overlayLineCapacity: the documented ceiling', () => {
     expect(measured.lines.length).toBeLessThan(20);
   });
 
-  /* fix(#1541 codex P1 round 2): the schema accepts 5,000 characters per
+  /* The schema accepts 5,000 characters per
    * credit (datasets/domain/schemas.py, processing/ingest/manifest_schemas.py).
    * That is ~77 lines in a 250px thumbnail — unrenderable at any legible size.
    * So the invariant is asserted at the CONTRACT's maximum, not at the 411
@@ -1426,7 +1426,7 @@ describe('overlayLineCapacity: the documented ceiling', () => {
   });
 
   it("counts CREDITS not fragments when credits contain the separator", () => {
-    // fix(#1541 codex P2): the marker's N used to be derived from a joined
+    // The marker's N used to be derived from a joined
     // string re-split on ` | `, so a credit containing the separator inflated
     // the count and could be cut in half with its remainder counted as another
     // provider. Each of these is ONE credit that happens to contain ` | `.
@@ -1544,7 +1544,7 @@ describe('measureAttributionBand / drawAttributionBand', () => {
   });
 });
 
-/* fix(#1541 codex P2 round 2): the export band is bounded too.
+/* The export band is bounded too.
  *
  * #1541 review had ruled its growth unlimited, on the reasoning that the export
  * canvas is sized after the band is measured and so has no height constraint.
@@ -1575,8 +1575,8 @@ describe('export canvas ceiling', () => {
   const RESERVED = 632;
 
   it('budgets against the smallest measured engine ceiling, not the roomiest', () => {
-    // fix(#1541 codex P2 round 4): the area cap is iOS Safari's 4,096² and NOT
-    // a desktop figure. codex's case: an iPad's 2048x2732 canvas is valid and
+    // The area cap is iOS Safari's 4,096² and NOT
+    // a desktop figure. Example: an iPad's 2048x2732 canvas is valid and
     // exports today, and the desktop budget let the band grow it past 8,192px
     // high, where toBlob returns null and the export produces nothing.
     expect(EXPORT_CANVAS_MAX_AREA).toBe(4096 * 4096);
@@ -1603,11 +1603,11 @@ describe('export canvas ceiling', () => {
     expect(attributionBandLineCapacity(10, 1)).toBe(0);
   });
 
-  /* fix(#1541 codex P2 round 5): the budget used to be floored at one minimum
+  /* The budget used to be floored at one minimum
    * band, which overran the very ceiling it sat inside — a floor and a ceiling
    * that did not know about each other. It never exceeds actual headroom now,
    * and under one line's worth it declines rather than drawing something
-   * invalid. codex's case is the first assertion. */
+   * invalid. The first assertion covers that case. */
 
   it('never exceeds actual headroom, even to keep one line', () => {
     // width 2048, dpr 2, 8,140px reserved: 52px of headroom against an 8,192px
@@ -1704,7 +1704,7 @@ describe('export canvas ceiling', () => {
   });
 });
 
-/* feat(#1553): the layout fits only what the budget can hold. The bound is
+/* The layout fits only what the budget can hold. The bound is
  * sound only if it cannot change an answer, which these assert — including on
  * the word-wrapper path, where a misplaced bound would pick the wrong one. */
 describe('bounded layout (#1553)', () => {

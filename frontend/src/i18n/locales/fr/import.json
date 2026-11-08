@@ -52,6 +52,7 @@
       "grid_misaligned": "Les dimensions de la grille ne correspondent pas"
     },
     "searchError": "Impossible de charger les résultats",
+    "searchRateLimited": "La recherche est temporairement limitée. Réessayez dans un instant.",
     "bandCount_one": "{{count}} bande",
     "bandCount_other": "{{count}} bandes",
     "resolutionValue": "Résolution : {{value}}"
@@ -101,6 +102,7 @@
     "mercatorClip": {
       "title": "Géométrie en dehors des limites Web Mercator",
       "description": "GeoLens diffuse des tuiles Web Mercator, qui couvrent les longitudes de -180° à 180° et les latitudes de -85,06° à 85,06°. La géométrie située en dehors de ce cadre a été découpée lors de l'importation. Les lignes restent dans le jeu de données : seule leur géométrie a changé. Vérifiez à la fois l'ordre et la plage des coordonnées source.",
+      "polarDescription": "GeoLens sert des tuiles Web Mercator, qui s'arrêtent aux latitudes -85,06° et 85,06°. Les entités proches des pôles ont été tronquées à cette limite lors de l'import. C'est normal pour des données mondiales, et le reste de chaque ligne est inchangé.",
       "skippedDescription": "Le système de coordonnées source a une zone de validité étroite : les limites Web Mercator n'ont pas pu y être exprimées et la vérification des limites a été ignorée. Aucune géométrie n'a été supprimée, mais une géométrie en dehors des longitudes -180° à 180° ou des latitudes -85,06° à 85,06° peut subsister et ne s'affichera pas sur la carte.",
       "dropped_one": "{{count}} entité a perdu toute sa géométrie",
       "dropped_other": "{{count}} entités ont perdu toute leur géométrie",
@@ -144,7 +146,7 @@
     "tilesetSubtext": "GeoLens vérifie chaque archive et lit son tileset.json avant tout stockage."
   },
   "stac": {
-    "label": "URL de l'API STAC; collez le point d'accès racine du catalogue",
+    "label": "URL de l'API STAC · collez le point d'accès racine du catalogue",
     "connect": "Connecter",
     "connecting": "Connexion au catalogue STAC...",
     "searching": "Recherche d'éléments...",
@@ -165,9 +167,11 @@
     "failureGroupCount_one": "{{count}} élément",
     "failureGroupCount_other": "{{count}} éléments",
     "failureUnknown": "Erreur inconnue",
+    "itemErrorImportFailed": "Cet élément n'a pas pu être importé.",
+    "itemErrorTooLong": "L'identifiant de l'élément ou le lien de la ressource est trop long pour être enregistré.",
     "importMore": "Importer davantage",
     "backToResults": "Retour aux résultats",
-    "catalogConnected": "Catalogue STAC; connecté",
+    "catalogConnected": "Catalogue STAC · connecté",
     "clear": "Effacer",
     "collectionsAvailable_one": "{{count}} collection disponible",
     "collectionsAvailable_other": "{{count}} collections disponibles",
@@ -237,7 +241,6 @@
   "serviceUrl": {
     "label": "URL de service",
     "placeholder": "https://example.com/wfs, ArcGIS FeatureServer, ou endpoint OGC API",
-    "helpText": "Collez une URL de service WFS, ArcGIS Feature Service ou OGC API Features",
     "arcgisPortalUrlHint": "Il semble s’agir d’une page d’organisation ou de portail ArcGIS, pas d’une couche. Ouvrez la page de l’élément de la couche, copiez son URL REST (elle se termine par /FeatureServer/0 ou /MapServer/0) et collez-la ici. Les couches protégées demandent une connexion une fois l’URL de la couche collée.",
     "tokenPlaceholder": "Jeton ArcGIS, clé API ou jeton d'accès WFS",
     "credentialMethodLabel": "Authentification",
@@ -261,7 +264,7 @@
     "connectFailed": "Échec de la connexion au service",
     "previewFailed": "Échec de l'aperçu de la couche",
     "commitFailed": "Échec du lancement de l'importation",
-    "detectedLabel": "URL de service; détectée",
+    "detectedLabel": "URL de service · détectée",
     "clear": "Effacer",
     "layersAvailable_one": "{{count}} calque disponible",
     "layersAvailable_other": "{{count}} calques disponibles",
@@ -293,7 +296,7 @@
     "arcgisTokenExpiredMidImport": "Votre connexion ArcGIS a expiré pendant que cette fenêtre était ouverte. Revenez en arrière et reconnectez-vous pour continuer."
   },
   "urlImport": {
-    "label": "URL de fichier; récupérée côté serveur",
+    "label": "URL de fichier · récupérée côté serveur",
     "placeholder": "https://data.source.coop/…/buildings.parquet",
     "fetch": "Récupérer →",
     "fetching": "Téléchargement du fichier...",
@@ -319,7 +322,6 @@
     "downloadFailed": "Le serveur n'a pas pu télécharger le fichier depuis cette URL"
   },
   "register": {
-    "helpText": "Cataloguez des tables PostGIS existantes de votre base de données en tant que jeux de données dans GeoLens. Utilisez cette option lorsque vous avez des données géographiques déjà dans la base de données qui n'ont pas été importées via GeoLens. Les tables sélectionnées seront ajoutées au catalogue avec détection automatique des métadonnées.",
     "discovering": "Recherche des tables...",
     "discoverFailed": "Échec de la découverte des tables :",
     "emptyState": "Aucune table non enregistrée trouvée dans la base de données.",
@@ -333,6 +335,7 @@
     },
     "visibilityLabel": "Visibilité",
     "visibilityPrivate": "Privé",
+    "visibilityInternal": "Interne",
     "visibilityPublic": "Publique",
     "registering": "Enregistrement...",
     "registerButton_one": "Enregistrer {{count}} table",
@@ -350,7 +353,6 @@
       "source_srid_undeclared": "Sa colonne geom ne déclare aucun SRID, donc GeoLens ne peut pas savoir où se trouvent ses coordonnées. Définissez le SRID, par exemple avec UpdateGeometrySRID, puis enregistrez la table.",
       "source_gid_unusable": "GeoLens identifie les entités par une colonne nommée gid : un entier NOT NULL et unique, comme une clé primaire, dans une table dont aucune autre table n'hérite. Cette table ne remplit pas cette condition. Ajoutez ou corrigez la colonne gid, ou renommez celle que GeoLens ne peut pas utiliser pour qu'il ajoute la sienne, puis enregistrez la table."
     },
-    "unknownError": "Erreur inconnue",
     "searchPlaceholder": "Rechercher des tables…",
     "selectHint": "Sélectionnez une table dans la liste pour voir son schéma et l'enregistrer.",
     "detailDesc": "Enregistrer comme jeu de données GeoLens; tuilé à la volée, aucune copie.",
@@ -367,19 +369,7 @@
     "tablesSidebarLabel": "Tables découvertes"
   },
   "layerPicker": {
-    "title": "Sélectionner une couche",
-    "emptyState": "Aucune couche trouvée dans ce service",
-    "columnName": "Nom",
-    "columnGeometry": "Type de géométrie",
-    "columnFeatureCount": "Nombre d'entités",
-    "previewLayer": "Aperçu de la couche"
-  },
-  "tablePicker": {
-    "selectAll": "Tout sélectionner ({{count}} table)",
-    "selectAll_one": "Tout sélectionner ({{count}} table)",
-    "selectAll_other": "Tout sélectionner ({{count}} tables)",
-    "nonSpatial": "non spatiale",
-    "estimatedRows": "~{{count}} lignes"
+    "title": "Sélectionner une couche"
   },
   "preview": {
     "title": "Aperçu du fichier",
@@ -411,11 +401,9 @@
     "nameLabel": "Nom *",
     "descriptionLabel": "Description",
     "descriptionPlaceholder": "Description facultative",
-    "tagsLabel": "Étiquettes",
-    "tagsPlaceholder": "étiquette1, étiquette2, étiquette3",
-    "tagsHelpText": "Séparés par des virgules",
     "visibilityLabel": "Visibilité",
     "visibilityPrivate": "Privé",
+    "visibilityInternal": "Interne",
     "visibilityPublic": "Publique",
     "crsLabel": "Remplacement du SCR",
     "crsPlaceholderDetected": "Laissez vide pour utiliser le SCR détecté ({{crs}})",
@@ -561,9 +549,6 @@
   "bulk": {
     "uploading_one": "Téléchargement de {{count}} fichier...",
     "uploading_other": "Téléchargement de {{count}} fichiers...",
-    "statusUploading": "Téléchargement...",
-    "statusPreviewing": "Génération de l'aperçu...",
-    "statusReady": "Prêt",
     "fileCount_one": "{{count}} fichier prêt pour l'importation",
     "fileCount_other": "{{count}} fichiers prêts pour l'importation",
     "importAllDefaults": "Tout importer avec les paramètres par défaut",
@@ -593,7 +578,8 @@
     "ingestAllLayers": "Ingérer les {{count}} couches comme jeux de données séparés",
     "activeJobs": "Tâches actives et récentes",
     "detectingHint": "Chargement & détection…",
-    "importingFiles": "Importation de {{count}} fichiers",
+    "importingFiles_one": "Importation de {{count}} fichier",
+    "importingFiles_other": "Importation de {{count}} fichiers",
     "progressDetail": "{{done}} terminé · {{active}} en cours · {{queued}} en attente",
     "uploadProgressLabel": "Progression du téléversement de {{name}}",
     "toggleDetails": "Afficher ou masquer les détails de {{name}}",

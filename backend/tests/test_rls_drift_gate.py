@@ -1,4 +1,4 @@
-"""ISO-03 mode-aware RLS drift gate (Phase 1208-03).
+"""Mode-aware RLS drift gate.
 
 Reflects ``pg_policies`` + ``pg_class.relrowsecurity/relforcerowsecurity`` for
 the tenant-shared control-plane boundary and compares the live state to the
@@ -55,6 +55,14 @@ _RLS_TABLES = [
     "oauth_accounts",
     "audit_logs",
     "ingest_jobs",
+    "groups",
+    "group_members",
+    "dataset_group_grants",
+    "map_group_grants",
+    "stories",
+    "story_maps",
+    "story_assets",
+    "story_group_grants",
 ]
 
 _POLICY_NAMES = [f"tenant_isolation_{t}" for t in _RLS_TABLES]
@@ -119,7 +127,15 @@ async def _reflect_rls_flags(db_url: str) -> dict[str, dict[str, bool]]:
                             'catalog.embed_tokens'::regclass,
                             'catalog.oauth_accounts'::regclass,
                             'catalog.audit_logs'::regclass,
-                            'catalog.ingest_jobs'::regclass
+                            'catalog.ingest_jobs'::regclass,
+                            'catalog.groups'::regclass,
+                            'catalog.group_members'::regclass,
+                            'catalog.dataset_group_grants'::regclass,
+                            'catalog.map_group_grants'::regclass,
+                            'catalog.stories'::regclass,
+                            'catalog.story_maps'::regclass,
+                            'catalog.story_assets'::regclass,
+                            'catalog.story_group_grants'::regclass
                         ]
                     )
                     ORDER BY relname
@@ -182,7 +198,7 @@ def _assert_policies_match_snapshot(
             f"  Snapshot with_check: {snap['with_check']!r}"
         )
 
-        # 2. IS NULL escape forbidden (fail-open regression — ISO-02).
+        # 2. IS NULL escape forbidden (fail-open regression).
         assert "IS NULL" not in qual.upper(), (
             f"ISO-03 DRIFT: Policy {name!r} qual contains IS NULL "
             f"(fail-open escape — forbidden by ISO-02).\n"
@@ -256,7 +272,7 @@ class TestSingleTenantSnapshot:
         """Every reviewed tenant_isolation_* policy exists in pg_policies."""
         from app.core.config import settings
 
-        live = await _reflect_policies(settings.database_url)
+        live = await _reflect_policies(settings.test_database_url)
         snap = _load_snapshot()
         _assert_policies_match_snapshot(live, snap)
 
@@ -264,7 +280,7 @@ class TestSingleTenantSnapshot:
         """relrowsecurity=False + relforcerowsecurity=False in single_tenant."""
         from app.core.config import settings
 
-        live_flags = await _reflect_rls_flags(settings.database_url)
+        live_flags = await _reflect_rls_flags(settings.test_database_url)
         snap = _load_snapshot()
         _assert_rls_flags_match_snapshot(live_flags, snap, "single_tenant")
 
@@ -272,7 +288,7 @@ class TestSingleTenantSnapshot:
         """No policy qual or with_check contains IS NULL (no fail-open escape)."""
         from app.core.config import settings
 
-        live = await _reflect_policies(settings.database_url)
+        live = await _reflect_policies(settings.test_database_url)
         for policy in live:
             qual = policy["qual"] or ""
             with_check = policy["with_check"] or ""

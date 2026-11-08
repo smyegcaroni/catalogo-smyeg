@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { DEFAULT_PAGE_SIZE } from '@/lib/constants';
 
 /** Valid keys for setFilter — excludes methods and non-filter state fields. */
-export type SearchFilterKey =
+type SearchFilterKey =
   | 'q'
   | 'bbox'
   | 'keywords'
@@ -86,9 +86,9 @@ const initialState = {
 };
 
 /**
- * Sort order and page size are the only state that survives an
- * identity change. The exported list lets the store test classify new fields;
- * spatialPanelOpen resets so uncommitted spatial drafts unmount with it.
+ * Sort order and page size are the only state that survives an identity change.
+ * The exported list lets the store test classify new fields; spatialPanelOpen
+ * resets so uncommitted spatial drafts unmount with it.
  */
 export const SEARCH_PRESENTATION_PREFERENCE_KEYS: readonly (keyof typeof initialState)[] = [
   'sort_by',

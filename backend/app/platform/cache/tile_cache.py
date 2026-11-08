@@ -5,19 +5,18 @@ Stores gzip-compressed MVT tile bytes with configurable TTL, using
 RedisCacheProvider). All Redis errors are caught and logged, never
 propagated to callers.
 
-PERF-01: when ``REDIS_URL`` is unset, ``InMemoryTileCacheProvider`` gives a
-bounded LRU fallback (~50k entries, ~200MB at ~4KB/tile) with matching TTL
-semantics (default 300s, per-call override).
+When ``REDIS_URL`` is unset, ``InMemoryTileCacheProvider`` gives an
+LRU fallback bounded by bytes with matching TTL semantics (default 300s,
+per-call override).
 
-PERF-11: hit/miss counters carry a ``table_name`` label; ``_safe_label``
+Hit/miss counters carry a ``table_name`` label; ``_safe_label``
 bounds cardinality by collapsing anything not matching the documented
 ``data.*`` shape to ``"_other"``.
 
-fix(#1429): the ``table`` argument is the tile router's composite segment
+The ``table`` argument is the tile router's composite segment
 (tenant id, dataset id, cluster params) and never matches ``_safe_label``'s
-shape, so deriving the metric label from it collapsed everything to
-``"_other"``. Readers now pass the bare table name separately as ``label``.
-Invalidation is unaffected: the dataset id sits AFTER the table segment, so
+shape, so readers pass the bare table name separately as ``label``.
+Invalidation still works: the dataset id sits AFTER the table segment, so
 ``tile:{table}:*`` still matches every key for a table regardless of which
 dataset wrote it.
 """
@@ -27,12 +26,13 @@ import time
 
 import redis.asyncio as redis_async
 import structlog
-from cachetools import LRUCache  # PERF-01 (Phase 274)
+from cachetools import LRUCache
 from prometheus_client import Counter
+
+from app.platform.redis_protocol import REDIS_PROTOCOL
 
 logger = structlog.stdlib.get_logger(__name__)
 
-# PERF-11: per-table cache observability (cardinality bounded by _safe_label).
 tile_cache_hits = Counter(
     "geolens_tile_cache_hits_total",
     "Total tile cache hits",
@@ -51,7 +51,7 @@ _SAFE_TABLE_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 
 def _safe_label(table: str) -> str:
-    """Bound Prometheus label cardinality (PERF-11): ``table`` if it matches
+    """Bound Prometheus label cardinality: ``table`` if it matches
     the documented dataset-table shape, else ``"_other"`` so an unsanitized
     identifier can't pollute the Prometheus label index.
     """
@@ -80,7 +80,9 @@ class TileCacheProvider:
     """
 
     def __init__(self, url: str) -> None:
-        self._client = redis_async.from_url(url, decode_responses=False)
+        self._client = redis_async.from_url(
+            url, decode_responses=False, protocol=REDIS_PROTOCOL
+        )
 
     async def get(
         self,
@@ -94,8 +96,8 @@ class TileCacheProvider:
         """Return cached tile bytes or None on miss/error.
 
         `cols_key` differentiates tiles for the same table/z/x/y with
-        different column projections; empty string preserves the original
-        key shape. `label` is the bare table name for the PERF-11 metric.
+        different column projections. `label` is the bare table name for the
+        metric.
         """
         suffix = f":{cols_key}" if cols_key else ""
         key = f"tile:{table}:{z}:{x}:{y}{suffix}"
@@ -158,20 +160,32 @@ class TileCacheProvider:
         return True
 
 
+# Tiles run from a few KB to several hundred KB on wide tables, so the budget
+# is in bytes: a count bound could hold tens of gigabytes.
+_MEMORY_TILE_BUDGET_BYTES = 256 * 1024 * 1024
+_TILE_ENTRY_OVERHEAD_BYTES = 256
+
+
+def _tile_entry_size(entry: tuple[bytes, float]) -> int:
+    return len(entry[0]) + _TILE_ENTRY_OVERHEAD_BYTES
+
+
 class InMemoryTileCacheProvider:
     """In-memory LRU fallback for tile cache when REDIS_URL is unset.
 
-    Bounded LRU + per-entry TTL (~50k entries, ~200MB at ~4KB/tile).
-    Interface matches ``TileCacheProvider`` -- same async
-    ``get/set/invalidate_table`` signatures, so callers need zero changes.
+    LRU bounded by tile bytes + per-entry TTL, with the same interface as
+    ``TileCacheProvider``.
 
     ``cachetools`` has no per-key TTL (``TTLCache`` is one global TTL), so
     entries are stored as ``(value, expires_at_monotonic)`` and checked on
-    read; ``maxsize`` bounds memory, expired entries drop lazily.
+    read; ``maxsize`` bounds bytes, expired entries drop lazily. A tile larger
+    than the whole budget is not cached.
     """
 
-    def __init__(self, max_entries: int = 50_000) -> None:
-        self._cache: LRUCache[str, tuple[bytes, float]] = LRUCache(maxsize=max_entries)
+    def __init__(self, max_bytes: int = _MEMORY_TILE_BUDGET_BYTES) -> None:
+        self._cache: LRUCache[str, tuple[bytes, float]] = LRUCache(
+            maxsize=max_bytes, getsizeof=_tile_entry_size
+        )
 
     async def get(
         self,
@@ -211,13 +225,17 @@ class InMemoryTileCacheProvider:
         """Store tile bytes with TTL. LRU evicts oldest when at capacity."""
         suffix = f":{cols_key}" if cols_key else ""
         key = f"tile:{table}:{z}:{x}:{y}{suffix}"
-        self._cache[key] = (data, time.monotonic() + ttl)
+        entry = (data, time.monotonic() + ttl)
+        if _tile_entry_size(entry) > self._cache.maxsize:
+            self._cache.pop(key, None)
+            return
+        self._cache[key] = entry
 
     async def invalidate_table(self, table: str) -> bool:
         """Delete all cached tiles for a table.
 
         Hosted invalidation is restricted to the active tenant's exact prefix;
-        single-tenant deployments retain the historical bare-table shape.
+        single-tenant deployments use the bare table name.
         """
         scoped_table = _invalidation_table_segment(table)
         prefix = f"tile:{scoped_table}:"

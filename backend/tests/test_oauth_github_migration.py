@@ -1,4 +1,4 @@
-"""Migration round-trip + constraint-state regression for Phase 1237 (GitHub provider type).
+"""Migration round-trip + constraint-state regression for the GitHub provider type.
 
 Verifies the 0010_oauth_github_provider_type migration:
   - Adds 'github' to the chk_oauth_providers_type CHECK constraint
@@ -300,7 +300,7 @@ class TestSamlRetainedOnDowngrade:
 
         try:
             # Downgrade BELOW 0010 (removes 'github', keeps 'saml').
-            # fix(#430): target 0010's parent explicitly — a relative "-1" was
+            # Target 0010's parent explicitly — a relative "-1" was
             # head-coupled and stopped landing below 0010 the moment a newer
             # migration (0011_allow_generic_geometry_type) became head.
             r = _run_alembic("downgrade", "0009_email_verification")

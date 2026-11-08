@@ -13,6 +13,7 @@ from pydantic import (
     model_validator,
 )
 
+from app.core.text import normalize_nfc
 from app.modules.auth.schemas import VALID_ROLES, UserResponse, validate_future_expiry
 from app.processing.ai.schemas import AIProbeReport
 
@@ -44,10 +45,10 @@ ShareTokenSortField = Literal[
 SortDirection = Literal["asc", "desc"]
 
 
-# fix(#1715): single shared password-policy wiring for every admin schema that
-# accepts a password; rules live in auth/password_policy.py.
+# Password-policy wiring for every admin schema that accepts a password; the
+# rules live in auth/password_policy.py.
 def _enforce_password_policy(value: str) -> str:
-    """Enforce the application password policy (SEC-S16, Phase 1062-01)."""
+    """Enforce the application password policy."""
     from app.modules.auth.password_policy import validate_password_from_settings  # noqa: PLC0415
 
     validate_password_from_settings(value)
@@ -224,6 +225,56 @@ class UserListResponse(BaseModel):
     )
 
 
+class GroupWrite(BaseModel):
+    name: str = Field(
+        min_length=1,
+        max_length=255,
+        description=(
+            "Group name, unique across the instance. Leading and trailing "
+            "whitespace is removed."
+        ),
+        json_schema_extra={"example": "Planning"},
+    )
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalize_name(cls, value: object) -> object:
+        if isinstance(value, str):
+            return normalize_nfc(value.strip())
+        return value
+
+
+class GroupResponse(BaseModel):
+    id: uuid.UUID = Field(description="Unique group identifier.")
+    name: str = Field(description="Group name.")
+    member_count: int = Field(description="Number of users in the group.")
+    created_at: datetime = Field(description="When the group was created.")
+    updated_at: datetime = Field(description="When the group was last renamed.")
+
+
+class GroupListResponse(BaseModel):
+    groups: list[GroupResponse] = Field(description="Page of groups, by name.")
+    total: int = Field(description="Total number of groups (across all pages).")
+
+
+class GroupMembersAdd(BaseModel):
+    user_ids: list[uuid.UUID] = Field(
+        min_length=1,
+        max_length=500,
+        description=(
+            "Users to add. Users already in the group are left as they are; "
+            "if any id matches no user, none are added."
+        ),
+    )
+
+
+class GroupMemberListResponse(BaseModel):
+    members: list[UserNameItem] = Field(
+        description="Page of group members, by username."
+    )
+    total: int = Field(description="Total number of members (across all pages).")
+
+
 class AdminJobResponse(BaseModel):
     id: uuid.UUID = Field(description="Unique ingestion job identifier.")
     status: JobStatus = Field(
@@ -295,7 +346,11 @@ class CatalogStatsResponse(BaseModel):
         description="Number of datasets added in the last 30 days."
     )
     total_storage_bytes: int | None = Field(
-        description="Total storage used by all dataset tables, in bytes. Null if calculation is unavailable."
+        description="Total storage used by dataset tables, including the tables that keep previous versions, plus the recorded sizes of stored data files (rasters, point clouds, 3D Tiles), in bytes. Quicklook images carry no recorded size and are not counted. Null if calculation is unavailable."
+    )
+    previous_versions_bytes: int = Field(
+        default=0,
+        description="Recorded size of the tables that keep datasets' previous versions, in bytes; part of total_storage_bytes.",
     )
     datasets_by_geometry_type: dict[str, int] = Field(
         description="Histogram of datasets keyed by geometry type (Point, MultiPolygon, etc.)."
@@ -334,7 +389,7 @@ class AIStatusResponse(BaseModel):
         description="Active AI provider name (e.g. 'anthropic', 'openai')."
     )
     model: str | None = Field(
-        description="Active model name (e.g. 'claude-sonnet-4-20250514')."
+        description="Active model name (e.g. 'claude-sonnet-5-5')."
     )
     enabled: bool = Field(
         description="Whether AI features are enabled for this instance."
@@ -348,9 +403,9 @@ class AIStatusResponse(BaseModel):
     has_embeddings: bool = Field(
         default=False, description="Whether at least one record has embeddings stored."
     )
-    # fix(#627): key presence != key validity. Present only when the caller
-    # passed ?probe=true (the ai-status routes serialize with exclude_unset,
-    # so default responses keep their exact pre-probe shape).
+    # Key presence != key validity. Present only when the caller passed
+    # ?probe=true (the ai-status routes serialize with exclude_unset, so
+    # default responses omit it).
     probe: AIProbeReport | None = Field(
         default=None,
         description="Live provider probe results. Only present when the "
@@ -575,14 +630,16 @@ class AdminApiKeyCreateRequest(BaseModel):
             "for a non-expiring key; expired keys stop authenticating."
         ),
     )
-    scope: Literal["full", "read_only"] = Field(
+    scope: Literal["full", "read_only", "publish"] = Field(
         default="full",
         description=(
             "Privilege scope. 'full' impersonates the owner completely. "
             "'read_only' authenticates GET, HEAD and "
             "OPTIONS requests only; any other method is refused with 403. A "
             "service-account key minted for an application is the usual case "
-            "for 'read_only'."
+            "for 'read_only'. 'publish' also allows uploads, manifest apply, "
+            "dataset metadata edits and new maps, but no map update, delete, "
+            "feature write, public visibility, admin or key route."
         ),
     )
 
@@ -603,7 +660,23 @@ class AdminApiKeyListItem(BaseModel):
         default=None,
         description="Expiry timestamp; null means the key does not expire.",
     )
-    scope: str = Field(description="Privilege scope: 'full' or 'read_only'.")
+    scope: str = Field(
+        description=(
+            "Privilege scope: 'full', 'read_only', 'publish' (reads, uploads, "
+            "manifest apply, dataset metadata edits and new maps, but no map "
+            "updates, deletes, feature writes or public visibility), "
+            "'dataset_write' (reads and writes the features of "
+            "the dataset in dataset_id, and nothing else), or 'dataset_append' "
+            "(only creates features in that dataset)."
+        )
+    )
+    dataset_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "The dataset a 'dataset_write' or 'dataset_append' key is bound to; "
+            "null for other scopes."
+        ),
+    )
     created_at: datetime = Field(description="Timestamp when the key was created.")
     last_used_at: datetime | None = Field(
         description="Timestamp of the most recent successful authentication using this key."

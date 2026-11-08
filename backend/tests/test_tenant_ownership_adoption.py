@@ -1443,7 +1443,7 @@ class TestReportedStateMatchesWhatApplyEnforces:
             await engine.dispose()
 
     async def test_a_member_dropped_after_the_scan_does_not_fail_validation(self):
-        """fix(#1913): a gateway member the scan enumerated and a peer dropped
+        """A gateway member the scan enumerated and a peer dropped
         before it is judged is no hazard; validation completes.
         """
         vanishing = f"w1913_member_{uuid.uuid4().hex[:12]}"
@@ -1763,7 +1763,7 @@ class TestAdoptionWithRestoredBoundaryFunctions:
             await engine.dispose()
 
     async def test_a_creator_shaped_edge_on_another_login_is_refused(self):
-        """fix(#998 codex r44): ADMIN alone can re-arm itself into a usable
+        """ADMIN alone can re-arm itself into a usable
         edge, so the creator shape is only safe on the login running adoption.
         The refusal names DROP ROLE, the one remedy a managed platform allows.
         """
@@ -1791,7 +1791,7 @@ class TestAdoptionWithRestoredBoundaryFunctions:
             await engine.dispose()
 
     async def test_a_foreign_granted_boundary_acl_is_refused(self):
-        """fix(#998 codex r44): an EXECUTE entry granted by a third role does
+        """An EXECUTE entry granted by a third role does
         not re-attribute on owner transfer and a non-grantor's REVOKE is a
         no-op, so repairing over it would silently leave the grant standing.
         """
@@ -2293,18 +2293,15 @@ class TestLiveTenantBoundary:
 
 
 # ---------------------------------------------------------------------------
-# The runbook recipe and the module it invokes
+# The runbook pointer and the module the recipe invokes
 # ---------------------------------------------------------------------------
 
 
-def test_runbook_documents_the_forward_only_recipe() -> None:
-    """A rename that orphans the DR recipe must fail here, not mid-recovery."""
+def test_runbook_sends_tenant_restores_to_the_cloud_runbook() -> None:
+    """The recipe lives with the Cloud overlay; Core keeps only the pointer."""
     runbook = (ROOT / "RUNBOOK.md").read_text(encoding="utf-8")
 
-    assert "python -m app.core.db.tenant_adoption --apply" in runbook
-    # The destructive downgrade is documented as the thing NOT to reach for,
-    # not as the recipe (#998).
-    assert "#### Do not reach for `alembic downgrade 0016`" in runbook
+    assert "follow the Cloud overlay's own" in runbook
     assert "uv run --no-dev alembic downgrade 0016" not in runbook
 
 

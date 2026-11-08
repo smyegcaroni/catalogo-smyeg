@@ -1,8 +1,8 @@
 """Staging helpers for the URL import: put, quota, settlement.
 
-feat(#1710): the download runs on the worker, so nothing here budgets
-against the edge proxy any more. What remains is the part that is about
-OWNERSHIP of staged bytes rather than about time.
+The download runs on the worker, so nothing here budgets against the
+edge proxy. These helpers are about ownership of staged bytes rather
+than time.
 """
 
 import uuid
@@ -25,18 +25,18 @@ from app.processing.ingest.service import (
 
 logger = structlog.get_logger(__name__)
 
-# fix(#1710): stamped by `_settle_failed_url_import` on the exception it has
-# already acted on, so the task's outer handler can settle what never reached
-# it without settling the same failure twice.
+# Stamped by `_settle_failed_url_import` on the exception it has already
+# acted on, so the task's outer handler can settle what never reached it
+# without settling the same failure twice.
 _SETTLED_ATTR = "_geolens_url_import_settled"
 
 
 class UrlImportRefused(ValueError):
     """A URL-import refusal the submitter is meant to read.
 
-    fix(#1710): the worker has no response to shape, so a refusal it raises
-    is a domain failure rather than an ``HTTPException``. Defined under
-    ``app.`` so ADR-002's stored-reason door (#1953) admits its text.
+    The worker has no response to shape, so a refusal it raises is a domain
+    failure rather than an ``HTTPException``. Defined under ``app.`` so the
+    stored-reason rule admits its text.
     """
 
 
@@ -46,7 +46,7 @@ async def _put_staging_object(s3_key: str, local_dest: Path) -> None:
     Owns its file handle: the drained provider call finishes its SDK thread
     before this returns, so the descriptor outlives every reader of it.
     """
-    # codeql[py/path-injection] fix(#1708): the component is basename-stripped (safe_upload_basename/filename_from_url) and byte-clamped, rooted under upload_staging_dir
+    # codeql[py/path-injection] the component is basename-stripped (safe_upload_basename/filename_from_url) and byte-clamped, rooted under upload_staging_dir
     fh = open(local_dest, "rb")
     try:
         await _await_provider_call_draining(
@@ -59,19 +59,19 @@ async def _put_staging_object(s3_key: str, local_dest: Path) -> None:
 async def _url_import_transition_landed(job_id: uuid.UUID, staged_path: str) -> bool:
     """Did the running->pending transition durably land despite the raise?
 
-    fix(#1708): a commit whose acknowledgement is lost (cancellation
-    or connection loss while ``COMMIT`` is in flight) may have been durably
-    applied by PostgreSQL even though the await raised. Read the row back on
-    a FRESH session — the request session is mid-failure and untrustworthy.
+    A commit whose acknowledgement is lost (cancellation or connection loss
+    while ``COMMIT`` is in flight) may have been durably applied by
+    PostgreSQL even though the await raised. Read the row back on a fresh
+    session, since the request session is mid-failure and untrustworthy.
     True means the job is live catalog state: 'pending', bound to exactly
     the staged path this request wrote.
 
-    A probe that itself fails returns True — standing down. Deliberately
+    A probe that itself fails returns True and stands down. Deliberately
     asymmetric: a false positive orphans bytes the sweeps can reclaim, while
     a false negative deletes data a durable pending row points at, which
     nothing can reclaim.
     """
-    # Late bind so tests' engine patching is honored (fix(#909)-style).
+    # Late bind so tests' engine patching is honored.
     import app.core.db as db_module
 
     from app.platform.jobs.models import IngestJob
@@ -91,22 +91,22 @@ async def _url_import_transition_landed(job_id: uuid.UUID, staged_path: str) -> 
     return row is not None and row.status == "pending" and row.file_path == staged_path
 
 
-# fix(#1708): stamped on the exception raised BY the final commit
-# and read back in settlement — carried on the exception, not threaded as a
-# handler flag, so the marker stays bound to the one await whose outcome is
-# genuinely unknown.
+# Stamped on the exception raised by the final commit and read back in
+# settlement. It rides on the exception rather than a handler flag, so the
+# marker stays bound to the one await whose outcome is genuinely
+# unknown.
 _COMMIT_AMBIGUOUS_ATTR = "_geolens_url_import_commit_ambiguous"
 
 
 async def _commit_staged_transition(db: AsyncSession) -> None:
     """The final running->pending commit, as a named seam.
 
-    fix(#1708): split out so tests can simulate the
-    ambiguous-commit shape — durable on the server, exception on the
-    acknowledgement — which a real session can't produce on demand.
-    Production behavior is exactly ``db.commit()``; the marking lives in
-    ``_commit_staged_transition_guarded`` around it, so it's always applied
-    by production code, not by whatever a test substitutes here.
+    Split out so tests can simulate the ambiguous-commit shape (durable on
+    the server, exception on the acknowledgement), which a real session
+    can't produce on demand. Production behavior is exactly
+    ``db.commit()``; the marking lives in
+    ``_commit_staged_transition_guarded`` around it, so production code
+    applies it whatever a test substitutes here.
     """
     await db.commit()
 
@@ -114,11 +114,11 @@ async def _commit_staged_transition(db: AsyncSession) -> None:
 async def _commit_staged_transition_guarded(db: AsyncSession) -> None:
     """Commit the staged transition, marking the exception if it raises.
 
-    fix(#1708): an exception out of THIS await, and only this
-    one, is ambiguous — PostgreSQL may have applied the transition before
-    the acknowledgement was lost. Marking it here lets settlement tell it
-    apart from every failure whose outcome is known, without another branch
-    in an already complexity-capped handler.
+    An exception out of this await, and only this one, is ambiguous:
+    PostgreSQL may have applied the transition before the acknowledgement
+    was lost. Marking it here lets settlement tell it apart from every
+    failure whose outcome is known, without another branch in an already
+    complexity-capped handler.
     """
     try:
         await _commit_staged_transition(db)
@@ -146,49 +146,49 @@ async def _settle_failed_url_import(
     (the local file and, if the put ran, the S3 object) — nothing else
     references them, so both go before the exception propagates.
 
-    fix(#1708): the session's transaction is ROLLED BACK FIRST, before
-    anything else here. The steps below — the probe's fresh session, the
-    remote delete, the CAS — otherwise run while this caller still holds
-    its failed transaction's pool connection.
+    The session's transaction is rolled back before anything else.
+    Otherwise the steps below (the probe's fresh session, the remote
+    delete, the CAS) run while this caller still holds its failed
+    transaction's pool connection.
 
-    fix(#1708): the ambiguous-commit probe fires ONLY when the exception
-    carries the marker ``_commit_staged_transition_guarded`` stamps on it.
-    If it did, and PostgreSQL applied the transition before the
-    acknowledgement was lost, the row is already 'pending' and bound to
-    ``staged_path`` — live catalog state, so deleting the bytes would leave
-    a durable pending job pointing at nothing, and settlement stands down
-    entirely. Applied to EVERY failure (r11's mistake), the probe's "assume
-    landed when the probe itself fails" default instead turned ordinary
-    pre-commit failures into skipped cleanups and stranded 'running' jobs —
-    the asymmetry is correct only where the outcome is genuinely unknown.
+    The ambiguous-commit probe fires only when the exception carries the
+    marker ``_commit_staged_transition_guarded`` stamps on it. If
+    PostgreSQL applied the transition before the acknowledgement was lost,
+    the row is already 'pending' and bound to ``staged_path``: live catalog
+    state, so deleting the bytes would leave a durable pending job pointing
+    at nothing, and settlement stands down entirely. The probe assumes the
+    transition landed when the probe itself fails, which is right only
+    where the outcome is genuinely unknown; on an ordinary pre-commit
+    failure it would skip the cleanup and strand a 'running' job, so no
+    other failure is probed.
 
-    fix(#1708): cleanup is best-effort STRUCTURALLY. A cleanup step that
-    raises (the NUL-path unlink was one instance) previously escaped the
-    caller's failure block before the failure CAS ran, stranding an
-    undiscoverable 'running' job for the full lease — a shape, not an
-    instance, so this helper makes "cleanup can never preempt the stamp" a
-    property of the one function every failure goes through.
+    Cleanup is best-effort by structure. A cleanup step that raised (an
+    unlink of a NUL path, say) would escape the caller's failure block
+    before the failure CAS ran and strand an undiscoverable 'running' job
+    for the full lease. Every failure goes through this one function, so
+    here "cleanup can never preempt the stamp" holds for every step at
+    once.
 
-    fix(#1710): the failure CAS is fenced on ``attempt_id`` as well as
-    'running'. A retry rotates the token, so a worker whose lease expired
-    and later resumed must not stamp a newer attempt's row failed; zero rows
-    means something external already settled it, and that verdict stands.
+    The failure CAS is fenced on ``attempt_id`` as well as 'running'. A
+    retry rotates the token, so a worker whose lease expired and later
+    resumed must not stamp a newer attempt's row failed; zero rows means
+    something external already settled it, and that verdict stands.
 
-    fix(#1710): ``local_dest`` is None for a caller that does not own staged
-    bytes. The task's outer handler is one: it settles failures raised
-    outside the staging block, which happen either before any byte exists or
-    AFTER the transition committed, and on local storage the published
-    ``file_path`` IS ``local_dest`` — deleting it there would leave a durable
-    pending row pointing at nothing.
+    ``local_dest`` is None for a caller that does not own staged bytes,
+    such as the task's outer handler. It settles failures raised outside
+    the staging block, which happen either before any byte exists or after
+    the transition committed, and on local storage the published
+    ``file_path`` is ``local_dest``: deleting it there would leave a
+    durable pending row pointing at nothing.
     """
-    # fix(#1710): stamped BEFORE any await, so a settlement that is itself
-    # cancelled still tells the outer handler this failure was claimed.
+    # Stamped before any await, so a settlement that is itself cancelled
+    # still tells the outer handler this failure was claimed.
     try:
         setattr(exc, _SETTLED_ATTR, True)
     except AttributeError:  # pragma: no cover - exotic exception types
         pass
 
-    # Release the pool connection before the probe/remote delete (r14).
+    # Release the pool connection before the probe and the remote delete.
     # Best-effort: a session whose connection died mid-commit may refuse
     # this, and the CAS below opens its own transaction regardless.
     try:
@@ -201,17 +201,17 @@ async def _settle_failed_url_import(
         and staged_path is not None
         and await _url_import_transition_landed(job_id, staged_path)
     ):
-        # fix(#1708): the transition is live, so the artifact the ROW
-        # references must survive. Discriminator is the row itself:
+        # The transition is live, so the artifact the row references must
+        # survive. The row itself tells which artifact that is:
         #   staged_path == str(local_dest) -> local storage; local_dest IS
         #     the referenced artifact, so it must not be deleted.
         #   staged_path != str(local_dest) -> S3; the row records only the
         #     staging key, so the local file is a redundant sniff copy that
-        #     nothing downstream can discover — left behind, repeated
+        #     nothing downstream can discover; left behind, repeated
         #     ambiguous commits fill the staging volume.
         if local_dest is not None and staged_path != str(local_dest):
             try:
-                # codeql[py/path-injection] fix(#1708): clamped, staging-rooted path — see fetch_url
+                # codeql[py/path-injection] clamped, staging-rooted path — see fetch_url
                 local_dest.unlink(missing_ok=True)
             except OSError:
                 logger.warning(
@@ -227,24 +227,24 @@ async def _settle_failed_url_import(
 
     try:
         if s3_key is not None:
-            # ``_cleanup_saved_upload`` drains and never raises. Unbounded
-            # by design now (#1710): a worker has no response to deliver, and
-            # the heartbeat renews the lease while a degraded provider
-            # spends its own connect/read timeouts and retries.
+            # ``_cleanup_saved_upload`` drains and never raises. It is
+            # unbounded: a worker has no response to deliver, and the
+            # heartbeat renews the lease while a degraded provider spends
+            # its own connect/read timeouts and retries.
             await _cleanup_saved_upload(s3_key, str(job_id))
         if local_dest is not None:
-            # codeql[py/path-injection] fix(#1708): clamped, staging-rooted path — see fetch_url
+            # codeql[py/path-injection] clamped, staging-rooted path — see fetch_url
             local_dest.unlink(missing_ok=True)
     except BaseException:
         logger.warning("url_import_cleanup_failed", job_id=str(job_id))
-    # fix(#1710, rebased onto #1957): the terminal write goes through the
-    # shared fenced helper, which arms the error-write budget so a row another
-    # writer is holding cannot block this settlement indefinitely, and which
-    # never raises. `None` is not a fence miss: the row stays running and the
-    # stale sweep settles it.
+    # The terminal write goes through the shared fenced helper, which
+    # arms the error-write budget so a row another writer is holding
+    # cannot block this settlement indefinitely, and which never raises.
+    # `None` is not a fence miss: the row stays running and the stale
+    # sweep settles it.
     #
-    # fix(#1953): the reason is the EXCEPTION, not a rendering of it. ADR-002's
-    # door applies its own provenance rule, which a caller that flattens to
+    # The reason is the exception, not a rendering of it. The stored-reason
+    # rule applies its own provenance check, which a caller that flattens to
     # text first has already thrown away.
     fenced = await write_job_failure_for_attempt(
         db, job_id, attempt_id, reason=exc, task_name="fetch_url"
@@ -259,14 +259,14 @@ async def _effective_stream_cap(
     """The fetch's byte cap, and the quota-shaped refusal detail if it is
     the quota rather than the instance limit doing the capping.
 
-    fix(#1708): the SMALLER of the instance upload max and the
-    caller's remaining CORE byte quota. With the instance-wide cap alone, a
-    user at or near their storage cap could spend instance-max bandwidth,
-    staging disk, and a worker slot on a download the post-stage check is
-    guaranteed to refuse. ``storage_cap == 0`` means unlimited;
-    zero remaining refuses here, before any fetch. The post-stage
-    byte-charged check stays authoritative for races and the cloud
-    entitlement seam, which this preflight doesn't consult.
+    The smaller of the instance upload max and the caller's remaining core
+    byte quota. With the instance-wide cap alone, a user at or near their
+    storage cap could spend instance-max bandwidth, staging disk and a
+    worker slot on a download the post-stage check is guaranteed to
+    refuse. ``storage_cap == 0`` means unlimited; zero remaining refuses
+    here, before any fetch. The post-stage byte-charged check stays
+    authoritative for races and the cloud entitlement seam, which this
+    preflight doesn't consult.
     """
     usage = await get_user_quota_usage(db, user_id)
     if usage.storage_cap <= 0:
@@ -290,11 +290,11 @@ async def _recheck_staged_quota(
 ) -> None:
     """Charge the bytes that actually landed against the caller's quota.
 
-    fix(#1710): a thin seam so the fetch task never imports
-    ``app.modules.*`` itself — the PROCESS-02/04 burndown lists in
-    ``tests/test_layering.py`` may only shrink, and this module already
-    carries the quota edge. ``request`` is None because a worker has none;
-    ``enforce_limit`` never reads it.
+    A thin seam so the fetch task needs no ``app.modules.*`` import of its
+    own. The layering burndown lists in ``tests/test_layering.py`` may only
+    shrink, and this module already carries the quota edge.
+    ``request`` is None because a worker has none; ``enforce_limit`` never
+    reads it.
 
     The door's refusal is HTTP-shaped; a worker's is not, so the detail is
     re-raised as a domain failure whose text the stored-reason rule admits.

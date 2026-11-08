@@ -115,7 +115,7 @@ describe('useMapLayers generic-geometry rendering (fix #430 codex r21)', () => {
 
 describe('useMapLayers vector source', () => {
   function vectorToken(sig: string): VectorTileToken {
-    return { kind: 'vector', sig, exp: 2000000000, scope: 'scope-1', expires_in: 900 };
+    return { kind: 'vector', sig, exp: 2000000000, scope: 'scope-1', expires_in: 900, tile_url_template: '' };
   }
 
   it('requests tiles from z0 and overzooms z14 tiles past z14', () => {
@@ -148,7 +148,7 @@ describe('useMapLayers vector source', () => {
   });
 });
 
-// #1362 codex r2: the raster tile route is a fixed per-dataset path, and a
+// The raster tile route is a fixed per-dataset path, and a
 // public dataset's tile response carries `Cache-Control: public,
 // max-age=3600` — so the browser's own HTTP cache can keep serving
 // pre-replace bytes for an identical URL. tileVersion busts that the same
@@ -217,7 +217,7 @@ describe('useMapLayers raster tile source cache-busting', () => {
     expect(source?.tiles[0]).not.toContain('?v=');
   });
 
-  // fix(#1372): the server now embeds `?v=<tile_cache_version>` in the raster
+  // The server embeds `?v=<tile_cache_version>` in the raster
   // tile URL (the shared nginx cache keys on it). A second client-side `v`
   // would make nginx key on the wrong (first) value, so the append must yield
   // to a server-versioned URL.
@@ -232,7 +232,7 @@ describe('useMapLayers raster tile source cache-busting', () => {
     );
   });
 
-  // fix(#2007): a legacy row with no tile_cache_version emits `?pv=` alone.
+  // A legacy row with no tile_cache_version emits `?pv=` alone.
   // A `?` appended onto that is a malformed URL, not a second version.
   it('leaves a server URL carrying only the publication version alone', () => {
     const map = runRasterHook(

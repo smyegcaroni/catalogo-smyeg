@@ -12,16 +12,13 @@ export interface BoundedGeoJsonResponse {
 
 const GEOJSON_TIMEOUT_MS = 30_000;
 
-export interface GeoJsonFetchOptions {
-  apiKey?: string;
+interface GeoJsonFetchOptions {
   embedToken?: string;
   signal?: AbortSignal;
 }
 
-export type GeoJsonZResponse = BoundedGeoJsonResponse;
-
 function boundedGeoJsonPath(datasetId: string) {
-  return `/datasets/${datasetId}/features.geojson`;
+  return `/datasets/${encodeURIComponent(datasetId)}/features.geojson`;
 }
 
 function directFetchPath(datasetId: string) {
@@ -48,10 +45,9 @@ export function asFeatureCollection(response: BoundedGeoJsonResponse): GeoJSON.F
  * Explode MultiPoint features into one Point feature per coordinate.
  *
  * The backend serves point datasets as MultiPoint (GDAL PROMOTE_TO_MULTI), but
- * MapLibre's `cluster: true` GeoJSON sources are backed by Supercluster, which
- * only indexes `Point` geometry and silently drops MultiPoint — leaving clustered
- * layers blank. Flattening here fixes that for every bounded-GeoJSON consumer
- * (viewer + builder) and is a no-op for already-Point geometry.
+ * MapLibre's `cluster: true` sources use Supercluster, which only indexes
+ * `Point` and silently drops MultiPoint, leaving clustered layers blank.
+ * A no-op for Point geometry.
  */
 function flattenMultiPoint(feature: GeoJSON.Feature): GeoJSON.Feature[] {
   if (feature.geometry?.type !== 'MultiPoint') return [feature];
@@ -63,7 +59,7 @@ function flattenMultiPoint(feature: GeoJSON.Feature): GeoJSON.Feature[] {
 
 /**
  * Fetch bounded GeoJSON for map renderers that need a client-side GeoJSON source.
- * Handles JWT auth (via apiFetch), API key, and embed token paths.
+ * Handles JWT auth (via apiFetch) and embed token paths.
  */
 export async function fetchBoundedGeoJson(
   datasetId: string,
@@ -80,28 +76,5 @@ export async function fetchBoundedGeoJson(
     return res.json() as Promise<BoundedGeoJsonResponse>;
   }
 
-  if (options?.apiKey) {
-    // fix(#833): send the key in the X-Api-Key header (same form the embed
-    // path uses above) — a query-string credential lands in server/proxy logs.
-    const res = await fetch(directFetchPath(datasetId), {
-      headers: { 'X-Api-Key': options.apiKey },
-      signal,
-    });
-    if (!res.ok) await throwLocalizedResponseError(res);
-    return res.json() as Promise<BoundedGeoJsonResponse>;
-  }
-
-  // Default: JWT auth via apiFetch
   return apiFetch<BoundedGeoJsonResponse>(boundedGeoJsonPath(datasetId), { signal });
-}
-
-/**
- * Fetch GeoJSON with Z coordinates for a dataset.
- * Handles JWT auth (via apiFetch), API key, and embed token paths.
- */
-export async function fetchGeoJsonZ(
-  datasetId: string,
-  options?: GeoJsonFetchOptions,
-): Promise<GeoJsonZResponse> {
-  return fetchBoundedGeoJson(datasetId, options);
 }

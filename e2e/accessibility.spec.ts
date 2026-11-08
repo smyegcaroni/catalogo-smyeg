@@ -16,7 +16,7 @@ function formatViolations(violations: any[]): string {
     .join('\n\n');
 }
 
-// fix(review #1792 round 4): `waitForLoadState('networkidle')` covers the
+// `waitForLoadState('networkidle')` covers the
 // document/asset load, not a subsequent React Query fetch -- a scan that
 // runs right after it can land mid-loading-state (a skeleton or spinner)
 // instead of the populated page, and axe never sees the real content. Every
@@ -43,7 +43,7 @@ test.describe('Accessibility - WCAG 2AA', () => {
   let collectionName: string;
 
   test.beforeAll(async () => {
-    // fix(review #1792 round 3): seedDataset alone can poll for up to 60s
+    // seedDataset alone can poll for up to 60s
     // (helpers/catalog.ts's seedFixtureDataset), which is Playwright's
     // default hook timeout with nothing left over for the collection/map/
     // layer/share calls this hook also makes. Give this hook real margin.
@@ -169,7 +169,7 @@ test.describe('Accessibility - WCAG 2AA', () => {
     });
   });
 
-  // fix(#1778): every gating axe scan below runs in both color schemes.
+  // Every gating axe scan below runs in both color schemes.
   // playwright.config.ts's `use` block sets no colorScheme, so Playwright
   // defaults to light and the ThemeProvider's "system" default
   // (main.tsx:106) resolves off that media query -- the dark palette was
@@ -183,14 +183,14 @@ test.describe('Accessibility - WCAG 2AA', () => {
       test.describe('logged-out routes', () => {
         test.use({ storageState: { cookies: [], origins: [] } });
 
-        // fix(#1778): this test sat OUTSIDE the logged-out describe block, so
-        // it inherited the chromium project's authenticated storageState —
-        // the anonymous landing page was never actually scanned under that
-        // name. Moved inside so "public" means logged-out.
+        // This test must sit INSIDE the logged-out describe block: outside it
+        // it would inherit the chromium project's authenticated storageState,
+        // and the anonymous landing page would never actually be scanned
+        // under that name.
         test('public search page has no accessibility violations', async ({ page }) => {
           await page.goto('/');
           await page.waitForLoadState('networkidle');
-          // fix(review #1792 round 4): SearchPage renders a DatasetCardSkeleton
+          // SearchPage renders a DatasetCardSkeleton
           // grid while `isLoading && !data`, before this scan waited for it
           // to clear -- see waitForLoadingIndicatorsToClear's comment.
           await waitForLoadingIndicatorsToClear(page);
@@ -217,13 +217,18 @@ test.describe('Accessibility - WCAG 2AA', () => {
           await page.goto(`/m/${shareToken}`);
           await expect(page.getByText(builderMapName)).toBeVisible({ timeout: 15_000 });
           await page.getByRole('button', { name: 'Map data' }).click();
-          const dataDialog = page.getByRole('dialog', { name: 'Map data' });
-          await expect(dataDialog).toBeVisible();
-          await expect(dataDialog.getByText(datasetTitle).first()).toBeVisible();
+          const dataPanel = page.getByRole('region', { name: 'Map data' });
+          await expect(dataPanel).toBeVisible();
+          // The panel opens on its Table view when the map offers one; the cards are the List view.
+          const listView = dataPanel.getByRole('radio', { name: 'List' });
+          if (await listView.count()) await listView.click();
+          await expect(dataPanel.getByText(datasetTitle).first()).toBeVisible();
           await expect(
-            dataDialog.getByRole('region', { name: 'Map layer and feature data' }),
+            dataPanel.getByRole('region', { name: 'Map layer and feature data' }),
           ).toBeVisible();
-          await expect(dataDialog.getByText('E2E Test Point', { exact: true })).toBeVisible({
+          // Tiles carry only the columns the map draws with; opening an item reads its other fields.
+          await dataPanel.getByText('All fields').first().click();
+          await expect(dataPanel.getByText('E2E Test Point', { exact: true })).toBeVisible({
             timeout: 15_000,
           });
           await page.waitForLoadState('networkidle').catch(() => {
@@ -322,9 +327,9 @@ test.describe('Accessibility - WCAG 2AA', () => {
         expect(results.violations, formatViolations(results.violations)).toEqual([]);
       });
 
-      // fix(#806 item 2): the builder-page test above scans the builder with the editor
-      // closed, so neither the analysis panel nor any layer-editor tab was ever covered
-      // — including the live-region work #784/#782/#804 added. Both surfaces are reached
+      // The builder-page test above scans the builder with the editor
+      // closed, so neither the analysis panel nor any layer-editor tab is
+      // covered by it — including their live regions. Both surfaces are reached
       // by interaction rather than by URL, so they follow the Add Dataset dialog's shape
       // and scope with .include() to keep them off what the page test already owns.
       test('analysis panel has no accessibility violations', async ({ page }) => {
@@ -389,14 +394,14 @@ test.describe('Accessibility - WCAG 2AA', () => {
         expect(results.violations, formatViolations(results.violations)).toEqual([]);
       });
 
-      // fix(#438): A11Y-12 — the audit found Import, Settings, and Collections
+      // The audit found Import, Settings, and Collections
       // uncovered. Same wcagTags contract as the routes above.
       //
-      // fix(#1778): the admin overview scan above only ever covered
+      // The admin overview scan above covers only
       // /admin — App.tsx declares seven further real admin routes
       // (admin/users, admin/jobs, admin/shared-maps, admin/audit,
-      // admin/saml, admin/settings/:tab, admin/config-ops) that were never
-      // scanned, including the densest forms in the app (SettingsAuthTab,
+      // admin/saml, admin/settings/:tab, admin/config-ops) that need their
+      // own scans, including the densest forms in the app (SettingsAuthTab,
       // SettingsAITab, SamlProvidersSection). Extend this same loop rather
       // than hand-duplicating the scan body.
       for (const { name, path } of [
@@ -416,7 +421,7 @@ test.describe('Accessibility - WCAG 2AA', () => {
         test(`${name} page has no accessibility violations`, async ({ page }) => {
           await page.goto(path);
           await page.waitForLoadState('networkidle');
-          // fix(review #1792 round 4): several of these routes (the admin
+          // Several of these routes (the admin
           // list pages especially) fetch their own data after mount and
           // render a skeleton/spinner until it resolves -- see
           // waitForLoadingIndicatorsToClear's comment. Applied to the whole
@@ -432,10 +437,10 @@ test.describe('Accessibility - WCAG 2AA', () => {
         });
       }
 
-      // fix(#1778): the dataset detail scan above only ever covered the
+      // The dataset detail scan above covers only the
       // default Overview tab — the Data (attribute table), Schema
       // (structure), Sources, and Access tabs render their own panel body
-      // and were never scanned. Tabs are addressable by URL hash
+      // and need their own scans. Tabs are addressable by URL hash
       // (DatasetPage.tsx's getInitialTab), so no interaction is needed to
       // reach them.
       for (const tab of ['data', 'structure', 'sources', 'access'] as const) {
@@ -446,7 +451,7 @@ test.describe('Accessibility - WCAG 2AA', () => {
             page.getByRole('heading', { name: datasetTitle, exact: true }),
           ).toBeVisible();
           await page.waitForLoadState('networkidle');
-          // fix(review #1792 round 4): the data tab's AttributeTable fetches
+          // The data tab's AttributeTable fetches
           // rows independently of the dataset payload the heading above
           // proves loaded, and shows its own Loader2 spinner until that
           // settles -- see waitForLoadingIndicatorsToClear's comment.
@@ -456,14 +461,13 @@ test.describe('Accessibility - WCAG 2AA', () => {
             .withTags(wcagTags)
             .exclude('.maplibregl-map');
 
-          // fix(#1778): this scan found a real, pre-existing contrast
-          // violation on the access tab: AccessTab.tsx's API-URL chip pairs
+          // The access tab has a real contrast
+          // violation: AccessTab.tsx's API-URL chip pairs
           // text-(--code-muted) on bg-(--code-chrome) at 4.15:1 in both
           // themes (index.css defines --code-muted the same in both color
           // schemes), under the 4.5:1 floor. That is a separate design-token
-          // bug, not part of this item's scope (route coverage) — excluded
-          // here so the new coverage can gate, and left alone otherwise; see
-          // the PR description.
+          // bug, not part of this loop's scope (route coverage) — excluded
+          // here so the rest of the tab can gate.
           if (tab === 'access') {
             scan.exclude('.text-\\(--code-muted\\)');
           }
@@ -474,8 +478,8 @@ test.describe('Accessibility - WCAG 2AA', () => {
         });
       }
 
-      // fix(#1778): SharePanel/ShareDialog (the sharing/embed surface) was
-      // never opened by this suite.
+      // SharePanel/ShareDialog (the sharing/embed surface) needs its own
+      // scan: no other test in this suite opens it.
       test('share dialog has no accessibility violations', async ({ page }) => {
         await page.goto(`/maps/${builderMapId}`);
         await page.waitForLoadState('networkidle');
@@ -486,7 +490,7 @@ test.describe('Accessibility - WCAG 2AA', () => {
         const dialog = page.getByRole('dialog', { name: 'Share' });
         await expect(dialog).toBeVisible();
 
-        // fix(review #1792 round 4): SharePanel's useMapShareToken query is
+        // SharePanel's useMapShareToken query is
         // still loading the instant the dialog mounts, so `hasShareToken`
         // reads false and the dialog renders the "Get share link" button --
         // scanning immediately raced that query and covered the wrong

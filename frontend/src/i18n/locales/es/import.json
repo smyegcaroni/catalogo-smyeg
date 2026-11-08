@@ -52,6 +52,7 @@
       "grid_misaligned": "Las dimensiones de la cuadrícula no coinciden"
     },
     "searchError": "No se pudieron cargar los resultados",
+    "searchRateLimited": "La búsqueda está limitada temporalmente. Inténtalo de nuevo en unos instantes.",
     "bandCount_one": "{{count}} banda",
     "bandCount_other": "{{count}} bandas",
     "resolutionValue": "Resolución: {{value}}"
@@ -101,6 +102,7 @@
     "mercatorClip": {
       "title": "Geometría fuera de los límites de Web Mercator",
       "description": "GeoLens sirve teselas Web Mercator, que cubren longitudes de -180° a 180° y latitudes de -85,06° a 85,06°. La geometría situada fuera de ese recuadro se recortó durante la importación. Las filas siguen en el conjunto de datos: solo cambió su geometría. Revise tanto el orden como el rango de las coordenadas de origen.",
+      "polarDescription": "GeoLens sirve teselas Web Mercator, que llegan solo hasta las latitudes -85,06° y 85,06°. Durante la importación se recortaron al límite los elementos cercanos a los polos. Es lo esperable en datos globales y el resto de cada fila no cambia.",
       "skippedDescription": "El sistema de coordenadas de origen tiene un área de validez estrecha: los límites de Web Mercator no pudieron expresarse en él y la comprobación de límites se omitió. No se eliminó ninguna geometría, pero puede seguir habiendo geometría fuera de las longitudes -180° a 180° o las latitudes -85,06° a 85,06°, que no se mostrará en el mapa.",
       "dropped_one": "{{count}} entidad perdió toda su geometría",
       "dropped_other": "{{count}} entidades perdieron toda su geometría",
@@ -144,7 +146,7 @@
     "tilesetSubtext": "GeoLens comprueba cada archivo y lee su tileset.json antes de almacenar nada."
   },
   "stac": {
-    "label": "URL de API STAC; pegue el endpoint raíz del catálogo",
+    "label": "URL de API STAC · pegue el endpoint raíz del catálogo",
     "connect": "Conectar",
     "connecting": "Conectando al catálogo STAC...",
     "searching": "Buscando elementos...",
@@ -165,9 +167,11 @@
     "failureGroupCount_one": "{{count}} elemento",
     "failureGroupCount_other": "{{count}} elementos",
     "failureUnknown": "Error desconocido",
+    "itemErrorImportFailed": "No se pudo importar este elemento.",
+    "itemErrorTooLong": "El identificador del elemento o el enlace del recurso es demasiado largo para guardarlo.",
     "importMore": "Importar más",
     "backToResults": "Volver a los resultados",
-    "catalogConnected": "Catálogo STAC; conectado",
+    "catalogConnected": "Catálogo STAC · conectado",
     "clear": "Borrar",
     "collectionsAvailable_one": "{{count}} colección disponible",
     "collectionsAvailable_other": "{{count}} colecciones disponibles",
@@ -237,7 +241,6 @@
   "serviceUrl": {
     "label": "URL de servicio",
     "placeholder": "https://example.com/wfs, ArcGIS FeatureServer o endpoint OGC API",
-    "helpText": "Pegue una URL de servicio WFS, ArcGIS Feature Service u OGC API Features",
     "arcgisPortalUrlHint": "Esto parece una página de organización o portal de ArcGIS, no una capa. Abre la página del elemento de la capa, copia su URL REST (termina en /FeatureServer/0 o /MapServer/0) y pégala aquí. Las capas protegidas piden iniciar sesión después de pegar la URL de la capa.",
     "tokenPlaceholder": "Token de ArcGIS, clave API o token de acceso WFS",
     "credentialMethodLabel": "Autenticación",
@@ -261,7 +264,7 @@
     "connectFailed": "Error al conectar con el servicio",
     "previewFailed": "Error al previsualizar la capa",
     "commitFailed": "Error al iniciar la importación",
-    "detectedLabel": "URL de servicio; detectada",
+    "detectedLabel": "URL de servicio · detectada",
     "clear": "Borrar",
     "layersAvailable_one": "{{count}} capa disponible",
     "layersAvailable_other": "{{count}} capas disponibles",
@@ -293,7 +296,7 @@
     "arcgisTokenExpiredMidImport": "Su sesión de ArcGIS caducó mientras esto estaba abierto. Vuelva atrás e inicie sesión de nuevo para continuar."
   },
   "urlImport": {
-    "label": "URL de archivo; descargada en el servidor",
+    "label": "URL de archivo · descargada en el servidor",
     "placeholder": "https://data.source.coop/…/buildings.parquet",
     "fetch": "Obtener →",
     "fetching": "Descargando archivo...",
@@ -319,7 +322,6 @@
     "downloadFailed": "El servidor no pudo descargar el archivo desde esa URL"
   },
   "register": {
-    "helpText": "Catalogue tablas PostGIS existentes de su base de datos como conjuntos de datos en GeoLens. Use esta opción cuando tenga datos geográficos ya en la base de datos que no fueron importados a través de GeoLens. Las tablas seleccionadas se añadirán al catálogo con detección automática de metadatos.",
     "discovering": "Descubriendo tablas...",
     "discoverFailed": "Error al descubrir tablas:",
     "emptyState": "No se encontraron tablas sin registrar en la base de datos.",
@@ -333,6 +335,7 @@
     },
     "visibilityLabel": "Visibilidad",
     "visibilityPrivate": "Privado",
+    "visibilityInternal": "Interno",
     "visibilityPublic": "Público",
     "registering": "Registrando...",
     "registerButton_one": "Registrar {{count}} tabla",
@@ -350,7 +353,6 @@
       "source_srid_undeclared": "Su columna geom no declara ningún SRID, así que GeoLens no puede saber dónde están sus coordenadas. Define el SRID, por ejemplo con UpdateGeometrySRID, y luego registra la tabla.",
       "source_gid_unusable": "GeoLens identifica las entidades por una columna llamada gid: un entero NOT NULL y único, como una clave primaria, en una tabla de la que no hereda ninguna otra. Esta tabla no lo cumple. Añade o corrige la columna gid, o cambia el nombre de una que GeoLens no pueda usar para que añada la suya, y luego registra la tabla."
     },
-    "unknownError": "Error desconocido",
     "searchPlaceholder": "Buscar tablas…",
     "selectHint": "Selecciona una tabla de la lista para ver su esquema y registrarla.",
     "detailDesc": "Registrar como conjunto de datos de GeoLens; teselado al vuelo, sin copia.",
@@ -367,19 +369,7 @@
     "tablesSidebarLabel": "Tablas descubiertas"
   },
   "layerPicker": {
-    "title": "Seleccionar capa",
-    "emptyState": "No se encontraron capas en este servicio",
-    "columnName": "Nombre",
-    "columnGeometry": "Tipo de geometría",
-    "columnFeatureCount": "Número de entidades",
-    "previewLayer": "Previsualizar capa"
-  },
-  "tablePicker": {
-    "selectAll": "Seleccionar todas ({{count}} tabla)",
-    "selectAll_one": "Seleccionar todas ({{count}} tabla)",
-    "selectAll_other": "Seleccionar todas ({{count}} tablas)",
-    "nonSpatial": "no espacial",
-    "estimatedRows": "~{{count}} filas"
+    "title": "Seleccionar capa"
   },
   "preview": {
     "title": "Vista previa del archivo",
@@ -411,11 +401,9 @@
     "nameLabel": "Nombre *",
     "descriptionLabel": "Descripción",
     "descriptionPlaceholder": "Descripción opcional",
-    "tagsLabel": "Etiquetas",
-    "tagsPlaceholder": "etiqueta1, etiqueta2, etiqueta3",
-    "tagsHelpText": "Separadas por comas",
     "visibilityLabel": "Visibilidad",
     "visibilityPrivate": "Privado",
+    "visibilityInternal": "Interno",
     "visibilityPublic": "Público",
     "crsLabel": "Anulación de CRS",
     "crsPlaceholderDetected": "Deje en blanco para usar el CRS detectado ({{crs}})",
@@ -561,9 +549,6 @@
   "bulk": {
     "uploading_one": "Subiendo {{count}} archivo...",
     "uploading_other": "Subiendo {{count}} archivos...",
-    "statusUploading": "Subiendo...",
-    "statusPreviewing": "Generando vista previa...",
-    "statusReady": "Listo",
     "fileCount_one": "{{count}} archivo listo para importar",
     "fileCount_other": "{{count}} archivos listos para importar",
     "importAllDefaults": "Importar todo con valores predeterminados",
@@ -593,7 +578,8 @@
     "ingestAllLayers": "Ingerir las {{count}} capas como conjuntos de datos separados",
     "activeJobs": "Trabajos activos y recientes",
     "detectingHint": "Cargando y detectando…",
-    "importingFiles": "Importando {{count}} archivos",
+    "importingFiles_one": "Importando {{count}} archivo",
+    "importingFiles_other": "Importando {{count}} archivos",
     "progressDetail": "{{done}} completo · {{active}} en progreso · {{queued}} en cola",
     "uploadProgressLabel": "Progreso de carga de {{name}}",
     "toggleDetails": "Mostrar u ocultar detalles de {{name}}",

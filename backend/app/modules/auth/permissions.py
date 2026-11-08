@@ -1,8 +1,7 @@
 """Granular permissions: capability constants, default role matrix, and effective permissions.
 
-Provides the foundation for capability-based access control. Each role has a set of
-boolean capabilities. The default matrix preserves current behavior (viewer=view+export,
-editor=+upload+edit+create, admin=all). Admins can customize via PersistentConfig.
+Each role has a set of boolean capabilities. ``DEFAULT_ROLE_PERMISSIONS`` is
+the default matrix; admins can customize it via PersistentConfig.
 """
 
 from __future__ import annotations
@@ -10,11 +9,12 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.identity import Identity
-from app.modules.auth.models import Role, UserRole
+from app.modules.auth.models import Role, User, UserRole
+from app.platform.extensions import get_permission_extension
 from app.core.permissions import (
     ALL_CAPABILITIES,
     CREATE_LAYERS,
@@ -42,6 +42,7 @@ __all__ = [
     "UPLOAD",
     "USE_AI_CHAT",
     "get_effective_permissions",
+    "get_user_effective_permissions",
     "get_user_roles",
     "user_has_capability",
     "validate_permission_matrix",
@@ -107,40 +108,70 @@ def validate_permission_matrix(matrix: Any) -> None:
             )
 
 
-# ---------------------------------------------------------------------------
-# Role resolution
-# ---------------------------------------------------------------------------
-
-
 async def get_user_roles(db: AsyncSession, user: Identity) -> set[str]:
     """Get the set of role names for a user.
 
-    Replaces the per-router ``_get_user_roles()`` duplicates. Lives here rather
-    than in ``catalog.authorization`` (its home until this move) because the
-    query reads the auth-owned ``Role``/``UserRole`` tables and touches nothing
-    catalog; ``catalog.authorization`` re-exports it so its callers are
-    unaffected.
+    Lives here rather than in ``catalog.authorization`` because the query
+    reads the auth-owned ``Role``/``UserRole`` tables and touches nothing
+    catalog; ``catalog.authorization`` wraps it for its callers.
     """
-    result = await db.execute(
-        select(Role.name)
-        .join(UserRole, Role.id == UserRole.role_id)
-        .where(UserRole.user_id == user.id)
-    )
+    result = await db.execute(_role_names(user.id))
     return {row[0] for row in result.all()}
 
 
-# ---------------------------------------------------------------------------
-# Effective permissions (DB override merged with defaults)
-# ---------------------------------------------------------------------------
+def _role_names(user_id: Any) -> Select[tuple[str]]:
+    return (
+        select(Role.name)
+        .join(UserRole, Role.id == UserRole.role_id)
+        .where(UserRole.user_id == user_id)
+    )
+
+
+def user_standing_columns(user_id: Any) -> tuple[ColumnElement, ...]:
+    """``user_id``'s role names (``roles``, an array), whether the account is
+    active (``active``, NULL for no account), and its ``username``, ``email``
+    and ``created_at``, as columns for another statement to select."""
+
+    def column(attribute: Any, label: str) -> ColumnElement:
+        return (
+            select(attribute).where(User.id == user_id).scalar_subquery().label(label)
+        )
+
+    return (
+        func.array(_role_names(user_id).scalar_subquery()).label("roles"),
+        column(User.is_active, "active"),
+        column(User.username, "username"),
+        column(User.email, "email"),
+        column(User.created_at, "created_at"),
+    )
+
+
+_ADMITTED_CAPABILITIES = "admitted_capabilities"
+
+
+def admit_capabilities(
+    db: AsyncSession, user_id: Any, capabilities: Any, matrix: dict
+) -> None:
+    """Record that ``require_permission`` admitted ``user_id`` under
+    ``capabilities``, read against ``matrix``, for this session."""
+    admitted = db.info.setdefault(_ADMITTED_CAPABILITIES, {})
+    held, _ = admitted.get(user_id, (frozenset(), matrix))
+    admitted[user_id] = (held | frozenset(capabilities), matrix)
+
+
+def admitted_capabilities(
+    db: AsyncSession, user_id: Any
+) -> tuple[frozenset[str], dict]:
+    """The capabilities and matrix :func:`admit_capabilities` recorded for
+    ``user_id`` in this session; none when nothing was recorded."""
+    return db.info.get(_ADMITTED_CAPABILITIES, {}).get(user_id, (frozenset(), {}))
 
 
 async def user_has_capability(db: AsyncSession, user: Any, capability: str) -> bool:
     """Return True if *user* holds *capability* via any of their assigned roles.
 
-    Used for break-glass exemptions (e.g. DOMAIN-04 manage_settings bypass).
-    Resolves roles via get_user_roles and checks the effective permission
-    matrix; does NOT add DB code to domain_validation.py (DB-free by contract,
-    T-1235 purity gate). *user* may be any object with a ``.id`` UUID
+    Used for break-glass exemptions (e.g. the manage_settings bypass of the
+    email-domain gate). *user* may be any object with a ``.id`` UUID
     attribute (User ORM or Identity).
     """
     roles = await get_user_roles(db, user)
@@ -158,20 +189,41 @@ async def get_effective_permissions(db: AsyncSession) -> dict[str, dict[str, boo
 
     stored: dict = await ROLE_PERMISSIONS.get(db)
 
-    # Deep merge: start from defaults, overlay stored values
     result: dict[str, dict[str, bool]] = copy.deepcopy(DEFAULT_ROLE_PERMISSIONS)
     for role, caps in stored.items():
         if role not in result:
-            # Custom role added by admin -- take as-is
+            # A custom role starts with every capability off.
             result[role] = {cap: False for cap in ALL_CAPABILITIES}
         if isinstance(caps, dict):
             result[role].update(caps)
 
-    # Defense in depth for rows written before this invariant existed (or by a
-    # privileged/manual DB operation): the tenant-editable matrix is never an
-    # authority source for fleet control. Permission extensions may still grant
-    # manage_tenants out-of-band after this baseline matrix is resolved.
+    # Defense in depth for rows that predate validation or came from a manual
+    # DB write: the tenant-editable matrix is never an authority for fleet
+    # control. Permission extensions may still grant manage_tenants
+    # out-of-band after this baseline matrix is resolved.
     for caps in result.values():
         caps[MANAGE_TENANTS] = False
 
     return result
+
+
+async def get_user_effective_permissions(
+    db: AsyncSession, user: Identity
+) -> dict[str, bool]:
+    """Overlays can deny a matrix grant or add one, so callers must not read the
+    matrix directly. The checks stay sequential: AsyncSession is not safe for
+    concurrent use by overlay implementations that consult the database.
+    """
+    user_roles = await get_user_roles(db, user)
+    matrix = await get_effective_permissions(db)
+    permission_ext = get_permission_extension()
+    return {
+        cap: await permission_ext.check_permission(
+            db,
+            user,
+            cap,
+            user_roles=user_roles,
+            permission_matrix=matrix,
+        )
+        for cap in ALL_CAPABILITIES
+    }

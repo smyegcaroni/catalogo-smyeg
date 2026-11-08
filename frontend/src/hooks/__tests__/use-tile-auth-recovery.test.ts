@@ -12,7 +12,7 @@ import { tryRefresh } from '@/api/client';
 
 vi.mock('@/api/client', () => ({ tryRefresh: vi.fn(async () => true) }));
 
-// fix(#621): one re-mint per cooldown window — MapLibre can fire dozens of
+// One re-mint per cooldown window — MapLibre can fire dozens of
 // tile errors per pan, and hammering the mint endpoint cannot help. Errors in
 // the settle window ride the pending re-mint (true); errors that persist past
 // it mean the re-mint didn't cure them (false).
@@ -68,7 +68,7 @@ describe('useTileAuthRecovery', () => {
     expect(remint).toHaveBeenCalledTimes(2);
   });
 
-  // fix(#890): telemetry lives here because this is the only place that knows a
+  // Telemetry lives here because this is the only place that knows a
   // mint actually started — the returned boolean is `true` both for a fresh mint
   // and for an error riding the settle window, and `false` mid-cooldown.
   describe('onRemint telemetry (fix #890)', () => {
@@ -134,14 +134,14 @@ describe('useTileAuthRecovery', () => {
   });
 });
 
-// fix(#755): tile sigs are minted on 900 s `round_expiry()` boundaries, so a tab
+// Tile sigs are minted on 900 s `round_expiry()` boundaries, so a tab
 // backgrounded for a few minutes routinely returns with an expired token and
 // MapLibre 403s every visible tile before the reactive handler heals the map.
 // The proactive path re-mints on the VISIBLE edge instead — on the hidden edge a
-// `setTiles` reload would be dropped by the paused TileManager (fix(#584)).
+// `setTiles` reload would be dropped by the paused TileManager.
 
 function vectorToken(expSeconds: number): TileToken {
-  return { kind: 'vector', sig: 's', exp: expSeconds, scope: 'x', expires_in: 900 };
+  return { kind: 'vector', sig: 's', exp: expSeconds, scope: 'x', expires_in: 900, tile_url_template: '' };
 }
 
 const rasterToken: TileToken = {
@@ -308,8 +308,8 @@ describe('useVisibleTileTokenRefresh (fix #755)', () => {
     expect(remint).toHaveBeenCalledTimes(1);
   });
 
-  // fix(#890): the trigger is what makes the re-mint traceable — the reactive
-  // 403 burst this path replaced at least left warnings behind as evidence that
+  // The trigger is what makes the re-mint traceable — a reactive
+  // 403 burst at least leaves warnings behind as evidence that
   // a recovery happened. `useTileAuthRecovery` turns it into one report per
   // actual mint (see its onRemint suite above).
   it('names itself as the trigger so the report can distinguish a tab return', () => {
@@ -345,7 +345,7 @@ describe('useVisibleTileTokenRefresh (fix #755)', () => {
     expect(onRemint).not.toHaveBeenCalled();
   });
 
-  // fix(#907): raster/DEM tiles carry the session JWT in an Authorization
+  // Raster/DEM tiles carry the session JWT in an Authorization
   // header, so a raster-only map has no `exp` for hasExpiringVectorToken to
   // see. Without the session half of the gate it 401s its whole tile surface
   // once on tab return.
@@ -369,7 +369,7 @@ describe('useVisibleTileTokenRefresh (fix #755)', () => {
     expect(recover).not.toHaveBeenCalled();
   });
 
-  // fix(#907) (codex P1): renewing the credential does not retry the raster
+  // Renewing the credential does not retry the raster
   // tiles that already 401'd — MapLibre resumes its fetches the moment the tab
   // is visible and races the refresh, and a raster descriptor is unchanged
   // across one, so nothing in the token→setTiles plumbing reloads them.
@@ -402,7 +402,7 @@ describe('useVisibleTileTokenRefresh (fix #755)', () => {
     expect(onCredentialRenewed).toHaveBeenCalledTimes(1);
   });
 
-  // codex on #964: `tryRefresh` resolves `!!token`, so it comes back TRUE for a
+  // `tryRefresh` resolves `!!token`, so it comes back TRUE for a
   // transient failure that left the stale token in place. Reloading on that
   // boolean would retry against the same Bearer and 401 again.
   it('does not reload when the refresh failed and nothing rotated', async () => {
@@ -442,7 +442,7 @@ describe('useVisibleTileTokenRefresh (fix #755)', () => {
     expect(onCredentialRenewed).toHaveBeenCalledTimes(1);
   });
 
-  // codex on #964: a dead session ends in `logout()`, which moves the token to
+  // A dead session ends in `logout()`, which moves the token to
   // null. Treating that as a rotation would refetch every raster tile with no
   // Authorization header — a second 401 burst under the signed-out dialog.
   it('does not treat a logout as a credential renewal', async () => {
@@ -463,7 +463,7 @@ describe('useVisibleTileTokenRefresh (fix #755)', () => {
     expect(onCredentialRenewed).not.toHaveBeenCalled();
   });
 
-  // codex on #964: with the reload in place a raster 401 from the visibility
+  // With the reload in place a raster 401 from the visibility
   // race heals on its own, but the surfaces still told the user to reload the
   // page. This is the window they use to suppress that.
   it('marks a renewal pending for the surfaces, time-boxed', async () => {
@@ -490,7 +490,7 @@ describe('useVisibleTileTokenRefresh (fix #755)', () => {
     expect(isSessionRenewalPending(startedAt + 60_000)).toBe(false);
   });
 
-  // codex on #964: refreshAccessToken rides an unbounded fetch, so a fixed
+  // refreshAccessToken rides an unbounded fetch, so a fixed
   // deadline could expire mid-flight and let a delayed raster 401 latch
   // DatasetMap's permanent error overlay for tiles the rotation then heals.
   it('stays pending for as long as the refresh is actually in flight', async () => {

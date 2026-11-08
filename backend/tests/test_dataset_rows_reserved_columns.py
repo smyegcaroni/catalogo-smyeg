@@ -1,15 +1,15 @@
-"""fix(#1778): the row browser must survive a column named after a SQL keyword.
+"""The row browser must survive a column named after a SQL keyword.
 
-``get_dataset_rows`` interpolated column identifiers bare, so ``SELECT gid, desc
-FROM data.x`` was a PostgreSQL syntax error (42601). 42601 is in none of the
-sqlstate sets ``get_dataset_rows`` degrades on, so the endpoint 5xx'd for that
+``get_dataset_rows`` must quote column identifiers: bare, ``SELECT gid, desc
+FROM data.x`` is a PostgreSQL syntax error (42601). 42601 is in none of the
+sqlstate sets ``get_dataset_rows`` degrades on, so the endpoint would 5xx for that
 dataset permanently -- for anonymous callers on a public dataset too. Nothing
 renames SQL keywords on ingest: ``rename_reserved_columns`` only touches
 gid/geom/geometry/geom_4326/fid/ogc_fid, and ``desc``/``order``/``user`` are
 routine ogr2ogr output from DBF fields.
 
 The same dataset reads fine through /features, which quotes its identifiers,
-so before this fix the failure looked like data corruption rather than quoting.
+so the failure looks like data corruption rather than quoting.
 
 Requires the Docker test database.
 """
@@ -67,7 +67,7 @@ async def test_reserved_word_columns_are_projected(test_db_session) -> None:
     """The page renders instead of raising a 42601 syntax error."""
     table = await _make_table(test_db_session)
     try:
-        rows, _total, _cols, _cursor = await get_dataset_rows(
+        rows, _total, _kind, _cols, _cursor = await get_dataset_rows(
             test_db_session, table, column_info=_column_info()
         )
     finally:
@@ -83,13 +83,13 @@ async def test_reserved_word_column_filter_matches(test_db_session) -> None:
     """`filter[desc]=...` composes into the ILIKE clause without a syntax error."""
     table = await _make_table(test_db_session)
     try:
-        matched, _total, _cols, _cursor = await get_dataset_rows(
+        matched, _total, _kind, _cols, _cursor = await get_dataset_rows(
             test_db_session,
             table,
             column_info=_column_info(),
             filters={"desc": "value-desc"},
         )
-        missed, _total, _cols, _cursor = await get_dataset_rows(
+        missed, _total, _kind, _cols, _cursor = await get_dataset_rows(
             test_db_session,
             table,
             column_info=_column_info(),

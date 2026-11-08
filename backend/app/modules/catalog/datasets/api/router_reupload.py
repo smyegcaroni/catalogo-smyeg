@@ -19,6 +19,7 @@ from fastapi import (
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import EDIT_METADATA
 from app.core.failure_reason import redact_failure_reason
 from app.core.geo import unknown_srid_refusal
 from app.core.upload_errors import (
@@ -35,6 +36,7 @@ from app.core.async_io import (
 )
 from app.modules.auth.dependencies import require_permission
 from app.modules.catalog.authorization import check_dataset_write_access
+from app.modules.catalog.features.service import lock_catalog_rows_for_write
 from app.core.config import settings
 from app.core.db.tenant_session import defer_async_with_tenant
 from app.modules.catalog.datasets.domain.schemas import (
@@ -55,9 +57,14 @@ from app.platform.jobs.defer_guard import (
     defer_with_orphan_guard,
     make_ingest_job_failed_rollback,
 )
+from app.platform.arcgis_native_types import (
+    ARCGIS_NATIVE_PG_TYPES,
+    column_casts_from_meta,
+)
+from app.platform.catalog_locks import CatalogLockConflict
 from app.platform.jobs import ledger
 from app.platform.jobs.ledger import hold
-from app.platform.jobs.models import IngestJob
+from app.platform.jobs.models import ADMITTED_CAPABILITY_METADATA_KEY, IngestJob
 from app.platform.refresh.credentials import (
     CredentialStoreUnavailable,
     credential_store_refusal,
@@ -67,6 +74,7 @@ from app.platform.refresh.credentials import (
 from app.platform.refresh import verification as refresh_policy
 from app.platform.refresh.service import DatasetBusyError, create_pending_run
 from app.platform.column_names import stored_column_names
+from app.platform.request_credential import refuse_publish_key
 from app.platform.dataset_origin import classify_origin
 from app.platform.extensions import get_catalog_port
 from app.core.persistent_config import UPLOAD_MAX_SIZE_MB, get_allowed_extensions_list
@@ -74,16 +82,25 @@ from app.core.record_types import is_table_or_raster_backed
 from app.core.pointcloud import LAZ_WITHOUT_KIND, POINTCLOUD_FILE_TYPE, is_laz
 from app.core.tiles3d import TILESET_ARCHIVE_SUFFIX
 from app.modules.quota.service import check_replacement_quota
+from app.modules.catalog.sources.adapters.arcgis import (
+    fetch_arcgis_layer_meta,
+    normalize_arcgis_url,
+)
 from app.modules.catalog.sources.preview import build_gdal_source, run_service_preview
 from app.modules.catalog.sources.schemas import service_credential_from_request
 from app.platform.service_auth import (
     credential_or_422,
+    credential_over_http_or_422,
     url_query_token,
     wire_credential,
 )
-from app.platform.security import SSRFError, validate_url_for_ssrf
+from app.platform.security import SSRFError, make_safe_client, validate_url_for_ssrf
 from app.platform.storage import get_storage
 from app.platform.storage.titiler_url import resolve_current_storage_key
+from app.platform.upload_filenames import (
+    refuse_control_characters,
+    safe_upload_basename,
+)
 from app.standards.ogc.errors import (
     BAD_GATEWAY_RESPONSE,
     ERROR_RESPONSES_WRITE,
@@ -131,7 +148,7 @@ _NO_REUPLOAD_DEFAULT = CodedRefusal(
 def _service_format(service_label: object) -> str | None:
     """The canonical service format a human service label resolves to.
 
-    fix(#1746): the credential policy is chosen by the format, because that is
+    The credential policy is chosen by the format, because that is
     what decides whether the credential becomes a header line or a URL query
     parameter. An unrecognized service label answers None, which is the
     worker's error to report; this does not take that decision away from it.
@@ -227,6 +244,7 @@ def _new_reupload_metadata(dataset_id: uuid.UUID, dataset) -> dict:
         "reupload": True,
         "dataset_id": str(dataset_id),
         _START_DATA_REVISION: dataset.data_revision,
+        ADMITTED_CAPABILITY_METADATA_KEY: EDIT_METADATA,
     }
 
 
@@ -270,6 +288,19 @@ async def _bind_presigned_reupload(
     return bool(bound.rowcount)
 
 
+def _refuse_publish_key_irreversible_replace(db: AsyncSession, dataset) -> None:
+    # A raster replace deletes the old COG once it commits and keeps no
+    # previous version, and a restore can bring back only an upload's or a
+    # drawn layer's source binding, not a service's, STAC item's or table's.
+    if dataset.record.record_type == "raster_dataset":
+        refuse_publish_key(db, "A publish key can't replace a raster dataset")
+    origin = classify_origin(dataset.source_format, dataset.record.record_type)
+    if origin not in ("upload", "created"):
+        refuse_publish_key(
+            db, "A publish key can't replace a dataset bound to a remote origin"
+        )
+
+
 def _assert_compatible_record_type(
     dataset,
     filename: str | None,
@@ -279,17 +310,16 @@ def _assert_compatible_record_type(
     """Raise HTTP 400 when the source is incompatible with dataset.record.record_type.
 
     Called from all three reupload doors (multipart, S3, service preview)
-    after dataset lookup, before pipeline work, so this gives one
-    identical error class instead of a deep-pipeline 500.
+    after dataset lookup, before pipeline work, so this gives one identical
+    error class instead of a deep-pipeline 500.
 
     VRT is rejected here since it's defined by membership, not a file, and
     so is any type that neither a feature table nor a raster asset backs (a
     tileset, a point cloud, an unknown type): none has a replace path.
-    Raster IS supported (#1221), constrained to raster payloads; file paths
+    Raster is supported, constrained to raster payloads; file paths
     additionally reject raster inputs for vector/table datasets.
 
-    Audit action `reupload.commit` is shipped -- see
-    test_provenance_attribution.py. Do not rename to `dataset.reupload`.
+    Audit action `reupload.commit` is pinned by test_provenance_attribution.py.
     """
     record_type: str = dataset.record.record_type
     ext: str = Path(filename or "").suffix.lower()
@@ -340,7 +370,7 @@ def _assert_compatible_record_type(
         )
 
     if record_type == "raster_dataset":
-        # feat(#1221): a raster dataset is replaced by uploading a replacement
+        # A raster dataset is replaced by uploading a replacement
         # raster. There is no service path — nothing fetches a GeoTIFF from a
         # feature service — so a service preview against a raster is refused
         # here rather than failing deep in an ogr2ogr the dataset can never use.
@@ -379,6 +409,7 @@ def _assert_compatible_record_type(
     response_model=ReuploadResponse,
     status_code=status.HTTP_201_CREATED,
     responses={413: PAYLOAD_TOO_LARGE_RESPONSE},
+    summary="Stage a file to replace a dataset's data",
 )
 async def reupload_dataset(
     dataset_id: uuid.UUID,
@@ -395,7 +426,7 @@ async def reupload_dataset(
             detail="Dataset not found",
         )
     await check_dataset_write_access(db, dataset, dataset_id, user)
-
+    _refuse_publish_key_irreversible_replace(db, dataset)
     _assert_compatible_record_type(dataset, file.filename)
 
     try:
@@ -407,11 +438,11 @@ async def reupload_dataset(
             detail=refusal_detail(exc),
         )
 
-    # QUOTA-01/02: per-user quota check before any staging or job creation.
-    # fix(#1290): the REPLACEMENT variant. The creation-shaped check
-    # refused at the dataset-count cap, which locked an owner at their limit
-    # out of replacing datasets they already own, and charged the incoming file
-    # on top of the bytes this dataset already contributes.
+    # Per-user quota check before any staging or job creation.
+    # The REPLACEMENT variant: the creation-shaped check would refuse at the
+    # dataset-count cap, locking an owner at their limit out of replacing
+    # datasets they already own, and would charge the incoming file on top of
+    # the bytes this dataset already contributes.
     incoming_bytes = file.size if file.size is not None else 0
     await check_replacement_quota(
         db,
@@ -427,7 +458,7 @@ async def reupload_dataset(
 
     max_size_mb = await UPLOAD_MAX_SIZE_MB.get(db)
     max_size_bytes = max_size_mb * 1024 * 1024
-    # fix(#1848): the job is committed BEFORE the upload so the pooled
+    # The job is committed BEFORE the upload so the pooled
     # connection is not held across it. The row therefore survives a failed
     # upload as `pending` with no `file_path`, which the stale-pending sweep
     # reaps on its one-hour abandonment policy.
@@ -461,7 +492,7 @@ async def reupload_dataset(
                 detail=refusal_detail(exc),
             ) from exc
 
-        # fix(#1848): bind only while the row is still pending and still bound
+        # Bind only while the row is still pending and still bound
         # to this dataset, stamping `staged_at` so the pending window restarts
         # here. The carried-through metadata is what the binding gate reads.
         bound = await db.execute(
@@ -485,17 +516,49 @@ async def reupload_dataset(
 
     return ReuploadResponse(
         job_id=job.id,
-        # fix(#1848): true by construction, not assumed -- the bind above
+        # True by construction, not assumed -- the bind above
         # only reached here because the row was still pending.
         status="pending",
         message="File uploaded for re-upload preview",
     )
 
 
+async def _refuse_featureless_arcgis_layer(
+    request: ReuploadServicePreviewRequest, token: str | None
+) -> dict | None:
+    """Raise the coded 422 for a layer that holds no rows; else its metadata.
+
+    Any other failure to read the metadata is left to the preview below,
+    which reports it, and gives None.
+    """
+    try:
+        base, url_layer_id = normalize_arcgis_url(request.url)
+    except Exception:  # broad: malformed ArcGIS URL, the preview reports it
+        return None
+    layer_id = request.layer_id if request.layer_id is not None else url_layer_id
+    if layer_id is None:
+        return None
+    try:
+        async with make_safe_client(timeout=15.0) as client:
+            return await fetch_arcgis_layer_meta(
+                base.rstrip("/"), str(layer_id).strip("/"), client, token
+            )
+    except HTTPException:
+        raise
+    except SSRFError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="redirect target refused by SSRF policy",
+        )
+    except Exception:  # broad: unreadable metadata, the preview reports it
+        return None
+
+
 @router.post(
     "/{dataset_id}/reupload/service/preview",
     response_model=ReuploadPreviewResponse,
     responses={502: BAD_GATEWAY_RESPONSE},
+    summary="Preview a service layer for re-upload",
 )
 async def reupload_service_preview(
     dataset_id: uuid.UUID,
@@ -504,13 +567,14 @@ async def reupload_service_preview(
     db: AsyncSession = Depends(get_db),
 ) -> ReuploadPreviewResponse:
     """Preview a remote service layer for dataset re-upload."""
-    # feat(#1746): the same conversion the three sibling doors do, and the same
+    # The same conversion the three sibling doors do, and the same
     # order: the credential is judged before any network call, and against the
     # transport the named service actually uses.
     credential = credential_or_422(
         service_credential_from_request(request.auth, request.token),
         service_format=_service_format(request.service_type),
     )
+    credential_over_http_or_422(request.url, credential)
     dataset = await get_dataset(db, dataset_id)
     if dataset is None:
         raise HTTPException(
@@ -519,7 +583,7 @@ async def reupload_service_preview(
         )
     await check_dataset_write_access(db, dataset, dataset_id, user)
 
-    # IA-P1-02: surface cross-record-type swaps as a useful 400 before the
+    # Surface cross-record-type swaps as a useful 400 before the
     # pipeline executes (vector→raster or any→VRT explodes deep otherwise).
     _assert_compatible_record_type(dataset, None, service_type=request.service_type)
 
@@ -542,6 +606,12 @@ async def reupload_service_preview(
             detail=str(exc),
         )
 
+    layer_meta = None
+    if request.service_type.startswith("ArcGIS"):
+        layer_meta = await _refuse_featureless_arcgis_layer(
+            request, url_query_token(credential)
+        )
+
     try:
         gdal_source, layer_arg = build_gdal_source(
             request.service_type,
@@ -554,6 +624,12 @@ async def reupload_service_preview(
             token=url_query_token(credential),
             order_field=None,
             result_limit=5,
+            # The worker stages Z for a layer that stores it, and for a 3D
+            # dataset whose layer JSON it cannot read; previewing flat would
+            # report a dimension change the import never makes.
+            return_z=bool(prior_geometry[1])
+            if layer_meta is None
+            else layer_meta.get("hasZ") is True,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -576,9 +652,12 @@ async def reupload_service_preview(
             },
         )
 
+    typed_columns = _with_declared_native_types(
+        _diffable_columns(preview_data["columns"]), layer_meta
+    )
     diff = compute_schema_diff(
         prior_columns,
-        _diffable_columns(preview_data["columns"]),
+        typed_columns,
         prior_feature_count,
         preview_data["feature_count"],
     )
@@ -608,6 +687,7 @@ async def reupload_service_preview(
             "source_type": "service_url",
             "object_id_field": request.object_id_field,
             _START_DATA_REVISION: start_data_revision,
+            ADMITTED_CAPABILITY_METADATA_KEY: EDIT_METADATA,
         },
     )
     await db.flush()
@@ -616,7 +696,12 @@ async def reupload_service_preview(
     return ReuploadPreviewResponse(
         job_id=job.id,
         source_filename=job.source_filename,
-        columns=preview_data["columns"],
+        columns=[
+            {**column, "type": typed["type"]}
+            for column, typed in zip(
+                preview_data["columns"], typed_columns, strict=True
+            )
+        ],
         crs=preview_data["srid"],
         geometry_type=preview_data["geometry_type"],
         feature_count=preview_data["feature_count"],
@@ -639,14 +724,32 @@ def _diffable_columns(columns: list[dict]) -> list[dict]:
     return [{**c, "name": name} for c, name in zip(columns, stored, strict=True)]
 
 
+def _with_declared_native_types(columns: list[dict], meta: dict | None) -> list[dict]:
+    """``columns`` with the types the import stores for the fields Esri types natively.
+
+    GDAL reports those fields as strings, but publication casts them, so the
+    preview names the same type changes the publication will.
+    """
+    if not meta:
+        return columns
+    casts = column_casts_from_meta(meta)
+    return [
+        {**c, "type": ARCGIS_NATIVE_PG_TYPES[casts[c["name"]]]}
+        if c["name"] in casts
+        else c
+        for c in columns
+    ]
+
+
 @router.post(
     "/{dataset_id}/reupload/{job_id}/preview",
     response_model=ReuploadPreviewResponse,
+    summary="Preview a re-upload",
 )
 async def reupload_preview(
     dataset_id: uuid.UUID,
     job_id: uuid.UUID,
-    # GPKG-01 Phase 1058: optional body allows callers to specify a layer_name
+    # Optional body allows callers to specify a layer_name
     # for multi-layer files; single-layer callers may omit the body entirely.
     request: ReuploadPreviewRequest | None = None,
     user: Identity = Depends(require_permission("edit_metadata")),
@@ -668,7 +771,7 @@ async def reupload_preview(
         )
     await check_dataset_write_access(db, dataset, dataset_id, user)
     _assert_compatible_record_type(dataset, None)
-    # feat(#1221): this endpoint's whole output is a schema diff, and a raster
+    # This endpoint's whole output is a schema diff, and a raster
     # has no attribute schema — the ogrinfo call below would fail on a GeoTIFF
     # for reasons that read as a broken upload. The raster flow is upload then
     # commit, with no preview step in between.
@@ -694,7 +797,7 @@ async def reupload_preview(
             detail="Job already processed",
         )
 
-    # fix(#1848): hand the pooled connection back before the S3 download and
+    # Hand the pooled connection back before the S3 download and
     # ogrinfo. The rollback expires every ORM instance, so everything the
     # response and the diff read off `dataset` and `job` is taken first.
     file_path = job.file_path
@@ -718,18 +821,15 @@ async def reupload_preview(
             file_path = resolved_file_path
             downloaded_preview_path = Path(file_path)
 
-    # GPKG-01 Phase 1058: thread layer_name from request body to ogrinfo helper
+    # Thread layer_name from the request body to the ogrinfo helper.
     layer_name = request.layer_name if request else None
 
-    # Validate layer_name against the file's actual layers (T-1058A-03).
-    # We run ogrinfo without layer_name first to get the full layer list,
-    # then validate — or use the targeted call if no validation needed.
     try:
         info = await get_catalog_port().run_ogrinfo_preview(
             file_path, layer_name=layer_name
         )
     except IngestCeilingError as exc:
-        # fix(#2043): the ceiling message the import preview already answers.
+        # The ceiling message the import preview already answers.
         # The broad handler below reports "malformed or unsupported", which is
         # wrong for a file that is merely too large, and hides the way out.
         raise HTTPException(
@@ -737,17 +837,15 @@ async def reupload_preview(
             detail=refusal_detail(exc),
         ) from exc
     except UnsafeUploadError as exc:
-        # fix(#1846): the same mapping `preview_file` gives it.
-        # This block had no `except` at all, so a content refusal -- which is a
-        # deliberate 4xx with a message that names the fix -- reached the client
-        # as a 500 on this endpoint alone.
+        # The same mapping `preview_file` gives it: a content refusal is a
+        # deliberate 4xx with a message that names the fix, not a 500.
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=refusal_detail(exc),
         ) from exc
     except Exception as exc:  # broad: GDAL subprocess can raise various errors on unsupported/malformed files
-        # fix(#2036): the 422 the import preview answers for the same failure.
-        # A malformed file's IngestionError escaped this door as a 500.
+        # The 422 the import preview answers for the same failure, rather than
+        # a 500 for a malformed file's IngestionError.
         logger.exception("ogrinfo_preview failed", job_id=str(job_id), error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -760,8 +858,8 @@ async def reupload_preview(
         if downloaded_preview_path is not None:
             downloaded_preview_path.unlink(missing_ok=True)
 
-    # GPKG-01 Phase 1058: validate user-supplied layer_name appears in the file.
-    # WR-02 fix: also check against info["layer_name"] for single-layer files where
+    # Validate that the user-supplied layer_name appears in the file.
+    # Also check against info["layer_name"] for single-layer files where
     # all_layers is None (ogr.py only sets all_layers when len(layers) > 1).
     # Without this branch a mistyped layer_name on a single-layer file silently
     # falls through and returns data for the wrong layer.
@@ -783,8 +881,8 @@ async def reupload_preview(
                 ),
             )
 
-    # fix(#2031): the diff below reads attribute columns only, so a geometry
-    # loss reached the client as an unremarkable schema diff.
+    # The diff below reads attribute columns only, so a geometry
+    # loss would otherwise look like an unremarkable schema diff.
     geometry_loss = geometry_loss_refusal(
         record_type=prior_record_type,
         dataset_geometry_type=prior_geometry_type,
@@ -812,8 +910,8 @@ async def reupload_preview(
         live_geometry=prior_geometry,
     )
 
-    # GPKG-01 Phase 1058: read the most-recent completed IngestJob's source_layer
-    # to provide a pre-selection hint for the frontend layer-select UI (D-02).
+    # Read the most-recent completed IngestJob's source_layer to provide a
+    # pre-selection hint for the frontend layer-select UI.
     from sqlalchemy import desc
 
     prior_result = await db.execute(
@@ -888,12 +986,12 @@ async def _preview_review(
 
 
 def _require_reupload_source(job, is_service_refresh: bool) -> None:
-    """fix(#1274): reject a source-less job BEFORE reserving the dataset.
+    """Reject a source-less job BEFORE reserving the dataset.
 
     A presigned reupload whose upload never completed has an EMPTY-STRING
-    file_path (not None -- hence the truthiness test) and no source_url.
-    Creating the run first and 400ing after left that reservation active,
-    so a later completed upload hit dataset_busy, unreleasable by the
+    file_path (not None, hence the truthiness test) and no source_url.
+    Creating the run first and 400ing after would leave the reservation
+    active, so a later completed upload hits dataset_busy, unreleasable by the
     sweep for up to the 24-hour bound-job timeout. The queue-time is-None
     check stays as defense in depth.
     """
@@ -909,18 +1007,18 @@ async def _refuse_if_origin_changed(
 ) -> None:
     """Refuse a commit whose expected origin is no longer the dataset's.
 
-    fix(#1768): `geolens replace` and the re-upload dialog both decide
-    from a SINGLE pre-upload read whether they're replacing a
-    service/STAC/registered-table dataset. Between that read and commit
-    sits an upload, a preview, and a human -- a service/STAC re-upload
-    committing in that window would rebind the dataset invisibly, since
-    the swap always rebinds to `upload` unconditionally.
+    `geolens replace` and the re-upload dialog both decide from a SINGLE
+    pre-upload read whether they're replacing a service/STAC/registered-table
+    dataset. Between that read and commit sits an upload, a preview, and a
+    human; a service/STAC re-upload committing in that window would rebind the
+    dataset invisibly, since the swap always rebinds to `upload`
+    unconditionally.
 
     Called AFTER `create_pending_run`: the one-active-run slot means a
     READ COMMITTED re-read sees any origin change already committed.
     Same `origin_changed` code as the refresh door's re-read
-    (`router_refresh.py`). ``None`` returns immediately: an older
-    CLI/SDK gets the pre-#1768 behaviour.
+    (`router_refresh.py`). ``None`` returns immediately, for an older CLI/SDK
+    that sends no expectation.
     """
     if expected_origin_kind is None:
         return
@@ -962,12 +1060,11 @@ async def _dispatch_reupload_task(
 ) -> None:
     """Defer the worker task this committed reupload needs.
 
-    Three destinations, one admission gate already reserved by the
-    caller; this only picks the executor and queue. Every branch goes
-    through ``defer_with_orphan_guard`` so a Procrastinate outage flips
-    the job to ``failed`` and finalizes the run instead of leaving a
-    ghost ``pending`` row. Extracted from ``reupload_commit`` when the
-    raster branch (#1221) pushed it past the McCabe gate.
+    Three destinations, one admission gate already reserved by the caller;
+    this only picks the executor and queue. Every branch goes through
+    ``defer_with_orphan_guard`` so a Procrastinate outage flips the job to
+    ``failed`` and finalizes the run instead of leaving a ghost ``pending``
+    row.
 
     ``credential_ref`` is the staged service credential from
     ``resolve_dispatch_credential``, forwarded verbatim; the token itself
@@ -1000,7 +1097,7 @@ async def _dispatch_reupload_task(
     file_path = job.file_path
 
     if record_type == "raster_dataset":
-        # feat(#1221): the raster swap moves a RasterAsset pointer rather
+        # The raster swap moves a RasterAsset pointer rather
         # than renaming a staging table, but is admitted by the same
         # `create_pending_run` reservation, so raster and vector reuploads
         # can't both run on one dataset. Goes to the `raster` queue, not
@@ -1052,6 +1149,7 @@ async def _dispatch_reupload_task(
     "/{dataset_id}/reupload/{job_id}/commit",
     response_model=ReuploadCommitResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    summary="Commit a re-upload",
 )
 async def reupload_commit(
     dataset_id: uuid.UUID,
@@ -1061,7 +1159,7 @@ async def reupload_commit(
     db: AsyncSession = Depends(get_db),
 ) -> ReuploadCommitResponse:
     """Commit a re-upload, queuing the background swap task."""
-    # feat(#1746): one conversion for the whole handler. The service format is
+    # One conversion for the whole handler. The service format is
     # not known until the job has been read, so the credential is judged and
     # composed a few lines below, before anything is written or reserved.
     credential = service_credential_from_request(request.auth, request.token)
@@ -1072,6 +1170,7 @@ async def reupload_commit(
             detail="Dataset not found",
         )
     await check_dataset_write_access(db, dataset, dataset_id, user)
+    _refuse_publish_key_irreversible_replace(db, dataset)
     _assert_compatible_record_type(dataset, None)
 
     job = await _get_bound_reupload_job_or_404(
@@ -1087,7 +1186,7 @@ async def reupload_commit(
             detail="Job already processed",
         )
 
-    # fix(#2032): an unassigned EPSG code committed and was then ignored.
+    # An unassigned EPSG code is refused rather than committed and ignored.
     srid_refusal = await unknown_srid_refusal(db, request.srid_override)
     if srid_refusal:
         raise HTTPException(
@@ -1095,18 +1194,19 @@ async def reupload_commit(
             detail=srid_refusal,
         )
 
-    # fix(#1746): judge the credential by the WORKER's policy for this
-    # job's service type -- a WFS token with `+`/`/` used to get a 202,
-    # spend its single-use credential, then fail in ogr2ogr's charset
+    # Judge the credential by the WORKER's policy for this
+    # job's service type -- otherwise a WFS token with `+`/`/` gets a 202,
+    # spends its single-use credential, then fails in ogr2ogr's charset
     # check. Placed ahead of every write so a bad credential never takes
     # the one-active-run slot from a refresh that can.
     service_token = wire_credential(credential, service_format=_job_service_format(job))
+    credential_over_http_or_422(job.source_url, credential)
 
     # Merge commit request params into user_metadata, preserving existing
     # keys. token + layer_name stay request-only (layer_name goes into the
-    # dedicated source_layer column, D-03 below).
+    # dedicated source_layer column, set below).
     #
-    # feat(#1746): `auth` is excluded for the same reason -- user_metadata
+    # `auth` is excluded for the same reason -- user_metadata
     # is a durable JSONB column and this model_dump is a whitelist by
     # omission, so a nested credential object would land in it in full.
     existing_meta = dict(job.user_metadata or {})
@@ -1122,17 +1222,17 @@ async def reupload_commit(
         existing_meta["service_auth_required"] = True
     job.user_metadata = existing_meta
 
-    # GPKG-01 (D-03): persist to the dedicated IngestJob.source_layer
+    # Persist to the dedicated IngestJob.source_layer
     # column; user_metadata is not consulted by the worker for this.
     if request.layer_name is not None:
-        job.source_layer = request.layer_name  # GPKG-01 Phase 1058
+        job.source_layer = request.layer_name
 
-    # feat(#1219) ADR-002 Decision 4b: the run row is written HERE, before
-    # the task is deferred, not at swap commit -- a worker dying mid-fetch
-    # would otherwise leave no history row at all. `trigger` is `manual`
-    # since a human clicked commit. Decision 5b: the insert is also the
-    # admission gate (partial unique index, one active run per dataset),
-    # refusing a second concurrent commit HERE rather than at the worker.
+    # ADR-002 Decision 4b: the run row is written HERE, before the task is
+    # deferred, not at swap commit -- a worker dying mid-fetch would otherwise
+    # leave no history row at all. `trigger` is `manual` since a human clicked
+    # commit. Decision 5b: the insert is also the admission gate (partial
+    # unique index, one active run per dataset), refusing a second concurrent
+    # commit HERE rather than at the worker.
     is_service_refresh = bool(job.source_url and not job.file_path)
     _require_reupload_source(job, is_service_refresh)
 
@@ -1146,6 +1246,7 @@ async def reupload_commit(
             ingest_job_id=job.id,
             feature_count_before=dataset.feature_count,
             data_revision_baseline=start_revision,
+            expected_data_revision=request.expected_data_revision,
         )
     except DatasetBusyError as exc:
         # Nothing this request wrote is committed, so the job row it merged
@@ -1163,10 +1264,7 @@ async def reupload_commit(
             },
         ) from exc
 
-    # fix(#1768): the origin door, and it has to be HERE -- after the run
-    # row took the one-active-run admission slot, not before it. See
-    # `_refuse_if_origin_changed` for why the reservation makes the
-    # re-read decisive.
+    # After the run row takes the one-active-run slot, which makes this re-read decisive.
     await _refuse_if_origin_changed(db, dataset, request.expected_origin_kind)
 
     # Staged before the commit so a store that is missing or unreachable
@@ -1186,17 +1284,11 @@ async def reupload_commit(
             await db.rollback()
             raise credential_store_refusal(exc, operation="re-upload") from exc
 
-    # fix(#1709): the pending check at the top is a plain read, and
-    # everything since flushes in THIS commit -- POST /jobs/{id}/cancel
-    # landing in between would, without a fence, bind a pending run to a
-    # now-cancelled job that holds `uq_refresh_runs_one_active` for up to
-    # an hour of false "busy" after a successful cancel.
-    #
-    # The hold below re-reads pending+attempt under the row lock, atomically
-    # with the run flush: a committed cancel fails it and rolls the whole
-    # request back into a clean 409; if this side takes the lock first, the
-    # cancel's own CAS then cancels job AND run together. No deadlock: this
-    # transaction's run row is invisible to the cancel's CAS until commit.
+    # The pending check at the top was a plain read. Re-read under the job row,
+    # with the run flush, a committed cancel refuses this request with a 409
+    # instead of leaving a run on a cancelled job holding the one-active-run
+    # slot. A cancel that comes second ends the job and run together; it cannot
+    # see this transaction's run until commit, so the two never deadlock.
     committing_attempt = job.attempt_id
     held = await ledger.hold(db, job.id, expect="pending")
     if held is None or held.attempt_id != committing_attempt:
@@ -1213,6 +1305,13 @@ async def reupload_commit(
                 ),
             },
         )
+    # Held to the commit, so a transfer waits and then finds this run busy.
+    try:
+        await lock_catalog_rows_for_write(db, dataset)
+    except (HTTPException, CatalogLockConflict):
+        await db.rollback()
+        await discard_service_credential(credential_ref)
+        raise
     await db.commit()
 
     # Each defer_async path is wrapped in the shared orphan guard so a
@@ -1262,6 +1361,7 @@ async def reupload_commit(
         413: PAYLOAD_TOO_LARGE_RESPONSE,
         502: BAD_GATEWAY_RESPONSE,
     },
+    summary="Request a presigned re-upload",
 )
 async def request_presigned_reupload(
     dataset_id: uuid.UUID,
@@ -1284,13 +1384,16 @@ async def request_presigned_reupload(
             detail="Dataset not found",
         )
     await check_dataset_write_access(db, dataset, dataset_id, user)
+    _refuse_publish_key_irreversible_replace(db, dataset)
 
+    refuse_control_characters(request.filename)
+    staged_name = safe_upload_basename(request.filename)
     _assert_compatible_record_type(dataset, request.filename)
 
     try:
         allowed_list = await get_allowed_extensions_list(db)
     except Exception:  # broad: persistent_config lookup must not crash reupload UI; fall back to safe default list
-        # fix(#1682): the configured default, not a frozen literal —
+        # The configured default, not a frozen literal —
         # see _fallback_allowed_extensions in processing/ingest/router.py for
         # why a narrower fallback is not a safer one.
         allowed_list = list(settings.allowed_extensions_list)
@@ -1320,8 +1423,8 @@ async def request_presigned_reupload(
             },
         )
 
-    # QUOTA-01/02: per-user quota check before any staging or job creation.
-    # fix(#1290): identical admission to the direct door — same function,
+    # Per-user quota check before any staging or job creation.
+    # Identical admission to the direct door — same function,
     # same arguments — so the two doors cannot diverge on who may replace what.
     await check_replacement_quota(
         db,
@@ -1333,7 +1436,7 @@ async def request_presigned_reupload(
 
     job = await get_catalog_port().create_ingest_job(db, request.filename, "", user.id)
     job.dataset_id = dataset_id
-    # fix(#1848): the markers the binding gate reads are committed with the
+    # The markers the binding gate reads are committed with the
     # row; the presigned facts land through the guarded bind once storage
     # has answered, so a row cancelled or unbound meanwhile is refused.
     job.user_metadata = _new_reupload_metadata(dataset_id, dataset)
@@ -1341,17 +1444,17 @@ async def request_presigned_reupload(
     job_created_at = job.created_at
     job_metadata = job.user_metadata
     storage = get_storage()
-    s3_key = f"staging/{job_id}/{request.filename}"
+    s3_key = f"staging/{job_id}/{staged_name}"
     physical_s3_key = resolve_current_storage_key(s3_key)
     threshold = settings.presigned_multipart_threshold_mb * 1024 * 1024
 
     part_size = get_catalog_port().ingest_part_size()
-    # fix(#1235): a gate, not a value — every signature below computes
+    # A gate, not a value — every signature below computes
     # its own expiration inside the signing thread, and this call is here only
     # so a job with no usable lifetime left is refused before an upload id
     # exists. The return is deliberately discarded. Same as the upload door.
     get_catalog_port().require_signable_job_lifetime(job_created_at)
-    # fix(#1848): committed before storage is asked for anything, so the pooled
+    # Committed before storage is asked for anything, so the pooled
     # connection is not held across the multipart initiation or the signing.
     await db.commit()
 
@@ -1367,7 +1470,7 @@ async def request_presigned_reupload(
                 raise initiation_cancel
             num_parts = math.ceil(request.file_size / part_size)
             urls = [
-                # fix(#1235): each part computes its own
+                # Each part computes its own
                 # expiration INSIDE the signing thread. Same as the upload
                 # door; `sign_url_with_deadline` carries the reasoning.
                 await run_in_thread_draining(
@@ -1388,7 +1491,7 @@ async def request_presigned_reupload(
                     upload_id=upload_id,
                     job_id=job_id,
                 )
-            # fix(#1235): an HTTPException from here is the lifetime
+            # An HTTPException from here is the lifetime
             # refusal and must survive as its own 409; the abort above has
             # already run. Same as the upload door.
             if isinstance(exc, (asyncio.CancelledError, HTTPException)):
@@ -1465,6 +1568,7 @@ async def request_presigned_reupload(
         413: PAYLOAD_TOO_LARGE_RESPONSE,
         502: BAD_GATEWAY_RESPONSE,
     },
+    summary="Complete a presigned re-upload",
 )
 async def complete_presigned_reupload(
     dataset_id: uuid.UUID,
@@ -1482,6 +1586,7 @@ async def complete_presigned_reupload(
             detail="Dataset not found",
         )
     await check_dataset_write_access(db, dataset, dataset_id, user)
+    _refuse_publish_key_irreversible_replace(db, dataset)
     _assert_compatible_record_type(dataset, None)
 
     job = await _get_bound_reupload_job_or_404(
@@ -1490,7 +1595,7 @@ async def complete_presigned_reupload(
         dataset_id=dataset_id,
         user_id=user.id,
     )
-    # fix(#1207): re-fetch under a row lock with attributes reloaded, then read
+    # Re-fetch under a row lock with attributes reloaded, then read
     # the one-shot fact. `_get_bound_reupload_job_or_404` above stays unlocked —
     # it carries the stricter binding checks (dataset, owner, reupload marker)
     # and its 404 semantics, which the lock helper must not replace.
@@ -1503,7 +1608,7 @@ async def complete_presigned_reupload(
             detail="Job is not a presigned upload",
         )
 
-    # fix(#1213): both one-shot facts, shared with the upload door.
+    # Both one-shot facts, shared with the upload door.
     # This door stamps `failed` itself before a content 422 (below), so without
     # the status half a client could re-PUT and complete again: a 200 that
     # binds a frozen object to a row preview and commit will refuse.
@@ -1535,11 +1640,11 @@ async def complete_presigned_reupload(
                 [{"ETag": p.etag, "PartNumber": p.part_number} for p in request.parts],
             )
             if completion_cancel is not None:
-                # fix(#1233): do NOT delete the assembled object -- the
-                # spent upload id means the object's presence is the only
-                # record assembly succeeded, which `should_assemble_multipart`
-                # reads to let a retry skip re-assembly. Deleting it left a
-                # retry 502ing forever with a spent id and no way back.
+                # Do NOT delete the assembled object: the upload id is spent,
+                # so the object's presence is the only record assembly
+                # succeeded, which `should_assemble_multipart` reads to let a
+                # retry skip re-assembly. Deleting it would leave retries
+                # 502ing forever.
                 raise completion_cancel
         except Exception as exc:  # broad: storage providers raise varied SDK errors
             await get_catalog_port().abort_presigned_multipart_upload(
@@ -1559,7 +1664,7 @@ async def complete_presigned_reupload(
                 detail="Upload completion failed — the upload session may have expired. Please try again.",
             ) from exc
 
-    # fix(#1207): rows 7-13 of the completion contract, shared with the upload
+    # Rows 7-13 of the completion contract, shared with the upload
     # door — exists, pre-copy size gate, drained freeze, verify and
     # content-validate the FROZEN bytes, with every cleanup decision. The
     # docstring carries the failure postconditions.
@@ -1573,9 +1678,9 @@ async def complete_presigned_reupload(
             filename=job.source_filename or "",
             user_id=dataset.record.created_by,
             request=http_request,
-            # fix(#1290): completion is the THIRD admission point, and
-            # it was still creation-shaped — an owner at the dataset-count cap
-            # passed the request-time door, uploaded, and was refused here.
+            # Completion is the THIRD admission point. A creation-shaped check
+            # would refuse an owner at the dataset-count cap here after they
+            # passed the request-time door and uploaded.
             # Naming the dataset makes the finalizer admit this as a
             # replacement, against the owner, like the other two.
             replacing_dataset_id=dataset_id,
@@ -1597,7 +1702,7 @@ async def complete_presigned_reupload(
     job.file_path = frozen_key
     await db.commit()
 
-    # fix(#1207): after the commit, never before — a rolled-back commit with
+    # After the commit, never before — a rolled-back commit with
     # the staging object already gone strands the retry. The helper is named
     # for its rollback callers, but it is just a best-effort logical-key
     # delete, which is what this needs too.

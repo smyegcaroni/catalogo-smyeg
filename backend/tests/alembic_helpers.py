@@ -37,6 +37,9 @@ This module is the one place that knows about refuse-to-coerce downgrades:
 - ``0077_dataset_previous_version``: refuses while any refresh run has
   ``origin_kind = 'restore'``. Normalized automatically, since ordinary
   restore tests leave such runs behind.
+- ``0088_dataset_kept_versions``: refuses while any dataset keeps more than
+  one previous version. Normalized automatically by forgetting all but each
+  dataset's newest, since ordinary replacement tests keep several.
 
 If a future migration gains a refuse-to-coerce downgrade, teach this module
 about it rather than adding cleanup to individual test files.
@@ -105,7 +108,7 @@ $$;
 """
 
 
-# fix(#1016): the remediation 0029's own error message prescribes, minus the
+# The remediation 0029's own error message prescribes, minus the
 # DELETE — a test database's keys are fixture noise, so clearing the state is
 # enough and there is no need to destroy rows a sibling test may still read.
 #
@@ -170,6 +173,30 @@ $$;
 """
 
 
+# Several kept versions are fixture noise in a test database; 0088's downgrade
+# refuses them because the earlier schema keeps one.
+_KEPT_VERSION_NORMALIZATION = """
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'catalog'
+          AND table_name = 'dataset_versions'
+          AND column_name = 'kept_table'
+    ) THEN
+        UPDATE catalog.dataset_versions v SET kept_table = NULL, kept_at = NULL,
+            kept_bytes = NULL, kept_refreshed_at = NULL
+        WHERE v.kept_table IS NOT NULL AND EXISTS (
+            SELECT 1 FROM catalog.dataset_versions n
+            WHERE n.dataset_id = v.dataset_id AND n.kept_table IS NOT NULL
+              AND n.version_number > v.version_number
+        );
+    END IF;
+END
+$$;
+"""
+
+
 def _execute_normalization(sql: str) -> None:
     from app.core.config import settings
 
@@ -196,6 +223,11 @@ def normalize_api_key_state() -> None:
 def normalize_restore_runs() -> None:
     """Delete restore refresh runs so downgrades can cross 0077."""
     _execute_normalization(_RESTORE_RUN_NORMALIZATION)
+
+
+def normalize_kept_versions() -> None:
+    """Forget all but each dataset's newest kept version so downgrades can cross 0088."""
+    _execute_normalization(_KEPT_VERSION_NORMALIZATION)
 
 
 def run_alembic(
@@ -226,11 +258,12 @@ def run_alembic(
         normalize_seam_extents()
         normalize_api_key_state()
         normalize_restore_runs()
+        normalize_kept_versions()
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(_BACKEND_DIR)
     env["POSTGRES_DB"] = settings.postgres_db_test
-    # fix(#933): stripped for determinism — migration 0012's dims fallback
+    # Stripped for determinism — migration 0012's dims fallback
     # reads these from the subprocess env, and every caller should see exactly
     # what its test injects via extra_env, never ambient shell state.
     env.pop("EMBEDDING_DIMS", None)

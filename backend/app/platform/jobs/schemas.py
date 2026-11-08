@@ -4,9 +4,9 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-# Structured ingest-warning contract (TYPE-1/TYPE-2/TYPE-3): warnings land in
+# Structured ingest-warning contract: warnings land in
 # ``IngestJob.user_metadata['warnings']``. Producers use TypedDicts in
-# ``app.ingest.warnings``; the router re-parses through ``IngestJobWarning``
+# ``app.processing.ingest.warnings``; the router re-parses through ``IngestJobWarning``
 # so malformed warnings are caught before they cross the wire.
 
 
@@ -52,10 +52,12 @@ class MercatorClipDetail(BaseModel):
 
     dropped_features: int = Field(ge=0)
     clipped_features: int = Field(ge=0)
-    # fix(#906): True when the clip was skipped because the Mercator safe
-    # envelope degenerates under ST_Transform (e.g. EPSG:4807 collapses it to
-    # a line); counts are 0/0 then. Defaults False so pre-#906 warnings validate.
+    # True when the clip was skipped because the Mercator safe envelope
+    # degenerates under ST_Transform (e.g. EPSG:4807 collapses it to a line);
+    # counts are 0/0 then. Defaults False so older warnings validate.
     clip_skipped: bool = False
+    # Defaults False so older warnings keep the check-your-source wording.
+    polar_only: bool = False
 
     model_config = ConfigDict(extra="forbid")
 
@@ -73,11 +75,32 @@ IngestJobWarning = Annotated[
 ]
 
 
+JobStatus = Literal[
+    "pending", "running", "complete", "failed", "cancelled", "fanned_out"
+]
+
+# Stamped at creation so a pending job reads as queued, not as having nothing
+# to say. Analysis today; any producer may set it.
+JobCurrentStep = Literal[
+    "queued",
+    # The URL import's server-side download, before the file is staged and
+    # previewable.
+    "downloading",
+    "validating",
+    "ogr2ogr",
+    "finalize",
+    "complete",
+    "cog_convert",
+    "quicklook",
+    # Analysis materialize: single CTAS, no progress to report between these.
+    "analyzing",
+    "registering",
+]
+
+
 class JobStatusResponse(BaseModel):
     id: uuid.UUID
-    status: Literal[
-        "pending", "running", "complete", "failed", "cancelled", "fanned_out"
-    ]
+    status: JobStatus
     dataset_id: uuid.UUID | None
     source_filename: str | None
     error_message: str | None
@@ -92,36 +115,17 @@ class JobStatusResponse(BaseModel):
     can_retry: bool
     retry_reason: str | None
     warning_message: str | None = None
-    # S3/TYPE-2: structured warnings from IngestJob.user_metadata. Legacy
+    # Structured warnings from IngestJob.user_metadata. Legacy
     # scalar ``warning_message`` stays as a fallback for the pre-structured
     # table-name collision case; clients should prefer ``warnings``.
     warnings: list[IngestJobWarning] = Field(default_factory=list)
-    # REMED-02 / ingest-audit P2-07: progress fields from the ingest worker,
-    # for multi-minute ingests. Default None so pre-existing/service rows
-    # validate. DB column stays String(32); this Literal is the source of truth.
+    # Progress fields from the ingest worker, for multi-minute ingests.
+    # Default None so older and service rows validate. The DB column is
+    # String(32); this Literal is the source of truth.
     progress: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
-    current_step: (
-        Literal[
-            # ux(#698): stamped at creation so a pending job reads as queued,
-            # not as having nothing to say. Analysis today; any producer may set it.
-            "queued",
-            # feat(#1710): the URL import's server-side download, before the
-            # file is staged and previewable.
-            "downloading",
-            "validating",
-            "ogr2ogr",
-            "finalize",
-            "complete",
-            "cog_convert",
-            "quicklook",
-            # Analysis materialize: single CTAS, no progress to report between these.
-            "analyzing",
-            "registering",
-        ]
-        | None
-    ) = None
+    current_step: JobCurrentStep | None = None
     rows_processed: Annotated[int, Field(ge=0)] | None = None
-    # fix(#1550): rows processed but NOT completed. `rows_processed`
+    # Rows processed but NOT completed. `rows_processed`
     # alone can't distinguish a clean run from a partial one (e.g. embedding
     # backfill after a FORCE run). Read from generic `user_metadata["rows_failed"]`.
     rows_failed: Annotated[int, Field(ge=0)] | None = None
@@ -132,8 +136,7 @@ class JobStatusResponse(BaseModel):
         "publication, so a client showing the thumbnail can poll again until the "
         "image has been replaced.",
     )
-    # TYPE-3: the temporal parser only ever emits these two keys; pin the
-    # shape so adding a third key requires touching the contract deliberately.
+    # The temporal parser only ever emits these two keys.
     temporal_parse_errors: dict[Literal["temporal_start", "temporal_end"], str] = Field(
         default_factory=dict
     )
@@ -172,3 +175,46 @@ class StaleCleanupResponse(BaseModel):
     staged_paths_skipped: int
     staged_cleanup_failures: int
     total_affected: int
+
+
+class JobStatusBatchRequest(BaseModel):
+    job_ids: list[uuid.UUID] = Field(
+        min_length=1,
+        max_length=100,
+        description="Jobs to report on. Repeated ids are answered once.",
+    )
+
+
+class JobRefreshRunSummary(BaseModel):
+    id: uuid.UUID
+    status: str = Field(
+        description="Refresh run status. `blocked` means the run is held for review."
+    )
+    review_reasons: list[str] = Field(
+        default_factory=list,
+        description="Why a blocked run needs review.",
+    )
+
+
+class JobStatusBatchEntry(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    status: JobStatus | Literal["not_found"] = Field(
+        description="Job status. `not_found` covers an unknown id and a job the "
+        "caller may not read alike."
+    )
+    dataset_id: uuid.UUID | None = None
+    progress: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
+    current_step: JobCurrentStep | None = None
+    error_code: str | None = None
+    warnings: list[IngestJobWarning] = Field(default_factory=list)
+    can_retry: bool = False
+    refresh_run: JobRefreshRunSummary | None = Field(
+        default=None,
+        description="The refresh run bound to a reupload or manifest update job.",
+    )
+
+
+class JobStatusBatchResponse(BaseModel):
+    jobs: list[JobStatusBatchEntry]

@@ -163,7 +163,7 @@ describe('useDraftEditing', () => {
   });
 
   it('savePendingDrafts includes a draft staged after the callback was captured (E-17)', async () => {
-    // fix(#458 E-17): savePendingDrafts blurs the focused input, which stages its
+    // savePendingDrafts blurs the focused input, which stages its
     // edit mid-call. The old code read `pendingDrafts` from the callback closure
     // and dropped that field; the ref-based read captures it. Capturing `save`
     // BEFORE staging reproduces the stale-closure condition.
@@ -254,7 +254,7 @@ describe('useDraftEditing', () => {
     expect(success).toBe(false);
   });
 
-  // fix(#1851): DatasetPage stays mounted across a route change from one
+  // DatasetPage stays mounted across a route change from one
   // dataset to another, so without a reset keyed on datasetId a staged draft
   // for dataset A survived into dataset B's render.
   it('resets staged drafts when datasetId changes', () => {
@@ -360,8 +360,9 @@ function draftUser(id: string): UserResponse {
     username: id,
     email: `${id}@example.com`,
     is_active: true,
-    status: 'approved',
+    status: 'active',
     last_login_at: null,
+    can_reset_password: true,
     created_at: '2026-01-01T00:00:00Z',
     roles: ['editor'],
   };

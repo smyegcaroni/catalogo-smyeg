@@ -29,7 +29,7 @@ const fullSource = 'National Oceanic and Atmospheric Administration Office for C
 
 function makeDataset(overrides: Partial<DatasetResponse> = {}): DatasetResponse {
   return {
-    id: 'ds-1', record_id: 'rec-1', table_name: 'public_parks', title: 'Parks', summary: null,
+    id: 'ds-1', record_id: 'rec-1', table_name: 'public_parks', has_generic_geometry: false, source_health: 'unknown', schema_drift_status: 'unknown', source_freshness: 'unknown', title: 'Parks', summary: null,
     srid: 4326, geometry_type: 'Polygon', feature_count: 100, extent_bbox: null, column_info: null,
     license: fullLicense, attribution: null, source_organization: fullSource,
     data_vintage_start: null, data_vintage_end: null, source_format: 'geojson', source_filename: null,
@@ -128,6 +128,46 @@ describe('OverviewTab Table Name row', () => {
     renderOverview(makeDataset({ record_type: 'vrt_dataset', table_name: 'raster_d4e5f6' }));
 
     expect(screen.queryByText('raster_d4e5f6')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [5, true],
+    [1, true],
+    [0, false],
+    [null, false],
+  ])('VRT source_count %s shows the Sources row: %s', (count, shown) => {
+    renderOverview(
+      makeDataset({
+        record_type: 'vrt_dataset',
+        raster: { vrt_type: 'mosaic', source_count: count } as DatasetResponse['raster'],
+      }),
+    );
+
+    expect(screen.queryByText('Sources') !== null).toBe(shown);
+    if (shown) expect(screen.getByText(String(count))).toBeInTheDocument();
+  });
+
+  it('shows N/A for a mosaic whose size is withheld', () => {
+    renderOverview(
+      makeDataset({
+        record_type: 'vrt_dataset',
+        raster: { vrt_type: 'mosaic', width: null, height: null } as DatasetResponse['raster'],
+      }),
+    );
+
+    expect(screen.queryByText(/ x .* px$/)).not.toBeInTheDocument();
+    expect(screen.getByText('Dimensions').nextElementSibling).toHaveTextContent('N/A');
+  });
+
+  it('shows the size of a mosaic the reader can see in full', () => {
+    renderOverview(
+      makeDataset({
+        record_type: 'vrt_dataset',
+        raster: { vrt_type: 'mosaic', width: 1100, height: 100 } as DatasetResponse['raster'],
+      }),
+    );
+
+    expect(screen.getByText('1100 x 100 px')).toBeInTheDocument();
   });
 
   it('hides the row for a 3D Tiles dataset', () => {

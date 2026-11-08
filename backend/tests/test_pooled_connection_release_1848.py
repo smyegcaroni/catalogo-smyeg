@@ -1,4 +1,4 @@
-"""fix(#1848): seven doors must not hold a pooled connection across their I/O.
+"""Seven doors must not hold a pooled connection across their I/O.
 
 `require_permission` queries the database before the handler body runs, so the
 request session has a connection checked out from the first line. Holding it
@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import HTTPException
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,7 +37,7 @@ pytestmark = pytest.mark.anyio
 def recording_url_validator(request_sessions):
     """The door's SSRF gate, stubbed and recording.
 
-    fix(#1848 codex r1): `validate_url_for_ssrf` awaits `getaddrinfo` in a
+    `validate_url_for_ssrf` awaits `getaddrinfo` in a
     thread, so it is one of the waits the release has to precede, not a cheap
     gate that may sit before it. Yields the same list the I/O recorder appends
     to, so each test reads `[validator, io]` in call order.
@@ -423,7 +424,7 @@ async def test_a_sweep_during_the_upload_refuses_rather_than_binding(
     test_db_session: AsyncSession,
     tmp_path: Path,
 ):
-    """fix(#1848 audit): the cost of committing first, bounded.
+    """The cost of committing first, bounded.
 
     The row is visible and `pending` for the whole upload now, so the
     stale-pending sweep can reclaim it while the bytes are still arriving. An
@@ -495,7 +496,7 @@ async def test_a_sweep_during_the_upload_refuses_rather_than_binding(
 async def test_only_the_local_provider_needs_the_stamp(
     test_db_session: AsyncSession,
 ):
-    """fix(#1848 codex r2): why the finding is local-only, measured.
+    """Why this only matters off the local provider, measured.
 
     `save_upload_file` returns `staging/{job}/{name}` under S3 and an absolute
     path under the local provider. The sweep's two classes are split by
@@ -524,7 +525,7 @@ async def test_a_slow_local_upload_that_binds_survives_the_next_sweep(
     test_db_session: AsyncSession,
     tmp_path: Path,
 ):
-    """fix(#1848 codex r2): the bind restarts the pending window.
+    """The bind restarts the pending window.
 
     With the local provider the bound path is absolute, so it never matches
     the sweep's `staging/%` completion class and the row stays in the class
@@ -605,7 +606,7 @@ async def test_a_dataset_deleted_during_the_upload_refuses_the_bind(
     test_db_session: AsyncSession,
     tmp_path: Path,
 ):
-    """fix(#1848 codex r3): the binding is part of the guard, not just status.
+    """The binding is part of the guard, not just status.
 
     The early commit released the row's foreign-key lock, and
     `ingest_jobs.dataset_id` is `ON DELETE SET NULL`. A dataset deleted while
@@ -1236,3 +1237,61 @@ async def test_a_direct_reupload_refused_for_content_leaves_a_completed_failed_r
     assert job.error_message == "a2b: not a recognised dataset"
     assert job.completed_at is not None
     assert not staged_file.exists()
+
+
+@pytest.mark.parametrize(
+    ("file_type", "io_target"),
+    [
+        (None, "run_ogrinfo_preview"),
+        ("raster", "_preview_raster"),
+        ("tiles3d", "preview_staged_tileset"),
+        ("pointcloud", "preview_staged_pointcloud"),
+    ],
+)
+async def test_staged_preview_releases_the_connection_before_storage_and_gdal(
+    client: AsyncClient,
+    admin_auth_header: dict,
+    test_db_session: AsyncSession,
+    request_sessions,
+    file_type: str | None,
+    io_target: str,
+):
+    """Storage download and GDAL ran on a held connection in every file-type branch."""
+    from app.processing.ingest import router as ingest_router
+
+    admin_id = await get_user_id(test_db_session, "admin")
+    metadata = {"file_type": file_type} if file_type else None
+    job = IngestJob(
+        source_filename="staged.dat",
+        file_path="/tmp/a2-staged.dat",
+        created_by=admin_id,
+        status="pending",
+        user_metadata=metadata,
+    )
+    test_db_session.add(job)
+    await test_db_session.commit()
+
+    held: dict[str, bool] = {}
+
+    async def _resolve(path, _job_id):
+        held["resolve"] = _holds_connection(request_sessions)
+        return path
+
+    def _recorder(name: str):
+        async def _record(*_args, **_kwargs):
+            held[name] = _holds_connection(request_sessions)
+            raise HTTPException(status_code=422, detail="stop here")
+
+        return _record
+
+    with (
+        patch.object(ingest_router, "resolve_file_path", new=_resolve),
+        patch.object(ingest_router, io_target, new=_recorder(io_target)),
+    ):
+        resp = await client.post(f"/ingest/preview/{job.id}", headers=admin_auth_header)
+
+    assert resp.status_code == 422, resp.text
+    assert held.pop(io_target) is False, (
+        f"the request session was still in a transaction when {io_target} ran"
+    )
+    assert not any(held.values()), "the session was in a transaction at resolve"

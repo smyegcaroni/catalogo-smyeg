@@ -11,6 +11,7 @@ import {
 } from '@/stores/analysis-job-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useJobStatus } from '@/components/import/hooks/use-ingest';
+import { useRefreshSearchWhenQuicklookLands } from '@/components/dataset/hooks/use-quicklook-settled';
 import { ApiError } from '@/api/client';
 import type { UserResponse } from '@/types/api';
 
@@ -20,6 +21,9 @@ vi.mock('sonner', () => ({
   toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn() },
 }));
 vi.mock('@/components/import/hooks/use-ingest', () => ({ useJobStatus: vi.fn() }));
+vi.mock('@/components/dataset/hooks/use-quicklook-settled', () => ({
+  useRefreshSearchWhenQuicklookLands: vi.fn(),
+}));
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     // Interpolates every {{placeholder}} from options, not just one: the
@@ -69,7 +73,7 @@ describe('AnalysisJobWatcher', () => {
     registerAnalysisAddToMap(null, null);
   });
 
-  it('fix(#793 review): a completed job clears the remembered form title for its map', async () => {
+  it('a completed job clears the remembered form title for its map', async () => {
     useAnalysisFormStore.getState().save('m1', {
       layerId: 'l1', operation: 'buffer', distance: '500', distanceUnit: 'm',
       mask: null, maskLayerId: '__none__', byField: '__none__',
@@ -86,7 +90,7 @@ describe('AnalysisJobWatcher', () => {
     expect(useAnalysisFormStore.getState().forms['m1']?.distance).toBe('500');
   });
 
-  it('fix(#793 review): a FAILED job keeps the remembered title for the retry', async () => {
+  it('a FAILED job keeps the remembered title for the retry', async () => {
     useAnalysisFormStore.getState().save('m1', {
       layerId: 'l1', operation: 'buffer', distance: '500', distanceUnit: 'm',
       mask: null, maskLayerId: '__none__', byField: '__none__',
@@ -101,7 +105,7 @@ describe('AnalysisJobWatcher', () => {
     expect(useAnalysisFormStore.getState().forms['m1']?.outputTitle).toBe('Walkshed');
   });
 
-  it('fix(#793 review): a title edited after the run started is not cleared', async () => {
+  it('a title edited after the run started is not cleared', async () => {
     useAnalysisFormStore.getState().save('m1', {
       layerId: 'l1', operation: 'buffer', distance: '500', distanceUnit: 'm',
       mask: null, maskLayerId: '__none__', byField: '__none__',
@@ -117,7 +121,7 @@ describe('AnalysisJobWatcher', () => {
     expect(useAnalysisFormStore.getState().forms['m1']?.outputTitle).toBe('My next run');
   });
 
-  it('fix(#793 review): a disowned draft reusing the run name survives completion', async () => {
+  it('a disowned draft reusing the run name survives completion', async () => {
     // Title equality is NOT ownership: the next draft may deliberately reuse
     // the same permitted, non-unique dataset name.
     useAnalysisFormStore.getState().save('m1', {
@@ -134,7 +138,7 @@ describe('AnalysisJobWatcher', () => {
     expect(useAnalysisFormStore.getState().forms['m1']?.outputTitle).toBe('Walkshed');
   });
 
-  it('fix(#793 review): a swept (404) job also clears the remembered title', async () => {
+  it('a swept (404) job also clears the remembered title', async () => {
     useAnalysisFormStore.getState().save('m1', {
       layerId: 'l1', operation: 'buffer', distance: '500', distanceUnit: 'm',
       mask: null, maskLayerId: '__none__', byField: '__none__',
@@ -158,7 +162,7 @@ describe('AnalysisJobWatcher', () => {
     expect(useAnalysisJobStore.getState().job).not.toBeNull();
   });
 
-  // fix(#1677): the cancel control made `cancelled` a reachable TERMINAL
+  // The cancel control made `cancelled` a reachable TERMINAL
   // status for every job type. `useJobStatus` already stopped polling on it,
   // but this watcher cleared only on complete/failed — so a cancelled
   // analysis job stayed in the PERSISTED store forever, survived reloads, and
@@ -208,7 +212,7 @@ describe('AnalysisJobWatcher', () => {
     expect(useAnalysisJobStore.getState().job).toBeNull();
   });
 
-  // feat(#1008): two builders open means two watchers polling the same job.
+  // Two builders open means two watchers polling the same job.
   // Without a claim each raises its own toast and its own invalidation — the
   // per-job toastId only collapses StrictMode's double invoke within one tab.
   it('stays silent when another tab already claimed the completion', async () => {
@@ -238,7 +242,7 @@ describe('AnalysisJobWatcher', () => {
 
     await waitFor(() => expect(useAnalysisJobStore.getState().job).toBeNull());
     expect(toast.success).not.toHaveBeenCalled();
-    // fix(#1008 codex P2): the claim dedups REPORTING, not refreshing. This
+    // The claim dedups REPORTING, not refreshing. This
     // tab has its own QueryClient and focus-refetch is off, so skipping the
     // invalidation would leave it showing a catalog without the new dataset.
     expect(invalidate).toHaveBeenCalledTimes(2);
@@ -281,7 +285,28 @@ describe('AnalysisJobWatcher', () => {
     invalidate.mockRestore();
   });
 
-  // fix(#1008 codex P2): a tab throttled through the terminal poll never sees
+  it('keeps watching for the output thumbnail after the job completes', async () => {
+    useAnalysisJobStore.setState({ job: { jobId: 'j1', title: 'Buffered', mapId: 'm1' } });
+    mockJob({ status: 'complete', dataset_id: 'ds9', quicklook_pending: true });
+
+    renderWatcher();
+
+    await waitFor(() =>
+      expect(useRefreshSearchWhenQuicklookLands).toHaveBeenLastCalledWith('j1'),
+    );
+  });
+
+  it('does not watch for a thumbnail that is already drawn', async () => {
+    useAnalysisJobStore.setState({ job: { jobId: 'j1', title: 'Buffered', mapId: 'm1' } });
+    mockJob({ status: 'complete', dataset_id: 'ds9', quicklook_pending: false });
+
+    renderWatcher();
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledTimes(1));
+    expect(useRefreshSearchWhenQuicklookLands).not.toHaveBeenCalledWith('j1');
+  });
+
+  // A tab throttled through the terminal poll never sees
   // it — the job simply vanishes when the reporting tab's clear propagates.
   // Its QueryClient and its remembered form title are document-local, so
   // without this it keeps a catalog that omits the new dataset and reopens the
@@ -320,7 +345,7 @@ describe('AnalysisJobWatcher', () => {
     invalidate.mockRestore();
   });
 
-  // fix(#1008 codex P2, second pass): a resuming tab rehydrates from the
+  // A resuming tab rehydrates from the
   // latest payload, so it can go straight from job1 to job2 without ever
   // rendering null. job1's cleanup is owed all the same.
   it('runs the cleanup when a completed job is replaced by the next one', async () => {
@@ -381,7 +406,7 @@ describe('AnalysisJobWatcher', () => {
     invalidate.mockRestore();
   });
 
-  // fix(#1008 codex P2, third pass): a tab suspended across two whole runs
+  // A tab suspended across two whole runs
   // resumes to a claim naming the second while it still remembers the first.
   // Refreshing is not job-specific — one invalidation re-reads the whole
   // catalog — so it has to fire on the claim it can see, not on an id match.
@@ -408,7 +433,24 @@ describe('AnalysisJobWatcher', () => {
     invalidate.mockRestore();
   });
 
-  // fix(#1008 codex P2, fourth pass): claim and clear are separate persisted
+  it('watches for the thumbnail of a run another tab reported', async () => {
+    useAnalysisJobStore.setState({ job: { jobId: 'j1', title: 'Buffered', mapId: 'm1' } });
+    mockJob({ status: 'running', dataset_id: null });
+    renderWatcher();
+
+    act(() => {
+      useAnalysisJobStore.setState({
+        job: null,
+        completedAt: { jobId: 'j1', tabId: 'some-other-tab', status: 'complete', at: Date.now() },
+      });
+    });
+
+    await waitFor(() =>
+      expect(useRefreshSearchWhenQuicklookLands).toHaveBeenLastCalledWith('j1'),
+    );
+  });
+
+  // Claim and clear are separate persisted
   // writes and arrive in either order, and a swept job departs with no claim
   // at all. Retiring the remembered title therefore keys on the departure of
   // the run this tab was showing, not on a claim turning up to explain it.
@@ -494,7 +536,7 @@ describe('AnalysisJobWatcher', () => {
     expect(useAnalysisFormStore.getState().forms['m1']?.outputTitle).toBe('Walkshed');
   });
 
-  // fix(#1008 codex P2, fifth pass): a tab suspended while one run succeeded
+  // A tab suspended while one run succeeded
   // and a later one failed resumes to the failed claim only. Gating the
   // refresh on the status would leave it a catalog missing the first run's
   // dataset, with nothing to correct it.
@@ -677,9 +719,9 @@ describe('AnalysisJobWatcher', () => {
     expect(onAdd).toHaveBeenCalledTimes(1);
   });
 
-  // fix(#833): the single-use guard is shared with the Analysis panel's own
-  // "Add to map" button — each affordance used to dedupe only against itself,
-  // so clicking the toast action and then the panel button added twice.
+  // The single-use guard is shared with the Analysis panel's own
+  // "Add to map" button — if each affordance deduped only against itself,
+  // clicking the toast action and then the panel button would add twice.
   it('the toast action shares its single-use marker via useAnalysisAddedStore', async () => {
     const onAdd = vi.fn();
     registerAnalysisAddToMap(onAdd, 'm1');
@@ -784,7 +826,7 @@ describe('AnalysisJobWatcher', () => {
     expect(toast.error).not.toHaveBeenCalled();
   });
 
-  it('keeps tracking through a transient failure (fix(#682) review)', () => {
+  it('keeps tracking through a transient failure', () => {
     // A 5xx or dropped connection after a reload must not discard the job:
     // polling continues, so tracking recovers on the next good response.
     useAnalysisJobStore.setState({ job: { jobId: 'j1', title: 'x', mapId: null } });
@@ -795,7 +837,7 @@ describe('AnalysisJobWatcher', () => {
     expect(toast.error).not.toHaveBeenCalled();
   });
 
-  it('keeps tracking a long-running job — no client staleness rule (fix(#682) review)', () => {
+  it('keeps tracking a long-running job — no client staleness rule', () => {
     // Deliberately mirrors the API's cap, which also has no staleness window.
     // Dropping a job on elapsed time loses its completion notification for
     // good, and the endpoint would still refuse a replacement anyway.

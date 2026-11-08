@@ -32,10 +32,11 @@ class DbfTruncationCollisionWarning(TypedDict):
 class MercatorClipDetail(TypedDict):
     dropped_features: int
     clipped_features: int
-    # fix(#906): True when the clip was skipped because the safe envelope
+    # True when the clip was skipped because the safe envelope
     # degenerates under ST_Transform into the source CRS (e.g. EPSG:4807
     # collapses to a line). Counts are 0/0 then; warn so it isn't silent.
     clip_skipped: NotRequired[bool]
+    polar_only: NotRequired[bool]
 
 
 class MercatorClipWarning(TypedDict):
@@ -47,15 +48,18 @@ class MercatorClipCounts(TypedDict):
     """Return shape of ``clip_to_mercator_bounds``.
 
     ``shifted_longitudes``: source was 0..360, translated to -180..180
-    before the clip ran. ``clip_skipped`` (fix(#906)): clip didn't run
+    before the clip ran. ``clip_skipped``: clip didn't run
     because the safe envelope degenerated in the source CRS; the
-    longitude shift was still applied.
+    longitude shift was still applied. ``polar_only``: the clip trimmed
+    geometry and none of it lay outside longitude ±180° or latitude ±90° in
+    EPSG:4326, so the source itself is not at fault; omitted otherwise.
     """
 
     shifted_longitudes: bool
     dropped_features: int
     clipped_features: int
     clip_skipped: NotRequired[bool]
+    polar_only: NotRequired[bool]
 
 
 IngestJobWarning = (
@@ -66,10 +70,7 @@ IngestJobWarning = (
 def make_reserved_rename_warning(
     renames: list[dict],
 ) -> ReservedRenameWarning:
-    """Build a ``reserved_rename`` warning from ``rename_reserved_columns`` output.
-
-    Narrows the helper's untyped ``list[dict]`` to the producer contract.
-    """
+    """Build a ``reserved_rename`` warning from ``rename_reserved_columns`` output."""
     return ReservedRenameWarning(
         kind="reserved_rename",
         details=[
@@ -103,11 +104,9 @@ def make_mercator_clip_warning(
 ) -> MercatorClipWarning | None:
     """Build a ``mercator_clip`` warning, or None when no geometry was lost.
 
-    fix(#888): the Web Mercator clamp can silently empty geometry (e.g. a
-    point at lat -89.95 becomes ``MULTIPOINT EMPTY``); this makes that
-    user-visible instead. Any shape other than the documented counts dict
-    (stale producer, monkeypatched stand-in) yields None rather than a
-    malformed warning — same fail-closed stance the router takes on re-parse.
+    The Web Mercator clamp can silently empty geometry (a point at lat -89.95
+    becomes ``MULTIPOINT EMPTY``); this makes that visible. Any shape other
+    than the counts dict yields None rather than a malformed warning.
     """
     if not isinstance(clip, dict):
         return None
@@ -115,8 +114,8 @@ def make_mercator_clip_warning(
     clipped = clip.get("clipped_features")
     if not isinstance(dropped, int) or not isinstance(clipped, int):
         return None
-    # fix(#906): a skipped clip lost no data but must not be silent either —
-    # the dataset now carries geometry the Mercator clamp never inspected.
+    # A skipped clip lost no data, but the dataset now carries geometry the
+    # Mercator clamp never inspected.
     skipped = clip.get("clip_skipped") is True
     if dropped <= 0 and clipped <= 0 and not skipped:
         return None
@@ -126,4 +125,6 @@ def make_mercator_clip_warning(
     )
     if skipped:
         details["clip_skipped"] = True
+    if clip.get("polar_only"):
+        details["polar_only"] = True
     return MercatorClipWarning(kind="mercator_clip", details=details)

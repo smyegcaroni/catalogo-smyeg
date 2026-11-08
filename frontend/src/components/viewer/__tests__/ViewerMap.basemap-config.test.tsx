@@ -325,7 +325,7 @@ describe('ViewerMap basemap config runtime', () => {
         mapState.fakeMap,
         BASEMAP_CONFIG_WITH_OVERRIDES.sublayer_overrides,
         'viewer-source-',
-        1, // builder-audit #338 CORR-01: master opacity (config.opacity undefined → 1)
+        1, // Master opacity (config.opacity undefined → 1)
       );
     });
   });
@@ -341,7 +341,7 @@ describe('ViewerMap basemap config runtime', () => {
       mapState.fakeMap,
       BASEMAP_CONFIG_WITH_OVERRIDES.sublayer_overrides,
       'viewer-source-',
-      1, // builder-audit #338 CORR-01: master opacity (config.opacity undefined → 1)
+      1, // Master opacity (config.opacity undefined → 1)
     );
   });
 
@@ -373,13 +373,13 @@ describe('ViewerMap basemap config runtime', () => {
         mapState.fakeMap,
         changedConfig.sublayer_overrides,
         'viewer-source-',
-        1, // builder-audit #338 CORR-01: master opacity (config.opacity undefined → 1)
+        1, // Master opacity (config.opacity undefined → 1)
       );
     });
   });
 
   it('legacy basemap_config without sublayer_overrides passes null (zero-migration backward compat)', async () => {
-    // ROADMAP.md Phase 1059 Acceptance Criterion 4: legacy saved maps without
+    // Legacy saved maps without
     // sublayer_overrides continue to render with default basemap styling.
     renderViewer(BASEMAP_CONFIG); // no sublayer_overrides field
     await waitFor(() => {
@@ -419,11 +419,11 @@ describe('ViewerMap basemap config runtime', () => {
     });
   });
 
-  it('passes the saved projection to MapGL for cold-mount application (feat(#845))', () => {
+  it('passes the saved projection to MapGL for cold-mount application', () => {
     const globe = renderViewer({ ...BASEMAP_CONFIG, projection: 'globe' });
     expect(screen.getByTestId('mapgl')).toHaveAttribute('data-projection', 'globe');
 
-    // Codex P2 r4 on #848: the prop must stay frozen after mount — a changed
+    // The prop must stay frozen after mount — a changed
     // projection prop hits react-maplibre's unguarded setter and throws mid
     // style-swap. Runtime changes flow through applyMapBasemapAppearance.
     globe.rerender(viewerElement({ ...BASEMAP_CONFIG, projection: 'mercator' }));
@@ -446,6 +446,7 @@ describe('ViewerMap basemap config runtime', () => {
         column_info: null,
         sort_order: 0,
         visible: true,
+        show_in_legend: true,
         opacity: 1,
         paint: {},
         layout: {},
@@ -465,6 +466,7 @@ describe('ViewerMap basemap config runtime', () => {
         column_info: null,
         sort_order: 0,
         visible: true,
+        show_in_legend: true,
         opacity: 1,
         paint: {},
         layout: {},
@@ -515,6 +517,7 @@ describe('ViewerMap basemap config runtime', () => {
         column_info: null,
         sort_order: 0,
         visible: true,
+        show_in_legend: true,
         opacity: 1,
         paint: { 'line-color': '#f97316', 'line-width': 4 },
         layout: {},
@@ -568,6 +571,7 @@ describe('ViewerMap basemap config runtime', () => {
         column_info: null,
         sort_order: 0,
         visible: true,
+        show_in_legend: true,
         opacity: 1,
         paint: { 'circle-color': '#2255aa', 'circle-radius': 6 },
         layout: {},
@@ -607,7 +611,6 @@ describe('ViewerMap basemap config runtime', () => {
 
     await waitFor(() => {
       expect(fetchBoundedGeoJsonMock).toHaveBeenCalledWith('dataset-cluster', {
-        apiKey: undefined,
         signal: expect.any(AbortSignal),
         embedToken: 'embed-token',
       });
@@ -633,6 +636,7 @@ describe('ViewerMap basemap config runtime', () => {
         column_info: null,
         sort_order: 0,
         visible: true,
+        show_in_legend: true,
         opacity: 1,
         paint: { 'circle-color': '#2255aa', 'circle-radius': 6 },
         layout: {},
@@ -695,6 +699,7 @@ describe('ViewerMap basemap config runtime', () => {
         column_info: null,
         sort_order: 0,
         visible: true,
+        show_in_legend: true,
         opacity: 1,
         paint: { 'circle-color': '#2255aa', 'circle-radius': 6 },
         layout: {},

@@ -9,11 +9,11 @@ import type {
 export async function previewAnalysis(
   datasetId: string,
   body: AnalysisPreviewRequest,
-  // fix(#787 item 3): callers cancel a preview they no longer want. apiFetch
+  // Callers cancel a preview they no longer want. apiFetch
   // composes this with its own request timeout, so whichever fires first wins.
   signal?: AbortSignal,
 ): Promise<AnalysisPreviewResponse> {
-  return apiFetch<AnalysisPreviewResponse>(`/datasets/${datasetId}/analysis/preview/`, {
+  return apiFetch<AnalysisPreviewResponse>(`/datasets/${encodeURIComponent(datasetId)}/analysis/preview/`, {
     method: 'POST',
     body: JSON.stringify(body),
     signal,
@@ -25,7 +25,7 @@ export async function materializeAnalysis(
   body: AnalysisMaterializeRequest,
 ): Promise<AnalysisMaterializeResponse> {
   return apiFetch<AnalysisMaterializeResponse>(
-    `/datasets/${datasetId}/analysis/materialize/`,
+    `/datasets/${encodeURIComponent(datasetId)}/analysis/materialize/`,
     {
       method: 'POST',
       body: JSON.stringify(body),

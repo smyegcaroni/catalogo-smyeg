@@ -1,11 +1,8 @@
 """Unit tests for _assert_compatible_record_type on the service-URL preview path.
 
-Pins the IA-P1-02 fix (Phase 1065 plan 03): `reupload_service_preview` now
+Pins the fix: `reupload_service_preview` now
 surfaces vector→raster and any→VRT swaps as HTTP 400 before pipeline execution,
 mirroring the multipart and presigned paths.
-
-Requirement: IA-P1-02
-Phase: 1065-03
 """
 
 from types import SimpleNamespace
@@ -37,7 +34,7 @@ class TestServiceTypeGuard:
     def test_raster_dataset_rejected_for_wfs(self):
         """All supported service types are vector — reject for raster_dataset.
 
-        feat(#1221): raster reupload is supported now, but only from a file.
+        Raster reupload is supported now, but only from a file.
         A service refresh stays refused because nothing fetches a GeoTIFF from
         a feature service, so the refusal message changed while the status did
         not.
@@ -98,7 +95,7 @@ class TestFilePathStillWorks:
         assert "standalone vrt" in exc.value.detail.lower()
 
     def test_raster_accepts_tif(self):
-        """feat(#1221): the gate this issue relaxed. A raster dataset takes a
+        """The gate admits raster replacement. A raster dataset takes a
         raster replacement — that is the whole point of the replace path."""
         _assert_compatible_record_type(_ds("raster_dataset"), "landcover.tif")
         _assert_compatible_record_type(_ds("raster_dataset"), "landcover.TIFF")

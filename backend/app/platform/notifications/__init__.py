@@ -1,4 +1,4 @@
-"""Outbound notification facade for GeoLens (NOTIF-01/NOTIF-04).
+"""Outbound notification facade for GeoLens.
 
 Mirrors ``app.platform.audit.audit_emit()``: ``notify()`` fans out to every
 registered ``NotificationSink``, isolating each sink in its own try/except
@@ -50,11 +50,11 @@ async def notify(
     Wraps each non-default sink's ``deliver()`` in try/except — success
     increments ``delivered``, failure appends a SAFE error string and logs
     (mirrors ``audit_emit``). Never re-raises: the caller's request path is
-    always unaffected (NOTIF-04). A sink with ``deliver_channels()`` counts
+    always unaffected. A sink with ``deliver_channels()`` counts
     as delivered when any of its channels delivered, as its ``deliver()``
     does. With ``channels``, only the channels named there are sent to.
     """
-    # Deferred import to avoid a module-level edge to defaults (Phase 214).
+    # Deferred import to avoid a module-level edge to defaults.
     from app.platform.extensions.defaults import DefaultNotificationSink
     from app.platform.notifications.env_sink import NotificationDeliveryError
 
@@ -67,7 +67,7 @@ async def notify(
         if isinstance(sink, DefaultNotificationSink):
             try:
                 await sink.deliver(notification)
-            except Exception:  # noqa: BLE001 - no-op must never raise
+            except Exception:  # broad: no-op must never raise
                 logger.exception(
                     "DefaultNotificationSink raised unexpectedly; suppressed",
                     sink=type(sink).__name__,
@@ -89,10 +89,10 @@ async def notify(
                 if failures and not sent:
                     raise NotificationDeliveryError("every channel failed")
             delivered += 1
-        except Exception as exc:  # noqa: BLE001 - sinks must not break callers
+        except Exception as exc:  # broad: sinks must not break callers
             # SAFE error only: type name + short message. NEVER interpolate
             # notification.body, smtp_password, webhook_url, or any other
-            # secret/payload value (T-1229-01/T-1229-03).
+            # secret/payload value.
             safe_error = f"{type(exc).__name__}: sink delivery failed"
             errors.append(safe_error)
             if per_channel is None:

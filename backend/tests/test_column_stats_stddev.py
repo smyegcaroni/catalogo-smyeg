@@ -1,4 +1,4 @@
-"""Tests for stddev in get_column_stats (v1041 ENH-04).
+"""Tests for stddev in get_column_stats.
 
 The data-driven "Standard Deviation" classification method needs the backend
 column-stats endpoint to return sigma. These tests run against a real database.
@@ -128,7 +128,7 @@ async def test_get_column_stats_nonexistent_column_raises_value_error(
 
 
 # ---------------------------------------------------------------------------
-# fix(#315): HTTP-layer coverage for /datasets/{id}/columns/{col}/stats/
+# HTTP-layer coverage for /datasets/{id}/columns/{col}/stats/
 # The tests above exercise the domain function directly; these drive the
 # endpoint so the ValueError->400 mapping and ColumnStatsResponse shape are
 # also covered.

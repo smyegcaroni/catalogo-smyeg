@@ -4,6 +4,7 @@ Tests cover CRUD operations, auth enforcement, and visibility checks
 for the /datasets/{dataset_id}/relationships/ endpoints.
 """
 
+import base64
 import uuid
 
 import pytest
@@ -77,8 +78,8 @@ class TestFKRelationships:
         assert data["label"] == "Links to target"
         assert "id" in data
 
-        # fix(#315): the CREATE response must carry dereferenceable Dataset.id values,
-        # NOT the stored record_ids, matching the LIST contract (#315). The DB
+        # The CREATE response must carry dereferenceable Dataset.id values,
+        # NOT the stored record_ids, matching the LIST contract. The DB
         # still stores record_ids and the create INPUT still takes a record_id
         # target — only the RESPONSE ids are Dataset.id.
         assert data["source_dataset_id"] == str(source.id)
@@ -99,7 +100,7 @@ class TestFKRelationships:
         admin_auth_header: dict,
         test_db_session,
     ):
-        """fix(#315): a relationship target id round-trips back into create.
+        """A relationship target id round-trips back into create.
 
         Responses serialize target_dataset_id as Dataset.id, so the create input
         must accept a Dataset.id too (not just the underlying record_id).
@@ -157,7 +158,7 @@ class TestFKRelationships:
             headers=admin_auth_header,
         )
         assert resp.status_code == 200, resp.text
-        # GAP-033: standard list envelope {relationships: [...], total: N}.
+        # Standard list envelope {relationships: [...], total: N}.
         body = resp.json()
         assert isinstance(body, dict)
         assert "total" in body
@@ -167,7 +168,7 @@ class TestFKRelationships:
         assert body["total"] >= 1
         rel = next(r for r in items if r["source_column"] == "ref_id")
 
-        # fix(#315): the response ids are Dataset.id (dereferenceable), NOT the stored
+        # The response ids are Dataset.id (dereferenceable), NOT the stored
         # record_id. Clients fetch /collections/{id} which resolves by Dataset.id.
         assert rel["target_dataset_id"] == str(target.id)
         assert rel["target_dataset_id"] != str(target.record_id)
@@ -187,7 +188,7 @@ class TestFKRelationships:
         admin_auth_header: dict,
         test_db_session,
     ):
-        """GAP-033: the envelope `total` is the FULL visible count, not the page.
+        """The envelope `total` is the FULL visible count, not the page.
 
         With limit=1 over 2 relationships the page holds 1 item but total is 2,
         so a paginating client can detect that more pages exist. FAILS pre-fix
@@ -260,7 +261,7 @@ class TestFKRelationships:
         resp = await client.get(f"/datasets/{source.id}/relationships/")
 
         assert resp.status_code == 200, resp.text
-        # GAP-033 envelope: private target is filtered out, total reflects the
+        # envelope: private target is filtered out, total reflects the
         # visible count (0), not the raw row count.
         body = resp.json()
         assert body["relationships"] == []
@@ -338,7 +339,7 @@ class TestFKRelationships:
     ):
         """A relationship whose target has no backing table returns 503, not 500.
 
-        fix(#315 sibling, G4/E3): the related-records traversal queries
+        The related-records traversal queries
         data.<target_table> directly. If the target dataset is a raster/VRT (no
         feature table) or its table was cold-evicted, that query raises
         UndefinedTableError. The service must map ProgrammingError ->
@@ -615,11 +616,13 @@ class TestFKRelationships:
         )
         assert listed.json()["relationships"][0]["broken"] is False
 
+    @pytest.mark.parametrize("transport", ["header", "basic"])
     async def test_related_records_column_dropped_live_read_with_api_key_does_not_write(
         self,
         client: AsyncClient,
         admin_auth_header: dict,
         test_db_session,
+        transport: str,
     ):
         """An API key never reaches the catalog repair, even for the dataset owner."""
         admin_id = await get_user_id(test_db_session, "admin")
@@ -688,10 +691,24 @@ class TestFKRelationships:
             headers=admin_auth_header,
         )
         assert key.status_code == 201, key.text
-        resp = await client.get(
-            f"/datasets/{source.id}/features/1/related/{rel_id}/",
-            headers={"X-Api-Key": key.json()["key"]},
-        )
+        # Revoked here: an active read_only key makes the 0032 downgrade refuse,
+        # failing any later migration test in the same database.
+        raw_key = key.json()["key"]
+        if transport == "basic":
+            basic = base64.b64encode(f"anyone:{raw_key}".encode()).decode()
+            key_headers = {"Authorization": f"Basic {basic}"}
+        else:
+            key_headers = {"X-Api-Key": raw_key}
+        try:
+            resp = await client.get(
+                f"/datasets/{source.id}/features/1/related/{rel_id}/",
+                headers=key_headers,
+            )
+        finally:
+            revoked = await client.delete(
+                f"/auth/api-keys/{key.json()['id']}", headers=admin_auth_header
+            )
+        assert revoked.status_code == 204, revoked.text
         assert resp.status_code == 409, resp.text
 
         listed = await client.get(

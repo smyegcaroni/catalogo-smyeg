@@ -107,7 +107,7 @@ def sync_detailed(
     client: AuthenticatedClient,
     limit: int | Unset = 1000,
 ) -> Response[DiscoverResponse | ProblemDetail]:
-    """Discover Tables
+    """Discover unregistered PostGIS tables
 
      Discover unregistered tables in the data schema.
 
@@ -115,6 +115,7 @@ def sync_detailed(
     system tables. Includes geometry type, SRID, and estimated row count.
     Bounded by ``limit`` (default 1000, max 5000) so instances with
     thousands of orphan tables don't blow up the response payload.
+    Administrators only.
 
     Args:
         limit (int | Unset): Maximum number of tables to return. Capped at 5000. Default: 1000.
@@ -143,7 +144,7 @@ def sync(
     client: AuthenticatedClient,
     limit: int | Unset = 1000,
 ) -> DiscoverResponse | ProblemDetail | None:
-    """Discover Tables
+    """Discover unregistered PostGIS tables
 
      Discover unregistered tables in the data schema.
 
@@ -151,6 +152,7 @@ def sync(
     system tables. Includes geometry type, SRID, and estimated row count.
     Bounded by ``limit`` (default 1000, max 5000) so instances with
     thousands of orphan tables don't blow up the response payload.
+    Administrators only.
 
     Args:
         limit (int | Unset): Maximum number of tables to return. Capped at 5000. Default: 1000.
@@ -174,7 +176,7 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     limit: int | Unset = 1000,
 ) -> Response[DiscoverResponse | ProblemDetail]:
-    """Discover Tables
+    """Discover unregistered PostGIS tables
 
      Discover unregistered tables in the data schema.
 
@@ -182,6 +184,7 @@ async def asyncio_detailed(
     system tables. Includes geometry type, SRID, and estimated row count.
     Bounded by ``limit`` (default 1000, max 5000) so instances with
     thousands of orphan tables don't blow up the response payload.
+    Administrators only.
 
     Args:
         limit (int | Unset): Maximum number of tables to return. Capped at 5000. Default: 1000.
@@ -208,7 +211,7 @@ async def asyncio(
     client: AuthenticatedClient,
     limit: int | Unset = 1000,
 ) -> DiscoverResponse | ProblemDetail | None:
-    """Discover Tables
+    """Discover unregistered PostGIS tables
 
      Discover unregistered tables in the data schema.
 
@@ -216,6 +219,7 @@ async def asyncio(
     system tables. Includes geometry type, SRID, and estimated row count.
     Bounded by ``limit`` (default 1000, max 5000) so instances with
     thousands of orphan tables don't blow up the response payload.
+    Administrators only.
 
     Args:
         limit (int | Unset): Maximum number of tables to return. Capped at 5000. Default: 1000.

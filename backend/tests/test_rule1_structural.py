@@ -1,5 +1,5 @@
 """Rule-1 structural guard: every route handler that fetches a guarded model
-must call a sanctioned access check (fix(#822)).
+must call a sanctioned access check.
 
 The pre-commit Rule-1 hook (.pre-commit-config.yaml, visibility-filter-coverage)
 is a cheap commit-time grep with three blind spots flagged by the 1.6.0
@@ -15,7 +15,7 @@ This module closes those gaps structurally. It walks the real FastAPI route
 table, parses each handler's source (plus one level of directly-called
 ``app.*`` helper functions) into an AST, and asserts that any handler whose
 effective source fetches a guarded model (``Record``, ``Dataset``, ``Map``,
-``RecordEmbedding``, ``IngestJob``) also CALLS one of the sanctioned guards. Model names are
+``Story``, ``StoryAsset``, ``RecordEmbedding``, ``IngestJob``) also CALLS one of the sanctioned guards. Model names are
 resolved by class identity through the function's module globals and its
 function-local imports, so aliases like ``Dataset as DatasetModel`` or
 ``Map as MapORM`` are covered, and multi-line ``select(\n    Model``
@@ -92,19 +92,19 @@ _CORE_GUARDS = (
     "check_dataset_access",
     "check_dataset_write_access",
     "apply_visibility_filter",
-    # fix(#1298): batch sibling of check_dataset_access — same fail-closed
+    # Batch sibling of check_dataset_access — same fail-closed
     # 404, one query for the whole set instead of one per id.
     "check_datasets_access_bulk",
+    "check_map_access",
+    "apply_map_visibility_filter",
 )
 
 # Domain guard helpers that wrap the core checks (or implement the
 # equivalent RBAC logic for their model). Their integrity is pinned by
 # test_delegated_guards_still_enforce_access below.
 _DELEGATED_GUARDS = (
-    # maps: app/modules/catalog/maps/{_router_helpers,service_crud,service_shared}.py
+    # maps: app/modules/catalog/maps/service_crud.py
     "check_map_ownership",
-    "_check_map_read_access",
-    "_apply_map_visibility_filter",
     # maps: app/modules/catalog/maps/service_layers.py — bulk variant of
     # check_dataset_access, kept in sync with can_access_dataset.
     "bulk_check_dataset_access",
@@ -114,14 +114,18 @@ _DELEGATED_GUARDS = (
     # tiles: app/processing/tiles/router.py — the vector-tile access model
     # (embed token, HMAC signature for non-public, published-status gating).
     "_authorize_vector_tile_request",
-    # tiles: app/processing/tiles/router.py — the SEC-01 status-aware gate
+    # tiles: app/processing/tiles/router.py — the status-aware gate
     # for the tile-token minting endpoints; delegates non-public RBAC to
     # port.check_dataset_access and 404s unpublished-public for non-owners.
     "_enforce_tile_token_access",
-    # search: app/modules/catalog/search/service_candidates.py, fix(#1855):
+    # search: app/modules/catalog/search/service_candidates.py:
     # the candidate selection /search/datasets/ and /search/facets/ share;
     # applies apply_visibility_filter through vetting_filters.
     "select_candidates",
+    # stories: app/modules/catalog/stories/service.py
+    "check_story_access",
+    "check_story_ownership",
+    "apply_story_visibility_filter",
 )
 
 # Guards that deny by RAISING (404/403) — a bare ``await guard(...)``
@@ -133,11 +137,13 @@ _RAISING_GUARDS = frozenset(
         "check_dataset_write_access",
         "check_datasets_access_bulk",
         "check_map_ownership",
-        "_check_map_read_access",
+        "check_map_access",
         "_check_record_read_access",
         "_check_record_ownership",
         "_authorize_vector_tile_request",
         "_enforce_tile_token_access",
+        "check_story_access",
+        "check_story_ownership",
     }
 )
 
@@ -145,13 +151,14 @@ _RAISING_GUARDS = frozenset(
 # accessible-id set). SQLAlchemy Selects are immutable: a bare
 # ``apply_visibility_filter(stmt, ...)`` statement discards the filtered
 # statement and protects nothing. These count only when the result is
-# consumed — assigned, returned, or passed on (codex P1 on #863, round 3).
+# consumed — assigned, returned, or passed on (codex P1 on #863).
 _VALUE_GUARDS = frozenset(
     {
         "apply_visibility_filter",
-        "_apply_map_visibility_filter",
+        "apply_map_visibility_filter",
         "bulk_check_dataset_access",
         "select_candidates",
+        "apply_story_visibility_filter",
     }
 )
 
@@ -165,20 +172,16 @@ def _guard_objects() -> dict[str, Any]:
     """The sanctioned guard FUNCTION OBJECTS, keyed by canonical name.
 
     Guard calls are credited only when the called name resolves to one of
-    these objects by identity (codex P2 on #863, round 5) — a handler
+    these objects by identity (codex P2 on #863) — a handler
     defining its own ``check_dataset_access`` or calling
     ``some_service.check_dataset_access(...)`` on an unrelated object does
     not count. Fails loudly here if a sanctioned guard is renamed or moved.
     """
     from app.modules.catalog import authorization
-    from app.modules.catalog.maps import (
-        _router_helpers,
-        service_crud,
-        service_layers,
-        service_shared,
-    )
+    from app.modules.catalog.maps import service_crud, service_layers
     from app.modules.catalog.records import router as records_router
     from app.modules.catalog.search import service_candidates
+    from app.modules.catalog.stories import service as stories_service
     from app.processing.tiles import router as tiles_router
 
     guard_objects = {
@@ -189,15 +192,18 @@ def _guard_objects() -> dict[str, Any]:
         "check_dataset_write_access": authorization.check_dataset_write_access,
         "check_datasets_access_bulk": authorization.check_datasets_access_bulk,
         "apply_visibility_filter": authorization.apply_visibility_filter,
+        "check_map_access": authorization.check_map_access,
+        "apply_map_visibility_filter": authorization.apply_map_visibility_filter,
         "check_map_ownership": service_crud.check_map_ownership,
-        "_check_map_read_access": _router_helpers._check_map_read_access,
-        "_apply_map_visibility_filter": service_shared._apply_map_visibility_filter,
         "bulk_check_dataset_access": service_layers.bulk_check_dataset_access,
         "_check_record_read_access": records_router._check_record_read_access,
         "_check_record_ownership": records_router._check_record_ownership,
         "_authorize_vector_tile_request": tiles_router._authorize_vector_tile_request,
         "_enforce_tile_token_access": tiles_router._enforce_tile_token_access,
         "select_candidates": service_candidates.select_candidates,
+        "check_story_access": stories_service.check_story_access,
+        "check_story_ownership": stories_service.check_story_ownership,
+        "apply_story_visibility_filter": stories_service.apply_story_visibility_filter,
     }
     assert set(guard_objects) == _RAISING_GUARDS | _VALUE_GUARDS
     return guard_objects
@@ -209,7 +215,7 @@ def _guards_requiring_await() -> frozenset[str]:
 
     Calling a coroutine guard WITHOUT ``await`` only creates a coroutine —
     no authorization runs and no denial ever raises — so for these the call
-    must sit under an ``ast.Await`` to count (codex P1 on #863, round 4).
+    must sit under an ``ast.Await`` to count (codex P1 on #863).
     Keyed on ``inspect.iscoroutinefunction`` of the real guard objects
     rather than a hardcoded list, so a guard changing between sync and
     async updates the requirement automatically.
@@ -249,10 +255,15 @@ ALLOWLIST: dict[str, str] = {
         "admin-gated (manage_settings); Dataset/Record select only labels audit rows"
     ),
     # Share-token capability route (crawler HTML card). Validates the token,
-    # then explicitly requires map.visibility == "public" before rendering any
-    # map details; non-public/expired links get an empty SPA-redirect shell.
+    # then requires a map anonymous callers may read before rendering any map
+    # details; other or expired links get an empty SPA-redirect shell.
     "app.modules.catalog.maps.router_sharing.shared_map_card_endpoint": (
-        "share-token capability route; hard-requires map.visibility == 'public'"
+        "share-token capability route; requires a map open to anonymous readers"
+    ),
+    # Admin "Published Maps" inventory; gated by require_permission
+    # ("manage_users"), and admins read every map.
+    "app.modules.admin.router_operations.list_share_tokens_endpoint": (
+        "admin-gated (manage_users); lists public maps and their share links"
     ),
     # Duplicate-source existence check before creating an IngestJob. The
     # select is scoped ``Record.created_by == user.id`` — the caller can only
@@ -279,7 +290,7 @@ ALLOWLIST: dict[str, str] = {
         "upload-gated physical-table registration; select is a dedupe existence check"
     ),
     # ---------------------------------------------------------------------
-    # fix(#1860): the IngestJob sweep. These seven handlers fetch a job
+    # The IngestJob sweep. These eight handlers fetch a job
     # row and none of them calls a CATALOG guard, because a job is owned by
     # the user who created it rather than reached through a dataset's
     # visibility. Each names the check it does apply instead.
@@ -292,14 +303,23 @@ ALLOWLIST: dict[str, str] = {
         "ops-gated (manage_users / manage_tenants); acts on the stale set, "
         "returns counts and no job content"
     ),
+    # On the single-job status/retry routes:
     # Owner-or-policy: creator passes, everyone else goes through
     # _can_access_another_users_job (the effective permission matrix), and a
-    # refusal is a 403 recorded as a permission denial.
+    # refusal answers 404 "Job not found", identical to an unknown id.
+    # Cross-user publish keys are rejected earlier without a permission-denial
+    # record; policy refusals are still recorded as permission denials.
     "app.platform.jobs.router.get_job_status": (
-        "owner-or-policy via _can_access_another_users_job; 403 on denial"
+        "owner-or-policy via _may_read_job; a refused id is "
+        'reported as 404 "Job not found", identical to an unknown id'
+    ),
+    "app.platform.jobs.router.get_job_statuses": (
+        "owner-or-policy via _may_read_job; a refused id is "
+        "reported as not_found, identical to an unknown id"
     ),
     "app.platform.jobs.router.retry_job": (
-        "owner-or-policy via _can_access_another_users_job; 403 on denial"
+        "owner-or-policy via _can_access_another_users_job; a refused id is "
+        'reported as 404 "Job not found", identical to an unknown id'
     ),
     # All four ingest doors load the job through get_job_or_404, which is
     # creator-or-admin and raises 404/403 before the handler sees the row.
@@ -328,6 +348,8 @@ class _HandlerReport(NamedTuple):
     methods: tuple[str, ...]
     fetch_lines: tuple[str, ...]  # evidence lines for guarded-model fetches
     guarded: bool
+    map_fetch: bool = False  # some fetch reads the Map table or a map accessor
+    guards: frozenset[str] = frozenset()  # canonical names of credited guards
 
 
 def _unwrap(fn: Any) -> Any:
@@ -356,14 +378,15 @@ def _parse(source: str) -> ast.Module | None:
 def _guarded_model_classes() -> tuple[type, ...]:
     from app.modules.catalog.datasets.domain.models import Dataset, Record
     from app.modules.catalog.maps.models import Map
+    from app.modules.catalog.stories.models import Story, StoryAsset
     from app.platform.jobs.models import IngestJob
     from app.processing.embeddings.models import RecordEmbedding
 
-    # fix(#1860): IngestJob joined the set because a job row carries the
+    # IngestJob joined the set because a job row carries the
     # uploader's filename and the failure text of their run, and every
     # job-row endpoint reported "no fetch detected" while it was outside.
     # A whole class of read was invisible to this gate rather than clean.
-    return (Dataset, Record, Map, RecordEmbedding, IngestJob)
+    return (Dataset, Record, Map, Story, StoryAsset, RecordEmbedding, IngestJob)
 
 
 # ProcessingPort accessors that hand a guarded ORM class to processing/ code
@@ -383,10 +406,17 @@ def _bound_objects(
     (resolved through ``sys.modules``, including relative imports).
     Returns name -> matched target object.
     """
+    names = {**getattr(fn, "__globals__", {}), **_local_imports(fn, tree)}
+    return {
+        name: value
+        for name, value in names.items()
+        if any(value is target for target in targets)
+    }
+
+
+def _local_imports(fn: Any, tree: ast.Module) -> dict[str, Any]:
+    """Objects bound by ``from X import Y as Z`` statements inside ``tree``."""
     bound: dict[str, Any] = {}
-    for name, value in getattr(fn, "__globals__", {}).items():
-        if any(value is target for target in targets):
-            bound[name] = value
     for node in ast.walk(tree):
         if not isinstance(node, ast.ImportFrom):
             continue
@@ -402,7 +432,7 @@ def _bound_objects(
             continue
         for alias in node.names:
             value = getattr(module, alias.name, None)
-            if any(value is target for target in targets):
+            if value is not None:
                 bound[alias.asname or alias.name] = value
     return bound
 
@@ -448,7 +478,7 @@ def _select_functions() -> tuple[Any, ...]:
 def _select_aliases(fn: Any, tree: ast.Module) -> frozenset[str]:
     """Names bound to ``sqlalchemy.select``, so aliased imports like
     ``from sqlalchemy import select as sel`` still register as fetches
-    (codex P1 on #863, round 3). The literal names ``select`` /
+    (codex P1 on #863). The literal names ``select`` /
     ``select_from`` are always recognized in addition to these.
     """
     return frozenset(_bound_names(fn, tree, _select_functions()))
@@ -460,13 +490,14 @@ def _accessor_functions() -> tuple[Any, ...]:
 
     Calls to these (resolved by identity, so function-local imports and
     aliases count) are fetch evidence just like a raw select — they are the
-    normal by-ID service paths Rule 1 exists for (codex P1 on #863, round 5).
+    normal by-ID service paths Rule 1 exists for (codex P1 on #863).
     """
     from app.modules.catalog.datasets.domain.service import get_dataset
     from app.modules.catalog.maps.service_crud import get_map, get_map_with_layers
     from app.modules.catalog.records.service import get_record
+    from app.modules.catalog.stories.service import get_story
 
-    return (get_dataset, get_map, get_map_with_layers, get_record)
+    return (get_dataset, get_map, get_map_with_layers, get_record, get_story)
 
 
 # Accessor METHOD names for attribute calls whose receiver cannot be
@@ -480,6 +511,7 @@ _ACCESSOR_METHOD_NAMES = frozenset(
         "get_dataset_with_attributes",
         "get_map",
         "get_map_with_layers",
+        "get_story",
     }
 )
 
@@ -590,7 +622,7 @@ def _assigned_call_targets(tree: ast.Module) -> dict[int, tuple[frozenset[str], 
 
     Maps call id -> (assigned Name targets, assignment end line). Used to
     require that an assigned value-guard result is actually loaded again
-    afterwards (codex P1, round 8).
+    afterwards (codex P1).
     """
     out: dict[int, tuple[frozenset[str], int]] = {}
     for node in ast.walk(tree):
@@ -666,13 +698,13 @@ def _guard_creditable_call_ids(tree: ast.Module) -> set[int]:
     """Call ids on the analyzed function's own EXECUTION PATH (guard scope).
 
     ``ast.walk`` visits nested function bodies, so a guard awaited inside a
-    nested def that may never run credited the enclosing handler (codex P2,
-    round 7). Guard credit is restricted to:
+    nested def that may never run credited the enclosing handler (codex P2).
+    Guard credit is restricted to:
 
     - calls in the analyzed function's own body (and at module level), and
     - calls in a FIRST-LEVEL nested def that the outer body provably
       invokes by simple name — the ``list_maps`` closure pattern
-      (``_apply_vis_filter`` wrapping ``_apply_map_visibility_filter``).
+      (``_apply_vis_filter`` wrapping ``apply_map_visibility_filter``).
       An async nested def's invocation must provably RUN the coroutine:
       directly awaited, or a direct argument of an awaited call (the STAC
       ``await asyncio.gather(_fetch_extents(), ...)`` idiom).
@@ -720,11 +752,14 @@ def _guard_creditable_call_ids(tree: ast.Module) -> set[int]:
 def _analyze_source(fn: Any, source: str, label: str) -> tuple[list[str], bool]:
     """AST-scan one function's source for model fetches and guard CALLS.
 
+    Returns the fetch evidence and whether any sanctioned guard is credited;
+    :func:`_scan` returns which guards, and whether a fetch reads ``Map``.
+
     Fetch shapes (all matched on call nodes, so formatting across multiple
     lines is irrelevant — codex P2 on #863). ``select`` matches both the
     plain name and qualified forms like ``sa.select``; model classes are
     recognized in positional and keyword argument position, so
-    ``db.get(entity=Dataset, ident=...)`` counts (codex P2, round 3):
+    ``db.get(entity=Dataset, ident=...)`` counts (codex P2):
     - ``select(<model or model attribute>, ...)`` / ``sa.select(...)``
     - ``<anything>.select_from(<model>)``
     - ``<anything>.get(<model>, ...)`` / ``.get_one(<model>, ...)``
@@ -735,23 +770,29 @@ def _analyze_source(fn: Any, source: str, label: str) -> tuple[list[str], bool]:
     by identity (``get_dataset`` / ``get_record`` / ``get_map`` /
     ``get_map_with_layers``, including function-local imports) and the
     matching method names on any receiver (``port.get_record(db, id)``)
-    (codex P1, round 5).
+    (codex P1).
 
     A guard counts only when it is actually INVOKED and the called name
-    RESOLVES to a sanctioned guard object by identity (codex P2 on #863,
-    rounds 2 and 5) — imports, docstrings, comments, shadowing local
+    RESOLVES to a sanctioned guard object by identity (codex P2 on #863) — imports,
+    docstrings, comments, shadowing local
     definitions, and same-named methods on unrelated objects do not count.
     The one non-identity path is a ``_PORT_GUARD_METHODS`` call on a
     provable ProcessingPort receiver. Value-returning guards
     (``_VALUE_GUARDS``) additionally require the call result to be
     CONSUMED — a bare expression statement discards the filtered Select and
-    is not a guard (codex P1, round 3). Coroutine guards additionally
+    is not a guard (codex P1). Coroutine guards additionally
     require the call to be AWAITED — an un-awaited call only creates a
-    coroutine and never runs the check (codex P1, round 4).
+    coroutine and never runs the check (codex P1).
     """
+    evidence, guards, _ = _scan(fn, source, label)
+    return evidence, bool(guards)
+
+
+def _scan(fn: Any, source: str, label: str) -> tuple[list[str], set[str], bool]:
+    """Fetch evidence, the credited guards' canonical names, and a Map-fetch flag."""
     tree = _parse(source)
     if tree is None:
-        return [], False
+        return [], set(), False
     ctx = _AnalysisContext(
         fn=fn,
         aliases=_model_aliases(fn, tree),
@@ -765,20 +806,24 @@ def _analyze_source(fn: Any, source: str, label: str) -> tuple[list[str], bool]:
         assigned=_assigned_call_targets(tree),
         load_lines=_name_load_lines(tree),
     )
+    map_names = _bound_names(fn, tree, (_map_class(),))
+    map_accessors = _bound_names(fn, tree, _map_accessor_functions())
     lines = source.splitlines()
     evidence: list[str] = []
-    guard_called = False
+    guards: set[str] = set()
+    map_fetch = False
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         if _is_effective_guard(ctx, node):
-            guard_called = True
+            guards.add(_resolve_guard(ctx, node)[0])
         if _is_fetch(ctx, node):
             line = lines[node.lineno - 1].strip() if node.lineno <= len(lines) else ""
             evidence.append(f"{label}:{node.lineno}: {line}")
+            map_fetch = map_fetch or _is_map_fetch(node, map_names, map_accessors)
 
-    return evidence, guard_called
+    return evidence, guards, map_fetch
 
 
 class _AnalysisContext(NamedTuple):
@@ -817,7 +862,7 @@ def _resolve_guard(ctx: _AnalysisContext, node: ast.Call) -> tuple[str, Any] | N
 
 def _is_effective_guard(ctx: _AnalysisContext, node: ast.Call) -> bool:
     if id(node) not in ctx.creditable:
-        return False  # nested def/lambda that may never run (codex P2, round 7)
+        return False  # nested def/lambda that may never run (codex P2)
     resolved = _resolve_guard(ctx, node)
     if resolved is None:
         return False
@@ -842,7 +887,7 @@ def _is_effective_guard(ctx: _AnalysisContext, node: ast.Call) -> bool:
             ):
                 # ``filtered = apply_visibility_filter(stmt, ...)`` with
                 # ``filtered`` never read again: the protection is inert
-                # (codex P1, round 8). Bounded check — see the module
+                # (codex P1). Bounded check — see the module
                 # docstring's documented-limits entry on dataflow.
                 return False
     return True
@@ -865,6 +910,30 @@ def _is_fetch(ctx: _AnalysisContext, node: ast.Call) -> bool:
     if attr in ("get", "get_one"):
         return _any_model_arg([*node.args[:1], *keyword_values])
     return False
+
+
+@lru_cache(maxsize=1)
+def _map_class() -> type:
+    from app.modules.catalog.maps.models import Map
+
+    return Map
+
+
+@lru_cache(maxsize=1)
+def _map_accessor_functions() -> tuple[Any, ...]:
+    from app.modules.catalog.maps.service_crud import get_map, get_map_with_layers
+
+    return (get_map, get_map_with_layers)
+
+
+def _is_map_fetch(node: ast.Call, map_names: set[str], map_accessors: set[str]) -> bool:
+    """Whether a call already known to be a fetch reads the ``Map`` table."""
+    func = node.func
+    name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+    if name in ("get_map", "get_map_with_layers") or name in map_accessors:
+        return True
+    candidates = [*node.args, *(kw.value for kw in node.keywords)]
+    return any(_root_name(candidate) in map_names for candidate in candidates)
 
 
 def _called_names(tree: ast.Module) -> list[tuple[str, ...]]:
@@ -892,21 +961,23 @@ def _one_level_expansion(fn: Any, source: str) -> dict[str, tuple[Any, str, bool
 
     Every helper call is expanded for FETCH evidence — a coroutine passed
     to ``await asyncio.gather(...)`` or ``create_task`` does execute, so
-    skipping it would hide its fetches (codex P1, round 6; fail-closed).
+    skipping it would hide its fetches (codex P1; fail-closed).
     GUARD credit from a helper is asymmetric: it flows to the handler only
     when the helper provably executes at the call site — the call is
     directly awaited, a direct argument of an awaited call (the awaited
     ``asyncio.gather(helper())`` idiom), or the helper is a plain sync
     function. Without that restriction an un-awaited
     ``record = _check_record_ownership(...)`` would be credited with the
-    helper's internal awaited guard call (the codex P1, round 4 hole).
+    helper's internal awaited guard call (the codex P1 hole).
     """
     tree = _parse(source)
     if tree is None:
         return {}
     awaited = _awaited_call_ids(tree)
     awaited_args = _awaited_argument_call_ids(tree)
-    module_globals = getattr(fn, "__globals__", {})
+    # Function-local imports count, so a helper imported inside the handler
+    # to dodge an import cycle is still expanded.
+    module_globals = {**getattr(fn, "__globals__", {}), **_local_imports(fn, tree)}
     expansion: dict[str, tuple[Any, str, bool]] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -950,16 +1021,24 @@ def _analyze_effective(fn: Any, source: str) -> tuple[list[str], bool]:
     guard credit accumulates from the handler and only the helpers whose
     call sites provably execute (see ``_one_level_expansion``).
     """
-    fetch_lines, guarded = _analyze_source(fn, source, "handler")
+    fetch_lines, guards, _ = _scan_effective(fn, source)
+    return fetch_lines, bool(guards)
+
+
+def _scan_effective(fn: Any, source: str) -> tuple[list[str], set[str], bool]:
+    """:func:`_scan` over the handler plus its one-level helper expansion."""
+    fetch_lines, guards, map_fetch = _scan(fn, source, "handler")
     for helper_key, (helper_fn, helper_source, creditable) in _one_level_expansion(
         fn, source
     ).items():
-        helper_evidence, helper_guard = _analyze_source(
+        helper_evidence, helper_guards, helper_map_fetch = _scan(
             helper_fn, helper_source, helper_key
         )
         fetch_lines.extend(helper_evidence)
-        guarded = guarded or (helper_guard and creditable)
-    return fetch_lines, guarded
+        map_fetch = map_fetch or helper_map_fetch
+        if creditable:
+            guards |= helper_guards
+    return fetch_lines, guards, map_fetch
 
 
 @lru_cache(maxsize=1)
@@ -985,17 +1064,19 @@ def _analyze_routes() -> tuple[int, tuple[_HandlerReport, ...]]:
         fn = _unwrap(route.endpoint)
         key = f"{fn.__module__}.{fn.__qualname__}"
         if key in reports:
-            # Dual-shape slash aliases (ROUTE-01) register the same endpoint
+            # Dual-shape slash aliases register the same endpoint
             # twice; analyze it once.
             continue
         source = _source_of(fn)
-        fetch_lines, guarded = _analyze_effective(fn, source)
+        fetch_lines, guards, map_fetch = _scan_effective(fn, source)
         reports[key] = _HandlerReport(
             key=key,
             path=ctx.path or route.path,
             methods=tuple(sorted(route.methods or ())),
             fetch_lines=tuple(fetch_lines),
-            guarded=guarded,
+            guarded=bool(guards),
+            map_fetch=map_fetch,
+            guards=frozenset(guards),
         )
     return context_count, tuple(reports.values())
 
@@ -1054,7 +1135,7 @@ def test_every_model_fetching_handler_is_guarded_or_allowlisted() -> None:
     """AGENTS.md Rule 1, enforced per handler across the whole route table.
 
     A handler whose effective source (own body + one level of directly-called
-    app.* helpers) fetches Record/Dataset/Map/RecordEmbedding/IngestJob must
+    app.* helpers) fetches Record/Dataset/Map/Story/StoryAsset/RecordEmbedding/IngestJob must
     CALL one
     of the sanctioned guards. Anything else must be a reviewed ALLOWLIST
     entry — and the allowlist must stay exact, so guarded-later or renamed
@@ -1074,7 +1155,7 @@ def test_every_model_fetching_handler_is_guarded_or_allowlisted() -> None:
             )
         pytest.fail(
             "Rule 1 violation: route handler(s) fetch a guarded model "
-            "(Record/Dataset/Map/RecordEmbedding/IngestJob) without a "
+            "(Record/Dataset/Map/Story/StoryAsset/RecordEmbedding/IngestJob) without a "
             "sanctioned access "
             "check. Add check_dataset_access_or_anonymous / "
             "check_dataset_access / check_dataset_write_access / "
@@ -1092,20 +1173,121 @@ def test_every_model_fetching_handler_is_guarded_or_allowlisted() -> None:
     )
 
 
+# A map's layers each pass their own dataset guard, which says nothing about
+# the map itself, so a handler that fetches a Map needs a map guard. A read
+# needs a read guard; a write may rest on ownership, which implies reading.
+_MAP_READ_GUARDS = frozenset({"check_map_access", "apply_map_visibility_filter"})
+_MAP_WRITE_GUARDS = _MAP_READ_GUARDS | {"check_map_ownership"}
+_READ_METHODS = frozenset({"GET", "HEAD"})
+
+# Map-fetching handlers without a map guard, each by design. Asserted exact.
+MAP_ALLOWLIST: dict[str, str] = {
+    "app.modules.catalog.maps.router_sharing.shared_map_card_endpoint": (
+        "share-token capability route; requires a map open to anonymous readers"
+    ),
+    "app.modules.admin.router_operations.list_share_tokens_endpoint": (
+        "admin-gated (manage_users); lists public maps and their share links"
+    ),
+}
+
+
+@pytest.mark.architecture
+def test_every_map_fetching_handler_checks_the_map() -> None:
+    """A handler that fetches a Map calls a map guard, not only a dataset guard."""
+    _, reports = _analyze_routes()
+    map_readers = [r for r in reports if r.map_fetch and r.guards & _MAP_READ_GUARDS]
+    assert len(map_readers) >= 10, (
+        f"only {len(map_readers)} handlers fetch a Map under a map read guard "
+        "(expected >=10); Map fetch or map guard detection has stopped matching."
+    )
+    unchecked = {}
+    for report in reports:
+        if not report.map_fetch:
+            continue
+        reads = set(report.methods) <= _READ_METHODS
+        required = _MAP_READ_GUARDS if reads else _MAP_WRITE_GUARDS
+        if not report.guards & required:
+            unchecked[report.key] = report
+
+    missing = sorted(set(unchecked) - set(MAP_ALLOWLIST))
+    assert not missing, (
+        "Rule 1 violation: handler(s) fetch a Map without a map guard. Reads "
+        "call check_map_access or apply_map_visibility_filter; writes may call "
+        "check_map_ownership instead. Only for a handler unguarded by design, "
+        "add a MAP_ALLOWLIST entry with a one-line reason.\n"
+        + "\n".join(
+            f"  {' '.join(unchecked[key].methods)} {unchecked[key].path}\n    {key}"
+            for key in missing
+        )
+    )
+    stale = sorted(set(MAP_ALLOWLIST) - set(unchecked))
+    assert not stale, "Stale MAP_ALLOWLIST entries:\n" + "\n".join(
+        f"  {key}" for key in stale
+    )
+
+
+# A map guard says nothing about a story, so a stories route that fetches a
+# Story needs a story guard; a write needs the ownership guard.
+_STORY_READ_GUARDS = frozenset(
+    {"check_story_access", "check_story_ownership", "apply_story_visibility_filter"}
+)
+_STORY_WRITE_GUARDS = frozenset({"check_story_ownership"})
+# Writes a caller may make to a story they can only read: copying it.
+_STORY_READ_ONLY_WRITES = frozenset(
+    {"app.modules.catalog.stories.router.duplicate_story_endpoint"}
+)
+
+
+@pytest.mark.architecture
+def test_every_story_route_checks_the_story() -> None:
+    """Each stories route that fetches a Story calls a story guard."""
+    _, reports = _analyze_routes()
+    story_routes = [
+        r for r in reports if r.key.startswith("app.modules.catalog.stories.")
+    ]
+    fetching = [r for r in story_routes if r.fetch_lines]
+    assert len(fetching) >= 8, (
+        f"only {len(fetching)} stories routes fetch a Story (expected >=8); "
+        "Story fetch detection has stopped matching."
+    )
+    unchecked = []
+    for report in fetching:
+        reads = set(report.methods) <= _READ_METHODS
+        required = (
+            _STORY_READ_GUARDS
+            if reads or report.key in _STORY_READ_ONLY_WRITES
+            else _STORY_WRITE_GUARDS
+        )
+        if not report.guards & required:
+            unchecked.append(
+                f"  {' '.join(report.methods)} {report.path}\n    {report.key}"
+            )
+    assert not unchecked, (
+        "Rule 1 violation: stories route(s) fetch a Story without the story "
+        "guard they need. Reads call check_story_access, check_story_ownership "
+        "or apply_story_visibility_filter; writes call check_story_ownership.\n"
+        + "\n".join(unchecked)
+    )
+
+
 @lru_cache(maxsize=1)
 def _disclosure_deciders() -> tuple[Any, ...]:
-    """The two predicates that settle how much of a run's record a caller sees.
+    """The predicates that settle how much of a run's record a caller sees.
 
-    ``_can_access_another_users_job`` is the owner-or-policy answer: the
-    caller gets the whole row or a 403. ``can_view_dataset_provenance`` is
+    ``_may_read_job`` is the owner-or-policy answer, owners included, over
+    ``_can_access_another_users_job``: the caller gets the whole row or is
+    refused. ``can_view_dataset_provenance`` is
     the graded answer ``list_dataset_refresh_runs`` uses: the full payload
     for the dataset's owner or an admin, a redacted one for everybody else.
     Either is a decision. Neither being present is the defect.
     """
     from app.modules.catalog.authorization import can_view_dataset_provenance
-    from app.platform.jobs.router import _can_access_another_users_job
+    from app.platform.jobs.router import (
+        _can_access_another_users_job,
+        _may_read_job,
+    )
 
-    return (_can_access_another_users_job, can_view_dataset_provenance)
+    return (_can_access_another_users_job, _may_read_job, can_view_dataset_provenance)
 
 
 # The three field names the provenance projection already decided are not for
@@ -1132,7 +1314,7 @@ PROVENANCE_ALLOWLIST: dict[str, str] = {
     "app.modules.admin.router.list_admin_jobs": (
         "manage_users-gated operator console; the cross-user view is the feature"
     ),
-    # fix(#2025): the embedding backfill's run history, on the coverage endpoint
+    # The embedding backfill's run history, on the coverage endpoint
     # the admin AI panel reads. One instance-wide operation per tenant, so there
     # is no narrower audience its error codes could be graded for.
     "app.modules.admin.router.get_embedding_stats": (
@@ -1171,7 +1353,7 @@ def _response_models(annotation: Any, depth: int = 0, seen: set[Any] | None = No
 def test_every_provenance_detail_route_decides_who_sees_it() -> None:
     """A run's failure text and the id of who triggered it are not visibility.
 
-    fix(#1860): Rule 1 above cannot see this class. It asks whether a handler
+    Rule 1 above cannot see this class. It asks whether a handler
     checked access at all, and both handlers this test was written for did:
     they filtered the DATASET and then served every field of the run to
     whoever that let in. Two sibling doors onto the same fields had already
@@ -1242,7 +1424,8 @@ def test_every_provenance_detail_route_decides_who_sees_it() -> None:
             "can_view_dataset_provenance (graded: full payload for the "
             "dataset's owner or an admin, a redacted projection for every "
             "other reader) or _can_access_another_users_job (owner-or-policy, "
-            "403 on denial). A dataset-visibility check alone is not an "
+            '404 "Job not found" on denial, identical to an unknown id). '
+            "A dataset-visibility check alone is not an "
             "answer: it admits any signed-in reader of a published public or "
             "internal dataset. Only for routes unguarded by design, add a "
             "PROVENANCE_ALLOWLIST entry in this file with a one-line "
@@ -1355,19 +1538,19 @@ def test_detection_self_checks_on_synthetic_sources() -> None:
     imp_avf = "from app.modules.catalog.authorization import apply_visibility_filter\n"
     imp_bulk = "from app.modules.catalog.maps.service_layers import bulk_check_dataset_access\n"
 
-    # Qualified select: sa.select(Model) is a fetch (codex P2, round 3).
+    # Qualified select: sa.select(Model) is a fetch (codex P2).
     evidence, guarded = _analyze_source(
         _dummy, imp + "def f(db):\n    return db.execute(sa.select(DsX))\n", "t"
     )
     assert evidence and not guarded, "sa.select(Model) must be detected as a fetch"
 
-    # Keyword get: db.get(entity=Model, ident=...) is a fetch (codex P2, round 3).
+    # Keyword get: db.get(entity=Model, ident=...) is a fetch (codex P2).
     evidence, guarded = _analyze_source(
         _dummy, imp + "def f(db, i):\n    return db.get(entity=DsX, ident=i)\n", "t"
     )
     assert evidence and not guarded, "db.get(entity=Model) must be detected as a fetch"
 
-    # AsyncSession.get_one is the same fetch shape (codex P1, round 6).
+    # AsyncSession.get_one is the same fetch shape (codex P1).
     evidence, guarded = _analyze_source(
         _dummy, imp + "async def f(db, i):\n    return await db.get_one(DsX, i)\n", "t"
     )
@@ -1376,7 +1559,7 @@ def test_detection_self_checks_on_synthetic_sources() -> None:
     )
 
     # A bare value-guard statement discards the filtered Select and is NOT a
-    # guard (codex P1, round 3)...
+    # guard (codex P1)...
     evidence, guarded = _analyze_source(
         _dummy,
         imp
@@ -1422,7 +1605,7 @@ def test_detection_self_checks_on_synthetic_sources() -> None:
 
     # Assigning the filtered statement to a name that is NEVER read again
     # leaves the protection inert — the raw statement is what gets executed
-    # (codex P1, round 8).
+    # (codex P1).
     evidence, guarded = _analyze_source(
         _dummy,
         imp
@@ -1454,7 +1637,7 @@ def test_detection_self_checks_on_synthetic_sources() -> None:
     )
 
     # An UN-AWAITED coroutine guard only creates a coroutine — the check
-    # never runs, so it must not count (codex P1, round 4).
+    # never runs, so it must not count (codex P1).
     evidence, guarded = _analyze_source(
         _dummy,
         imp
@@ -1497,7 +1680,7 @@ def test_detection_self_checks_on_synthetic_sources() -> None:
     )
 
     # A SHADOWED guard name — locally defined, never imported — must not
-    # count: guard credit requires identity resolution (codex P2, round 5).
+    # count: guard credit requires identity resolution (codex P2).
     evidence, guarded = _analyze_source(
         _dummy,
         imp
@@ -1514,7 +1697,7 @@ def test_detection_self_checks_on_synthetic_sources() -> None:
     )
 
     # ProcessingPort accessor: port.get_record(db, id) is a fetch even
-    # though the receiver is a local (codex P1, round 5).
+    # though the receiver is a local (codex P1).
     evidence, guarded = _analyze_source(
         _dummy,
         'async def f(db, i, port: "ProcessingPort"):\n'
@@ -1567,7 +1750,7 @@ def test_detection_self_checks_on_synthetic_sources() -> None:
     )
 
     # A guard inside a nested def the handler NEVER invokes must not credit
-    # the handler — the callback may never run (codex P2, round 7).
+    # the handler — the callback may never run (codex P2).
     evidence, guarded = _analyze_source(
         _dummy,
         imp
@@ -1647,7 +1830,7 @@ def test_detection_self_checks_on_synthetic_sources() -> None:
 
 @pytest.mark.architecture
 def test_expansion_semantics_on_synthetic_sources() -> None:
-    """Pin the helper-expansion semantics (codex P1 rounds 4 and 6).
+    """Pin the helper-expansion semantics (codex P1).
 
     Dummy functions are built with controlled globals binding REAL app
     helpers, because expansion only follows ``app.*`` functions. The
@@ -1662,7 +1845,7 @@ def test_expansion_semantics_on_synthetic_sources() -> None:
 
     # A helper scheduled through an AWAITED asyncio.gather provably
     # executes — its fetches must be visible and its internal (consumed)
-    # guard is credited (codex P1 round 6 + P2 round 7).
+    # guard is credited (codex P1 + P2).
     # _get_visible_dataset selects Dataset and applies the filter inside.
     fn = _dummy_with({"gather_helper": ogc_router._get_visible_dataset})
     evidence, guarded = _analyze_effective(
@@ -1702,7 +1885,7 @@ def test_expansion_semantics_on_synthetic_sources() -> None:
         "an awaited helper must contribute both its fetches and its guards"
     )
 
-    # Round-4 pin at composition level: an un-awaited (assigned) coroutine
+    # Composition-level pin: an un-awaited (assigned) coroutine
     # helper never runs, so its internal guard must NOT be credited — while
     # its fetch stays visible (fail-closed).
     fn = _dummy_with({"load_visible": ogc_router._get_visible_dataset})
@@ -1724,7 +1907,8 @@ def test_delegated_guards_still_enforce_access() -> None:
     so hollowing out a helper fails here rather than silently weakening the
     main test.
     """
-    from app.modules.catalog.maps import _router_helpers, service_crud, service_shared
+    from app.modules.catalog import authorization
+    from app.modules.catalog.maps import service_crud
     from app.modules.catalog.records import router as records_router
 
     def _calls_in(fn: Any) -> set[str]:
@@ -1741,23 +1925,48 @@ def test_delegated_guards_still_enforce_access() -> None:
         records_router._check_record_ownership
     ), "records _check_record_ownership no longer calls _check_record_read_access"
 
-    map_read = _source_of(_router_helpers._check_map_read_access)
-    assert "visibility" in map_read and "404" in map_read, (
-        "maps _check_map_read_access no longer enforces visibility with a 404"
+    map_read = _source_of(authorization.check_map_access)
+    assert "_MAP_VISIBILITIES" in map_read and "404" in map_read, (
+        "check_map_access no longer enforces map visibility with a 404"
     )
     map_own = _source_of(service_crud.check_map_ownership)
     assert "created_by" in map_own and "admin" in map_own, (
         "maps check_map_ownership no longer enforces owner-or-admin"
     )
-    map_filter = _source_of(service_shared._apply_map_visibility_filter)
-    assert "visibility" in map_filter and "created_by" in map_filter, (
-        "maps _apply_map_visibility_filter no longer filters by visibility/ownership"
+    map_filter = _source_of(authorization.apply_map_visibility_filter)
+    assert "_MAP_VISIBILITIES" in map_filter and "created_by" in map_filter, (
+        "apply_map_visibility_filter no longer filters by visibility/ownership"
     )
+
+    from app.modules.catalog.stories import service as stories_service
+
+    story_read = _source_of(stories_service.check_story_access)
+    assert (
+        "_STORY_VISIBILITIES" in story_read
+        and "published_at" in story_read
+        and "_not_found" in _calls_in(stories_service.check_story_access)
+    ), "check_story_access no longer enforces published-story visibility with a 404"
+    story_own = _source_of(stories_service.check_story_ownership)
+    assert {"check_story_access", "can_edit_story"} <= _calls_in(
+        stories_service.check_story_ownership
+    ) and "403" in story_own, (
+        "check_story_ownership no longer checks access and owner-or-admin"
+    )
+    can_edit = _source_of(stories_service.can_edit_story)
+    assert "created_by" in can_edit and "admin" in can_edit, (
+        "can_edit_story no longer means owner-or-admin"
+    )
+    story_filter = _source_of(stories_service.apply_story_visibility_filter)
+    assert (
+        "_STORY_VISIBILITIES" in story_filter
+        and "created_by" in story_filter
+        and "published_at" in story_filter
+    ), "apply_story_visibility_filter no longer filters by visibility/ownership"
 
     from app.modules.catalog.maps import service_layers
     from app.processing.tiles import router as tiles_router
 
-    # fix(#929 review): the bulk check delegates to the permission extension
+    # The bulk check delegates to the permission extension
     # via apply_visibility_filter instead of inlining a policy mirror, so an
     # overlay that replaces the extension governs the map-attach paths too.
     bulk_calls = _calls_in(service_layers.bulk_check_dataset_access)
@@ -1772,7 +1981,7 @@ def test_delegated_guards_still_enforce_access() -> None:
 
     from app.modules.catalog.search import service_candidates, service_datasets
 
-    # fix(#1855): the shared candidate selection is credited as a guard only
+    # The shared candidate selection is credited as a guard only
     # while it still routes every base statement through apply_visibility_filter.
     assert "vetting_filters" in _calls_in(service_candidates.select_candidates), (
         "search select_candidates no longer applies vetting_filters"
@@ -1805,9 +2014,15 @@ def test_delegated_guards_still_enforce_access() -> None:
         "access to a non-public dataset to check_dataset_access"
     )
     tile_auth = _source_of(tiles_router._authorize_vector_tile_request)
-    assert "visibility" in tile_auth and "403" in tile_auth, (
-        "tiles _authorize_vector_tile_request no longer gates non-public "
-        "datasets with a 403"
+    tile_refusal = _source_of(tiles_router._refuse_unseen_tile)
+    assert (
+        "visibility" in tile_auth
+        and "_refuse_unseen_tile" in tile_auth_calls
+        and "403" in tile_refusal
+        and "404" in tile_refusal
+    ), (
+        "tiles _authorize_vector_tile_request no longer refuses non-public "
+        "datasets to anonymous callers with the unknown-table 403/404"
     )
 
     token_gate_calls = _calls_in(tiles_router._enforce_tile_token_access)
@@ -1823,7 +2038,7 @@ def test_delegated_guards_still_enforce_access() -> None:
 
     # ProcessingPort guard wrappers are credited by method name on provable
     # port receivers, so the default implementation must keep delegating to
-    # the real authorization functions (codex P2, round 5).
+    # the real authorization functions (codex P2).
     from app.platform.extensions.defaults import DefaultProcessingPort
 
     for method_name in sorted(_PORT_GUARD_METHODS):

@@ -1,14 +1,14 @@
 """Reading metadata back off a landed PostGIS table.
 
-Split out of ``metadata.py`` (#1042). ``extract_metadata``'s CTE consolidates
-``get_feature_count``, ``get_table_srid``, ``get_geometry_type`` and the
-extent query into a single scan, falling back to those same four helpers one
-at a time when a deployment can't run it — the CTE and the helpers must
-agree line for line, so they're kept where a reader can see both.
+``extract_metadata``'s CTE consolidates ``get_feature_count``,
+``get_table_srid``, ``get_geometry_type`` and the extent query into a single
+scan, falling back to those same four helpers one at a time when a
+deployment can't run it. The CTE and the helpers must agree line for line,
+so they're kept where a reader can see both.
 
 ``get_extent`` and the CTE also share the two extent corrections: the
-antimeridian override in ``_seam_crossing_extent_wkt`` (#934) and the
-degenerate POINT/LINESTRING padding (#430 BA-18).
+antimeridian override in ``_seam_crossing_extent_wkt`` and the degenerate
+POINT/LINESTRING padding.
 """
 
 import re
@@ -98,13 +98,13 @@ async def get_declared_srid(
     )
 
 
-# Phase 1057 WFS-04: map abstract OGC GML 3 geometry types (returned by
+# Map abstract OGC GML 3 geometry types (returned by
 # PostGIS GeometryType() when the source WFS stores them, e.g. GeoServer's
 # opengeo:countries) to the closest concrete subtype, since
 # chk_datasets_geometry_type only allows the 7 concrete types (POINT,
 # LINESTRING, POLYGON, MULTIPOINT, MULTILINESTRING, MULTIPOLYGON,
-# GEOMETRYCOLLECTION). ``-nlt GEOMETRY`` (same phase) relaxed the column
-# type so ogr2ogr can load these, but leaves the stored subtype
+# GEOMETRYCOLLECTION). ``-nlt GEOMETRY`` relaxes the column type so
+# ogr2ogr can load these, but leaves the stored subtype
 # (MULTISURFACE / MULTICURVE / ...) as GeometryType(geom)'s answer.
 _ABSTRACT_TO_CONCRETE_GEOMETRY_TYPE: dict[str, str] = {
     "MULTISURFACE": "MULTIPOLYGON",
@@ -145,7 +145,7 @@ async def get_geometry_type(
     """
     result = await session.execute(
         text(
-            # codeql[py/sql-injection] fix(#1615): identifiers validated by _qtable (metadata_sql.py)
+            # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
             f"SELECT GeometryType(geom) FROM "
             f"{_qtable(table_name, schema=schema)} WHERE geom IS NOT NULL LIMIT 1"
         )
@@ -166,7 +166,7 @@ async def get_geometry_types(
         return None
     result = await session.execute(
         text(
-            # codeql[py/sql-injection] fix(#1615): identifiers validated by _qtable (metadata_sql.py)
+            # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
             f"SELECT DISTINCT GeometryType(geom) FROM "
             f"{_qtable(table_name, schema=schema)} "
             "WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom)"
@@ -205,7 +205,7 @@ async def get_feature_count(
 ) -> int:
     """Count the number of features (rows) in the table."""
     result = await session.execute(
-        # codeql[py/sql-injection] fix(#1615): identifiers validated by _qtable (metadata_sql.py)
+        # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
         text(f"SELECT COUNT(*) FROM {_qtable(table_name, schema=schema)}")
     )
     return result.scalar_one()
@@ -221,7 +221,7 @@ async def _seam_crossing_extent_wkt(
 ) -> str | None:
     """Two-ring extent WKT when the table honestly crosses ±180, else None.
 
-    fix(#934): ``xmin``/``xmax`` are the naive ``ST_Extent`` bounds already
+    ``xmin``/``xmax`` are the naive ``ST_Extent`` bounds already
     computed by the caller's query. A crossing dataset folded naively always
     spans more than 180 degrees (shifted-domain span is ``360 - width``, so
     the shifted domain only wins when ``width > 180``), letting the common
@@ -239,22 +239,22 @@ async def get_extent(
 ) -> str | None:
     """Get the 4326 extent WKT (or None for empty tables).
 
-    fix(#934): a Pacific-crossing table (reachable since #888 shifts 0..360
-    sources instead of clipping) must not store the naive fold (a
-    near-global POLYGON); when the honest extent crosses the seam this
-    returns the two-ring MULTIPOLYGON instead. Non-crossing extents stay
-    byte-identical to the original query.
+    A Pacific-crossing table (0..360 sources are shifted rather than
+    clipped) must not store the naive fold, a near-global POLYGON. When
+    the honest extent crosses the seam this returns the two-ring
+    MULTIPOLYGON instead; any other extent is ST_Extent's, padded only
+    when degenerate (below).
 
-    fix(#430): spatial_extent admits POLYGON/MULTIPOLYGON only
+    spatial_extent admits POLYGON/MULTIPOLYGON only
     (chk_records_spatial_extent_type). ST_Extent of a single point or
-    axis-collinear points casts to a rejected POINT/LINESTRING, crashing
-    the reupload swap. Pad ONLY the degenerate cases into a valid sub-mm
-    polygon; genuine extents stay byte-identical.
+    axis-collinear points casts to a rejected POINT/LINESTRING, which would
+    fail the reupload swap, so only those degenerate cases are padded into
+    a valid sub-mm polygon.
     """
     _validate_table_name(table_name)
     result = await session.execute(
         text(
-            # codeql[py/sql-injection] fix(#1615): identifiers validated by _qtable (metadata_sql.py)
+            # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
             f"SELECT CASE "
             f"  WHEN ext IS NULL THEN NULL "
             f"  WHEN GeometryType(ext::geometry) = 'POLYGON' "
@@ -297,7 +297,7 @@ async def detect_3d_metadata(
     try:
         result = await session.execute(
             text(
-                # codeql[py/sql-injection] fix(#1615): identifiers validated by _qtable (metadata_sql.py)
+                # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
                 f"SELECT "
                 f"  MAX(ST_NDims(geom)) AS n_dims, "
                 f"  BOOL_OR(ST_Zmflag(geom) IN (2, 3)) AS has_z, "
@@ -372,7 +372,7 @@ async def promote_z_to_elev(
     try:
         await session.execute(
             text(
-                # codeql[py/sql-injection] fix(#1615): identifiers validated by _qtable (metadata_sql.py)
+                # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
                 f"ALTER TABLE {_qtable(table_name, schema=schema)} ADD COLUMN elev double precision"
             )
         )
@@ -380,7 +380,7 @@ async def promote_z_to_elev(
         if geom_upper == "POINT":
             await session.execute(
                 text(
-                    # codeql[py/sql-injection] fix(#1615): identifiers validated by _qtable (metadata_sql.py)
+                    # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
                     f"UPDATE {_qtable(table_name, schema=schema)} "
                     f"SET elev = ST_Z(geom) "
                     f"WHERE geom IS NOT NULL AND ST_NDims(geom) > 2"
@@ -390,7 +390,7 @@ async def promote_z_to_elev(
             # MultiPoint: extract Z from first point in the multi
             await session.execute(
                 text(
-                    # codeql[py/sql-injection] fix(#1615): identifiers validated by _qtable (metadata_sql.py)
+                    # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
                     f"UPDATE {_qtable(table_name, schema=schema)} "
                     f"SET elev = ST_Z(ST_GeometryN(geom, 1)) "
                     f"WHERE geom IS NOT NULL AND ST_NDims(geom) > 2"
@@ -529,7 +529,7 @@ async def get_sample_values(
     )
 
     rows = await session.execute(
-        # codeql[py/sql-injection] fix(#1615): table via _qtable, columns via _sql_quote_ident (metadata_sql.py)
+        # codeql[py/sql-injection] table via _qtable, columns via _sql_quote_ident (metadata_sql.py)
         text(query).bindparams(sample_size=sample_size, t=table_name, schema=schema)
     )
 
@@ -600,7 +600,7 @@ async def extract_metadata(
     try:
         result = await session.execute(
             text(
-                # codeql[py/sql-injection] fix(#1615): identifiers validated by _qtable (metadata_sql.py)
+                # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
                 f"""
                 WITH meta AS (
                     SELECT
@@ -611,7 +611,7 @@ async def extract_metadata(
                             WHERE geom IS NOT NULL
                             LIMIT 1
                         ) AS geometry_type,
-                        -- fix(#430 BA-18): pad only degenerate (point/line) extents
+                        -- Pad only degenerate (point/line) extents
                         -- into a POLYGON; spatial_extent rejects POINT/LINESTRING.
                         CASE
                             WHEN ST_Extent(geom_4326) IS NULL THEN NULL
@@ -645,8 +645,8 @@ async def extract_metadata(
         geometry_type = await _generic_column_type(
             session, _normalize_geometry_type(row.geometry_type), table_name, schema
         )
-        # fix(#934): emit the two-ring MULTIPOLYGON for a Pacific-crossing
-        # source instead of storing the naive fold; see get_extent above.
+        # A Pacific-crossing source gets the two-ring MULTIPOLYGON; see
+        # get_extent.
         extent_wkt = row.extent_wkt
         crossing = await _seam_crossing_extent_wkt(
             session, table_name, schema=schema, xmin=row.ext_xmin, xmax=row.ext_xmax

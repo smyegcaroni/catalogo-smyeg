@@ -1,8 +1,8 @@
 /**
- * fix(#1708 codex r22): the URL-import lifecycle as a state machine.
+ * The URL-import lifecycle as a state machine.
  *
- * Four consecutive review rounds landed on this component, each a single
- * cell of the same table being wrong. These tests are written against the
+ * Several past bugs in this component were each a single cell of the
+ * same table being wrong. These tests are written against the
  * table rather than against the individual findings, so the next change has
  * to keep every transition true, not just the one it was aiming at.
  *
@@ -11,8 +11,8 @@
  * Events: mount · unmount · reset · commit resolve · commit reject ·
  *         job reaches terminal · layer change · commit submit
  *
- * fix(#1708 codex r24): the last two events are the ones r22 missed. Its
- * state axis was right and its event axis was a list of remembered events,
+ * The last two events are the ones an earlier version of these tests
+ * missed. Its state axis was right and its event axis was a list of remembered events,
  * so `committing × layer-change` was simply absent. The axis is now taken
  * from the component's RENDERED CONTROLS instead: every control that can
  * mutate `step`, the module session, or an in-flight request is an event
@@ -41,7 +41,7 @@ vi.mock('@/api/ingest', () => ({
   uploadFromUrl: (...a: unknown[]) => mockUploadFromUrl(...a),
   previewFile: (...a: unknown[]) => mockPreviewFile(...a),
   commitImport: (...a: unknown[]) => mockCommitImport(...a),
-  // fix(review #1800 P2): UrlImportForm's preview-failure handling now
+  // UrlImportForm's preview-failure handling now
   // calls these to decide whether the failed job is still retryable.
   getJobStatus: (...a: unknown[]) => mockGetJobStatus(...a),
   cancelJob: (...a: unknown[]) => mockCancelJob(...a),
@@ -117,7 +117,7 @@ const VECTOR_PREVIEW = {
   layer_name: 'roads',
   layers: null,
 };
-// Only a MULTI-layer container renders the layer picker, so the r24 cell is
+// Only a MULTI-layer container renders the layer picker, so the layer-change cell is
 // unreachable without one.
 const MULTI_LAYER_PREVIEW = {
   ...VECTOR_PREVIEW,
@@ -147,6 +147,14 @@ const RASTER_PREVIEW = {
   file_size_bytes: 1,
 };
 
+// Radix Select needs these pointer/scroll APIs, which jsdom lacks.
+beforeAll(() => {
+  Element.prototype.hasPointerCapture = vi.fn(() => false);
+  Element.prototype.setPointerCapture = vi.fn();
+  Element.prototype.releasePointerCapture = vi.fn();
+  Element.prototype.scrollIntoView = vi.fn();
+});
+
 beforeEach(() => {
   vi.clearAllMocks();
   clearUrlImport();
@@ -155,7 +163,7 @@ beforeEach(() => {
 afterEach(() => clearUrlImport());
 
 async function driveToReview(preview: unknown, jobId: string) {
-  // fix(#1710): the submit call only queues a download, so the form parks on
+  // The submit call only queues a download, so the form parks on
   // the job poll until it reads `pending`. Answer that here, then restore
   // whatever tracking status the test configured before calling this.
   const tracking = mockUseJobStatus(null) ?? { data: undefined };
@@ -219,7 +227,7 @@ describe('URL import lifecycle', () => {
     );
   });
 
-  // ── r24: the two events the r22 axis never had ──
+  // ── the two events the state axis never covered ──
 
   // The counterfactual for the test below: with nothing in flight the picker
   // is enabled and this exact event DOES re-preview. So when the same event
@@ -227,12 +235,13 @@ describe('URL import lifecycle', () => {
   // that never reached React.
   test('review + layer change re-previews the chosen layer', async () => {
     render(<UrlImportForm />);
-    await driveToReview(MULTI_LAYER_PREVIEW, 'job-m');
+    const user = await driveToReview(MULTI_LAYER_PREVIEW, 'job-m');
     expect(mockPreviewFile).toHaveBeenCalledTimes(1);
 
     const select = screen.getByLabelText('urlImport.layerLabel');
     expect(select).toBeEnabled();
-    fireEvent.change(select, { target: { value: 'layer_b' } });
+    await user.click(select);
+    await user.click(await screen.findByRole('option', { name: 'layer_b' }));
 
     await waitFor(() =>
       expect(mockPreviewFile).toHaveBeenLastCalledWith('job-m', 'layer_b'),
@@ -261,8 +270,9 @@ describe('URL import lifecycle', () => {
     // Belt: the control is disabled while the commit is in flight.
     expect(select).toBeDisabled();
 
-    // Braces: firing the event anyway must not re-enter preview.
-    fireEvent.change(select, { target: { value: 'layer_b' } });
+    // Braces: the disabled picker must not open, so no layer can be chosen.
+    fireEvent.keyDown(select, { key: 'ArrowDown' });
+    expect(screen.queryByRole('option', { name: 'layer_b' })).not.toBeInTheDocument();
 
     // Still committing — no re-preview, and the controls that a bounce
     // through `review` would have re-enabled are all still shut.
@@ -346,7 +356,7 @@ describe('URL import lifecycle', () => {
     expect(mockUploadFromUrl).toHaveBeenCalledTimes(2);
   });
 
-  // ── r25: `cancelled` became reachable when #1709 shipped job cancellation ──
+  // ── `cancelled` became reachable once job cancellation shipped ──
   test.each([
     ['cancelled', 'an admin cancelled the job from the job list'],
     ['fanned_out', 'a terminal status this flow should not reach, handled anyway'],
@@ -361,7 +371,7 @@ describe('URL import lifecycle', () => {
     );
 
     // JobProgress renders an action block only for complete/failed, so before
-    // r25 this state had NO control at all and pinned the tab for the rest of
+    // the fix this state had NO control at all and pinned the tab for the rest of
     // the SPA session.
     expect(
       within(screen.getByTestId('job-progress')).queryByRole('button'),

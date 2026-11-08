@@ -48,7 +48,7 @@ describe('apiFetch', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useAuthStore.setState({ token: null, refreshToken: null, expiresAt: null, user: null });
-    // fix(#2038): the transient refresh back-off is module state; start signed out.
+    // The transient refresh back-off is module state; start signed out.
     abortInflightRefresh();
   });
 
@@ -71,6 +71,14 @@ describe('apiFetch', () => {
     await apiFetch('/test/');
     const headers: Headers = mockFetch.mock.calls[0][1].headers;
     expect(headers.get('Content-Type')).toBe('application/json');
+  });
+
+  it('reads maps with their restricted visibility', async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({}));
+    await apiFetch('/maps/');
+
+    const headers = mockFetch.mock.calls[0][1].headers as Headers;
+    expect(headers.get('X-GeoLens-Map-Visibility')).toBe('restricted');
   });
 
   it('does not set Content-Type for FormData body', async () => {
@@ -109,6 +117,27 @@ describe('apiFetch', () => {
       '/api/items/',
       expect.objectContaining({ method: 'POST', body }),
     );
+  });
+
+  it('carries a 429\'s Retry-After on the error', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ...errorResponse(429, '10 per 1 second'),
+      headers: new Headers({ 'Retry-After': '3' }),
+    } as Response);
+
+    await expect(apiFetch('/datasets/x/aggregate/')).rejects.toMatchObject({ status: 429, retryAfterMs: 3000 });
+  });
+
+  it('reads a Retry-After given as an HTTP date', async () => {
+    const at = new Date(Date.now() + 5000).toUTCString();
+    mockFetch.mockResolvedValueOnce({
+      ...errorResponse(429, '10 per 1 second'),
+      headers: new Headers({ 'Retry-After': at }),
+    } as Response);
+
+    const error = await apiFetch('/datasets/x/aggregate/').catch((err: ApiError) => err);
+    expect((error as ApiError).retryAfterMs).toBeGreaterThan(3000);
+    expect((error as ApiError).retryAfterMs).toBeLessThanOrEqual(5000);
   });
 
   it('returns undefined for 204 No Content', async () => {
@@ -207,7 +236,7 @@ describe('apiFetch', () => {
     expect(retryHeaders.get('Authorization')).toBe('Bearer new-token');
   });
 
-  // BUG-016: after a successful refresh, a retry that returns a non-401 error
+  // After a successful refresh, a retry that returns a non-401 error
   // (e.g. 403 Forbidden) must be RETURNED to the caller — NOT treated as an
   // auth failure. Pre-fix this fell through to logout(); post-fix it returns
   // the retry response.
@@ -276,16 +305,16 @@ describe('apiFetch', () => {
     });
   });
 
-  // fix(#1302): with no stored refresh token the session may still be alive —
+  // With no stored refresh token the session may still be alive —
   // the credential is an httpOnly cookie JS cannot see — so a 401 must still
   // attempt a refresh. Only when that refresh also fails is the session dead.
   it('still attempts a cookie refresh on 401 with no stored refresh token', async () => {
     const { refreshAccessToken } = await import('@/api/auth');
-    // fix(#2038): 401 is what makes the session dead rather than merely stalled.
+    // 401 is what makes the session dead rather than merely stalled.
     vi.mocked(refreshAccessToken).mockRejectedValueOnce(new ApiError('unauthorized', 401));
 
     useAuthStore.setState({ token: 'cookie-session-token', refreshToken: null });
-    // fix(#1849): a failed refresh no longer retries with the dead token, so
+    // A failed refresh does not retry with the dead token, so
     // only the initial 401 fetch happens — one queued response, not two.
     mockFetch.mockResolvedValueOnce(errorResponse(401));
 
@@ -316,7 +345,7 @@ describe('apiFetch', () => {
 
     await expect(apiFetch('/protected/')).rejects.toThrow(ApiError);
     expect(useAuthStore.getState().token).toBeNull();
-    // fix(#1849): a failed refresh must not retry the original request with
+    // A failed refresh must not retry the original request with
     // the now-dead token — only the initial 401 fetch happens.
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
@@ -370,14 +399,14 @@ describe('apiFetch', () => {
 
         expect(result).toBeInstanceOf(ApiError);
         expect(mockFetch).toHaveBeenCalledTimes(1);
-        // fix(#2038): rate-limited is transient, so the session survives it.
+        // Rate-limited is transient, so the session survives it.
         expect(useAuthStore.getState().token).toBe('expired-token-1849c');
       } finally {
         vi.useRealTimers();
       }
     });
 
-    // fix(#1862 review P2): a regression of the fix above. Before it, the
+    // A regression of the fix above. Before it, the
     // stale-token truthiness masked this case by accident — `!!token` was
     // true regardless of whose refresh put it there. Reporting failure here
     // for an outcome the store shows as success would make the caller treat
@@ -407,7 +436,7 @@ describe('apiFetch', () => {
       expect(useAuthStore.getState().token).toBe('peer-rotated-token');
     });
 
-    // fix(#2038): without the back-off, an auth outage let every 401'd surface
+    // Without the back-off, an auth outage would let every 401'd surface
     // in every tab re-ask forever against a rate-limited endpoint.
     it('stops asking until the back-off expires after a transient failure', async () => {
       vi.useFakeTimers();
@@ -442,7 +471,7 @@ describe('apiFetch', () => {
     });
   });
 
-  // RES-N1: `TypeError: Failed to fetch` is what browsers throw when the
+  // `TypeError: Failed to fetch` is what browsers throw when the
   // network is unreachable (offline, DNS, CORS preflight block). Without
   // the safeFetch wrapper, this propagated as an unhandled rejection through
   // every TanStack Query. We now convert it to a friendly ApiError(status=0).
@@ -492,7 +521,7 @@ describe('apiFetch', () => {
     });
   });
 
-  // SP-09: 3 concurrent 401 responses should collapse to a single refresh POST.
+  // 3 concurrent 401 responses should collapse to a single refresh POST.
   // Smoke check on 2026-05-15 saw 3 concurrent /auth/refresh/ POSTs because the
   // proactive timer in use-auth.ts bypassed the client.ts mutex. Both call sites
   // must share the same in-flight singleton.
@@ -547,11 +576,11 @@ describe('apiFetch', () => {
       const { refreshAccessToken } = await import('@/api/auth');
       const mockRefresh = vi.mocked(refreshAccessToken);
 
-      // fix(#2038): a REJECTED credential, so no transient back-off is armed
+      // A REJECTED credential, so no transient back-off is armed
       // and the second wave below is free to ask again immediately.
       mockRefresh.mockRejectedValueOnce(new ApiError('unauthorized', 401));
       useAuthStore.setState({ token: 'expired', refreshToken: 'r' });
-      // fix(#1849): a failed refresh no longer retries with the dead token —
+      // A failed refresh does not retry with the dead token —
       // one queued response, not two.
       mockFetch.mockResolvedValueOnce(errorResponse(401));
 

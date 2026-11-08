@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { LayerLegend } from '../LayerLegend';
+import { MAP_COLORS } from '@/lib/map-colors';
 import type { DrawnLayer } from '@/components/map/legend-facts';
 import { SAVED_LAYERS, toSharedLayer } from '@/test/fixtures/saved-layers';
 import type { MapLayerResponse, MapTerrainConfig, SharedLayerResponse } from '@/types/api';
@@ -16,6 +17,7 @@ function layer(overrides: Partial<SharedLayerResponse> = {}): SharedLayerRespons
     column_info: null,
     sort_order: 0,
     visible: true,
+    show_in_legend: true,
     opacity: 0.85,
     paint: {
       'circle-radius': [
@@ -135,12 +137,59 @@ describe('LayerLegend notes under an entry', () => {
   const clusters = [SAVED_LAYERS.boundedCluster, SAVED_LAYERS.serverCluster, SAVED_LAYERS.fallbackCluster];
   const entry = (name: string) => within(screen.getByText(name).closest('li')!);
 
+  it('says a layer is a sample while a capped tile is in view, and clears when none is', () => {
+    const note = 'Showing a sample at this zoom. Zoom in to see all features.';
+    const quakes = layer();
+    const legend = (drawn: ReadonlyMap<string, DrawnLayer>) => (
+      <LayerLegend
+        layers={[quakes]}
+        visibleLayers={new Set([quakes.id])}
+        onToggleVisibility={vi.fn()}
+        isOpen
+        onToggle={vi.fn()}
+        drawn={drawn}
+      />
+    );
+    const { rerender } = render(legend(new Map([[quakes.id, { drawsAs: 'circle', sampled: true }]])));
+
+    expect(entry('Earthquakes (M5+)').getByText(note)).toBeInTheDocument();
+
+    rerender(legend(new Map([[quakes.id, { drawsAs: 'circle' }]])));
+
+    expect(screen.queryByText(note)).not.toBeInTheDocument();
+  });
+
   it('names each cluster by its saved strategy when the map has reported nothing', () => {
     renderLegend(clusters);
 
     expect(entry('Bike racks').getByText('Bounded cluster')).toBeInTheDocument();
     expect(entry('Street trees').getByText('Server cluster')).toBeInTheDocument();
     expect(entry('Survey points').getByText('Point fallback')).toBeInTheDocument();
+  });
+
+  it('explains the cluster circle colours with their point counts', () => {
+    renderLegend(clusters);
+
+    const trees = entry('Street trees');
+    expect(trees.getByText('Points per cluster')).toBeInTheDocument();
+    expect(trees.getByText('< 100')).toBeInTheDocument();
+    expect(trees.getByText('\u2265 100')).toBeInTheDocument();
+    expect(entry('Bike racks').queryByText('Points per cluster')).not.toBeInTheDocument();
+    expect(entry('Survey points').queryByText('Points per cluster')).not.toBeInTheDocument();
+  });
+
+  it('draws the cluster swatches with the cluster circle stroke', () => {
+    renderLegend([SAVED_LAYERS.serverCluster]);
+
+    const circle = entry('Street trees').getByText('< 100').closest('li')!.querySelector('circle');
+    expect(circle).toHaveAttribute('fill', '#bbf7d0');
+    expect(circle).toHaveAttribute('stroke', MAP_COLORS.cluster.stroke);
+  });
+
+  it('drops the cluster counts when the map drew single points', () => {
+    renderLegend(clusters, new Map([[SAVED_LAYERS.serverCluster.id, { drawsAs: 'circle' }]]));
+
+    expect(entry('Street trees').queryByText('Points per cluster')).not.toBeInTheDocument();
   });
 
   it('names a bounded cluster the map drew as single points a point fallback', () => {
@@ -203,7 +252,7 @@ describe('LayerLegend terrain consistency (Fix 1)', () => {
       style_config: null,
       tile_url: null,
       is_dem: true,
-      // 999.17 MD-01: must be terrain-capable (raster_dataset) so the synthetic
+      // Must be terrain-capable (raster_dataset) so the synthetic
       // entry's backing-layer check (isTerrainCapableDemLayer) passes.
       dataset_record_type: 'raster_dataset',
       ...overrides,
@@ -250,7 +299,7 @@ describe('LayerLegend terrain consistency (Fix 1)', () => {
     );
 
     expect(screen.getByText('Roads')).toBeInTheDocument();
-    // fix(HT-08): the DEM name shows exactly once, inside the synthetic terrain
+    // The DEM name shows exactly once, inside the synthetic terrain
     // entry — never as a second per-layer row for a render_mode:"terrain" DEM.
     const nameEl = screen.getByText('Elevation (terrain)');
     expect(screen.getByTestId('legend-terrain-synthetic')).toContainElement(nameEl);
@@ -272,7 +321,7 @@ describe('LayerLegend terrain consistency (Fix 1)', () => {
     );
 
     expect(screen.getAllByTestId('legend-terrain-synthetic')).toHaveLength(1);
-    // fix(HT-08): keeps the bound DEM's identity ("Elevation") instead of a
+    // Keeps the bound DEM's identity ("Elevation") instead of a
     // generic "3D terrain" row.
     expect(screen.getByText('Elevation')).toBeInTheDocument();
   });
@@ -292,7 +341,7 @@ describe('LayerLegend terrain consistency (Fix 1)', () => {
     expect(screen.queryByTestId('legend-terrain-synthetic')).not.toBeInTheDocument();
   });
 
-  // 999.17 MD-01: dangling terrain_config (enabled + source, NO backing DEM
+  // A dangling terrain_config (enabled + source, NO backing DEM
   // layer) must NOT render a phantom synthetic entry in the viewer either.
   it('does NOT show the synthetic entry for a dangling terrain_config (no backing DEM layer)', () => {
     render(
@@ -381,13 +430,11 @@ describe('LayerLegend terrain consistency (Fix 1)', () => {
     expect(screen.queryByText('3D terrain')).not.toBeInTheDocument();
   });
 
-  // Regression: the viewer keeps toggled-off layers in the list (visibility
-  // fix(#452): live-hiding the bound DEM now DISABLES terrain (useViewerTerrain
-  // honors visibleLayers), so the synthetic entry must disappear with it — a
-  // "3D terrain" row for a mesh that no longer renders is a phantom. The DEM
-  // keeps its own toggled-off per-layer row so the user can re-show it.
-  // (Inverts the pre-#452 pin: back then the mesh stayed active on live-hide,
-  // so the synthetic row had to stay too.)
+  // The viewer keeps toggled-off layers in the list, and live-hiding the
+  // bound DEM DISABLES terrain (useViewerTerrain honors visibleLayers), so the
+  // synthetic entry must disappear with it — a "3D terrain" row for a mesh
+  // that no longer renders is a phantom. The DEM keeps its own toggled-off
+  // per-layer row so the user can re-show it.
   it('drops the synthetic entry when the source DEM is live-toggled off', () => {
     render(
       <LayerLegend
@@ -412,7 +459,7 @@ describe('LayerLegend terrain consistency (Fix 1)', () => {
     expect(screen.getByRole('button', { name: 'Show swissALTI3D relief' })).toBeInTheDocument();
   });
 
-  // fix(#452): icon parity — the legend renders the SAME glyph chip as the
+  // Icon parity — the legend renders the SAME glyph chip as the
   // builder layer stack (⛰ for a hillshade-mode DEM row, ◬ for the synthetic
   // terrain entry), not divergent lucide icons.
   it('renders stack-parity glyph chips for DEM rows and the synthetic terrain entry', () => {

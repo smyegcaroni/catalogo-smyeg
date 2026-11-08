@@ -31,15 +31,13 @@ from app.core.runtime.staging import (
 # `/tmp` tmpfs and rejects rasters that fit fine on the staging volume.
 redirect_tempfile_to_staging(settings.upload_staging_dir)
 
-# fix(#579): before any GDAL/rasterio use — /vsis3/ reads need the custom
+# Before any GDAL/rasterio use — /vsis3/ reads need the custom
 # S3 endpoint derived into AWS_* env, and GDAL subprocesses inherit os.environ.
 configure_gdal_s3_env(settings)
 
-# Configure structured logging with service label
 setup_logging(
     json_logs=settings.log_json,
     log_level=settings.log_level,
-    production=settings.is_production,
 )
 structlog.contextvars.bind_contextvars(service="worker")
 log = structlog.get_logger()
@@ -104,28 +102,28 @@ async def _recover_stale_jobs_for_current_scope() -> None:
         )
 
 
-# fix(#624): a worker killed mid-job leaves its queue row in `doing` forever.
-# Procrastinate 3.x tracks worker heartbeats, so "this worker is gone" is a
-# fact we can read rather than a timeout to guess at — the window is
-# deliberately generous, since waiting costs a stale metric but being wrong
-# fails live work. Covers the final heartbeat interval (10s default) plus
-# the unregister that follows the graceful wait.
+# A worker killed mid-job leaves its queue row in `doing` forever.
+# Procrastinate tracks worker heartbeats, so "this worker is gone" can be
+# read rather than guessed. The window is deliberately generous, since
+# waiting costs a stale metric but being wrong fails live work. Covers the
+# final heartbeat interval (10s default) plus the unregister that follows
+# the graceful wait.
 _STALLED_SHUTDOWN_MARGIN_SECONDS = 60
 
 
 def stalled_worker_seconds() -> int:
     """Heartbeat silence after which a worker counts as dead.
 
-    Floored at ``JOB_TIMEOUT_SECONDS`` (60 min) — the same threshold the
-    ingest_jobs reaper above already calls stale.
+    Floored at ``JOB_TIMEOUT_SECONDS`` (60 min), the threshold the
+    ingest_jobs stale sweep uses.
 
-    fix(#624): this sweep is global, so a threshold derived from THIS
+    This sweep is global, so a threshold derived from THIS
     process's config would let a general worker fail a split-queue raster
     worker's live job. Past the hour the reaper has already failed the
     user-facing ingest_jobs row, so failing the queue row too is consistent
     — no fleet-wide config coordination needed.
 
-    fix(#624): still maxed against the local graceful window, since
+    Still maxed against the local graceful window, since
     procrastinate cancels the heartbeat side task BEFORE waiting
     ``shutdown_graceful_timeout``, so a longer configured window would
     otherwise get its own long jobs swept out from under it.
@@ -138,7 +136,7 @@ def stalled_worker_seconds() -> int:
     )
 
 
-# fix(#624): a startup-only sweep is always one restart behind — under
+# A startup-only sweep is always one restart behind — under
 # `restart: unless-stopped` a crashed worker is back in seconds while its
 # last heartbeat is still fresh, so the startup pass skips the row it
 # exists to reap. Sweeping on an interval fails a stranded job ~1 cycle
@@ -149,7 +147,7 @@ STALLED_QUEUE_SWEEP_INTERVAL_SECONDS = 60
 async def _ingest_jobs_still_leasing(jobs: list) -> set[str]:
     """Of ``jobs``, the ingest_jobs ids whose row is provably still working.
 
-    fix(#624): the worker heartbeat and the ingest task's own lease are
+    The worker heartbeat and the ingest task's own lease are
     INDEPENDENT signals — ``Worker._shutdown`` cancels the heartbeat before
     waiting out ``shutdown_graceful_timeout``, while
     ``maintain_ingest_job_heartbeat`` keeps renewing the lease. So a silent
@@ -157,7 +155,7 @@ async def _ingest_jobs_still_leasing(jobs: list) -> set[str]:
     timeout. The threshold is the backstop for jobs with no lease to read
     (non-ingest tasks carry no ``job_id``).
 
-    fix(#624): grouped by tenant, since ``ingest_jobs`` is FORCE-RLS
+    Grouped by tenant, since ``ingest_jobs`` is FORCE-RLS
     scoped — an un-tenanted SELECT sees nothing and every hosted lease would
     read as dead, the exact failure this guard exists to prevent.
     """
@@ -225,7 +223,7 @@ async def _leasing_ingest_job_ids(ids: set) -> set[str]:
 async def _purge_stalled_queue_row_tokens(job_ids: list) -> None:
     """Drop the service tokens of the rows this sweep just failed. Never raises.
 
-    fix(#1755 item 12): a crashed worker never reaches
+    A crashed worker never reaches
     ``purge_token_on_failure``, so this transition is the first moment its
     token is provably dead weight. Without it the row waits for
     ``purge_terminal_job_tokens``, a whole API sweeper cadence later.
@@ -247,9 +245,9 @@ async def _purge_stalled_queue_row_tokens(job_ids: list) -> None:
 async def fail_stalled_queue_jobs() -> int:
     """Fail procrastinate rows whose worker died mid-job. Returns the count.
 
-    The ingest_jobs reaper above gives the user a verdict, but never
-    transitions the queue row, so queue depth counted phantom in-flight
-    work, accumulating per worker kill. Fail rather than requeue: ingest
+    The ingest_jobs stale sweep gives the user a verdict but never
+    transitions the queue row, so without this queue depth would count
+    phantom in-flight work per worker kill. Fail rather than requeue: ingest
     tasks are not idempotency-audited.
 
     Caller must hold an open connector. Runs once per process, not once per
@@ -281,12 +279,10 @@ async def fail_stalled_queue_jobs() -> int:
         await manager.finish_job_by_id_async(
             job_id=job.id, status=Status.FAILED, delete_job=False
         )
-        # fix(#1778): a second terminal-failed-row site, so it needs
-        # its own increment — after the await, matching the wrapper's
-        # ordering, since this path calls `finish_job_by_id_async` directly.
-        # fix(#1778): `getattr`, not `job.queue` — an attribute read
-        # outside count_failed_job's guard would abort the rest of the
-        # sweep mid-loop; metrics bookkeeping must never stop a sweep.
+        # This path calls `finish_job_by_id_async` directly, bypassing the
+        # counting wrapper, so it counts here, after the await. `getattr`:
+        # an attribute read outside count_failed_job's guard could abort the
+        # rest of the sweep.
         count_failed_job(getattr(job, "queue", None))
         failed += 1
         failed_ids.append(job.id)
@@ -342,10 +338,10 @@ async def _registered_tenant_ids_for_recovery() -> list[str]:
 async def recover_stale_jobs() -> None:
     """Recover stale jobs once globally or once per hosted tenant.
 
-    The historical single-tenant path remains one direct recovery call. In
-    hosted mode ``ingest_jobs`` is FORCE-RLS protected, so each recovery must
-    run with an active tenant GUC. A failure is isolated to that tenant and is
-    logged before recovery continues for the rest of the fleet.
+    Single-tenant mode makes one direct recovery call. In hosted mode
+    ``ingest_jobs`` is FORCE-RLS protected, so each recovery must run with an
+    active tenant GUC. A failure is isolated to that tenant and is logged
+    before recovery continues for the rest of the fleet.
     """
     from app.core.db.tenant_session import tenant_job_context
     from app.core.tenancy import is_multi_tenant
@@ -373,15 +369,14 @@ _OUTCOME_COUNTERS_ATTR = "_geolens_job_outcome_counters_installed"
 def install_job_outcome_counters(task_app) -> None:
     """Count a job's outcome once its terminal row is written, not before.
 
-    fix(#1778): the completed/failed counters used to be derived from a
-    ``GROUP BY status`` poll over ``procrastinate_jobs``, but this worker
-    runs ``delete_jobs="successful"``, so no ``succeeded`` row (or its
-    cascade-deleted events) ever survives for the poll to see. The only
-    place the transition is observable is inside the process that performs
-    it — ``purge_expired_terminal_jobs`` broke the failed-delta arithmetic
-    the same way (r1).
+    A ``GROUP BY status`` poll over ``procrastinate_jobs`` can't supply the
+    completed/failed counters: this worker runs ``delete_jobs="successful"``,
+    so no ``succeeded`` row (or its cascade-deleted events) ever survives
+    for the poll to see. The only place the transition is observable is
+    inside the process that performs it — the failed-delta arithmetic would
+    break the same way once ``purge_expired_terminal_jobs`` deletes rows.
 
-    fix(#1778): hangs off the JOB MANAGER, not worker middleware —
+    Hangs off the JOB MANAGER, not worker middleware —
     Procrastinate runs middleware before ``_persist_job_status``, so it
     would count a completion whose terminal row was never written. Wrapping
     ``finish_job`` counts strictly after the row lands, and leaves both
@@ -444,7 +439,7 @@ def count_completed_job(queue: str | None) -> None:
 def count_failed_job(queue: str | None) -> None:
     """Record one terminal failure on *queue*.
 
-    fix(#1778): the single place the failed counter moves, so the
+    The single place the failed counter moves, so the
     manager wrapper and the stalled-job sweep cannot drift apart.
     """
     try:
@@ -455,7 +450,7 @@ def count_failed_job(queue: str | None) -> None:
         log.warning("Failed to count a failed job", exc_info=True)
 
 
-# fix(#1778): six hours is well under the shortest sensible
+# Six hours is well under the shortest sensible
 # INGEST_JOBS_RETENTION_DAYS and keeps the delete's cost off the hot path.
 TERMINAL_JOB_PURGE_INTERVAL_SECONDS = 6 * 3600
 
@@ -463,12 +458,10 @@ TERMINAL_JOB_PURGE_INTERVAL_SECONDS = 6 * 3600
 async def purge_expired_terminal_jobs() -> None:
     """Age out failed, cancelled and aborted queue rows and their events.
 
-    fix(#1778): nothing deleted these before. ``delete_old_jobs`` was never
-    called, and only successful jobs cleared themselves
-    (``delete_jobs="successful"`` plus cascade-deleted events); every
-    failure/cancellation/abort left rows forever, and the mirror row aged
-    out on ``INGEST_JOBS_RETENTION_DAYS`` separately, leaving them
-    unattributable.
+    Only successful jobs clear themselves (``delete_jobs="successful"``
+    plus cascade-deleted events); every failure/cancellation/abort would
+    otherwise leave rows forever, and the mirror row ages out on
+    ``INGEST_JOBS_RETENTION_DAYS`` separately, leaving them unattributable.
 
     Keyed to the same ``INGEST_JOBS_RETENTION_DAYS`` so the queue row and
     its mirror age out together. 0 disables it.
@@ -584,6 +577,7 @@ async def main() -> None:
     from app.observability.metrics.jobs import update_job_metrics
     from app.observability.metrics.memory import update_memory_metrics
     from app.observability.metrics.pool import update_pool_metrics
+    from app.platform.jobs.audit_retention import run_audit_log_prunes
     from app.platform.refresh.credentials import renew_credentials_periodically
     from app.platform.extensions import get_scheduled_refresh_lifecycle
     from app.platform.extensions.scheduled_refresh import (
@@ -591,33 +585,29 @@ async def main() -> None:
     )
     from app.processing.ingest.tasks import task_app
 
-    # MIG-02: fail closed if the schema heads are skewed from this image's
+    # Fail closed if the schema heads are skewed from this image's
     # migration scripts. The worker doesn't run migrations itself
     # (depends_on: migrate); mirrors the API lifespan guard.
     from app.core.db.schema_skew import assert_schema_in_sync
 
     await assert_schema_in_sync()
 
-    # 1. Ensure staging directories exist
     ensure_staging_ready(settings.upload_staging_dir)
     ensure_staging_ready(Path(settings.upload_staging_dir) / "exports")
 
-    # ING-04 (P2-04): sweep orphaned export temp dirs from previous crashes,
-    # only entries older than EXPORTS_SWEEP_AGE_SECONDS (1 hour) — in-flight
-    # exports survive a rolling restart instead of being truncated mid-download.
+    # Only entries older than EXPORTS_SWEEP_AGE_SECONDS, so in-flight exports
+    # survive a rolling restart.
     exports_dir = Path(settings.upload_staging_dir) / "exports"
     sweep_orphaned_exports(exports_dir)
 
-    # fix(#1746): reclaim GDAL bearer-header tempfiles a
-    # SIGKILL/OOM left on the container tmpfs (not the staging volume — see
-    # gdal_header_dir()); boot-time is the only hook, no periodic sweep loop here.
+    # Reclaim GDAL bearer-header tempfiles a SIGKILL/OOM left on the
+    # container tmpfs (see gdal_header_dir()); boot is the only hook.
     sweep_stale_gdal_header_files()
 
-    # 2. WORK-01: shared bootstrap (extensions, edition, storage, cache).
-    # bootstrap(app=None) = worker mode, skipping router/billing (need a
-    # FastAPI app). Runs before run_worker_async so all single-slot ports
-    # are resolved before any task uses them — closes the split-brain bug
-    # where the worker ran community ports on licensed deployments.
+    # bootstrap(app=None) is worker mode, skipping router/billing. Runs
+    # before run_worker_async so overlay ports are registered before any task
+    # uses them; assert_enterprise_ports_resolved then fails loud if a port
+    # the edition requires is still its community default.
     from app.platform.extensions.bootstrap import (
         bootstrap,
         assert_enterprise_ports_resolved,
@@ -625,41 +615,37 @@ async def main() -> None:
 
     await bootstrap(app=None)
 
-    # WORK-02: under GEOLENS_EDITION=enterprise every single-slot port must
-    # be non-Default; fails loud rather than silently running community ports.
     assert_enterprise_ports_resolved()
 
-    # 3. fix(#507): recover only after bootstrap applies tenancy RLS —
-    # earlier, an unqualified startup sweep could cross tenants.
+    # Only after bootstrap applies tenancy RLS; earlier, an unqualified
+    # startup sweep could cross tenants.
     await recover_stale_jobs()
 
-    # 4. Start health server as background task
     health_task = asyncio.create_task(run_health_server())
-
-    # 5. Start job metrics collector as background task
     metrics_task = asyncio.create_task(update_job_metrics())
 
-    # fix(#1778): the same two collectors the API lifespan starts, missing
-    # here despite this process hosting GDAL/OGR at a 4 GB mem_limit — an
-    # OOM kill left only dmesg, no gauge (#643). Also covers
-    # GeoLensDbPoolSaturated, which can't fire for the worker's own engine.
+    # The same two collectors the API lifespan starts: this process hosts
+    # GDAL/OGR at a 4 GB mem_limit, where an OOM kill leaves no other trace,
+    # and the pool gauge lets GeoLensDbPoolSaturated fire for its engine.
     memory_metrics_task = asyncio.create_task(update_memory_metrics())
     pool_metrics_task = asyncio.create_task(update_pool_metrics())
 
-    # fix(#1277): the worker hosts credential renewal too, since this
-    # process's liveness gates the CLAIM — an API-only sweeper left a
-    # healthy worker unable to claim a credential the API's downtime
-    # expired. EXPIRE is idempotent, so the two hosts overlapping is cheap.
+    # The worker hosts credential renewal too, since this process's liveness
+    # gates the CLAIM: an API-only sweeper would leave a healthy worker unable
+    # to claim a credential the API's downtime expired. EXPIRE is idempotent,
+    # so the two hosts overlapping is cheap.
     credential_renewal_task = asyncio.create_task(renew_credentials_periodically())
+    from app.core.persistent_config import run_log_level_sync
+
+    log_level_task = asyncio.create_task(run_log_level_sync())
 
     try:
-        # 6. Run Procrastinate worker
         shutdown_timeout = settings.worker_shutdown_timeout
-        # fix(#448): concurrency defaulted to 1, so one long COG conversion
-        # head-of-line-blocked every queued upload. Both knobs are
+        # Concurrency above 1, so one long COG conversion doesn't
+        # head-of-line-block every queued upload. Both knobs are
         # env-configurable; a second worker can pin WORKER_QUEUES=raster.
         queues = [q.strip() for q in settings.worker_queues.split(",") if q.strip()]
-        # fix(#1812): "ingest-auth-v2" is consumer-only this release; an override
+        # "ingest-auth-v2" is consumer-only this release; an override
         # that omits it strands what a v1.18.0/1.18.1 API queued there (RUNBOOK 10).
         if "ingest-auth-v2" not in queues:
             log.warning(
@@ -673,23 +659,24 @@ async def main() -> None:
                 ),
             )
         async with task_app.open_async():
-            # fix(#1778): the only place a job outcome is observable, since
+            # The only place a job outcome is observable, since
             # delete_jobs="successful" removes a row before any poll sees
             # it. Installed after the connector opens, before the worker
             # starts, so no job can finish outside the wrapper.
             install_job_outcome_counters(task_app)
-            # fix(#624): inside the connector context and before the worker
+            # Inside the connector context and before the worker
             # registers, so this process's own heartbeat can never be in the
             # window it sweeps. Clears rows stranded before it existed; the
             # loop below owns rows that go stale while it runs.
             await _sweep_stalled_queue_safely()
-            # fix(#1778): early, before the jobs-by-events join this query
+            # Early, before the jobs-by-events join this query
             # builds has a large table to sort.
             await _purge_terminal_jobs_safely()
             await _expire_unclaimed_scheduled_refreshes_safely()
             await _queue_crs_facts_repair_safely()
             sweep_task = asyncio.create_task(run_stalled_queue_sweeps())
             purge_task = asyncio.create_task(run_terminal_job_purges())
+            audit_prune_task = asyncio.create_task(run_audit_log_prunes())
             scheduled_expiry_task = asyncio.create_task(
                 run_scheduled_refresh_expiry_sweeps()
             )
@@ -705,13 +692,12 @@ async def main() -> None:
                         install_signal_handlers=True,
                         delete_jobs="successful",
                         shutdown_graceful_timeout=shutdown_timeout,
-                        # fix(#624): MUST match the sweep's own window.
-                        # worker_id is ON DELETE SET NULL, and
-                        # select_stalled_jobs_by_heartbeat treats a NULL
-                        # worker_id as stalled OUTRIGHT — at the 30s default, a
-                        # merely-stalled live worker gets pruned and its
-                        # in-flight jobs fail despite our cushion. Equal windows
-                        # mean NULL worker_id can only be a genuinely dead worker.
+                        # MUST match the sweep's own window: worker_id is
+                        # ON DELETE SET NULL, and select_stalled_jobs_by_heartbeat
+                        # treats a NULL worker_id as stalled OUTRIGHT, so at the
+                        # 30s default a merely-stalled live worker gets pruned
+                        # and its in-flight jobs fail. Equal windows mean NULL
+                        # worker_id can only be a genuinely dead worker.
                         stalled_worker_timeout=stalled_worker_seconds(),
                     )
             finally:
@@ -719,19 +705,21 @@ async def main() -> None:
                 # the pool closes would raise on the way out.
                 sweep_task.cancel()
                 purge_task.cancel()
+                audit_prune_task.cancel()
                 scheduled_expiry_task.cancel()
                 await asyncio.gather(
                     sweep_task,
                     purge_task,
+                    audit_prune_task,
                     scheduled_expiry_task,
                     return_exceptions=True,
                 )
     finally:
-        # 7. Clean up background tasks after worker exits
         metrics_task.cancel()
         memory_metrics_task.cancel()
         pool_metrics_task.cancel()
         credential_renewal_task.cancel()
+        log_level_task.cancel()
         health_task.cancel()
         try:
             await asyncio.gather(
@@ -739,6 +727,7 @@ async def main() -> None:
                 memory_metrics_task,
                 pool_metrics_task,
                 credential_renewal_task,
+                log_level_task,
                 health_task,
                 return_exceptions=True,
             )

@@ -180,7 +180,7 @@ class TestParseTextOgrinfo:
         assert result["srid"] is None
 
     def test_non_spatial_layer_reports_no_geometry(self):
-        """fix(#2031 review): `Geometry: None` is a sentinel, not a type."""
+        """`Geometry: None` is a sentinel, not a type."""
         output = "Layer name: attrs\nGeometry: None\nFeature Count: 3\n"
         assert _parse_text_ogrinfo(output)["geometry_type"] is None
 
@@ -208,7 +208,7 @@ class TestDetectDbfTruncationCollisions:
     """Pure-unit tests for the DBF 10-char truncation collision detector.
 
     These tests do not require ogr2ogr or a database and always run
-    regardless of environment (RESEARCH §2.3).
+    regardless of environment.
     """
 
     def test_detects_collision(self):
@@ -277,7 +277,7 @@ class TestDetectDbfTruncationCollisions:
 
 
 class TestSqlQuoteIdent:
-    """Post-impl audit PERF-6 / KISS-N helper."""
+    """SQL identifier quoting helper."""
 
     def test_plain_identifier(self):
         assert _sql_quote_ident("foo") == '"foo"'
@@ -303,7 +303,7 @@ class TestSqlQuoteIdent:
 
 
 class TestExtractCommonLayerMetadata:
-    """Post-impl audit KISS-12 helper — shared ogrinfo JSON parser."""
+    """Shared ogrinfo JSON parser."""
 
     def test_raises_keyerror_when_no_layers(self):
         with pytest.raises(KeyError):
@@ -312,6 +312,65 @@ class TestExtractCommonLayerMetadata:
     def test_raises_keyerror_when_layers_missing(self):
         with pytest.raises(KeyError):
             _extract_common_layer_metadata({}, None)
+
+    def test_geodatabase_attachment_tables_are_not_offered_as_layers(self):
+        data = {
+            "driverShortName": "OpenFileGDB",
+            "layers": [
+                {"name": "sites__ATTACH", "featureCount": 3, "fields": []},
+                {"name": "sites", "featureCount": 5, "fields": []},
+                {"name": "sites__ATTACHREL", "featureCount": 0, "fields": []},
+                {"name": "roads", "featureCount": 2, "fields": []},
+            ],
+        }
+
+        target, meta = _extract_common_layer_metadata(data, None)
+
+        assert target["name"] == "sites"
+        assert [lyr["name"] for lyr in meta["all_layers"]] == ["sites", "roads"]
+
+    def test_geodatabase_with_one_real_layer_previews_that_layer(self):
+        data = {
+            "driverShortName": "OpenFileGDB",
+            "layers": [
+                {"name": "sites__ATTACH", "featureCount": 3, "fields": []},
+                {"name": "sites", "featureCount": 5, "fields": []},
+            ],
+        }
+
+        target, meta = _extract_common_layer_metadata(data, None)
+
+        assert target["name"] == "sites"
+        assert meta["all_layers"] is None
+        assert meta["attachments_omitted"] is True
+
+    def test_geodatabase_holding_only_attachment_tables_still_previews(self):
+        data = {
+            "driverShortName": "OpenFileGDB",
+            "layers": [{"name": "sites__ATTACH", "featureCount": 3, "fields": []}],
+        }
+
+        target, meta = _extract_common_layer_metadata(data, None)
+
+        assert target["name"] == "sites__ATTACH"
+        assert meta["attachments_omitted"] is False
+
+    def test_attachment_suffix_layers_outside_a_geodatabase_stay_offered(self):
+        data = {
+            "driverShortName": "GPKG",
+            "layers": [
+                {"name": "survey__ATTACH", "featureCount": 3, "fields": []},
+                {"name": "roads", "featureCount": 2, "fields": []},
+            ],
+        }
+
+        _, meta = _extract_common_layer_metadata(data, None)
+
+        assert [lyr["name"] for lyr in meta["all_layers"]] == [
+            "survey__ATTACH",
+            "roads",
+        ]
+        assert meta["attachments_omitted"] is False
 
     def test_single_layer_with_geometry(self):
         data = {
@@ -411,8 +470,8 @@ class TestExtractCommonLayerMetadata:
         target, meta = _extract_common_layer_metadata(data, "second")
         assert target["name"] == "second"
         assert meta["geometry_type"] == "Polygon"
-        # Phase 1058 (GPKG-01): all_layers stays populated even when a specific
-        # layer was requested, so the fan-out endpoint (Plan 1058-04) can
+        # all_layers stays populated even when a specific
+        # layer was requested, so the fan-out endpoint can
         # validate layer names without re-running ogrinfo.
         assert meta["all_layers"] is not None
         assert {lyr["name"] for lyr in meta["all_layers"]} == {"first", "second"}
@@ -428,7 +487,7 @@ class TestExtractCommonLayerMetadata:
         assert target["name"] == "first"
 
     def test_columns_populated_from_target_layer_fields(self):
-        """PERF-1: columns come through the shared helper so shapefile ingest
+        """Columns come through the shared helper so shapefile ingest
         does not need a second run_ogrinfo_preview subprocess.
         """
         data = {
@@ -504,9 +563,9 @@ class _FakeJob:
 
 
 class TestAppendJobWarning:
-    """Post-impl audit KISS-1 helper — consolidated warning accumulator.
+    """Consolidated warning accumulator.
 
-    TYPE-1: warnings are now TypedDicts built via the producer helpers in
+    Warnings are now TypedDicts built via the producer helpers in
     ``app.ingest.warnings``. These tests exercise the accumulator logic;
     producer-shape tests live in ``TestIngestWarningProducers`` below.
     """
@@ -595,7 +654,7 @@ class TestAppendJobWarning:
 
 
 class TestIngestWarningProducers:
-    """TYPE-1: ensure the producer helpers emit shapes the Pydantic models accept."""
+    """Ensure the producer helpers emit shapes the Pydantic models accept."""
 
     def test_reserved_rename_producer_round_trips_through_pydantic(self):
         from app.processing.ingest.warnings import make_reserved_rename_warning
@@ -643,7 +702,7 @@ class TestIngestWarningProducers:
 
 
 class TestRunServiceImportWithWfsFallback:
-    """Post-impl audit KISS-8 helper — WFS namespace retry + auth detection."""
+    """WFS namespace retry + auth detection."""
 
     def _run(self, coro):
         return asyncio.get_event_loop().run_until_complete(coro)
@@ -765,7 +824,7 @@ class TestRunServiceImportWithWfsFallback:
 
 
 class TestResolveEffectiveSrid:
-    """Post-impl audit K1 extraction — ingest_file SRID resolution helper."""
+    """ingest_file SRID resolution helper."""
 
     def test_override_wins_over_detected(self):
         """User-supplied srid_override takes precedence over ogrinfo-detected SRID."""
@@ -791,7 +850,7 @@ class TestResolveEffectiveSrid:
 
 
 class TestBindTaskLogContext:
-    """Post-impl audit N1 — worker task log correlation via structlog contextvars."""
+    """Worker task log correlation via structlog contextvars."""
 
     def test_binds_job_id_and_task_name(self):
         import structlog
@@ -843,7 +902,7 @@ class TestBindTaskLogContext:
 
 
 class TestParseTemporalFields:
-    """Post-impl audit N5 — raster ingest temporal field parsing + error surface."""
+    """Raster ingest temporal field parsing + error surface."""
 
     def test_both_fields_valid(self):
         """Happy path: both fields parse cleanly, no errors."""
@@ -936,7 +995,7 @@ class TestParseTemporalFields:
 
 
 class TestStripOgrDriverList:
-    """SEED-04: driver-list stripping helper — removes GDAL driver enumeration
+    """Driver-list stripping helper that removes GDAL driver enumeration
     from ogr2ogr stderr so IngestionError messages show only actionable lines.
     """
 
@@ -1018,7 +1077,7 @@ class TestIsUnopenableSourceStderr:
     def test_matches_sqlite_malformed_page_failure(self):
         """A GPKG with a fully intact SQLite header but a corrupted interior
         b-tree page — a DIFFERENT SQLite diagnostic from the corrupt-header
-        case above (codex review, #1640): "database disk image is
+        case above (#1640): "database disk image is
         malformed", not "file is not a database". Empirically confirmed
         against a real ogr2ogr-generated GPKG with one byte-flipped leaf
         page (see test_ingest_open_failure_message.py's
@@ -1055,7 +1114,7 @@ class TestIsUnopenableSourceStderr:
 
 
 class TestOgrinfoOneLineOpenFailure:
-    """fix(#2036): ogrinfo reports an unopenable source in one line of its
+    """ogrinfo reports an unopenable source in one line of its
     own rather than ogr2ogr's driver enumeration, so the reason for it is
     the friendly sentence and not ``ogrinfo failed (exit 1)``.
     """
@@ -1137,7 +1196,7 @@ class TestFriendlyOpenFailureMessage:
 
 
 def _sanitize(value: "str | None") -> "str | None":
-    """`_sanitize_authorization_token` for a WFS job (fix(#1746 B2b r3)).
+    """`_sanitize_authorization_token` for a WFS job.
 
     The format only selects the builder's allowlist branch, and both
     header-auth formats compose an identical bearer line, so every case below
@@ -1147,13 +1206,13 @@ def _sanitize(value: "str | None") -> "str | None":
 
 
 class TestSecFu04SanitizeAuthorizationToken:
-    """SEC-FU-04: the credential header LINE filter, before the header file.
+    """The credential header LINE filter, before the header file.
 
     A line with CR/LF or arbitrary unicode could smuggle extra HTTP headers
     into libcurl through the GDAL_HTTP_HEADER_FILE pipeline, so the shape and
     the charsets are a security boundary rather than a formatting preference.
 
-    fix(#1746 B2b) plan D9: the value crossing from the door to the worker is
+    The value crossing from the door to the worker is
     the finished header line, so this judges a line — printable ASCII, no CR or
     LF, one ``": "`` separator, an RFC 7230 field name — and keeps the
     base64url charset and the length floor on the bearer branch of it.
@@ -1182,21 +1241,21 @@ class TestSecFu04SanitizeAuthorizationToken:
         assert _sanitize(line) == line
 
     def test_sec_fu_04_crlf_injection_raises_value_error(self):
-        """A line carrying CR/LF raises ValueError naming SEC-FU-04."""
+        """A line carrying CR/LF raises ValueError."""
         line = "Authorization: Bearer valid.jwt.sig\r\nX-Smuggled-Header: evil"
         with pytest.raises(ValueError) as exc_info:
             _sanitize(line)
         msg = str(exc_info.value)
-        assert "SEC-FU-04" in msg
+        assert "did not arrive as one header line" in msg
 
     def test_sec_fu_04_a_second_separator_raises_value_error(self):
         """Two ``: `` separators are two headers, whatever the writer intended."""
         with pytest.raises(ValueError) as exc_info:
             _sanitize("X-Api-Key: a: b")
-        assert "SEC-FU-04" in str(exc_info.value)
+        assert "did not arrive as one header line" in str(exc_info.value)
 
     def test_sec_fu_04_a_legacy_bare_token_becomes_its_line(self):
-        """fix(#1746 B2b review r3): the pre-#1770 wire value keeps working.
+        """The pre-#1770 wire value keeps working.
 
         A worker that starts while authenticated WFS or OGC API jobs are
         already queued reads a bare bearer token out of the queue row, or out
@@ -1219,7 +1278,7 @@ class TestSecFu04SanitizeAuthorizationToken:
         for bad in ("short", "has spaces here", "plus+slash/", "sig\r\nX-Evil: 1"):
             with pytest.raises(ValueError) as exc_info:
                 _sanitize(bad)
-            assert "SEC-FU-04" in str(exc_info.value)
+            assert "The service credential" in str(exc_info.value)
             # Policy-only: from here a bad line and a bad legacy token are
             # indistinguishable, and neither names the value.
             assert bad not in str(exc_info.value)
@@ -1227,13 +1286,13 @@ class TestSecFu04SanitizeAuthorizationToken:
     def test_sec_fu_04_an_invalid_field_name_raises_value_error(self):
         with pytest.raises(ValueError) as exc_info:
             _sanitize("Bad Name: value")
-        assert "SEC-FU-04" in str(exc_info.value)
+        assert "named a header this build will not write" in str(exc_info.value)
 
     def test_sec_fu_04_whitespace_in_the_bearer_token_raises_value_error(self):
         """A space inside the token is refused by the bearer charset."""
         with pytest.raises(ValueError) as exc_info:
             _sanitize("Authorization: Bearer valid jwt sig")
-        assert "SEC-FU-04" in str(exc_info.value)
+        assert "non-base64url" in str(exc_info.value)
 
     def test_sec_fu_04_unicode_raises_value_error(self):
         """A non-ASCII character anywhere in the value is refused.
@@ -1244,20 +1303,20 @@ class TestSecFu04SanitizeAuthorizationToken:
         """
         with pytest.raises(ValueError) as exc_info:
             _sanitize("X-Api-Key: signaturé")  # U+00E9
-        assert "SEC-FU-04" in str(exc_info.value)
+        assert "cannot be written into an HTTP header" in str(exc_info.value)
 
     def test_sec_fu_04_empty_string_raises_value_error(self):
         """Empty string raises ValueError (operator misconfiguration guard)."""
         with pytest.raises(ValueError) as exc_info:
             _sanitize("")
-        assert "SEC-FU-04" in str(exc_info.value)
+        assert "did not arrive as one header line" in str(exc_info.value)
 
     def test_sec_fu_04_none_returns_none(self):
         """None passes through unchanged (the no-token path from the calling code)."""
         assert _sanitize(None) is None
 
     def test_sec_fu_04_only_the_bearer_branch_names_a_character(self):
-        """fix(#1746): the message is policy-only for every other method.
+        """The message is policy-only for every other method.
 
         This exception becomes `IngestJob.error_message`, a log record, a
         notification reason and the exception the queue records. Naming a
@@ -1276,7 +1335,7 @@ class TestSecFu04SanitizeAuthorizationToken:
         assert "!" in str(exc_info.value)
 
     def test_sec_fu_04_a_d9_line_registers_the_value_for_exact_scrub(self) -> None:
-        """fix(#1770 round 49 P3, `core/service_tokens.py`/`ogr.py`).
+        """An Authorization line in the D9 wire format registers its value.
 
         `register_credential_secret` (`core/service_tokens.py`) is only
         called from `build_credential_header` -- the whole reason the
@@ -1285,16 +1344,16 @@ class TestSecFu04SanitizeAuthorizationToken:
         separator, what a modern job actually carries), this function
         validates the line and returns it unchanged without ever calling
         that builder: `_legacy_bearer_line` above is the only branch that
-        does, for the pre-#1770 bare-token shape. So the registry stayed
-        empty for the whole worker service-import path on the format every
-        current job actually uses, and only the two explicit
+        does, for the legacy bare-token shape. Without the registration the
+        registry would stay empty for the whole worker service-import path on
+        the format every current job actually uses, and only the two explicit
         `scrub_secret_from_exception` calls covered exceptions -- an
         ordinary log line calling `_scrub_text` directly was not covered at
         all. Counterfactual: remove the `register_credential_secret(...)`
         call from `_sanitize_authorization_token` and the secret below
         survives `_scrub_text` untouched.
 
-        fix(#1844): that call registers the LINE now, not the value -- see
+        That call registers the LINE, not the value -- see
         `test_sec_fu_04_registration_expands_to_every_wire_shape` below for
         the shapes only the line expands to. A named API key's own value is
         the tail of its own line, so this test reads the same either way.
@@ -1328,15 +1387,15 @@ class TestSecFu04SanitizeAuthorizationToken:
         assert "never-sanitized" in rendered
 
     def test_sec_fu_04_registration_expands_to_every_wire_shape(self) -> None:
-        """fix(#1844): register the LINE, because only a line expands.
+        """Register the LINE, because only a line expands.
 
         `_secret_variants` (`core/url_redaction.py`) derives the bare token,
         the basic blob and the decoded `user:pass` cleartext from a secret
-        that CONTAINS `": "`, and from nothing else. Round 49 registered the
-        VALUE (`Bearer <tok>` / `Basic <blob>`) to keep the header NAME out of
-        the registry, which meant the worker -- the one process that spends
-        the credential against a hostile origin -- registered a shape the
-        expansion could not open. So an origin echoing the bare token back in
+        that CONTAINS `": "`, and from nothing else. Registering the VALUE
+        (`Bearer <tok>` / `Basic <blob>`) to keep the header NAME out of the
+        registry would mean the worker -- the one process that spends the
+        credential against a hostile origin -- registers a shape the
+        expansion cannot open. So an origin echoing the bare token back in
         a URL path, or naming the basic username in its own error text
         ("authentication failed for user ..."), passed the exact-value scrub
         untouched, and only the two explicit `scrub_secret_from_exception`
@@ -1412,12 +1471,12 @@ class TestSecFu04SanitizeAuthorizationToken:
         assert "CCCCCCCCCCCCCCCC" in rendered
 
     def test_sec_fu_04_a_refused_short_bearer_registers_nothing(self) -> None:
-        """fix(#1844 codex r1): a line this function REFUSES is not a secret.
+        """A line this function REFUSES is not a secret.
 
-        Registration used to run above the bearer grammar checks, so a refused
-        line still seeded the registry. `Authorization: Bearer e` seeded the
+        Registering above the bearer grammar checks would let a refused
+        line seed the registry. `Authorization: Bearer e` would seed the
         one-character variant `e`, and every later `_scrub_text` in the same
-        job then replaced every "e" in every log line with the redaction
+        job then replace every "e" in every log line with the redaction
         marker -- destroying the diagnostic exactly when something upstream
         had let a malformed credential through.
         """
@@ -1487,15 +1546,15 @@ class TestSecFu04SanitizeAuthorizationToken:
     def test_sec_fu_04_a_valid_short_basic_pair_still_expands_to_both_halves(
         self,
     ) -> None:
-        """fix(#1844 codex r2): no length floor on a derived variant.
+        """No length floor on a derived variant.
 
-        Round 1 added one and it was wrong. `credential_input_rejection_reason`
+        A floor would be wrong. `credential_input_rejection_reason`
         (`core/service_tokens.py`) accepts any nonempty printable username or
         password with no minimum, so a one-character half is a VALID credential
         a user can really configure, not a malformed one -- and a floor decides
-        which valid credentials stop being scrubbed. A Basic password of
-        `admin` had exactly this regression: `authentication failed for user
-        admin` stopped being redacted out of worker logs and the persisted
+        which valid credentials stop being scrubbed. With a floor, a Basic
+        password of `admin` would stop `authentication failed for user
+        admin` being redacted out of worker logs and the persisted
         exception text.
 
         Over-scrubbing a short secret is the deliberate trade-off documented on

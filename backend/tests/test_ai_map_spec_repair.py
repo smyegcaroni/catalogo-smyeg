@@ -1,4 +1,4 @@
-"""fix(#642): schema-invalid LLM map specs get one bounded repair round.
+"""Schema-invalid LLM map specs get one bounded repair round.
 
 Parse failures already had _retry_parse_map_spec; these tests cover the
 sibling path for valid-JSON-wrong-shape output (the failure mode observed
@@ -6,12 +6,13 @@ live on the demo: 'Field required' for name/layers).
 """
 
 import uuid
-from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
 
 from app.processing.ai import service as ai_service
+from app.processing.ai.llm_loop import ToolLoopResult
 from app.processing.ai.schemas import LLMMapSpec
 
 pytestmark = pytest.mark.anyio
@@ -37,14 +38,14 @@ class _FakeProvider:
 
     async def complete(self, **kwargs):
         self.prompts.append(kwargs["user_message"])
-        return SimpleNamespace(text=self.text, input_tokens=7, output_tokens=11)
+        return ToolLoopResult(text=self.text, input_tokens=7, output_tokens=11)
 
 
 @pytest.fixture
 def usage_records(monkeypatch):
     records: list[dict] = []
 
-    async def _record(_db, **kwargs):
+    async def _record(**kwargs):
         records.append(kwargs)
 
     monkeypatch.setattr(ai_service, "record_token_usage", _record)
@@ -59,7 +60,7 @@ async def _run_repair(fake, monkeypatch):
         "anthropic",
         "m",
         {},
-        session=None,
+        session=AsyncMock(),
         user_id=USER_ID,
     )
 
@@ -113,7 +114,7 @@ async def test_parse_retry_records_token_usage(monkeypatch, usage_records):
     monkeypatch.setattr(ai_service, "get_ai_provider", lambda name: fake)
 
     spec_dict = await ai_service._retry_parse_map_spec(
-        "garbled", "anthropic", "m", {}, session=None, user_id=USER_ID
+        "garbled", "anthropic", "m", {}, session=AsyncMock(), user_id=USER_ID
     )
 
     assert spec_dict["name"] == "Fixed"

@@ -29,7 +29,7 @@ import type { SettingItem } from '@/api/settings';
 import type { ResetHandler } from '@/components/admin/settings/useSettingsForm';
 import { useDocumentTitle } from '@/hooks/use-document-title';
 
-// Exported for the App route-table guard (fix(#871)): a static
+// Exported for the App route-table guard: a static
 // `admin/settings/<key>` route outranks `admin/settings/:tab`, so any static
 // path matching one of these keys silently steals the tab from this page.
 export const ALL_TAB_KEYS = ['general', 'auth', 'ai', 'network', 'storage', 'map', 'permissions', 'appearance'] as const;
@@ -174,10 +174,9 @@ export function AdminSettingsPage() {
         />
       </div>
 
-      {/* Unsaved changes navigation guard.
-          fix(#438): UX-11 — was a dismissible Dialog, so clicking the backdrop
-          silently discarded the guard. DatasetPage uses a modal AlertDialog
-          that forces an explicit Stay/Leave; match it. */}
+      {/* Unsaved changes navigation guard: a modal AlertDialog forcing an
+          explicit Stay/Leave, like DatasetPage, so a backdrop click can't
+          silently discard it. */}
       <AlertDialog open={blocker.state === 'blocked'} onOpenChange={() => blocker.reset?.()}>
         <AlertDialogContent size="sm">
           <AlertDialogHeader>

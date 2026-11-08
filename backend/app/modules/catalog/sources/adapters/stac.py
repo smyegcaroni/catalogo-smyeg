@@ -34,6 +34,10 @@ from app.platform.service_endpoints import (
     EndpointCheckFailedError,
 )
 
+# StacImportItem.title caps at 500; an untitled item falls back to its id,
+# which may be longer.
+_MAX_TITLE_CHARS = 500
+
 logger = structlog.stdlib.get_logger(__name__)
 
 # Maximum items to return per search request
@@ -65,15 +69,15 @@ def projection_epsg(properties: dict[str, Any]) -> int | None:
 # without one, and refresh falls back to matching on the href.
 MAX_ASSET_KEY_CHARS = 255
 
-# feat(#1692): width of DatasetAsset.media_type (String(100)); same
-# capture-side bound and reason as MAX_ASSET_KEY_CHARS above.
+# Width of DatasetAsset.media_type (String(100)); the same capture-side
+# bound and reason as MAX_ASSET_KEY_CHARS above.
 MAX_ASSET_MEDIA_TYPE_CHARS = 100
 
 
 def storable_media_type(media_type: str | None) -> str | None:
     """The asset's declared media type if it fits the column, else None.
 
-    feat(#1692): applied here and again on refresh, so every writer of
+    Applied here and again on refresh, so every writer of
     ``DatasetAsset.media_type`` carries the column's bound.
     """
     if not isinstance(media_type, str) or len(media_type) > MAX_ASSET_MEDIA_TYPE_CHARS:
@@ -84,10 +88,10 @@ def storable_media_type(media_type: str | None) -> str | None:
 def storable_asset_key(key: str | None) -> str | None:
     """The asset key if it is short enough to carry, else None.
 
-    fix(#1331): ``""`` is a legal STAC asset key and is deliberately NOT
-    refused here — downstream (``stac_resolve.py``) tests a stored key with
-    ``is not None``, never truthiness, so ``""`` still means "recorded" and
-    a resolve can round-trip a moved asset without losing the key.
+    ``""`` is a legal STAC asset key and is deliberately NOT refused here:
+    STAC re-resolution tests a stored key with ``is not None``, never
+    truthiness, so ``""`` still means "recorded" and a resolve can
+    round-trip a moved asset without losing the key.
     """
     if key is None or len(key) > MAX_ASSET_KEY_CHARS:
         return None
@@ -102,10 +106,10 @@ _PREFERRED_ASSET_KEYS: tuple[str, ...] = ("data", "visual", "image", "B04")
 def pick_data_asset(assets: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
     """The item's primary data asset, as ``(key, asset)``, or None.
 
-    feat(#1266): shared by search and by refresh re-picking from the same
-    item fetched again later, so both agree instead of drifting to a
-    different band. The key is returned alongside the asset because it is
-    the durable name that survives an href moving.
+    Shared by search and by refresh re-picking from the same item fetched
+    again later, so both agree instead of drifting to a different band. The
+    key is returned alongside the asset because it is the durable name that
+    survives an href moving.
 
     Non-dict entries are skipped: a malformed catalog with a scalar asset
     value must not raise inside search.
@@ -125,11 +129,11 @@ def pick_data_asset(assets: dict[str, Any]) -> tuple[str, dict[str, Any]] | None
 def storable_href(href: Any, base_url: str) -> str | None:
     """Resolve *href* against *base_url*, or None if it may not be STORED.
 
-    feat(#1266): shared by ``self_link_href`` for the item href and here for
-    the asset href — both end up in ``origin_ref`` and must clear the same
-    bar as the import request model: pydantic ``HttpUrl``, the model's 4096
-    cap, and the ADR-002 invariant-4 credential refusal (a signed URL must
-    never reach the source binding).
+    Shared by ``self_link_href`` for the item href and here for the asset
+    href. Both end up in ``origin_ref``, so they clear the same bar as the
+    import request model: pydantic ``HttpUrl``, the model's 4096 cap, and
+    the ADR-002 invariant-4 credential refusal (a signed URL must never
+    reach the source binding).
 
     A relative href is legal STAC, so it is resolved BEFORE any check —
     otherwise ``//user:pw@host/x`` could smuggle userinfo past a raw scan.
@@ -143,9 +147,9 @@ def storable_href(href: Any, base_url: str) -> str | None:
         return None
     if len(resolved) > 4096 or has_url_credentials(resolved):
         return None
-    # fix(#1764): and the origin does not get to hand the caller's own
-    # credential back for storage. `has_url_credentials` allowlists parameter
-    # NAMES; this asks whether the value is one this request composed.
+    # Nor does the origin get to hand the caller's own credential back for
+    # storage: `has_url_credentials` allowlists parameter NAMES, while this
+    # asks whether the value is one this request composed.
     if carries_registered_credential(resolved):
         return None
     return resolved
@@ -156,25 +160,25 @@ def self_link_href(
 ) -> str | None:
     """The item's own canonical href, from its ``rel="self"`` link.
 
-    feat(#1222): search is the ONE place GeoLens holds a STAC item document,
-    so it is the only place the item's own href can be captured — without
-    it, ``origin_ref``'s ``item_href`` stays unwritten and the health probe
-    can only ever check the asset, never a withdrawal from the catalog.
+    Search is the ONE place GeoLens holds a STAC item document, so it is
+    the only place the item's own href can be captured. Without it,
+    ``origin_ref``'s ``item_href`` stays unwritten and the health probe can
+    only ever check the asset, never a withdrawal from the catalog.
 
     A relative href is legal STAC, so it is resolved against the response's
-    actual URL before any check (fix(#1271) review). ``storable_href`` then
-    drops a non-http(s) or credentialed href rather than surfacing it: a
-    credentialed one would otherwise turn an optional convenience into a
-    422 for the caller's whole import batch.
+    actual URL before any check. ``storable_href`` then drops a non-http(s)
+    or credentialed href rather than surfacing it: a credentialed one would
+    otherwise turn an optional convenience into a 422 for the caller's
+    whole import batch.
 
-    fix(#1764): ``catalog_url`` fences the result to the origin the caller
-    submitted. This pointer becomes ``origin_ref["item_href"]``, which a
-    later credentialed refresh anchors on, so a catalog that advertises an
+    ``catalog_url`` fences the result to the origin the caller submitted.
+    This pointer becomes ``origin_ref["item_href"]``, which a later
+    credentialed refresh anchors on, so a catalog that advertises an
     off-origin self link here could name the host its own key is sent to.
     """
     links = feature.get("links")
-    # fix(#1271): a malformed scalar `links` must cost only this
-    # optional field, not 502 the whole search.
+    # A malformed scalar `links` must cost only this optional field, not 502
+    # the whole search.
     for link in links if isinstance(links, list) else []:
         if not isinstance(link, dict) or link.get("rel") != "self":
             continue
@@ -297,13 +301,13 @@ def _following_page(
 def _make_client(credential_header: str | None = None) -> httpx.AsyncClient:
     """Shared httpx client for STAC API requests.
 
-    Phase 1061 SEC-S04: uses make_safe_client() so the per-hop SSRF
-    revalidation hook covers every redirect a STAC probe follows.
+    Uses make_safe_client() so the per-hop SSRF revalidation hook covers
+    every redirect a STAC probe follows.
 
-    feat(#1764): ``credential_header`` names the header this request carries,
-    so a 302 to another origin is refused rather than followed with the
-    caller's key. Passed even for ``Authorization``, which httpx would
-    silently strip — a refusal says what happened.
+    ``credential_header`` names the header this request carries, so a 302
+    to another origin is refused rather than followed with the caller's
+    key. Passed even for ``Authorization``, which httpx would silently
+    strip, because a refusal says what happened.
     """
     return make_safe_client(timeout=STAC_TIMEOUT, credential_header=credential_header)
 
@@ -313,11 +317,11 @@ async def connect_stac_api(
 ) -> dict | None:
     """Validate a STAC API URL and return landing page info, or None.
 
-    fix(#1770): the whole function runs under ``DEFAULT_CHECK_TIMEOUT``,
-    same reasoning as ``probe_ogcapi``.
+    The whole function runs under ``DEFAULT_CHECK_TIMEOUT``, for the same
+    reason as ``probe_ogcapi``.
 
-    feat(#1764): ``credential`` becomes a header here, keeping
-    ``build_credential_header`` the tree's only producer of one.
+    ``credential`` becomes a header here, keeping ``build_credential_header``
+    the tree's only producer of one.
     """
     try:
         async with asyncio.timeout(DEFAULT_CHECK_TIMEOUT):
@@ -340,7 +344,7 @@ async def _connect_stac_api_within_deadline(
             headers[pair[0]] = pair[1]
     async with _make_client(None if pair is None else pair[0]) as client:
         try:
-            # fix(#1770): bounded read, not a plain `client.get` — see
+            # Bounded read, not a plain `client.get` — see
             # `bounded_probe_read`'s docstring.
             body, _ = await bounded_probe_read(
                 client, url, headers=headers, accept=OGC_JSON_ACCEPT
@@ -363,14 +367,14 @@ async def _connect_stac_api_within_deadline(
             logger.debug("STAC connect: non-JSON response", url=url)
             return None
 
-        # fix(#1770): a `200 []`/`200 null`/`200 "x"` response is valid JSON
-        # but not a dict, and `.get(...)` on it raises `AttributeError`
-        # instead of degrading to "not a STAC API" below.
+        # A `200 []`/`200 null`/`200 "x"` response is valid JSON but not a
+        # dict, and `.get(...)` on it would raise `AttributeError` instead of
+        # degrading to "not a STAC API" below.
         if not isinstance(data, dict):
             logger.debug("STAC connect: non-dict response", url=url)
             return None
 
-        # Must have stac_version or type == "Catalog"
+        # Must have stac_version or a type of "Catalog" or "API".
         if not data.get("stac_version") and data.get("type") not in ("Catalog", "API"):
             logger.debug("STAC connect: not a STAC API", url=url)
             return None
@@ -403,11 +407,10 @@ async def list_stac_collections(
 ) -> list[StacCollectionDict]:
     """Fetch collections from a STAC API.
 
-    Returns a list of collection dicts with id, title, description,
-    spatial_extent, temporal_extent, and item_count (if available).
+    Returns at most ``MAX_COLLECTIONS`` entries.
 
-    feat(#1764): carries the same credential the landing-page read carried,
-    so a protected catalog answers both or neither.
+    Carries the same credential the landing-page read carried, so a
+    protected catalog answers both or neither.
     """
     collections_url = url.rstrip("/") + "/collections"
 
@@ -487,9 +490,8 @@ async def search_stac_items(
     (None on the last page). ``next_page`` is a link this function returned
     earlier; the caller must have validated its href against the catalog.
 
-    feat(#1764): carries the same credential the connect and collections
-    reads carried, so search and import agree about what the catalog
-    publishes.
+    Carries the same credential the connect and collections reads carried,
+    so search and import agree about what the catalog publishes.
     """
     search_url = url.rstrip("/") + "/search"
     limit = min(limit, MAX_SEARCH_ITEMS)
@@ -549,65 +551,65 @@ async def search_stac_items(
 
     items = []
     for f in features:
-        # fix(#1764): a catalog can reflect the credential it was just sent
-        # into anything it publishes, and only `item_href` passes
-        # `storable_href` here. The rest of this item is echoed back to
-        # `/import` by the client, whose own request registers no credential
-        # and so cannot recognise one, and is then stored. Judged over the
-        # whole feature rather than one field, since `id`, `collection` and
-        # `title` reach storage too.
+        # A catalog can reflect the credential it was just sent into anything
+        # it publishes, and only `item_href` passes `storable_href` here. The
+        # rest of this item is echoed back to `/import` by the client, whose
+        # own request registers no credential and so cannot recognise one,
+        # and is then stored. Judged over the whole feature rather than one
+        # field, since `id`, `collection` and `title` reach storage too.
         if carries_registered_credential(json.dumps(f)):
             logger.warning("STAC search: item reflects the request credential")
             continue
         props = f.get("properties", {})
         assets = f.get("assets", {})
 
-        # Find the primary data asset (COG), through the same choice the
-        # refresh strategy re-makes later (feat #1266).
+        # The primary data asset (COG), through the same choice the refresh
+        # strategy re-makes later.
         picked = pick_data_asset(assets)
         data_asset_key, data_asset = picked if picked else (None, None)
 
-        # Find thumbnail
         thumbnail = assets.get("thumbnail") or next(
             (a for a in assets.values() if "thumbnail" in (a.get("roles") or [])),
             None,
         )
 
-        # Extract datetime — may be null with start/end range
+        # `datetime` may be null when a start/end range is given.
         dt = props.get("datetime")
         dt_start = props.get("start_datetime") or dt
         dt_end = props.get("end_datetime") or dt
 
-        # EW-05: surface file:size so the frontend can show an estimated
-        # download size before the user commits to a multi-GB fetch.
+        # Surface file:size so the frontend can show an estimated download
+        # size before the user commits to a multi-GB fetch.
         data_asset_size_bytes = data_asset.get("file:size") if data_asset else None
         if not isinstance(data_asset_size_bytes, int):
-            data_asset_size_bytes = None  # be defensive — bad-shape values become None
+            data_asset_size_bytes = None
 
         items.append(
             {
                 "id": f.get("id"),
                 "collection": f.get("collection"),
-                # resp.url is the LOGICAL post-redirect URL — the SSRF
-                # transport restores the hostname after each pinned hop
-                # (_SSRFGuardTransport) — so a relative self link resolves
-                # against the caller's host, never the pinned IP.
+                # resp.url is the LOGICAL post-redirect URL (the SSRF
+                # transport restores the hostname after each pinned hop), so a
+                # relative self link resolves against the caller's host, never
+                # the pinned IP.
                 "item_href": self_link_href(f, str(resp.url), url),
                 "bbox": f.get("bbox"),
                 "datetime": dt,
                 "datetime_start": dt_start,
                 "datetime_end": dt_end,
-                "title": props.get("title", f.get("id")),
+                "title": str(props.get("title") or f.get("id") or "")[
+                    :_MAX_TITLE_CHARS
+                ],
                 "epsg": projection_epsg(props),
                 "gsd": props.get("gsd"),
                 "cloud_cover": props.get("eo:cloud_cover"),
                 "data_asset_href": data_asset.get("href") if data_asset else None,
-                # feat(#1692): bounded to fit DatasetAsset.media_type.
+                # Bounded to fit DatasetAsset.media_type.
                 "data_asset_type": storable_media_type(
                     data_asset.get("type") if data_asset else None
                 ),
-                # feat(#1266): durable name that survives the href moving,
-                # so refresh can follow the move instead of re-picking.
+                # Durable name that survives the href moving, so refresh can
+                # follow the move instead of re-picking.
                 "data_asset_key": storable_asset_key(data_asset_key),
                 "data_asset_size_bytes": data_asset_size_bytes,
                 "thumbnail_href": thumbnail.get("href") if thumbnail else None,

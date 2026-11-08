@@ -52,6 +52,7 @@
       "grid_misaligned": "Grid dimensions do not match"
     },
     "searchError": "Failed to load results",
+    "searchRateLimited": "Search is temporarily rate-limited. Try again shortly.",
     "bandCount_one": "{{count}} band",
     "bandCount_other": "{{count}} bands",
     "resolutionValue": "Resolution: {{value}}"
@@ -101,6 +102,7 @@
     "mercatorClip": {
       "title": "Geometry outside the Web Mercator bounds",
       "description": "GeoLens serves Web Mercator tiles, which cover longitude -180° to 180° and latitude -85.06° to 85.06°. Geometry outside that box was clipped away during import. The rows are still in the dataset; only their geometry changed. Check both the coordinate order and the coordinate range of your source.",
+      "polarDescription": "GeoLens serves Web Mercator tiles, which stop at latitude -85.06° and 85.06°. Features near the poles were trimmed to that limit during import. This is expected for global data, and the rest of each row is unchanged.",
       "skippedDescription": "The source coordinate system has a narrow area of validity, so the Web Mercator bounds could not be expressed in it and the boundary check was skipped. No geometry was removed, but geometry outside longitude -180° to 180° or latitude -85.06° to 85.06° may still be present and will not render on the map.",
       "dropped_one": "{{count}} feature lost its geometry entirely",
       "dropped_other": "{{count}} features lost their geometry entirely",
@@ -167,7 +169,7 @@
     "tilesetSubtext": "GeoLens checks each archive and reads its tileset.json before anything is stored."
   },
   "stac": {
-    "label": "STAC API URL; paste the catalog root endpoint",
+    "label": "STAC API URL · paste the catalog root endpoint",
     "connect": "Connect",
     "connecting": "Connecting to STAC catalog...",
     "searching": "Searching items...",
@@ -188,9 +190,11 @@
     "failureGroupCount_one": "{{count}} item",
     "failureGroupCount_other": "{{count}} items",
     "failureUnknown": "Unknown error",
+    "itemErrorImportFailed": "This item could not be imported.",
+    "itemErrorTooLong": "The item id or asset link is too long to store.",
     "importMore": "Import more",
     "backToResults": "Back to results",
-    "catalogConnected": "STAC Catalog; connected",
+    "catalogConnected": "STAC Catalog · connected",
     "clear": "Clear",
     "collectionsAvailable_one": "{{count}} collection available",
     "collectionsAvailable_other": "{{count}} collections available",
@@ -260,9 +264,8 @@
   "serviceUrl": {
     "label": "Service URL",
     "placeholder": "https://example.com/wfs, ArcGIS FeatureServer, or OGC API endpoint",
-    "helpText": "Paste a WFS, ArcGIS Feature Service, or OGC API Features URL",
     "arcgisPortalUrlHint": "This looks like an ArcGIS organization or portal page, not a layer. Open the layer's item page, copy its REST URL (it ends in /FeatureServer/0 or /MapServer/0) and paste that here. Protected layers ask for sign-in after you paste the layer URL.",
-    "detectedLabel": "Service URL; detected",
+    "detectedLabel": "Service URL · detected",
     "clear": "Clear",
     "layersAvailable_one": "{{count}} layer available",
     "layersAvailable_other": "{{count}} layers available",
@@ -316,7 +319,7 @@
     "arcgisTokenExpiredMidImport": "Your ArcGIS sign-in expired while this was open. Go back and sign in again to continue."
   },
   "urlImport": {
-    "label": "File URL; fetched server-side",
+    "label": "File URL · fetched server-side",
     "placeholder": "https://data.source.coop/…/buildings.parquet",
     "fetch": "Fetch →",
     "fetching": "Downloading file...",
@@ -388,7 +391,6 @@
     "pointcloudDesc": "served to external COPC clients; no built-in map preview."
   },
   "register": {
-    "helpText": "Catalog existing PostGIS tables from your database as datasets in GeoLens. Use this when you have geographic data already in the database that wasn't imported through GeoLens. Selected tables will be added to the dataset catalog with automatic metadata detection.",
     "discovering": "Discovering tables...",
     "discoverFailed": "Failed to discover tables:",
     "emptyState": "No unregistered tables found in the database.",
@@ -402,6 +404,7 @@
     },
     "visibilityLabel": "Visibility",
     "visibilityPrivate": "Private",
+    "visibilityInternal": "Internal",
     "visibilityPublic": "Public",
     "registering": "Registering...",
     "registerButton_one": "Register {{count}} Table",
@@ -419,7 +422,6 @@
       "source_srid_undeclared": "Its geom column declares no SRID, so GeoLens cannot tell where its coordinates are. Set the SRID, for example with UpdateGeometrySRID, then register the table.",
       "source_gid_unusable": "GeoLens identifies features by a column named gid: an integer that is NOT NULL and unique, such as a primary key, in a table no other table inherits from. This table does not meet that. Add or fix the gid column, or rename one GeoLens can't use so it can add its own, then register the table."
     },
-    "unknownError": "Unknown error",
     "searchPlaceholder": "Search tables…",
     "selectHint": "Select a table from the list to see its schema and register it.",
     "detailDesc": "Register to expose as a GeoLens dataset; tiled on the fly, no copy.",
@@ -436,19 +438,7 @@
     "tablesSidebarLabel": "Discovered tables"
   },
   "layerPicker": {
-    "title": "Select Layer",
-    "emptyState": "No layers found in this service",
-    "columnName": "Name",
-    "columnGeometry": "Geometry Type",
-    "columnFeatureCount": "Feature Count",
-    "previewLayer": "Preview Layer"
-  },
-  "tablePicker": {
-    "selectAll": "Select all ({{count}} table)",
-    "selectAll_one": "Select all ({{count}} table)",
-    "selectAll_other": "Select all ({{count}} tables)",
-    "nonSpatial": "non-spatial",
-    "estimatedRows": "~{{count}} rows"
+    "title": "Select Layer"
   },
   "preview": {
     "title": "File preview",
@@ -481,11 +471,9 @@
     "nameLabel": "Name *",
     "descriptionLabel": "Description",
     "descriptionPlaceholder": "Optional description",
-    "tagsLabel": "Tags",
-    "tagsPlaceholder": "tag1, tag2, tag3",
-    "tagsHelpText": "Comma-separated",
     "visibilityLabel": "Visibility",
     "visibilityPrivate": "Private",
+    "visibilityInternal": "Internal",
     "visibilityPublic": "Public",
     "crsLabel": "CRS Override",
     "crsPlaceholderDetected": "Leave blank to use detected CRS ({{crs}})",
@@ -634,11 +622,9 @@
     "uploading_other": "Uploading {{count}} files...",
     "activeJobs": "Active and recent jobs",
     "detectingHint": "Uploading & detecting…",
-    "importingFiles": "Importing {{count}} files",
+    "importingFiles_one": "Importing {{count}} file",
+    "importingFiles_other": "Importing {{count}} files",
     "progressDetail": "{{done}} complete · {{active}} in progress · {{queued}} queued",
-    "statusUploading": "Uploading...",
-    "statusPreviewing": "Generating preview...",
-    "statusReady": "Ready",
     "fileCount_one": "{{count}} file ready for import",
     "fileCount_other": "{{count}} files ready for import",
     "importAllDefaults": "Import All with Defaults",

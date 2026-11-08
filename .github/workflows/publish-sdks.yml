@@ -66,20 +66,23 @@ jobs:
     if: ${{ !cancelled() && (needs.gate.result == 'success' || needs.gate.result == 'skipped') && (github.event_name == 'push' || inputs.target == 'python' || inputs.target == 'both') }}
     name: Publish Python SDK to PyPI
     runs-on: ubuntu-26.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         with:
           version: "0.10.2"
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
 
-      # fix(#1778): every publishing run must come from a tag ref, and this is
+      # Every publishing run must come from a tag ref, and this is
       # a hard failure rather than a skipped check, same as publish-mcp.yml's
-      # #1623 guard: a manual dispatch defaults to the branch selected in the
+      # guard: a manual dispatch defaults to the branch selected in the
       # Actions UI, and the repo sits at the last released version between
       # bumps, so a branch run would happily publish that branch's current
       # pyproject version as metadata for an already-released PyPI artifact.
@@ -167,12 +170,15 @@ jobs:
     if: ${{ !cancelled() && (needs.gate.result == 'success' || needs.gate.result == 'skipped') && (github.event_name == 'push' || inputs.target == 'typescript' || inputs.target == 'both') }}
     name: Publish TypeScript SDK to npm
     runs-on: ubuntu-26.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
-          # fix(#819): Node 24 ships npm 11.x — OIDC Trusted Publishing requires npm >= 11.5.1.
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          # Node 24 ships npm 11.x; OIDC Trusted Publishing requires npm >= 11.5.1.
           # Node 22 (npm 10.x) cannot authenticate; there is no NODE_AUTH_TOKEN
           # fallback on the publish step, so the npm version IS the auth path.
           node-version: 24
@@ -180,9 +186,9 @@ jobs:
           cache: npm
           cache-dependency-path: sdks/typescript/package-lock.json
 
-      # fix(#1778): every publishing run must come from a tag ref, and this is
+      # Every publishing run must come from a tag ref, and this is
       # a hard failure rather than a skipped check, same as publish-mcp.yml's
-      # #1623 guard: a manual dispatch defaults to the branch selected in the
+      # guard: a manual dispatch defaults to the branch selected in the
       # Actions UI, and the repo sits at the last released version between
       # bumps, so a branch run would happily publish that branch's current
       # package.json version as metadata for an already-released npm
@@ -243,5 +249,5 @@ jobs:
         # npm >= 11.5.1 (from Node 24 in setup-node above) also generates + attaches
         # provenance automatically, so no explicit --provenance flag is needed. OIDC + provenance
         # both require a public source repository (it is). `--access public` is kept for
-        # the scoped package. NPM_TOKEN secret is now unused (kept as a manual fallback).
+        # the scoped package. The NPM_TOKEN secret is unused (kept as a manual fallback).
         run: npm publish --access public

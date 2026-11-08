@@ -10,6 +10,9 @@ import type {
   BackfillResponse,
   CatalogStatsResponse,
   EmbeddingStatsResponse,
+  GroupListResponse,
+  GroupMemberListResponse,
+  GroupResponse,
   UserListResponse,
   UserResponse,
   AuditLogListResponse,
@@ -54,6 +57,49 @@ export async function listUserNames(): Promise<{ id: string; username: string }[
     names.push(...page);
     if (page.length < limit) return names;
   }
+}
+
+export async function listGroups(params: { skip?: number; limit?: number } = {}): Promise<GroupListResponse> {
+  const query = new URLSearchParams();
+  if (params.skip !== undefined) query.set('skip', String(params.skip));
+  if (params.limit !== undefined) query.set('limit', String(params.limit));
+  const qs = query.toString();
+  return apiFetch<GroupListResponse>(`/admin/groups/${qs ? `?${qs}` : ''}`);
+}
+
+export async function createGroup(name: string): Promise<GroupResponse> {
+  return apiFetch<GroupResponse>('/admin/groups/', { method: 'POST', body: JSON.stringify({ name }) });
+}
+
+export async function renameGroup(groupId: string, name: string): Promise<GroupResponse> {
+  return apiFetch<GroupResponse>(`/admin/groups/${groupId}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+}
+
+export async function deleteGroup(groupId: string): Promise<void> {
+  await apiFetch<void>(`/admin/groups/${groupId}`, { method: 'DELETE' });
+}
+
+export async function listGroupMembers(groupId: string): Promise<{ id: string; username: string }[]> {
+  const limit = 200;
+  const members: { id: string; username: string }[] = [];
+  for (let skip = 0; ; skip += limit) {
+    const page = await apiFetch<GroupMemberListResponse>(
+      `/admin/groups/${groupId}/members/?skip=${skip}&limit=${limit}`,
+    );
+    members.push(...page.members);
+    if (members.length >= page.total || page.members.length < limit) return members;
+  }
+}
+
+export async function addGroupMembers(groupId: string, userIds: string[]): Promise<GroupResponse> {
+  return apiFetch<GroupResponse>(`/admin/groups/${groupId}/members/`, {
+    method: 'POST',
+    body: JSON.stringify({ user_ids: userIds }),
+  });
+}
+
+export async function removeGroupMember(groupId: string, userId: string): Promise<void> {
+  await apiFetch<void>(`/admin/groups/${groupId}/members/${userId}`, { method: 'DELETE' });
 }
 
 export async function listAdminJobs(
@@ -110,7 +156,6 @@ export async function listAuditLogs(
   return apiFetch<AuditLogListResponse>(`/admin/audit-logs/${qs ? `?${qs}` : ''}`);
 }
 
-// User CRUD
 export async function createUser(data: {
   username: string;
   password: string;
@@ -126,44 +171,41 @@ export async function updateUser(userId: string, data: {
   status?: 'active' | 'suspended' | 'deactivated';
   role?: string;
 }): Promise<UserResponse> {
-  return apiFetch<UserResponse>(`/admin/users/${userId}`, { method: 'PATCH', body: JSON.stringify(data) });
+  return apiFetch<UserResponse>(`/admin/users/${encodeURIComponent(userId)}`, { method: 'PATCH', body: JSON.stringify(data) });
 }
 
 export async function deactivateUser(userId: string): Promise<UserResponse> {
-  return apiFetch<UserResponse>(`/admin/users/${userId}/deactivate/`, { method: 'POST' });
+  return apiFetch<UserResponse>(`/admin/users/${encodeURIComponent(userId)}/deactivate/`, { method: 'POST' });
 }
 
 /**
- * feat(#1715): admin-initiated password reset. The submitted value is sent once
- * and never held anywhere else on the client; the backend revokes the target's
- * outstanding sessions and API keys as part of the same request.
+ * Admin-initiated password reset. The submitted value is sent once and never
+ * held elsewhere on the client; the backend revokes the target's outstanding
+ * sessions and API keys in the same request.
  */
 export async function resetUserPassword(userId: string, password: string): Promise<UserResponse> {
-  return apiFetch<UserResponse>(`/admin/users/${userId}/reset-password/`, {
+  return apiFetch<UserResponse>(`/admin/users/${encodeURIComponent(userId)}/reset-password/`, {
     method: 'POST',
     body: JSON.stringify({ password }),
   });
 }
 
 export async function deleteUser(userId: string): Promise<void> {
-  await apiFetch(`/admin/users/${userId}`, { method: 'DELETE' });
+  await apiFetch(`/admin/users/${encodeURIComponent(userId)}`, { method: 'DELETE' });
 }
 
 export async function approveUser(userId: string, role: string): Promise<UserResponse> {
-  return apiFetch<UserResponse>(`/admin/users/${userId}/approve/`, { method: 'POST', body: JSON.stringify({ role }) });
+  return apiFetch<UserResponse>(`/admin/users/${encodeURIComponent(userId)}/approve/`, { method: 'POST', body: JSON.stringify({ role }) });
 }
 
 export async function rejectUser(userId: string): Promise<void> {
-  await apiFetch(`/admin/users/${userId}/reject/`, { method: 'POST' });
+  await apiFetch(`/admin/users/${encodeURIComponent(userId)}/reject/`, { method: 'POST' });
 }
 
 // API Key management
-// fix(#1778): was capped at the backend's default limit=50 with `total`
-// fetched and discarded, so a user holding more than 50 keys had an
-// arbitrary subset silently hidden from the only UI that revokes them.
-// fix(#1805 review round 3 P2): the flat limit=200 cap above was itself the
-// backend's hard max (`le=200`) -- a user with 201+ keys still had no way to
-// reach the rest. skip/limit are now threaded through so the caller can page.
+// skip/limit are threaded through so the caller can page: the backend defaults
+// to limit=50 (max 200), so more keys than one page would otherwise be hidden
+// from the only UI that revokes them.
 export async function listApiKeys(
   userId: string,
   options: { skip?: number; limit?: number } = {},
@@ -171,7 +213,7 @@ export async function listApiKeys(
   const skip = options.skip ?? 0;
   const limit = options.limit ?? 50;
   return apiFetch<{ items: ApiKeyResponse[]; total: number }>(
-    `/admin/api-keys/?user_id=${userId}&skip=${skip}&limit=${limit}`,
+    `/admin/api-keys/?user_id=${encodeURIComponent(userId)}&skip=${skip}&limit=${limit}`,
   );
 }
 
@@ -180,8 +222,7 @@ export async function createApiKey(
   name: string,
   options: { scope?: ApiKeyScope; expiresAt?: string | null } = {},
 ): Promise<ApiKeyCreateResponse> {
-  // fix(#875): same omission as createMyApiKey — expires_at has been accepted
-  // by AdminApiKeyCreateRequest since #821 and was never sent.
+  // AdminApiKeyCreateRequest accepts expires_at, as createMyApiKey does.
   return apiFetch<ApiKeyCreateResponse>('/admin/api-keys/', {
     method: 'POST',
     body: JSON.stringify({
@@ -194,10 +235,9 @@ export async function createApiKey(
 }
 
 export async function revokeApiKey(keyId: string): Promise<void> {
-  await apiFetch(`/admin/api-keys/${keyId}`, { method: 'DELETE' });
+  await apiFetch(`/admin/api-keys/${encodeURIComponent(keyId)}`, { method: 'DELETE' });
 }
 
-// Share tokens
 export async function listShareTokens(
   params: {
     skip?: number;
@@ -220,10 +260,9 @@ export async function listShareTokens(
 }
 
 export async function adminRevokeShareToken(tokenId: string): Promise<void> {
-  await apiFetch(`/admin/share-tokens/${tokenId}`, { method: 'DELETE' });
+  await apiFetch(`/admin/share-tokens/${encodeURIComponent(tokenId)}`, { method: 'DELETE' });
 }
 
-// Embed tokens
 export async function listAdminEmbedTokens(
   params: { skip?: number; limit?: number; map_id?: string; map_search?: string; creator?: string; status?: string } = {},
 ): Promise<AdminEmbedTokenListResponse> {
@@ -245,26 +284,23 @@ export async function bulkRevokeEmbedTokens(tokenIds: string[]): Promise<BulkRev
   });
 }
 
-// AI Status
 export async function getAIStatus(): Promise<AIStatusResponse> {
   return apiFetch<AIStatusResponse>('/admin/ai-status/');
 }
 
-// feat(#635): live provider probe — spends real provider tokens, so only
+// Live provider probe — spends real provider tokens, so only
 // invoked from an explicit admin action, never on page load.
-// fix(#652): chat + embeddings probe sequentially at up to 15s each, so the
+// Chat + embeddings probe sequentially at up to 15s each, so the
 // backend's sanitized timeout rows can arrive after the default 30s client
 // deadline — outlive the backend worst case instead of toasting a generic error.
 export async function probeAIStatus(): Promise<AIStatusResponse> {
   return apiFetch<AIStatusResponse>('/admin/ai-status/?probe=true', { timeoutMs: 45_000 });
 }
 
-// Infrastructure
 export async function getInfrastructure(): Promise<InfrastructureResponse> {
   return apiFetch<InfrastructureResponse>('/admin/infrastructure/');
 }
 
-// Embedding stats
 export async function getEmbeddingStats(): Promise<EmbeddingStatsResponse> {
   return apiFetch<EmbeddingStatsResponse>('/admin/embedding-stats/');
 }
@@ -274,7 +310,6 @@ export async function getEmbeddingStats(): Promise<EmbeddingStatsResponse> {
 // page as the proxy's verdict rather than a client-side abort.
 const ALL_TENANT_BACKFILL_TIMEOUT_MS = 630_000;
 
-// Backfill embeddings
 export async function triggerBackfill(force = false, allTenants = false): Promise<BackfillResponse> {
   const params = new URLSearchParams();
   if (force) params.set('force', 'true');
@@ -308,10 +343,10 @@ export async function exportAuditLogs(
   if (filters.date_to) query.set('date_to', filters.date_to);
   if (filters.search) query.set('search', filters.search);
   const qs = query.toString();
-  const url = `${API_BASE}/admin/audit-logs/export/${format}${qs ? `?${qs}` : ''}`;
+  const url = `${API_BASE}/admin/audit-logs/export/${encodeURIComponent(format)}${qs ? `?${qs}` : ''}`;
 
-  // BUG-035: refresh-aware raw fetch so an export issued as the first request
-  // after a long idle transparently refreshes the JWT instead of 401-ing.
+  // Refresh-aware raw fetch so an export issued after a long idle refreshes the
+  // JWT instead of 401-ing.
   const response = await authenticatedRawFetch(url);
   if (!response.ok) {
     let detail: unknown;
@@ -325,10 +360,8 @@ export async function exportAuditLogs(
 }
 
 /**
- * fix(#438): UX-01 — the users CSV export used to be `window.open()`, which
- * cannot carry the Bearer token, so admins got a tab full of
- * `{"detail":"Could not validate credentials"}`. Same refresh-aware raw fetch
- * as the audit-log export above.
+ * Users CSV export. `window.open()` cannot carry the Bearer token, so this uses
+ * the same refresh-aware raw fetch as the audit-log export above.
  */
 export async function exportUsersCsv(): Promise<Blob> {
   const response = await authenticatedRawFetch(`${API_BASE}/admin/users/export.csv`);

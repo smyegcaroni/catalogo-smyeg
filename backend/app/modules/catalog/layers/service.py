@@ -7,11 +7,12 @@ ingestion post-processing pipeline, and registers the layer as a catalog dataset
 import uuid
 
 import structlog
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db.tenant_schema import tenant_data_schema, tenant_reader_role
 from app.core.db.tenant_session import current_tenant_var
+from app.modules.catalog.collections.models import DatasetVersion
 from app.modules.catalog.datasets.domain.models import AttributeMetadata, Dataset
 from app.modules.catalog.datasets.domain.service import create_dataset
 from app.modules.catalog.layers.schemas import (
@@ -21,6 +22,7 @@ from app.modules.catalog.layers.schemas import (
     RESERVED_COLUMNS,
 )
 from app.platform.extensions import get_catalog_port
+from app.modules.catalog.features.retention import refuse_retention_column_change
 from app.modules.catalog.features.service import lock_catalog_rows_for_write
 
 logger = structlog.stdlib.get_logger(__name__)
@@ -29,11 +31,44 @@ logger = structlog.stdlib.get_logger(__name__)
 def _qcol(name: str) -> str:
     """Return a double-quoted column identifier for DDL interpolation.
 
-    fix(#458): a reserved-word name (``desc``, ``order`` — routine ogr2ogr
+    A reserved-word name (``desc``, ``order`` — routine ogr2ogr
     DBF output) passes COLUMN_NAME_RE but breaks unquoted DDL. Names are
     already regex-validated, so this is belt-and-braces, not an injection guard.
     """
     return '"' + name.replace('"', '""') + '"'
+
+
+async def _keep_source_names(
+    session: AsyncSession,
+    dataset: Dataset,
+    column_info: list[dict],
+    renamed: dict[str, str] | None = None,
+) -> list[dict]:
+    """``column_info`` re-read from the database, with each column's source name.
+
+    The re-read knows only the stored columns; ``renamed`` maps an old column
+    name to its new one so a renamed column keeps the name it was imported as.
+    Called with the catalog rows held, after reloading ``dataset.column_info``,
+    so a concurrent column edit's names are not overwritten from a stale copy.
+    Refreshes the live version's snapshot if its row has already been recorded.
+    """
+    await session.refresh(dataset, ["column_info", "current_version"])
+    source_names = {
+        (renamed or {}).get(c["name"], c["name"]): c.get("source_name")
+        for c in dataset.column_info or []
+    }
+    column_info = [
+        {**c, "source_name": source_names.get(c["name"])} for c in column_info
+    ]
+    await session.execute(
+        update(DatasetVersion)
+        .where(
+            DatasetVersion.dataset_id == dataset.id,
+            DatasetVersion.version_number == dataset.current_version,
+        )
+        .values(column_info=column_info)
+    )
+    return column_info
 
 
 async def _compute_quality_detail(
@@ -41,10 +76,10 @@ async def _compute_quality_detail(
 ) -> object:
     """The quality score for a schema change, WITHOUT storing it.
 
-    fix(#458): column DDL didn't recompute quality_detail like
-    reupload does, so attribute_completeness went stale until the next
-    reupload. Returns rather than assigns so the caller can run it before
-    taking the catalog rows; `no_autoflush` because those rows aren't held yet.
+    Column DDL recomputes quality_detail the way reupload does, so
+    attribute_completeness doesn't go stale. Returns rather than assigns so the
+    caller can run it before taking the catalog rows; `no_autoflush` because
+    those rows aren't held yet.
     """
     with session.no_autoflush:
         return await get_catalog_port().compute_quality_score(
@@ -81,7 +116,7 @@ async def create_layer(
     reader_role = tenant_reader_role(tenant_id)
     table_ref = get_catalog_port().quote_table(table_name, schema=data_schema)
 
-    # fix(#1988): checked HERE, not only in the request schema. This value is
+    # Checked HERE, not only in the request schema. This value is
     # interpolated into DDL, and the schema validator only guards the one route
     # that reaches this function today. Case-insensitive because direct callers
     # pass the PostGIS spelling ("POINT") while the route passes the schema's
@@ -104,7 +139,7 @@ async def create_layer(
             col_defs += f", {_qcol(col.name)} {pg_type}"
 
     ddl = f"CREATE TABLE {table_ref} ({col_defs})"
-    # codeql[py/sql-injection] fix(#1615): geometry_type is allowlisted above; column names match COLUMN_NAME_RE and types come from ALLOWED_COLUMN_TYPES; table via quote_table
+    # codeql[py/sql-injection] geometry_type is allowlisted above; column names match COLUMN_NAME_RE and types come from ALLOWED_COLUMN_TYPES; table via quote_table
     await session.execute(text(ddl))
 
     # Adds geom_4326 and its index; source is already 4326, so the copy needs
@@ -160,7 +195,7 @@ async def count_maps_referencing_column(
 ) -> int:
     """Count distinct saved maps whose layer config references the column.
 
-    fix(#458): warns before a rename/drop breaks a saved map's
+    Warns before a rename/drop breaks a saved map's
     data-driven style, filter, label, or popup. Text-scans the JSONB configs
     for the quoted column name — approximate, but scoped to this dataset.
     """
@@ -218,18 +253,21 @@ async def add_column(
 
     table_ref = get_catalog_port().quote_table(dataset.table_name)
     ddl = f"ALTER TABLE {table_ref} ADD COLUMN {_qcol(column_name)} {pg_type}"
+    # codeql[py/sql-injection] column matches COLUMN_NAME_RE, is not reserved, and is quoted by _qcol; pg_type comes from ALLOWED_COLUMN_TYPES; table via quote_table
     await session.execute(text(ddl))
+    await refuse_retention_column_change(session, dataset, column_name)
 
     column_info = await get_catalog_port().get_column_info(session, dataset.table_name)
-    # fix(#1847): scan, then lock, then assign — the scan needs neither
+    # Scan, then lock, then assign — the scan needs neither
     # catalog row, and the lock must follow the ALTER since the reupload swap
     # takes its data-table ACCESS EXCLUSIVE before its catalog rows.
     quality_detail = await _compute_quality_detail(session, dataset, column_info)
     await lock_catalog_rows_for_write(session, dataset)
+    column_info = await _keep_source_names(session, dataset, column_info)
     dataset.column_info = column_info
     dataset.quality_detail = quality_detail
 
-    # fix(#458): (dataset_id, field_name) is unique, so re-adding a
+    # (dataset_id, field_name) is unique, so re-adding a
     # previously dropped name must revive the historical is_current=False row
     # instead of inserting a duplicate (UniqueViolation -> 500).
     new_col = next((c for c in column_info if c["name"] == column_name), None)
@@ -250,9 +288,9 @@ async def add_column(
             )
             session.add(am)
         am.data_type = data_type
-        # fix(#458): the revive path (drop → re-add the same name) used to
-        # overwrite user-customized inferred fields with fresh inference while
-        # user_modified_fields still claimed the customization. Honor it.
+        # The revive path (drop → re-add the same name) must not overwrite
+        # user-customized inferred fields with fresh inference while
+        # user_modified_fields still claims the customization. Honor it.
         user_modified = set(am.user_modified_fields or [])
         if "units" not in user_modified:
             am.units = get_catalog_port().infer_units(column_name)
@@ -320,15 +358,20 @@ async def rename_column(
 
     table_ref = get_catalog_port().quote_table(dataset.table_name)
     ddl = f"ALTER TABLE {table_ref} RENAME COLUMN {_qcol(column_name)} TO {_qcol(new_name)}"
+    # codeql[py/sql-injection] both names match COLUMN_NAME_RE, are not reserved, and are quoted by _qcol; the old one exists on the layer; table via quote_table
     await session.execute(text(ddl))
+    await refuse_retention_column_change(session, dataset, column_name, new_name)
 
     column_info = await get_catalog_port().get_column_info(session, dataset.table_name)
-    # fix(#1847): lock follows the ALTER — the reupload swap takes its
+    # Lock follows the ALTER — the reupload swap takes its
     # data-table ACCESS EXCLUSIVE before its catalog rows.
     await lock_catalog_rows_for_write(session, dataset)
+    column_info = await _keep_source_names(
+        session, dataset, column_info, {column_name: new_name}
+    )
     dataset.column_info = column_info
 
-    # fix(#458): keep the cached sample-values snapshot keyed by the new
+    # Keep the cached sample-values snapshot keyed by the new
     # name; the builder reads this dict and an old-name entry looks like an
     # empty column after a rename.
     if dataset.sample_values and column_name in dataset.sample_values:
@@ -387,21 +430,26 @@ async def alter_column_type(
     if column_name not in existing:
         raise ValueError(f"Column {column_name!r} does not exist on this layer.")
 
+    # The retype can rewrite the table, and a failing cast would hide the
+    # conflict, so refuse early too; the check after the ALTER still holds.
+    await refuse_retention_column_change(session, dataset, column_name)
     pg_type = ALLOWED_COLUMN_TYPES[new_type]
     table_ref = get_catalog_port().quote_table(dataset.table_name)
     ddl = (
         f"ALTER TABLE {table_ref} ALTER COLUMN {_qcol(column_name)} TYPE {pg_type} "
         f"USING {_qcol(column_name)}::{pg_type}"
     )
-    # codeql[py/sql-injection] fix(#1615): column exists on the layer and is quoted by _qcol; pg_type comes from ALLOWED_COLUMN_TYPES; table via quote_table
+    # codeql[py/sql-injection] column exists on the layer and is quoted by _qcol; pg_type comes from ALLOWED_COLUMN_TYPES; table via quote_table
     await session.execute(text(ddl))
+    await refuse_retention_column_change(session, dataset, column_name)
 
     column_info = await get_catalog_port().get_column_info(session, dataset.table_name)
-    # fix(#1847): scan, then lock, then assign — the scan needs neither
+    # Scan, then lock, then assign — the scan needs neither
     # catalog row, and the lock must follow the ALTER since the reupload swap
     # takes its data-table ACCESS EXCLUSIVE before its catalog rows.
     quality_detail = await _compute_quality_detail(session, dataset, column_info)
     await lock_catalog_rows_for_write(session, dataset)
+    column_info = await _keep_source_names(session, dataset, column_info)
     dataset.column_info = column_info
     dataset.quality_detail = quality_detail
 
@@ -449,27 +497,29 @@ async def drop_column(
 
     table_ref = get_catalog_port().quote_table(dataset.table_name)
     ddl = f"ALTER TABLE {table_ref} DROP COLUMN {_qcol(column_name)}"
-    # codeql[py/sql-injection] fix(#1615): column matches COLUMN_NAME_RE, is not reserved, exists on the layer, and is quoted by _qcol; table via quote_table
+    # codeql[py/sql-injection] column matches COLUMN_NAME_RE, is not reserved, exists on the layer, and is quoted by _qcol; table via quote_table
     await session.execute(text(ddl))
+    await refuse_retention_column_change(session, dataset, column_name)
 
     column_info = await get_catalog_port().get_column_info(session, dataset.table_name)
-    # fix(#1847): scan, then lock, then assign — the scan needs neither
+    # Scan, then lock, then assign — the scan needs neither
     # catalog row, and the lock must follow the ALTER since the reupload swap
     # takes its data-table ACCESS EXCLUSIVE before its catalog rows.
     quality_detail = await _compute_quality_detail(session, dataset, column_info)
     await lock_catalog_rows_for_write(session, dataset)
+    column_info = await _keep_source_names(session, dataset, column_info)
     dataset.column_info = column_info
     dataset.quality_detail = quality_detail
 
-    # fix(#458): drop the removed column's cached sample values too.
+    # Drop the removed column's cached sample values too.
     if dataset.sample_values and column_name in dataset.sample_values:
         samples = dict(dataset.sample_values)
         samples.pop(column_name)
         dataset.sample_values = samples
 
-    # fix(#458): filter on is_current like rename/alter do — a
+    # Filter on is_current like rename/alter do — a
     # drop→re-add→drop of the same name leaves historical rows, and an
-    # unfiltered scalar_one_or_none() raised MultipleResultsFound (500).
+    # unfiltered scalar_one_or_none() would raise MultipleResultsFound (500).
     result = await session.execute(
         select(AttributeMetadata).where(
             AttributeMetadata.dataset_id == dataset.id,

@@ -4,16 +4,16 @@
 
 | Version | Supported |
 |---------|-----------|
-| 1.x     | Yes       |
-| < 1.0   | No        |
+| Latest release | Yes |
+| Earlier releases | No |
 
-We only patch the latest release. If you're running an older version, please upgrade before reporting.
+We only patch the latest release; there is no long-term support line. If you're running an older version, please upgrade before reporting.
 
 ## Reporting a Vulnerability
 
 **Do not open a public issue for security vulnerabilities.**
 
-Email **security@getgeolens.com** with:
+Report it privately through [GitHub private vulnerability reporting](https://github.com/geolens-io/geolens/security/advisories/new), or email **security@getgeolens.com**. Include:
 
 - Description of the vulnerability
 - Steps to reproduce

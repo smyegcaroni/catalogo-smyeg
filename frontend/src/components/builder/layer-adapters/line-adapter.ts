@@ -10,8 +10,8 @@ import {
 import { MAP_COLORS } from '@/lib/map-colors';
 import { addDescribedLayer, writeDescribedLayer, writeDescribedVisibility } from '../layer-writer';
 import { labelLayerId, withLabelCompanion } from '../label-layer-utils';
-// builder-audit #338 DRY-06: arrow render-mode defaults come from the single builder-defaults
-// source of truth (shared with renderAs + backend mirror) instead of bare 14/80 literals.
+// Arrow render-mode defaults come from the single builder-defaults source of
+// truth (shared with renderAs + backend mirror).
 import { DEFAULT_ARROW_SIZE, DEFAULT_ARROW_SPACING, DEFAULT_LINE_PAINT } from './builder-defaults';
 
 const ARROW_IMAGE_ID = 'geolens-line-arrow';
@@ -23,7 +23,7 @@ export const LINE_OWNED_LAYOUT_PROPERTIES = [
   'line-join',
 ] as const;
 
-// Exported for the mixed adapter's line-family sublayer (ADAPT-03 reuse).
+// Exported for the mixed adapter's line-family sublayer (reuse).
 export const LINE_OWNED_PAINT_PROPERTIES = [
   'line-color',
   'line-width',
@@ -86,9 +86,8 @@ const ARROW_IMAGE: ImageSpec = {
 
 function arrowConfig(input: AdapterLayerInput) {
   const builder = getBuilderStyleConfig(input);
-  const lineColor = typeof input.paint['line-color'] === 'string'
-    ? input.paint['line-color']
-    : MAP_COLORS.default.fill;
+  const stored = input.paint['line-color'];
+  const lineColor = typeof stored === 'string' || Array.isArray(stored) ? stored : MAP_COLORS.default.fill;
   return {
     color: typeof builder.arrowColor === 'string' ? builder.arrowColor : lineColor,
     size: typeof builder.arrowSize === 'number' ? builder.arrowSize : DEFAULT_ARROW_SIZE,
@@ -141,10 +140,10 @@ export function resolveLinePaint(paint: Record<string, unknown>): Record<string,
  * expression. Master opacity rides on `line-layer-opacity`, its own tier in
  * maplibre-gl v6, leaving the per-feature `line-opacity` unmultiplied.
  *
- * line-gradient REQUIRES an expression that consumes ['line-progress'] — there is no
- * valid scalar fallback, so it is excluded from the "is paint empty" check the same
- * way the legacy add path did. The writer's EXPRESSION_ONLY_PAINT keeps a real
- * gradient expression out of the initial addLayer call; reconcilePaint installs it.
+ * line-gradient REQUIRES an expression that consumes ['line-progress']; there is
+ * no valid scalar fallback, so it is excluded from the "is paint empty" check.
+ * The writer's EXPRESSION_ONLY_PAINT keeps a real gradient expression out of the
+ * initial addLayer call; reconcilePaint installs it.
  */
 function linePaint(input: AdapterLayerInput): Record<string, unknown> {
   const rawPaint = input.paint;

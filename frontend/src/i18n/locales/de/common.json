@@ -110,7 +110,6 @@
     "darkMode": "Dunkler Modus"
   },
   "theme": {
-    "toggle": "Design umschalten",
     "light": "Hell",
     "dark": "Dunkel",
     "system": "System"
@@ -132,16 +131,13 @@
     "jobs": "Aufträge",
     "failedJobs_one": "{{count}} fehlgeschlagener Auftrag",
     "failedJobs_other": "{{count}} fehlgeschlagene Aufträge",
-    "auditLog": "Protokoll",
+    "auditLog": "Audit-Protokoll",
     "sharedMaps": "Veröffentlichte Karten",
     "saml": "SAML SSO",
     "ai": "KI",
     "infrastructure": "Infrastruktur",
     "general": "Allgemein",
     "basemaps": "Basiskarten",
-    "mapDefaults": "Kartenvorgaben",
-    "security": "Sicherheit",
-    "uploads": "Hochladen",
     "settings": "Einstellungen",
     "operations": "Betrieb",
     "settingsGeneral": "Allgemein",
@@ -152,7 +148,8 @@
     "settingsAppearance": "Darstellung",
     "settingsInfrastructure": "Infrastruktur",
     "backToApp": "Zurück zur App",
-    "configOps": "Konfigurationsvorgänge"
+    "configOps": "Konfigurationsvorgänge",
+    "groups": "Gruppen"
   },
   "errors": {
     "unexpected": "Ein unerwarteter Fehler ist aufgetreten",
@@ -177,6 +174,7 @@
     "jobFailureStaleNeverQueued": "Veraltet: zu lange ausstehend (nie eingereiht)",
     "jobFailureUploadAbandoned": "Abgebrochen: Upload wurde nie abgeschlossen",
     "jobFailureUserCancelled": "Vom Benutzer abgebrochen",
+    "jobFailureCredentialOverHttp": "Der Dienst dieses Datensatzes verwendet unverschlüsseltes HTTP, daher wurden seine Anmeldedaten nicht gesendet. Importieren Sie ihn erneut über die https://-Adresse des Dienstes oder bitten Sie eine Administratorin oder einen Administrator, seinen Host zuzulassen.",
     "jobFailureWorkerLost": "Veraltet: Der Auftrag lief zu lange, ohne dass sein Worker einen Fortschritt meldete",
     "requestFailed": "Die Anfrage konnte nicht abgeschlossen werden. Versuchen Sie es erneut.",
     "badRequest": "Die Anfrage konnte nicht abgeschlossen werden. Prüfen Sie Ihre Eingaben.",
@@ -204,10 +202,12 @@
     "sharedQueryBusy": "Analysevorschauen und der KI-Chat teilen sich eine Datenabfrage, und eine läuft bereits. Warten Sie, bis sie abgeschlossen ist, und versuchen Sie es erneut.",
     "analysisVectorRequired": "Die Analyse benötigt einen Vektordatensatz – diese Ebene ist keiner.",
     "analysisMaskPolygonRequired": "Die Zuschneidemaske muss eine Polygon-Ebene sein.",
+    "datasetUnpublishBlockedByMaps": "Diese Karten teilen den Datensatz mit einem Publikum, das ihn verlieren würde, wenn seine Veröffentlichung aufgehoben wird: {{maps}}. Entfernen Sie dort den Layer oder schränken Sie zuerst diese Karten ein.",
     "datasetVisibilityBlockedByMaps": "Diese Karten teilen den Datensatz mit einem Publikum, das ihn verlieren würde: {{maps}}. Entfernen Sie dort den Layer oder schränken Sie zuerst diese Karten ein.",
     "workflowTransitionDeniedNoneAllowed": "Dieser Datensatz kann im Veröffentlichungs-Workflow nicht von „{{from}}“ zu „{{to}}“ wechseln, und für Sie ist kein anderer Schritt offen. Wenden Sie sich an eine Prüfperson oder einen Administrator mit der nötigen Rolle.",
     "workflowTransitionDenied": "Dieser Datensatz kann im Veröffentlichungs-Workflow nicht von „{{from}}“ zu „{{to}}“ wechseln. Für Sie offene Schritte von hier aus: {{allowed}}.",
     "analysisUnknownDissolveColumn": "Die Spalte „{{column}}“ existiert in diesem Datensatz nicht. Wähle ein anderes Gruppierungsfeld.",
+    "columnsNeedRefresh": "Die Spalten {{columns}} gibt es in der Tabelle, GeoLens kennt sie aber noch nicht. Aktualisiere den Datensatz und versuche es dann erneut.",
     "corsWildcardNotAllowed": "Platzhalter-Ursprünge werden nicht akzeptiert. Anfragen mit Anmeldedaten erfordern jeden Ursprung vollständig, zum Beispiel https://example.com.",
     "embedDomainLockUnenforceable": "Diese Installation kann eine Domain-Sperre noch nicht durchsetzen: Ihre öffentliche App-URL ist auf {{resolved}} gesetzt, aufgerufen wurde sie aber über {{origin}}. Eine Einbettung lädt die Karte über GeoLens selbst, die Sperre würde also jeden Betrachter aussperren. Setze PUBLIC_APP_URL auf {{origin}} und erstelle das Token erneut.",
     "duplicateSource": "Ein Datensatz aus dieser Quelle ist bereits registriert ({{title}}).",
@@ -225,9 +225,13 @@
     "arcgisSigninInProgress": "Für dieses Konto läuft bereits eine andere Anmeldung. Versuchen Sie es gleich noch einmal.",
     "arcgisPortalNotHttps": "Dieses Portal oder der von ihm angegebene Token-Dienst verwendet kein HTTPS. GeoLens sendet kein Passwort über unverschlüsseltes HTTP; verwenden Sie eine https://-Portal-URL.",
     "arcgisPortalHostInvalid": "Diese Portaladresse ist kein verwendbarer Hostname. Überprüfen Sie die URL, zum Beispiel https://ihre-org.maps.arcgis.com.",
+    "credentialOverHttp": "Diese Dienstadresse verwendet unverschlüsseltes HTTP, daher sendet GeoLens keine Anmeldedaten dorthin. Verwenden Sie die https://-Adresse des Dienstes oder bitten Sie eine Administratorin oder einen Administrator, diesen Host zuzulassen.",
+    "credentialOverHttpRefresh": "Die Quelle dieses Datensatzes verwendet unverschlüsseltes HTTP, daher sendet GeoLens keine Anmeldedaten dorthin. Importieren Sie die Daten erneut über die https://-Adresse des Dienstes oder bitten Sie eine Administratorin oder einen Administrator, diesen Host zuzulassen.",
     "refreshServiceTokenRequired": "Die Quelle dieses Datensatzes benötigt eine Dienst-Anmeldeinformation zur Aktualisierung. Geben Sie unten eine an, um fortzufahren.",
     "refreshSourceUrlBlocked": "Die gespeicherte Quell-URL dieses Datensatzes hat eine Sicherheitsprüfung nicht bestanden und kann nicht automatisch aktualisiert werden. Wenden Sie sich an einen Administrator.",
     "reuploadGeometryLoss": "Diese Ersetzung enthält keine Geometrie, dieser Datensatz speichert jedoch Geometrie, daher wurde nichts geändert. Importieren Sie die Datei als neuen Datensatz.",
+    "serviceLayerNoFeatures": "Diese Ebene enthält keine Features (Gruppen-, Raster-, Annotations-, Topologie- oder Versorgungsnetz-Ebene). Importieren Sie stattdessen eine ihrer Feature-Ebenen oder Tabellen.",
+    "serviceGeometryUnsupported": "Diese Ebene enthält Multipatch-Geometrie, die nicht importiert werden kann. Veröffentlichen Sie sie als Feature-Ebene mit einem anderen Geometrietyp.",
     "reuploadOriginChanged": "Die Quelle dieses Datensatzes hat sich geändert, während die Ersetzung vorbereitet wurde, daher wurde nichts in die Warteschlange gestellt. Prüfen Sie die Quelle des Datensatzes, bevor Sie seine Daten ersetzen.",
     "reuploadPointCloudUnsupported": "Punktwolken-Datensätze können nicht durch erneutes Hochladen ersetzt werden. Laden Sie die neue Punktwolke als neuen Datensatz hoch.",
     "reuploadTilesetUnsupported": "3D-Tiles-Datensätze können nicht durch erneutes Hochladen ersetzt werden. Laden Sie das neue Tileset als neuen Datensatz hoch.",
@@ -316,6 +320,10 @@
     "collectionNotFound": "Sammlung nicht gefunden",
     "mapNotFound": "Karte nicht gefunden",
     "incorrectCredentials": "Falscher Benutzername oder falsches Passwort",
+    "loginThrottled": "Zu viele fehlgeschlagene Anmeldungen für dieses Konto. Verwenden Sie einen Browser, mit dem Sie sich bereits angemeldet haben, melden Sie sich per SSO an oder verwenden Sie einen API-Schlüssel für Skripte und Desktop-Apps.",
+    "deviceTrustLinkInvalid": "Dieser Link ist ungültig, abgelaufen oder wurde bereits verwendet. Bitten Sie Ihren Administrator um einen neuen.",
+    "deviceTrustBrowserFull": "Dieser Browser merkt sich bereits so viele Konten wie möglich. Öffnen Sie den Link in einem privaten Fenster oder einem anderen Browser.",
+    "deviceTrustUnavailable": "Diese GeoLens-Instanz kann unter ihrer aktuellen Adresse keine Browser merken. Wenden Sie sich an Ihren Administrator.",
     "awaitingApproval": "Ihr Konto wartet auf Genehmigung",
     "accountNotActive": "Konto nicht aktiv",
     "insufficientPermissions": "Unzureichende Berechtigungen",
@@ -327,6 +335,8 @@
     "layerNotFound": "Layer nicht gefunden",
     "userNotFound": "Benutzer nicht gefunden",
     "apiKeyNotFound": "API-Schlüssel nicht gefunden",
+    "datasetKeyLimit": "Dieser Datensatz hat bereits 100 aktive Schreibschlüssel. Widerrufen Sie einen, um einen neuen zu erstellen.",
+    "valueLabelsTooLarge": "Die Wertebezeichnungen dieses Datensatzes überschreiten das Limit von 1 MB. Entfernen Sie einige Bezeichnungen, um weitere hinzuzufügen.",
     "accessDenied": "Zugriff verweigert",
     "couldNotValidateCredentials": "Anmeldedaten konnten nicht überprüft werden",
     "inactiveUser": "Inaktiver Benutzer",
@@ -346,6 +356,7 @@
     "stagingFileUnavailable": "Staging-Datei nicht mehr verfügbar. Bitte erneut hochladen.",
     "serviceRequiresAuth": "Dieser Dienst erfordert Authentifizierung. Geben Sie ein Zugriffstoken ein und versuchen Sie es erneut.",
     "couldNotReachService": "Dienst nicht erreichbar. Überprüfen Sie die URL und versuchen Sie es erneut.",
+    "serviceNotRecognized": "Der Diensttyp konnte nicht erkannt werden. Unterstützt: WFS, ArcGIS Feature Service und OGC API Features.",
     "serviceTimeout": "Dienst hat nicht rechtzeitig geantwortet. Überprüfen Sie die URL und versuchen Sie es erneut.",
     "remoteServiceError": "Remote-Dienst hat einen Fehler zurückgegeben",
     "aiSummaryFailed": "Zusammenfassung konnte nicht generiert werden",
@@ -369,10 +380,46 @@
     "mapMessage": "Kartenfehler — einige Ebenen werden möglicherweise nicht korrekt angezeigt.",
     "networkUnavailable": "Netzwerk nicht verfügbar. Prüfen Sie Ihre Verbindung.",
     "requestTimeout": "Die Anfrage hat zu lange gedauert. Versuchen Sie es erneut.",
-    "unauthorized": "Ihre Sitzung ist abgelaufen. Melden Sie sich erneut an."
+    "unauthorized": "Ihre Sitzung ist abgelaufen. Melden Sie sich erneut an.",
+    "retentionUnsupportedRelation": "Die Aufbewahrung braucht die Daten des Datensatzes in einer gewöhnlichen Tabelle. Dieser Datensatz liest sie aus einer Sicht, einer partitionierten Tabelle oder einer anderen Relation, daher lässt sie sich hier nicht einschalten.",
+    "retentionHasChildren": "Die Aufbewahrung kann nicht auf einer Tabelle laufen, von der andere Tabellen erben, weil ein Löschen deren Zeilen erreichen könnte. Entfernen Sie die erbenden Tabellen, um die Aufbewahrung zu nutzen.",
+    "retentionReferenced": "Ein Fremdschlüssel verweist auf diese Tabelle, daher würde das Löschen alter Zeilen auch die verweisenden Zeilen ändern. Entfernen Sie den Fremdschlüssel, um die Aufbewahrung zu nutzen.",
+    "retentionDeleteRule": "Diese Tabelle hat eine DELETE-Regel, die ändert, was ein Löschen bewirkt. Entfernen Sie die Regel, um die Aufbewahrung zu nutzen.",
+    "retentionNotFeatureDataset": "Die Aufbewahrung funktioniert nur bei Datensätzen, deren Features eine Geometrie haben.",
+    "retentionColumnMissing": "Die Spalte {{column}} existiert nicht mehr. Wählen Sie eine andere Datums- oder Zeitstempelspalte.",
+    "retentionColumnNotTemporal": "Die Spalte {{column}} ist keine Datums- oder Zeitstempelspalte. Wählen Sie eine Datums- oder Zeitstempelspalte.",
+    "retentionColumnInUse": "Die Aufbewahrung löscht Zeilen anhand der Spalte {{column}}. Schalten Sie die Aufbewahrung aus oder legen Sie sie auf eine andere Spalte, bevor Sie diese Spalte ändern oder einer anderen Spalte ihren Namen geben.",
+    "retentionGidUnusable": "Die Aufbewahrung durchläuft die Tabelle über ihre ganzzahlige gid-Spalte, die diese Tabelle nicht mehr hat. Stellen Sie eine ganzzahlige gid-Spalte wieder her, um die Aufbewahrung zu nutzen.",
+    "retentionDeleteTrigger": "Die Aufbewahrung kann nicht auf einer Tabelle mit einem Lösch-Trigger laufen, weil der Trigger Zeilen behalten oder andere Zeilen ändern kann, wenn alte gelöscht werden. Entfernen Sie den Trigger, um die Aufbewahrung zu nutzen.",
+    "groupNotFound": "Gruppe nicht gefunden",
+    "groupNotJoined": "Sie können nur mit Gruppen teilen, denen Sie angehören.",
+    "mapRestrictedNeedsGroups": "Teilen Sie die Karte mit einer Gruppe, bevor Sie sie einschränken.",
+    "mapChangeInProgress": "Eine andere Änderung an dieser Karte läuft gerade. Versuchen Sie es gleich noch einmal.",
+    "groupMemberNotFound": "Diese Person ist kein Mitglied dieser Gruppe",
+    "groupNameTaken": "Eine Gruppe mit dem Namen „{{name}}“ existiert bereits",
+    "vrtAudienceExceedsSources": "Ein VRT-Datensatz wäre für Personen sichtbar, die nicht alle seine Quelldatensätze sehen können. Schränken Sie die Sichtbarkeit des VRT ein oder verwenden Sie Quellen, die seine Zielgruppe sehen kann.",
+    "storyNotFound": "Story nicht gefunden.",
+    "storyLocked": "Eine andere Änderung an dieser Story läuft gerade. Versuchen Sie es gleich noch einmal.",
+    "storyNewerVersion": "Diese Story wurde von einer neueren GeoLens-Version gespeichert und kann hier nicht geändert werden.",
+    "storyScenesUnreadable": "Einige Szenen wurden von einer neueren GeoLens-Version gespeichert und können hier nicht veröffentlicht werden.",
+    "storyVisibilityUnsupported": "Storys können mit dieser Sichtbarkeit noch nicht veröffentlicht werden.",
+    "dashboardTooNew": "Dieses Dashboard wurde mit einer neueren GeoLens-Version gespeichert und kann hier nicht geändert werden.",
+    "dashboardTooManyWidgets": "Ein Dashboard enthält höchstens 50 Widgets. Entfernen Sie vor dem Speichern einige.",
+    "dashboardWidgetsRefused": "Einige Dashboard-Widgets nutzen Layer, die nicht auf dieser Karte liegen oder die Sie nicht lesen können. Entfernen Sie sie oder wählen Sie andere Layer.",
+    "storyImageUnreadable": "Die Datei ist kein lesbares Bild.",
+    "storyImageTooLarge": "Dieses Bild ist zu groß. Laden Sie eine Datei unter 50 MB mit weniger Pixeln hoch.",
+    "storyImageUnsupported": "Nur PNG-, JPEG- und WebP-Bilder können hochgeladen werden.",
+    "storyImageBusy": "Andere Bilder werden gerade verarbeitet. Versuchen Sie es gleich noch einmal.",
+    "storyImageMissing": "Es wurde kein Bild gesendet. Wählen Sie eine Datei und versuchen Sie es erneut.",
+    "storyAssetLimit": "Diese Story enthält bereits die maximale Anzahl an Bildern: 200 oder insgesamt 250 MB.",
+    "storyAssetOwnerLimit": "Ihre Storys enthalten bereits so viel Bildspeicher, wie ein Admin erlaubt. Entfernen Sie Bilder aus Ihren Storys oder bitten Sie einen Admin, das Limit zu erhöhen.",
+    "storyAssetsNotFound": "Einige Bilder dieser Story wurden nicht gefunden. Entfernen Sie diese Bildblöcke und speichern Sie erneut.",
+    "storyFrameHostNotAllowed": "Einige Einbettungen oder Videos verwenden eine Website, die kein Admin freigegeben hat. Korrigieren oder entfernen Sie sie und versuchen Sie es erneut."
   },
   "settings": {
-    "apiKeys": { "manageTitle": "API-Schlüssel verwalten" },
+    "apiKeys": {
+      "manageTitle": "API-Schlüssel verwalten"
+    },
     "tabs": {
       "preferences": "Einstellungen",
       "apiKeys": "API-Schlüssel"
@@ -405,7 +452,8 @@
     "docs": "Dokumentation",
     "github": "GitHub",
     "api": "API",
-    "license": "Apache 2.0"
+    "license": "Apache 2.0",
+    "thirdPartyLicenses": "Drittanbieter-Lizenzen"
   },
   "viewer": {
     "loading": "Karte wird geladen...",
@@ -413,7 +461,6 @@
     "linkExpiredDescription": "Dieser geteilte Kartenlink ist nicht mehr verfügbar. Er ist möglicherweise abgelaufen oder wurde vom Eigentümer widerrufen.",
     "mapNotFound": "Karte nicht gefunden",
     "mapNotFoundDescription": "Diese Karte wurde möglicherweise entfernt oder der Link ist ungültig.",
-    "poweredBy": "Betrieben mit GeoLens",
     "featureFallback": "Objekt",
     "legend": {
       "title": "Ebenen",
@@ -428,10 +475,12 @@
       "weightedBy": "Gewichtet nach: {{column}}",
       "weightedByScaled": "Gewichtet nach: {{column}} (skaliert)",
       "other": "Sonstige",
+      "sampled": "Bei dieser Zoomstufe wird nur eine Stichprobe angezeigt. Zoomen Sie hinein, um alle Objekte zu sehen.",
       "cluster": {
         "server": "Server-Cluster",
         "bounded": "Begrenzter Cluster",
-        "fallback": "Punkt-Fallback"
+        "fallback": "Punkt-Fallback",
+        "pointsPerCluster": "Punkte pro Cluster"
       },
       "geometry": {
         "point": "Punkt",
@@ -466,7 +515,34 @@
       "booleanFalse": "Falsch",
       "resultSummary_one": "{{count}} sichtbares Objekt",
       "resultSummary_other": "{{count}} sichtbare Objekte",
-      "resultSummaryTruncated": "{{shown}} von {{total}} sichtbaren Objekten werden angezeigt"
+      "resultSummaryTruncated": "{{shown}} von {{total}} sichtbaren Objekten werden angezeigt",
+      "truncatedHint": "Zoomen oder verschieben Sie die Karte, um die übrigen Objekte aufzulisten.",
+      "openDatasetData": "Alle Daten von {{name}} anzeigen",
+      "tableView": "Tabelle",
+      "listView": "Liste",
+      "viewSwitch": "Ansicht der Kartendaten",
+      "layerPicker": "Ebene der Tabelle",
+      "inView": "Im Ausschnitt",
+      "inViewNoGeometry": "Diese Ebene hat keine Geometrie, die sich nach dem Kartenausschnitt filtern lässt",
+      "filteredByMap": "Nach Karte gefiltert",
+      "filterUnsupported": "Der Filter der Ebene konnte nicht angewendet werden – alle Zeilen werden angezeigt.",
+      "close": "Kartendaten schließen",
+      "resize": "Kartendaten in der Größe ändern",
+      "expand": "Kartendaten vergrößern",
+      "collapse": "Kartendaten verkleinern",
+      "emptyFiltered": "Keine Zeilen entsprechen den Filtern der Karte",
+      "emptyInView": "Keine Zeilen im Ausschnitt. Verschieben Sie die Karte oder schalten Sie „Im Ausschnitt“ aus.",
+      "unavailable": "Die Tabelle dieser Ebene ist hier nicht verfügbar.",
+      "loadingRows": "Zeilen werden geladen",
+      "allFields": "Alle Felder",
+      "loadingFields": "Weitere Felder werden geladen …",
+      "fieldsFailed": "Die übrigen Felder konnten nicht geladen werden.",
+      "selectionMissing": "Das ausgewählte Objekt befindet sich nicht auf dieser Seite.",
+      "selectionShow": "Auswahl anzeigen",
+      "selectionShowing": "Nur das ausgewählte Objekt wird angezeigt.",
+      "selectionShowAll": "Alle Zeilen anzeigen",
+      "selectionHiddenByFilters": "Die Filter der Tabelle blenden das ausgewählte Objekt aus.",
+      "openInTable": "{{name}} in der Tabelle öffnen"
     },
     "heatmapLow": "Niedrig",
     "heatmapHigh": "Hoch",
@@ -495,6 +571,7 @@
       "emptyHint": "Stellen Sie eine Frage zu den Daten dieser Karte.",
       "readOnlyNote": "Antworten sind schreibgeschützt — erkunden Sie die Daten, ohne die Karte zu ändern.",
       "error": "Etwas ist schiefgelaufen. Bitte versuchen Sie es erneut.",
+      "errorModelUnsupported": "Das KI-Modell dieser Seite benötigt die OpenAI Responses API. Bitten Sie einen Administrator, sie zu aktivieren oder ein anderes Modell zu wählen.",
       "retry": "Erneut versuchen",
       "queryResult": {
         "empty": "Keine passenden Ergebnisse.",
@@ -523,6 +600,7 @@
     "private": "Privat",
     "internal": "Intern",
     "public": "Öffentlich",
+    "restricted": "Eingeschränkt",
     "listView": "Listenansicht",
     "gridView": "Rasteransicht",
     "loadFailed": "Karten konnten nicht geladen werden: {{message}}",
@@ -541,7 +619,8 @@
     "card": {
       "previewAlt": "Vorschau von {{name}}",
       "updated": "Aktualisiert {{date}}",
-      "delete": "Karte löschen"
+      "delete": "Karte löschen",
+      "dashboard": "Dashboard"
     }
   },
   "enums": {
@@ -719,7 +798,9 @@
     "adminSettings": "Admin-Einstellungen",
     "adminSaml": "SAML-SSO-Konfiguration",
     "verifyEmail": "E-Mail bestätigen",
-    "signingIn": "Anmeldung läuft"
+    "signingIn": "Anmeldung läuft",
+    "trustBrowser": "Diesen Browser merken",
+    "adminGroups": "Admin-Gruppen"
   },
   "sidebar": {
     "title": "Seitenleiste",
@@ -732,9 +813,6 @@
   },
   "inlineEdit": {
     "hint": "Strg+Eingabe zum Speichern, Escape zum Abbrechen"
-  },
-  "mapCoordReadout": {
-    "scale": "1:{{value}}"
   },
   "errorBoundary": {
     "appTitle": "Etwas ist schiefgelaufen",

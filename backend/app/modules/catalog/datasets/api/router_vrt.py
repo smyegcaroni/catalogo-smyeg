@@ -22,6 +22,8 @@ from app.modules.catalog.authorization import (
     can_view_dataset_provenance,
     check_dataset_access,
     check_dataset_write_access,
+    check_vrt_members,
+    lock_dataset_rows_for_write,
 )
 from app.modules.catalog.datasets.domain.schemas import (
     VrtActiveGeneration,
@@ -70,6 +72,7 @@ async def _load_source_datasets(
     "/{dataset_id}/vrt-sources/",
     response_model=VrtSourceListResponse,
     responses={403: FORBIDDEN_RESPONSE},
+    summary="List a VRT dataset's sources",
 )
 async def list_vrt_sources(
     dataset_id: uuid.UUID,
@@ -141,6 +144,7 @@ async def list_vrt_sources(
     "/{dataset_id}/vrt/status/",
     response_model=VrtStatusResponse,
     responses={403: FORBIDDEN_RESPONSE},
+    summary="Get a VRT dataset's status",
 )
 async def get_vrt_status(
     dataset_id: uuid.UUID,
@@ -206,7 +210,6 @@ async def get_vrt_status(
                 elapsed_seconds=elapsed,
             )
 
-    # Source health check
     source_rows = await db.execute(
         text("""
             SELECT
@@ -270,14 +273,12 @@ async def get_vrt_status(
                 for row in sources_to_check
             )
         )
-        # A replaced member probes healthy on its own, but the
-        # parent's stored VRT still names the old COG -- surface that as
-        # the member's own "stale" state instead of "fine".
-        # Compares STATE (what the member IS vs what the VRT
-        # was built FROM), not timestamps -- a replacement's `ingested_at`
-        # commits after a concurrent rebuild's read, so a timestamp
-        # comparison can read a healthy member as stale. `built_from` NULL
-        # means older VRTs, which fall back to the timestamp comparison.
+        # A replaced member probes healthy on its own, but the parent's stored
+        # VRT still names the old COG, so report it as "stale". Compares STATE
+        # (what the member is vs what the VRT was built from), not timestamps:
+        # a replacement's `ingested_at` commits after a concurrent rebuild's
+        # read and would read a healthy member as stale. A NULL `built_from`
+        # (older VRTs) falls back to the timestamp comparison.
         built_from = vrt_asset.built_from or None
         built_at = vrt_asset.last_regenerated_at or vrt_asset.ingested_at
         for row, file_exists in zip(sources_to_check, exists_results):
@@ -340,6 +341,7 @@ def _vrt_generation_item(generation: Any, *, include_detail: bool) -> VrtGenerat
     "/{dataset_id}/vrt/generations/",
     response_model=VrtGenerationListResponse,
     responses={403: FORBIDDEN_RESPONSE},
+    summary="List a VRT dataset's generations",
 )
 async def list_vrt_generations(
     dataset_id: uuid.UUID,
@@ -385,7 +387,6 @@ async def list_vrt_generations(
     )
     total = count_result.scalar() or 0
 
-    # Paginated results
     gen_result = await db.execute(
         select(VrtGeneration)
         .where(VrtGeneration.vrt_dataset_id == dataset_id)
@@ -405,6 +406,7 @@ async def list_vrt_generations(
     "/{dataset_id}/vrt/regenerate/",
     response_model=VrtMutationResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    summary="Regenerate a VRT dataset",
 )
 async def regenerate_vrt_endpoint(
     dataset_id: uuid.UUID,
@@ -428,6 +430,8 @@ async def regenerate_vrt_endpoint(
     # Owner-or-admin: regenerating mutates asset status and enqueues work;
     # any authenticated user could otherwise trigger it on a peer's raster.
     await check_dataset_write_access(db, dataset, dataset_id, user)
+    # Members were authorized when linked; their owners may have narrowed them since.
+    await check_vrt_members(db, dataset)
 
     asset_result = await db.execute(
         select(RasterAsset).where(RasterAsset.dataset_id == dataset_id)
@@ -456,6 +460,7 @@ async def regenerate_vrt_endpoint(
     )
     src_count = count_result.scalar() or 0
 
+    await lock_dataset_rows_for_write(db, dataset, raster_asset_cls=RasterAsset)
     generation = VrtGeneration(
         vrt_dataset_id=dataset_id,
         status="pending",

@@ -1,4 +1,4 @@
-"""fix(#1755 item 3): one rule for a service-credential token, on every door.
+"""One rule for a service-credential token, on every door.
 
 Every request model accepting a service credential judges its flat ``token`` by
 one shared function, and the door-side header-token policy is unchanged.
@@ -73,7 +73,7 @@ _WIDE_VOCABULARY_TOKEN = "aaaa+bbbb/cccc="
 _TOKEN_MAX_LENGTH = 1000
 
 # The rule is printable and whitespace-free, so these are what it refuses.
-# CR and LF are the header-smuggling primitive SEC-021 named.
+# CR and LF are the header-smuggling primitive named.
 _REFUSED_TOKENS = {
     "carriage return": "tok\rX-Injected: yes",
     "line feed": "tok\nX-Injected: yes",
@@ -255,7 +255,7 @@ def _assert_refused_without_the_token(resp, secret: str) -> None:
     """422 carrying the shared refusal code, and the credential absent."""
     assert resp.status_code == 422, resp.text
     detail = resp.json()["detail"]
-    # fix(#1924): a schema-layer refusal publishes the same code a door-layer
+    # A schema-layer refusal publishes the same code a door-layer
     # one does — the frontend banner and the CLI sentence key on it.
     assert detail["code"] == "invalid_service_token"
     assert "whitespace" in detail["message"]

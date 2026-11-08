@@ -1,4 +1,4 @@
-"""Tests for EXTENSION_API_VERSION constant + overlay compat check (OCG-04 core half).
+"""Tests for EXTENSION_API_VERSION constant + overlay compat check.
 
 Covers:
 - An overlay declaring the matching version loads successfully.
@@ -6,8 +6,6 @@ Covers:
 - An overlay that does not declare a version (treated as version-0/legacy) LOADS with a WARNING
   (backward compatibility — see check_extension_api_version; only declared-mismatch hard-fails).
 - A non-version loader exception (e.g. ImportError) is still caught + logged (broad-except preserved).
-
-References: OCG-04
 """
 
 from __future__ import annotations
@@ -35,13 +33,13 @@ class TestExtensionApiVersionConstant:
 
         v2 covered the required connector discovery/dispatch methods. v3 adds
         the ``mask_dataset`` keyword to ``ProcessingPort.run_analysis_preview``
-        (feat(#683), chat clip-by-layer) — the ``processing_port`` registry key
+        (chat clip-by-layer) — the ``processing_port`` registry key
         is overlay-populated, so changing that method's signature changes the
         expected type of a registry key, which version.py's bump convention
         names explicitly. v4 adds the required ``record_audience`` method to
-        ``PermissionExtension`` (feat(#1068)), which the convention names
+        ``PermissionExtension``, which the convention names
         outright: a required method added to a Protocol. v5 adds the required
-        ``reconcile_distributions`` method to ``ProcessingPort`` (fix(#1314)),
+        ``reconcile_distributions`` method to ``ProcessingPort``,
         the same case again: the registered-PostGIS refresh and the reupload
         swap call it inside their write transactions whenever the modality
         they measured differs from the stored one, so an overlay that replaces
@@ -58,7 +56,7 @@ class TestExtensionApiVersionConstant:
         required.
 
         v7 adds the required ``get_retired_table_name_orm_class`` method to
-        ``ProcessingPort`` (fix(#1443)), the same case a third time.
+        ``ProcessingPort``, the same case a third time.
         ``generate_table_name`` lives in processing/ and cannot import the
         catalog model it now probes, so it reaches one through this accessor —
         on every ingest, analysis output, and layer materialization. An overlay
@@ -67,7 +65,7 @@ class TestExtensionApiVersionConstant:
         keeping a freed table name from reaching a successor that would inherit
         its predecessor's cached authorization.
 
-        v8 carries TWO ``CatalogPort`` changes (fix(#1546)). A required
+        v8 carries TWO ``CatalogPort`` changes. A required
         ``resolve_embedding_config`` method: stored embeddings now record the
         configuration that produced them, semantic search filters on it, and
         ``modules/catalog/`` may not import ``app.processing.*``, so the answer
@@ -78,7 +76,7 @@ class TestExtensionApiVersionConstant:
         raises TypeError on the first semantic search. Both are required in the
         convention's sense, and both land in one change, so they share a bump.
 
-        v9 carries two ``CatalogPort`` shape changes (fix(#1580)), on the
+        v9 carries two ``CatalogPort`` shape changes, on the
         related-items path. ``get_record_embedding`` returns the anchor row's
         ``(embedding, model_name, config_fingerprint)`` rather than a bare
         vector, because that comparison is between two STORED rows and the
@@ -122,11 +120,38 @@ class TestExtensionApiVersionConstant:
         v16 adds the required ``restore_previous_version_task`` method to
         ``CatalogPort``, which the previous-version restore route defers.
 
+        v17 adds the required ``vrt_members_beyond_audience`` method to
+        ``ProcessingPort``. Raster tile serving and VRT builds call it, so an
+        overlay that replaces the ``processing_port`` key without it fails
+        every VRT tile and build.
+
+        v18 adds the required ``vrts_beyond_member_audience`` method to
+        ``ProcessingPort``. Both tile-token endpoints call it, so an overlay
+        that replaces the ``processing_port`` key without it fails every
+        raster tile token.
+
+        v19 lets members of a sharing group granted on a ``restricted``
+        dataset read it. The ``permission`` methods keep their signatures, so
+        an overlay replacing that key must add the group branch itself.
+
+        v20 adds the required ``compare_and_set`` and ``compare_and_delete``
+        methods to ``CacheProvider``. An overlay that replaces the cache
+        provider without them fails on its first token-conditional health-alert
+        claim.
+
+        v21 makes ``ProcessingPort.build_gdal_source`` take the optional
+        ``return_z`` keyword. An overlay that replaces the ``processing_port``
+        key without it gets a TypeError on ArcGIS imports.
+
+        v22 adds the required ``get_reader_theme`` method to
+        ``BrandingExtension``. An overlay that replaces the ``branding`` key
+        without it serves story and dashboard pages no reader theme.
+
         Update this pin, and the note above it, whenever the constant moves.
         """
         from app.platform.extensions.version import EXTENSION_API_VERSION
 
-        assert EXTENSION_API_VERSION == 16
+        assert EXTENSION_API_VERSION == 22
 
 
 class TestCheckExtensionApiVersion:

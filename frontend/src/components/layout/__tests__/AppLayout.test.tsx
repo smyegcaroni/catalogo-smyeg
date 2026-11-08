@@ -86,6 +86,7 @@ describe('AppLayout', () => {
         is_active: true,
         status: 'active',
         last_login_at: null,
+        can_reset_password: true,
         created_at: '2026-01-01T00:00:00Z',
         roles: ['settings-operator'],
       },
@@ -96,7 +97,7 @@ describe('AppLayout', () => {
     expect(document.querySelector('a[href="/admin"]')).not.toBeNull();
   });
 
-  // fix(#817): a multi-tenant fleet operator can hold manage_tenants alone —
+  // A multi-tenant fleet operator can hold manage_tenants alone —
   // the admin routes admit them, so the navbar entry must be discoverable too.
   it('shows the admin entry to a manage_tenants-only fleet operator in multi-tenant mode', () => {
     permissionState.manageTenants = true;
@@ -119,6 +120,7 @@ describe('AppLayout', () => {
         is_active: true,
         status: 'active',
         last_login_at: null,
+        can_reset_password: true,
         created_at: '2026-01-01T00:00:00Z',
         roles: ['fleet-operator'],
       },
@@ -167,6 +169,12 @@ describe('AppLayout', () => {
     expect(screen.getByRole('contentinfo')).toBeInTheDocument();
   });
 
+  it.each(['/stories/story-1', '/stories/story-1/edit'])('lays out %s full height, without the footer', (path) => {
+    const { container } = renderAppLayout([path]);
+    expect(screen.queryByRole('contentinfo')).not.toBeInTheDocument();
+    expect(container.firstElementChild).toHaveClass('h-dvh');
+  });
+
   it('hides footer on editor map builder pages', () => {
     useAuthStore.setState({
       token: 'token',
@@ -179,6 +187,7 @@ describe('AppLayout', () => {
         is_active: true,
         status: 'active',
         last_login_at: null,
+        can_reset_password: true,
         created_at: '2026-01-01T00:00:00Z',
         roles: ['editor'],
       },
@@ -220,6 +229,7 @@ describe('AppLayout', () => {
         is_active: true,
         status: 'active',
         last_login_at: null,
+        can_reset_password: true,
         created_at: '2026-01-01T00:00:00Z',
         roles: ['editor'],
       },

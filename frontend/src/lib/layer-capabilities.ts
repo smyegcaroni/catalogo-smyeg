@@ -1,16 +1,12 @@
 import type { MapLayerResponse } from '@/types/api';
 import { classifyGeometry } from '@/components/builder/layer-adapters/shared';
 
-export type LayerKind = 'vector' | 'raster' | 'vrt';
+type LayerKind = 'vector' | 'raster' | 'vrt';
 
 /**
  * Returns true when a layer represents a folder group (layer_type starts with
  * 'group:folder'). Use this single predicate everywhere a folder-group check
- * is needed so all callers stay consistent if new group subtypes are added.
- *
- * If a future phase introduces a new group subtype (e.g. 'group:cluster') and
- * that subtype should have different render or menu behaviour, update this
- * predicate and document the intentional split with a comment at each call site.
+ * is needed.
  */
 export function isFolderGroupLayer(
   layer: { layer_type?: string | null },
@@ -18,7 +14,7 @@ export function isFolderGroupLayer(
   return ((layer.layer_type as string | null | undefined) ?? '').startsWith('group:folder');
 }
 
-export interface LayerCapabilities {
+interface LayerCapabilities {
   kind: LayerKind;
   supportsStyleEditor: boolean;
   supportsFilterEditor: boolean;
@@ -31,9 +27,6 @@ export interface LayerCapabilities {
 /**
  * Classify a map layer into its capability set based on layer_type,
  * dataset_record_type, and dataset_geometry_type.
- *
- * Consolidates the branching logic previously duplicated across
- * BuilderMap, StackRow, and MapBuilderPage.
  */
 export function getLayerCapabilities(
   layer: Pick<MapLayerResponse, 'layer_type' | 'dataset_record_type' | 'dataset_geometry_type'>,
@@ -64,10 +57,8 @@ export function getLayerCapabilities(
     };
   }
 
-  // Vector layer — derive map layer type from geometry.
-  // builder-audit #338 ADAPT-02/DRY-05: consume the canonical classifier instead of a
-  // local POINT/LINE substring ladder. polygon and `other` (e.g.
-  // GEOMETRYCOLLECTION) both map to fill/polygon, preserving prior behavior.
+  // Vector layer: derive map layer type from the canonical classifier. polygon
+  // and `other` (e.g. GEOMETRYCOLLECTION) both map to fill/polygon.
   const family = classifyGeometry(layer.dataset_geometry_type);
   let mapLayerType: 'fill' | 'line' | 'circle';
   let iconVariant: 'point' | 'line' | 'polygon';
@@ -92,4 +83,36 @@ export function getLayerCapabilities(
     mapLayerType,
     iconVariant,
   };
+}
+
+// Record types the rows endpoint refuses (no PostGIS feature table behind
+// them): raster family plus the stored-file datasets. Mirrors the backend's
+// capabilities().feature_table — a denylist so a record type arriving without
+// the field on an older server keeps the action, like isAnalysableLayer.
+const NO_DATA_TABLE_RECORD_TYPES = new Set([
+  'raster_dataset',
+  'vrt_dataset',
+  'tiles3d_dataset',
+  'pointcloud_dataset',
+]);
+
+/**
+ * True when a layer can open the read-only attribute table drawer: a dataset
+ * backed layer whose record type carries a feature table AND that renders as
+ * a vector layer (add_layer lets the caller's layer_type override the
+ * dataset-derived one, so the record type alone does not say what the layer
+ * draws). Excludes the raster family, terrain (DEM), the stored-file
+ * datasets, folder-group rows, basemaps (own rows, no kebab) and unsaved
+ * previews (own row type).
+ */
+export function canOpenAttributeTable(
+  layer: Pick<MapLayerResponse, 'dataset_id' | 'is_dem' | 'layer_type' | 'dataset_record_type'>,
+): boolean {
+  return (
+    !isFolderGroupLayer(layer) &&
+    !!layer.dataset_id &&
+    !layer.is_dem &&
+    layer.layer_type !== 'raster_geolens' &&
+    !NO_DATA_TABLE_RECORD_TYPES.has((layer.dataset_record_type ?? '').toLowerCase())
+  );
 }

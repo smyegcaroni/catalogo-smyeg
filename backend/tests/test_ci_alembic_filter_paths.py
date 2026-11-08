@@ -1,4 +1,4 @@
-"""OCG-02: ci.yml paths-filter guard tests.
+"""ci.yml paths-filter guard tests.
 
 Parses the alembic filter list from .github/workflows/ci.yml and asserts:
 1. Every glob in the alembic filter matches at least one real file on disk
@@ -7,21 +7,16 @@ Parses the alembic filter list from .github/workflows/ci.yml and asserts:
 3. At least one glob covers real model modules (e.g. backend/app/core/db/models.py
    or the backend/app/**/models.py family) so a model-only PR triggers alembic check.
 
-It also guards the ``backend`` filter (fix(#1088)): every ``scripts/`` file a
+It also guards the ``backend`` filter: every ``scripts/`` file a
 backend test reads by literal path must be in that filter, or the suite that
 asserts against the file skips on the very PR that changes it.
 
-fix(#1778): the currency check above only scanned for
-``scripts/...`` literals — it had no ``frontend/...`` or ``e2e/...`` half, so
-several frontend files and one e2e spec that backend cross-language/parity
-tests read by literal path drifted out of the ``backend`` filter with nothing
-noticing. Both halves now share one scanner (``_referenced_by_backend_tests``)
+The currency check covers ``scripts/...`` literals and also ``frontend/...``
+and ``e2e/...`` ones that backend cross-language/parity tests read by literal
+path. Both halves share one scanner (``_referenced_by_backend_tests``)
 parameterized by pattern.
 
 These tests run locally (filesystem + YAML parse only; no Docker, no DB).
-They are the locally-verifiable proof of the CI fix (OCG-02).
-
-References: OCG-02, #1088
 """
 
 from __future__ import annotations
@@ -75,24 +70,39 @@ def _parse_alembic_filter_globs() -> list[str]:
     return _parse_filter_globs("alembic")
 
 
+_PATH_PARTS = re.compile(r'"(scripts|frontend|e2e)"((?:\s*/\s*"[^"\n]+")+)')
+_PATH_PART = re.compile(r'"([^"\n]+)"')
+
+# Tests of the filters themselves, which name paths as filter inputs.
+_FILTER_TESTS = frozenset({pathlib.Path(__file__).name, "test_ci_job_selection.py"})
+
+
 def _referenced_by_backend_tests(pattern: re.Pattern[str]) -> dict[str, list[str]]:
     """Map each path matching *pattern* that a backend test names to the tests
     naming it.
 
-    Literal-path reads only. A test that shells out to (or imports) a path it
-    never names is invisible here, which is the limit of this guard, not a
-    reason to skip it.
+    A test names a path either as one literal (``"scripts/x.sh"``) or as quoted
+    parts joined with ``/`` (``ROOT / "scripts" / "x.sh"``). A test that shells
+    out to (or imports) a path it never names is invisible here, which is the
+    limit of this guard, not a reason to skip it.
     """
     found: dict[str, list[str]] = {}
     tests_dir = REPO_ROOT / "backend" / "tests"
     for path in sorted(tests_dir.rglob("*")):
         if not path.is_file() or path.suffix not in {".py", ".sh"}:
             continue
+        if path.name in _FILTER_TESTS:
+            continue
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:  # pragma: no cover - unreadable file
             continue
-        for ref in set(pattern.findall(text)):
+        joined = {
+            "/".join([m.group(1), *_PATH_PART.findall(m.group(2))])
+            for m in _PATH_PARTS.finditer(text)
+        }
+        refs = set(pattern.findall(text)) | {j for j in joined if pattern.fullmatch(j)}
+        for ref in refs:
             if (REPO_ROOT / ref).is_file():
                 found.setdefault(ref, []).append(path.name)
     return found
@@ -100,15 +110,34 @@ def _referenced_by_backend_tests(pattern: re.Pattern[str]) -> dict[str, list[str
 
 _SCRIPTS_PATTERN = re.compile(r"scripts/[A-Za-z0-9_./-]+\.(?:sh|py|yml|yaml)")
 
-# fix(#1778): ``tsx`` MUST precede ``ts`` in the
+# ``tsx`` MUST precede ``ts`` in the
 # extension alternation. The greedy path class backtracks into whichever
 # alternative matches first, so ``ts`` before ``tsx`` silently resolves
 # ``AuditLogViewer.tsx`` to the nonexistent ``AuditLogViewer.ts`` — the
-# ``is_file()`` check below then drops it, which is exactly how this file
-# went uncovered by the scanner (and the filter) for as long as it did.
+# ``is_file()`` check below then drops it, which is how a file can go
+# uncovered by the scanner (and the filter).
 _FRONTEND_PATTERN = re.compile(
     r"(?:frontend|e2e)/[A-Za-z0-9_./-]+\.(?:tsx|ts|json|conf|js|html|md)"
 )
+
+
+# Backend tests that name a frontend file only in a comment or docstring. None
+# of them reads it, so it stays out of the backend filter and a frontend-only
+# PR editing it does not run the backend shards. Only the listed test files are
+# exempt; any other backend test naming the path still needs filter coverage.
+_PROSE_ONLY_FRONTEND_REFERENCES: dict[str, frozenset[str]] = {
+    "frontend/package.json": frozenset({"test_audit_1778_docs.py"}),
+    "frontend/vite.config.ts": frozenset({"test_redirect_slashes.py"}),
+    "frontend/src/components/admin/__tests__/AdminSidebar.test.tsx": frozenset(
+        {"test_saml_overlay.py"}
+    ),
+    "frontend/src/lib/__tests__/public-urls.test.ts": frozenset(
+        {"test_public_app_url_shape_contract_1548.py"}
+    ),
+    "frontend/src/lib/normalize-style-config.ts": frozenset(
+        {"test_legacy_builder_paint_keys_drift.py"}
+    ),
+}
 
 
 def _scripts_referenced_by_backend_tests() -> dict[str, list[str]]:
@@ -134,7 +163,7 @@ class TestAlembicFilterGlobs:
         """backend/app/models/** must NOT be in the alembic filter.
 
         This directory was deleted in b63803c1. Its continued presence silently
-        lets model-only PRs bypass the alembic drift check (OCG-02 root cause).
+        lets model-only PRs bypass the alembic drift check (root cause).
         """
         globs = _parse_alembic_filter_globs()
         dead = "backend/app/models/**"
@@ -148,7 +177,7 @@ class TestAlembicFilterGlobs:
         """Every path glob in the alembic filter must match ≥1 existing file.
 
         A glob that matches nothing means no PR touching those files will trigger
-        the alembic drift check — a silent CI gap (the original OCG-02 bug).
+        the alembic drift check — a silent CI gap.
         """
         globs = _parse_alembic_filter_globs()
         missing: list[str] = []
@@ -221,7 +250,7 @@ class TestAlembicFilterGlobs:
 
 
 class TestPullRequestDiffBase:
-    """fix(#1094): the PR diff base must not be the stale pull_request.base.sha."""
+    """The PR diff base must not be the stale pull_request.base.sha."""
 
     def _changes_steps(self) -> list[dict]:
         with CI_YML_PATH.open() as fh:
@@ -290,7 +319,7 @@ class TestPullRequestDiffBase:
 
 
 class TestBackendFilterCoversReferencedScripts:
-    """fix(#1088): guard the backend filter against the skipped-suite trap."""
+    """Guard the backend filter against the skipped-suite trap."""
 
     def test_every_backend_glob_matches_at_least_one_real_file(self):
         """No dead globs in the backend filter.
@@ -352,15 +381,13 @@ class TestBackendFilterCoversReferencedScripts:
         """Every frontend/ or e2e/ file a backend test reads must trigger
         Backend Tests.
 
-        fix(#1778): the currency check above only had a
-        scripts/ half. Several frontend files and one e2e spec that backend
-        cross-language/parity tests read by literal path — most notably
-        frontend/src/components/admin/AuditLogViewer.tsx, which
-        test_audit_action_registry.py's bidirectional audit-action parity
-        gate reads — were absent from the 'backend' filter with nothing
-        checking for it. A PR editing only that file matched the 'frontend'
-        filter but not 'backend', so Backend Tests skipped and the parity
-        gate never ran. Same "skipped required job reads as green" trap as
+        The currency check above covers more than the scripts/ half: frontend files and
+        e2e specs that backend cross-language/parity tests read by literal path — most
+        notably frontend/src/components/admin/AuditLogViewer.tsx, which
+        test_audit_action_registry.py's bidirectional audit-action parity gate reads —
+        must be in the 'backend' filter. A PR editing only that file would otherwise
+        match the 'frontend' filter but not 'backend', so Backend Tests would skip and
+        the parity gate never run. Same "skipped required job reads as green" trap as
         the scripts/ test above.
         """
         referenced = _frontend_referenced_by_backend_tests()
@@ -377,7 +404,13 @@ class TestBackendFilterCoversReferencedScripts:
                 covered.add(str(pathlib.Path(match).relative_to(REPO_ROOT)))
 
         uncovered = {
-            ref: tests for ref, tests in referenced.items() if ref not in covered
+            ref: unexempt
+            for ref, tests in referenced.items()
+            if ref not in covered
+            and (
+                unexempt := set(tests)
+                - _PROSE_ONLY_FRONTEND_REFERENCES.get(ref, frozenset())
+            )
         }
         assert not uncovered, (
             "These frontend/ or e2e/ files are read by backend tests but are "
@@ -388,5 +421,24 @@ class TestBackendFilterCoversReferencedScripts:
                 f"  - {ref}  (read by {', '.join(sorted(tests))})"
                 for ref, tests in sorted(uncovered.items())
             )
-            + "\n\nAdd each path to the 'backend' filter."
+            + "\n\nAdd each path to the 'backend' filter, or, when a test only "
+            "mentions it in a comment or docstring, to "
+            "_PROSE_ONLY_FRONTEND_REFERENCES."
+        )
+
+    def test_prose_only_allowlist_names_only_current_mentions(self):
+        """An allowlist entry whose test no longer names the path is dead.
+
+        Leaving it would exempt a later, real read of that file from the scan
+        above.
+        """
+        referenced = _frontend_referenced_by_backend_tests()
+        stale = {
+            ref: sorted(tests - set(referenced.get(ref, [])))
+            for ref, tests in _PROSE_ONLY_FRONTEND_REFERENCES.items()
+            if tests - set(referenced.get(ref, []))
+        }
+        assert not stale, (
+            "These _PROSE_ONLY_FRONTEND_REFERENCES entries name tests that no "
+            f"longer mention the path; remove them: {stale}"
         )

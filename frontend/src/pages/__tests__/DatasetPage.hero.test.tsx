@@ -46,7 +46,7 @@ vi.mock('@/components/dataset/hooks/use-dataset', () => ({
   useUpdateAttribute: () => ({ mutateAsync: vi.fn() }),
   useDatasetHistory: () => ({ data: { history: [], total: 0 }, isLoading: false }),
   useDatasetRows: () => ({ data: { rows: [], total: 0 }, isLoading: false }),
-  // fix(#1285 codex round 4): mounted at the page level now.
+  // Mounted at the page level now.
   useDatasetRefreshWatch: () => ({ latestRun: undefined, isBusy: false, trackDispatchedRun: vi.fn() }),
 }));
 
@@ -97,7 +97,7 @@ vi.mock('@/components/dataset/DatasetDeleteDialog', () => ({
 }));
 
 vi.mock('@/components/dataset/ReuploadDialog', () => ({
-  // codex(#1362 r1): exposes onReplaceComplete as a clickable stub so tests
+  // Exposes onReplaceComplete as a clickable stub so tests
   // can simulate "a raster reupload job just completed" without driving the
   // full dialog flow (that flow is covered in ReuploadDialog.test.tsx).
   ReuploadDialog: (props: { onReplaceComplete?: () => void }) => (
@@ -197,6 +197,7 @@ const EDITOR_USER: UserResponse = {
   is_active: true,
   status: 'active',
   last_login_at: null,
+  can_reset_password: true,
   created_at: '2026-03-01T00:00:00Z',
   roles: ['editor'],
 };
@@ -206,6 +207,10 @@ function makeDataset(overrides: Partial<DatasetResponse> = {}): DatasetResponse 
     id: 'dataset-1',
     record_id: 'record-1',
     table_name: 'world_countries',
+    source_health: 'unknown',
+    schema_drift_status: 'unknown',
+    source_freshness: 'unknown',
+    has_generic_geometry: false,
     title: 'World Countries',
     summary: 'Original summary',
     srid: 4326,
@@ -292,7 +297,7 @@ describe('DatasetPage hero state machine', () => {
     setup({ record_type: 'raster_dataset', raster: { tile_url: '/raster-tiles/test/{z}/{x}/{y}.png' } as DatasetResponse['raster'] });
     render(<DatasetPage />, { route: '/datasets/dataset-1' });
 
-    // PERF-06 (Phase 274): DatasetMap is lazy-loaded — flush the dynamic
+    // DatasetMap is lazy-loaded — flush the dynamic
     // import microtask under fake timers so the lazy module resolves before
     // we assert the mock is in the DOM. After this first test, the lazy
     // module is cached for the rest of the suite.
@@ -369,12 +374,12 @@ describe('DatasetPage hero state machine', () => {
     expect(screen.getByText('Tiles may still be processing')).toBeInTheDocument();
   });
 
-  // codex(#1362 r1): a raster's tile URL is a fixed per-dataset route (not
+  // A raster's tile URL is a fixed per-dataset route (not
   // content-versioned), and the hero map's MapLibre raster source is added
   // once and never re-added on prop change — so ReuploadDialog's
   // onReplaceComplete is wired to handleRetry (the same remount mechanism
   // the manual Retry button uses) to pick up a completed replacement.
-  // codex(#1362 r4): onReplaceComplete must remount the hero map WITHOUT
+  // onReplaceComplete must remount the hero map WITHOUT
   // spending the manual-retry budget — a successful replace is not a failed
   // retry, and routing it through handleRetry would leave a later genuine
   // tile failure unretryable once 3 replaces (or a mix of retries/replaces)
@@ -484,25 +489,28 @@ describe('DatasetPage header status badge', () => {
     setUser(null);
   });
 
-  // fix(#430 V-07): "Private" badge alone next to the "Unpublish" action read as a
-  // contradiction (no visible cue explaining why "Unpublish" was offered).
-  // Catalog publish-state and access visibility are orthogonal — both axes
-  // are now always labeled explicitly ("Catalog: <status>" / "Access:
-  // <visibility>") so a published-but-private dataset reads unambiguously.
-  it('shows an explicit "Catalog: Published" badge alongside "Access: Private" for a published-but-private dataset', () => {
+  // Catalog status and visibility are separate axes; one badge states both so a
+  // published but private dataset can't be read as public.
+  it('states a published private dataset is private in the catalog badge', () => {
     setup({ record_status: 'published', visibility: 'private' });
     render(<DatasetPage />, { route: '/datasets/dataset-1' });
 
-    expect(screen.getByText('Catalog: Published')).toBeInTheDocument();
-    expect(screen.getByText('Access: Private')).toBeInTheDocument();
+    expect(screen.getByText('Catalog: Published · Private')).toBeInTheDocument();
+    expect(screen.queryByText('Catalog: Published')).not.toBeInTheDocument();
   });
 
-  it('shows an explicit "Catalog: Draft" badge for a draft dataset', () => {
+  it('states a published public dataset is public in the catalog badge', () => {
+    setup({ record_status: 'published', visibility: 'public' });
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    expect(screen.getByText('Catalog: Published · Public')).toBeInTheDocument();
+  });
+
+  it('shows draft status with its visibility', () => {
     setup({ record_status: 'draft', visibility: 'private' });
     render(<DatasetPage />, { route: '/datasets/dataset-1' });
 
-    expect(screen.getByText('Catalog: Draft')).toBeInTheDocument();
-    expect(screen.getByText('Access: Private')).toBeInTheDocument();
+    expect(screen.getByText('Catalog: Draft · Private')).toBeInTheDocument();
   });
 
   it('wires detail freshness and health fields into header chips', () => {

@@ -1,15 +1,14 @@
 """Chat-based map editing service: facade re-exporting from chat_* sub-modules.
 
 Preserves the stable public import path used by router.py, streaming.py,
-metadata_service.py, service.py, and tests — both the public orchestrator
+metadata_service.py, service.py, and tests: the public orchestrator
 (``chat_edit_map``, ``build_chat_system_prompt``) and the private helpers
 pulled from sibling modules for patching (see ``__all__`` below).
 
 ``generate_sql`` and ``validate_and_execute`` are imported here AT module
-level so existing tests can patch
-``app.processing.ai.chat_service.generate_sql``/``.validate_and_execute``
-and the patch is honored at every call site (chat_actions._handle_query_data
-looks them up via this module — see chat_actions.py for the rationale).
+level so a patch of ``app.processing.ai.chat_service.generate_sql`` or
+``.validate_and_execute`` is honored at every call site:
+``chat_actions._handle_query_data`` looks them up through this module.
 """
 
 import json
@@ -18,28 +17,24 @@ from typing import TYPE_CHECKING
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.db import release_connection
 from app.core.identity import Identity
 from app.platform.extensions import get_ai_provider
 from app.platform.sandbox import validate_and_execute  # re-exported (test patch target)
 
-# Re-exports — public names every external caller may import from this facade.
-# Sub-module imports first; the facade-only orchestrator follows below.
+# Re-exports: public names every external caller may import from this facade.
 from app.processing.ai.chat_actions import (
-    _build_label_action,
     _collect_chat_action,
     _execute_chat_tool,
     _handle_query_data,
 )
 from app.processing.ai.chat_constants import (
-    _EDIT_TOOLS,
     TOOL_RESULT_PROTOCOL,
     _MAX_COLUMNS_PER_LAYER,
     _MAX_SAMPLE_COLS,
     _MAX_SYSTEM_PROMPT_LAYERS,
     ERROR_MESSAGES,
     QUERY_RESULT_SANITY_PROMPT,
-    RAMP_COLORS,
-    _get_ramp_colors,
     _sanitize_layer_name,
     fence_untrusted_content,
     lang_name,
@@ -48,26 +43,9 @@ from app.processing.ai.chat_constants import (
 from app.processing.ai.chat_dataset import (
     build_dataset_chat_system_prompt,
 )  # re-exported (facade contract — router imports via this module)
-from app.processing.ai.chat_geojson import (
-    _detect_geom_column,
-    _extract_geojson,
-    _is_geom_value,
-    _safe_value,
-    safe_rows,
-    ensure_geometry_selected,
-    strip_geometry_columns,
-)
-from app.processing.ai.chat_styles import (
-    _build_categorical_style,
-    _build_data_driven_style,
-    _build_graduated_style,
-    _get_color_property,
-)
 from app.processing.ai.chat_validation import (
     _build_chat_actions,
-    _extract_get_refs,
     _validate_actions,
-    _validate_filter_columns,
 )
 from app.processing.ai.llm_loop import resolve_provider
 from app.processing.ai.schemas import (
@@ -97,7 +75,6 @@ __all__ = [
     "build_dataset_chat_system_prompt",
     # Constants / language utilities (used by service.py + metadata_service.py)
     "ERROR_MESSAGES",
-    "RAMP_COLORS",
     "lang_name",
     # Tool-call entry points (used by streaming.py + tests)
     "_execute_chat_tool",
@@ -106,31 +83,10 @@ __all__ = [
     # Validation (used by streaming.py)
     "_build_chat_actions",
     "_validate_actions",
-    "_validate_filter_columns",
-    "_extract_get_refs",
-    # GeoJSON helpers (used by tests)
-    "_is_geom_value",
-    "_detect_geom_column",
-    "_safe_value",
-    "safe_rows",
-    "_extract_geojson",
-    "ensure_geometry_selected",
-    "strip_geometry_columns",
     # Test patch targets (kept module-level so unittest.mock.patch resolves
     # ``app.processing.ai.chat_service.{generate_sql,validate_and_execute}``)
     "generate_sql",
     "validate_and_execute",
-    # Style builders (kept available; not imported by external callers but
-    # tests inspect the facade surface).
-    "_build_data_driven_style",
-    "_build_categorical_style",
-    "_build_graduated_style",
-    "_get_color_property",
-    # Action helpers
-    "_build_label_action",
-    # Tool name set
-    "_EDIT_TOOLS",
-    "_get_ramp_colors",
 ]
 
 
@@ -145,21 +101,20 @@ def build_chat_system_prompt(
     When ``can_edit`` is False the caller may view but not edit the map (the AI
     is given read-only tools — see ``select_chat_tools``); a read-only directive
     is injected so the model declines edit requests instead of silently failing.
-    ``can_edit`` also gates the query_data filter-offer note (#1242): only an
-    editor has set_filter available to fulfil it.
+    ``can_edit`` also gates the query_data filter-offer note: only an editor
+    has set_filter available to fulfil it.
     """
-    # Cap layers to prevent unbounded prompt growth
+    # Cap layers to bound prompt growth.
     display_layers = layers[:_MAX_SYSTEM_PROMPT_LAYERS]
     truncated_count = len(layers) - len(display_layers)
 
     layers_desc = []
     for layer in display_layers:
-        # Limit column info to first N columns to avoid token bloat
         cols_raw = layer.column_info or []
         cols_limited = cols_raw[:_MAX_COLUMNS_PER_LAYER]
-        # fix(#1778): column names reach here from the client for a map layer
-        # and from an upstream service schema for an ArcGIS/STAC ingest, so
-        # they carry the same injection risk as the layer name sanitized below.
+        # Column names come from the client for a map layer and from an
+        # upstream service schema for an ArcGIS/STAC ingest, so they carry the
+        # same injection risk as the layer name sanitized below.
         cols_str = ", ".join(
             f"{sanitize_dataset_value(c.get('name', '?'))} "
             f"({sanitize_dataset_value(c.get('type', '?'))})"
@@ -178,7 +133,7 @@ def build_chat_system_prompt(
         if layer.paint:
             summary_parts.append(f"Paint: {json.dumps(layer.paint)}")
 
-        # Dataset metadata lines — dataset_title is also user-controlled, sanitize it
+        # dataset_title is user-controlled too.
         title_str = (
             f"\n  Title: {_sanitize_layer_name(layer.dataset_title)}"
             if layer.dataset_title
@@ -188,7 +143,6 @@ def build_chat_system_prompt(
             f"\n  Features: {layer.feature_count}" if layer.feature_count else ""
         )
 
-        # Sample values (limit to first N columns, 5 values each)
         sample_str = ""
         if layer.sample_values:
             sample_parts = []
@@ -196,8 +150,8 @@ def build_chat_system_prompt(
                 :_MAX_SAMPLE_COLS
             ]:
                 vals = values[:5] if isinstance(values, list) else [values]
-                # fix(#1778): raw row content — the one field on this layer
-                # that an attacker controls end to end via a public dataset.
+                # Raw row content: the one field on this layer an attacker
+                # controls end to end via a public dataset.
                 safe_col = sanitize_dataset_value(col_name)
                 safe_vals = [sanitize_dataset_value(v) for v in vals]
                 sample_parts.append(f"{safe_col}: {safe_vals}")
@@ -242,13 +196,10 @@ def build_chat_system_prompt(
         )
     )
 
-    # feat(#1242): companion to query_data/set_filter, not a rewrite — this
-    # fires AFTER query_data answers a QUESTION, so it never decides which
-    # tool a request reaches. It must stay an OFFER, once: #549 is the
-    # regression where "show me the..." silently landed on a persistent
-    # filter, reverted because a read-shaped question must never mutate
-    # saved map state on its own. Gated on can_edit — a read-only caller
-    # has no set_filter tool, so offering it here would be broken.
+    # Fires AFTER query_data answers a QUESTION, so it never decides which
+    # tool a request reaches. It must stay an OFFER, once: a read-shaped
+    # question ("show me the...") must never mutate saved map state on its own.
+    # Gated on can_edit: a read-only caller has no set_filter tool.
     filter_offer_note = (
         (
             "\n- If the question was a simple row predicate on a layer "
@@ -265,10 +216,10 @@ def build_chat_system_prompt(
         else ""
     )
 
-    # fix(#1778): the fence is assembled by one helper that also strips
-    # any forged marker out of the block. Interpolating the tags here would
-    # have left the id, the serialized filter and the paint dict able to close
-    # the region early, since none of those pass through a sanitizer.
+    # One helper assembles the fence and strips any forged marker from the
+    # block. Interpolating the tags here would leave the id, the serialized
+    # filter and the paint dict able to close the region early, since none of
+    # those pass through a sanitizer.
     fenced_layers = fence_untrusted_content(
         f"{chr(10).join(layers_desc)}{truncation_note}"
     )
@@ -291,6 +242,7 @@ You are a map editing assistant. The user has a map with these layers:
   - circle-color for Point/MultiPoint
 - For data-driven coloring (e.g., "color by population"), use set_data_driven_style, NOT set_style.
 - For simple flat color changes (e.g., "make it red"), use set_style. set_style patches the current paint; omitted paint properties are preserved.
+- To change how a layer is drawn (heatmap, cluster, symbol, arrows, outline only, 3D extrusion), use set_render_as; paint properties cannot switch the render type. When the same request also tunes the new type, call set_render_as before set_style.
 - To remove a stale style property, pass clear_paint with the property name (for example clear_paint: ["line-gradient"] when changing a line from gradient back to solid).
 - Use replace_paint=true only when you are providing the full desired paint object.
   Example paint: {{"fill-color": "#ef4444", "fill-opacity": 0.7, "_outline-color": "#dc2626"}}
@@ -346,7 +298,7 @@ You are a map editing assistant. The user has a map with these layers:
 - Respond in PLAIN TEXT only. The chat panel does not render markdown: never
   use **bold**, headers, backticks, or [links](...). Simple "- " bullet lines
   are fine.
-- For raster layers (marked "[raster layer]"), only use set_opacity (with layer_id and opacity 0.0-1.0) or toggle_visibility. Do not use set_style, set_filter, set_label, or set_data_driven_style on raster layers.
+- For raster layers (marked "[raster layer]"), only use set_opacity (with layer_id and opacity 0.0-1.0) or toggle_visibility. Do not use set_style, set_render_as, set_filter, set_label, or set_data_driven_style on raster layers.
 - To add a raster dataset as a layer, use search_datasets then add_layer — same as vector.
 - The current basemap is: {basemap_style or "unknown"}.{" This is a dark basemap — use light colors for labels (#e5e7eb) and outlines (#d1d5db)." if basemap_style and "dark" in basemap_style.lower() else " Use dark colors for labels (#333333) and outlines (#374151)."}
 
@@ -411,11 +363,10 @@ async def chat_edit_map(
     selected_tools = select_chat_tools(can_edit)
     allowed_tool_names = {t["name"] for t in selected_tools}
 
-    # Build tool executor bound to this session/user/layers. The non-streaming
-    # complete() loop is advertised-tool constrained and has no XML fallback, but
-    # we still reject tool names outside the selected set at execution AND
-    # collection so a view-only caller can never run or receive a mutating action
-    # (defense-in-depth, uniform with the streaming path).
+    # The non-streaming complete() loop is constrained to advertised tools and
+    # has no XML fallback, but tool names outside the selected set are still
+    # rejected at execution AND collection so a view-only caller can never run
+    # or receive a mutating action (defense in depth, as on the streaming path).
     async def tool_executor(tool_name: str, tool_input: dict) -> dict:
         if tool_name not in allowed_tool_names:
             logger.warning(
@@ -423,7 +374,7 @@ async def chat_edit_map(
                 tool=tool_name,
             )
             return {"error": "Tool not permitted for this map."}
-        return await _execute_chat_tool(
+        result = await _execute_chat_tool(
             tool_name,
             tool_input,
             session,
@@ -433,6 +384,8 @@ async def chat_edit_map(
             port=port,
             map_id=map_id,
         )
+        await release_connection(session)
+        return result
 
     def collect_allowed_action(
         tool_name: str, tool_input: dict, tool_result: dict
@@ -441,9 +394,9 @@ async def chat_edit_map(
             return None
         return _collect_chat_action(tool_name, tool_input, tool_result)
 
-    # fix(#1778): one accounting shape at every provider call site.
-    # The tokens are spent the moment the provider answers, so any way out of
-    # the loop must still bill the daily cap: an exhaustion, a later request
+    await release_connection(session)
+    # Tokens are spent the moment the provider answers, so any way out of the
+    # loop must still bill the daily cap: an exhaustion, a later request
     # failure, a tool executor that raises, or a client that disconnects.
     async with usage_accounting(
         session, user_id=user.id, subsystem="chat", model=model
@@ -467,7 +420,6 @@ async def chat_edit_map(
     )
 
     await record_token_usage(
-        session,
         user_id=user.id,
         subsystem="chat",
         model=model,
@@ -475,11 +427,9 @@ async def chat_edit_map(
         output_tokens=result.output_tokens,
     )
 
-    # Parse actions into ChatAction models (per-item; invalid ones drop with a
-    # note instead of failing the whole turn — fix(#525))
+    # Per-item: invalid actions drop with a note instead of failing the turn.
     actions, invalid = _build_chat_actions(result.actions)
 
-    # Validate layer_id references + add_layer dataset RBAC
     actions, dropped = await _validate_actions(
         actions, layers, session=session, user=user, port=port
     )

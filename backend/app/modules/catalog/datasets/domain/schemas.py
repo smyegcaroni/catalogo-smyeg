@@ -14,8 +14,14 @@ from pydantic import (
 )
 
 from app.core.url_redaction import has_url_credentials
+from app.platform.value_labels import (
+    MAX_VALUE_LABEL_LENGTH,
+    MAX_VALUE_LABELS,
+    is_storable_text,
+)
 from app.core.text import normalize_nfc as _nfc
 from app.core.text import reject_html_markup as _reject_markup
+from app.modules.auth.schemas import GroupRef
 from app.modules.catalog.sources.origin_probe import DETAIL_CODES
 from app.modules.catalog.sources.schemas import (
     DEPRECATED_TOKEN_SUFFIX,
@@ -26,12 +32,12 @@ from app.modules.catalog.sources.schemas import (
 from app.platform.analysis_sql import MAX_SPATIAL_JOIN_FIELDS
 from app.platform.dataset_origin import OriginKind
 
-# fix(#1755): the shared rule, not a second copy of it. Every request
+# The shared rule, not a second copy of it. Every request
 # model carrying a service-credential token judges it by this one function.
 from app.platform.service_auth import _validate_safe_token
 
 
-# feat(#1222): built from the probe's own closed vocabulary, not retyped,
+# Built from the probe's own closed vocabulary, not retyped,
 # so the two cannot drift. The wording matters: it tells a client author
 # this is an enumerated code, not a message to show verbatim.
 SOURCE_HEALTH_DETAIL_DESCRIPTION = (
@@ -105,6 +111,7 @@ class ColumnInfo(BaseModel):
     domain_type: str | None = None
     sample_values: list | None = None
     stats: dict | None = None
+    source_name: str | None = None
 
 
 class QualityDetail(BaseModel):
@@ -122,7 +129,7 @@ class QualityDetail(BaseModel):
 
 class ColumnDefinition(BaseModel):
     name: str
-    type: Literal["text", "integer", "float", "date", "boolean"]
+    type: Literal["text", "integer", "float", "date", "boolean", "timestamp"]
 
 
 class CreateEmptyDatasetRequest(BaseModel):
@@ -214,7 +221,7 @@ class PointCloudMetadata(BaseModel):
     url: str | None = Field(
         default=None,
         description="URL path of the COPC file on the app origin, e.g. "
-        "/api/datasets/{id}/copc/{attempt}/data.copc.laz. A replaced file gets a new URL",
+        "/api/datasets/{id}/copc/{attempt}/data.copc.laz. Point clouds cannot be replaced; a new file is a new dataset",
     )
     size_bytes: int | None = Field(
         default=None, description="Size of the COPC file in bytes"
@@ -321,7 +328,7 @@ class DerivedFromResponse(BaseModel):
 
 
 class PreviousVersionResponse(BaseModel):
-    """The data a replacement or restore replaced, kept until the next one."""
+    """Data a replacement or restore replaced, kept so a restore can publish it again."""
 
     version_number: int = Field(description="The version whose data is kept")
     retained_at: datetime | None = None
@@ -335,13 +342,60 @@ class PreviousVersionResponse(BaseModel):
 
 class RestorePreviousVersionRequest(BaseModel):
     expected_version_number: int = Field(
-        description="The previous version the caller confirmed restoring"
+        description="The newest kept version, which the caller confirmed restoring"
     )
 
 
 class RestorePreviousVersionResponse(BaseModel):
     job_id: uuid.UUID
     run_id: uuid.UUID
+
+
+RETENTION_MAX_DAYS = 3650
+
+
+class DatasetRetention(BaseModel):
+    """Keep only the rows from the last `days` days, judged by `column`."""
+
+    column: str = Field(
+        max_length=63,
+        description=(
+            "A date or timestamp column of the dataset's table. Rows where it "
+            "is null are kept."
+        ),
+    )
+    days: int = Field(ge=1, le=RETENTION_MAX_DAYS)
+
+    @field_validator("column")
+    @classmethod
+    def validate_column(cls, v: str) -> str:
+        if not _COLUMN_NAME_RE.match(v):
+            raise ValueError("column must be a plain column name")
+        return v
+
+
+class DatasetRetentionUpdate(BaseModel):
+    """The retention setting to store; null turns retention off."""
+
+    retention: DatasetRetention | None
+
+
+class DatasetRetentionResponse(BaseModel):
+    retention: DatasetRetention | None
+    rows_past_cutoff: int | None = Field(
+        description=(
+            "On a dry run, rows currently older than the cutoff, 0 when off. "
+            "Hourly runs delete them in batches, so a large backlog can take "
+            "several runs. Null on a save, which does not count them."
+        )
+    )
+    cutoff: datetime | None = Field(
+        default=None,
+        description=(
+            "Rows older than this UTC instant are past retention; for a date "
+            "column it is UTC midnight of the cutoff date. Null when off."
+        ),
+    )
 
 
 class DatasetResponse(BaseModel):
@@ -419,6 +473,10 @@ class DatasetResponse(BaseModel):
             "[] emits geometry-only tiles, list emits those properties at any zoom."
         ),
     )
+    retention: DatasetRetention | None = Field(
+        default=None,
+        description="How long rows are kept; null keeps every row.",
+    )
     original_srid: int | None = Field(
         default=None, description="EPSG SRID of the uploaded source file"
     )
@@ -428,7 +486,7 @@ class DatasetResponse(BaseModel):
         max_length=2000,
         description="URL the data was originally fetched from",
     )
-    # feat(#1218): read-only source-origin & refresh state. Every field below
+    # Read-only source-origin & refresh state. Every field below
     # is system-managed -- none accepted by PATCH /datasets/{id}/metadata.
     origin: str | None = Field(
         default=None,
@@ -489,7 +547,7 @@ class DatasetResponse(BaseModel):
             "schema diff; 'unknown' until a refresh has run."
         ),
     )
-    # feat(#1224): computed at read time from last_refreshed_at, the record's
+    # Computed at read time from last_refreshed_at, the record's
     # update_frequency, and origin. Not stored — see domain/source_freshness.py.
     source_freshness: str = Field(
         default="unknown",
@@ -550,6 +608,13 @@ class DatasetResponse(BaseModel):
     owner_org: str | None = Field(default=None, description="Owning organization name")
     published_at: datetime | None = None
     updated_by: uuid.UUID | None = None
+    data_revision: int | None = Field(
+        default=None,
+        description=(
+            "Counts writes to the dataset's features and columns. Owner and "
+            "admin only; null for other readers."
+        ),
+    )
     record_type: str = Field(
         default="vector_dataset",
         description=(
@@ -597,13 +662,59 @@ class DatasetResponse(BaseModel):
     previous_version: PreviousVersionResponse | None = Field(
         default=None,
         description=(
-            "The data the last replacement or restore replaced, which "
-            "POST /previous-version/restore publishes again. Set on the "
+            "Deprecated: the first entry of previous_versions. Set on the "
             "detail endpoint only; null elsewhere and when there is none."
+        ),
+    )
+    previous_versions: list[PreviousVersionResponse] | None = Field(
+        default=None,
+        description=(
+            "The kept previous versions, newest first, each of which "
+            "POST /previous-versions/{version_number}/restore publishes "
+            "again. An administrator sets how many a dataset keeps. Set on "
+            "the detail endpoint only; null elsewhere."
+        ),
+    )
+    groups: list[GroupRef] | None = Field(
+        default=None,
+        description=(
+            "The sharing groups the dataset is shared with, by name. Set on "
+            "the detail endpoint for the owner and admins only; null elsewhere."
         ),
     )
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class DatasetGroupsUpdate(BaseModel):
+    group_ids: list[uuid.UUID] = Field(
+        max_length=100,
+        description=(
+            "Every group the dataset is shared with afterwards; an empty list "
+            "unshares it. An owner may add only groups they belong to, and an "
+            "admin any group."
+        ),
+    )
+
+
+class DatasetGroupsResponse(BaseModel):
+    visibility: str = Field(
+        description=(
+            "The dataset's visibility after the change: a private dataset "
+            "shared with a group becomes restricted, and a restricted one "
+            "left with no group or role grant becomes private."
+        )
+    )
+    groups: list[GroupRef] = Field(
+        description="The sharing groups the dataset is shared with, by name."
+    )
+    metadata_warnings: list[str] | None = Field(
+        default=None,
+        description=(
+            "Advisory warnings, as on the metadata PATCH. The change has "
+            "already applied."
+        ),
+    )
 
 
 class StatusUpdateResponse(BaseModel):
@@ -666,7 +777,7 @@ class BulkDeleteResultItem(BaseModel):
     dataset_id: uuid.UUID
     status: str  # "deleted" | "error"
     detail: str | None = None
-    # fix(#1847): carries the same code the single-delete 409 does, so a
+    # Carries the same code the single-delete 409 does, so a
     # client sees one code regardless of endpoint. None for prose-only errors.
     code: str | None = None
 
@@ -703,7 +814,7 @@ class DatasetMeta(BaseModel):
         description="Access level: private, restricted, internal, or public",
     )
     license: str | None = Field(default=None, max_length=1000)
-    # feat(#1472): 5000, not the 1000 its neighbours use -- a 1000-char bound
+    # 5000, not the 1000 its neighbours use -- a 1000-char bound
     # would reject a manifest value the ingest tail writes straight to the
     # column (ManifestMetadata.attribution is NonEmptyString5000).
     attribution: str | None = Field(
@@ -773,12 +884,21 @@ class DatasetMeta(BaseModel):
         max_length=100,
         description=(
             "Ordered vector-tile property allowlist; null restores zoom defaults, "
-            "[] emits geometry-only tiles, list emits those properties at any zoom."
+            "[] emits geometry-only tiles, list emits those properties at any zoom. "
+            "Reads authorized only by an embed token are limited to these columns too."
         ),
     )
     owner_id: uuid.UUID | None = Field(
         default=None,
         description="Admin only: transfer the dataset to this active user.",
+    )
+    expected_updated_at: datetime | None = Field(
+        default=None,
+        description=(
+            "The dataset's `updated_at` the caller read. When set and the dataset "
+            "has changed since, nothing is written and the answer is 409 with "
+            "`detail.code` `stale_write`. Omit it to write unconditionally."
+        ),
     )
 
     @field_validator("language")
@@ -818,7 +938,7 @@ class DatasetMeta(BaseModel):
     def normalize_nfc(cls, v: str | None) -> str | None:
         return _nfc(v)
 
-    # fix(#1472): attribution is the one field here that reaches an HTML
+    # Attribution is the one field here that reaches an HTML
     # render context (MapLibre's attribution control assigns it to
     # innerHTML), so it must stay markup-free. See reject_html_markup.
     @field_validator("attribution")
@@ -860,7 +980,7 @@ class SchemaDiff(BaseModel):
     )
     row_count_old: int | None
     row_count_new: int | None
-    # fix(#1746): nullable, but still REQUIRED -- `None` is the answer when
+    # Nullable, but still REQUIRED -- `None` is the answer when
     # either count is unknown; a client need not distinguish "absent" from
     # "unknown" too.
     row_count_delta: int | None = Field(
@@ -899,7 +1019,7 @@ class ReuploadPreviewResponse(BaseModel):
     sample_rows: list[dict[str, Any]]
     layer_name: str
     schema_diff: SchemaDiff
-    # GPKG-01 Phase 1058: multi-layer support fields
+    # Multi-layer support fields
     all_layers: list[dict[str, Any]] | None = None
     previous_source_layer: str | None = None
     review_reasons: list[ReviewReason] = Field(
@@ -931,7 +1051,7 @@ class ReuploadServicePreviewRequest(BaseModel):
     )
     _validate_token = field_validator("token")(_validate_safe_token)
     object_id_field: str | None = Field(default=None, max_length=200)
-    # feat(#1746): must stay LAST, like every model with this field. The
+    # Must stay LAST, like every model with this field. The
     # generated Python SDK gives each field a positional slot in declaration
     # order; inserting `auth` earlier would shift `object_id_field`'s slot
     # and send an existing positional caller's OID string as `auth`, a 422.
@@ -943,7 +1063,7 @@ class ReuploadServicePreviewRequest(BaseModel):
 
 
 class ReuploadPreviewRequest(BaseModel):
-    # GPKG-01 Phase 1058: optional layer_name for multi-layer file sources
+    # Optional layer_name for multi-layer file sources
     layer_name: str | None = Field(default=None, max_length=500)
     srid_override: int | None = Field(
         default=None,
@@ -954,6 +1074,14 @@ class ReuploadPreviewRequest(BaseModel):
             "the coordinate system the replacement will be stored in."
         ),
     )
+
+
+_EXPECTED_DATA_REVISION_DESCRIPTION = (
+    "The dataset's `data_revision` the caller last saw. When it differs from "
+    "the revision this replacement is compared with, every write counts as "
+    "later, so the run stops for review with `live_data_changed` instead of "
+    "publishing. Omit it to compare with the revision at admission only."
+)
 
 
 class ReuploadCommitRequest(BaseModel):
@@ -973,7 +1101,7 @@ class ReuploadCommitRequest(BaseModel):
         default=None, max_length=1000, description=DEPRECATED_TOKEN_SUFFIX.strip()
     )
     _validate_token = field_validator("token")(_validate_safe_token)
-    # GPKG-01 Phase 1058: user-chosen layer for multi-layer GPKG files
+    # User-chosen layer for multi-layer GPKG files
     layer_name: str | None = Field(default=None, max_length=500)
     auth: ServiceAuthRequest | None = Field(
         default=None, description=SERVICE_AUTH_FIELD_DESCRIPTION
@@ -987,6 +1115,9 @@ class ReuploadCommitRequest(BaseModel):
             "with review reasons publishes only when the worker's own "
             "fingerprint matches; otherwise its run ends `blocked`."
         ),
+    )
+    expected_data_revision: int | None = Field(
+        default=None, ge=0, description=_EXPECTED_DATA_REVISION_DESCRIPTION
     )
     _reject_auth_conflict = model_validator(mode="after")(reject_service_auth_conflict)
 
@@ -1037,7 +1168,22 @@ class DatasetRefreshRequest(BaseModel):
     auth: ServiceAuthRequest | None = Field(
         default=None, description=SERVICE_AUTH_FIELD_DESCRIPTION
     )
+    expected_data_revision: int | None = Field(
+        default=None,
+        ge=0,
+        description=_EXPECTED_DATA_REVISION_DESCRIPTION
+        + " Service refreshes only; 422 for any other origin.",
+    )
     _reject_auth_conflict = model_validator(mode="after")(reject_service_auth_conflict)
+
+    @model_validator(mode="after")
+    def _reject_expected_revision_with_acceptance(self) -> "DatasetRefreshRequest":
+        if self.expected_data_revision is not None and self.accept_blocked_run_id:
+            raise ValueError(
+                "expected_data_revision can't be combined with accept_blocked_run_id: "
+                "an acceptance compares with the revision of the run it accepts"
+            )
+        return self
 
 
 class DatasetRefreshResponse(BaseModel):
@@ -1092,10 +1238,42 @@ class DatasetRowsResponse(BaseModel):
     columns: list[ColumnChange]
     rows: list[dict[str, Any]]
     approximate_total: int = Field(
-        description="Estimated total row count (may use pg stats)"
+        description=(
+            "Total row count, or with `filter[...]` or the CQL2 `filter` the "
+            "matching rows; `total_kind` says how exact it is."
+        )
+    )
+    total_kind: Literal["estimate", "exact", "at_least"] = Field(
+        default="estimate",
+        description=(
+            "`estimate` for the table's planner statistics (no filter), "
+            "`exact` for counted matches, `at_least` when more rows match "
+            "than the 10,000 that are counted."
+        ),
     )
     next_cursor: int | None = Field(
         default=None, description="Cursor value for the next page, null if last"
+    )
+    sortable_columns: list[str] = Field(
+        default_factory=list,
+        description="Columns the rows endpoint accepts as `sort`.",
+    )
+    bboxes: list[list[float] | None] | None = Field(
+        default=None,
+        description=(
+            "With `with_bbox=true`, one entry per row in `rows` order: the "
+            "row's [minx, miny, maxx, maxy] in EPSG:4326, or null for a row "
+            "without geometry. Null otherwise."
+        ),
+    )
+    table_id: str | None = Field(
+        default=None,
+        description=(
+            "Opaque id of the data table these rows were read from. Send it as "
+            "the `table_id` query parameter of a feature write or batch delete "
+            "to have it refused if a reupload or overwrite replaced the table "
+            "since."
+        ),
     )
 
 
@@ -1136,6 +1314,10 @@ class AttributeMetadataResponse(BaseModel):
     example_values: list | None = Field(
         default=None, description="Sample values from the column"
     )
+    value_labels: dict[str, str] | None = Field(
+        default=None,
+        description="Label for each stored code, keyed by the code as text.",
+    )
     ordinal_position: int | None = Field(
         default=None, description="Column position in the table (1-based)"
     )
@@ -1168,7 +1350,7 @@ class VrtSourceListResponse(BaseModel):
 class VrtSourceHealth(BaseModel):
     dataset_id: uuid.UUID
     title: str
-    # feat(#1221): `stale` means the member's raster was replaced after the
+    # `stale` means the member's raster was replaced after the
     # parent VRT was last built -- the fix is a regenerate, not anything on
     # the source. Distinct from `inaccessible`, about the member itself.
     status: Literal["healthy", "missing", "inaccessible", "stale"]
@@ -1250,6 +1432,28 @@ class AttributeMetadataUpdate(BaseModel):
     domain_type: DOMAIN_TYPES | None = Field(
         default=None, description="Value domain: continuous, categorical, coded, etc."
     )
+    value_labels: dict[str, str] | None = Field(
+        default=None,
+        description="Label for each stored code, keyed by the code as text.",
+    )
+
+    @field_validator("value_labels")
+    @classmethod
+    def _bound_value_labels(cls, labels: dict[str, str] | None):
+        if labels is None:
+            return labels
+        if len(labels) > MAX_VALUE_LABELS:
+            raise ValueError(f"At most {MAX_VALUE_LABELS} value labels")
+        for code, label in labels.items():
+            if max(len(code), len(label)) > MAX_VALUE_LABEL_LENGTH:
+                raise ValueError(
+                    f"Codes and labels are at most {MAX_VALUE_LABEL_LENGTH} characters"
+                )
+            if not (is_storable_text(code) and is_storable_text(label)):
+                raise ValueError(
+                    "Codes and labels must be valid UTF-8 text without NUL"
+                )
+        return labels
 
 
 class RelatedDatasetItem(BaseModel):
@@ -1353,9 +1557,9 @@ class IngestionResult(BaseModel):
 
 
 # Operation-scoped request fields -> the only operation that reads them,
-# actually dropped by the request validators (fix(#682): a stray
-# mask_dataset_id sent alongside buffer/centroid could otherwise 404/422 the
-# request or fail the job). fix(#955): values are tuples because a param can
+# actually dropped by the request validators (a stray mask_dataset_id sent
+# alongside buffer/centroid could otherwise 404/422 the request or fail the
+# job). Values are tuples because a param can
 # belong to more than one operation -- select_by_location shares
 # `mask`/`mask_dataset_id` with clip rather than re-spelling them.
 _ANALYSIS_PARAM_OWNERS = {
@@ -1387,7 +1591,7 @@ _JOIN_FILTER_DESCRIPTION = (
 )
 
 # Operations whose geometry comes from a drawn mask or a mask layer, exactly
-# one of the two. fix(#956): intersect is deliberately NOT here -- it takes
+# one of the two. Intersect is deliberately NOT here -- it takes
 # a LAYER only, since a drawn polygon has no attributes to overlay with.
 MASK_OPERATIONS = ("clip", "select_by_location")
 
@@ -1417,7 +1621,7 @@ def _require_analysis_params(request: Any) -> None:
         raise ValueError(
             f"{request.operation} requires exactly one of mask or mask_dataset_id"
         )
-    # fix(#956): layer only, and required. `mask` is not an intersect param,
+    # Layer only, and required. `mask` is not an intersect param,
     # so _drop_params_for_other_operations already discarded any drawn one;
     # this just insists on the layer that replaces it.
     if request.operation == "intersect" and request.mask_dataset_id is None:
@@ -1707,7 +1911,25 @@ class RefreshVerification(BaseModel):
         ),
     )
     accepted_blocked_run_id: uuid.UUID | None
+    data_unchanged: bool | None = Field(
+        default=None,
+        description=(
+            "True when this service refresh or file re-upload brought exactly "
+            "the columns and rows the dataset already held, so it published no "
+            "new version; last_refreshed_at still moves. False when the data "
+            "differed or could not be compared. Null when the run made no "
+            "comparison: a service re-upload, a file replacing data that came "
+            "from another origin, or a run verification held back."
+        ),
+    )
     acceptance_consumed_by_run_id: uuid.UUID | None = None
+    data_revision: int | None = Field(
+        default=None,
+        description=(
+            "The dataset's data revision when this run checked its live table. "
+            "A run accepted after a live edit publishes over this revision."
+        ),
+    )
 
 
 class DatasetRefreshRunResponse(BaseModel):

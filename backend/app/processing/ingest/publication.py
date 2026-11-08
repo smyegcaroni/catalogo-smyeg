@@ -24,6 +24,7 @@ from sqlalchemy.orm import joinedload
 
 from app.core.db.sqlstate import is_lock_conflict
 from app.core.failure_reason import FixedReason
+from app.core.identity import IdentityRole, IdentitySnapshot
 from app.platform.catalog_locks import (
     CatalogLockConflict,
     bump_tile_cache_version_on,
@@ -31,6 +32,7 @@ from app.platform.catalog_locks import (
     lock_conflict_report,
     worker_lock_budget,
 )
+from app.platform.dataset_origin import BoundPointer, still_bound
 from app.platform.jobs import heartbeat, ledger
 from app.platform.jobs.heartbeat import (
     StaleIngestAttempt,
@@ -42,7 +44,13 @@ from app.platform.jobs.heartbeat import (
     stop_ingest_job_heartbeat,
 )
 from app.platform.jobs.ledger import hold
-from app.platform.jobs.models import ACTIVE_STATUSES, IngestJob
+from app.platform.jobs.models import (
+    ACTIVE_STATUSES,
+    ADMITTED_CAPABILITY_METADATA_KEY,
+    ADMITTED_PUBLIC_VISIBILITY_METADATA_KEY,
+    ADMITTED_RAW_SOURCE_METADATA_KEY,
+    IngestJob,
+)
 from app.platform.refresh.service import (
     claim_run_for_job,
     record_refresh_failure,
@@ -137,7 +145,7 @@ class Failure:
     schema_diff: dict[str, Any] | None = None
     verification: dict[str, Any] | None = None
     # The origin binding the attempt contacted, when it reached the origin.
-    contacted: tuple[str | None, dict[str, Any] | None, str | None] | None = None
+    contacted: BoundPointer | None = None
     # What the contact established about the origin: (health, detail).
     health: tuple[str, str | None] | None = None
     # A refused input is recorded like any failure, but the task returns.
@@ -161,6 +169,21 @@ _DATASET_DELETED = Failure(
         "The dataset was deleted while this job was running.", code="dataset_deleted"
     ),
 )
+
+
+class WriteAccessRevoked(Exception):
+    """The account that started the attempt can no longer write its dataset."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The account that started this job can no longer modify this "
+            "dataset, so its data was not replaced."
+        )
+
+
+# Recorded on the job and its run without a notice: the account it would
+# go to has lost access to the dataset.
+_WRITE_ACCESS_REVOKED = Failure("write_access_revoked", notify=False, refused=True)
 
 
 class ReplacementStrategy(Protocol):
@@ -369,11 +392,12 @@ async def settle_replacement(
         failed = await _publish(strategy, attempt)
     except Exception as exc:  # broad: every failure before the commit is recorded once
         failed = True
-        failure = (
-            _DATASET_DELETED
-            if isinstance(exc, DatasetDeleted)
-            else strategy.classify(exc)
-        )
+        if isinstance(exc, DatasetDeleted):
+            failure = _DATASET_DELETED
+        elif isinstance(exc, WriteAccessRevoked):
+            failure = _WRITE_ACCESS_REVOKED
+        else:
+            failure = strategy.classify(exc)
         logger.exception("Ingest task failed", job_id=job_id, task=strategy.task)
         await _record_failure(strategy.task, attempt, exc, failure)
         if failure.refused:
@@ -522,6 +546,12 @@ async def _publish(strategy: ReplacementStrategy, attempt: _Attempt) -> bool:
 
         await strategy.install(session, dataset)
         await _take_catalog_rows(session, strategy, dataset)
+        await require_submitter_can_write(
+            session,
+            dataset,
+            job,
+            capability=(job.user_metadata or {}).get(ADMITTED_CAPABILITY_METADATA_KEY),
+        )
         published = await strategy.write(session, dataset)
         if published.tiles_changed:
             await bump_tile_cache_version_on(session, dataset)
@@ -559,6 +589,83 @@ async def _publish(strategy: ReplacementStrategy, attempt: _Attempt) -> bool:
             session, job_id=job_id, attempt_id=attempt_id, task=strategy.task
         )
     return False
+
+
+# In SQL, since processing may not import the auth models.
+_SUBMITTER = text(
+    "SELECT u.id, u.username, u.email, u.is_active, u.created_at, "
+    "ARRAY(SELECT r.name FROM catalog.user_roles ur "
+    "JOIN catalog.roles r ON r.id = ur.role_id WHERE ur.user_id = u.id) AS roles "
+    "FROM catalog.users u WHERE u.id = :uid"
+)
+
+
+async def require_submitter_can_write(
+    session: AsyncSession, dataset: Any, job: IngestJob, *, capability: str | None
+) -> None:
+    """Raise ``WriteAccessRevoked`` unless the job's submitter may still write
+    the dataset, as committed now, and their roles still grant ``capability``,
+    the one the job's door admitted it under. With None, only the account and
+    owner-or-admin are checked. A job only an admin could queue, for a raw
+    seed source or public data under ``restrict_public_visibility``, also needs
+    them to still be an admin.
+
+    Call holding the catalog rows, which an ownership transfer also takes.
+    """
+    from fastapi import HTTPException
+
+    from app.platform.extensions import get_permission_extension, get_processing_port
+
+    row = None
+    if job.created_by is not None:
+        row = (await session.execute(_SUBMITTER, {"uid": job.created_by})).first()
+    if row is None or not row.is_active:
+        raise WriteAccessRevoked
+    submitter = IdentitySnapshot(
+        id=row.id,
+        username=row.username,
+        email=row.email,
+        is_active=row.is_active,
+        roles=tuple(IdentityRole(name) for name in row.roles),
+        created_at=row.created_at,
+    )
+    await session.refresh(
+        dataset.record, attribute_names=["created_by", "visibility", "record_status"]
+    )
+    try:
+        await get_processing_port().check_dataset_write_access(
+            session,
+            dataset,
+            dataset.id,
+            submitter,
+            user_roles={role.name for role in submitter.roles},
+        )
+    except HTTPException:
+        raise WriteAccessRevoked from None
+    if capability is not None and not await get_permission_extension().check_permission(
+        session, submitter, capability, user_roles=set(row.roles)
+    ):
+        raise WriteAccessRevoked
+    if await _no_longer_admin_to_publish(session, job, set(row.roles)):
+        raise WriteAccessRevoked
+
+
+async def _no_longer_admin_to_publish(
+    session: AsyncSession, job: IngestJob, roles: set[str]
+) -> bool:
+    """A job only an admin could queue, whose submitter is no longer one: it
+    reads a raw seed source, or makes data public while the restricted-public
+    setting is still on."""
+    from app.core.persistent_config import RESTRICT_PUBLIC_VISIBILITY
+
+    metadata = job.user_metadata or {}
+    if "admin" in roles:
+        return False
+    if metadata.get(ADMITTED_RAW_SOURCE_METADATA_KEY):
+        return True
+    if not metadata.get(ADMITTED_PUBLIC_VISIBILITY_METADATA_KEY):
+        return False
+    return bool(await RESTRICT_PUBLIC_VISIBILITY.get(session))
 
 
 async def _take_catalog_rows(
@@ -721,7 +828,7 @@ _VERDICT_LOCK_TIMEOUT = "1s"
 async def _stamp_contact(
     session: AsyncSession,
     dataset_id: uuid.UUID,
-    binding: tuple[str | None, dict[str, Any] | None, str | None],
+    binding: BoundPointer,
     health: tuple[str, str | None] | None = None,
 ) -> bool:
     """Date a failed attempt's origin contact, only while the dataset is still bound as it read.
@@ -735,18 +842,12 @@ async def _stamp_contact(
     from app.platform.extensions import get_processing_port
 
     Dataset = get_processing_port().get_dataset_orm_class()
-    origin_uri, origin_ref, source_format = binding
     values: dict[str, Any] = {"last_checked_at": datetime.now(timezone.utc)}
     if health is not None:
         values.update(source_health=health[0], source_health_detail=health[1])
     stamp = (
         update(Dataset)
-        .where(
-            Dataset.id == dataset_id,
-            Dataset.origin_uri.is_not_distinct_from(origin_uri),
-            Dataset.origin_ref.is_not_distinct_from(origin_ref),
-            Dataset.source_format.is_not_distinct_from(source_format),
-        )
+        .where(still_bound(Dataset, dataset_id, binding))
         .values(**values)
         .execution_options(synchronize_session=False)
     )

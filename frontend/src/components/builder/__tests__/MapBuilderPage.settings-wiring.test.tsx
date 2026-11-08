@@ -92,6 +92,7 @@ vi.mock('@/hooks/use-maps', () => ({
   useRemoveLayer: () => ({}),
   useExportMapStyleJson: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useImportMapStyleJson: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useLayersHiddenFromMapGroups: () => new Set(),
 }));
 
 vi.mock('@/hooks/use-ai-availability', () => ({
@@ -129,6 +130,7 @@ vi.mock('@/components/builder/hooks/use-builder-dialogs', () => ({
 // SettingsEditorScene without driving the sidebar cog.
 vi.mock('@/components/builder/hooks/use-builder-layers', () => ({
   useBuilderLayers: () => ({
+    dashboard: { panel: 'right', widgets: [] },
     localLayers: [],
     savedLayerBaseline: [],
     localName: 'Operations Map',
@@ -177,7 +179,6 @@ vi.mock('@/components/builder/hooks/use-builder-layers', () => ({
     handleAiRemoveLayer: vi.fn(),
     handleQueryResult: vi.fn(),
     handleDismissEphemeral: vi.fn(),
-    handleRenderModeChange: vi.fn(),
     chatLayerActions: {
       onFilterChange: vi.fn(), onPaintChange: vi.fn(), onStyleConfigChange: vi.fn(),
       onLabelChange: vi.fn(), onToggleVisibility: vi.fn(), onAddDataset: vi.fn(),
@@ -246,7 +247,7 @@ describe('MapBuilderPage settings wiring (plugin dirty + projection persistence)
     const measureSwitch = await screen.findByRole('switch', { name: 'Enable measurement' });
     fireEvent.click(measureSwitch);
 
-    // fix(#913): plugin state lives in its own store, so it is OPAQUE dirt —
+    // Plugin state lives in its own store, so it is OPAQUE dirt —
     // the clean-state recheck cannot re-derive it from server data.
     expect(mockMarkOpaqueDirty).toHaveBeenCalled();
   });

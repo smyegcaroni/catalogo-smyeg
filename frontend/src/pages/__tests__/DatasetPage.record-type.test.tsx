@@ -71,8 +71,9 @@ const mapInstances = vi.hoisted(() => ({ count: 0 }));
 vi.mock('@/components/dataset/DatasetMap', async () => {
   const { useState } = await import('react');
   return {
-    DatasetMap: ({ canEdit, bbox, shortcutsEnabled }: {
+    DatasetMap: ({ canEdit, bbox, shortcutsEnabled, viewer3d }: {
       canEdit?: boolean;
+      viewer3d?: { kind: string; url: string } | null;
       bbox?: [number, number, number, number] | null;
       shortcutsEnabled?: boolean;
     }) => {
@@ -84,6 +85,7 @@ vi.mock('@/components/dataset/DatasetMap', async () => {
           data-instance={instance}
           data-bbox={bbox ? JSON.stringify(bbox) : ''}
           data-shortcuts-enabled={String(shortcutsEnabled !== false)}
+          data-viewer3d={viewer3d ? `${viewer3d.kind}:${viewer3d.url}` : ''}
         />
       );
     },
@@ -192,6 +194,7 @@ const OWNER: UserResponse = {
   is_active: true,
   status: 'active',
   last_login_at: null,
+  can_reset_password: true,
   created_at: '2026-03-01T00:00:00Z',
   roles: ['editor'],
 };
@@ -201,6 +204,10 @@ function makeDataset(recordType: string): DatasetResponse {
     id: 'dataset-1',
     record_id: 'record-1',
     table_name: 'world_countries',
+    source_health: 'unknown',
+    schema_drift_status: 'unknown',
+    source_freshness: 'unknown',
+    has_generic_geometry: false,
     title: 'World Countries',
     summary: 'Country boundaries',
     srid: 4326,
@@ -295,8 +302,53 @@ describe('DatasetPage actions by record type', () => {
     expect(map).toHaveAttribute('data-can-edit', 'true');
     expect(screen.getByTestId('dataset-chat-panel')).toBeInTheDocument();
     await openMoreActions();
-    expect(screen.getByRole('menuitem', { name: 'Re-Upload' })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: 'Re-upload' })).toBeInTheDocument();
     expect(screen.getByTestId('reupload-dialog')).toBeInTheDocument();
+  });
+
+  it('offers a format Download menu for a vector dataset and no COG download', async () => {
+    await renderAs('vector_dataset');
+
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Download' }));
+    expect(await screen.findByRole('menuitem', { name: 'GeoPackage' })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: 'GeoJSON' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Download COG' })).not.toBeInTheDocument();
+  });
+
+  it('offers only CSV in the Download menu for a dataset with no geometry', async () => {
+    vi.mocked(useDataset).mockReturnValue({
+      data: { ...makeDataset('table'), geometry_type: null },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useDataset>);
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    await userEvent.setup().click(await screen.findByRole('button', { name: 'Download' }));
+    expect(await screen.findByRole('menuitem', { name: 'CSV' })).toBeInTheDocument();
+    expect(screen.queryByRole('menuitem', { name: 'GeoPackage' })).not.toBeInTheDocument();
+  });
+
+  it('keeps Download COG and no format menu for a raster with a connect block', async () => {
+    vi.mocked(useDataset).mockReturnValue({
+      data: { ...makeDataset('raster_dataset'), raster: { connect: {} } },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useDataset>);
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    expect(await screen.findByRole('button', { name: 'Download COG' })).toBeInTheDocument();
+    expect(screen.queryByTestId('dataset-header-download')).not.toBeInTheDocument();
+  });
+
+  it('truncates a long table name in the readout and keeps its copy button visible', async () => {
+    await renderAs('vector_dataset');
+
+    const readout = screen.getByTestId('dataset-table-readout');
+    expect(readout).toHaveClass('min-w-0', 'max-w-full');
+    const name = readout.querySelector('span.truncate');
+    expect(name).toHaveAttribute('title', expect.stringMatching(/\S/));
+    expect(name).toHaveClass('min-w-0', 'truncate');
+    expect(within(readout).getByRole('button')).toHaveClass('shrink-0');
   });
 
   it('offers Add to map to a capable viewer who does not own the dataset', async () => {
@@ -319,7 +371,7 @@ describe('DatasetPage actions by record type', () => {
     expect(map).toHaveAttribute('data-can-edit', 'false');
     expect(screen.queryByTestId('dataset-chat-panel')).not.toBeInTheDocument();
     await openMoreActions();
-    expect(screen.queryByRole('menuitem', { name: 'Re-Upload' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('menuitem', { name: 'Re-upload' })).not.toBeInTheDocument();
     expect(screen.queryByTestId('reupload-dialog')).not.toBeInTheDocument();
   });
 
@@ -420,6 +472,7 @@ describe('DatasetPage actions by record type', () => {
     const map = await screen.findByTestId('dataset-map');
     expect(screen.getByRole('region', { name: 'Map Preview' })).toBeInTheDocument();
     expect(map).toHaveAttribute('data-bbox', JSON.stringify([-180, -90, 180, 90]));
+    expect(map).toHaveAttribute('data-viewer3d', 'pointcloud:/api/datasets/dataset-1/copc/attempt-1/data.copc.laz');
     expect(screen.queryByRole('button', { name: 'Add to map' })).not.toBeInTheDocument();
     expect(screen.queryByTestId('dataset-table-readout')).not.toBeInTheDocument();
   });

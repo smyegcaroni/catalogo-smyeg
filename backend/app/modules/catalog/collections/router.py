@@ -19,6 +19,7 @@ from app.modules.catalog.authorization import (
     check_datasets_access_bulk,
     get_user_roles,
     visible_lineage_summaries,
+    visible_vrt_extents,
 )
 from app.modules.catalog.collections.schemas import (
     AddDatasetsResponse,
@@ -38,6 +39,7 @@ from app.modules.catalog.collections.service import (
     get_collection,
     get_collection_datasets,
     list_collections,
+    lock_collection_for_write,
     remove_dataset_from_collection,
     update_collection,
 )
@@ -68,7 +70,7 @@ def _collection_to_response(
     )
 
 
-# fix(ROUTE-01): dual-shape decorator so both trailing-slash (canonical) and
+# Dual-shape decorator so both trailing-slash (canonical) and
 # no-slash variants hit this handler, closing the 404 from
 # redirect_slashes=False.
 @router.post(
@@ -76,9 +78,13 @@ def _collection_to_response(
     response_model=CollectionResponse,
     status_code=status.HTTP_201_CREATED,
     include_in_schema=False,
+    summary="Create a collection",
 )
 @router.post(
-    "/", response_model=CollectionResponse, status_code=status.HTTP_201_CREATED
+    "/",
+    response_model=CollectionResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a collection",
 )
 async def create_collection_endpoint(
     body: CollectionCreate,
@@ -123,17 +129,19 @@ async def create_collection_endpoint(
 _CATALOG_CACHE_TTL = 60  # seconds
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see POST above.
+# Dual-shape decorator; see POST above.
 @router.get(
     "",
     response_model=CollectionListResponse,
     include_in_schema=False,
     responses={403: FORBIDDEN_RESPONSE},
+    summary="List collections",
 )
 @router.get(
     "/",
     response_model=CollectionListResponse,
     responses={403: FORBIDDEN_RESPONSE},
+    summary="List collections",
 )
 async def list_collections_endpoint(
     skip: int = Query(0, ge=0),
@@ -186,6 +194,7 @@ async def list_collections_endpoint(
     "/{collection_id}",
     response_model=CollectionResponse,
     responses={403: FORBIDDEN_RESPONSE},
+    summary="Get a collection",
 )
 async def get_collection_endpoint(
     collection_id: uuid.UUID,
@@ -213,7 +222,9 @@ async def get_collection_endpoint(
     )
 
 
-@router.patch("/{collection_id}", response_model=CollectionResponse)
+@router.patch(
+    "/{collection_id}", response_model=CollectionResponse, summary="Update a collection"
+)
 async def update_collection_endpoint(
     collection_id: uuid.UUID,
     body: CollectionUpdate,
@@ -229,6 +240,7 @@ async def update_collection_endpoint(
             detail="Collection not found",
         )
     await check_collection_ownership(db, existing, user)
+    await lock_collection_for_write(db, collection_id)
     try:
         collection = await update_collection(
             db, collection_id, name=body.name, description=body.description
@@ -246,7 +258,7 @@ async def update_collection_endpoint(
             action="collection.update",
             resource_type="collection",
             resource_id=collection_id,
-            # fix(#1484): mode="json" so a future non-JSON scalar on
+            # mode="json" so a future non-JSON scalar on
             # CollectionUpdate cannot reach the JSONB column as a raw object.
             details=body.model_dump(mode="json", exclude_none=True),
             ip_address=request.client.host if request.client else None,
@@ -272,7 +284,11 @@ async def update_collection_endpoint(
     )
 
 
-@router.delete("/{collection_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{collection_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a collection",
+)
 async def delete_collection_endpoint(
     collection_id: uuid.UUID,
     request: Request,
@@ -287,6 +303,7 @@ async def delete_collection_endpoint(
             detail="Collection not found",
         )
     await check_collection_ownership(db, existing, user)
+    await lock_collection_for_write(db, collection_id)
     try:
         name = await delete_collection(db, collection_id)
     except ValueError:
@@ -312,7 +329,11 @@ async def delete_collection_endpoint(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/{collection_id}/datasets/", response_model=AddDatasetsResponse)
+@router.post(
+    "/{collection_id}/datasets/",
+    response_model=AddDatasetsResponse,
+    summary="Add datasets to a collection",
+)
 async def add_datasets_endpoint(
     collection_id: uuid.UUID,
     body: CollectionAddDatasetsRequest,
@@ -329,12 +350,13 @@ async def add_datasets_endpoint(
         )
     await check_collection_ownership(db, collection, user)
 
-    # fix(GAP-014,#1298): authorize each linked dataset at write time (mirrors
-    # the FK-relationship and VRT SEC-C checks, since manage_collections alone
+    # Authorize each linked dataset at write time (mirrors
+    # the FK-relationship and VRT checks, since manage_collections alone
     # doesn't gate link targets); batched via check_datasets_access_bulk.
     user_roles = await get_user_roles(db, user)
     await check_datasets_access_bulk(db, body.dataset_ids, user, user_roles)
 
+    await lock_collection_for_write(db, collection_id)
     try:
         count = await add_datasets_to_collection(
             db, collection_id, body.dataset_ids, user.id
@@ -363,7 +385,9 @@ async def add_datasets_endpoint(
 
 
 @router.delete(
-    "/{collection_id}/datasets/{dataset_id}", status_code=status.HTTP_204_NO_CONTENT
+    "/{collection_id}/datasets/{dataset_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove a dataset from a collection",
 )
 async def remove_dataset_endpoint(
     collection_id: uuid.UUID,
@@ -381,6 +405,7 @@ async def remove_dataset_endpoint(
         )
     await check_collection_ownership(db, collection, user)
 
+    await lock_collection_for_write(db, collection_id)
     removed = await remove_dataset_from_collection(db, collection_id, dataset_id)
     if not removed:
         raise HTTPException(
@@ -409,6 +434,7 @@ async def remove_dataset_endpoint(
     "/{collection_id}/datasets/",
     response_model=DatasetListResponse,
     responses={403: FORBIDDEN_RESPONSE},
+    summary="List a collection's datasets",
 )
 async def get_collection_datasets_endpoint(
     collection_id: uuid.UUID,
@@ -442,9 +468,15 @@ async def get_collection_datasets_endpoint(
         rows = await db.execute(select(User).where(User.id.in_(actor_ids)))
         actor_map = {u.id: u for u in rows.scalars()}
 
-    # fix(#1103): one visibility query for the page, not one per row.
+    # One visibility query for the page, not one per row.
     lineage = await visible_lineage_summaries(
         db, [d.record for d in datasets], user, user_roles
+    )
+    vrt_extents = await visible_vrt_extents(
+        db,
+        [d.id for d in datasets if d.record.record_type == "vrt_dataset"],
+        user,
+        user_roles,
     )
 
     return DatasetListResponse(
@@ -452,8 +484,9 @@ async def get_collection_datasets_endpoint(
             dataset_to_response(
                 d,
                 actors_by_id=actor_map,
+                vrt_extents=vrt_extents,
                 lineage_summary=lineage[d.record_id],
-                # feat(#1316): per-row, same reasoning as the plain dataset list.
+                # per-row, same reasoning as the plain dataset list.
                 can_view_provenance=can_view_dataset_provenance(
                     d.record, user, user_roles
                 ),

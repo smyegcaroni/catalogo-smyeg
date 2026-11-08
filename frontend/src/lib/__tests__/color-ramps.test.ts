@@ -4,6 +4,7 @@ import {
   colorClassificationIsOrphaned,
   reconcileColorClassification,
   buildCategoricalExpression,
+  categoricalFallbackOf,
   buildGraduatedSizeExpression,
   getSizeProperty,
   getColorProperty,
@@ -115,9 +116,9 @@ describe('getRampColors with reversed flag', () => {
   });
 });
 
-// fix(#1856): qualitative palettes are discrete categories, not a gradient —
-// sampling them continuously blended unrelated hues and washed small counts
-// out toward grey. getRampColors now assigns palette entries directly.
+// Qualitative palettes are discrete categories, not a gradient —
+// sampling them continuously would blend unrelated hues and wash small counts
+// out toward grey. getRampColors assigns palette entries directly.
 describe('getRampColors on qualitative ramps (#1856)', () => {
   it('five categories on Set2 yield five distinct palette members', () => {
     const colors = getRampColors('Set2', 5);
@@ -207,7 +208,7 @@ describe('getColorProperty regression', () => {
 });
 
 // ---------------------------------------------------------------------------
-// ENH-08: nextRotatingRamp + suggestRampForMode
+// nextRotatingRamp + suggestRampForMode
 // ---------------------------------------------------------------------------
 
 describe('nextRotatingRamp — graduated (sequential ramps)', () => {
@@ -314,7 +315,7 @@ describe('suggestRampForMode', () => {
 });
 
 // ---------------------------------------------------------------------------
-// fix(#527 B-054/S-03): empty categorical map emits the bare fallback, never a
+// Empty categorical map emits the bare fallback, never a
 // zero-pair ['match'] (below spec minimum arity — addLayer throws, swallowed,
 // and the layer silently never renders).
 // ---------------------------------------------------------------------------
@@ -333,7 +334,7 @@ describe('buildCategoricalExpression empty-map guard (B-054/S-03)', () => {
   });
 });
 
-// fix(#910, codex P2): the one predicate both halves of the reconciliation read — the
+// The one predicate both halves of the reconciliation read — the
 // commit boundary in use-layer-map-sync.ts, and DataDrivenStyleEditor's skip guard.
 describe('colorClassificationIsOrphaned', () => {
   const RAMP = ['match', ['get', 'era'], 'pre-war', '#ff0000', '#00ff00'];
@@ -354,7 +355,7 @@ describe('colorClassificationIsOrphaned', () => {
     expect(colorClassificationIsOrphaned(categorical(), { 'fill-color': RAMP }, 'Polygon')).toBe(false);
   });
 
-  // fix(#461): an all-null column legitimately yields `categories: []`, and
+  // An all-null column legitimately yields `categories: []`, and
   // buildCategoricalExpression emits a BARE colour for it rather than a below-arity
   // `match`. Calling that orphaned makes the editor regenerate on every render.
   it('is not orphaned by a config that claims no classes', () => {
@@ -368,7 +369,7 @@ describe('colorClassificationIsOrphaned', () => {
     expect(colorClassificationIsOrphaned(categorical({ render_mode }), {}, 'MultiPoint')).toBe(false);
   });
 
-  // fix(#910, codex P2): an array alone is not proof. Advanced JSON or the AI can swap a
+  // An array alone is not proof. Advanced JSON or the AI can swap a
   // categorical `era` expression for one reading `status`, and the legend then reports
   // `era` over a map drawn by `status`.
   it('is orphaned when the expression classifies a different column', () => {
@@ -427,7 +428,7 @@ describe('reconcileColorClassification', () => {
     expect(next?.categories).toBeUndefined();
     expect(next?.colors).toBeUndefined();
     expect(next?.breaks).toBeUndefined();
-    // fix(#910, codex P2): column and ramp too — a config carrying a column and no mode
+    // Column and ramp too — a config carrying a column and no mode
     // reads to a freshly mounted DataDrivenStyleEditor as a live categorical
     // classification, which re-applied it over the paint that retired it.
     expect(next?.column).toBeUndefined();
@@ -445,5 +446,36 @@ describe('reconcileColorClassification', () => {
   it('collapses to null when the claim was all the config had', () => {
     const claimOnly = { mode: 'categorical', categories: [{ value: 'a', color: '#111' }] } as StyleConfig;
     expect(reconcileColorClassification(claimOnly, {}, 'Polygon')).toBeNull();
+  });
+});
+
+describe('categoricalFallbackOf', () => {
+  it('reads back the fallback buildCategoricalExpression wrote', () => {
+    const expression = buildCategoricalExpression('kind', [['a', '#111111']], '#abcdef');
+    expect(categoricalFallbackOf(expression)).toBe('#abcdef');
+    expect(categoricalFallbackOf(['match', ['get', 'kind'], 'a', '#111111', '#fedcba'])).toBe('#fedcba');
+  });
+
+  it('prefers the nested match catch-all over a different null colour', () => {
+    const guarded = ['case', ['==', ['get', 'kind'], null], '#000000', ['match', ['get', 'kind'], 'a', '#111111', '#fedcba']];
+    expect(categoricalFallbackOf(guarded)).toBe('#fedcba');
+  });
+
+  it('does not take a nested match from a hand-authored case', () => {
+    const match = ['match', ['get', 'kind'], 'a', '#111111', '#fedcba'];
+    expect(categoricalFallbackOf(['case', ['>', ['get', 'n'], 3], '#ff0000', match])).toBeNull();
+    expect(
+      categoricalFallbackOf(['case', ['==', ['get', 'kind'], null], '#000000', ['has', 'x'], '#222222', match]),
+    ).toBeNull();
+  });
+
+  it('reads the final arm of a general case expression', () => {
+    expect(categoricalFallbackOf(['case', ['>', ['get', 'n'], 3], '#ff0000', '#cccccc'])).toBe('#cccccc');
+  });
+
+  it('returns null for a paint that is not a categorical expression', () => {
+    expect(categoricalFallbackOf('#3b82f6')).toBeNull();
+    expect(categoricalFallbackOf(undefined)).toBeNull();
+    expect(categoricalFallbackOf(['step', ['get', 'n'], '#000000', 5, '#ffffff'])).toBeNull();
   });
 });

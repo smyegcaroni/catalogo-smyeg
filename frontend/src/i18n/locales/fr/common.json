@@ -110,7 +110,6 @@
     "darkMode": "Mode sombre"
   },
   "theme": {
-    "toggle": "Changer le thème",
     "light": "Clair",
     "dark": "Sombre",
     "system": "Système"
@@ -139,9 +138,6 @@
     "infrastructure": "Infrastructure",
     "general": "Général",
     "basemaps": "Fonds de carte",
-    "mapDefaults": "Carte par défaut",
-    "security": "Sécurité",
-    "uploads": "Téléchargements",
     "settings": "Paramètres",
     "operations": "Opérations",
     "settingsGeneral": "Général",
@@ -152,7 +148,8 @@
     "settingsAppearance": "Apparence",
     "settingsInfrastructure": "Infrastructure",
     "backToApp": "Retour",
-    "configOps": "Opérations de config."
+    "configOps": "Opérations de config.",
+    "groups": "Groupes"
   },
   "errors": {
     "unexpected": "Une erreur inattendue s'est produite",
@@ -177,6 +174,7 @@
     "jobFailureStaleNeverQueued": "Périmée : en attente trop longtemps (jamais mise en file d'attente)",
     "jobFailureUploadAbandoned": "Abandonnée : le téléversement n'a jamais été terminé",
     "jobFailureUserCancelled": "Annulée par l'utilisateur",
+    "jobFailureCredentialOverHttp": "Le service de ce jeu de données utilise HTTP non chiffré : ses identifiants n'ont pas été envoyés. Réimportez-le depuis l'adresse https:// du service ou demandez à un administrateur d'autoriser son hôte.",
     "jobFailureWorkerLost": "Périmée : la tâche a duré trop longtemps sans que son processus de travail signale de progression",
     "requestFailed": "La requête n'a pas pu aboutir. Réessayez.",
     "badRequest": "La requête n'a pas pu aboutir. Vérifiez les données saisies.",
@@ -204,10 +202,12 @@
     "sharedQueryBusy": "Les aperçus d’analyse et le chat IA partagent une seule requête de données à la fois, et une requête est déjà en cours. Attendez qu’elle se termine, puis réessayez.",
     "analysisVectorRequired": "L’analyse nécessite un jeu de données vectoriel — cette couche n’en est pas un.",
     "analysisMaskPolygonRequired": "Le masque de découpe doit être une couche de polygones.",
+    "datasetUnpublishBlockedByMaps": "Ces cartes partagent le jeu de données avec un public qui le perdrait s'il était dépublié : {{maps}}. Supprimez-y la couche, ou restreignez d'abord ces cartes.",
     "datasetVisibilityBlockedByMaps": "Ces cartes partagent le jeu de données avec un public qui le perdrait : {{maps}}. Supprimez-y la couche, ou restreignez d'abord ces cartes.",
     "workflowTransitionDeniedNoneAllowed": "Ce jeu de données ne peut pas passer de « {{from}} » à « {{to}} » dans le flux de publication, et aucune autre étape ne vous est ouverte. Demandez à un relecteur ou à un administrateur disposant du rôle requis.",
     "workflowTransitionDenied": "Ce jeu de données ne peut pas passer de « {{from}} » à « {{to}} » dans le flux de publication. Étapes disponibles pour vous à partir d’ici : {{allowed}}.",
     "analysisUnknownDissolveColumn": "La colonne « {{column}} » n’existe pas dans ce jeu de données. Choisissez un autre champ de regroupement.",
+    "columnsNeedRefresh": "Les colonnes {{columns}} existent dans la table, mais GeoLens ne les connaît pas encore. Actualisez le jeu de données, puis réessayez.",
     "corsWildcardNotAllowed": "Les origines génériques ne sont pas acceptées. Les requêtes avec identifiants exigent que chaque origine soit indiquée en entier, par exemple https://example.com.",
     "embedDomainLockUnenforceable": "Ce déploiement ne peut pas encore appliquer un verrouillage de domaine : son URL publique est définie sur {{resolved}}, mais vous y avez accédé via {{origin}}. Une intégration charge la carte via GeoLens, le verrouillage bloquerait donc tous les visiteurs. Définissez PUBLIC_APP_URL sur {{origin}}, puis créez le jeton.",
     "duplicateSource": "Un jeu de données provenant de cette source est déjà enregistré ({{title}}).",
@@ -225,9 +225,13 @@
     "arcgisSigninInProgress": "Une autre connexion pour ce compte est déjà en cours. Réessayez dans un instant.",
     "arcgisPortalNotHttps": "Ce portail, ou le service de jetons qu'il indique, n'utilise pas HTTPS. GeoLens n'enverra pas de mot de passe en HTTP non chiffré ; utilisez une URL de portail en https://.",
     "arcgisPortalHostInvalid": "Cette adresse de portail n'est pas un nom d'hôte utilisable. Vérifiez l'URL, par exemple https://votre-org.maps.arcgis.com.",
+    "credentialOverHttp": "Cette adresse de service utilise HTTP non chiffré : GeoLens ne lui enverra pas d'identifiants. Utilisez l'adresse https:// du service ou demandez à un administrateur d'autoriser cet hôte.",
+    "credentialOverHttpRefresh": "La source de ce jeu de données utilise HTTP non chiffré : GeoLens ne lui enverra pas d'identifiants. Réimportez les données depuis l'adresse https:// du service ou demandez à un administrateur d'autoriser cet hôte.",
     "refreshServiceTokenRequired": "La source de ce jeu de données nécessite un identifiant de service pour être actualisée. Fournissez-en un ci-dessous pour continuer.",
     "refreshSourceUrlBlocked": "L'URL source enregistrée de ce jeu de données a échoué à un contrôle de sécurité et ne peut pas être actualisée automatiquement. Contactez un administrateur.",
     "reuploadGeometryLoss": "Ce remplacement n'a pas de géométrie alors que ce jeu de données en stocke, rien n'a donc été modifié. Importez le fichier comme un nouveau jeu de données.",
+    "serviceLayerNoFeatures": "Cette couche ne contient aucune entité (couche de groupe, raster, annotation, topologie ou réseau de services). Importez plutôt l'une de ses couches d'entités ou tables.",
+    "serviceGeometryUnsupported": "Cette couche contient une géométrie multipatch, qui ne peut pas être importée. Publiez-la comme couche d'entités avec un autre type de géométrie.",
     "reuploadOriginChanged": "La source de ce jeu de données a changé pendant la préparation du remplacement, rien n'a donc été mis en file d'attente. Vérifiez la source du jeu de données avant de remplacer ses données.",
     "reuploadPointCloudUnsupported": "Les jeux de données de nuage de points ne peuvent pas être remplacés par un rechargement. Téléversez le nouveau nuage de points comme un nouveau jeu de données.",
     "reuploadTilesetUnsupported": "Les jeux de données 3D Tiles ne peuvent pas être remplacés par un rechargement. Téléversez le nouveau jeu de tuiles comme un nouveau jeu de données.",
@@ -316,6 +320,10 @@
     "collectionNotFound": "Collection introuvable",
     "mapNotFound": "Carte introuvable",
     "incorrectCredentials": "Nom d'utilisateur ou mot de passe incorrect",
+    "loginThrottled": "Trop d'échecs de connexion pour ce compte. Utilisez un navigateur avec lequel vous vous êtes déjà connecté, connectez-vous avec l'authentification unique (SSO) ou utilisez une clé d'API pour les scripts et les applications de bureau.",
+    "deviceTrustLinkInvalid": "Ce lien est invalide, expiré ou déjà utilisé. Demandez-en un nouveau à votre administrateur.",
+    "deviceTrustBrowserFull": "Ce navigateur mémorise déjà autant de comptes que possible. Ouvrez le lien dans une fenêtre privée ou un autre navigateur.",
+    "deviceTrustUnavailable": "Ce GeoLens ne peut pas mémoriser de navigateurs à son adresse actuelle. Contactez votre administrateur.",
     "awaitingApproval": "Votre compte est en attente d'approbation",
     "accountNotActive": "Compte non actif",
     "insufficientPermissions": "Permissions insuffisantes",
@@ -327,6 +335,8 @@
     "layerNotFound": "Couche introuvable",
     "userNotFound": "Utilisateur introuvable",
     "apiKeyNotFound": "Clé API introuvable",
+    "datasetKeyLimit": "Ce jeu de données a déjà 100 clés d'écriture actives. Révoquez-en une pour en créer une autre.",
+    "valueLabelsTooLarge": "Les libellés de valeurs de ce jeu de données dépassent la limite de 1 Mo. Supprimez-en pour en ajouter.",
     "accessDenied": "Accès refusé",
     "couldNotValidateCredentials": "Impossible de valider les identifiants",
     "inactiveUser": "Utilisateur inactif",
@@ -346,6 +356,7 @@
     "stagingFileUnavailable": "Le fichier temporaire n'est plus disponible. Veuillez le télécharger à nouveau.",
     "serviceRequiresAuth": "Ce service nécessite une authentification. Fournissez un jeton d'accès et réessayez.",
     "couldNotReachService": "Impossible de joindre le service. Vérifiez l'URL et réessayez.",
+    "serviceNotRecognized": "Impossible de détecter le type de service. Pris en charge : WFS, ArcGIS Feature Service et OGC API Features.",
     "serviceTimeout": "Le service n'a pas répondu à temps. Vérifiez l'URL et réessayez.",
     "remoteServiceError": "Le service distant a renvoyé une erreur",
     "aiSummaryFailed": "Échec de la génération du résumé",
@@ -369,10 +380,46 @@
     "mapMessage": "Erreur de carte — certains calques pourraient ne pas s'afficher correctement.",
     "networkUnavailable": "Réseau indisponible. Vérifiez votre connexion.",
     "requestTimeout": "La requête a pris trop de temps. Réessayez.",
-    "unauthorized": "Votre session a expiré. Reconnectez-vous."
+    "unauthorized": "Votre session a expiré. Reconnectez-vous.",
+    "retentionUnsupportedRelation": "La rétention exige que les données du jeu soient dans une table ordinaire. Ce jeu les lit depuis une vue, une table partitionnée ou un autre type de relation ; la rétention ne peut donc pas être activée ici.",
+    "retentionHasChildren": "La rétention ne peut pas s’exécuter sur une table dont d’autres tables héritent, car une suppression pourrait atteindre leurs lignes. Retirez les tables héritières pour utiliser la rétention.",
+    "retentionReferenced": "Une clé étrangère pointe vers cette table : supprimer ses anciennes lignes modifierait aussi les lignes qui y font référence. Retirez la clé étrangère pour utiliser la rétention.",
+    "retentionDeleteRule": "Cette table a une règle DELETE qui change l’effet d’une suppression. Retirez la règle pour utiliser la rétention.",
+    "retentionNotFeatureDataset": "La rétention ne fonctionne que sur les jeux de données dont les entités ont une géométrie.",
+    "retentionColumnMissing": "La colonne {{column}} n’existe plus. Choisissez une autre colonne de date ou d’horodatage.",
+    "retentionColumnNotTemporal": "La colonne {{column}} n’est pas une colonne de date ou d’horodatage. Choisissez une colonne de date ou d’horodatage.",
+    "retentionColumnInUse": "La rétention supprime les lignes selon la colonne {{column}}. Désactivez la rétention ou associez-la à une autre colonne avant de modifier cette colonne ou de donner son nom à une autre colonne.",
+    "retentionGidUnusable": "La rétention parcourt la table par sa colonne gid de nombres entiers, que cette table n’a plus. Rétablissez une colonne gid entière pour utiliser la rétention.",
+    "retentionDeleteTrigger": "La rétention ne peut pas s’exécuter sur une table qui a un déclencheur de suppression, car il peut conserver des lignes ou en modifier d’autres quand les anciennes sont supprimées. Retirez le déclencheur pour utiliser la rétention.",
+    "groupNotFound": "Groupe introuvable",
+    "groupNotJoined": "Vous ne pouvez partager qu'avec des groupes auxquels vous appartenez.",
+    "mapRestrictedNeedsGroups": "Partagez la carte avec un groupe avant de la restreindre.",
+    "mapChangeInProgress": "Une autre modification de cette carte est en cours. Réessayez dans un instant.",
+    "groupMemberNotFound": "Cette personne n’est pas membre de ce groupe",
+    "groupNameTaken": "Un groupe nommé « {{name}} » existe déjà",
+    "vrtAudienceExceedsSources": "Un jeu de données VRT serait accessible à des personnes qui ne voient pas tous ses jeux de données sources. Restreignez la visibilité du VRT ou utilisez des sources que son public peut voir.",
+    "storyNotFound": "Récit introuvable.",
+    "storyLocked": "Une autre modification de ce récit est en cours. Réessayez dans un instant.",
+    "storyNewerVersion": "Ce récit a été enregistré par une version plus récente de GeoLens et ne peut pas être modifié ici.",
+    "storyScenesUnreadable": "Certaines scènes ont été enregistrées par une version plus récente de GeoLens et ne peuvent pas être publiées ici.",
+    "storyVisibilityUnsupported": "Les récits ne peuvent pas encore être publiés avec cette visibilité.",
+    "dashboardTooNew": "Ce tableau de bord a été enregistré par une version plus récente de GeoLens et ne peut pas être modifié ici.",
+    "dashboardTooManyWidgets": "Un tableau de bord contient au plus 50 widgets. Supprimez-en avant d'enregistrer.",
+    "dashboardWidgetsRefused": "Certains widgets du tableau de bord utilisent des couches absentes de cette carte ou que vous ne pouvez pas lire. Supprimez-les ou choisissez d'autres couches.",
+    "storyImageUnreadable": "Le fichier n’est pas une image lisible.",
+    "storyImageTooLarge": "Cette image est trop grande. Envoyez un fichier de moins de 50 Mo avec moins de pixels.",
+    "storyImageUnsupported": "Seules les images PNG, JPEG et WebP peuvent être envoyées.",
+    "storyImageBusy": "D’autres images sont en cours de traitement. Réessayez dans un instant.",
+    "storyImageMissing": "Aucune image n’a été envoyée. Choisissez un fichier et réessayez.",
+    "storyAssetLimit": "Cette histoire contient déjà le maximum d’images : 200, ou 250 Mo au total.",
+    "storyAssetOwnerLimit": "Vos histoires occupent déjà tout l’espace d’images qu’un administrateur autorise. Retirez des images de vos histoires ou demandez à un administrateur d’augmenter la limite.",
+    "storyAssetsNotFound": "Certaines images de cette histoire sont introuvables. Retirez ces blocs d’image et enregistrez de nouveau.",
+    "storyFrameHostNotAllowed": "Certaines intégrations ou vidéos utilisent un site qu’aucun administrateur n’a approuvé. Corrigez-les ou retirez-les, puis réessayez."
   },
   "settings": {
-    "apiKeys": { "manageTitle": "Gérer les clés API" },
+    "apiKeys": {
+      "manageTitle": "Gérer les clés API"
+    },
     "tabs": {
       "preferences": "Préférences",
       "apiKeys": "Clés API"
@@ -405,7 +452,8 @@
     "docs": "Documentation",
     "github": "GitHub",
     "api": "API",
-    "license": "Apache 2.0"
+    "license": "Apache 2.0",
+    "thirdPartyLicenses": "Licences tierces"
   },
   "viewer": {
     "loading": "Chargement de la carte...",
@@ -413,7 +461,6 @@
     "linkExpiredDescription": "Ce lien de carte partagée n'est plus disponible. Il a peut-être expiré ou été révoqué par le propriétaire.",
     "mapNotFound": "Carte introuvable",
     "mapNotFoundDescription": "Cette carte a peut-être été supprimée ou le lien est invalide.",
-    "poweredBy": "Propulsé par GeoLens",
     "featureFallback": "Entité",
     "legend": {
       "title": "Couches",
@@ -428,10 +475,12 @@
       "weightedBy": "Pondéré par : {{column}}",
       "weightedByScaled": "Pondéré par : {{column}} (mis à l'échelle)",
       "other": "Autres",
+      "sampled": "Échantillon affiché à ce niveau de zoom. Zoomez pour afficher toutes les entités.",
       "cluster": {
         "server": "Regroupement côté serveur",
         "bounded": "Regroupement limité",
-        "fallback": "Points de secours"
+        "fallback": "Points de secours",
+        "pointsPerCluster": "Points par cluster"
       },
       "geometry": {
         "point": "Point",
@@ -466,7 +515,34 @@
       "booleanFalse": "Faux",
       "resultSummary_one": "{{count}} entité visible",
       "resultSummary_other": "{{count}} entités visibles",
-      "resultSummaryTruncated": "Affichage de {{shown}} entités visibles sur {{total}}"
+      "resultSummaryTruncated": "Affichage de {{shown}} entités visibles sur {{total}}",
+      "truncatedHint": "Zoomez ou déplacez la carte pour afficher le reste des entités.",
+      "openDatasetData": "Voir toutes les données de {{name}}",
+      "tableView": "Tableau",
+      "listView": "Liste",
+      "viewSwitch": "Vue des données de la carte",
+      "layerPicker": "Couche du tableau",
+      "inView": "Dans la vue",
+      "inViewNoGeometry": "Cette couche n'a pas de géométrie à filtrer selon la vue de la carte",
+      "filteredByMap": "Filtré par la carte",
+      "filterUnsupported": "Le filtre de la couche n'a pas pu être appliqué ; toutes les lignes sont affichées.",
+      "close": "Fermer les données de la carte",
+      "resize": "Redimensionner les données de la carte",
+      "expand": "Agrandir les données de la carte",
+      "collapse": "Réduire les données de la carte",
+      "emptyFiltered": "Aucune ligne ne correspond aux filtres de la carte",
+      "emptyInView": "Aucune ligne dans la vue. Déplacez la carte ou désactivez Dans la vue.",
+      "unavailable": "Le tableau de cette couche n'est pas disponible ici.",
+      "loadingRows": "Chargement des lignes",
+      "allFields": "Tous les champs",
+      "loadingFields": "Chargement des autres champs…",
+      "fieldsFailed": "Impossible de charger les autres champs.",
+      "selectionMissing": "L'élément sélectionné n'est pas sur cette page.",
+      "selectionShow": "Afficher la sélection",
+      "selectionShowing": "Affichage de l'élément sélectionné uniquement.",
+      "selectionShowAll": "Afficher toutes les lignes",
+      "selectionHiddenByFilters": "Les filtres du tableau masquent l'élément sélectionné.",
+      "openInTable": "Ouvrir {{name}} dans le tableau"
     },
     "heatmapLow": "Faible",
     "heatmapHigh": "Élevé",
@@ -495,6 +571,7 @@
       "emptyHint": "Posez une question sur les données de cette carte.",
       "readOnlyNote": "Les réponses sont en lecture seule — explorez les données sans modifier la carte.",
       "error": "Une erreur s'est produite. Veuillez réessayer.",
+      "errorModelUnsupported": "Le modèle d'IA de ce site nécessite l'API Responses d'OpenAI. Demandez à un administrateur de l'activer ou de choisir un autre modèle.",
       "retry": "Réessayer",
       "queryResult": {
         "empty": "Aucun résultat correspondant.",
@@ -523,6 +600,7 @@
     "private": "Privé",
     "internal": "Interne",
     "public": "Public",
+    "restricted": "Restreint",
     "listView": "Vue liste",
     "gridView": "Vue grille",
     "loadFailed": "Échec du chargement des cartes : {{message}}",
@@ -541,7 +619,8 @@
     "card": {
       "previewAlt": "Aperçu de {{name}}",
       "updated": "Mis à jour {{date}}",
-      "delete": "Supprimer la carte"
+      "delete": "Supprimer la carte",
+      "dashboard": "Tableau de bord"
     }
   },
   "enums": {
@@ -719,7 +798,9 @@
     "adminSettings": "Paramètres admin",
     "adminSaml": "Configuration SSO SAML",
     "verifyEmail": "Vérifier l'e-mail",
-    "signingIn": "Connexion en cours"
+    "signingIn": "Connexion en cours",
+    "trustBrowser": "Mémoriser ce navigateur",
+    "adminGroups": "Groupes admin"
   },
   "sidebar": {
     "title": "Barre latérale",
@@ -732,9 +813,6 @@
   },
   "inlineEdit": {
     "hint": "Ctrl+Entrée pour enregistrer, Échap pour annuler"
-  },
-  "mapCoordReadout": {
-    "scale": "1:{{value}}"
   },
   "errorBoundary": {
     "appTitle": "Une erreur est survenue",

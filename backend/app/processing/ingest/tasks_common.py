@@ -20,12 +20,12 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from procrastinate import App, PsycopgConnector
+from procrastinate import App
 
 from app.platform.dataset_origin import classify_origin, set_dataset_origin
-from app.core.config import settings
 from app.core.service_tokens import reset_registered_credential_secrets
 from app.core.url_redaction import redact_exception_text
+from app.platform.jobs.queue_connector import make_queue_connector
 from app.platform.storage import get_storage
 
 if TYPE_CHECKING:
@@ -41,10 +41,7 @@ if TYPE_CHECKING:
 def _current_tenant_schema() -> str:
     """Return the data schema for the current tenant (or 'data' in single_tenant).
 
-    Reads ``current_tenant_var`` and delegates to ``tenant_data_schema`` which
-    is a hard no-op returning ``'data'`` in single_tenant mode.
-    Called by ingest task helpers to route CREATE/RENAME/DROP/GRANT statements
-    to the correct per-tenant schema (DP-01, Phase 1209-02).
+    Raises RuntimeError in multi-tenant mode when no tenant context is bound.
     """
     from app.core.db.tenant_schema import tenant_data_schema
     from app.core.db.tenant_session import current_tenant_var
@@ -61,11 +58,11 @@ async def rename_pkey_to_match_table(session: "AsyncSession", table_name: str) -
 
     ALTER TABLE ... RENAME TO keeps the constraint (and its backing index)
     named after the attempt-scoped staging table (``*_staging_<uuid>_pkey``),
-    which is what QGIS/pgAdmin/DBeaver users see on a direct connection
-    (db-audit #529). Call inside the publish transaction, which already
-    holds the table's AccessExclusiveLock from the rename, so this cannot
-    block. Failure is cosmetic and must never fail the ingest — it is
-    swallowed under a SAVEPOINT and logged.
+    which is what QGIS/pgAdmin/DBeaver users see on a direct connection.
+    Call it inside the publish transaction, which already holds the table's
+    AccessExclusiveLock from the rename, so this cannot block. Failure is
+    cosmetic and must never fail the ingest, so it is swallowed under a
+    SAVEPOINT and logged.
     """
     from sqlalchemy import text
 
@@ -106,10 +103,7 @@ async def rename_pkey_to_match_table(session: "AsyncSession", table_name: str) -
 def _current_tenant_role() -> str:
     """Return the reader role for the current tenant (or 'geolens_reader' in single_tenant).
 
-    Reads ``current_tenant_var`` and delegates to ``tenant_reader_role`` which
-    is a hard no-op returning ``'geolens_reader'`` in single_tenant mode.
-    Called by ingest task helpers to GRANT SELECT to the correct per-tenant
-    reader role (DP-01, Phase 1209-02).
+    Raises RuntimeError in multi-tenant mode when no tenant context is bound.
     """
     from app.core.db.tenant_schema import tenant_reader_role
     from app.core.db.tenant_session import current_tenant_var
@@ -129,15 +123,14 @@ async def _emit_billing_event(
     event_id: str | None = None,
     table_name: str | None = None,
 ) -> bool:
-    """Dispatch a billable usage event to registered BillingExtensions (METER-01).
+    """Dispatch a billable usage event to registered BillingExtensions.
 
-    Imports ONLY ``get_billing_extensions`` from ``app.platform.extensions`` —
-    zero billing/stripe symbols enter core (T-1213-06); no-op in OSS/
-    single_tenant since ``DefaultBillingExtension`` has no ``on_usage_event``.
-    Each extension call is wrapped in try/except that logs and continues:
-    a failing billing extension must never fail an ingest task (T-1213-05).
+    Imports only ``get_billing_extensions`` from ``app.platform.extensions``,
+    so no billing symbol enters core; a no-op in OSS/single_tenant since
+    ``DefaultBillingExtension`` has no ``on_usage_event``. A failing billing
+    extension is logged and skipped: it must never fail an ingest task.
     ``tenant_id`` comes from the worker's ``current_tenant_var`` (set by
-    middleware), never client input (T-1213-07 spoofing).
+    middleware), never client input, which could be spoofed.
 
     Args:
         tenant_id: None (single_tenant, or context unset) returns immediately.
@@ -146,14 +139,13 @@ async def _emit_billing_event(
         event_id: dedup key — pass the Procrastinate job_id so retries stay
             idempotent at the DB layer.
         table_name: workers leave this None; the tile/OGC request path
-            passes it to drive the METER-03 last_accessed_at signal.
+            passes it to drive the last_accessed_at signal.
 
     Returns False when an extension raised, and True otherwise.
     """
     if not tenant_id:
         return True  # single_tenant no-op: no ledger, no billing (byte-identical OSS)
 
-    # Billing-import-free: only import the extension accessor, never billing symbols
     from app.platform.extensions import get_billing_extensions
 
     _log = structlog.get_logger()
@@ -170,8 +162,6 @@ async def _emit_billing_event(
                 table_name=table_name,
             )
         except Exception:  # broad: billing emit must NEVER fail an ingest task; varied extension errors
-            # Per-extension isolation — mirrors lifespan dispatch D-10 pattern
-            # (api/main.py bootstrap.py). Log and continue to next extension.
             _log.warning(
                 "billing_emit_error",
                 dimension=dimension,
@@ -187,10 +177,8 @@ async def _emit_billing_event(
 class IngestContext:
     """Bundle of parameters shared across the post-ogr2ogr finalize pipeline.
 
-    KISS-2 / K7: ``_finalize_ingest`` used to take 11 keyword-only
-    parameters, which made every call site noisy and hard to keep in sync.
-    Collecting them in a dataclass keeps the call sites terse and adds a
-    single obvious place to add future finalize inputs.
+    ``_finalize_ingest`` takes many inputs; collecting them in a dataclass
+    keeps the call sites terse.
     """
 
     session: "AsyncSession"
@@ -205,30 +193,20 @@ class IngestContext:
     user_metadata: dict[str, Any]
     source_url: str | None = None
     attempt_id: uuid.UUID | None = None
-    # feat(#1218): typed origin_ref for the created dataset, minus `kind`
-    # (derived from source_format). Keys are validated against the
-    # per-kind allowlist in app/platform/dataset_origin.py, so nothing
-    # unexpected — a credential most of all — reaches the column. Callers
-    # pass their own payload rather than one being inferred here.
+    # Typed origin_ref for the created dataset, minus `kind` (derived from
+    # source_format). Keys are validated against the per-kind allowlist in
+    # app/platform/dataset_origin.py, so nothing unexpected, a credential most
+    # of all, reaches the column. Callers pass their own payload rather than
+    # one being inferred here.
     origin_ref: dict[str, Any] | None = None
     # The local copy of the upload the task archives after the commit that
     # completes the job; that commit owes the archive in a follow-up record.
     archive_from: str | None = None
+    source_columns: list[dict] | None = None
 
-
-_connector_kwargs: dict = {
-    "min_size": 1,
-    "max_size": 3,
-    "kwargs": {"connect_timeout": 5},
-}
-if settings.db_use_external_pooler:
-    _connector_kwargs["kwargs"]["prepare_threshold"] = None
 
 task_app = App(
-    connector=PsycopgConnector(
-        conninfo=settings.procrastinate_conninfo,
-        **_connector_kwargs,
-    ),
+    connector=make_queue_connector(),
     import_paths=[
         "app.processing.ingest.tasks_vector",
         "app.processing.ingest.tasks_raster",
@@ -239,31 +217,31 @@ task_app = App(
         "app.processing.ingest.tasks_reupload",
         "app.processing.embeddings.tasks",
         "app.processing.analysis.tasks",
-        # fix(#1542): the queued admin embedding backfill. It lives under
-        # modules/admin/ because it emits the run's audit events, which
-        # processing/ may not import; this list is how the worker finds it.
+        # The embedding backfill, dataset retention and story image sweep.
+        # They live under modules/admin/: processing/ may not import the
+        # audit or catalog code they run. This list is how the worker finds them.
         "app.modules.admin.backfill_jobs",
+        "app.modules.admin.retention_jobs",
+        "app.modules.admin.story_asset_jobs",
     ],
 )
 
 
-# fix(#1746): without a credential store, service tasks are dispatched with
-# the raw token in job kwargs; the worker only deletes SUCCESSFUL rows, so a
-# terminal failure leaves it in `procrastinate_jobs.args->>'token'`
-# indefinitely.
+# Without a credential store, service tasks are dispatched with the raw token
+# in job kwargs; the worker only deletes successful rows, so a terminal failure
+# leaves it in `procrastinate_jobs.args->>'token'` indefinitely.
 #
-# fix(#1710): `url` joins `token` as a key worth purging. A submitted file URL
-# can be a presigned S3 or SAS link, which is bearer-equivalent, and it sits in
-# the row for the whole transfer plus forever after any non-successful
-# delivery. The statement itself stays in platform/jobs/sweep.py (#1755 item
-# 12), so there is still one home for it.
+# `url` is purged too. A submitted file URL can be a presigned S3 or SAS link,
+# which is bearer-equivalent, and it sits in the row for the whole transfer
+# plus forever after any non-successful delivery. The statement itself lives
+# in platform/jobs/sweep.py.
 async def purge_queued_job_arg(job_context: Any, *, arg_key: str = "token") -> None:
     """Best-effort: drop one credential-bearing key from this job's queue row.
 
     Takes the Procrastinate ``JobContext`` (not a bare id) so a direct call
     passing ``None`` is a no-op instead of an error.
 
-    Never raises — a failure caller runs this while a real exception is being
+    Never raises: a failure caller runs this while a real exception is being
     handled, and displacing that would cost the diagnosis. The warning logs
     only the row id and the key name, never the value it failed to remove.
     """
@@ -287,9 +265,9 @@ async def purge_queued_job_arg(job_context: Any, *, arg_key: str = "token") -> N
 def purge_token_on_failure(fn):
     """Wrap a ``pass_context=True`` task so a dying attempt purges its token.
 
-    Applied UNDER ``@tenant_task`` so the purge runs with the job's tenant
+    Applied under ``@tenant_task`` so the purge runs with the job's tenant
     context still bound. Absorbs the ``JobContext`` Procrastinate passes
-    positionally, keeping the task's own keyword-only call shape unchanged —
+    positionally, keeping the task's own keyword-only call shape unchanged;
     a direct caller (tests, ``.func``) supplies no context, so there's no
     row to purge and the wrapper is transparent.
 
@@ -313,10 +291,10 @@ def purge_token_on_failure(fn):
 async def cleanup_step(what: str, *, job_id: str) -> AsyncGenerator[None, None]:
     """Run one terminal-cleanup step; log a failure in it rather than raise it.
 
-    fix(#1755): a `finally`-block cleanup step must never replace the
-    exception the block is already propagating, and must not skip the steps
-    after it — wrap ONE step per `async with`; isolation is per block, not
-    per `finally`.
+    A `finally`-block cleanup step must never replace the exception the
+    block is already propagating, and must not skip the steps after it, so
+    wrap one step per `async with`: isolation is per block, not per
+    `finally`.
 
     Catches ``Exception``, not ``BaseException``, so a worker-shutdown
     ``CancelledError`` still propagates.
@@ -341,11 +319,10 @@ async def cleanup_step(what: str, *, job_id: str) -> AsyncGenerator[None, None]:
 def _append_job_warning(job, warning: "IngestJobWarning") -> None:
     """Append a structured warning to ``job.user_metadata['warnings']``.
 
-    Mutates ``job.user_metadata`` in place, creating the list if absent.
-    Caller is responsible for committing the session. ``warning`` is a
-    TypedDict from ``app.ingest.warnings.IngestJobWarning`` — route through
-    that module's producer helpers rather than building one inline, to keep
-    this in sync with the Pydantic ``JobStatusResponse`` (TYPE-1).
+    Mutates ``job.user_metadata`` in place, creating the list if absent; the
+    caller commits. Build ``warning`` with the producer helpers in
+    ``app.processing.ingest.warnings``, whose TypedDicts match the Pydantic
+    ``JobStatusResponse``.
     """
     warnings_list = list((job.user_metadata or {}).get("warnings", []))
     warnings_list.append(warning)
@@ -356,7 +333,7 @@ def _append_job_warning(job, warning: "IngestJobWarning") -> None:
 
 
 def _append_mercator_clip_warning(job, clip: dict | None) -> None:
-    """Warn when the Web Mercator clamp destroyed geometry (fix(#888)).
+    """Warn when the Web Mercator clamp destroyed geometry.
 
     ``clip`` is the ``clip_to_mercator_bounds`` return value. No-ops for the
     no-loss clip that every ordinary dataset produces, so each of the three
@@ -379,7 +356,7 @@ def _parse_temporal_fields(
     Each field is ISO-8601-parsed independently. A field that fails to
     parse is dropped from the return tuple but recorded in ``errors``
     (keyed by field name, value truncated to 100 chars) so the caller can
-    persist it to ``job.user_metadata.temporal_parse_errors`` for the UI (N5).
+    persist it to ``job.user_metadata.temporal_parse_errors`` for the UI.
     """
     from datetime import date as _date
 
@@ -424,8 +401,8 @@ def _manifest_text(user_metadata: dict, key: str) -> str | None:
 async def _apply_manifest_tags(session: Any, record: Any, tags: Any) -> None:
     """Add ``metadata.tags`` as theme keywords the record does not already have.
 
-    fix(#2039): a re-apply reaches the reupload swap with the same list, and
-    ``uq_record_keyword`` is a unique index — an unconditional insert would
+    A re-apply reaches the reupload swap with the same list, and
+    ``uq_record_keyword`` is a unique index, so an unconditional insert would
     fail the whole swap transaction on the second apply of one manifest.
     """
     if not isinstance(tags, list):
@@ -439,15 +416,15 @@ async def _apply_manifest_tags(session: Any, record: Any, tags: Any) -> None:
     from app.platform.extensions import get_processing_port
 
     port = get_processing_port()
-    # fix(#2039): the keyword class off the relationship of the record class the
-    # port already exposes — a new port accessor would be a required method, so
-    # every overlay would have to re-pin, and processing/ cannot import this ORM.
+    # The keyword class off the relationship of the record class the port
+    # already exposes: a new port accessor would be a required method that every
+    # overlay would have to re-pin for, and processing/ cannot import this ORM.
     keywords_rel = sa_inspect(port.get_record_orm_class()).relationships["keywords"]
     RecordKeyword = keywords_rel.mapper.class_
-    # fix(#2039 review): the rows `uq_record_keyword` would actually collide
-    # with, spelled as that index spells them — COALESCE, because a stored ''
-    # collides with the NULL written below — and case-folded like `wanted`. A
-    # record-wide read skipped a manifest tag that existed under another type.
+    # The rows `uq_record_keyword` would actually collide with, spelled as that
+    # index spells them (COALESCE, because a stored '' collides with the NULL
+    # written below) and case-folded like `wanted`. A record-wide read would
+    # skip a manifest tag that exists under another type.
     existing = {
         k.lower()
         for k in await session.scalars(
@@ -473,14 +450,11 @@ async def apply_manifest_record_metadata(
     catalog ORM class here would add a ``processing`` -> ``modules.catalog``
     edge, which ``ProcessingPort`` exists to keep out.
 
-    feat(#1472): the read-back for ``manifest_job_metadata``'s
-    ``metadata.attribution`` write, called once per ingest tail after the
-    record exists and before the phase transaction commits — without it an
-    operator-supplied attribution credit was accepted then silently dropped.
-
-    fix(#2039): ``license``, ``organization`` and ``tags`` are the same
-    shape of accepted-then-dropped field, and every manifest under
-    ``examples/manifests/`` sets them.
+    The read-back for ``manifest_job_metadata``'s ``metadata.attribution``,
+    ``license``, ``organization`` and ``tags`` writes, called once per ingest
+    tail after the record exists and before the phase transaction commits.
+    Without it those fields would be accepted and then silently dropped, and
+    every manifest under ``examples/manifests/`` sets them.
 
     Only manifest-namespaced keys are copied; un-namespaced ``title``/
     ``summary``/``visibility`` go through ``create_dataset``'s own
@@ -539,21 +513,21 @@ async def _job_phase_session(
     lock_and_statement_timeout_ms: int | None = None,
     require_status: str | None = None,
 ) -> "AsyncGenerator[tuple[AsyncSession, IngestJob | None], None]":
-    """Two-phase session bracket for ingest workers (REMED-03 / P2-05).
+    """Two-phase session bracket for ingest workers.
 
     Yields ``(session, job)``; ``job`` is ``None`` if the IngestJob row
     vanished between phases (caller should early-return; this logs and
     continues rather than raising). ``phase`` labels that warning. Caller
-    owns commits. Session lifetime is scoped to the ``async with`` block —
-    CPU/subprocess work must happen outside it (the #100 greenlet rule; see
+    owns commits. Session lifetime is scoped to the ``async with`` block;
+    CPU/subprocess work must happen outside it (the greenlet rule; see the
     ``ingest_file`` / ``ingest_raster`` docstrings).
 
     ``lock_and_statement_timeout_ms``, if given, issues ``SET LOCAL
     lock_timeout``/``statement_timeout`` before the SELECT.
 
-    fix(#1778): pass ``require_status="running"`` at any phase that must not
-    resume after a stale-job sweep has failed the row — a worker that was
-    only paused (not dead) can still hold a matching ``attempt_id`` and
+    Pass ``require_status="running"`` at any phase that must not resume
+    after a stale-job sweep has failed the row: a worker that was only
+    paused (not dead) can still hold a matching ``attempt_id`` and
     resume into a terminal row otherwise. This also switches the SELECT to
     ``FOR NO KEY UPDATE``, holding the row lock until commit so the
     ``SELECT ... FOR UPDATE SKIP LOCKED`` passes in sweep.py and worker.py's
@@ -589,9 +563,8 @@ async def _job_phase_session(
             filters.append(IngestJob.status == require_status)
         stmt = select(IngestJob).where(*filters)
         if require_status is not None:
-            # fix(#1778): held through this phase's own first
-            # irreversible write and up to its next commit — see the
-            # docstring above.
+            # Held through this phase's own first irreversible write and up
+            # to its next commit; see the docstring above.
             stmt = stmt.with_for_update(key_share=True)
         result = await session.execute(stmt)
         job = result.scalar_one_or_none()
@@ -616,7 +589,7 @@ async def _job_phase_session(
 
 
 def _bind_task_log_context(*, task_name: str, job_id: str, **extra: object) -> None:
-    """Bind structlog contextvars for a worker task entry point (N1/R-18/R-24).
+    """Bind structlog contextvars for a worker task entry point.
 
     Procrastinate tasks run outside the request loop and so lack the
     ``request_id`` the HTTP middleware binds; ``job_id`` is the correlation
@@ -626,10 +599,10 @@ def _bind_task_log_context(*, task_name: str, job_id: str, **extra: object) -> N
     """
 
     structlog.contextvars.clear_contextvars()
-    # fix(#1770): also resets the credential-secret registry
-    # (`core/service_tokens.register_credential_secret`) — otherwise a
-    # prior job's registered secret lingers and mis-scrubs a later job's
-    # log lines.
+    # The credential-secret registry
+    # (`core/service_tokens.register_credential_secret`) is reset too, or a
+    # prior job's registered secret lingers and mis-scrubs a later job's log
+    # lines.
     reset_registered_credential_secrets()
     structlog.contextvars.bind_contextvars(
         service="worker",
@@ -642,7 +615,7 @@ def _bind_task_log_context(*, task_name: str, job_id: str, **extra: object) -> N
 # File formats whose missing CRS declaration conventionally means EPSG:4326
 # (lon/lat). Anything else with geometry but no detectable CRS must fail (or
 # carry a user srid_override) instead of silently assuming 4326. Shared by
-# ingest_file and reupload_file (fix(#541): reupload lacked the gate).
+# ingest_file and reupload_file, so a reupload cannot skip the gate.
 ASSUMES_4326_SUFFIXES = (".csv", ".geojson", ".json", ".xlsx", ".xls")
 
 
@@ -674,10 +647,8 @@ def _resolve_effective_srid(
     """Decide which SRID to feed to ``add_4326_column``.
 
     User override takes precedence, otherwise the detected source SRID,
-    otherwise 4326 (safe default for GeoJSON/CSV). K1/KISS-3 extraction from
-    ``ingest_file``. Callers in non-spatial paths should not invoke this
-    helper — the fallback only makes sense when the caller has already
-    decided a geometry column will exist.
+    otherwise 4326 (safe default for GeoJSON/CSV). Only for a caller that
+    has already decided a geometry column will exist.
     """
     if srid_override is not None:
         return int(srid_override)
@@ -699,8 +670,8 @@ async def _detect_and_override_geometry(
     Runs ``construct_point_geometry`` or ``construct_wkt_geometry`` when the
     user supplied ``x_column + y_column`` or ``geom_column`` in the commit
     metadata. Returns the geometry type string the caller should use in place
-    of the ogrinfo-detected value (or ``None`` if neither override is set —
-    callers guard on ``user_wants_geom`` so this branch is defensive only).
+    of the ogrinfo-detected value, or ``None`` if neither override is set
+    (callers guard on ``user_wants_geom``, so that branch is defensive only).
 
     ``renamed_columns`` is what ``rename_reserved_columns`` returned: a column
     the user picked may have moved to ``src_<name>`` since the preview, and the
@@ -708,7 +679,7 @@ async def _detect_and_override_geometry(
 
     Callers are responsible for importing the file as non-spatial (see the
     ``ogr_geometry_type = None if user_wants_geom else ...`` branch in
-    ``ingest_file``) before invoking this helper. K1/KISS-3 extraction.
+    ``ingest_file``) before invoking this helper.
     """
     from app.processing.ingest.metadata import _qtable
 
@@ -779,6 +750,7 @@ async def run_paged_arcgis_service_fetch(
     on_spawn: Any = None,
     on_page: Any = None,
     planned_ids: tuple[int, ...] | None = None,
+    return_z: bool = False,
 ) -> None:
     """Guarded ArcGIS paging shared by initial import and refresh/reupload.
 
@@ -818,6 +790,7 @@ async def run_paged_arcgis_service_fetch(
                 result_offset=None,
                 object_ids=object_ids,
                 force_arcgis_geojson=force_arcgis_geojson,
+                return_z=return_z,
             )
             return len(page_source.encode("utf-8")) <= _ARCGIS_GDAL_GET_URL_MAX_BYTES
 
@@ -863,6 +836,7 @@ async def run_paged_arcgis_service_fetch(
             result_offset=offset,
             object_ids=object_ids,
             force_arcgis_geojson=force_arcgis_geojson,
+            return_z=return_z,
         )
         await ogr.run_ogr2ogr_service(
             page_source,
@@ -875,6 +849,7 @@ async def run_paged_arcgis_service_fetch(
             append=append,
             schema=schema,
             on_spawn=on_spawn,
+            keep_z=return_z,
         )
         async with async_session() as session:
             result = await session.execute(
@@ -894,10 +869,10 @@ async def run_paged_arcgis_service_fetch(
             else min(page_size, feature_count - offset)
         )
         if grew != expected:
-            # fix(#1675): positive growth alone isn't enough — a server
-            # returning fewer rows than requested while offset advances by
-            # page_size would silently skip records. A mid-fetch source
-            # mutation trips this too; failing is the safe direction.
+            # Positive growth alone isn't enough: a server returning fewer
+            # rows than requested while offset advances by page_size would
+            # silently skip records. A mid-fetch source mutation trips this
+            # too; failing is the safe direction.
             raise ogr.IngestionError(
                 f"ArcGIS page at offset {offset if offset is not None else 'ID chunk'} returned {grew} rows where "
                 f"{expected} were expected; the server may cap responses "
@@ -1044,13 +1019,13 @@ async def load_job_for_error_write(
 ):
     """Load the job row a failure tail is about to settle, under the shared budget.
 
-    Never raises — every caller reaches it from inside an ``except``, where
+    Never raises: every caller reaches it from inside an ``except``, where
     a raise would replace the ingest failure with a lock timeout.
 
     Returns ``None`` when the row is gone, a newer attempt owns it, or the
     budget expired (logged as its own event); on any ``None`` the
     transaction is ended so the caller's remaining writes run unbudgeted
-    on a clean session. On a hit the transaction stays open and budgeted —
+    on a clean session. On a hit the transaction stays open and budgeted:
     ending it here would expire the row instance before the caller passes
     it to ``_cleanup_staging_on_failure``.
     """
@@ -1097,7 +1072,7 @@ async def _generate_quicklook(session, dataset_id: uuid.UUID, table_name: str) -
     Separate try/except blocks around generate+upload, the URI write and
     the commit let operators tell which phase failed from the logs.
 
-    The caller MUST pass a FRESH session, not the one that published the
+    The caller must pass a fresh session, not the one that published the
     table. The generation timeout can cancel the inner geom query mid-flight
     and poison the asyncpg cursor; the defensive ``rollback()`` then expires
     every ORM attribute (``expire_on_rollback=True``). On the publishing
@@ -1340,6 +1315,7 @@ async def _finalize_ingest(ctx: IngestContext):
         table_name=table_name,
         has_geometry=ctx.has_geometry,
         effective_srid=ctx.effective_srid,
+        source_columns=ctx.source_columns,
     )
     _append_mercator_clip_warning(job, staging.mercator_clip)
     has_geometry = staging.has_geometry
@@ -1347,7 +1323,6 @@ async def _finalize_ingest(ctx: IngestContext):
     three_d = staging.three_d
     sample_values = staging.sample_values
 
-    # Create Dataset record
     dataset_name = user_metadata.get("title") or source_filename or table_name
     ingestion_fields: dict = {
         **metadata,
@@ -1375,24 +1350,24 @@ async def _finalize_ingest(ctx: IngestContext):
         ingestion=ingestion,
     )
     await apply_source_field_labels(session, dataset.id, user_metadata)
-    # fix(#430): create_dataset defaults the record to 'published',
-    # so the before_insert hook has already stamped published_at by the time
-    # this overwrite runs. A non-published final status must not keep that
-    # timestamp — the real transition path (_apply_record_status_change)
-    # stamps it when the dataset is actually published later.
+    # create_dataset defaults the record to 'published', so the before_insert
+    # hook has already stamped published_at by the time this overwrite runs.
+    # A non-published final status must not keep that timestamp; the real
+    # transition path (_apply_record_status_change) stamps it when the dataset
+    # is actually published later.
     final_status = user_metadata.get("record_status", "published")
     dataset.record.record_status = final_status
     if final_status != "published":
         dataset.record.published_at = None
 
-    # feat(#1472): the manifest's credit line, which create_dataset has no
-    # argument for. Same transaction as the record it annotates.
+    # The manifest's catalog metadata, which create_dataset has no argument
+    # for, in the same transaction as the record it annotates.
     await apply_manifest_record_metadata(session, dataset.record, user_metadata)
 
-    # feat(#1218): system-managed origin pointer, in the same transaction that
-    # creates the dataset. Service ingest supplies the enriched URL through
-    # ctx.source_url; an uploaded file has no remote origin to point at, so
-    # its origin_uri stays NULL and only the ref carries the filename.
+    # System-managed origin pointer, in the same transaction that creates the
+    # dataset. Service ingest supplies the enriched URL through ctx.source_url;
+    # an uploaded file has no remote origin to point at, so its origin_uri
+    # stays NULL and only the ref carries the filename.
     ingest_origin_kind = classify_origin(ctx.source_format)
     set_dataset_origin(
         dataset,
@@ -1400,10 +1375,10 @@ async def _finalize_ingest(ctx: IngestContext):
         uri=ctx.source_url,
         **(ctx.origin_ref or {}),
     )
-    # fix(#1271): a first service or STAC ingest fetched its bytes
-    # from the origin moments ago, so the import IS a contact — same contract
-    # as the reupload swap below. Without this, every freshly imported
-    # service dataset reported last_checked_at NULL until someone probed it.
+    # A first service or STAC ingest fetched its bytes from the origin moments
+    # ago, so the import is a contact, as in the reupload swap. Otherwise a
+    # freshly imported service dataset would report last_checked_at NULL until
+    # someone probed it.
     if ingest_origin_kind in ("service", "stac"):
         dataset.last_checked_at = datetime.now(timezone.utc)
 
@@ -1417,15 +1392,13 @@ async def _finalize_ingest(ctx: IngestContext):
     )
     dataset.quality_detail = quality_score
 
-    # Update job to complete and commit dataset + job atomically. The
-    # attempt predicate is the worker lease fence: if a stale worker resumes
-    # after a retry rotated the token, this no-op raises and the surrounding
-    # phase transaction rolls back the dataset it built.
-    # REMED-02 / ingest-audit P2-07: stamp the terminal progress signal so the
-    # polling UI sees current_step=complete + progress=1.0 immediately on
-    # success. ``rows_processed`` is the feature_count derived by
-    # ``extract_metadata`` above; raster ingests (which do not call this
-    # helper) leave the column NULL — see tasks_raster.ingest_raster.
+    # Complete the job and commit dataset + job atomically. The attempt
+    # predicate is the worker lease fence: if a stale worker resumes after a
+    # retry rotated the token, this no-op raises and the surrounding phase
+    # transaction rolls back the dataset it built. The terminal progress lets
+    # the polling UI see current_step=complete and progress=1.0 at once.
+    # ``rows_processed`` is the feature_count ``extract_metadata`` derived;
+    # raster ingests, which do not call this helper, leave the column NULL.
     from app.platform.jobs import ledger
     from app.processing.ingest.publish_followups import owed_followups
 
@@ -1433,7 +1406,8 @@ async def _finalize_ingest(ctx: IngestContext):
     if ctx.archive_from is not None:
         from app.processing.ingest.tasks_staging import original_archive_key
 
-        # A fan-out layer shares its upload with its siblings, so it never deletes it.
+        # A fan-out layer shares its upload with its siblings, so it never
+        # deletes it.
         archive = {
             "reaps_staged_upload": not user_metadata.get("fan_out_parent_id"),
             "archive_key": original_archive_key(dataset.id, ctx.archive_from),
@@ -1487,13 +1461,12 @@ def _is_lock_timeout_error(exc: BaseException) -> bool:
 
     asyncpg raises ``asyncpg.exceptions.LockNotAvailableError``; SQLAlchemy
     wraps it in ``DBAPIError`` with ``.orig`` pointing at the original
-    asyncpg exception. Check both shapes so behavior is identical
-    regardless of where the exception bubbles up from.
+    asyncpg exception. Both shapes are checked so behavior is identical
+    wherever the exception bubbles up from.
 
-    ING-06 / P2-08: used by ``_install_reupload_table`` to gate its single
-    retry. Returns False for any other exception class or SQLSTATE so
-    real errors (e.g., 23505 unique violation) still propagate
-    immediately.
+    Gates the swap's single retry in ``install_candidate_table``. Returns
+    False for any other exception class or SQLSTATE so real errors (e.g.
+    23505 unique violation) still propagate immediately.
     """
     # Direct asyncpg exception
     try:
@@ -1540,7 +1513,7 @@ async def _run_service_import_with_wfs_fallback(
     """Run a service import with WFS namespace retry + optional auth detection.
 
     Extracts the retry pattern that appears in both ingest_service and
-    reupload_service (KISS-8). If the initial import raises
+    reupload_service. If the initial import raises
     ``IngestionError`` and the layer name has a ``ns:name`` prefix,
     retries with the unqualified name. If ``auth_error_message`` is
     provided and the token is None and the error looks like an auth
@@ -1597,7 +1570,7 @@ async def invalidate_tile_cache_for_table(table_name: str) -> bool:
 
 
 # The AccessExclusiveLock budget the reupload swap DDL spends: first attempt,
-# the single retry, and the pause between them (#1917).
+# the single retry, and the pause between them.
 _SWAP_FIRST_TIMEOUT = "5s"
 _SWAP_RETRY_TIMEOUT = "15s"
 _SWAP_RETRY_SLEEP_MS = 200
@@ -1608,7 +1581,7 @@ async def _install_reupload_table(
 ) -> None:
     """Rename the staging table over the dataset's live table, in the caller's transaction.
 
-    The replaced table is kept as the dataset's previous version. The caller
+    The replaced table is kept as one of the dataset's previous versions. The caller
     takes the catalog rows next, then calls :func:`_write_reupload_catalog`.
     """
     await install_candidate_table(
@@ -1622,40 +1595,38 @@ async def install_candidate_table(
     dataset,
     candidate: str,
     measurement: "Measurement",
-    holding: str | None = None,
+    restoring: int | None = None,
 ) -> None:
-    """Make ``candidate`` the dataset's live table and keep the live one as its previous version.
+    """Make ``candidate`` the dataset's live table and keep the live one as a previous version.
 
-    Any older previous version is dropped. When ``candidate`` is the previous
-    version itself, the live table waits under ``holding`` until it can take
-    that name. The renames run on their own lock budget in the caller's
-    transaction, which keeps its ``lock_timeout`` afterwards.
+    ``restoring`` is the kept version ``candidate`` holds when the swap
+    publishes it again. Past ``PREVIOUS_VERSIONS_KEPT`` kept versions, the
+    oldest are dropped. The renames run on their own lock budget in the
+    caller's transaction, which keeps its ``lock_timeout`` afterwards.
     """
     from sqlalchemy import text
 
     from app.platform.jobs.heartbeat import previous_version_table
     from app.processing.ingest.metadata import _qtable
     from app.processing.ingest.previous_version import (
+        kept_tables_to_drop,
         refuse_dependent_relations,
-        require_own_previous_version_name,
+        require_free_previous_version_name,
+        require_unclaimed_previous_version_name,
     )
 
     table_name = dataset.table_name
-    previous = previous_version_table(table_name, dataset.id)
-    keep = previous if candidate != previous else holding
-    if keep is None:
-        raise ValueError("Restoring the previous version needs a holding name")
+    keep = previous_version_table(table_name, dataset.id, dataset.current_version)
 
     # Tenant schema for this ingest: same schema for every table renamed
-    # (T-1209-07: the RENAMEs must stay intra-schema so they are atomic DDL).
+    # (the RENAMEs must stay intra-schema so they are atomic DDL).
     _tenant_schema = _current_tenant_schema()
 
     def _q(name: str) -> str:
         return _qtable(name, schema=_tenant_schema)
 
-    await require_own_previous_version_name(
-        session, dataset, previous, schema=_tenant_schema
-    )
+    if restoring is not None:
+        await require_unclaimed_previous_version_name(session, dataset, candidate)
 
     # Resolve live_exists once — independent of lock contention; this
     # SELECT does not need the AccessExclusiveLock we're about to acquire.
@@ -1675,13 +1646,25 @@ async def install_candidate_table(
         ),
         {"schema": _tenant_schema, "tn": table_name},
     )
+    # A partitioned table's partitions would keep their own names under the
+    # renamed parent, where discovery lists them and registration accepts
+    # them, so a replacement drops it rather than keeping it.
+    keeps_live = live_exists and not (live_partitioned and restoring is None)
+    if keeps_live:
+        await require_free_previous_version_name(
+            session, dataset, keep, schema=_tenant_schema
+        )
 
-    # ING-06 (P2-08): wrap the swap DDL in SAVEPOINTs + single retry on
-    # lock_timeout. Autovacuum can hold AccessExclusiveLock long enough to
-    # collide with the 5s default; bumping to 15s on retry plus a 200ms
-    # sleep gives the autovacuum a chance to clear without surfacing the
-    # failure to the user. Beyond this single retry we surface the error
-    # so ops can investigate.
+    dropped = await kept_tables_to_drop(
+        session, dataset, keeping=keeps_live, restoring=restoring
+    )
+    locked = (table_name, *([candidate] if restoring is not None else []), *dropped)
+
+    # The swap DDL runs in SAVEPOINTs with a single retry on lock_timeout.
+    # Autovacuum can hold AccessExclusiveLock long enough to collide with the
+    # 5s default; 15s on retry plus a 200ms sleep gives it a chance to clear
+    # without surfacing the failure to the user. Beyond the single retry the
+    # error surfaces so ops can investigate.
 
     async def _swap_with_timeout(timeout_str: str) -> None:
         """Run SET LOCAL lock_timeout and the swap's DDL.
@@ -1691,36 +1674,24 @@ async def install_candidate_table(
         renamed as the table is, since the next rename needs the name it held.
         """
         await session.execute(text(f"SET LOCAL lock_timeout = '{timeout_str}'"))
-        await refuse_dependent_relations(
-            session, (table_name, previous), schema=_tenant_schema
-        )
-        if candidate != previous:
-            # Without a live table there is nothing to keep, and an older
-            # previous version left in place would be stamped as this one's.
-            await session.execute(text(f"DROP TABLE IF EXISTS {_q(previous)}"))
-        if live_exists:
+        await refuse_dependent_relations(session, locked, schema=_tenant_schema)
+        for table in dropped:
+            await session.execute(text(f"DROP TABLE IF EXISTS {_q(table)}"))
+        if keeps_live:
             await session.execute(
                 text(f'ALTER TABLE {_q(table_name)} RENAME TO "{keep}"')
             )
             await rename_pkey_to_match_table(session, keep)
+        elif live_exists:
+            await session.execute(text(f"DROP TABLE {_q(table_name)}"))
         await session.execute(
             text(f'ALTER TABLE {_q(candidate)} RENAME TO "{table_name}"')
         )
         await rename_pkey_to_match_table(session, table_name)
-        if live_exists and keep != previous:
-            await session.execute(
-                text(f'ALTER TABLE {_q(keep)} RENAME TO "{previous}"')
-            )
-            await rename_pkey_to_match_table(session, previous)
-        if live_partitioned and candidate != previous:
-            # Its partitions would keep their own names under the renamed
-            # parent, where discovery lists them and registration accepts
-            # them, so a partitioned table is not kept.
-            await session.execute(text(f"DROP TABLE {_q(previous)}"))
 
-    # fix(#1917): a `SET LOCAL` survives RELEASE SAVEPOINT, so the DDL budget
-    # below outlives its savepoint and would clamp every later wait in this
-    # transaction. Capture what is in effect; it is put back after the swap.
+    # A `SET LOCAL` survives RELEASE SAVEPOINT, so the DDL budget below
+    # outlives its savepoint and would clamp every later wait in this
+    # transaction. What is in effect now is put back after the swap.
     pre_swap_lock_timeout = await session.scalar(
         text("SELECT current_setting('lock_timeout')")
     )
@@ -1760,17 +1731,16 @@ async def install_candidate_table(
             retry_timeout_seconds=15,
         )
 
-    # fix(#1917): the DDL budget ends here. `set_config(..., true)` is
-    # `SET LOCAL` taking a bind parameter.
+    # The DDL budget ends here. `set_config(..., true)` is `SET LOCAL` taking a
+    # bind parameter.
     await session.execute(
         text("SELECT set_config('lock_timeout', :value, true)"),
         {"value": pre_swap_lock_timeout},
     )
 
-    # fix(#448): belt-and-braces after the swap — the staging pipeline is
-    # responsible for the GIST index, but a re-ingest of a table that already
-    # lost its index (the IF-NOT-EXISTS name-collision regression) must
-    # self-heal here rather than serve full-scan tiles until the next audit.
+    # Belt-and-braces after the swap: the staging pipeline is responsible for
+    # the GIST index, but a re-ingest of a table that already lost its index
+    # must self-heal here rather than serve full-scan tiles.
     if measurement.geometry_type is not None:
         from app.processing.ingest.metadata import ensure_geom_4326_gist_index
 
@@ -1789,6 +1759,8 @@ async def _write_reupload_catalog(
     source_url: str | None = None,
     file_hash: str | None = None,
     origin_ref: dict[str, Any] | None = None,
+    field_labels: dict | None,
+    job_id: uuid.UUID | None = None,
 ) -> tuple[Any, dict]:
     """Write what the installed table holds onto the catalog rows the caller holds.
 
@@ -1801,6 +1773,9 @@ async def _write_reupload_catalog(
     through the per-kind allowlist, and callers supply their own rather than
     one being inferred here.
 
+    ``job_id`` names the job that records ``origin_link_loss`` when the swap
+    moves a service dataset to a host its portal link no longer matches.
+
     Returns the ``DatasetVersion`` this swap produced, flushed so the run row
     can link to its id, and the schema diff the projection computed under the
     lock, which is the diff the run stores. The tile-cache bump is the
@@ -1809,12 +1784,12 @@ async def _write_reupload_catalog(
     from app.modules.audit.service import (
         AuditEvent,
         audit_emit,
-    )  # LAZY — preserved per D-17
+    )
     from app.platform.extensions import get_processing_port
     from app.processing.ingest.catalog_projection import project
     from app.processing.ingest.previous_version import (
         record_live_version,
-        stamp_previous_version,
+        stamp_kept_versions,
     )
 
     DatasetVersion = get_processing_port().get_dataset_version_orm_class()
@@ -1822,8 +1797,10 @@ async def _write_reupload_catalog(
     new_version = dataset.current_version + 1
 
     await record_live_version(session, dataset)
-    schema_diff = await project(session, dataset, measurement)
-    await stamp_previous_version(session, dataset, dataset.current_version)
+    schema_diff = await project(
+        session, dataset, measurement, field_labels=field_labels
+    )
+    await stamp_kept_versions(session, dataset, dataset.current_version)
 
     dataset.source_format = source_format
     dataset.source_filename = source_filename
@@ -1833,36 +1810,41 @@ async def _write_reupload_catalog(
     if source_url is not None:
         dataset.source_url = source_url
 
-    # fix(#1218): restamp the binding to describe where the CURRENT bytes
-    # came from. Without this a file reupload of a registered-postgis or
-    # service dataset leaves the old pointer in place — computed origin
-    # `upload` beside a stored ref still claiming `postgis` — and a later
-    # refresh follows the stale pointer. Kind is derived from the NEW
-    # source_format, same as first ingest, so a service reupload stays a
-    # service origin and a file reupload clears `origin_uri`.
-    #
-    # #1220's shared refresh executor takes over both writes for
-    # server-side refresh; until it lands, this path owns them.
+    # Restamp the binding to describe where the current bytes came from.
+    # Otherwise a file reupload of a registered-postgis or service dataset
+    # leaves the old pointer in place (computed origin `upload` beside a
+    # stored ref still claiming `postgis`), and a later refresh follows the
+    # stale pointer. Kind is derived from the new source_format, as on first
+    # ingest, so a service reupload stays a service origin and a file
+    # reupload clears `origin_uri`.
     origin_kind = classify_origin(source_format)
-    set_dataset_origin(
+    link_losses = set_dataset_origin(
         dataset,
         origin_kind,
         uri=source_url,
         **(origin_ref or {}),
     )
+    if link_losses and job_id is not None:
+        from app.platform.jobs.models import IngestJob
+
+        job = await session.get(IngestJob, job_id)
+        if job is not None:
+            job.user_metadata = {
+                **(job.user_metadata or {}),
+                "origin_link_loss": link_losses,
+            }
     # The swap commit time, which is what migration 0036's backfill reads off
     # max(dataset_versions.uploaded_at) for a pre-existing dataset. A Python
     # datetime rather than func.now(): a SQL expression leaves the attribute
     # expired after flush, and the next read of dataset.last_refreshed_at then
     # lazy-loads against a session that may already be closed.
     swap_time = datetime.now(timezone.utc)
-    # fix(#1271): set_dataset_origin just cleared the probe state, and
-    # for a service or STAC origin this swap IS a contact — the bytes were
-    # fetched from that origin moments ago. Leaving last_checked_at NULL
-    # would make the API claim the origin was never contacted, which is the
-    # column's contract violated in the other direction. source_health stays
-    # NULL: the health vocabulary belongs to the probe's classifier. A file
-    # upload or registered table contacts nothing and stamps nothing.
+    # set_dataset_origin just cleared the probe state, and for a service or
+    # STAC origin this swap is a contact: the bytes were fetched from that
+    # origin moments ago. Leaving last_checked_at NULL would make the API claim
+    # the origin was never contacted. source_health stays NULL: the health
+    # vocabulary belongs to the probe's classifier. A file upload or
+    # registered table contacts nothing and stamps nothing.
     if origin_kind in ("service", "stac"):
         dataset.last_checked_at = swap_time
     dataset.last_refreshed_at = swap_time
@@ -1875,10 +1857,11 @@ async def _write_reupload_catalog(
         feature_count=measurement.metadata.get("feature_count"),
         srid=measurement.metadata.get("srid"),
         # The effective type, so the version history and the dataset row it
-        # describes never disagree about what this swap installed (#1373).
+        # describes never disagree about what this swap installed.
         geometry_type=measurement.geometry_type,
         file_hash=file_hash,
         original_srid=original_srid,
+        column_info=dataset.column_info,
         is_3d=measurement.three_d.get("is_3d"),
         n_dims=measurement.three_d.get("n_dims"),
         uploaded_by=actor_id,

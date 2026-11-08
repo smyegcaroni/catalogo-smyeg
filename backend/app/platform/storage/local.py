@@ -12,12 +12,12 @@ from app.core.async_io import run_in_thread_draining
 from app.platform.storage.provider import StoredObject
 
 
-# Chunk size for streaming reads (ING-03/P2-03): balances syscall overhead
+# Chunk size for streaming reads: balances syscall overhead
 # against per-download resident memory.
 _STREAM_CHUNK_BYTES = 1024 * 1024  # 1 MiB
 
 # Matches the ListObjectsV2 default so a consumer's per-page budget behaves
-# the same on every backend (feat #1249).
+# the same on every backend.
 _OBJECT_PAGE_SIZE = 1000
 
 
@@ -32,8 +32,8 @@ class LocalStorageProvider:
         """Return the resolved path for *key*, asserting it stays inside base_dir.
 
         Rejects absolute keys, null bytes, and path-traversal that escapes
-        base_dir, raising ``ValueError`` (caller maps to 400/403). SEC-026:
-        called at the top of every IO method so none is a bypass.
+        base_dir, raising ``ValueError`` (caller maps to 400/403).
+        Called at the top of every IO method so none is a bypass.
         """
         if "\x00" in key:
             raise ValueError(f"Storage key contains a null byte: {key!r}")
@@ -41,6 +41,7 @@ class LocalStorageProvider:
             raise ValueError(
                 f"Storage key must be relative, got absolute path: {key!r}"
             )
+        # codeql[py/path-injection] this join is the containment check: the key is rejected unless the resolved path stays under the resolved base
         candidate = (self.base_dir / key).resolve()
         resolved_base = self.base_dir.resolve()
         if candidate != resolved_base and not candidate.is_relative_to(resolved_base):
@@ -53,7 +54,7 @@ class LocalStorageProvider:
     async def put(self, key: str, data: BinaryIO | bytes) -> str:
         """Store data at key. Returns the absolute path as a string.
 
-        fix(#435): a file-like ``data`` stays file-like, copied in 1 MiB
+        A file-like ``data`` stays file-like, copied in 1 MiB
         chunks inside the worker thread — not ``data.read()`` materializing a
         whole COG/VRT/original (can exceed the 2 GB container limit) as one
         ``bytes`` object.
@@ -69,7 +70,7 @@ class LocalStorageProvider:
 
         def _put() -> str:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            # fix(#1532): write beside dest, then os.replace (atomic, same
+            # Write beside dest, then os.replace (atomic, same
             # dir) — an ENOSPC or kill mid-copy must never leave a partial
             # file visible under the real key, unlike S3/Azure puts.
             tmp = dest.with_name(f"{dest.name}.{uuid.uuid4().hex}.tmp")
@@ -77,7 +78,7 @@ class LocalStorageProvider:
                 try:
                     _write(tmp, data)
                 except FileNotFoundError:
-                    # fix(#1532): the dir can vanish between mkdir and open if
+                    # The dir can vanish between mkdir and open if
                     # the empty-dir sweeper runs concurrently. Retry ONCE — a
                     # second disappearance means a broken volume, not a race.
                     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -97,7 +98,7 @@ class LocalStorageProvider:
                 raise
             return str(dest)
 
-        # fix(#435): drain the copy thread on cancellation — otherwise the
+        # Drain the copy thread on cancellation — otherwise the
         # caller's `with open(...)` can close `data` mid-copyfileobj and
         # truncate the artifact. See app/core/async_io.py.
         return await run_in_thread_draining(_put)
@@ -108,13 +109,16 @@ class LocalStorageProvider:
         return await asyncio.to_thread(path.read_bytes)
 
     async def copy(self, src_key: str, dst_key: str) -> None:
-        """Copy within the staging root, creating the destination's parents."""
+        """Copy within the staging root, creating the destination's parents.
+
+        The copy is a new object, modified now, as on S3 and Azure.
+        """
         src = self._resolve_contained(src_key)
         dst = self._resolve_contained(dst_key)
 
         def _copy() -> None:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
+            shutil.copy(src, dst)
 
         await asyncio.to_thread(_copy)
 
@@ -130,7 +134,7 @@ class LocalStorageProvider:
         return await asyncio.to_thread(_read)
 
     async def get_stream(self, key: str) -> AsyncIterator[bytes]:
-        """Stream key bytes in 1 MiB chunks (ING-03/P2-03).
+        """Stream key bytes in 1 MiB chunks.
 
         Avoids materializing a large COG as one ``bytes`` object. Handle
         closed in ``finally`` so a client disconnect mid-stream doesn't leak
@@ -156,7 +160,7 @@ class LocalStorageProvider:
     ) -> AsyncIterator[bytes]:
         """Stream ``length`` bytes from ``start`` off ONE open file handle.
 
-        fix(#1540): mirrors S3/Azure's one-call contract, though local never
+        Mirrors S3/Azure's one-call contract, though local never
         paid the per-chunk-request cost they did — this keeps object stores
         from being a special case at the call site. Handle closed in
         ``finally`` for the same fd-leak reason as ``get_stream``.
@@ -196,8 +200,8 @@ class LocalStorageProvider:
     async def delete(self, key: str) -> None:
         """Delete a key. No error if missing.
 
-        Deliberately does not remove emptied directories (fix(#1532)):
-        pruning here raced a concurrent writer's mkdir/open. Pruning belongs
+        Deliberately does not remove emptied directories:
+        pruning here would race a concurrent writer's mkdir/open. Pruning belongs
         to the subsystem that owns the prefix — see ``prune_empty_dirs``.
         """
         path = self._resolve_contained(key)
@@ -261,7 +265,7 @@ class LocalStorageProvider:
 
     async def list(self, prefix: str) -> list[str]:
         """List keys matching a prefix, relative to base_dir."""
-        # SEC-026: resolve the prefix before touching the filesystem, outside
+        # Resolve the prefix before touching the filesystem, outside
         # the worker, so a rejected key never reaches exists()/rglob()/glob().
         resolved_prefix = self._resolve_contained(prefix)
         resolved_base = self.base_dir.resolve()
@@ -279,7 +283,7 @@ class LocalStorageProvider:
     ):
         """Lazily yield ``(path, key)`` under *root* in ascending key order.
 
-        Blocking; a generator (fix(#1249)) so an unbounded walk never sits in
+        Blocking; a generator so an unbounded walk never sits in
         front of the first page, and a subtree entirely below ``start_after``
         is never entered.
 
@@ -291,6 +295,7 @@ class LocalStorageProvider:
         the tree through one.
         """
         try:
+            # codeql[py/path-injection] root is the prefix _resolve_contained returned, or a directory found walking under it without following symlinks
             with os.scandir(root) as entries:
                 ordered = sorted(
                     entries,
@@ -332,8 +337,10 @@ class LocalStorageProvider:
             return
         # File prefix: one bounded directory glob — the pre-delete re-read's shape.
         parent = resolved_prefix.parent
+        # codeql[py/path-injection] parent is the directory holding a prefix _resolve_contained returned, so it is the base or inside it
         if not parent.exists():
             return
+        # codeql[py/path-injection] parent is inside the base, and a single-component pattern cannot leave it
         for path in sorted(parent.glob(resolved_prefix.name + "*")):
             if not path.is_file():
                 continue
@@ -344,7 +351,7 @@ class LocalStorageProvider:
     async def iter_object_pages(
         self, prefix: str, *, start_after: str | None = None
     ) -> AsyncIterator[list[StoredObject]]:
-        """Yield keys matching a prefix with their mtimes (feat #1249).
+        """Yield keys matching a prefix with their mtimes.
 
         Chunked into ``_OBJECT_PAGE_SIZE`` pages so an unbounded page can't
         defeat the consumer's between-pages budget, even though local has no

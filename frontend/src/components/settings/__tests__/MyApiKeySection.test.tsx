@@ -1,14 +1,15 @@
 /**
- * GLUX-002 / GLUX-014 (Phase 1248): regression gate for the MyApiKeySection
+ * Regression gate for the MyApiKeySection
  * control semantics.
  *
  * Asserts:
- * - Create-form name input has an accessible name via FieldLabel (GLUX-002).
- * - Active / revoked status is rendered as visible text, not color+title only (GLUX-014).
- * - The icon-only revoke button has an accessible name (GLUX-002).
- * - Create and revoke mutation errors are announced via role=alert (GLUX-014).
+ * - Create-form name input has an accessible name via FieldLabel.
+ * - Active / revoked status is rendered as visible text, not color+title only.
+ * - The icon-only revoke button has an accessible name.
+ * - Create and revoke mutation errors are announced via role=alert.
  */
 import userEvent from '@testing-library/user-event';
+import { act } from '@testing-library/react';
 import { render, screen } from '@/test/test-utils';
 import { vi } from 'vitest';
 import { MyApiKeySection } from '@/components/settings/MyApiKeySection';
@@ -175,7 +176,7 @@ describe('GLUX-002 / GLUX-014: MyApiKeySection control semantics', () => {
   });
 });
 
-// fix(#875): per-key scopes. A read-only key is a different credential in
+// Per-key scopes. A read-only key is a different credential in
 // practice, so the list has to say which one you are holding, and the mint
 // form has to be able to ask for one.
 describe('#875: API key scope', () => {
@@ -216,7 +217,40 @@ describe('#875: API key scope', () => {
     expect(defaultCreateMutation.mutateAsync).toHaveBeenCalledWith({
       name: 'CI pipeline',
       scope: 'full',
+      expiresAt: null,
     });
+  });
+
+  it('submits the publish scope and says what it allows', async () => {
+    const user = userEvent.setup();
+    render(<MyApiKeySection />);
+
+    await user.click(screen.getByRole('button', { name: 'admin:apiKeys.createKey' }));
+    expect(screen.queryByText('apiKeys.scopePublishDescription')).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText('admin:apiKeys.keyName'), 'QGIS laptop');
+    await user.click(screen.getByRole('combobox', { name: 'apiKeys.scope' }));
+    await user.click(await screen.findByRole('option', { name: 'apiKeys.scopePublish' }));
+
+    expect(screen.getByRole('combobox', { name: 'apiKeys.scope' })).toHaveAccessibleDescription(
+      'apiKeys.scopePublishDescription',
+    );
+    await user.click(screen.getByRole('button', { name: 'create' }));
+    expect(defaultCreateMutation.mutateAsync).toHaveBeenCalledWith({
+      name: 'QGIS laptop',
+      scope: 'publish',
+      expiresAt: null,
+    });
+  });
+
+  it('badges a publish key in the list', () => {
+    vi.mocked(useMyApiKeys).mockReturnValue({
+      data: [makeKey({ scope: 'publish' })],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useMyApiKeys>);
+
+    render(<MyApiKeySection />);
+
+    expect(screen.getByText('admin:apiKeys.scopePublish')).toBeInTheDocument();
   });
 
   it('badges a read_only key in the list', () => {
@@ -230,6 +264,42 @@ describe('#875: API key scope', () => {
     expect(screen.getByText('admin:apiKeys.scopeReadOnly')).toBeInTheDocument();
   });
 
+  it('badges a dataset_write key in the list', () => {
+    vi.mocked(useMyApiKeys).mockReturnValue({
+      data: [makeKey({ scope: 'dataset_write', dataset_id: 'ds-1' })],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useMyApiKeys>);
+
+    render(<MyApiKeySection />);
+
+    expect(screen.getByText('admin:apiKeys.scopeDatasetWrite')).toBeInTheDocument();
+  });
+
+  it('badges a dataset_append key in the list', () => {
+    vi.mocked(useMyApiKeys).mockReturnValue({
+      data: [makeKey({ scope: 'dataset_append', dataset_id: 'ds-1' })],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useMyApiKeys>);
+
+    render(<MyApiKeySection />);
+
+    expect(screen.getByText('admin:apiKeys.scopeDatasetAppend')).toBeInTheDocument();
+    expect(screen.queryByText('admin:apiKeys.scopeDatasetWrite')).not.toBeInTheDocument();
+  });
+
+  it('wraps the badges below a key name instead of squeezing it at phone width', () => {
+    vi.mocked(useMyApiKeys).mockReturnValue({
+      data: [makeKey({ name: 'Webhook smoke', scope: 'dataset_write', dataset_id: 'ds-1' })],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useMyApiKeys>);
+
+    render(<MyApiKeySection />);
+
+    const name = screen.getByText('Webhook smoke');
+    expect(name).toHaveClass('min-w-0', 'max-w-full', 'truncate');
+    expect(name.parentElement).toHaveClass('flex-wrap');
+  });
+
   it('does not badge a full key', () => {
     vi.mocked(useMyApiKeys).mockReturnValue({
       data: [makeKey({ scope: 'full' })],
@@ -239,5 +309,120 @@ describe('#875: API key scope', () => {
     render(<MyApiKeySection />);
 
     expect(screen.queryByText('admin:apiKeys.scopeReadOnly')).not.toBeInTheDocument();
+  });
+});
+
+// Radix Select needs these in jsdom.
+beforeAll(() => {
+  Element.prototype.hasPointerCapture = vi.fn();
+  Element.prototype.releasePointerCapture = vi.fn();
+  Element.prototype.scrollIntoView = vi.fn();
+});
+
+describe('API key expiry', () => {
+  beforeEach(() => {
+    vi.mocked(useMyApiKeys).mockReturnValue({
+      data: [],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useMyApiKeys>);
+    vi.mocked(useCreateMyApiKey).mockReturnValue(
+      defaultCreateMutation as unknown as ReturnType<typeof useCreateMyApiKey>,
+    );
+    vi.mocked(useRevokeMyApiKey).mockReturnValue(
+      defaultRevokeMutation as unknown as ReturnType<typeof useRevokeMyApiKey>,
+    );
+    defaultCreateMutation.mutateAsync.mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('sends an expires_at 90 days out when the 90 day preset is chosen', async () => {
+    const user = userEvent.setup();
+    render(<MyApiKeySection />);
+    // Fake only Date so userEvent's timers keep running.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-01-10T12:00:00Z') });
+
+    await user.click(screen.getByRole('button', { name: 'admin:apiKeys.createKey' }));
+    await user.type(screen.getByLabelText('admin:apiKeys.keyName'), 'CI pipeline');
+    await user.click(screen.getByRole('combobox', { name: 'apiKeys.expiry' }));
+    await user.click(await screen.findByRole('option', { name: 'apiKeys.expiryOptions.90d' }));
+    await user.click(screen.getByRole('button', { name: 'create' }));
+
+    expect(defaultCreateMutation.mutateAsync).toHaveBeenCalledWith({
+      name: 'CI pipeline',
+      scope: 'full',
+      expiresAt: '2026-04-10T12:00:00.000Z',
+    });
+  });
+
+  it('shows when a key expires', () => {
+    vi.mocked(useMyApiKeys).mockReturnValue({
+      data: [makeKey({ expires_at: '2999-01-01T00:00:00Z' })],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useMyApiKeys>);
+
+    render(<MyApiKeySection />);
+
+    expect(screen.getByText(/admin:apiKeys\.expiresOn/)).toBeInTheDocument();
+    expect(screen.getByText('admin:apiKeys.active')).toBeInTheDocument();
+  });
+
+  it('marks a key past its expiry as expired instead of active', () => {
+    vi.mocked(useMyApiKeys).mockReturnValue({
+      data: [makeKey({ expires_at: '2020-01-01T00:00:00Z' })],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useMyApiKeys>);
+
+    render(<MyApiKeySection />);
+
+    expect(screen.getByText('admin:apiKeys.expired')).toBeInTheDocument();
+    expect(screen.queryByText('admin:apiKeys.active')).not.toBeInTheDocument();
+  });
+
+  it('gives an expired key the inactive status dot', () => {
+    vi.mocked(useMyApiKeys).mockReturnValue({
+      data: [makeKey({ expires_at: '2020-01-01T00:00:00Z' })],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useMyApiKeys>);
+
+    const { container } = render(<MyApiKeySection />);
+
+    expect(container.querySelector('span.rounded-full.bg-destructive')).toBeInTheDocument();
+    expect(container.querySelector('span.rounded-full.bg-success')).not.toBeInTheDocument();
+  });
+
+  it('keeps a revoked key revoked but still dates its past expiry as expired', () => {
+    vi.mocked(useMyApiKeys).mockReturnValue({
+      data: [makeKey({ is_active: false, expires_at: '2020-01-01T00:00:00Z' })],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useMyApiKeys>);
+
+    render(<MyApiKeySection />);
+
+    expect(screen.getByText('admin:apiKeys.revoked')).toBeInTheDocument();
+    expect(screen.queryByText('admin:apiKeys.expired')).not.toBeInTheDocument();
+    expect(screen.getByText(/admin:apiKeys\.expiredOn/)).toBeInTheDocument();
+    expect(screen.queryByText(/admin:apiKeys\.expiresOn/)).not.toBeInTheDocument();
+  });
+
+  it('flips an open list to expired when a key passes its expiry', () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    vi.setSystemTime(new Date('2026-01-10T12:00:00Z'));
+    vi.mocked(useMyApiKeys).mockReturnValue({
+      data: [makeKey({ expires_at: '2026-01-10T12:01:00Z' })],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useMyApiKeys>);
+
+    render(<MyApiKeySection />);
+    expect(screen.getByText('admin:apiKeys.active')).toBeInTheDocument();
+
+    act(() => {
+      vi.advanceTimersByTime(61_000);
+    });
+
+    expect(screen.getByText('admin:apiKeys.expired')).toBeInTheDocument();
+    expect(screen.queryByText('admin:apiKeys.active')).not.toBeInTheDocument();
   });
 });

@@ -14,11 +14,9 @@ import { ReportProblemWizard } from './ReportProblemWizard';
  *
  * Available to everyone, signed in or not. Capture runs app-wide via
  * initReportCapture() (main.tsx); this only owns the affordance + wizard.
- * Anonymous visitors matter here: on a public instance most traffic browses
- * without an account, the floating button only appears once an error is
- * captured, and the wizard's output is a prefilled GitHub issue — nothing
- * about it needs a GeoLens session. (Originally auth-gated; relaxed so an
- * anonymous visitor who hits a broken map can still tell someone.)
+ * Nothing in the wizard needs a GeoLens session (its output is a prefilled
+ * GitHub issue), so an anonymous visitor who hits a broken map can still tell
+ * someone.
  */
 export function ReportProblemHost() {
   const entries = useReportEntries();
@@ -26,8 +24,8 @@ export function ReportProblemHost() {
   const open = useReportDialog((s) => s.open);
   const setOpen = useReportDialog((s) => s.setOpen);
 
-  // fix(#908): distinct failures, not rows — one unrecovered map error writes
-  // both a `maplibre` row and a `console` row, and the badge used to read "2".
+  // Distinct failures, not rows — one unrecovered map error writes
+  // both a `maplibre` row and a `console` row, and counting rows would read "2".
   const errorCount = countDistinctFailures(entries);
   const hasErrors = errorCount > 0;
   const badge = errorCount > 9 ? '9+' : String(errorCount);

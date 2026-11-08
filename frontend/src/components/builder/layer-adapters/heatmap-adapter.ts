@@ -2,14 +2,13 @@ import type { StyleConfig } from '@/types/api';
 import type { AdapterLayerInput, LayerAdapter, LayerDrawing } from './types';
 import { filterSpec, getBuilderStyleConfig, sourceLayerSpec } from './shared';
 import { addDescribedLayer, writeDescribedLayer, writeDescribedVisibility } from '../layer-writer';
-// builder-audit #338 ADAPT-05: the radius/weight/intensity/opacity defaults come from the
-// single builder-defaults source of truth (radius 30 / weight 1) instead of the magic
-// literals that previously diverged from renderAs's heatmap default (radius 18 / weight 0.5).
+// Defaults come from the shared builder-defaults source of truth (radius 30 /
+// weight 1).
 import { DEFAULT_HEATMAP_PAINT as HEATMAP_PAINT_DEFAULTS } from './builder-defaults';
 import { getRampColors } from '@/lib/color-ramps';
 import { MAP_COLORS } from '@/lib/map-colors';
 
-/** builder-audit #338 ADAPT-11: typed coercion so an out-of-range / string / expression
+/** Typed coercion so an out-of-range / string / expression
  *  heatmap-opacity cannot flow through a bare `as number` cast into NaN math
  *  (storedHeatmapOpacity * masterOpacity). Mirrors fill-adapter's finiteNumber. */
 function finiteNumber(value: unknown): number | null {
@@ -41,16 +40,7 @@ export const HEATMAP_OWNED_PAINT_PROPERTIES = [
   'heatmap-opacity',
 ] as const;
 
-/** Default paint properties for a new heatmap layer. The numeric defaults are the
- *  shared builder-defaults (radius/weight/intensity/opacity); only the ramp-derived
- *  heatmap-color is layered on here (it lives in this module to avoid a builder-defaults
- *  -> color-ramps circular import). */
-export const DEFAULT_HEATMAP_PAINT: Record<string, unknown> = {
-  ...HEATMAP_PAINT_DEFAULTS,
-  'heatmap-color': buildHeatmapColorExpression(DEFAULT_RAMP),
-};
-
-export interface HeatmapColor {
+interface HeatmapColor {
   /** The heatmap-color expression the layer draws. */
   expression: unknown;
   /** The named ramp the expression is built from; null for a stored expression. */

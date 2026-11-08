@@ -1,22 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Analysis commands — preview a PostGIS operation, or save it as a dataset.
 
-Hand-maintained — NOT regenerated. Pure SDK pass-through (D-25, D-28): the
+Hand-maintained — NOT regenerated. Pure SDK pass-through: the
 backend at ``backend/app/modules/catalog/datasets/api/router_analysis.py``
 owns every rule, and the CLI carries no copy of them.
 
 That includes the operation list. ``--operation`` is handed to the SDK
-unchanged rather than validated against a literal here, so the generated
-enum stays the single authority and a new backend operation reaches the CLI
-with the next ``make sdks`` instead of a second list to keep in step (#685).
+unchanged, so the generated enum stays the single authority and a new backend
+operation reaches the CLI with the next ``make sdks``. The one rule copied is
+``_require_join_dataset``, because it concerns a flag name the CLI owns. The
+help strings in main.py that name the operations are held to the SDK enum by
+cli/tests/test_analysis.py.
 
-The single exception is ``_require_join_dataset`` below, which copies one
-requiredness rule because it is really about a flag name the CLI owns — see
-its docstring (#1105). The operation list is still not copied; the help
-strings in main.py that name it are held to the SDK enum by
-cli/tests/test_analysis.py rather than by a check at call time.
-
-OCCLI-06 invariant: zero direct ``httpx`` / ``requests`` imports — every HTTP
+Invariant: zero direct ``httpx`` / ``requests`` imports — every HTTP
 call goes through the generated SDK functions.
 """
 from __future__ import annotations
@@ -29,29 +25,21 @@ import typer
 
 from ._sdk_helpers import EXIT_AUTH, call_sdk, unwrap, long_request_timeout
 
-#: Distances are metres on the wire, matching the API and the map builder's
-#: unit picker (AnalysisPanel converts feet/miles before it POSTs).
-DISTANCE_UNIT = "metres"
-
-#: fix(#685 review): there is no defensible fixed wait, so the default is not
-#: one. publish's 120s, then 600s, then an hour were each a guess about how
-#: long the work takes, and the queue makes that unanswerable. #703 ranks
-#: analysis below uploads, and the server states the consequence outright in
-#: no_live_procrastinate_job() (backend/app/platform/jobs/router.py): a job
-#: Procrastinate still holds is "simply waiting ... with no upper bound", and
-#: failing it at the one-hour mark would be "both a lie and a loss". A CLI
-#: that gives up first tells automation the analysis produced nothing while
-#: the server is still going to produce it.
+#: There is no defensible fixed wait: a fixed bound is a guess about how long
+#: the work takes, and the job queue makes that unanswerable. The server says
+#: as much in no_live_procrastinate_job() (backend/app/platform/jobs/router.py):
+#: a job Procrastinate still holds is "simply waiting ... with no upper bound",
+#: and failing it early would be "both a lie and a loss". A CLI that gives up
+#: first tells automation the analysis produced nothing while the server will
+#: still produce it.
 #:
-#: So --wait waits for a terminal state. Ctrl+C is the way out of a wait the
-#: user no longer wants; --timeout is the way out for automation that needs a
-#: bound of its own, and hitting it reports honestly that the job is unfinished
-#: rather than failed.
+#: So --wait waits for a terminal state. Ctrl+C abandons a wait; --timeout
+#: bounds it for automation and reports the job as unfinished, not failed.
 POLL_FOREVER: float = float("inf")
 
 
 def require_finite(value: Optional[float], flag: str) -> Optional[float]:
-    """Reject NaN/Infinity before they reach the wire (fix(#685 review)).
+    """Reject NaN/Infinity before they reach the wire.
 
     Click parses ``nan``, ``inf`` and overflowing literals like ``1e309`` into
     real float values, and JSON has no way to spell any of them: the encoder
@@ -95,12 +83,11 @@ def parse_join_fields(raw: Optional[str]) -> Optional[list[str]]:
 def _require_join_dataset(operation: str, join_dataset_id: Optional[str]) -> None:
     """Reject a spatial_join with no join layer before it reaches the wire.
 
-    fix(#1105): the one server rule this module copies, and deliberately so.
     The operation list stays uncopied (see the module docstring), but this
     condition is about a flag the CLI owns the name of: without it the request
-    comes back 422 and ``unwrap`` reports it as a generic failure (exit 1),
-    naming the JSON field ``join_dataset_id`` the user never typed. The
-    server's rule is ``_require_analysis_params`` in
+    comes back 422 and ``unwrap`` reports a generic failure (exit 1) naming the
+    JSON field ``join_dataset_id`` the user never typed. The server's rule is
+    ``_require_analysis_params`` in
     backend/app/modules/catalog/datasets/domain/schemas.py; the wording below
     mirrors it and adds the flag that supplies it.
     """
@@ -171,14 +158,10 @@ def build_materialize_request(
 def run_preview(client: Any, dataset_id: str, request: Any) -> Any:
     """POST the preview and return the parsed AnalysisPreviewResponse.
 
-    fix(#1778 review round 11): the backend can run up to three
-    sequential sandbox queries before responding — a bbox-scoped source
-    count, the capped geometry query, and an uncapped match count, each
-    with its own 10s statement timeout (see the
-    ``LONG_RUNNING_SDK_FUNCTIONS`` docstring in ``_sdk_helpers.py`` for
-    the full accounting) — which can outlast AppState.sdk()'s plain 30s
-    bound for a valid, if slow, preview. Wrapped in
-    ``long_request_timeout()``.
+    The backend can run up to three sequential sandbox queries before
+    responding (see the ``LONG_RUNNING_SDK_FUNCTIONS`` comment in
+    ``_sdk_helpers.py``), which can outlast the plain 30s bound for a valid,
+    slow preview. Wrapped in ``long_request_timeout()``.
     """
     from geolens.api.datasets_analysis import (
         analysis_preview_endpoint_datasets_dataset_id_analysis_preview_post as _preview,
@@ -197,11 +180,9 @@ def run_preview(client: Any, dataset_id: str, request: Any) -> Any:
 def run_materialize(client: Any, dataset_id: str, request: Any) -> Any:
     """POST the materialize request and return the parsed job response.
 
-    fix(#1778 review round 5): this expects 200 back, not a fire-and-
-    forget 202 — the backend does the submit-time validation/setup work
-    synchronously before responding, which can outlast AppState.sdk()'s
-    plain 30s bound for a large or complex request. Wrapped in
-    ``long_request_timeout()``.
+    Expects 200, not a 202: the backend does submit-time validation/setup
+    synchronously, which can outlast the plain 30s bound for a large request.
+    Wrapped in ``long_request_timeout()``.
     """
     from geolens.api.datasets_analysis import (
         analysis_materialize_endpoint_datasets_dataset_id_analysis_materialize_post as _materialize,
@@ -222,15 +203,14 @@ def job_snapshot(client: Any, job_id: str) -> tuple[Optional[str], Optional[str]
 
     ``resolve_dataset_id`` collapses "the job failed", "the poll ran out" and
     "the job endpoint would not answer" into one ``None``, and those deserve
-    different sentences even though all three mean "no dataset" (fix(#685
-    review)).
+    different sentences even though all three mean "no dataset".
 
     The dataset id rides along because the job can finish between the poll's
     last look and this one: the status response carries the id, and discarding
     it would report a completed job as unfinished.
 
     A 401/403 is raised rather than reported, so the exit code matches what
-    actually went wrong (D-32) instead of collapsing into the generic one.
+    actually went wrong instead of collapsing into the generic one.
     """
     from geolens.api.admin import get_job_status_jobs_job_id_get
 
@@ -277,7 +257,7 @@ def preview_geojson(response: Any) -> dict:
 def render_geojson(payload: dict, *, compact: bool = False) -> str:
     """Format the FeatureCollection for stdout.
 
-    Same contract as ``geolens export stac`` (D-27: pretty with sorted keys
+    Same contract as ``geolens export stac`` (pretty with sorted keys
     by default, single-line under ``--compact``), and the same implementation,
     so the two commands cannot drift into different JSON shapes.
     """

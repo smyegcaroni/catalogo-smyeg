@@ -106,13 +106,13 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: VrtCreateRequest,
 ) -> Response[ProblemDetail | VrtCreateResponse]:
-    """Create Vrt
+    """Create a VRT dataset
 
      Create a VRT dataset by combining existing raster datasets.
 
     Validates sources synchronously, then defers VRT assembly to an async task.
     Returns a job_id for polling. Validation + queuing logic lives in
-    ``ingest.service.create_vrt_job`` (K5 extraction).
+    ``ingest.service.create_vrt_job``.
 
     Args:
         body (VrtCreateRequest):
@@ -141,13 +141,13 @@ def sync(
     client: AuthenticatedClient,
     body: VrtCreateRequest,
 ) -> ProblemDetail | VrtCreateResponse | None:
-    """Create Vrt
+    """Create a VRT dataset
 
      Create a VRT dataset by combining existing raster datasets.
 
     Validates sources synchronously, then defers VRT assembly to an async task.
     Returns a job_id for polling. Validation + queuing logic lives in
-    ``ingest.service.create_vrt_job`` (K5 extraction).
+    ``ingest.service.create_vrt_job``.
 
     Args:
         body (VrtCreateRequest):
@@ -171,13 +171,13 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: VrtCreateRequest,
 ) -> Response[ProblemDetail | VrtCreateResponse]:
-    """Create Vrt
+    """Create a VRT dataset
 
      Create a VRT dataset by combining existing raster datasets.
 
     Validates sources synchronously, then defers VRT assembly to an async task.
     Returns a job_id for polling. Validation + queuing logic lives in
-    ``ingest.service.create_vrt_job`` (K5 extraction).
+    ``ingest.service.create_vrt_job``.
 
     Args:
         body (VrtCreateRequest):
@@ -204,13 +204,13 @@ async def asyncio(
     client: AuthenticatedClient,
     body: VrtCreateRequest,
 ) -> ProblemDetail | VrtCreateResponse | None:
-    """Create Vrt
+    """Create a VRT dataset
 
      Create a VRT dataset by combining existing raster datasets.
 
     Validates sources synchronously, then defers VRT assembly to an async task.
     Returns a job_id for polling. Validation + queuing logic lives in
-    ``ingest.service.create_vrt_job`` (K5 extraction).
+    ``ingest.service.create_vrt_job``.
 
     Args:
         body (VrtCreateRequest):

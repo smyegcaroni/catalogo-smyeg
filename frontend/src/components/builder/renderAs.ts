@@ -3,9 +3,8 @@ import { canUseClusterSource } from './cluster-source';
 import { classifyGeometry } from './layer-adapters/shared';
 import { MAP_COLORS } from '@/lib/map-colors';
 import i18n from '@/i18n/i18n';
-// builder-audit #338 ADAPT-05/06 / DRY-04/06: pull the per-render-mode default paint and
-// the arrow/extrusion magic constants from the single builder-defaults source of truth
-// instead of re-declaring divergent copies here.
+// Per-render-mode default paint and the arrow/extrusion constants come from the
+// single builder-defaults source of truth.
 import {
   DEFAULT_ARROW_SIZE,
   DEFAULT_ARROW_SPACING,
@@ -31,7 +30,7 @@ export type RenderAsId =
   | 'image'
   | 'hillshade';
 
-export type RenderAsSource =
+type RenderAsSource =
   | 'vector-point'
   | 'vector-line'
   | 'vector-polygon'
@@ -39,23 +38,19 @@ export type RenderAsSource =
   | 'raster-dem'
   | 'unsupported';
 
-export interface RenderAsOption {
+interface RenderAsOption {
   id: RenderAsId;
   label: string;
   source: RenderAsSource;
 }
 
-// builder-audit #338 ADAPT-07: trimmed RendererCapability to the fields runtime code
-// actually reads. The previous schema modeled backend/viewerSupport/styleJsonSupport/
-// companionLayers/sourceRequirement/writableFields/enabled, none of which had a
-// consumer outside this module and its tests (every row was backend:'maplibre',
-// enabled:true). GUARD-05: 'deckgl-future' was already removed; with the single
-// backend gone there is no multi-backend abstraction left to model.
-export interface RendererCapability {
+// RendererCapability trimmed to the fields runtime code reads. Every renderer is
+// backend:'maplibre', so there is no multi-backend abstraction to model.
+interface RendererCapability {
   id: RenderAsId;
   label: string;
   source: Exclude<RenderAsSource, 'unsupported'>;
-  /** Cluster needs a GeoJSON/cluster source — the only capability-level gate read at runtime. */
+  /** Cluster needs a GeoJSON/cluster source; the only capability-level gate read at runtime. */
   requiresClusterSource?: boolean;
 }
 
@@ -70,14 +65,14 @@ const defaultBuilderTranslator: BuilderTranslator = (key, options) =>
 
 export type RenderAsAdapterType = 'circle' | 'symbol' | 'heatmap' | 'line' | 'fill' | 'raster' | 'hillshade';
 
-export interface RenderAsPatch {
+interface RenderAsPatch {
   layer_type?: MapLayerType | null;
   style_config?: StyleConfig | null;
   paint?: Record<string, unknown> | null;
   layout?: Record<string, unknown> | null;
 }
 
-export interface RenderAsMutation {
+interface RenderAsMutation {
   patch: RenderAsPatch;
   adapterType: RenderAsAdapterType;
 }
@@ -130,7 +125,7 @@ function isRasterLayer(layer: RenderAsLayer) {
   );
 }
 
-// builder-audit #338 ADAPT-02/DRY-05: derive from the single classifyGeometry scanner.
+// Derive from the single classifyGeometry scanner.
 function geometryFamily(geometryType: string | null): 'point' | 'line' | 'polygon' | null {
   const family = classifyGeometry(geometryType);
   return family === 'other' ? null : family;
@@ -201,13 +196,24 @@ function numericHeightColumn(layer: RenderAsLayer) {
 }
 
 /** The column auto-pick would choose on extrusion entry — the "uncustomized"
- *  heightColumn baseline for hasCustomizedRenderAsStyle (fix #430 codex). */
+ *  heightColumn baseline for hasCustomizedRenderAsStyle. */
 function defaultHeightColumn(layer: RenderAsLayer): string {
   const numericColumn = layer.dataset_column_info?.find((column) => {
     const type = column.type.toLowerCase();
     return /(int|float|double|decimal|numeric|real|number)/.test(type);
   });
   return numericColumn?.name ?? layer.dataset_column_info?.[0]?.name ?? 'height';
+}
+
+/** The heatmap paint to keep for a return to heatmap mode. */
+function heatmapPaintStash(layer: RenderAsLayer): Record<string, unknown> | undefined {
+  return getCurrentRenderAs(layer) === 'heatmap' ? { ...(layer.paint ?? {}) } : layer.style_config?.heatmapPaint;
+}
+
+/** The circle paint stashed on heatmap entry; an empty stash counts as none. */
+function stashedCirclePaint(layer: RenderAsLayer): Record<string, unknown> | undefined {
+  const saved = layer.style_config?.savedCirclePaint;
+  return saved && Object.keys(saved).length > 0 ? saved : undefined;
 }
 
 function polygonPaint(layer: RenderAsLayer): Record<string, unknown> {
@@ -259,17 +265,6 @@ export function getRendererCapabilities(
     .map(({ labelKey, ...entry }) => ({ ...entry, label: t(labelKey) }));
 }
 
-export function getRendererCapability(
-  id: RenderAsId,
-  layer?: RenderAsLayer,
-  t: BuilderTranslator = defaultBuilderTranslator,
-): RendererCapability | null {
-  const entries = layer
-    ? getRendererCapabilities(layer, t)
-    : RENDERER_CAPABILITIES.map(({ labelKey, ...entry }) => ({ ...entry, label: t(labelKey) }));
-  return entries.find((entry) => entry.id === id) ?? null;
-}
-
 export function getCurrentRenderAs(layer: RenderAsLayer): RenderAsId | null {
   const source = getRenderAsSource(layer);
   const renderMode = layer.style_config?.render_mode;
@@ -309,22 +304,18 @@ export function getCurrentRenderAs(layer: RenderAsLayer): RenderAsId | null {
   return null;
 }
 
-export function isSupportedRenderAsId(value: string): value is RenderAsId {
-  return RENDERER_CAPABILITIES.some((entry) => entry.id === value);
-}
-
 /**
- * fix(#430 V-09): whether the layer's CURRENT render mode carries mode-specific
- * style settings that diverge from that mode's fresh/default state. Used to
- * decide whether the render-as confirm dialog is warranted — a layer that has
- * never been customized beyond the mode's defaults has nothing to lose by
- * switching, so `handleRenderAsClick` skips the confirm when this is `false`.
+ * Whether the layer's current render mode carries mode-specific style settings
+ * that diverge from that mode's fresh/default state. Decides whether the
+ * render-as confirm dialog is warranted: a layer never customized beyond the
+ * mode's defaults has nothing to lose, so `handleRenderAsClick` skips the
+ * confirm when this is `false`.
  *
- * Only checks fields with a fixed, mode-independent default (radius/zoom/size
- * numbers, ramp/icon names). Color fields are intentionally excluded — they
- * are derived from the layer's base paint at mode-entry time (e.g. arrow
- * color inherits the line color), so there is no fixed "default" to diverge
- * from and comparing them would always read as customized.
+ * Only fields with a fixed, mode-independent default (radius/zoom/size numbers,
+ * ramp/icon names) are checked. Color fields are excluded: they derive from the
+ * layer's base paint at mode entry (e.g. arrow color inherits the line color),
+ * so there is no fixed default to diverge from and they would always read as
+ * customized.
  */
 export function hasCustomizedRenderAsStyle(layer: RenderAsLayer): boolean {
   const mode = getCurrentRenderAs(layer);
@@ -340,8 +331,8 @@ export function hasCustomizedRenderAsStyle(layer: RenderAsLayer): boolean {
         || (symbol.iconSize !== undefined && symbol.iconSize !== 1)
         || (symbol.iconRotation !== undefined && symbol.iconRotation !== 0)
         || (symbol.iconAnchor !== undefined && symbol.iconAnchor !== 'center')
-        // fix(#430 codex r3): the Symbol editor also persists iconOffset and a
-        // per-category icon mapping — all dropped when leaving symbol mode.
+        // The Symbol editor also persists iconOffset and a per-category icon
+        // mapping, all dropped when leaving symbol mode.
         || (symbol.iconOffset !== undefined
           && (symbol.iconOffset[0] !== 0 || symbol.iconOffset[1] !== 0))
         || (typeof symbol.categoryColumn === 'string' && symbol.categoryColumn !== '')
@@ -357,10 +348,9 @@ export function hasCustomizedRenderAsStyle(layer: RenderAsLayer): boolean {
     }
 
     case 'cluster': {
-      // fix(#430 codex r9): clusterColor is auto-seeded on mode entry (from
-      // the circle paint), so presence alone isn't customization — diverging
-      // from that seed is (same pattern as extrusion heightColumn). Any
-      // non-empty ramp is user-authored destructible state.
+      // A clusterColor equal to the point colour (older maps seeded it on mode
+      // entry) is not customization; a diverging one is, as for extrusion
+      // heightColumn. Any non-empty ramp is user-authored state.
       const seededClusterColor = typeof paint['circle-color'] === 'string'
         ? paint['circle-color']
         : DEFAULT_CIRCLE_PAINT['circle-color'];
@@ -371,20 +361,21 @@ export function hasCustomizedRenderAsStyle(layer: RenderAsLayer): boolean {
         || (typeof builder.clusterTextSize === 'number' && builder.clusterTextSize !== 12)
         || (typeof builder.clusterColor === 'string' && builder.clusterColor !== seededClusterColor)
         || (Array.isArray(builder.clusterColorRamp) && builder.clusterColorRamp.length > 0)
-        // ux(#839): counts hidden is user-authored destructible state.
+        // Counts hidden is user-authored destructible state.
         || builder.clusterShowCounts === false
       );
     }
 
     case 'arrow': {
-      // fix(#430 codex r17): arrowColor is auto-seeded on mode entry from the
-      // line paint (same pattern as clusterColor/heightColumn); diverging
-      // from the seed is destructible state. With this, every editor-persisted
-      // builder field (arrow*, cluster*, heightColumn, symbol.*) is covered
-      // by this switch — verified against the LayerStyleEditor inventory.
-      const seededArrowColor = typeof paint['line-color'] === 'string'
-        ? paint['line-color']
-        : MAP_COLORS.default.fill;
+      // An arrowColor equal to the line colour (older maps seeded it on mode
+      // entry) is not customization; a diverging one is destructible state.
+      // Every editor-persisted builder field (arrow*, cluster*, heightColumn,
+      // symbol.*) is covered by this switch.
+      // With a data-driven line colour the arrows follow the data, so any picked colour is a choice.
+      const lineColor = paint['line-color'];
+      const seededArrowColor = typeof lineColor === 'string'
+        ? lineColor
+        : Array.isArray(lineColor) ? undefined : MAP_COLORS.default.fill;
       return (
         (typeof builder.arrowSize === 'number' && builder.arrowSize !== DEFAULT_ARROW_SIZE)
         || (typeof builder.arrowSpacing === 'number' && builder.arrowSpacing !== DEFAULT_ARROW_SPACING)
@@ -393,9 +384,9 @@ export function hasCustomizedRenderAsStyle(layer: RenderAsLayer): boolean {
     }
 
     case 'extrusion-3d': {
-      // fix(#430 codex): a user-chosen heightColumn is destructible state too —
-      // leaving extrusion deletes it. Entry auto-picks a column, so presence
-      // alone isn't customization; diverging from the auto-pick default is.
+      // A user-chosen heightColumn is destructible too (leaving extrusion deletes
+      // it). Entry auto-picks a column, so presence alone isn't customization;
+      // diverging from the auto-pick default is.
       const heightColumn = builderHeightColumn(layer);
       return (
         (typeof builder.heightScale === 'number' && builder.heightScale !== 1)
@@ -405,47 +396,55 @@ export function hasCustomizedRenderAsStyle(layer: RenderAsLayer): boolean {
       );
     }
 
-    // 'point' / 'line' / 'fill' / 'stroke' / 'fill-stroke' / 'image' / 'hillshade':
-    // these modes have no destructible mode-specific settings of their own —
-    // buildRenderAsPatch preserves or stashes (savedCirclePaint) their base
-    // paint across a mode switch, so there is nothing mode-specific to lose.
+    // 'point' / 'line' / 'fill' / 'stroke' / 'fill-stroke' / 'image' /
+    // 'hillshade' have no destructible mode-specific settings: buildRenderAsPatch
+    // preserves or stashes (savedCirclePaint) their base paint across a switch.
     default:
       return false;
   }
 }
 
-export function buildRenderAsPatch(layer: RenderAsLayer, renderAs: RenderAsId): RenderAsMutation | null {
+export function buildRenderAsPatch(
+  layer: RenderAsLayer,
+  renderAs: RenderAsId,
+  options: { heightColumn?: string } = {},
+): RenderAsMutation | null {
   if (!getRenderAsOptions(layer).some((option) => option.id === renderAs)) return null;
 
   if (renderAs === 'point') {
+    const current = getCurrentRenderAs(layer);
     const style = styleWithoutRenderMode(layer, {
-      heatmapPaint: getCurrentRenderAs(layer) === 'heatmap' ? { ...(layer.paint ?? {}) } : layer.style_config?.heatmapPaint,
+      heatmapPaint: heatmapPaintStash(layer),
       savedCirclePaint: undefined,
       symbol: undefined,
     });
-    const savedCirclePaint = layer.style_config?.savedCirclePaint;
+    // Cluster draws its unclustered points with the layer's own circle paint.
+    const circlePaint = current === 'cluster' ? layer.paint : stashedCirclePaint(layer);
     return {
       adapterType: 'circle',
       patch: {
         layer_type: vectorLayerType(layer),
-        paint: savedCirclePaint && Object.keys(savedCirclePaint).length > 0
-          ? { ...savedCirclePaint }
-          : { ...DEFAULT_CIRCLE_PAINT },
+        paint: { ...(circlePaint ?? DEFAULT_CIRCLE_PAINT) },
         style_config: style,
       },
     };
   }
 
   if (renderAs === 'symbol') {
+    // Only a heatmap holds non-circle paint; every other mode's live paint is the circle paint.
+    const circlePaint = getCurrentRenderAs(layer) === 'heatmap'
+      ? stashedCirclePaint(layer)
+      : layer.paint;
     return {
       adapterType: 'symbol',
       patch: {
         layer_type: vectorLayerType(layer),
-        paint: { ...(layer.style_config?.savedCirclePaint ?? layer.paint ?? DEFAULT_CIRCLE_PAINT) },
+        paint: { ...(circlePaint ?? DEFAULT_CIRCLE_PAINT) },
         style_config: compactRecord({
           ...styleRecord(layer),
           render_mode: 'symbol',
-          savedCirclePaint: layer.style_config?.savedCirclePaint ?? { ...(layer.paint ?? DEFAULT_CIRCLE_PAINT) },
+          heatmapPaint: heatmapPaintStash(layer),
+          savedCirclePaint: { ...(circlePaint ?? DEFAULT_CIRCLE_PAINT) },
           symbol: layer.style_config?.symbol ?? {
             iconImage: 'marker',
             iconSize: 1,
@@ -480,10 +479,10 @@ export function buildRenderAsPatch(layer: RenderAsLayer, renderAs: RenderAsId): 
   }
 
   if (renderAs === 'cluster') {
-    const circlePaint = { ...(layer.paint ?? DEFAULT_CIRCLE_PAINT) };
-    const clusterColor = typeof circlePaint['circle-color'] === 'string'
-      ? circlePaint['circle-color']
-      : DEFAULT_CIRCLE_PAINT['circle-color'];
+    // Heatmap paint holds heatmap-* keys; the circle paint is stashed.
+    const circlePaint = getCurrentRenderAs(layer) === 'heatmap'
+      ? { ...(stashedCirclePaint(layer) ?? DEFAULT_CIRCLE_PAINT) }
+      : { ...(layer.paint ?? DEFAULT_CIRCLE_PAINT) };
     return {
       adapterType: 'circle',
       patch: {
@@ -493,10 +492,10 @@ export function buildRenderAsPatch(layer: RenderAsLayer, renderAs: RenderAsId): 
           ...builderRecord(layer),
           clusterRadius: layer.style_config?.builder?.clusterRadius ?? 48,
           clusterMaxZoom: layer.style_config?.builder?.clusterMaxZoom ?? 14,
-          clusterColor: layer.style_config?.builder?.clusterColor ?? clusterColor,
+          // Unset until chosen, so cluster bubbles follow later circle-color edits.
           clusterTextColor: layer.style_config?.builder?.clusterTextColor ?? MAP_COLORS.cluster.text,
           clusterTextSize: layer.style_config?.builder?.clusterTextSize ?? 12,
-        }, { render_mode: 'cluster' }),
+        }, { render_mode: 'cluster', savedCirclePaint: undefined, heatmapPaint: heatmapPaintStash(layer) }),
       },
     };
   }
@@ -512,16 +511,13 @@ export function buildRenderAsPatch(layer: RenderAsLayer, renderAs: RenderAsId): 
   }
 
   if (renderAs === 'arrow') {
-    const lineColor = typeof layer.paint?.['line-color'] === 'string'
-      ? layer.paint['line-color']
-      : MAP_COLORS.default.fill;
     return {
       adapterType: 'line',
       patch: {
         layer_type: vectorLayerType(layer),
+        // arrowColor stays unset until chosen, so arrows follow later line-color edits.
         style_config: styleWithBuilder(layer, {
           ...builderRecord(layer),
-          arrowColor: layer.style_config?.builder?.arrowColor ?? lineColor,
           arrowSize: layer.style_config?.builder?.arrowSize ?? DEFAULT_ARROW_SIZE,
           arrowSpacing: layer.style_config?.builder?.arrowSpacing ?? DEFAULT_ARROW_SPACING,
         }, { render_mode: 'arrow' }),
@@ -551,6 +547,8 @@ export function buildRenderAsPatch(layer: RenderAsLayer, renderAs: RenderAsId): 
     }
 
     const paint = polygonPaint(layer);
+    // The legacy paint key would keep a layer 3D after the builder's column is gone.
+    delete paint['_height_column'];
     if (renderAs === 'stroke') {
       paint['fill-opacity'] = 0;
     } else if (typeof paint['fill-opacity'] !== 'number' || paint['fill-opacity'] <= 0) {
@@ -558,11 +556,10 @@ export function buildRenderAsPatch(layer: RenderAsLayer, renderAs: RenderAsId): 
     }
 
     if (renderAs === 'extrusion-3d') {
-      builder.heightColumn = numericHeightColumn(layer);
+      builder.heightColumn = options.heightColumn ?? numericHeightColumn(layer);
       builder.heightScale = typeof priorHeightScale === 'number' ? priorHeightScale : 1;
       builder.extrusionMinZoom = typeof priorExtrusionMinZoom === 'number' ? priorExtrusionMinZoom : DEFAULT_EXTRUSION_MIN_ZOOM;
-      // builder-audit #338 (verifier nit): the prior `Math.min(0.85, 1)` was a no-op that
-      // always evaluated to 0.85; use the shared extrusion-opacity cap directly.
+      // The shared extrusion-opacity cap, not a hardcoded value.
       builder.extrusionOpacity = typeof priorExtrusionOpacity === 'number' ? priorExtrusionOpacity : DEFAULT_EXTRUSION_OPACITY_CAP;
     }
 

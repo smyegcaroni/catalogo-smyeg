@@ -1,6 +1,6 @@
 """Backfill email_verified for GitHub-provisioned OAuth users.
 
-fix(#623): the JIT provisioning path built ``User(...)`` without
+The JIT provisioning path built ``User(...)`` without
 ``email_verified``, so every OAuth-provisioned account persisted the model
 default (false) even though the claim guaranteed verification — 27 of 27 SSO
 users on the public demo.
@@ -9,9 +9,9 @@ Backfill is deliberately narrow. Only GitHub-linked accounts are provably
 verified: ``_fetch_github_claims`` raises unless the account has a
 primary+verified email, so a GitHub-linked row with an email cannot have been
 created from an unverified address. OIDC/Google/Microsoft rows are left alone —
-their ``email_verified`` claim is per-provider and older rows predate the H-30
-gate, so asserting verification for them would be a guess. Those converge on
-next login instead (the returning-user refresh added alongside this migration).
+their ``email_verified`` claim is per-provider and older rows predate the
+verification gate, so asserting verification for them would be a guess. Those
+converge on next login instead (the returning-user refresh added alongside this migration).
 
 Revision ID: 0028_oauth_email_verified_backfill
 Revises: 0027_source_format_parquet

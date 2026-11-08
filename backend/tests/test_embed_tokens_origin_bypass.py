@@ -1,4 +1,4 @@
-"""Unit-level regression tests for Phase 268 H-31 — embed-token Origin bypass.
+"""Unit-level regression tests for the embed-token Origin bypass.
 
 The legacy localhost-Origin bypass was trivially forgeable by non-browser
 callers: a curl/CLI/server-side caller could set ``Origin: http://localhost``
@@ -23,12 +23,12 @@ from app.modules.embed_tokens import service as embed_service
 
 @pytest.fixture(autouse=True)
 def _self_origin_is_configured(monkeypatch):
-    """fix(#1548 review P2): stand in for the #1531 self-origin lookup.
+    """Stand in for the self-origin lookup.
 
-    These tests pass an ``AsyncMock`` database. Since #1531 the domain-lock
+    These tests pass an ``AsyncMock`` database. The domain-lock
     check resolves the deployment's own origin through ``get_configured_public_app_url``,
     which reads an AppSetting row, so on a cold public-URL cache the mock DB
-    reaches ``_load_public_url_overrides`` and raises. The service now fails
+    reaches ``_load_public_url_overrides`` and raises. The service fails
     closed on that, which means these tests would still report False and pass
     for the wrong reason: proving the lookup exploded, not that a foreign
     origin is rejected. Patch it so they exercise the real decision. A
@@ -61,7 +61,7 @@ def _make_request(*, origin: str | None, client_host: str | None) -> MagicMock:
 
 
 class TestClientIsLoopback:
-    """Phase 268 H-31: _client_is_loopback gates bypass on TCP peer."""
+    """_client_is_loopback gates bypass on TCP peer."""
 
     def test_127_0_0_1_is_loopback(self):
         request = _make_request(origin=None, client_host="127.0.0.1")
@@ -84,16 +84,26 @@ class TestClientIsLoopback:
         assert embed_service._client_is_loopback(request) is False
 
 
+@pytest.fixture(autouse=True)
+def _minter_reads_every_dataset(monkeypatch):
+    async def _readable(db, dataset_ids, user_id):
+        return set(dataset_ids)
+
+    monkeypatch.setattr(
+        "app.modules.embed_tokens.service.datasets_account_can_read", _readable
+    )
+
+
 _TEST_GENERATION = 3
 
 
 class TestEmbedTokenOriginBypassRequiresLoopbackPeer:
-    """Phase 268 H-31: validate_embed_token_access must NOT honor a forged
+    """validate_embed_token_access must NOT honor a forged
     ``Origin: http://localhost`` from a non-loopback TCP peer."""
 
     @pytest.fixture(autouse=True)
     def _pin_revocation_generation(self, monkeypatch):
-        """fix(#1778 codex r3): a positive entry now carries the revocation
+        """A positive entry now carries the revocation
         generation it was minted under, and one whose stamp is stale (or
         missing) is refused and re-read from the database. These cases are about
         the ORIGIN check on the cache-hit path, so they pin the generation and
@@ -114,7 +124,7 @@ class TestEmbedTokenOriginBypassRequiresLoopbackPeer:
         from datetime import datetime, timedelta, timezone
 
         # Patch the cache to return a positive cache hit with allowed_origins.
-        # SEC-014: cache entry must include expires_at so the expiry re-check passes.
+        # Cache entry must include expires_at so the expiry re-check passes.
         cache = AsyncMock()
         cache.get = AsyncMock(
             return_value={
@@ -122,6 +132,7 @@ class TestEmbedTokenOriginBypassRequiresLoopbackPeer:
                 "scoped_dataset_ids": ["00000000-0000-0000-0000-000000000001"],
                 "allowed_origins": ["https://customer.example.com"],
                 "map_id": "00000000-0000-0000-0000-000000000002",
+                "created_by": "00000000-0000-0000-0000-000000000003",
                 "expires_at": (
                     datetime.now(timezone.utc) + timedelta(days=1)
                 ).isoformat(),
@@ -162,6 +173,7 @@ class TestEmbedTokenOriginBypassRequiresLoopbackPeer:
                 "scoped_dataset_ids": [str(dataset_id)],
                 "allowed_origins": ["https://customer.example.com"],
                 "map_id": "00000000-0000-0000-0000-000000000002",
+                "created_by": "00000000-0000-0000-0000-000000000003",
                 "expires_at": (
                     datetime.now(timezone.utc) + timedelta(days=1)
                 ).isoformat(),
@@ -172,7 +184,7 @@ class TestEmbedTokenOriginBypassRequiresLoopbackPeer:
         cache.delete = AsyncMock()
         monkeypatch.setattr(embed_service, "get_cache", lambda: cache)
         membership = AsyncMock(return_value=True)
-        monkeypatch.setattr(embed_service, "map_contains_dataset", membership)
+        monkeypatch.setattr(embed_service, "map_embeds_dataset", membership)
 
         request = _make_request(origin="http://localhost:3000", client_host="127.0.0.1")
 
@@ -198,6 +210,7 @@ class TestEmbedTokenOriginBypassRequiresLoopbackPeer:
                 "scoped_dataset_ids": ["00000000-0000-0000-0000-000000000001"],
                 "allowed_origins": ["https://customer.example.com"],
                 "map_id": "00000000-0000-0000-0000-000000000002",
+                "created_by": "00000000-0000-0000-0000-000000000003",
                 "expires_at": (
                     datetime.now(timezone.utc) + timedelta(days=1)
                 ).isoformat(),

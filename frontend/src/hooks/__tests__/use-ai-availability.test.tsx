@@ -7,12 +7,12 @@ vi.mock('@/api/admin', () => ({
   getAIStatus: vi.fn(),
 }));
 
-// builder-audit #338 P1-11: non-admin editors read the public-safe availability endpoint.
+// Non-admin editors read the public-safe availability endpoint.
 vi.mock('@/api/maps', () => ({
   getAIAvailability: vi.fn(),
 }));
 
-// fix(#815): the hook branches on useAIStatusReader (capabilities + edition),
+// The hook branches on useAIStatusReader (capabilities + edition),
 // not the isAdmin flag — mock both sides with per-test mutable state.
 const mocks = vi.hoisted(() => ({
   capabilities: new Set<string>(),
@@ -60,8 +60,9 @@ const adminUser = {
   email: 'admin@x',
   roles: ['admin'],
   is_active: true,
-  status: 'active',
+  status: 'active' as const,
   last_login_at: null,
+  can_reset_password: true,
   created_at: '',
 };
 
@@ -182,7 +183,7 @@ describe('useAIAvailability — CONSOLE-01 gating', () => {
 
   it('authed viewer WITHOUT use_ai_chat: fires NEITHER endpoint — query stays idle, reason=permission', async () => {
     // A genuine viewer lacks use_ai_chat → no admin status probe AND no public
-    // availability probe (P1-11: no 403 console noise for viewers).
+    // availability probe (no 403 console noise for viewers).
     mocks.capabilities = new Set();
     useAuthStore.setState({
       token: 'viewer-token',
@@ -196,6 +197,7 @@ describe('useAIAvailability — CONSOLE-01 gating', () => {
         is_active: true,
         status: 'active',
         last_login_at: null,
+        can_reset_password: true,
         created_at: '',
       },
     });
@@ -228,6 +230,7 @@ describe('useAIAvailability — CONSOLE-01 gating', () => {
         is_active: true,
         status: 'active',
         last_login_at: null,
+        can_reset_password: true,
         created_at: '',
       },
     });
@@ -257,6 +260,7 @@ describe('useAIAvailability — CONSOLE-01 gating', () => {
         is_active: true,
         status: 'active',
         last_login_at: null,
+        can_reset_password: true,
         created_at: '',
       },
     });
@@ -284,6 +288,7 @@ describe('useAIAvailability — CONSOLE-01 gating', () => {
         is_active: true,
         status: 'active',
         last_login_at: null,
+        can_reset_password: true,
         created_at: '',
       },
     });
@@ -303,7 +308,7 @@ describe('useAIAvailability — CONSOLE-01 gating', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Phase 1135 AI-02: reason field taxonomy
+// Reason field taxonomy
 // ---------------------------------------------------------------------------
 
 describe('useAIAvailability — reason field (Phase 1135 AI-02)', () => {
@@ -426,7 +431,7 @@ describe('useAIAvailability — reason field (Phase 1135 AI-02)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// fix(#815): the status branch follows useAIStatusReader, not the isAdmin flag
+// The status branch follows useAIStatusReader, not the isAdmin flag
 // ---------------------------------------------------------------------------
 
 describe('useAIAvailability — mode-aware status gate (fix #815)', () => {
@@ -510,9 +515,9 @@ describe('useAIAvailability — mode-aware status gate (fix #815)', () => {
     expect(result.current.reason).toBeNull();
   });
 
-  // fix(#818): can() answers false while the permissions query is loading, which
-  // used to settle reason='permission' with isLoading=false — a cold mount
-  // flashed the no-permission disabled state at permitted editors.
+  // can() answers false while the permissions query is loading, which must
+  // not settle reason='permission' with isLoading=false — a cold mount would
+  // flash the no-permission disabled state at permitted editors.
   it('cold permissions load: surfaces isLoading with reason=null instead of a premature permission denial', () => {
     mocks.permissionsLoading = true;
     mocks.capabilities = new Set(['use_ai_chat']);
@@ -528,6 +533,7 @@ describe('useAIAvailability — mode-aware status gate (fix #815)', () => {
         is_active: true,
         status: 'active',
         last_login_at: null,
+        can_reset_password: true,
         created_at: '',
       },
     });
@@ -559,6 +565,7 @@ describe('useAIAvailability — mode-aware status gate (fix #815)', () => {
         is_active: true,
         status: 'active',
         last_login_at: null,
+        can_reset_password: true,
         created_at: '',
       },
     });

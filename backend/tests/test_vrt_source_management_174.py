@@ -1,20 +1,20 @@
-"""Tests for VRT source add/remove endpoints, regenerate_vrt task, and status serialization (Phase 174-01).
+"""Tests for VRT source add/remove endpoints, regenerate_vrt task, and status serialization.
 
 Covers:
 - TestAddSource: POST /ingest/vrt/{dataset_id}/sources/ endpoint behavior
 - TestRemoveSource: DELETE /ingest/vrt/{dataset_id}/sources/{source_dataset_id}/ endpoint behavior
-- TestMutationSerialization: 409 when VRT is regenerating (SRC-05)
+- TestMutationSerialization: 409 when VRT is regenerating
 - TestRegenerateVrtTask: regenerate_vrt task logic (build, swap, metadata update, error handling)
-- TestStatusField: GET /datasets/{id} response includes raster.status (SRC-06)
-- TestStagedSourceSetReading: fix(#1327) — what the task accepts as a staged
+- TestStatusField: GET /datasets/{id} response includes raster.status
+- TestStagedSourceSetReading: what the task accepts as a staged
   member set, and what it refuses
 
 All tests are pure unit tests -- no DB, no real files, no network. Keep it that
 way: the autouse `_stub_vrt_source_authz` fixture below patches module-level
 names, and a DB/client-backed test here can make a router module import for the
 FIRST time while those patches are live, permanently binding the mocks into
-that module (fix(#1327 codex P1) hit exactly this and moved its HTTP coverage
-to tests/test_vrt_staged_mutation_1327.py).
+that module (HTTP coverage for staged mutations lives in
+tests/test_vrt_staged_mutation_1327.py for this reason).
 """
 
 import asyncio
@@ -88,7 +88,7 @@ def _make_mock_asset(
 def _added_generation(mock_db: AsyncMock):
     """The single VrtGeneration the endpoint under test handed to ``db.add``.
 
-    fix(#1327): the staged member set is the endpoint's whole output now, and
+    The staged member set is the endpoint's whole output now, and
     it lives on that row — these doubles never reach a database, so the object
     passed to ``db.add`` is the only place to read it back from.
     """
@@ -116,7 +116,8 @@ def _make_mock_source_asset(band_count: int = 1, epsg: int = 4326) -> MagicMock:
 def _stub_vrt_source_authz():
     """``add_vrt_source`` authorizes the new source and the parent VRT, and both
     add/remove_vrt_source now require owner-or-admin on the VRT via
-    ``check_dataset_write_access``. Those helpers issue their own ``db.execute``
+    ``check_dataset_write_access``, and checks the members against the VRT's
+    audience. Those helpers issue their own ``db.execute``
     calls, which would shift the call-count-ordered mock ``db`` sequences these
     pure unit tests rely on. Stub them to make ZERO ``db.execute`` calls (and
     always allow) so the existing sequences stay valid and the tests reach the
@@ -135,6 +136,10 @@ def _stub_vrt_source_authz():
         patch(
             "app.modules.catalog.authorization.check_dataset_write_access",
             new=AsyncMock(return_value=set()),
+        ),
+        patch(
+            "app.modules.catalog.authorization.check_vrt_members",
+            new=AsyncMock(return_value=None),
         ),
         patch(
             "app.modules.catalog.datasets.domain.service.get_dataset",
@@ -317,7 +322,7 @@ class TestAddSource:
             assert json.loads(json.dumps(exc_info.value.detail)) == [
                 error.model_dump(mode="json")
             ]
-            # fix(#1327): a rejected request stages nothing. Validation still
+            # A rejected request stages nothing. Validation still
             # runs synchronously and still runs BEFORE the generation exists,
             # so an incompatible source leaves no intent behind for a task to
             # pick up later.
@@ -337,7 +342,7 @@ class TestAddSource:
 
         async def _check():
             from app.processing.ingest.router import add_vrt_source
-            import app.processing.ingest.router as ingest_router
+            import app.processing.ingest.vrt_admission as vrt_admission
 
             source_id = uuid.uuid4()
             mock_request = MagicMock()
@@ -351,7 +356,7 @@ class TestAddSource:
                 _build_mock_db_success_add(mock_asset, dataset_id)
             )
             monkeypatch.setattr(
-                ingest_router, "create_ingest_job", mock_create_ingest_job
+                vrt_admission, "create_ingest_job", mock_create_ingest_job
             )
 
             with (
@@ -374,7 +379,7 @@ class TestAddSource:
         asyncio.run(_check())
 
     def test_stages_post_add_set_and_leaves_links_untouched(self, monkeypatch):
-        """fix(#1327): the addition is STAGED on the generation, not applied.
+        """The addition is STAGED on the generation, not applied.
 
         The endpoint issues no write against vrt_source_links, and the
         generation it creates carries the full post-add member set with the new
@@ -383,7 +388,7 @@ class TestAddSource:
 
         async def _check():
             from app.processing.ingest.router import add_vrt_source
-            import app.processing.ingest.router as ingest_router
+            import app.processing.ingest.vrt_admission as vrt_admission
 
             source_id = uuid.uuid4()
             mock_request = MagicMock()
@@ -397,7 +402,7 @@ class TestAddSource:
                 _build_mock_db_success_add(mock_asset, dataset_id)
             )
             monkeypatch.setattr(
-                ingest_router, "create_ingest_job", mock_create_ingest_job
+                vrt_admission, "create_ingest_job", mock_create_ingest_job
             )
 
             with (
@@ -539,7 +544,7 @@ class TestRemoveSource:
 
         async def _check():
             from app.processing.ingest.router import remove_vrt_source
-            import app.processing.ingest.router as ingest_router
+            import app.processing.ingest.vrt_admission as vrt_admission
 
             dataset_id = uuid.uuid4()
             source_dataset_id = uuid.uuid4()
@@ -556,7 +561,7 @@ class TestRemoveSource:
                 )
             )
             monkeypatch.setattr(
-                ingest_router, "create_ingest_job", mock_create_ingest_job
+                vrt_admission, "create_ingest_job", mock_create_ingest_job
             )
 
             with patch(
@@ -573,7 +578,7 @@ class TestRemoveSource:
         asyncio.run(_check())
 
     def test_stages_post_removal_set_and_leaves_links_untouched(self, monkeypatch):
-        """fix(#1327): the removal is STAGED on the generation, not applied.
+        """The removal is STAGED on the generation, not applied.
 
         Two properties in one place, because they are the same property: the
         endpoint issues no write against vrt_source_links, and the generation
@@ -582,7 +587,7 @@ class TestRemoveSource:
 
         async def _check():
             from app.processing.ingest.router import remove_vrt_source
-            import app.processing.ingest.router as ingest_router
+            import app.processing.ingest.vrt_admission as vrt_admission
 
             dataset_id = uuid.uuid4()
             source_dataset_id = uuid.uuid4()
@@ -599,7 +604,7 @@ class TestRemoveSource:
                 )
             )
             monkeypatch.setattr(
-                ingest_router, "create_ingest_job", mock_create_ingest_job
+                vrt_admission, "create_ingest_job", mock_create_ingest_job
             )
 
             with patch(
@@ -629,10 +634,10 @@ class TestRemoveSource:
 
 
 class TestMutationSerialization:
-    """Both add and remove return 409 when VRT is regenerating (SRC-05)."""
+    """Both add and remove return 409 when VRT is regenerating."""
 
     def test_add_returns_409_when_regenerating(self):
-        """SRC-05: add endpoint refuses mutation when already regenerating."""
+        """Add endpoint refuses mutation when already regenerating."""
         from fastapi import HTTPException
 
         async def _check():
@@ -653,7 +658,7 @@ class TestMutationSerialization:
         asyncio.run(_check())
 
     def test_remove_returns_409_when_regenerating(self):
-        """SRC-05: remove endpoint refuses mutation when already regenerating."""
+        """Remove endpoint refuses mutation when already regenerating."""
         from fastapi import HTTPException
 
         async def _check():
@@ -679,7 +684,7 @@ class TestMutationSerialization:
 
         async def _check():
             from app.processing.ingest.router import add_vrt_source
-            import app.processing.ingest.router as ingest_router
+            import app.processing.ingest.vrt_admission as vrt_admission
 
             mock_request = MagicMock()
             mock_request.source_dataset_id = uuid.uuid4()
@@ -692,7 +697,7 @@ class TestMutationSerialization:
                 mock_asset, dataset_id
             )
             monkeypatch.setattr(
-                ingest_router, "create_ingest_job", mock_create_ingest_job
+                vrt_admission, "create_ingest_job", mock_create_ingest_job
             )
 
             with (
@@ -800,7 +805,7 @@ class TestRegenerateVrtTask:
 
             with (
                 patch(
-                    # fix(#909): tasks_vrt late-binds; patch the origin
+                    # tasks_vrt late-binds; patch the origin
                     "app.core.db.async_session"
                 ) as mock_async_session,
                 patch(
@@ -825,7 +830,7 @@ class TestRegenerateVrtTask:
                 str(call.args[0]) for call in mock_session.execute.await_args_list
             )
             assert "UPDATE catalog.raster_assets" in statements
-            # fix(#1962 codex r3): an attempt that bound no generation releases
+            # An attempt that bound no generation releases
             # the asset unless a live generation owns it, which is the only
             # rule that reaches one the sweep cannot see.
             assert "catalog.vrt_generations" in statements
@@ -835,7 +840,7 @@ class TestRegenerateVrtTask:
     def test_task_clears_current_generation_id_on_failure(self):
         """On failure, current_generation_id is cleared (set to None).
 
-        fix(#1962): in its own committed transaction, ahead of the job row.
+        In its own committed transaction, ahead of the job row.
         """
 
         async def _check():
@@ -862,7 +867,7 @@ class TestRegenerateVrtTask:
         asyncio.run(_check())
 
     def test_the_asset_settles_before_the_job_and_generation_write(self):
-        """fix(#1962): the reverse order puts both writes back in one abort."""
+        """The reverse order puts both writes back in one abort."""
         import ast
         import inspect
 
@@ -981,7 +986,7 @@ class TestRegenerateVrtTask:
 
             with (
                 patch(
-                    # fix(#909): tasks_vrt late-binds; patch the origin
+                    # tasks_vrt late-binds; patch the origin
                     "app.core.db.async_session"
                 ) as mock_async_session,
                 patch(
@@ -1134,7 +1139,7 @@ class TestRegenerateVrtTask:
 
             with (
                 patch(
-                    # fix(#909): tasks_vrt late-binds; patch the origin
+                    # tasks_vrt late-binds; patch the origin
                     "app.core.db.async_session"
                 ) as mock_async_session,
                 patch(
@@ -1205,7 +1210,7 @@ class TestRegenerateVrtTask:
 
 
 class TestStatusField:
-    """Status field exposed in GET /datasets/{id} response (SRC-06)."""
+    """Status field exposed in GET /datasets/{id} response."""
 
     def test_raster_metadata_has_status_field(self):
         """RasterMetadata schema must include a status field."""
@@ -1296,7 +1301,7 @@ class TestStatusField:
 
 
 # ---------------------------------------------------------------------------
-# TestStagedSourceSetReading — fix(#1327)
+# TestStagedSourceSetReading
 # ---------------------------------------------------------------------------
 
 
@@ -1461,7 +1466,7 @@ def _build_mock_db_success_add(
 
     Returns (mock_db, expected_job_id, mock_create_ingest_job, existing_ids) —
     ``existing_ids`` in position order, so a caller can assert the staged set
-    is exactly those plus the new source (fix(#1327)).
+    is exactly those plus the new source.
     """
     mock_db = AsyncMock()
     call_count = [0]
@@ -1496,7 +1501,7 @@ def _build_mock_db_success_add(
         elif n == 5:
             # Load existing source assets
             result_mock.scalars.return_value.all.return_value = existing_assets
-        # fix(#1327): there is no 6th query. The MAX(position) lookup and the
+        # There is no 6th query. The MAX(position) lookup and the
         # link INSERT that followed it are gone — order in the staged set is
         # the position.
         return result_mock
@@ -1513,7 +1518,7 @@ def _build_mock_db_success_add(
 def _link_rows(source_ids: list[uuid.UUID]) -> list[MagicMock]:
     """Rows as the ordered vrt_source_links SELECT returns them.
 
-    fix(#1327): remove_vrt_source reads the member set ONCE, in position order,
+    remove_vrt_source reads the member set ONCE, in position order,
     and answers the count guard, the "is it linked" guard and the staged
     post-removal set from that single read — so these doubles supply link rows
     where they used to supply a COUNT(*) scalar and a separate position row.

@@ -1,13 +1,13 @@
 /**
- * feat(#1705): UrlImportForm orchestration tests.
+ * UrlImportForm orchestration tests.
  *
  * The heavy children (ImportMetadataForm, ImportPreview, JobProgress) are
  * stubbed. These tests pin the step machine and the API call shapes:
  * submit, download, preview, review, commit, tracking, error fallback to
  * idle, and layer_name threading for multi-layer containers.
  *
- * feat(#1710): the submit call only queues a download, so every path to a
- * preview now runs through the job poll returning a `pending` job.
+ * The submit call only queues a download, so every path to a
+ * preview runs through the job poll returning a `pending` job.
  */
 import { fireEvent, render, screen, waitFor } from '@/test/test-utils';
 import userEvent from '@testing-library/user-event';
@@ -76,12 +76,12 @@ const VECTOR_PREVIEW = {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  // fix(#1710): the download is observed through useJobStatus, which is
+  // The download is observed through useJobStatus, which is
   // gated on a signed-in token. Without one the poll never runs and the
   // form stays on the download step forever.
   useAuthStore.setState({ token: 'test-token' });
   mockGetJobStatus.mockResolvedValue({ job_id: 'job-1', status: 'pending' });
-  // fix(#1708 codex r19): the URL-import session is module-owned so it can
+  // The URL-import session is module-owned so it can
   // outlive an unmount (that is the point). Tests must therefore start from
   // a clean one, or a leftover session resumes into the next test's mount.
   clearUrlImport();
@@ -104,7 +104,7 @@ describe('UrlImportForm', () => {
     expect(screen.getByRole('button', { name: 'urlImport.fetch' })).toBeDisabled();
   });
 
-  // fix(#1710): the submit call answers before the file exists, so the
+  // The submit call answers before the file exists, so the
   // download is a polled job state. These two pin both of its exits.
   test('a queued download shows job progress and does not preview yet', async () => {
     mockUploadFromUrl.mockResolvedValue({ job_id: 'job-3', status: 'running' });
@@ -225,7 +225,7 @@ describe('UrlImportForm', () => {
     expect(mockPreviewFile).not.toHaveBeenCalled();
   });
 
-  // fix(review #1800 P2 on #1778): a preview failure whose job is confirmed
+  // A preview failure whose job is confirmed
   // gone (404/410 on the preview call itself) is genuinely terminal — clear
   // the session, same as a fetch failure.
   test('a preview failure that is 404 on the job releases the module session', async () => {
@@ -241,7 +241,7 @@ describe('UrlImportForm', () => {
     expect(peekUrlImport()).toBeNull();
   });
 
-  // fix(review #1800 P2 on #1778): #1778's original fix cleared the session
+  // #1778's original fix cleared the session
   // unconditionally on ANY preview failure, which threw away the only
   // client-side copy of the staged job id — a transient failure (GDAL
   // timeout, network blip) leaves the job right where it was (`pending`).
@@ -264,7 +264,7 @@ describe('UrlImportForm', () => {
     expect(mockUploadFromUrl).toHaveBeenCalledTimes(1);
   });
 
-  // fix(review #1800 P2 round 3): the url/filename fields stayed editable
+  // The url/filename fields stayed editable
   // next to the recovery actions while a job was retained — changing a
   // value and clicking Fetch started a SECOND session, replacing the
   // module-level `current` (startUrlImport can no longer recognize the
@@ -359,7 +359,7 @@ describe('UrlImportForm', () => {
     expect(peekUrlImport()).toBeNull();
   });
 
-  // fix(review #1800 P2 round 2): the cancel handler used to reset
+  // The cancel handler used to reset
   // UNCONDITIONALLY once cancelJob settled, success or failure — a failed
   // cancel (job still pending server-side with its staged file) cleared
   // the only client-side copy of the job id anyway, orphaning it with no

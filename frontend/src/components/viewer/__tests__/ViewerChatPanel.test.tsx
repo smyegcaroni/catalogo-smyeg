@@ -23,7 +23,7 @@ function setAvailable(available: boolean) {
   mockAvailability.mockReturnValue({ isAIAvailable: available } as ReturnType<typeof useAIAvailability>);
 }
 
-/** One overlay feature. feat(#1241 codex r1): overlay completeness is judged
+/** One overlay feature. overlay completeness is judged
  *  against row_count, so a fixture's feature COUNT is now load-bearing. */
 function feature() {
   return { type: 'Feature', geometry: { type: 'Point', coordinates: [-73.9, 40.8] }, properties: {} };
@@ -46,7 +46,7 @@ beforeEach(() => {
 });
 
 describe('ViewerChatPanel', () => {
-  it('fix(#542): shows a dismissible query-result badge when the overlay is active', async () => {
+  it('shows a dismissible query-result badge when the overlay is active', async () => {
     setAvailable(true);
     const handleDismissEphemeral = vi.fn();
     mockEphemeral.mockReturnValue({
@@ -66,7 +66,7 @@ describe('ViewerChatPanel', () => {
 
     renderPanel();
 
-    // fix(#674 audit): the badge labels analysis previews as well as query
+    // The badge labels analysis previews as well as query
     // results, so its copy is operation-neutral ("Result", not "Query result").
     expect(screen.getByText(/Result/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Dismiss result' }));
@@ -133,9 +133,9 @@ describe('ViewerChatPanel', () => {
     expect(screen.getByText('1 row')).toBeInTheDocument();
   });
 
-  // fix(#1076): the viewer is the surface an embed or a shared link lands on,
+  // The viewer is the surface an embed or a shared link lands on,
   // so a silent truncation here reaches the widest audience. A clip reports no
-  // source total, and requiring one dropped the flag before the badge saw it.
+  // source total, and requiring one would drop the flag before the badge sees it.
   it('forwards a cap that arrives without a total', async () => {
     setAvailable(true);
     mockStream.mockImplementation(async function* () {
@@ -171,7 +171,7 @@ describe('ViewerChatPanel', () => {
     );
   });
 
-  // feat(#1241 codex r1): one feature per matched row is what "uncapped" means.
+  // One feature per matched row is what "uncapped" means.
   // The server never emits an empty FeatureCollection (_extract_geojson returns
   // None when no row is mappable), so features:[] with row_count: 12 described
   // an impossible state that now reads, correctly, as a clipped overlay.
@@ -307,6 +307,25 @@ describe('ViewerChatPanel', () => {
     await screen.findByText('Nothing found.');
     expect(handleDismissEphemeral).toHaveBeenCalled();
     expect(handleQueryResult).not.toHaveBeenCalled();
+  });
+
+  it('explains a model that needs the Responses API', async () => {
+    setAvailable(true);
+    mockStream.mockImplementation(async function* () {
+      yield {
+        event: 'error',
+        data: { message: 'English server text', code: 'model_requires_responses_api' },
+      };
+    });
+
+    renderPanel();
+    await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+    await userEvent.type(screen.getByPlaceholderText('Ask about this map...'), 'hi');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await screen.findByText(
+      "This site's AI model needs the OpenAI Responses API. Ask an administrator to turn it on or choose a different model.",
+    );
   });
 
   it('shows a retry-able error bubble when the stream fails', async () => {

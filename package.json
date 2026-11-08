@@ -1,13 +1,13 @@
 {
   "name": "geolens",
-  "version": "1.24.0",
+  "version": "1.30.0",
   "private": true,
   "license": "Apache-2.0",
-  "author": "Carto Concepts, LLC",
+  "author": "GeoLens contributors",
   "scripts": {
     "e2e": "npx playwright test",
     "e2e:smoke": "npm run e2e:smoke:core && npm run e2e:smoke:builder && npm run e2e:smoke:fixtures",
-    "e2e:smoke:core": "npx playwright test e2e/admin.spec.ts e2e/auth.spec.ts e2e/search.spec.ts e2e/dataset-detail.spec.ts e2e/collections.spec.ts e2e/permissions.spec.ts e2e/console-hygiene.spec.ts e2e/vector-tile-pipeline.spec.ts --project=chromium",
+    "e2e:smoke:core": "npx playwright test e2e/admin.spec.ts e2e/auth.spec.ts e2e/search.spec.ts e2e/dataset-detail.spec.ts e2e/collections.spec.ts e2e/permissions.spec.ts e2e/console-hygiene.spec.ts e2e/vector-tile-pipeline.spec.ts e2e/stories.spec.ts e2e/dashboards.spec.ts --project=chromium",
     "e2e:smoke:builder": "npx playwright test e2e/builder.spec.ts e2e/builder-styling.spec.ts e2e/builder-v1-5.spec.ts --project=chromium",
     "e2e:smoke:builder-hardening": "npx playwright test -c playwright.builder-hardening.config.ts",
     "e2e:smoke:fixtures": "npx playwright test e2e/upload.spec.ts e2e/non-spatial.spec.ts --project=chromium",
@@ -23,7 +23,7 @@
     "check:deployed-surface": "make deployed-surface-check"
   },
   "devDependencies": {
-    "@axe-core/playwright": "^4.13.0",
-    "@playwright/test": "^1.63.0"
+    "@axe-core/playwright": "^4.14.0",
+    "@playwright/test": "^1.64.1"
   }
 }

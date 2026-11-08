@@ -1,5 +1,5 @@
 /**
- * GLUX-006 regression test: the catalog Import CTA must be gated on the
+ * Regression test: the catalog Import CTA must be gated on the
  * 'upload' capability, not on token presence. A guest or viewer-role user
  * must not see an Import link that dead-ends at the editor-gated /import route.
  *
@@ -24,7 +24,7 @@ vi.mock('@/hooks/use-permissions', () => ({
 
 vi.mock('@/components/search/hooks/use-search', () => ({
   useSearchResults: vi.fn(),
-  // fix(#430 V-08): SearchPage now also calls useMapSearchResults — stub it so
+  // SearchPage now also calls useMapSearchResults — stub it so
   // the parallel maps section is inert (no maps) unless a test overrides it.
   useMapSearchResults: vi.fn(() => ({ data: undefined })),
 }));
@@ -86,6 +86,7 @@ function makeUser(overrides: Partial<UserResponse> = {}): UserResponse {
     is_active: true,
     status: 'active',
     last_login_at: null,
+    can_reset_password: true,
     created_at: '2026-01-01T00:00:00Z',
     roles: ['viewer'],
     ...overrides,

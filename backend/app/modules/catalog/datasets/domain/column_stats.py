@@ -68,7 +68,7 @@ def _qtable(table_name: str, *, schema: str | None = None) -> str:
 def _sql_quote_ident(name: str) -> str:
     """Return a safely double-quoted SQL identifier for use inside text().
 
-    fix(#640): colons are backslash-escaped because SQLAlchemy ``text()``
+    Colons are backslash-escaped because SQLAlchemy ``text()``
     parses ``:name`` as a bind parameter even inside double-quoted
     identifiers. Only valid inside ``text()``.
     """
@@ -81,6 +81,25 @@ def _json_number(value):
         number = float(value)
         return number if math.isfinite(number) else str(value)
     return value
+
+
+def value_expr(col_q: str, data_type: str) -> str:
+    """Render a column so its driver value serializes as JSON.
+
+    ``data_type`` is the column's ``information_schema`` type; a type outside
+    the native and numeric sets is returned as text, and a ``timestamptz`` in
+    the UTC form vector tiles carry.
+    """
+    data_type = data_type.lower()
+    if data_type == "timestamp with time zone":
+        return utc_timestamptz_text(col_q)
+    if (
+        data_type
+        and data_type not in _NATIVE_VALUE_TYPES
+        and data_type not in _NUMERIC_TYPES - {"money"}
+    ):
+        return f"{col_q}::text"
+    return col_q
 
 
 async def get_distinct_values(
@@ -105,7 +124,7 @@ async def get_distinct_values(
         raise PermissionError(f"Access denied to table: {table_name!r}")
 
     table_ref = _qtable(table_name)
-    # fix(#458): quote so a reserved-word column name (desc, order,
+    # Quote so a reserved-word column name (desc, order,
     # user) doesn't 500 the query.
     col_q = _sql_quote_ident(column_name)
 
@@ -116,16 +135,7 @@ async def get_distinct_values(
             "AND column_name = :c"
         ).bindparams(schema=_current_data_schema(), t=table_name, c=column_name)
     )
-    data_type = (type_result.scalar_one_or_none() or "").lower()
-    expr = col_q
-    if data_type == "timestamp with time zone":
-        expr = utc_timestamptz_text(col_q)
-    elif (
-        data_type
-        and data_type not in _NATIVE_VALUE_TYPES
-        and data_type not in _NUMERIC_TYPES - {"money"}
-    ):
-        expr = f"{col_q}::text"
+    expr = value_expr(col_q, type_result.scalar_one_or_none() or "")
 
     sql = text(
         # codeql[py/sql-injection]
@@ -275,6 +285,7 @@ async def get_column_stats(
     if data_type not in _NUMERIC_TYPES:
         # Non-numeric: return a categorical summary instead of casting.
         cat_sql = text(
+            # codeql[py/sql-injection] column passed _validate_identifier and is quoted by _sql_quote_ident; table via _qtable
             f"SELECT COUNT({col_q}), COUNT(DISTINCT {col_q}) "
             f"FROM {tbl_q} "
             f"WHERE {col_q} IS NOT NULL"
@@ -295,6 +306,7 @@ async def get_column_stats(
     fractions_str = ", ".join(str(f) for f in fractions)
 
     combined_sql = text(
+        # codeql[py/sql-injection] column passed _validate_identifier and is quoted by _sql_quote_ident; table via _qtable; fractions are computed from an int
         f"SELECT MIN({col_q}::numeric), MAX({col_q}::numeric), "
         f"COUNT({col_q}), AVG({col_q}::numeric), "
         f"percentile_cont(ARRAY[{fractions_str}]) "

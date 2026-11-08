@@ -1,6 +1,6 @@
 name: Prod Compose Smoke
 
-# INST-02 (Phase 1218): pull the PUBLISHED release images and boot
+# Pull the PUBLISHED release images and boot
 # docker-compose.prod.yml to healthy, then tear down. This catches an
 # image/compose combination that parses (CI `installer-test` runs `config -q`)
 # but cannot actually start — e.g. a missing baked dependency, a broken
@@ -19,11 +19,11 @@ name: Prod Compose Smoke
 on:
   push:
     tags:
-      # Semver release tags only (fix #829): bare "v*" also matched 4-digit GSD
-      # milestone tags (v1055, v1044, …), firing a full image-pull + E2E smoke
-      # on non-release tags. The second pattern keeps prerelease tags
-      # (v1.5.0-rc.1) in the release chain — release.yml is gated on this
-      # workflow's success and explicitly supports prerelease suffixes (#715).
+      # Semver release tags only: bare "v*" also matches 4-digit non-release
+      # tags (v1055, v1044, …), which would fire a full image-pull + E2E
+      # smoke. The second pattern keeps prerelease tags (v1.5.0-rc.1) in the
+      # release chain — release.yml is gated on this
+      # workflow's success and explicitly supports prerelease suffixes.
       # Globs cannot fully express semver (`*` matches zero or more of ANY
       # character, so e.g. v1.2.3-foo_bar still slips through); the
       # "Assert semver release tag" step below is the authoritative gate.
@@ -53,7 +53,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 40
     steps:
-      # Backstop for the tag globs above (fix #829): a glob still admits
+      # Backstop for the tag globs above: a glob still admits
       # non-semver suffixes like v1.2.3- or v1.2.3-foo_bar, whose images
       # publish.yml never pushes — the pull step below would retry for ~20 min
       # and fail. Fail fast instead, using the exact regex from release.yml's
@@ -61,7 +61,7 @@ jobs:
       # junk tag is correct and cheap: release.yml fires only on this
       # workflow's SUCCESS, so nothing downstream advances.
       #
-      # fix(#1778): gate on ref_type, not event_name. A workflow_dispatch run
+      # Gate on ref_type, not event_name. A workflow_dispatch run
       # from a tag ref (`gh workflow run prod-smoke.yml --ref vX.Y.Z`) must be
       # held to the same semver check as a tag push, or a re-smoke of a junk
       # tag would skip straight past this and into the pull-retry loop below.
@@ -76,6 +76,8 @@ jobs:
           fi
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Resolve image tag to smoke
         id: ver
@@ -85,7 +87,7 @@ jobs:
           # the script body, where it would be evaluated as shell.
           INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          # fix(#1778): bind the smoked artifact to the ref, not the event.
+          # Bind the smoked artifact to the ref, not the event.
           # On ANY run from a tag ref — a tag push, or a workflow_dispatch
           # re-run from that tag — github.ref_name IS the tag (vX.Y.Z), so
           # ignore INPUT_VERSION and smoke that tag's own images. A dispatch
@@ -109,7 +111,7 @@ jobs:
           echo "Smoking image tag: ${VER:-latest}"
 
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -121,7 +123,7 @@ jobs:
         run: |
           cp .env.example .env
           # CI-distinct, non-default secrets. JWT_SECRET_KEY must be >= 32 chars
-          # to satisfy the Settings validator (backend/app/config.py).
+          # to satisfy the Settings validator (backend/app/core/config.py).
           sed -i -E 's|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=geolens_smoke_pw|' .env
           sed -i -E 's|^JWT_SECRET_KEY=.*|JWT_SECRET_KEY=prod-smoke-secret-key-padding-32chars-min|' .env
           # .env.example ships GEOLENS_ADMIN_USERNAME= empty, so the seeded admin
@@ -192,14 +194,14 @@ jobs:
           echo "frontend -> /api/health never returned 200"; exit 1
 
       - name: Assert the template boot counts rate limits per worker
-        # fix(#2041): the template .env leaves REDIS_URL empty while the prod
+        # The template .env leaves REDIS_URL empty while the prod
         # compose runs two API workers, so each worker logs this notice once at
         # startup. A silent boot means that default or the notice changed.
         env:
           # Free-text on a branch dispatch: pass via env, reference as "$VAR".
           SMOKED_VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          # fix(#2041 codex r3): images before 1.19.0 predate the notice, and a
+          # Images before 1.19.0 predate the notice, and a
           # branch dispatch may smoke one; the boot itself already passed above.
           if [ "${SMOKED_VERSION}" != "latest" ] && [ "$(printf '%s\n' 1.19.0 "${SMOKED_VERSION}" | sort -V | head -n1)" != "1.19.0" ]; then
             echo "image tag ${SMOKED_VERSION} predates the rate_limit_storage_not_configured notice (1.19.0); skipping this assertion"
@@ -213,13 +215,13 @@ jobs:
             exit 1
           fi
 
-      # E2E through the PROD reverse proxy: now that the published stack is
+      # E2E through the PROD reverse proxy: once the published stack is
       # healthy, drive the existing Playwright audit suite against the prod nginx
       # (127.0.0.1:8080) via E2E_BASE_URL. release.yml is gated on this workflow's
       # success (workflow_run), so a failing tag E2E withholds the GitHub Release
       # (the "latest" pointer the website + release API follow).
       - name: Set up Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -271,6 +273,8 @@ jobs:
             timeout -k 10 180 npx playwright install --with-deps chromium && break
             echo "playwright install attempt $i failed"
             [ "$i" = 3 ] && exit 1
+            # A stalled Azure mirror stays stalled for the retries, so fall back to archive.ubuntu.com.
+            sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt 2>/dev/null || true
             sudo pkill -TERM -x apt-get || true
             sudo pkill -TERM -x dpkg || true
             sleep 5
@@ -302,7 +306,7 @@ jobs:
 
       - name: Upload Playwright test results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: prod-smoke-playwright-test-results
           path: test-results/
@@ -310,7 +314,7 @@ jobs:
 
       - name: Upload Playwright report
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: prod-smoke-playwright-report
           path: playwright-report/

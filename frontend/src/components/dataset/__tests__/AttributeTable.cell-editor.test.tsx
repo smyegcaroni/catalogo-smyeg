@@ -1,17 +1,18 @@
 /**
- * fix(#1628): an in-progress inline cell edit must survive an unrelated
+ * An in-progress inline cell edit must survive an unrelated
  * re-render of AttributeTable.
  *
  * TanStack's `<table.FlexRender cell={cell} />` renders `columnDef.cell` as the
  * React component TYPE, so rebuilding the `columns` array gives every cell a
  * new element type and React remounts the cell subtree instead of re-rendering
  * it — wiping InlineCellEditor's `value` state back to the stored cell value.
- * `columns` used to list `handleCellSave`, whose dep list carries the object
- * react-query's `useMutation` returns, and that object is rebuilt on every
- * render. So any re-render at all discarded what the user had typed, and the
- * following Enter took commit()'s `value === initialValue` branch: no PATCH,
- * no validation message, editor silently closed. That is the intermittent
- * failure e2e/feature-editing.spec.ts kept hitting.
+ * Listing `handleCellSave` in `columns` would do that: its dep list carries
+ * the object react-query's `useMutation` returns, and that object is rebuilt
+ * on every render. Any re-render at all would discard what the user had
+ * typed, and the following Enter would take commit()'s
+ * `value === initialValue` branch: no PATCH, no validation message, editor
+ * silently closed (the intermittent failure e2e/feature-editing.spec.ts
+ * exercises).
  *
  * `useUpdateFeature` is deliberately NOT mocked here — the real react-query
  * `useMutation` identity churn is the trigger under test, and a hand-stubbed
@@ -25,7 +26,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import userEvent from '@testing-library/user-event';
-import { act } from '@testing-library/react';
+import { act, fireEvent } from '@testing-library/react';
 import { render, screen } from '@/test/test-utils';
 import { AttributeTable } from '@/components/dataset/AttributeTable';
 import { useDatasetRows } from '@/components/dataset/hooks/use-dataset';
@@ -102,7 +103,27 @@ describe('fix(#1628): inline cell editor survives an unrelated re-render', () =>
     expect(afterRerender).toHaveValue('250');
   });
 
-  // fix(#458 E-03/E-39) says a rejected value stays in the box to be
+  // fireEvent skips the focus change a real click makes, so the editor's own
+  // blur-commit can't close it and only the row-set change is under test.
+  it('closes an open cell editor when the page changes', async () => {
+    vi.mocked(useDatasetRows).mockReturnValue({
+      data: { ...ROWS_RESPONSE, next_cursor: 1 },
+      isLoading: false,
+      isFetching: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useDatasetRows>);
+    const user = userEvent.setup();
+    render(<AttributeTable datasetId="ds-1628" canEdit />);
+
+    await user.click(screen.getByRole('button', { name: '100' }));
+    expect(screen.getByRole('textbox', { name: 'Edit population for feature 1' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /next/i }));
+
+    expect(screen.queryByRole('textbox', { name: 'Edit population for feature 1' })).toBeNull();
+  });
+
+  // A rejected value stays in the box to be
   // corrected. Setting editError re-rendered AttributeTable, which rebuilt
   // `columns`, which remounted the editor — so the rejected text was replaced
   // by the old value and only the message survived.

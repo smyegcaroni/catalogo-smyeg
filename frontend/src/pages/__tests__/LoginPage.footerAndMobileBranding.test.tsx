@@ -1,10 +1,10 @@
 /**
- * fix(#1852): /login sits outside AppLayout, so it never got the site
- * footer AppLayout renders on every other route, and the desktop brand
- * panel (logo/headline/features) is `hidden` entirely below 880px, leaving
- * a phone visitor with a bare, unbranded password form. Also, the wordmark
- * used to Link to="/", which with landing_first on bounces straight back
- * to /login for a signed-out visitor — a dead click.
+ * /login sits outside AppLayout, so it renders its own site footer, and the
+ * desktop brand panel (logo/headline/features) is `hidden` entirely below
+ * 880px, so a phone visitor needs the mobile branding to avoid a bare,
+ * unbranded password form. The wordmark must not Link to="/", which with
+ * landing_first on bounces straight back to /login for a signed-out visitor —
+ * a dead click.
  */
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -143,7 +143,7 @@ describe('LoginPage footer and mobile branding (#1852)', () => {
     expect(sessionStorage.getItem('gl-guest-browse')).toBe('true');
   });
 
-  // fix(#1863 P2, codex round 1): useEdition() reports isEnterprise === false
+  // useEdition() reports isEnterprise === false
   // (its default) until the edition query resolves, so an enterprise
   // instance with show_badge false briefly rendered the "Powered by
   // GeoLens" badge, then removed it once isEnterprise flipped true.

@@ -19,7 +19,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-// PB-07 (Phase 1047 Plan 02): lazy-load DatasetSearchPanel so the ~35 KB chunk only
+// Lazy-load DatasetSearchPanel so the ~35 KB chunk only
 // loads when the Add Data dialog opens, not on initial builder mount.
 const DatasetSearchPanel = lazy(() =>
   import('@/components/builder/DatasetSearchPanel').then((m) => ({ default: m.DatasetSearchPanel }))
@@ -41,7 +41,7 @@ interface BuilderDialogsProps {
   onDuplicateRendering: (layerId: string) => void;
   layers: MapLayerResponse[];
   isAdding: boolean;
-  // fix(#526 B-050): dataset id currently being added (per-row spinner).
+  // Dataset id currently being added (per-row spinner).
   addingDatasetId?: string | null;
   addDataInitialQuery?: string;
   // Fires before a pointer-down outside the dialog closes it.
@@ -136,11 +136,13 @@ export function BuilderDialogs({
           mapId={mapId}
           mapName={mapData.name}
           visibility={mapData.visibility ?? 'private'}
+          groups={mapData.groups}
+          hasDashboard={(mapData.dashboard_config?.widgets?.length ?? 0) > 0}
           open={showShare}
           onOpenChange={onShowShareChange}
           hasUnsavedChanges={hasUnsavedChanges}
           saveStatus={saveStatus}
-          // fix(#430 V-17): drives the "hidden from viewers" warning listing
+          // Drives the "hidden from viewers" warning listing
           // layers whose dataset is private/unpublished on this public/shared map.
           layers={layers}
         />
@@ -197,19 +199,17 @@ export function BuilderDialogs({
         </DialogContent>
       </Dialog>
 
-      {/* Unsaved changes leave warning.
-          ux(#777): a modal AlertDialog with the canonical Cancel-then-Action
-          footer, matching the DatasetPage / AdminSettingsPage navigation guards
-          — was a dismissible Dialog with a hand-rolled footer.
-          Note on the blocker callbacks: AlertDialogAction/Cancel ALSO close
-          the dialog, so every click double-invokes — the button's own handler
-          runs, then the close fires onOpenChange, which calls reset again
-          (proceed→reset, or reset→reset). Verified benign with react-router
-          7.18.1: proceed() re-checks the blocker synchronously, so by the
-          time the trailing reset() runs the blocker is no longer 'blocked'
-          and reset() is a no-op that cannot throw. Don't "fix" the
-          double-invoke by dropping onOpenChange — Escape/overlay dismissal
-          needs it to reset the blocker. */}
+      {/* Unsaved changes leave warning: a modal AlertDialog with the canonical
+          Cancel-then-Action footer, matching the DatasetPage /
+          AdminSettingsPage navigation guards. AlertDialogAction/Cancel ALSO
+          close the dialog, so every click double-invokes: the button's own
+          handler runs, then the close fires onOpenChange, which calls reset
+          again (proceed->reset, or reset->reset). Verified benign with
+          react-router 7.18.1: proceed() re-checks the blocker synchronously, so
+          by the time the trailing reset() runs the blocker is no longer
+          'blocked' and reset() is a no-op that cannot throw. Don't "fix" the
+          double-invoke by dropping onOpenChange: Escape/overlay dismissal needs
+          it to reset the blocker. */}
       <AlertDialog open={blockerState === 'blocked'} onOpenChange={() => onBlockerReset?.()}>
         <AlertDialogContent size="sm">
           <AlertDialogHeader>

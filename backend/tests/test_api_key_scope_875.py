@@ -1,7 +1,7 @@
-"""fix(#875): per-key scopes — least-privilege machine credentials.
+"""Per-key scopes — least-privilege machine credentials.
 
-An API key impersonated its owner completely, so anyone building an
-application on GeoLens had to embed a credential that could also mutate or
+An API key that impersonates its owner completely forces anyone building an
+application on GeoLens to embed a credential that could also mutate or
 delete everything its owner could. The deprecated ``?api_key=`` query lane
 makes that sharper: a credential in a URL lands in access logs and any
 upstream proxy's logs, and a read-only one is far less dangerous there.
@@ -9,7 +9,7 @@ upstream proxy's logs, and a read-only one is far less dangerous there.
 Enforcement is HTTP-method based at the key-resolution chokepoint, not
 capability based. These tests pin the three things that can go wrong:
 the refusal must be a 403 and not a fallthrough 401, existing keys must be
-untouched, and the single #565 carve-out must stay a named route rather than
+untouched, and the single carve-out must stay a named route rather than
 a "POST that looks like a read" category.
 """
 
@@ -146,7 +146,7 @@ async def test_unknown_scope_is_rejected(client: AsyncClient):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("scope", ["full", "read_only"])
+@pytest.mark.parametrize("scope", ["full", "read_only", "publish"])
 async def test_scope_appears_in_the_audit_event(
     client: AsyncClient, test_db_session, scope
 ):
@@ -284,11 +284,44 @@ async def test_full_key_is_unchanged_on_read_and_write(client: AsyncClient):
     assert me_resp.status_code == 200
 
     created = await client.post(
-        "/auth/api-keys/",
-        json={"name": "Minted By A Full Key"},
+        "/maps/",
+        json={"name": f"Made By A Full Key {uuid.uuid4().hex[:6]}"},
         headers={"X-Api-Key": raw_key},
     )
-    assert created.status_code == 201
+    assert created.status_code == 201, created.text
+
+
+@pytest.mark.anyio
+async def test_no_api_key_can_create_an_api_key(client: AsyncClient):
+    """Both key-creation routes refuse a request that presents an API key, even alongside a valid session."""
+    headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+    admin_id = await _get_admin(client, headers)
+    raw_key = (await _mint(client, headers, scope="full"))["key"]
+    before = (await client.get("/auth/api-keys/", headers=headers)).json()["total"]
+
+    for caller in ({"X-Api-Key": raw_key}, {**headers, "X-Api-Key": raw_key}):
+        own = await client.post(
+            "/auth/api-keys/", json={"name": "Child Key"}, headers=caller
+        )
+        assert own.status_code == 403, own.text
+        admin = await client.post(
+            "/admin/api-keys/",
+            json={"user_id": str(admin_id), "name": "Child Key"},
+            headers=caller,
+        )
+        assert admin.status_code == 403, admin.text
+
+    after = (await client.get("/auth/api-keys/", headers=headers)).json()["total"]
+    assert after == before
+
+
+def test_key_creation_publishes_bearer_auth_only():
+    """The contract for both key-creation routes offers no API-key scheme."""
+    from app.api.main import app
+
+    paths = app.openapi()["paths"]
+    for path in ("/auth/api-keys/", "/admin/api-keys/"):
+        assert paths[path]["post"]["security"] == [{"OAuth2PasswordBearer": []}]
 
 
 @pytest.mark.anyio
@@ -312,11 +345,11 @@ async def test_key_predating_the_migration_resolves_as_full(
     await test_db_session.commit()
 
     resp = await client.post(
-        "/auth/api-keys/",
-        json={"name": "Backfilled Key Still Writes"},
+        "/maps/",
+        json={"name": f"Backfilled Key Still Writes {uuid.uuid4().hex[:6]}"},
         headers={"X-Api-Key": data["key"]},
     )
-    assert resp.status_code == 201
+    assert resp.status_code == 201, resp.text
 
 
 @pytest.mark.anyio
@@ -371,15 +404,14 @@ def test_unsafe_methods_are_refused_off_the_exempt_list():
 # to resolve in the live route table, which is what makes the spelling of a
 # real entry verifiable instead of self-asserted.
 #
-# fix(#875 codex r2): the original entries were spelled `/api/query/`. The app
+# The original entries were spelled `/api/query/`. The app
 # sets `root_path="/api"` and a route template never includes an ASGI
 # root_path, so those could never match — and because the check fails closed,
 # a read_only key would have been refused on the one endpoint the maintainer
 # decision says it may call, silently.
 #
-# feat(#565): POST /query/ is mounted now, so its pair moved out of here and
-# under the live resolution check below. Empty until the next pre-announced
-# carve-out.
+# Empty: POST /query/ is mounted, so its pair is covered by the live
+# resolution check below.
 _PENDING_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset()
 
 
@@ -458,6 +490,10 @@ def test_the_carve_out_is_a_named_method_and_route():
             ("POST", "/query/"),
             ("POST", "/query"),
             ("POST", "/stac/search"),
+            ("POST", "/jobs/status"),
+            ("POST", "/jobs/status/"),
+            ("POST", "/datasets/{dataset_id}/aggregate"),
+            ("POST", "/datasets/{dataset_id}/aggregate/"),
         }
     )
     # Driven from the ROUTE TABLE rather than from a literal: this pair is
@@ -482,11 +518,10 @@ def test_an_unresolvable_route_fails_closed():
 
 
 def test_565_route_is_mounted_in_both_shapes():
-    """feat(#565): the carve-out is live. Both exempted templates resolve.
+    """The carve-out is live. Both exempted templates resolve.
 
-    Replaces the pre-landing ``test_565_route_is_not_mounted_yet`` hook, per
-    its own instructions. The trailing-slash form is the canonical
-    registration; the bare form is ROUTE-01's hidden alias.
+    The trailing-slash form is the canonical
+    registration; the bare form is the hidden alias.
     """
     mounted = _mounted_route_pairs()
     assert ("POST", "/query/") in mounted
@@ -497,7 +532,7 @@ def test_565_route_is_mounted_in_both_shapes():
 async def test_read_only_key_carve_out_works_in_both_directions(
     client: AsyncClient, test_db_session
 ):
-    """feat(#565): the live assertion the pre-landing hook demanded.
+    """A read_only key resolves the carve-out live.
 
     A read_only key SUCCEEDS on POST /query/ (a read in POST clothing), and
     the very same key still gets 403 on another POST — so the carve-out is the
@@ -533,7 +568,7 @@ async def test_read_only_key_carve_out_works_in_both_directions(
 
 
 # ---------------------------------------------------------------------------
-# fix(#875 codex r1): "safe method" is not the same as "no side effect"
+# "safe method" is not the same as "no side effect"
 # ---------------------------------------------------------------------------
 
 # GET handlers that touch a write marker but are NOT writes a read_only key
@@ -546,6 +581,7 @@ _BENIGN_WRITING_GET_ROUTES: dict[str, str] = {
     "/layers/{dataset_id}/columns/{column_name}/references": (
         "owner-gated read, no write"
     ),
+    "/datasets/{dataset_id}/api-keys": "owner-gated read, no write",
     # Reads that commit an AUDIT row for having been read. The commit records
     # the read; it does not change the resource, and refusing them would refuse
     # the reads this feature exists to serve.
@@ -556,7 +592,6 @@ _BENIGN_WRITING_GET_ROUTES: dict[str, str] = {
     "/datasets/{dataset_id}": "commits an audit row for the read",
     "/datasets/{dataset_id}/download/cog": "commits an audit row for the read",
     "/datasets/{dataset_id}/export": "commits an audit row for the read",
-    "/jobs/{job_id}": "commits an audit row for the read",
     # Repairs the stored schema for a dropped join column, only for a caller
     # who passes the write check and supplies no API key.
     "/datasets/{dataset_id}/features/{gid}/related/{relationship_id}/": (
@@ -706,7 +741,7 @@ def test_the_stac_search_carve_out_is_required_by_the_acceptance_criteria():
 
 
 # ---------------------------------------------------------------------------
-# fix(#1845): the deprecated ?api_key= transport carries reads only
+# The deprecated ?api_key= transport carries reads only
 # ---------------------------------------------------------------------------
 
 
@@ -851,7 +886,7 @@ def test_no_mutating_route_in_the_table_accepts_a_url_borne_key():
 
 def test_the_query_lane_does_not_inherit_the_read_only_scope_exemptions():
     """``_READ_ONLY_KEY_EXEMPT_ROUTES`` is about what a scoped key may do; this
-    is about what a credential written into a URL may do. The two POSTs there
+    is about what a credential written into a URL may do. The POSTs there
     are reads an owner chose to make with a credential they control, and the
     clients this lane exists for issue GETs, so the exemption stops here."""
     assert _READ_ONLY_KEY_EXEMPT_ROUTES
@@ -883,7 +918,7 @@ def test_an_unresolvable_route_fails_closed_on_the_transport_gate():
 
 
 # ---------------------------------------------------------------------------
-# fix(#1845): the refusal warning is throttled, not one line per request
+# The refusal warning is throttled, not one line per request
 # ---------------------------------------------------------------------------
 
 

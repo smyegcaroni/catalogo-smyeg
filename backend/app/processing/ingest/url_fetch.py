@@ -1,6 +1,6 @@
 """Worker-side fetch of a user-supplied HTTP(S) file URL into local staging.
 
-feat(#1705): the URL variant of upload. Rule 2 (AGENTS.md security checklist)
+The URL variant of upload. Rule 2 (AGENTS.md security checklist)
 shapes everything here — GDAL/ogr2ogr/rasterio NEVER see the caller's URL:
 
 1. ``validate_url_for_ssrf`` gates the URL at submission time (router).
@@ -13,10 +13,10 @@ shapes everything here — GDAL/ogr2ogr/rasterio NEVER see the caller's URL:
 4. The staged file then enters the normal upload pipeline unchanged:
    extension allowlist, magic-byte content sniff, preview, commit.
 
-This module deliberately imports nothing from ``app.modules.*`` — the
-PROCESS-02/04 burndown lists in ``tests/test_layering.py`` may only shrink,
-so all domain wiring (auth, quota, job rows) stays in the router, which
-already owns those edges.
+Domain wiring (auth, quota, job rows) stays in the router, which already
+owns those edges. The layering burndown lists in ``tests/test_layering.py``
+may only shrink, so this module imports nothing from
+``app.modules.*``.
 """
 
 import asyncio
@@ -38,36 +38,36 @@ logger = structlog.get_logger(__name__)
 FETCH_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
 
 # The edge proxy's ceiling on any /api/ request: frontend/nginx.conf's
-# `location /api/` sets `proxy_read_timeout 600s`. feat(#1710) took the URL
-# import off that clock — the download is a worker job now — but the
-# constant stays here, where it is documented, for the request-scoped
-# consumers that still budget against it (processing/export/ogr.py and
-# export/router.py, and the statement-timeout bound in core config).
+# `location /api/` sets `proxy_read_timeout 600s`. The URL import is off that
+# clock, since the download is a worker job.
+#
+# Request-scoped consumers budget against it: processing/export/ogr.py,
+# export/router.py and the statement-timeout bound in core config.
 EDGE_PROXY_READ_TIMEOUT_SECONDS = 600
 
 # Bound on the submission-time SSRF preflight (validate_url_for_ssrf's
-# getaddrinfo). fix(#1708): stalled DNS has no bound of its own and would
-# pile up executor resolver threads under load. Bounded AT THE CALL SITE
-# (platform/security.py stays untouched): asyncio.wait_for cancels the
-# to_thread wrapper, which returns immediately while the resolver thread
-# runs on until the OS resolver gives up. 30s dwarfs any healthy
-# resolution, and this is now the ONLY long operation on the request path
-# — feat(#1710) moved the download itself to the worker.
+# getaddrinfo). Stalled DNS has no bound of its own and would pile up
+# executor resolver threads under load.
+#
+# The bound sits at the call site: asyncio.wait_for cancels the to_thread
+# wrapper, which returns at once while the resolver thread runs on until the
+# OS resolver gives up. 30s dwarfs any healthy resolution, and this is the
+# only long operation on the request path; the download runs on the worker.
 PREFLIGHT_DNS_MAX_SECONDS = 30
 
 _CHUNK_SIZE = 65536
 
-# Batch threaded writes, mirroring manifest_service._download_http_source
-# (fix(#435)): a thread handoff per 64 KiB httpx chunk is pure overhead, so
+# Batch threaded writes, mirroring manifest_service._download_http_source:
+# a thread handoff per 64 KiB httpx chunk is pure overhead, so
 # buffer up to 4 MiB between writes.
 _WRITE_BUFFER_BYTES = 4 * 1024 * 1024
 
-# Longest filename we stage, in ENCODED UTF-8 BYTES — filesystems cap name
+# Longest filename we stage, in encoded UTF-8 bytes: filesystems cap name
 # components in bytes (NAME_MAX 255), not characters, so a character-count
-# cap admits multibyte names four times too long (#1708 codex P2). Local
-# staging prepends "{job_id}_" (37 bytes) and resolve_file_path's mkstemp
-# builds "{job_id}_<8 random>_{name}" (46 bytes), so 160 keeps the worst
-# component at 206 bytes, under the limit.
+# cap admits multibyte names four times too long. Local staging prepends
+# "{job_id}_" (37 bytes) and resolve_file_path's mkstemp builds
+# "{job_id}_<8 random>_{name}" (46 bytes), so 160 keeps the worst component
+# at 206 bytes, under the limit.
 _MAX_FILENAME_BYTES = 160
 
 
@@ -82,8 +82,8 @@ class UrlFetchTooLargeError(UrlFetchError):
 def clamp_filename_bytes(name: str) -> str:
     """Trim the STEM so the whole name fits ``_MAX_FILENAME_BYTES`` of UTF-8.
 
-    fix(#1708): clamps by encoded byte length, never splitting a
-    codepoint, and keeps the suffix — the extension allowlist keys on it.
+    Clamps by encoded byte length without splitting a codepoint, and keeps
+    the suffix, which the extension allowlist keys on.
     Both name sources (URL basename, the request's ``filename`` override)
     go through here before any path is built.
     """
@@ -112,9 +112,9 @@ def filename_from_url(url: str) -> str:
 def _size_cap_error(
     max_size_bytes: int, cap_error_detail: str | None = None
 ) -> UrlFetchTooLargeError:
-    # fix(#1708): when the effective cap is the caller's quota
-    # rather than the instance limit, the refusal should say so — the caller
-    # passes the quota-shaped detail and both refusal sites speak with one voice.
+    # When the caller's quota rather than the instance limit is the cap, the
+    # caller passes a quota-shaped detail, and both refusal sites (declared
+    # length and streamed bytes) use it.
     if cap_error_detail is not None:
         return UrlFetchTooLargeError(cap_error_detail)
     return UrlFetchTooLargeError(
@@ -147,9 +147,9 @@ async def fetch_url_to_path(
       other transport failure.
     """
     total = 0
-    # feat(#1710): the operator's ceiling, no longer a share of a request
-    # budget — the download runs on the worker under a heartbeat-renewed
-    # lease, so nothing upstream of it expires while it transfers.
+    # The operator's ceiling. The download runs on the worker under a
+    # heartbeat-renewed lease, so nothing upstream of it expires while it
+    # transfers.
     fetch_timeout = (
         float(settings.url_import_fetch_max_seconds)
         if timeout_seconds is None
@@ -157,31 +157,31 @@ async def fetch_url_to_path(
     )
     # Synchronous open, mirroring save_upload_file: no cancellation point
     # between acquiring the descriptor and owning it.
-    # codeql[py/path-injection] fix(#1708): dest's caller-influenced component is basename-stripped and byte-clamped (clamp_filename_bytes), rooted under upload_staging_dir
+    # codeql[py/path-injection] dest's caller-influenced component is basename-stripped and byte-clamped (clamp_filename_bytes), rooted under upload_staging_dir
     f = open(dest, "wb")
     try:
         try:
             try:
-                # fix(#1708): the wall clock wraps the ENTIRE fetch — DNS,
-                # TLS, headers, every redirect hop, the body — not just gaps
-                # between chunks, which is what an origin trickling one chunk
-                # per read timeout stays inside forever. asyncio.timeout
-                # cancels the scope at the deadline (drained writes finish
-                # their in-flight chunk first, so no thread outlives the
+                # The wall clock wraps the entire fetch (DNS, TLS, headers,
+                # every redirect hop, the body), not just the gaps between
+                # chunks, which an origin trickling one chunk per read
+                # timeout stays inside forever. asyncio.timeout cancels the
+                # scope at the deadline (drained writes finish their
+                # in-flight chunk first, so no thread outlives the
                 # descriptor) and raises TimeoutError at exit, translated
-                # below — same outer-deadline pattern as origin_probe.py.
+                # below; origin_probe.py uses the same outer deadline.
                 async with asyncio.timeout(fetch_timeout):
                     async with make_safe_client(timeout=FETCH_TIMEOUT) as client:
-                        # fix(#1708): identity requested, enforced
-                        # below, and the loop reads aiter_raw — three layers
-                        # against compression bombs (see the loop comment).
+                        # Identity is requested here and enforced below,
+                        # and the loop reads aiter_raw: three layers against
+                        # compression bombs (see the loop comment).
                         #
                         # The marker below must stay the LAST line before the
                         # call: the suppression query binds a marker to the
                         # line that follows it, so an explanatory comment
-                        # inserted between the two silently disarms it (that
-                        # is how alert 103 re-fired at r11). Prose goes above.
-                        # codeql[py/full-ssrf] fix(#1708): Rule 2 posture — validate_url_for_ssrf gates the URL at submission, and make_safe_client's transport re-resolves, validates, and pins the IP at connect time plus revalidates every redirect hop
+                        # inserted between the two silently disarms it. Prose
+                        # goes above.
+                        # codeql[py/full-ssrf] Rule 2 posture — validate_url_for_ssrf gates the URL at submission, and make_safe_client's transport re-resolves, validates, and pins the IP at connect time plus revalidates every redirect hop
                         async with client.stream(
                             "GET",
                             url,
@@ -192,10 +192,10 @@ async def fetch_url_to_path(
                                     f"The server returned HTTP "
                                     f"{response.status_code} for this URL."
                                 )
-                            # fix(#1708): a transport-compressed
-                            # response is refused by design — the staged
-                            # file must be the literal bytes the sniff and
-                            # GDAL will read.
+                            # A transport-compressed response is refused by
+                            # design: the staged file must be the literal
+                            # bytes the sniff and GDAL will read, so no
+                            # decoding layer may sit in between.
                             encoding = response.headers.get(
                                 "Content-Encoding", "identity"
                             ).lower()
@@ -217,16 +217,16 @@ async def fetch_url_to_path(
                             # httpx chunk. `bytes(buffer)` snapshots before
                             # the thread reads it, so `clear()` is safe.
                             #
-                            # fix(#1708): aiter_raw, NEVER
-                            # aiter_bytes. aiter_bytes transparently inflates
-                            # Content-Encoding gzip/br/zstd, so one wire
-                            # chunk could materialize an unbounded
-                            # intermediate `bytes` BEFORE the size check ran
-                            # — a compression bomb despite the streaming cap.
-                            # aiter_raw measures wire bytes even if the
-                            # origin lies about its encoding, which (with
-                            # identity enforced above) are exactly the
-                            # staged bytes.
+                            # `aiter_raw`, never aiter_bytes. aiter_bytes
+                            # transparently inflates Content-Encoding
+                            # gzip/br/zstd, so one wire chunk could
+                            # materialize an unbounded intermediate `bytes`
+                            # before the size check ran: a compression bomb
+                            # despite the streaming cap.
+                            #
+                            # aiter_raw counts wire bytes even if the
+                            # origin lies about its encoding; with identity
+                            # enforced above, those are the staged bytes.
                             buffer = bytearray()
                             async for chunk in response.aiter_raw(_CHUNK_SIZE):
                                 total += len(chunk)
@@ -261,13 +261,13 @@ async def fetch_url_to_path(
         finally:
             await run_in_thread_draining(f.close)
     except BaseException:
-        # Partial or refused download: remove the file before propagating.
-        # Ordering matters — the descriptor was drained and closed above.
-        # fix(#1708): best-effort, so a path the filesystem refuses
-        # (or a transient FS error) cannot replace the real failure on its
-        # way to the caller's cleanup-then-stamp sequence.
+        # Partial or refused download: remove the file before propagating,
+        # after the descriptor was drained and closed above. Best-effort, so
+        # a path the filesystem refuses (or a transient FS error) cannot
+        # replace the real failure on its way to the caller's
+        # cleanup-then-stamp sequence.
         try:
-            # codeql[py/path-injection] fix(#1708): same clamped, staging-rooted path as the open above
+            # codeql[py/path-injection] same clamped, staging-rooted path as the open above
             dest.unlink(missing_ok=True)
         except (OSError, ValueError):
             pass

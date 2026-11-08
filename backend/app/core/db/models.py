@@ -5,8 +5,7 @@ configuration). Domain-specific models stay in their domain package
 (`app.modules.<domain>.<...>`).
 
 Never import from `app.modules.*` in this module — `core/` must not depend on
-`modules/`. The `tests/test_layering.py` architecture guard enforces this rule
-(introduced in Phase 212, plan 03).
+`modules/`. The `tests/test_layering.py` architecture guard enforces this rule.
 """
 
 from sqlalchemy import BigInteger, Boolean, CheckConstraint, Text, text, true
@@ -27,7 +26,7 @@ class AppSetting(Base):
 class SecurityRevocationGeneration(Base):
     """One row, one number: the cluster-global revocation generation.
 
-    fix(#1778): declared here rather than in a domain package because no
+    Declared here rather than in a domain package because no
     domain owns it — it is the counter every worker consults to decide
     whether a cached AUTHORIZATION decision predates the latest revocation,
     and ``app/platform/cache/revocation.py`` (which may not import from

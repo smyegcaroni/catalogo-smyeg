@@ -138,7 +138,7 @@ class TestExtractRasterMetadata:
             tif.unlink(missing_ok=True)
 
     def test_rotated_resolution_is_the_pixel_vector_not_its_x_component(self, tmp_path):
-        """fix(#1375 review): a rotated raster's pixel size is the length of
+        """A rotated raster's pixel size is the length of
         its pixel vector, not that vector's component on the world x axis.
 
         This raster is rotated 30° with 10 m pixels, so its affine reads
@@ -406,7 +406,7 @@ class _MockRecord:
     def __init__(self, title: str, record_type: str):
         self.title = title
         self.record_type = record_type
-        # fix(#1456): delete_dataset copies this onto the retired-name row as
+        # delete_dataset copies this onto the retired-name row as
         # previous_owner_id, reading it before the record is deleted. A real
         # record's created_by is nullable, and None is the honest value for a
         # double that never had an owner.
@@ -430,7 +430,7 @@ class _MockDataset:
         # is what scopes the retirement to a tenant. None is the single-tenant
         # value a real row carries here.
         self.tenant_id = None
-        # fix(#1452): delete_dataset asks geolens_owns_table whether it may
+        # delete_dataset asks geolens_owns_table whether it may
         # drop the table and retire the name. These two fields are the whole
         # input to that question, and the defaults describe an ingested
         # dataset — the case every test in this class exercises. A registered
@@ -439,7 +439,7 @@ class _MockDataset:
         self.source_format = source_format
         self.origin_ref = None
         self.record = _MockRecord(title, record_type)
-        # fix(#1847): delete_dataset takes the (datasets, records) pair before
+        # delete_dataset takes the (datasets, records) pair before
         # it reaps storage, and the acquisition reads this.
         self.record_id = uuid.uuid4()
 
@@ -528,7 +528,7 @@ class TestRasterDeleteCascadeRemovesStorage:
 
         # All raster and original keys must be deleted
         expected_deleted = set(raster_keys + original_keys)
-        # fix(#1847): the reap is the caller's, after its commit. Run it here
+        # The reap is the caller's, after its commit. Run it here
         # with what delete_dataset returned, so this still covers which objects
         # go, in the shape the endpoints now use.
         from app.modules.catalog.datasets.domain.service import reap_managed_storage
@@ -583,7 +583,7 @@ class TestRasterDeleteCascadeRemovesStorage:
         ):
             from app.modules.catalog.datasets.domain.service import delete_dataset
 
-            # fix(#1847): the reap is the CALLER's, after its commit, so a
+            # The reap is the CALLER's, after its commit, so a
             # failing provider is unreachable here. The guarantee is inverted:
             # a failed reap orphans objects rather than restoring a dataset.
             result = await delete_dataset(session, dataset_id, "My Raster")
@@ -598,7 +598,7 @@ class TestRasterDeleteCascadeRemovesStorage:
     async def test_vector_delete_still_drops_table(self):
         """Vector datasets execute DROP TABLE AND clean managed storage.
 
-        fix(#430 BA-17): the vector branch now also reaps originals/{id}/ (archived
+        The vector branch now also reaps originals/{id}/ (archived
         source) and vectors/{id}/ (quicklook) — previously orphaned forever.
         """
         import unittest.mock as mock
@@ -626,7 +626,7 @@ class TestRasterDeleteCascadeRemovesStorage:
 
         async def _capture_execute(stmt, *args, **kwargs):
             executed_sqls.append(str(stmt))
-            # fix(#1456): the vector branch now probes pg_class for the
+            # The vector branch now probes pg_class for the
             # relation's oid before the DROP, and reads .scalar() off the
             # result. Returning None here answered every execute with None and
             # broke on that read. A scalar of None is the honest answer for a
@@ -657,8 +657,8 @@ class TestRasterDeleteCascadeRemovesStorage:
         assert len(drop_calls) == 1, f"Expected exactly 1 DROP TABLE, got: {drop_calls}"
         assert "test_table" in drop_calls[0]
 
-        # fix(#430 BA-17): both managed-storage prefixes reaped
-        # fix(#1847): the reap is the caller's, after its commit. Run it here
+        # Both managed-storage prefixes reaped
+        # The reap is the caller's, after its commit. Run it here
         # with what delete_dataset returned, so this still covers which objects
         # go, in the shape the endpoints now use.
         from app.modules.catalog.datasets.domain.service import reap_managed_storage

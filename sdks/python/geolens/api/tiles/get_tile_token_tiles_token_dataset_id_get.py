@@ -104,7 +104,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
 ) -> Response[ProblemDetail | RasterTileToken | VectorTileToken]:
-    """Get Tile Token
+    """Create a tile token
 
      Generate a tile token for a dataset.
 
@@ -113,8 +113,9 @@ def sync_detailed(
 
     Both responses include a discriminated ``kind`` field.
 
-    Public datasets can be accessed without authentication.
-    Private/restricted datasets require authentication and RBAC checks.
+    A public, published dataset needs no authentication. Any other dataset
+    needs a caller with access to it, and answers 404 to everyone else,
+    anonymous callers included, exactly as an unknown dataset does.
 
     Args:
         dataset_id (UUID):
@@ -143,7 +144,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
 ) -> ProblemDetail | RasterTileToken | VectorTileToken | None:
-    """Get Tile Token
+    """Create a tile token
 
      Generate a tile token for a dataset.
 
@@ -152,8 +153,9 @@ def sync(
 
     Both responses include a discriminated ``kind`` field.
 
-    Public datasets can be accessed without authentication.
-    Private/restricted datasets require authentication and RBAC checks.
+    A public, published dataset needs no authentication. Any other dataset
+    needs a caller with access to it, and answers 404 to everyone else,
+    anonymous callers included, exactly as an unknown dataset does.
 
     Args:
         dataset_id (UUID):
@@ -177,7 +179,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
 ) -> Response[ProblemDetail | RasterTileToken | VectorTileToken]:
-    """Get Tile Token
+    """Create a tile token
 
      Generate a tile token for a dataset.
 
@@ -186,8 +188,9 @@ async def asyncio_detailed(
 
     Both responses include a discriminated ``kind`` field.
 
-    Public datasets can be accessed without authentication.
-    Private/restricted datasets require authentication and RBAC checks.
+    A public, published dataset needs no authentication. Any other dataset
+    needs a caller with access to it, and answers 404 to everyone else,
+    anonymous callers included, exactly as an unknown dataset does.
 
     Args:
         dataset_id (UUID):
@@ -214,7 +217,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
 ) -> ProblemDetail | RasterTileToken | VectorTileToken | None:
-    """Get Tile Token
+    """Create a tile token
 
      Generate a tile token for a dataset.
 
@@ -223,8 +226,9 @@ async def asyncio(
 
     Both responses include a discriminated ``kind`` field.
 
-    Public datasets can be accessed without authentication.
-    Private/restricted datasets require authentication and RBAC checks.
+    A public, published dataset needs no authentication. Any other dataset
+    needs a caller with access to it, and answers 404 to everyone else,
+    anonymous callers included, exactly as an unknown dataset does.
 
     Args:
         dataset_id (UUID):

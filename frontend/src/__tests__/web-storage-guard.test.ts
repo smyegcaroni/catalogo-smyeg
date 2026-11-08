@@ -1,5 +1,5 @@
 /**
- * fix(#1536): structural gate for unguarded Web Storage access.
+ * Structural gate for unguarded Web Storage access.
  *
  * Reading `sessionStorage` or `localStorage` throws in a storage-denied
  * context: a sandboxed frame with an opaque origin, private-mode Safari, or a
@@ -8,8 +8,7 @@
  * `typeof sessionStorage !== 'undefined'` check passes in every one of those,
  * so it protects nothing.
  *
- * #1515 fixed three sites by hand. #1527/#1535 fixed six more, five of which
- * were writes. This is the gate so there is no seventh round.
+ * This gate keeps every site guarded as the codebase grows, writes included.
  *
  * THE RULE (one condition, no exemptions): every member access of
  * `sessionStorage`/`localStorage` under `src/` must sit lexically inside the
@@ -27,31 +26,23 @@
  * is the kind of thing someone later widens. If you are here because you want
  * to add one, the answer is almost certainly a `try` block instead.
  *
- * That claim was false for seven rounds. A `*.skip.tsx?` filter sat in
- * `isProductionSource` doing exactly what the paragraph above forbids, and it
- * was harder to see than an array of paths would have been, because an
- * exemption spelled as a naming convention is claimed by renaming a file and
- * leaves nothing in a diff to argue with. It excluded nothing that scope did
- * not already exclude. It is gone, and `isProductionSource` now says what
- * separates scope from exemption, with a fixture per condition so the
- * distinction is checked rather than asserted.
+ * `isProductionSource` carries no exemption either. It says what separates
+ * scope from exemption, with a fixture per condition so the distinction is
+ * checked rather than asserted. A naming-convention filter such as
+ * `*.skip.tsx?` would be an exemption claimed by renaming a file, leaving
+ * nothing in a diff to argue with.
  *
- * THE FALSE-NEGATIVE PROMISE. This gate claimed false positives are possible
- * and false negatives are not. It broke that claim seven times: renamed
- * destructuring (five spellings, not the one that was reported), instance field
- * initializers, a `try` with no `catch`, assignment targets in for-of and
- * for-in, every `.ts` file being parsed as TSX, keys behind transparent wrappers
- * such as `window[('sessionStorage')]` (ten spellings, not the two reported),
- * and `Reflect.get(window, 'sessionStorage')` in either spelling of the callee.
- * Every fix was correct and every one was incomplete, because each answered
- * "is this X?" by listing the shapes it recognised and calling the rest safe. A list of TypeScript shapes is never
- * finished, and twice the reported spelling turned out to be a sample of a
- * family rather than the family.
+ * THE FALSE-NEGATIVE PROMISE. The gate does not promise zero false negatives.
+ * A recogniser that answers "is this X?" by listing the shapes it knows and
+ * calling the rest safe is never finished: renamed destructuring, instance
+ * field initializers, a `try` with no `catch`, assignment targets in for-of
+ * and for-in, `.ts` files parsed as TSX, keys behind transparent wrappers such
+ * as `window[('sessionStorage')]`, and `Reflect.get(window, 'sessionStorage')`
+ * in either spelling of the callee each looked like the whole family and were
+ * one sample of it. So the promise is a stated scope and three checkable
+ * properties, below.
  *
- * An unbounded promise is what made each of those a surprise, so it has been
- * replaced by a stated scope and three checkable properties, below.
- *
- * What makes the claim defensible now is not a longer list, it is the failure
+ * What makes the claim defensible is not a longer list, it is the failure
  * direction. Every membership predicate here answers "report" when it meets
  * something it does not recognise:
  *   - RUNS_IN_ENCLOSING_FRAME — an unlisted node is an execution boundary, so
@@ -68,23 +59,18 @@
  * and noisy is a bug report. Two predicates cannot be inverted; they are named
  * below with the reason.
  *
- * The fifth break was a level below all of those, and it is the one worth
- * remembering. No predicate was wrong: the PARSE was, and a file the analyser
- * cannot read yields no identifiers, which yields no findings, which reads as
- * clean. The worst possible input produced the most reassuring output. So parse
- * failures are now fatal and name the file, and a half-read file contributes no
- * accesses at all rather than the ones it happened to see before it gave up.
- * That guard is worth more than the ScriptKind fix that prompted it, because it
- * catches the whole class — a syntax the installed TypeScript cannot parse, a
- * ScriptTarget that ages out, a file that is not what its extension says —
- * without anyone having to anticipate the next member of it.
+ * Parse failures are fatal and name the file. A file the analyser cannot read
+ * yields no identifiers, which yields no findings, which would read as clean,
+ * so a half-read file contributes no accesses at all rather than the ones it
+ * happened to see before it gave up. That guard catches the whole class — a
+ * syntax the installed TypeScript cannot parse, a ScriptTarget that ages out,
+ * a file that is not what its extension says — without anyone having to
+ * anticipate the next member of it.
  *
- * The sixth was the mirror image of the predicate bugs. Nothing was listing the
- * wrong shapes; the matchers were being handed a wrapped node and answering
- * about the wrapper. Since parentheses, `as`, `satisfies`, `!` and the rest are
- * erased before the code runs, the fix is to peel them — using the compiler's
- * own `skipOuterExpressions`, because writing that list here would have been a
- * seventh chance to miss a member of it.
+ * Transparent wrappers are peeled, not listed. Parentheses, `as`, `satisfies`,
+ * `!` and the rest are erased before the code runs, so the matchers peel them
+ * with the compiler's own `skipOuterExpressions`; writing that list here would
+ * be one more chance to miss a member of it.
  *
  * Adding a kind to any of those allowlists widens what the gate calls safe.
  * That is a deliberate act and must read like one: a one-line reason at the
@@ -93,8 +79,7 @@
  * it.
  *
  * SCOPE: STATICALLY DETERMINABLE ACCESS ONLY. This is the boundary, and it is
- * stated here because seven findings arrived as "here is another form" while
- * this file described only what it catches and never what it cannot.
+ * stated here so the file says what it cannot catch as well as what it does.
  *
  * The gate detects access to `sessionStorage`/`localStorage` where the source
  * says so: a named identifier, a property or element access with a literal key,
@@ -111,20 +96,17 @@
  *     the store, a value off `any`, a proxy, an aliased `Reflect`.
  *   - the descriptor escape hatch, where the getter is pulled off the prototype
  *     and invoked by hand.
- * Some of those are statically visible in principle and would be reasonable
- * additions; they belong in the follow-up issue, not in another round here. The
+ * Some of those are statically visible in principle and could be added. The
  * rest are not decidable without running the program, so no amount of review
  * closes them, and a reader who assumes otherwise will trust this gate for
  * something it was never able to do.
  *
- * fix(#1552): the follow-up issue's four candidate forms needed no detector
- * change; each is triaged, with its evidence, at its own fixture block below
- * (search `#1552` in this file).
+ * The four candidate forms raised against the detector needed no change; each
+ * is triaged, with its evidence, at its own fixture block below (the describe
+ * blocks titled `#1552`).
  *
- * WHAT THE PROMISE IS WORTH NOW. Seven rounds is a poor advertisement for the
- * original claim, and the gate is nonetheless much harder to fool than when it
- * started. The honest version of the claim is not "there are no false
- * negatives" but this, which a reader can check for themselves:
+ * WHAT THE PROMISE IS WORTH. The claim is not "there are no false negatives"
+ * but this, which a reader can check for themselves:
  *
  *   1. Every membership predicate fails toward reporting. An unrecognised
  *      construct makes this gate noisy, never silent — verified per predicate
@@ -141,20 +123,18 @@
  *
  * Those three bound the risk; they do not eliminate it. The gaps are the ones
  * named under SCOPE above and under TWO PREDICATES below, which is why this
- * says "bounded" rather than "closed". What is genuinely gone is the failure
- * mode all seven rounds shared, where the gate's silence meant nothing at all
- * and read like evidence.
+ * says "bounded" rather than "closed". What is gone is the failure mode where
+ * the gate's silence meant nothing at all and read like evidence.
  *
  * WHAT THIS GATE DOES NOT PROVE. It proves an access cannot throw. It does
  * NOT prove the code degrades correctly when storage is denied, and those two
- * came apart in this repo. Before #1515, `public/asset-guard.js` wrapped the
- * access in a try and reached `window.location.reload()` from the catch: the
- * SecurityError was swallowed, the latch never got written, and the reload ran
- * anyway. Roughly 12,000 reloads in 12 seconds. That code would pass this
- * gate. An empty catch followed by the consequential action is invisible here,
- * and deliberately so, since deciding whether a catch fails open is a
- * judgement about what the code does next and an AST rule that guessed would
- * only produce noise. Read the catch block yourself.
+ * can come apart. A guard that wrapped the access in a try and reached
+ * `window.location.reload()` from the catch swallowed the SecurityError, never
+ * wrote its latch, and reloaded in a loop (roughly 12,000 reloads in 12
+ * seconds). That code would pass this gate. An empty catch followed by the
+ * consequential action is invisible here, and deliberately so, since
+ * deciding whether a catch fails open is a judgement about what the code
+ * does next, and an AST rule that guessed would only produce noise. Read the catch block yourself.
  *
  * TWO PREDICATES THAT DO NOT FAIL TOWARD REPORTING. `catchStopsTheThrow` calls
  * a catch with no lexical `throw` protective, so `catch (e) { fail(e); }` where
@@ -191,7 +171,7 @@ const allModules = import.meta.glob('/src/**/*.{ts,tsx}', {
 }) as Record<string, string>;
 
 /**
- * fix(#1545 codex P2, round 8): every condition here is SCOPE. There is no
+ * Every condition here is SCOPE. There is no
  * exemption, and there must never be one.
  *
  * A `*.skip.tsx?` filter used to sit at the end of this list, and it was an
@@ -221,7 +201,7 @@ const sources = Object.entries(allModules).filter(([path]) => isProductionSource
 const excludedCount = Object.keys(allModules).length - sources.length;
 
 /**
- * fix(#1545 codex P2, round 6): the compiler's own wrapper peeling, not a list
+ * The compiler's own wrapper peeling, not a list
  * of wrapper kinds written here.
  *
  * TypeScript calls these OUTER EXPRESSIONS: parentheses, `as`, `satisfies`,
@@ -231,10 +211,10 @@ const excludedCount = Object.keys(allModules).length - sources.length;
  * read the getter exactly as `window['sessionStorage']` does. A node-kind test
  * handed the wrapper answers about the wrapper.
  *
- * The reported case was two spellings. Measuring the family found ten, in three
- * different matchers. Enumerating the wrappers here would have been a seventh
- * chance to miss one, so this borrows `isOuterExpression`/`skipOuterExpressions`
- * from the compiler, which is where the canonical list lives and is maintained.
+ * The family has ten spellings, in three different matchers. Enumerating the
+ * wrappers here would be one more chance to miss one, so this borrows
+ * `isOuterExpression`/`skipOuterExpressions` from the compiler, which is
+ * where the canonical list lives and is maintained.
  *
  * They are not in typescript@6's published `.d.ts`, hence the cast — the same
  * bargain as `parseErrorsOf`, and the same protection. If an upgrade moves
@@ -260,7 +240,7 @@ function unwrap(node: ts.Node): ts.Node {
 /**
  * A behavioural check, not a `typeof` check: the helpers must actually peel a
  * stack of wrappers down to the literal, or this file's matching is quietly
- * back to where round 6 found it.
+ * back to being wrong.
  */
 const OUTER_EXPRESSION_PEELING_WORKS = ((): boolean => {
   const probe = ts.createSourceFile(
@@ -281,17 +261,15 @@ const OUTER_EXPRESSION_PEELING_WORKS = ((): boolean => {
 })();
 
 /**
- * fix(#1545 codex P2, round 2): this list is an ALLOWLIST, and that is the
+ * This list is an ALLOWLIST, and that is the
  * whole design.
  *
- * The previous version asked the opposite question: it climbed toward the `try`
- * and stopped at anything it recognised as function-like. Everything it did not
- * recognise was assumed to run synchronously. That is a blocklist of
- * deferred-execution constructs, and a blocklist of those in TypeScript will
- * never be complete. Two rounds of review found two holes in it: a callback is
+ * The opposite question, climbing toward the `try` and stopping at anything
+ * recognised as function-like, would assume everything unrecognised runs
+ * synchronously. That is a blocklist of deferred-execution constructs, and a
+ * blocklist of those in TypeScript will never be complete: a callback is
  * obvious, a non-static class field initializer is not, and neither is the next
- * one nobody has thought of. Every gap was a silent FALSE NEGATIVE in a gate
- * whose docstring promises there are none.
+ * one nobody has thought of. Every gap would be a silent FALSE NEGATIVE.
  *
  * So the question is inverted. An access counts as guarded only if EVERY node
  * between it and the `try` is listed below as running in the enclosing frame.
@@ -440,7 +418,7 @@ function catchStopsTheThrow(clause: ts.CatchClause): boolean {
  * Guarded means: some enclosing `try` CATCHES the throw, and every node between
  * the access and that try's block runs in the same frame.
  *
- * fix(#1545 codex P2, round 3): the old version asked "is there an enclosing
+ * The old version asked "is there an enclosing
  * try", which is a different question — `try { ... } finally { ... }` runs the
  * finally and then lets the SecurityError carry on out. That was the third
  * false negative in a gate whose docstring promises none, so here is the
@@ -504,41 +482,39 @@ function isGuarded(node: ts.Node): boolean {
 }
 
 /**
- * fix(#1545 codex P2): destructuring evaluates the getter too.
+ * Destructuring evaluates the getter too.
  *
  * `const { sessionStorage: store } = window` throws exactly like
  * `window.sessionStorage` does, because binding the property reads it. The
  * storage name sits in a key position there, which `isNonValuePosition` below
- * classifies as a name rather than a read, so the whole family slipped through
- * as a FALSE NEGATIVE. That contradicted this file's own invariant, and false
- * negatives are the one thing this walk promises not to have.
+ * classifies as a name rather than a read, so the whole family would slip
+ * through as a FALSE NEGATIVE, contradicting this file's own invariant.
  *
- * Five forms were missed, not the one that was reported:
+ * Five forms need to be caught, not just one:
  *   const { sessionStorage: s } = window          BindingElement.propertyName
  *   function f({ sessionStorage: s } = window)    BindingElement.propertyName
  *   const { a: { sessionStorage: s } } = obj      BindingElement.propertyName
  *   const { ['sessionStorage']: s } = window      ComputedPropertyName
  *   ({ sessionStorage: s } = window)              PropertyAssignment.name
  *
- * The unrenamed forms (`const { sessionStorage } = window`) were already caught,
- * by falling through this function rather than by design, and the fixtures now
- * pin that so it cannot regress silently.
+ * The unrenamed forms (`const { sessionStorage } = window`) are caught by
+ * falling through this function rather than by design, and the fixtures pin
+ * that so it cannot regress silently.
  *
- * Deliberately NOT conditioned on the initializer being a global. The review
- * suggested flagging only when destructuring from `window`/`globalThis`, which
- * is more precise and reintroduces the same class of hole: `const w = window;
+ * Deliberately NOT conditioned on the initializer being a global. Flagging
+ * only when destructuring from `window`/`globalThis` is more precise and
+ * reintroduces the same class of hole: `const w = window;
  * const { sessionStorage: s } = w;` would read as safe. A destructuring key
  * named `sessionStorage`/`localStorage` on a non-global object is close to
  * nonexistent in real code, and flagging it is a false positive, which this
  * walk already accepts. Precision here would be bought with the invariant.
  *
- * fix(#1545 codex P2, round 4): INVERTED, for the reason given at
- * RUNS_IN_ENCLOSING_FRAME. The old version asked "is the parent an `=`
- * expression", answered false for everything else, and so missed
+ * INVERTED, for the reason given at
+ * RUNS_IN_ENCLOSING_FRAME. Asking "is the parent an `=` expression" and
+ * answering false for everything else would miss
  * `for ({ sessionStorage: store } of [window]) {}` — a target that binds the
- * key on every iteration. That was the fourth false negative in four rounds,
- * and the third produced by a predicate that recognises shapes and calls the
- * rest safe.
+ * key on every iteration. A predicate that recognises shapes and calls the
+ * rest safe has that failure mode.
  *
  * So the question is inverted here too. The positions where an object literal
  * is a VALUE are enumerated below; everything else is treated as a target and
@@ -642,7 +618,7 @@ function storageNameOfKey(key: ts.Node): string | null {
 }
 
 /**
- * fix(#1545 codex P2, round 7): `Reflect.get(window, 'sessionStorage')` invokes
+ * `Reflect.get(window, 'sessionStorage')` invokes
  * the getter exactly as `window.sessionStorage` does, and throws in the same
  * contexts, but nothing else here sees it: there is no storage-named identifier
  * and no element access, only a call whose second argument is a string.
@@ -664,7 +640,7 @@ function storageNameOfKey(key: ts.Node): string | null {
  * The property a member access reads, however it is spelled. `x.get` and
  * `x['get']` are the same read, so a matcher that tests only for a
  * PropertyAccessExpression answers about the spelling rather than the property
- * — the round-6 lesson applied to the member name instead of the key.
+ * — the same wrapper rule as for the key, applied to the member name.
  */
 function accessedName(node: ts.Node): string | null {
   if (ts.isPropertyAccessExpression(node)) return node.name.text;
@@ -696,7 +672,7 @@ function isReflectiveStorageRead(node: ts.Node): boolean {
 /**
  * Identifier positions that are names rather than value reads.
  *
- * fix(#1545 codex P2, round 4): audited, and deliberately left as it is. This
+ * Audited, and deliberately left as it is. This
  * one already fails the right way — the default is `false`, so an identifier in
  * a position nobody enumerated counts as a read and gets reported. Inverting it
  * would mean listing every position that IS a read, which is most of the
@@ -704,7 +680,7 @@ function isReflectiveStorageRead(node: ts.Node): boolean {
  * obligations with the same hole at the end.
  *
  * Two entries are silent only because another branch of `collectAccesses`
- * covers them, and that split is what round 4 tripped over. The key of a
+ * covers them, and that split is an easy place to lose a case. The key of a
  * `PropertyAssignment` and the `propertyName` of a `BindingElement` are skipped
  * here and matched there instead, so a storage key in a destructuring pattern
  * is seen exactly once. When the BindingElement branch says "always a pattern"
@@ -760,7 +736,7 @@ interface ScanResult {
 }
 
 /**
- * fix(#1545 codex P2, round 5): the kind is chosen from the extension, not
+ * The kind is chosen from the extension, not
  * assumed.
  *
  * Every file used to be parsed as TSX, which is wrong for `.ts` and wrong
@@ -902,7 +878,7 @@ describe('#1536: Web Storage access under src/ must be exception-safe', () => {
     expect(accesses.length).toBeGreaterThan(0);
   });
 
-  // fix(#1545 codex P2 round 6): the matchers below lean on the compiler to
+  // The matchers below lean on the compiler to
   // peel runtime-transparent wrappers. Those helpers are not in the published
   // .d.ts, so this asserts they still behave, and says so precisely instead of
   // letting ten wrapper fixtures fail with no explanation.
@@ -917,7 +893,7 @@ describe('#1536: Web Storage access under src/ must be exception-safe', () => {
     ).toBe(true);
   });
 
-  // fix(#1545 codex P2 round 5): the finest-grained vacuity guard of the three.
+  // The finest-grained vacuity guard of the three.
   // A file the parser could not read yields no identifiers, no identifiers
   // yields no findings, and the gate reports clean — the worst possible input
   // producing the most reassuring output. So an unreadable file is a gate
@@ -994,7 +970,7 @@ describe('#1536: detector fixtures', () => {
     ['callback declared inside try', `try { on('x', () => sessionStorage.getItem('k')); } catch {}`],
     ['inside catch block', `try { g(); } catch { sessionStorage.setItem('k', 'v'); }`],
     ['inside finally block', `try { g(); } finally { sessionStorage.setItem('k', 'v'); }`],
-    // fix(#1545 codex P2): the destructuring family. Binding the property runs
+    // The destructuring family. Binding the property runs
     // the getter, so every one of these throws under an opaque origin. The
     // renamed forms were the false negative; the unrenamed ones are pinned here
     // because they passed by falling through rather than by design.
@@ -1006,7 +982,7 @@ describe('#1536: detector fixtures', () => {
     ['computed-key destructuring', `const { ['sessionStorage']: s } = window;`],
     ['assignment destructuring', `let s; ({ sessionStorage: s } = window);`],
     ['shorthand assignment destructuring', `let sessionStorage; ({ sessionStorage } = window);`],
-    // fix(#1545 codex P2 round 2): the deferred-execution class. Each of these
+    // The deferred-execution class. Each of these
     // sits lexically inside a try whose frame is gone by the time the code
     // runs. None is special-cased; they are all simply absent from
     // RUNS_IN_ENCLOSING_FRAME, which is the point of the inversion.
@@ -1038,7 +1014,7 @@ describe('#1536: detector fixtures', () => {
       'a constructor body inside a try',
       `try { class C { constructor() { sessionStorage.getItem('k'); } } } catch {}`,
     ],
-    // fix(#1545 codex P2 round 3): a try that does not CATCH does not guard.
+    // A try that does not CATCH does not guard.
     // `finally` runs and the SecurityError carries on out of the statement, so
     // every one of these still crashes the frame the access ran on.
     ['a try with only a finally', `try { sessionStorage.getItem('k'); } finally { done(); }`],
@@ -1068,7 +1044,7 @@ describe('#1536: detector fixtures', () => {
       'a catch that rethrows a wrapped error',
       `try { sessionStorage.getItem('k'); } catch (e) { throw (e as Error); }`,
     ],
-    // fix(#1545 codex P2 round 4): assignment patterns outside an `=`. Each of
+    // Assignment patterns outside an `=`. Each of
     // these binds the storage key on every iteration, so each reads the getter.
     [
       'a for-of assignment target',
@@ -1134,7 +1110,7 @@ describe('#1536: detector fixtures', () => {
       'a JSX attribute inside a try',
       `try { render(<div title={sessionStorage.getItem('k')} />); } catch {}`,
     ],
-    // fix(#1545 codex P2 round 3): the catching try is not always the nearest
+    // The catching try is not always the nearest
     // one — each of these reaches an outer `catch` that does stop the throw.
     // The old rule answered at the first TryStatement it met, so it reported
     // the last two outright; the middle pair passed only because stopping early
@@ -1177,7 +1153,7 @@ describe('#1536: detector fixtures', () => {
     // that separates a false positive from a real access.
     ['a local renamed FROM a non-storage key', `const { foo: sessionStorage } = cfg;`],
     ['a type annotation', `let s: Storage | null = null;`],
-    // fix(#1545 codex P2 round 4): the counterweight to inverting the
+    // The counterweight to inverting the
     // destructuring-target test. Treating every unrecognised position as a
     // target is only affordable if the positions where an object literal is a
     // VALUE are enumerated properly, so each of these pins one of them. Without
@@ -1206,8 +1182,8 @@ describe('#1536: detector fixtures', () => {
 /**
  * The parse layer's own fixtures.
  *
- * Everything above assumes a tree that reflects the source. Round 5 was the
- * round where that assumption broke instead of a predicate, so these pin the
+ * Everything above assumes a tree that reflects the source. That assumption can
+ * break instead of a predicate, so these pin the
  * two halves of it: the right ScriptKind per extension, and a parse failure
  * that is reported rather than swallowed.
  */
@@ -1269,7 +1245,7 @@ describe('#1536: the parse is asserted, not assumed', () => {
   });
 });
 /**
- * fix(#1545 codex P2, round 6): transparent wrappers.
+ * Transparent wrappers.
  *
  * `window['sessionStorage']` was matched; `window[('sessionStorage')]` was not,
  * because the argument is a ParenthesizedExpression rather than a string
@@ -1278,7 +1254,7 @@ describe('#1536: the parse is asserted, not assumed', () => {
  * and throws in a storage-denied context.
  *
  * The reported case was two of these. Measuring the family found ten, which is
- * the same lesson as rounds 1 and 4: the reported spelling is a sample, not the
+ * the same lesson as elsewhere in this file: the reported spelling is a sample, not the
  * set. They are pinned per form rather than as one representative case, because
  * the wrappers compose and each site that unwraps has to unwrap fully.
  */
@@ -1327,7 +1303,7 @@ describe('#1536: transparent wrappers do not hide an access', () => {
   });
 });
 /**
- * fix(#1545 codex P2, round 7): reflective reads.
+ * Reflective reads.
  *
  * `Reflect.get(window, 'sessionStorage')` invokes the same getter as
  * `window.sessionStorage` and throws in the same contexts, but the visitor saw
@@ -1372,7 +1348,7 @@ describe('#1536: reflective reads', () => {
     expect(r.accesses[0].guarded).toBe(true);
   });
 
-  // Already covered before this round; pinned so they cannot regress silently.
+  // Pinned so these cannot regress silently.
   it.each([
     ['optional element access', `const s = window?.['sessionStorage'];`],
     ['a template-literal key', `const s = window[\`sessionStorage\`];`],
@@ -1386,7 +1362,7 @@ describe('#1536: reflective reads', () => {
     ['a key enumeration', `const k = Reflect.ownKeys(window);`],
     ['a non-storage key', `const s = Reflect.get(window, 'somethingElse');`],
     ['a runtime key', `const s = Reflect.get(window, key);`],
-    // fix(#1552): this descriptor is an accessor pair (`get`/`set`), not a
+    // This descriptor is an accessor pair (`get`/`set`), not a
     // data property, so it has no `value` key and reading one that is not
     // there cannot call `get`. Same shape from `Reflect.getOwnPropertyDescriptor`.
     ['a descriptor .value read', `const d = Object.getOwnPropertyDescriptor(window, 'sessionStorage'); void d?.value;`],
@@ -1397,7 +1373,7 @@ describe('#1536: reflective reads', () => {
   });
 });
 /**
- * fix(#1545 codex P2, round 8): exclusions must be SCOPE, never exemption.
+ * Exclusions must be SCOPE, never exemption.
  *
  * This gate ships with no allowlist, on the reasoning that an escape hatch is
  * never emptied once it exists. A `*.skip.ts` suffix filter was one anyway, and
@@ -1462,9 +1438,9 @@ describe('#1536: reflective reads, however the callee is spelled', () => {
 });
 
 /**
- * fix(#1552): a differently-named alias is judged at its capture, the
+ * A differently-named alias is judged at its capture, the
  * property read, never at its later dereference. Scoped to this gate's own
- * SecurityError claim — see the last fixture and #1552 for what that excludes.
+ * SecurityError claim — see the last fixture for what that excludes.
  */
 describe('#1552: a captured alias is judged at the capture site, not the dereference', () => {
   const scan = (src: string) => scanSource('/src/fixture.ts', src);
@@ -1511,7 +1487,7 @@ describe('#1552: a captured alias is judged at the capture site, not the derefer
     expect(r.accesses[0].guarded).toBe(false);
   });
 
-  // fix(#1552 codex P2): documented gap, not a false pass — see #1552.
+  // Documented gap, not a false pass.
   it('does NOT protect a later fallible call through the alias — a real, untracked gap', () => {
     const r = scan(
       `let s: Storage | undefined;
@@ -1524,7 +1500,7 @@ describe('#1552: a captured alias is judged at the capture site, not the derefer
 });
 
 /**
- * fix(#1552): an `any`/`unknown`-typed alias is not a new form — this walk
+ * An `any`/`unknown`-typed alias is not a new form — this walk
  * has no type checker, so `w.sessionStorage` parses the same regardless of
  * what TypeScript believes `w` is.
  */
@@ -1549,9 +1525,9 @@ describe('#1552: a type annotation does not hide the property name from this wal
 });
 
 /**
- * fix(#1552): `with (window) { ... }` is skipped — it changes how a bare
+ * `with (window) { ... }` is skipped — it changes how a bare
  * identifier resolves, not how it is spelled, so it cannot hide a read from
- * a walk that matches spelling. Not a parse failure here; see #1552.
+ * a walk that matches spelling. Not a parse failure here.
  */
 describe('#1552: with cannot hide a bare read, because it does not rename anything', () => {
   it('flags an unguarded access inside a with statement', () => {

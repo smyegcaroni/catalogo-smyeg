@@ -3,7 +3,7 @@ import { toViewerSyncInput } from '@/components/viewer/ViewerMap';
 import { getDataDrivenColumnsForLayer } from '@/components/builder/map-sync';
 import type { SharedLayerResponse } from '@/types/api';
 
-// #350 (Codex P2): the INITIAL viewer render builds its source via
+// #350: the INITIAL viewer render builds its source via
 // toViewerSyncInput() -> syncMapComposition before any token-refresh path runs.
 // If popup_config is dropped in that conversion, a viewer opened at z<10 strips
 // the popup's selected fields and shows "No attributes". Pin the copy so the
@@ -44,5 +44,12 @@ describe('toViewerSyncInput popup_config preservation (#350)', () => {
     const input = toViewerSyncInput(makeShared(null), 'l1', new Set(['l1']));
     expect(input.popup_config).toBeNull();
     expect(getDataDrivenColumnsForLayer(input)).toEqual([]);
+  });
+});
+
+describe('toViewerSyncInput tile allowlist', () => {
+  it('carries the dataset tile allowlist, which keeps a filter the cluster route refuses off its URL', () => {
+    const layer = { table_name: 'cities', dataset_id: 'ds-1', dataset_tile_columns: ['kind'] } as unknown as SharedLayerResponse;
+    expect(toViewerSyncInput(layer, 'l1', new Set(['l1'])).dataset_tile_columns).toEqual(['kind']);
   });
 });

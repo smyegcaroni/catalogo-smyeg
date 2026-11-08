@@ -5,8 +5,8 @@ data without importing the concrete SQLAlchemy ORM from
 app.modules.catalog.* — ORM classes satisfy them structurally (PEP 544).
 
 Uses only stdlib types (plus AsyncSession) to avoid a core -> modules.catalog
-import edge (Phase 225 PROCESS-01..05); core/ is the lowest layer and never
-imports from modules/ (Phase 214 IDENT-01). SearchFilters and
+import edge; core/ is the lowest layer and never
+imports from modules/. SearchFilters and
 IngestionResult are typed as unresolved forward-reference strings for the
 same reason.
 
@@ -66,7 +66,7 @@ class RecordProtocol(Protocol):
     translations: Sequence[TranslationProtocol]
     spatial_extent: Any  # geoalchemy2 type — Any keeps core/ free of geoalchemy2 import
     lineage_summary: str | None
-    # feat(#765): analysis provenance, written by processing/analysis.
+    # Analysis provenance, written by processing/analysis.
     derived_from: dict | None
     source_organization: str | None
     access_constraints: str | None
@@ -127,12 +127,12 @@ class DatasetGrantProtocol(Protocol):
 
 @runtime_checkable
 class DatasetVersionProtocol(Protocol):
-    """Catalog DatasetVersion surface — only ``id`` is read by reupload finalize path (OQ-2)."""
+    """Catalog DatasetVersion surface — only ``id`` is read by reupload finalize path."""
 
     id: uuid.UUID
 
 
-# Shorter aliases for caller annotations (Phase 225 D-04, mirrors Phase 214 D-05).
+# Shorter aliases for caller annotations.
 # Both names are exported; ``Dataset`` reads cleaner in parameter annotations
 # and ``DatasetProtocol`` is preferred in conformance assertions.
 Dataset = DatasetProtocol
@@ -149,15 +149,15 @@ Attribute = AttributeProtocol
 class ProcessingPort(Protocol):
     """Comprehensive catalog accessor contract used by backend/app/processing/*.
 
-    Mirrors Phase 214 IdentityProtocol's "single comprehensive Protocol"
-    shape (D-01) — every cross-domain catalog accessor processing/* needs
+    Mirrors IdentityProtocol's "single comprehensive Protocol"
+    shape: every cross-domain catalog accessor processing/* needs
     is on this surface. Companion structural Protocols (DatasetProtocol,
     etc.) above type the ORM-shaped return values without leaking
     SQLAlchemy ORM into core/.
 
     SearchFilters and IngestionResult are typed as Any / forward-reference
-    strings — they live in app.modules.* and can't be imported here (Phase
-    214 IDENT-01). DefaultProcessingPort in platform/extensions/defaults.py
+    strings — they live in app.modules.* and can't be imported here.
+    DefaultProcessingPort in platform/extensions/defaults.py
     has full typed access.
     """
 
@@ -210,6 +210,23 @@ class ProcessingPort(Protocol):
         self, session: AsyncSession, user: Identity
     ) -> set[str]: ...
 
+    # A VRT serves its members' pixels to its own audience, which the tile path
+    # and the build tasks compare against each member's. ``vrt`` is a
+    # ``RecordAudienceQuery``, typed Any since core/ may not import platform/.
+    async def vrt_members_beyond_audience(
+        self, session: AsyncSession, member_ids: Sequence[uuid.UUID], vrt: Any
+    ) -> list[uuid.UUID]: ...
+
+    # REQUIRED (EXTENSION_API_VERSION 17 -> 18): the batch tile-token endpoint
+    # asks once for every mosaic in the batch. Each item is ``(vrt,
+    # member_ids)``; the answer says, per item, whether a member is beyond the
+    # VRT's audience, as ``vrt_members_beyond_audience`` would.
+    async def vrts_beyond_member_audience(
+        self,
+        session: AsyncSession,
+        vrts: Sequence[tuple[Any, Sequence[uuid.UUID]]],
+    ) -> list[bool]: ...
+
     async def run_analysis_preview(
         self,
         session: AsyncSession,
@@ -219,7 +236,7 @@ class ProcessingPort(Protocol):
         user_id: uuid.UUID,
         distance_meters: float | None = None,
         mask: dict[str, Any] | None = None,
-        # feat(#683): the clip mask can come from another dataset, not just a
+        # The clip mask can come from another dataset, not just a
         # drawn polygon. Passed as the loaded object, not an id, because the
         # caller owns its visibility check, as it owns the source dataset's.
         mask_dataset: Any | None = None,
@@ -262,7 +279,7 @@ class ProcessingPort(Protocol):
     # ``translations``: embedding backfills consume them after query
     # execution and the community ORM deliberately uses lazy="raise".
     #
-    # fix(#1506): with ``force=False`` the contract is "records with no vector
+    # With ``force=False`` the contract is "records with no vector
     # under the ACTIVE embedding model", not "records with no vector at all" —
     # an implementation that can't resolve the active model must return an
     # empty list; returning everything hands the whole catalog to a run that
@@ -353,7 +370,7 @@ class ProcessingPort(Protocol):
 
     def create_ingestion_result(self, **kwargs: Any) -> Any: ...  # -> IngestionResult
 
-    # fix(#1314): the refresh/reupload paths can change a dataset's modality,
+    # The refresh/reupload paths can change a dataset's modality,
     # so the auto-generated `record_distributions` rows must be reconciled —
     # that logic belongs beside `generate_distributions` in the catalog
     # domain, which processing/ may not import. Returns the rows created and
@@ -380,6 +397,7 @@ class ProcessingPort(Protocol):
         result_offset: int | None = None,
         object_ids: list[int] | tuple[int, ...] | None = None,
         force_arcgis_geojson: bool = False,
+        return_z: bool = False,
     ) -> tuple[str, str]: ...
 
     async def fetch_arcgis_id_plan(
@@ -395,7 +413,7 @@ class ProcessingPort(Protocol):
 
     # ORM class helpers: let processing/* call sites pass concrete ORM
     # classes to select()/session.add() without importing app.modules.catalog.*
-    # directly — Phase 214 IDENT-01 compliant since the Protocol declares
+    # directly. This respects the core/ layering since the Protocol declares
     # only a `type` return, no modules.* import.
     def get_record_orm_class(self) -> type: ...
 
@@ -409,7 +427,7 @@ class ProcessingPort(Protocol):
 
     def get_record_distribution_orm_class(self) -> type: ...
 
-    # feat(#1223): the swap path recomputes schema drift against the staging
+    # The swap path recomputes schema drift against the staging
     # table rather than trusting the preview, which may be minutes stale for a
     # live service. The function is pure but lives in the catalog domain, and
     # processing/ may not import it directly.
@@ -423,13 +441,13 @@ class ProcessingPort(Protocol):
 
     def get_attribute_metadata_orm_class(self) -> type: ...
 
-    # feat(#1266): the STAC refresh strategy re-reads the item document its
-    # asset was published in, through Rule 2's safe client and the #1222
+    # The STAC refresh strategy re-reads the item document its
+    # asset was published in, through Rule 2's safe client and the
     # health classifier — both live in the catalog domain, so the strategy
     # asks for the answer through this port and holds no HTTP client of its
     # own. Returns a ``StacResolution``, typed Any since core/ may not
     # import modules.*.
-    # feat(#1764): ``credential`` is the ``ServiceCredential`` a credentialed
+    # ``credential`` is the ``ServiceCredential`` a credentialed
     # refresh claimed for this attempt, and ``catalog_origin`` the catalog
     # address it was given for; a read steered elsewhere is made anonymously.
     # ``repair_nodata`` asks the resolver for a nodata-only backfill.

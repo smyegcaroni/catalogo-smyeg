@@ -1,10 +1,9 @@
 """HTTP-surface enforcement of the ``allowed_email_domains`` allowlist.
 
-fix(#836): consolidates a fetch-check-403 block duplicated across four HTTP
-endpoints. OAuth-service call sites keep their own flow — they raise
-``OAuthDomainNotAllowedError`` into the SSO redirect and add verified-claim
-trust rules with no HTTP analogue. Kept separate from ``domain_validation.py``
-so that module stays pure pattern matching, no DB/HTTP concerns.
+The fetch-check-403 gate the HTTP endpoints share. OAuth-service call sites
+keep their own flow: they raise ``OAuthDomainNotAllowedError`` into the SSO
+redirect and add verified-claim trust rules with no HTTP analogue. Kept apart
+from ``domain_validation.py`` so that module stays pure pattern matching.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ async def enforce_email_domain_gate(
     if is_email_allowed(email, domains):
         return
     if break_glass_user is not None:
-        from app.modules.auth.permissions import (  # LAZY — per D-17
+        from app.modules.auth.permissions import (
             MANAGE_SETTINGS,
             user_has_capability,
         )

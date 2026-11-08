@@ -13,15 +13,14 @@ import {
 } from '@/components/ui/tooltip';
 
 /**
- * Floating toolbar centered at the top of the map canvas.
- * Grouped into semantic sections: navigation | plugins.
+ * Floating toolbar centered at the top of the map canvas, grouped into
+ * navigation | plugins.
  *
- * fix(#394) UX-08 (decision record): there is deliberately NO global terrain
- * toggle here. Terrain is layer-owned — it activates through a DEM layer's
- * editor scene (render mode + exaggeration live with the layer that supplies
- * the elevation data), so a map without a DEM layer has nothing for a global
- * toggle to enable. Revisit only alongside the global-base-DEM plan
- * (terrain-pedestal Phase 1), which would give every map a default source.
+ * There is deliberately no global terrain toggle: terrain is layer-owned and
+ * activates through a DEM layer's editor scene (render mode + exaggeration live
+ * with the layer supplying the elevation data), so a map without a DEM layer
+ * has nothing for a global toggle to enable. Revisit only alongside a global
+ * base DEM giving every map a default source.
  */
 interface MapToolbarProps {
   onStyleJsonClick?: () => void;
@@ -77,10 +76,9 @@ export function MapToolbar({ onStyleJsonClick, onShortcutsClick }: MapToolbarPro
     return tools;
   }, [activePlugins, close, measureActive, measurementPlugin, toggle, t]);
 
-  // fix(#526 B-041): the shortcuts sheet and these buttons' own tooltips
-  // advertise V/M/L, but no handler was ever wired -- two surfaces
-  // misinformed (audit U-02). Guarded like MapBuilderPage's '?' hotkey:
-  // no-op while typing, with modifier keys held, or when a dialog is open.
+  // The shortcuts sheet and these buttons' tooltips advertise V/M/L. Guarded
+  // like MapBuilderPage's '?' hotkey: no-op while typing, with modifier keys
+  // held, or when a dialog is open.
   useEffect(() => {
     function handleToolHotkey(e: KeyboardEvent) {
       if (e.metaKey || e.ctrlKey || e.altKey) return;

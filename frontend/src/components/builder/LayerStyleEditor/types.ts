@@ -1,7 +1,5 @@
 import type { BuilderStyleConfig, MapLayerResponse, StyleConfig, SymbolStyleConfig } from '@/types/api';
 
-export type PointRenderMode = 'points' | 'heatmap' | 'symbol' | 'cluster';
-
 /**
  * Shared props passed to every per-render-mode editor sub-component.
  * All editors receive the same interface so RenderModeSwitch can pass
@@ -31,12 +29,11 @@ export interface BaseStyleEditorProps {
   /** Patch a single paint property (handles builder-alias routing internally). */
   onPaintProp: (key: string, value: unknown) => void;
   /**
-   * EDIT-05: Dedicated fill-pattern change handler. Enforces mutual exclusion:
-   * setting a pattern deletes fill-color; clearing the pattern (id=undefined)
-   * deletes fill-pattern and restores fill-color. Optional — only FillEditor uses it.
+   * Dedicated fill-pattern change handler. Enforces mutual exclusion: setting a
+   * pattern deletes fill-color; clearing the pattern (id=undefined) deletes
+   * fill-pattern and restores fill-color. Required: a fallback that set
+   * fill-pattern to undefined instead of deleting the key would break the rule.
    */
-  /** fix(#922): required — the fallback set fill-pattern to undefined instead of
-   *  deleting the key, exactly what the EDIT-05 mutual-exclusion rule forbids. */
   onFillPatternChange: (id: string | undefined) => void;
   onToggleFill: () => void;
   onToggleStroke: () => void;

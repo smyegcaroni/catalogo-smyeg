@@ -1,4 +1,4 @@
-"""builder-audit #338 P0-01 regression: embed tokens must not survive share revocation,
+"""Regression: embed tokens must not survive share revocation,
 visibility downgrade, or layer removal.
 
 These tests prove the two halves of the fix in
@@ -101,7 +101,7 @@ async def test_revoke_by_map_denies_validation_and_clears_cache(
     assert revoked == 1
 
     # The positive cache entry must not outlive the revocation.
-    # fix(#1778): the entry is REPLACED by a denial rather than deleted, so a
+    # The entry is REPLACED by a denial rather than deleted, so a
     # request that raced the revoke cannot re-publish a positive under the same
     # key. See the module note on EMBED_TOKEN_REVOCATION_DENIAL_TTL_SECONDS in
     # app/modules/embed_tokens/service.py.
@@ -133,7 +133,7 @@ async def test_revoke_by_map_is_idempotent_when_no_active_tokens(
 async def test_layer_removal_denies_scoped_token_even_when_cached(
     test_db_session: AsyncSession, clean_tables
 ):
-    """builder-audit #338 P0-01 live membership re-check: removing the dataset's layer
+    """Live membership re-check: removing the dataset's layer
     from the map denies a token scoped to that dataset, even with a positive
     cache entry present (the snapshot scoped_dataset_ids must not outlive the
     layer removal)."""

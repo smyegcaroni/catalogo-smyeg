@@ -38,6 +38,7 @@ from app.modules.admin.schemas import (
     UserUpdate,
 )
 from app.modules.admin.service import (
+    AdminNotFoundError,
     AdminService,
     PendingUserMutationError,
     PendingUserTransitionConflict,
@@ -49,10 +50,11 @@ from app.modules.auth.dependencies import (
     require_mode_permission,
     require_permission,
 )
-from app.platform.ratelimit import limiter  # HARDEN-01: shared rate-limiter instance
+from app.platform.ratelimit import limiter
 from app.modules.auth.models import User
 from app.modules.auth.schemas import RoleName, UserResponse
 from app.processing.export.service import safe_content_disposition
+from app.core.ai_credentials import anthropic_configured
 from app.core.config import settings as app_settings
 from app.core.permissions import MANAGE_TENANTS
 from app.core.db.tenant_session import (
@@ -63,6 +65,7 @@ from app.core.db.tenant_session import (
 from app.core.csv_safety import escape_csv_formula
 from app.core.dependencies import get_client_ip, get_db
 from app.core.url_redaction import redact_url_credentials
+from app.modules.admin.router_groups import router as groups_router
 from app.modules.admin.router_operations import router as operations_router
 from app.platform.binary_response import binary_response
 from app.platform.extensions import get_catalog_port
@@ -95,6 +98,7 @@ logger = structlog.stdlib.get_logger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["Admin"], responses=ERROR_RESPONSES_AUTH)
 router.include_router(operations_router)
+router.include_router(groups_router)
 
 require_ai_status_reader = require_mode_permission(
     single_tenant="manage_users", multi_tenant="manage_tenants"
@@ -156,27 +160,28 @@ def _refuse_backfill_in_flight(
 def _raise_on_error(exc: ValueError, default_status: int) -> NoReturn:
     """Map a service-layer ValueError to an HTTPException.
 
-    'not found' messages map to 404; everything else uses default_status.
+    AdminNotFoundError maps to 404; everything else uses default_status.
     """
-    detail = str(exc)
-    if "not found" in detail.lower():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
-    raise HTTPException(status_code=default_status, detail=detail)
+    if isinstance(exc, AdminNotFoundError):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    raise HTTPException(status_code=default_status, detail=str(exc))
 
 
-# ROUTE-01: dual-shape decorator — trailing-slash form is canonical (in OpenAPI);
-# no-slash is a hidden alias closing the redirect_slashes=False 404 regression.
+# Trailing slash is canonical (in OpenAPI); the no-slash form is a hidden alias
+# because api/main.py sets redirect_slashes=False.
 @router.post(
     "/users",
     response_model=UserResponse,
     status_code=status.HTTP_201_CREATED,
     include_in_schema=False,
+    summary="Create a user",
 )
 @router.post(
     "/users/",
     response_model=UserResponse,
     status_code=status.HTTP_201_CREATED,
     responses={409: CONFLICT_RESPONSE},
+    summary="Create a user",
 )
 @limiter.limit("30/minute")
 async def create_user(
@@ -186,10 +191,10 @@ async def create_user(
     db: AsyncSession = Depends(get_db),
 ) -> UserResponse:
     """Create a new user with the specified role (admin only)."""
-    # DOMAIN-04: enforce allowed_email_domains on admin-create. Break-glass:
-    # the requesting admin is exempt when they hold manage_settings (see the
-    # shared gate, fix(#836)).
-    from app.modules.auth.domain_policy import (  # LAZY — per D-17
+    # Enforce allowed_email_domains on admin-create. Break-glass: the
+    # requesting admin is exempt when they hold manage_settings (see the shared
+    # gate).
+    from app.modules.auth.domain_policy import (
         enforce_email_domain_gate,
     )
 
@@ -224,17 +229,18 @@ async def create_user(
     return _user_response(user)
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see /users above.
 @router.get(
     "/users",
     response_model=UserListResponse,
     dependencies=[Depends(require_permission("manage_users"))],
     include_in_schema=False,
+    summary="List users",
 )
 @router.get(
     "/users/",
     response_model=UserListResponse,
     dependencies=[Depends(require_permission("manage_users"))],
+    summary="List users",
 )
 async def list_users(
     skip: int = Query(0, ge=0),
@@ -269,8 +275,8 @@ async def list_users(
         sort=sort,
         order=order,
     )
-    # QUOTA-04: quota usage for the page. fix(#435): genuinely batched now — this
-    # said "batch" but ran one three-table aggregate per user, 200 users per page.
+    # Quota usage for the page, fetched in one batch rather than one
+    # three-table aggregate per user.
     usage_by_user = await get_user_quota_usage_bulk(db, [u.id for u in users])
     user_responses = [
         UserResponse(
@@ -383,7 +389,9 @@ async def export_users_csv(
             with tenant_job_context(tenant_id):
                 async with async_session() as stream_db:
                     stmt = select(User).order_by(User.created_at.asc())
-                    result = await stream_db.stream(stmt)
+                    result = await stream_db.stream(
+                        stmt.execution_options(yield_per=100)
+                    )
                     async for (user,) in result:
                         writer.writerow(
                             [
@@ -415,17 +423,18 @@ async def export_users_csv(
     )
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see /users above.
 @router.get(
     "/users/names",
     response_model=list[UserNameItem],
     dependencies=[Depends(require_permission("manage_users"))],
     include_in_schema=False,
+    summary="List usernames",
 )
 @router.get(
     "/users/names/",
     response_model=list[UserNameItem],
     dependencies=[Depends(require_permission("manage_users"))],
+    summary="List usernames",
 )
 async def list_user_names(
     db: AsyncSession = Depends(get_db),
@@ -449,6 +458,7 @@ async def list_user_names(
     "/users/{user_id}",
     response_model=UserResponse,
     dependencies=[Depends(require_permission("manage_users"))],
+    summary="Get a user",
 )
 async def get_user(
     user_id: uuid.UUID,
@@ -466,6 +476,7 @@ async def get_user(
 @router.patch(
     "/users/{user_id}",
     response_model=UserResponse,
+    summary="Update a user",
 )
 @limiter.limit("30/minute")
 async def update_user(
@@ -510,15 +521,16 @@ async def update_user(
     return _user_response(user)
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see /users above.
 @router.post(
     "/users/{user_id}/deactivate",
     response_model=UserResponse,
     include_in_schema=False,
+    summary="Deactivate a user",
 )
 @router.post(
     "/users/{user_id}/deactivate/",
     response_model=UserResponse,
+    summary="Deactivate a user",
 )
 @limiter.limit("30/minute")
 async def deactivate_user(
@@ -551,16 +563,17 @@ async def deactivate_user(
     return _user_response(user)
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see /users above.
 @router.post(
     "/users/{user_id}/reset-password",
     response_model=UserResponse,
     include_in_schema=False,
+    summary="Reset a user's password",
 )
 @router.post(
     "/users/{user_id}/reset-password/",
     response_model=UserResponse,
     responses={404: NOT_FOUND_RESPONSE},
+    summary="Reset a user's password",
 )
 @limiter.limit("30/minute")
 async def reset_user_password(
@@ -604,7 +617,6 @@ async def reset_user_password(
     return _user_response(user)
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see /users above.
 @router.post(
     "/users/{user_id}/convert-saml-to-local",
     response_model=UserResponse,
@@ -625,19 +637,19 @@ async def convert_saml_to_local(
 ) -> UserResponse:
     """Convert a SAML-authenticated user to local-password (admin only).
 
-    Phase 221 LIFECYCLE-06. The conversion happens in a single DB transaction:
+    The conversion happens in a single DB transaction:
     validate -> set password -> flip auth_provider -> delete SAML oauth_accounts
     row -> write audit_log row. The audit_log write is the LAST step before
-    commit (per D-05) so failed conversions never leave an orphan audit entry.
+    commit so failed conversions never leave an orphan audit entry.
 
     Audit details are an explicit allow-list ({"from", "to", "provider_slug"})
     -- password material is never logged.
 
     Self-conversion is blocked with 422 to prevent admin self-lockout when an
-    admin fat-fingers the new password (Phase 221 Risk Surfaces / Pitfall 7).
+    admin fat-fingers the new password.
     """
-    # Self-conversion guard -- mirrors update_user's self-action guard at
-    # router.py:180-184. 422 (NOT 400/403) per the existing convention.
+    # Self-conversion guard, like update_user's self-action guard; 422 (NOT
+    # 400/403) per the existing convention.
     if user_id == current_user.id:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -650,7 +662,8 @@ async def convert_saml_to_local(
             user_id, body.password
         )
     except ValueError as exc:
-        # All non-"not found" ValueErrors (auth_provider mismatch, no SAML linkage) -> 422
+        # Every other ValueError (auth_provider mismatch, no SAML linkage) is
+        # a 422.
         _raise_on_error(exc, status.HTTP_422_UNPROCESSABLE_ENTITY)
 
     ip = get_client_ip(request)
@@ -668,9 +681,9 @@ async def convert_saml_to_local(
     try:
         await db.commit()
     except Exception:  # broad: commit can fail with diverse asyncpg/transaction errors; log and bubble for handler
-        # Service mutations + audit_log row written but commit failed --
-        # leaves no persisted record. Log with request_id correlation so
-        # operators can reconcile against client-side state.
+        # A failed commit may still have landed (a lost acknowledgement), so
+        # whether the conversion and its audit row persisted is unknown.
+        # Logged so operators can reconcile against the database.
         logger.exception(
             "convert_saml_to_local commit failed",
             user_id=str(user_id),
@@ -681,15 +694,16 @@ async def convert_saml_to_local(
     return _user_response(user)
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see /users above.
 @router.post(
     "/users/{user_id}/approve",
     response_model=UserResponse,
     include_in_schema=False,
+    summary="Approve a pending user",
 )
 @router.post(
     "/users/{user_id}/approve/",
     response_model=UserResponse,
+    summary="Approve a pending user",
 )
 @limiter.limit("30/minute")
 async def approve_user(
@@ -723,15 +737,16 @@ async def approve_user(
     return _user_response(user)
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see /users above.
 @router.post(
     "/users/{user_id}/reject",
     status_code=status.HTTP_204_NO_CONTENT,
     include_in_schema=False,
+    summary="Reject a pending user",
 )
 @router.post(
     "/users/{user_id}/reject/",
     status_code=status.HTTP_204_NO_CONTENT,
+    summary="Reject a pending user",
 )
 @limiter.limit("30/minute")
 async def reject_user(
@@ -766,6 +781,7 @@ async def reject_user(
 @router.delete(
     "/users/{user_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a user",
 )
 @limiter.limit("30/minute")
 async def delete_user(
@@ -796,15 +812,16 @@ async def delete_user(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see /users above.
 @router.get(
     "/stats",
     response_model=CatalogStatsResponse,
     include_in_schema=False,
+    summary="Get catalog statistics",
 )
 @router.get(
     "/stats/",
     response_model=CatalogStatsResponse,
+    summary="Get catalog statistics",
 )
 async def get_catalog_stats(
     user: User = Depends(require_permission("manage_users")),
@@ -815,17 +832,18 @@ async def get_catalog_stats(
     return await service.get_catalog_stats()
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see /users above.
 @router.get(
     "/jobs",
     response_model=AdminJobListResponse,
     dependencies=[Depends(require_permission("manage_users"))],
     include_in_schema=False,
+    summary="List all ingest jobs",
 )
 @router.get(
     "/jobs/",
     response_model=AdminJobListResponse,
     dependencies=[Depends(require_permission("manage_users"))],
+    summary="List all ingest jobs",
 )
 async def list_admin_jobs(
     status: str | None = Query(
@@ -938,16 +956,17 @@ def _ai_status(
 
     ``configured`` reflects only the SELECTED ``LLM_PROVIDER``'s key, matching
     what ``_check_ai_available`` gates chat on — the other provider's key is
-    metadata only and never flips ``configured``/``provider`` (#338).
+    metadata only and never flips ``configured``/``provider``.
     """
     keys = {
-        "anthropic": app_settings.anthropic_api_key,
+        "anthropic": anthropic_configured(),
         "openai_compatible": app_settings.openai_api_key,
     }
     display_names = {"anthropic": "anthropic", "openai_compatible": "openai"}
 
     selected_key = keys.get(provider)
-    configured = bool(selected_key)
+    # "" means the provider has no default model (Bedrock, Vertex) and no override.
+    configured = bool(selected_key) and model != ""
     return AIStatusResponse(
         provider=display_names.get(provider) if configured else None,
         model=model if configured else None,
@@ -958,9 +977,8 @@ def _ai_status(
     )
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see /users above.
-# fix(#627): exclude_unset so the `probe` field appears ONLY when the caller
-# opted in — the default response keeps its exact pre-probe JSON shape.
+# exclude_unset so the `probe` field appears ONLY when the caller
+# opted in; the default response keeps its probe-less JSON shape.
 # Safe because _ai_status passes every other field explicitly.
 @router.get(
     "/ai-status",
@@ -968,14 +986,16 @@ def _ai_status(
     response_model_exclude_unset=True,
     dependencies=[Depends(require_ai_status_reader)],
     include_in_schema=False,
+    summary="Get the AI feature status",
 )
 @router.get(
     "/ai-status/",
     response_model=AIStatusResponse,
     response_model_exclude_unset=True,
     dependencies=[Depends(require_ai_status_reader)],
+    summary="Get the AI feature status",
 )
-# fix(#627): probe=true spends real provider quota and can hold a worker for
+# probe=true spends real provider quota and can hold a worker for
 # the probe timeout — same 30/minute cap as the PATCH sibling; plain status
 # reads share it too, but dashboards fetch far less than 30/minute.
 @limiter.limit("30/minute")
@@ -1017,18 +1037,19 @@ async def get_ai_status(
     return result
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see /users above.
-# fix(#627): exclude_unset for shape parity with GET (probe is never set here).
+# exclude_unset for shape parity with GET (probe is never set here).
 @router.patch(
     "/ai-status",
     response_model=AIStatusResponse,
     response_model_exclude_unset=True,
     include_in_schema=False,
+    summary="Turn AI features on or off",
 )
 @router.patch(
     "/ai-status/",
     response_model=AIStatusResponse,
     response_model_exclude_unset=True,
+    summary="Turn AI features on or off",
 )
 @limiter.limit("30/minute")
 async def update_ai_status(
@@ -1064,17 +1085,18 @@ async def update_ai_status(
     )
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see /users above.
 @router.get(
     "/embedding-stats",
     response_model=EmbeddingStatsResponse,
     dependencies=[Depends(require_permission("manage_users"))],
     include_in_schema=False,
+    summary="Get embedding coverage",
 )
 @router.get(
     "/embedding-stats/",
     response_model=EmbeddingStatsResponse,
     dependencies=[Depends(require_permission("manage_users"))],
+    summary="Get embedding coverage",
 )
 async def get_embedding_stats(
     db: AsyncSession = Depends(get_db),
@@ -1135,16 +1157,17 @@ async def _require_backfill_permission(
     )
 
 
-# ROUTE-01 (Phase 1092): dual-shape decorator — see /users above.
 @router.post(
     "/backfill-embeddings",
     response_model=BackfillResponse,
     include_in_schema=False,
+    summary="Queue an embedding backfill",
 )
 @router.post(
     "/backfill-embeddings/",
     response_model=BackfillResponse,
     responses={409: CONFLICT_RESPONSE, 503: QUEUE_UNAVAILABLE_RESPONSE},
+    summary="Queue an embedding backfill",
 )
 @limiter.limit("30/minute")
 async def trigger_backfill(
@@ -1240,11 +1263,11 @@ async def _queue_backfill_run(
 
     requester = str(requested_by) if requested_by is not None else None
 
-    # fix(#1542): retrying after a 504 could start a second regenerate (a
-    # second DELETE on the force path); #1519's pre-flight guards don't see
-    # concurrent runs. This SELECT is the FRIENDLY half — the real guard is
-    # the partial unique index from migration 0050, since a check-then-insert
-    # is a TOCTOU the database must serialize, not the application.
+    # Retrying after a 504 could start a second regenerate (a second DELETE on
+    # the force path), and the pre-flight guards don't see concurrent runs.
+    # This SELECT is the FRIENDLY half; the real guard is the partial unique
+    # index from migration 0050, since a check-then-insert is a TOCTOU the
+    # database must serialize, not the application.
     active = await find_active_embedding_backfill(db)
     if active is not None:
         _refuse_backfill_in_flight(
@@ -1262,7 +1285,7 @@ async def _queue_backfill_run(
     }
 
     # The insert lands with null user_metadata; only the later UPDATE that sets
-    # the backfill marker makes the partial unique index reject a duplicate —
+    # the backfill marker makes the partial unique index reject a duplicate,
     # and that UPDATE flushes on this session's first flush, well before commit.
     pending_job_id: uuid.UUID | None = None
     try:
@@ -1276,8 +1299,8 @@ async def _queue_backfill_run(
                 "operation_id": operation_id,
             }
         }
-        # ux(#698), as analysis does: a pending job that says "queued" reads as
-        # waiting rather than as a job with nothing to say for itself.
+        # As analysis does: a pending job that says "queued" reads as waiting
+        # rather than as a job with nothing to say for itself.
         job.current_step = "queued"
         await audit_emit(
             db,
@@ -1301,13 +1324,13 @@ async def _queue_backfill_run(
     except IntegrityError as exc:
         await db.rollback()
         if ACTIVE_BACKFILL_INDEX_NAME not in str(getattr(exc, "orig", exc)):
-            # Some other constraint. Dressing it up as a concurrency refusal
-            # would be a fabricated answer of exactly the kind this endpoint
-            # has already been corrected for once.
+            # Some other constraint: reporting it as a concurrency refusal
+            # would be a fabricated answer.
             raise
-        # The index refused it: another request won the race between the SELECT
-        # above and this write. The transaction rolled back job row and audit
-        # entry together, so the loser leaves no trace of a run that never started.
+        # The index refused it: another request won the race between the
+        # SELECT above and this write. The transaction rolled back job row and
+        # audit entry together, so the loser leaves no trace of a run that
+        # never started.
         winner = await find_active_embedding_backfill(db)
         _refuse_backfill_in_flight(
             active_job_id=str(winner.id) if winner is not None else None,
@@ -1316,9 +1339,9 @@ async def _queue_backfill_run(
             detected_by="unique_index",
         )
     except BaseException:
-        # fix(#1556 review): ANY failure of that commit can be a lost
-        # acknowledgement, not only a cancellation, and one that never landed
-        # matches no row — so the fenced cleanup is right for the whole class.
+        # ANY failure of that commit can be a lost acknowledgement, not only a
+        # cancellation, and one that never landed matches no row, so the fenced
+        # cleanup is right for the whole class.
         if pending_job_id is not None:
             await _settle_undispatched_backfill(
                 db, pending_job_id, {**audit_context, "job_id": str(pending_job_id)}
@@ -1385,9 +1408,9 @@ async def _queue_backfill_run(
                 )
         raise
     except asyncio.CancelledError:
-        # fix(#1550): the orphan guard catches `Exception`, so cancellation here
-        # bypasses it and `DeferFailed` above. Cleanup is fenced on `pending`
-        # and shielded, and the cancellation is re-raised so shutdown still works.
+        # The orphan guard catches `Exception`, so cancellation here bypasses
+        # it and `DeferFailed` above. Cleanup is fenced on `pending` and
+        # shielded, and the cancellation is re-raised so shutdown still works.
         await _settle_undispatched_backfill(
             db, job.id, {**audit_context, "job_id": job_id}
         )
@@ -1401,9 +1424,10 @@ async def _queue_backfill_for_other_tenants(
     """Queue a backfill in every registered tenant except the caller's.
 
     Tenants come from the registry rather than the request, and each run is
-    queued in its own session under that tenant's context, as a system run with
-    no user or client address, which belong to the caller's tenant. A tenant with nothing to embed still gets a run, which finishes at
-    once; checking for records first would scan the shared table per tenant. A
+    queued in its own session under that tenant's context, as a system run
+    with no user or client address, which belong to the caller's tenant. A
+    tenant with nothing to embed still gets a run, which finishes at once;
+    checking for records first would scan the shared table per tenant. A
     refusal or failure in one tenant is reported and the loop moves on.
     """
     from app.core.db import async_session

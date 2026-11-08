@@ -1,11 +1,11 @@
 """Tests for SQL sandbox validation, RBAC table allowlist, and execution safety.
 
 Covers:
-- SAND-01: SQL validation (unit tests)
-- SAND-02: READ ONLY transaction enforcement (integration)
-- SAND-03: Row limit truncation (integration)
-- SAND-04: RBAC table access (unit + integration)
-- SAND-05: Error sanitization and timeout handling (unit + integration)
+- SQL validation (unit tests)
+- READ ONLY transaction enforcement (integration)
+- Row limit truncation (integration)
+- RBAC table access (unit + integration)
+- Error sanitization and timeout handling (unit + integration)
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ async def tiles3d_table(test_db_session):
 
 
 # ---------------------------------------------------------------------------
-# SAND-01: SQL validation (unit tests, no DB needed)
+# SQL validation (unit tests, no DB needed)
 # ---------------------------------------------------------------------------
 
 
@@ -139,7 +139,7 @@ class TestRejectSelectInto:
 
 
 class TestRejectNestedMutation:
-    """fix(#1011): the SELECT-only check inspects the root node, so a write
+    """The SELECT-only check inspects the root node, so a write
     statement nested inside a CTE or a scalar subquery used to validate. Only
     SET TRANSACTION READ ONLY in execute_safe stopped it from running, which
     made a one-line change to how that transaction opens the difference
@@ -231,7 +231,7 @@ class TestValidateParseError:
         ],
     )
     def test_unterminated_literal_is_invalid_query(self, sql):
-        """fix(#1778): sqlglot raises TokenError, a SIBLING of ParseError.
+        """sqlglot raises TokenError, a SIBLING of ParseError.
 
         Before the fix these four escaped validate_sql entirely, landed in the
         sandbox boundary's broad catch as category ``query_failed`` and came
@@ -307,7 +307,7 @@ class TestCteAliasNotRejected:
 
 
 # ---------------------------------------------------------------------------
-# SAND-04: check_table_access (unit tests, no DB needed)
+# check_table_access (unit tests, no DB needed)
 # ---------------------------------------------------------------------------
 
 
@@ -384,7 +384,7 @@ class TestCheckTableAccessNonDataSchema:
 
 
 # ---------------------------------------------------------------------------
-# SAND-04: build_table_allowlist (integration test, needs DB)
+# build_table_allowlist (integration test, needs DB)
 # ---------------------------------------------------------------------------
 
 
@@ -465,7 +465,7 @@ class TestBuildTableAllowlist:
 
 
 # ---------------------------------------------------------------------------
-# SAND-02: READ ONLY transaction enforcement (integration, needs DB)
+# READ ONLY transaction enforcement (integration, needs DB)
 # ---------------------------------------------------------------------------
 
 
@@ -502,7 +502,7 @@ class TestReadOnlyTransaction:
     async def test_trailing_line_comment_does_not_break_the_limit_wrapper(
         self, client, test_db_session
     ):
-        """fix(#1778): a query ending in ``--`` used to comment out the wrapper.
+        """A query ending in ``--`` used to comment out the wrapper.
 
         ``execute_safe`` splices validated SQL into
         ``SELECT * FROM (<sql>) AS _q LIMIT n``. With the tail on the same
@@ -520,7 +520,7 @@ class TestReadOnlyTransaction:
     async def test_validated_terminator_run_survives_the_limit_wrapper(
         self, client, test_db_session, suffix
     ):
-        """fix(#1892): a terminator inside the wrapper's parentheses is a syntax
+        """A terminator inside the wrapper's parentheses is a syntax
         error, so the validator strips the whole run. The raw statement is the
         control."""
         from app.platform.sandbox.validator import validate_sql
@@ -536,7 +536,7 @@ class TestReadOnlyTransaction:
 
 
 # ---------------------------------------------------------------------------
-# SAND-03: Row limit truncation (integration, needs DB)
+# Row limit truncation (integration, needs DB)
 # ---------------------------------------------------------------------------
 
 
@@ -588,7 +588,7 @@ class TestRowLimitTruncation:
 
 
 # ---------------------------------------------------------------------------
-# SAND-05: Error sanitization and timeout handling (unit + integration)
+# Error sanitization and timeout handling (unit + integration)
 # ---------------------------------------------------------------------------
 
 
@@ -682,7 +682,7 @@ async def _stub_allowlist(db, user, **kwargs):
 
 
 class TestTimeoutThreading:
-    """fix(#1011): execute_safe has always taken timeout_ms, but the public
+    """execute_safe has always taken timeout_ms, but the public
     wrapper did not expose it, so every caller silently got the 10 s default
     and none could ask for less."""
 
@@ -813,9 +813,15 @@ class TestValidateAndExecuteIntegration:
         assert exc_info.value.category == "table_not_accessible"
 
 
+class _DriverError(Exception):
+    def __init__(self, code: str | None) -> None:
+        super().__init__("driver error")
+        self.sqlstate = code
+
+
 class TestExecutionErrorClassification:
-    """fix(#680 review): only data-driven failures may map to a 4xx category —
-    infrastructure failures must stay generic (callers report those as 500)."""
+    """Only data-driven failures may map to a 4xx category. A database that
+    could not serve the query is query_unavailable; other faults stay generic."""
 
     def test_data_and_internal_errors_classify_as_data_error(self):
         from sqlalchemy.exc import DataError, InternalError
@@ -828,12 +834,32 @@ class TestExecutionErrorClassification:
                 _handle_execution_error(exc, "SELECT 1")
             assert exc_info.value.category == "query_data_error"
 
-    def test_operational_errors_stay_generic(self):
-        from sqlalchemy.exc import OperationalError
+    @pytest.mark.parametrize("code", ["53100", "53200", "08006", None])
+    def test_operational_errors_are_unavailable(self, code):
+        from sqlalchemy.exc import DBAPIError
 
         from app.platform.sandbox.executor import _handle_execution_error
 
-        exc = OperationalError("SELECT 1", None, Exception("connection refused"))
+        exc = DBAPIError("SELECT 1", None, _DriverError(code))
+        with pytest.raises(SandboxError) as exc_info:
+            _handle_execution_error(exc, "SELECT 1")
+        assert exc_info.value.category == "query_unavailable"
+        assert exc_info.value.headers == {"Retry-After": "2"}
+
+    def test_a_refused_connection_is_unavailable(self):
+        from app.platform.sandbox.executor import _handle_execution_error
+
+        with pytest.raises(SandboxError) as exc_info:
+            _handle_execution_error(ConnectionRefusedError(111, "refused"), "SELECT 1")
+        assert exc_info.value.category == "query_unavailable"
+
+    def test_other_database_errors_stay_generic(self):
+        from sqlalchemy.exc import DBAPIError
+
+        from app.platform.sandbox.executor import _handle_execution_error
+
+        exc = DBAPIError("SELECT 1", None, _DriverError("42501"))
         with pytest.raises(SandboxError) as exc_info:
             _handle_execution_error(exc, "SELECT 1")
         assert exc_info.value.category == "query_failed"
+        assert exc_info.value.headers is None

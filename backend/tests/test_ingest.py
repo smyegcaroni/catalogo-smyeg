@@ -33,9 +33,8 @@ def mock_ingest_task():
     """Prevent procrastinate task deferral in all ingest tests.
 
     The router now delegates all task routing (ingest_file / ingest_raster
-    / ingest_service) to ``queue_ingest_job`` in the service layer (post-
-    impl audit KISS-9). Mock that single entry point so every commit_import
-    path becomes a no-op.
+    / ingest_service) to ``queue_ingest_job`` in the service layer. Mock that
+    single entry point so every commit_import path becomes a no-op.
     """
     with patch(
         "app.processing.ingest.router.queue_ingest_job", new_callable=AsyncMock
@@ -50,7 +49,7 @@ def mock_file_save(tmp_path: Path):
         "app.processing.ingest.router.save_upload_file", new_callable=AsyncMock
     ) as mock_save:
         # NOTE: `**_` absorbs production kwargs the mock doesn't model
-        # (e.g. ``max_size_bytes`` added by Phase 1066 feat IA-P0-02 in
+        # (e.g. ``max_size_bytes`` added in
         # commit e11924c3). The tests using this fixture do not exercise
         # the size-enforcement path, so silently ignoring the kwarg is
         # the smallest-diff way to keep the mock signature future-proof.
@@ -71,9 +70,9 @@ def mock_file_save(tmp_path: Path):
 
 class TestUpload:
     def test_upload_config_never_advertises_standalone_vrt(self):
-        from app.processing.ingest.router import _without_standalone_vrt
+        from app.processing.ingest.upload_limits import without_standalone_vrt
 
-        assert _without_standalone_vrt(".geojson, .VRT,.tif") == ".geojson,.tif"
+        assert without_standalone_vrt(".geojson, .VRT,.tif") == ".geojson,.tif"
 
     async def test_upload_requires_auth(self, client: AsyncClient):
         """POST /ingest/upload without token returns 401."""
@@ -375,7 +374,7 @@ class TestJobStatus:
     async def test_job_status_forbidden_other_user(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
     ):
-        """Non-creator, non-admin user gets 403 on another user's job."""
+        """Non-creator, non-admin user gets 404 on another user's job."""
         # Get admin user ID
         from app.modules.auth.models import User
 
@@ -407,7 +406,8 @@ class TestJobStatus:
 
         editor_headers = await get_auth_header(client, username, "TestPass1234!")
         resp = await client.get(f"/jobs/{job.id}", headers=editor_headers)
-        assert resp.status_code == 403
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Job not found"
 
     async def test_job_status_auto_fails_stale_pending(
         self, client: AsyncClient, admin_auth_header: dict, test_db_session
@@ -427,7 +427,7 @@ class TestJobStatus:
             file_path="/tmp/fake.geojson",
             created_by=admin_user.id,
             status="pending",
-            # fix(#1744): a dispatch was attempted for this row and never
+            # A dispatch was attempted for this row and never
             # landed, which is the class that keeps reporting `failed` so
             # /jobs/{id}/retry stays reachable. Without the stamp the row is
             # an upload nobody committed, and the poll cancels it.
@@ -472,7 +472,7 @@ class TestJobCleanup:
             source_filename="stale.geojson",
             created_by=admin_user.id,
             status="pending",
-            # fix(#1744): see the poll test above. `pending_failed` is the
+            # See the poll test above. `pending_failed` is the
             # count this asserts, and an unstamped row lands in
             # `pending_cancelled` instead.
             user_metadata=commit_attempted_marker(),
@@ -718,7 +718,7 @@ class TestCsvNonSpatialPipeline:
 
 
 async def _get_admin_id_for_ingest(session):
-    """Helper to get admin user id for Task 3 tests."""
+    """Helper to get admin user id for these tests."""
     from tests.factories import get_user_id
 
     return await get_user_id(session, "admin")
@@ -781,7 +781,7 @@ async def test_nonspatial_arcgis_service_load_keeps_attribute_columns(
 
 
 # ---------------------------------------------------------------------------
-# fix(#430 codex r16): published_at must match the FINAL record_status
+# published_at must match the FINAL record_status
 # ---------------------------------------------------------------------------
 
 
@@ -789,10 +789,11 @@ async def test_nonspatial_arcgis_service_load_keeps_attribute_columns(
 async def test_finalize_ingest_non_published_status_has_no_published_at(
     test_db_session,
 ):
-    """fix(#430 codex r16): create_dataset defaults the record to 'published',
+    """create_dataset defaults the record to 'published',
     so the before_insert hook stamps published_at BEFORE _finalize_ingest
     overwrites record_status from user_metadata — a manifest/vector ingest
-    finalizing as draft/ready/internal kept a bogus publication timestamp."""
+    finalizing as draft/ready/internal must not keep a bogus publication
+    timestamp."""
     import uuid as _uuid
 
     from sqlalchemy import text
@@ -880,7 +881,7 @@ async def test_finalize_ingest_non_published_status_has_no_published_at(
 async def test_detect_and_override_geometry_returns_none_when_no_override(
     test_db_session,
 ):
-    """Empty user_metadata → helper is a no-op returning None (KISS-2)."""
+    """Empty user_metadata → helper is a no-op returning None."""
     from app.processing.ingest.tasks import _detect_and_override_geometry
 
     geom_type = await _detect_and_override_geometry(
@@ -1245,7 +1246,7 @@ async def test_archive_original_file_failure_lands_nothing_once_another_attempt_
 async def test_archive_original_file_commit_failure_does_not_raise(
     tmp_path, monkeypatch
 ):
-    """RESILIENCE-1 regression: commit failure after archive failure must not raise.
+    """Regression: commit failure after archive failure must not raise.
 
     Before fix: if storage.put raised AND then session.commit raised (e.g. a
     transient pooler drop), the unguarded commit propagated out of the helper
@@ -1308,7 +1309,7 @@ async def test_archive_original_file_failure_truncates_long_error(
 
 
 # ---------------------------------------------------------------------------
-# queue_ingest_job orphan-guard (RESILIENCE-2 extension)
+# queue_ingest_job orphan-guard (extension)
 # ---------------------------------------------------------------------------
 
 
@@ -1363,8 +1364,8 @@ async def test_queue_ingest_job_defer_failure_marks_job_failed(
 
 
 class TestCommitImportDispatch:
-    """Direct router coverage for POST /ingest/commit/{job_id} (Phase 220,
-    INGEST-K6-02). Before this phase, the endpoint had zero direct tests."""
+    """Direct router coverage for POST /ingest/commit/{job_id} (the
+    endpoint had no direct tests before this class)."""
 
     async def test_vector_job_commits_with_vector_body(
         self,
@@ -1476,7 +1477,7 @@ class TestCommitImportDispatch:
     async def test_strict_cog_with_a_rewriting_option_is_refused(
         self, client, admin_auth_header, test_db_session, mock_ingest_task
     ) -> None:
-        """fix(#1961): the four options are applied by a conversion, so the
+        """The four options are applied by a conversion, so the
         combination is refused instead of converting behind the flag."""
         result = await test_db_session.execute(
             select(User).where(User.username == "admin")
@@ -1509,7 +1510,7 @@ class TestCommitImportDispatch:
     async def test_a_vector_job_still_commits_the_same_body(
         self, client, admin_auth_header, test_db_session, mock_ingest_task
     ) -> None:
-        """fix(#1961): the refusal is the raster subclass's, so a vector job
+        """The refusal is the raster subclass's, so a vector job
         keeps dropping the raster fields it was always sent."""
         result = await test_db_session.execute(
             select(User).where(User.username == "admin")
@@ -1570,7 +1571,7 @@ class TestCommitImportDispatch:
         await test_db_session.commit()
         await test_db_session.refresh(job)
 
-        # Phase 1066 feat IA-P0-03 (commit f8c91297) added a commit-time
+        # A change (commit f8c91297) added a commit-time
         # SSRF re-validation of ``job.source_url`` in ``commit_import``
         # (router.py:640-652) via a LAZY import:
         #     from app.platform.security import validate_url_for_ssrf
@@ -1596,7 +1597,7 @@ class TestCommitImportDispatch:
         assert resp.status_code == 202, resp.text
         assert mock_ingest_task.await_count == 1
         # The credential must be forwarded as a kwarg, not persisted to
-        # metadata. feat(#1746 B2b): as a `ServiceCredential` rather than a
+        # metadata. It is a `ServiceCredential` rather than a
         # bare token, so the queue composes the wire value against the job's
         # own service format; the flat `token` field still means a bearer one.
         call_kwargs = mock_ingest_task.await_args.kwargs
@@ -1612,7 +1613,7 @@ class TestCommitImportDispatch:
     ) -> None:
         """Vector job + kitchen-sink body (mixed vector/raster/service fields) -> 202.
 
-        Regression test for D-02: the frontend may send irrelevant fields
+        Regression test: the frontend may send irrelevant fields
         and the server must silently ignore them, not 422.
         """
         result = await test_db_session.execute(
@@ -1675,7 +1676,7 @@ class TestCommitImportDispatch:
         (``title``, ``status``, ``detail``). Using ``RequestValidationError``
         (not ``HTTPException(422)``) in the handler refactor ensures the
         envelope shape is consistent with every other 422 in the API — which
-        is the whole point of Pitfall 2.
+        is the whole point.
         """
         result = await test_db_session.execute(
             select(User).where(User.username == "admin")
@@ -1708,7 +1709,7 @@ class TestCommitImportDispatch:
 
 
 # ---------------------------------------------------------------------------
-# fix(#1746): the auth_required marker on a first service import
+# The auth_required marker on a first service import
 # ---------------------------------------------------------------------------
 
 
@@ -1758,6 +1759,8 @@ class TestServiceImportAuthRequiredMarker:
                 "service_type": "ArcGIS FeatureServer",
                 "layer_id": "0",
                 "geometry_type": None,
+                "item_id": "a" * 32,
+                "portal_url": "https://org.maps.arcgis.com",
             },
         )
         test_db_session.add(job)
@@ -1872,6 +1875,8 @@ class TestServiceImportAuthRequiredMarker:
                     assert "auth_required" not in origin_ref
                 else:
                     assert origin_ref["auth_required"] is True
+                assert origin_ref["item_id"] == "a" * 32
+                assert origin_ref["portal_url"] == "https://org.maps.arcgis.com"
                 # A boolean, never the credential, anywhere on the row.
                 assert "service-token" not in str(origin_ref)
                 assert "service-token" not in str(dataset.origin_uri)

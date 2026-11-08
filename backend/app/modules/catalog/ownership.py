@@ -18,10 +18,14 @@ from app.core.identity import Identity
 from app.core.permissions import EDIT_METADATA, UPLOAD
 from app.modules.audit.service import AuditEvent, audit_emit
 from app.modules.auth.service import get_user_identity
-from app.modules.catalog.authorization import get_user_roles
+from app.modules.catalog.authorization import (
+    check_vrt_audiences_after_change,
+    get_user_roles,
+)
 from app.modules.catalog.maps.service import (
     filter_layer_rows_by_dataset_visibility,
     get_map_with_layers,
+    lock_map_layers,
     terrain_dataset_ids_visible_to,
 )
 from app.platform.catalog_locks import bump_publication_version_on
@@ -119,15 +123,23 @@ async def transfer_dataset_owner(
     *,
     actor: Identity,
     ip_address: str | None,
+    visibility: str | None = None,
+    record_status: str | None = None,
 ) -> None:
     """Make ``owner_id`` the owner of the dataset and write one audit row.
 
+    ``visibility`` and ``record_status`` are the values the same request will
+    set, so the VRT audience check sees the request's final state.
+
     Call after the dataset's catalog rows are locked. A transfer to the
     current owner changes nothing, vets nothing and writes no row. Raises 422
-    for a target that is unknown, inactive or lacks ``upload``, and 409 while
-    a refresh, re-upload or VRT regeneration is pending or running. Does not
-    commit.
+    for a target that is unknown, inactive or lacks ``upload``, or one that
+    would leave a VRT reaching past one of its members, and 409 while
+    a refresh, re-upload or VRT regeneration is pending or running. Raises
+    403 unless the actor is still an admin, read as committed under the lock.
+    Does not commit.
     """
+    require_transfer_admin(await get_user_roles(db, actor), owner_id)
     record = dataset.record
     previous = await _locked_owner(db, record)
     if previous == owner_id:
@@ -146,6 +158,13 @@ async def transfer_dataset_owner(
                 ),
             },
         )
+    await check_vrt_audiences_after_change(
+        db,
+        dataset,
+        visibility=visibility,
+        record_status=record_status,
+        owner_id=new_owner.id,
+    )
     record.created_by = new_owner.id
     record.updated_by = actor.id
     # Signed tile templates bind this counter, and the previous owner may
@@ -211,9 +230,12 @@ async def transfer_map_owner(
 
     A transfer to the current owner changes nothing, vets nothing and writes
     no row. Raises 422 for a target that is unknown, inactive, lacks
-    ``edit_metadata`` or cannot read every dataset the map uses. Does not
-    commit.
+    ``edit_metadata`` or cannot read every dataset the map uses. Takes the
+    map row, which re-checks the actor, and raises 403 unless the actor is
+    still an admin as committed. Does not commit.
     """
+    await lock_map_layers(db, map_obj.id)
+    require_transfer_admin(await get_user_roles(db, actor), owner_id)
     previous = await _locked_owner(db, map_obj)
     if previous == owner_id:
         return

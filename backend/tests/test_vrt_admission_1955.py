@@ -1,4 +1,4 @@
-"""fix(#1955): admission control for the three VRT regeneration doors.
+"""Admission control for the three VRT regeneration doors.
 
 ADR-002 Decision 5b admits one mutation per dataset through a partial unique
 index the VRT path never writes to. Its three doors read the asset status,
@@ -237,7 +237,7 @@ class TestAHeldAdmissionRefusesTheSecondDoor:
 
 
 async def test_an_asset_deleted_under_the_re_read_is_refused(test_db_session) -> None:
-    """fix(#1955 codex r2): `refresh` reports a vanished row, and 409 beats 500."""
+    """`refresh` reports a vanished row, and 409 beats 500."""
     import app.core.db as db_module
     from app.processing.raster.models import RasterAsset
 

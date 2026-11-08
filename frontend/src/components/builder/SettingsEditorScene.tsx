@@ -1,4 +1,4 @@
-import { memo, useMemo, useState } from 'react';
+import { memo, useId, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { eyebrowClassName } from './EmptyStackState';
 import { Switch } from '@/components/ui/switch';
@@ -20,7 +20,7 @@ export interface SettingsEditorSceneProps {
   isTerrainActive: boolean;
   /** Name of the bound DEM layer (for the "Bound to:" hint) */
   boundLayerName?: string;
-  /** fix(HT-04): open the bound DEM layer's editor from Settings so the
+  /** Open the bound DEM layer's editor from Settings so the
    *  terrain source is always reachable (its controls live in the DEM editor).
    *  Undefined when no bound layer resolves. */
   onOpenBoundLayer?: () => void;
@@ -38,6 +38,10 @@ export interface SettingsEditorSceneProps {
   // Projection (persisted on basemap_config.projection)
   projection: 'mercator' | 'globe';
   onSetProjection: (projection: 'mercator' | 'globe') => void;
+  // Readers
+  /** Whether the viewer's Map data panel offers each layer's attribute table. */
+  showAttributeTable: boolean;
+  onShowAttributeTableChange: (show: boolean) => void;
 }
 
 export const SettingsEditorScene = memo(function SettingsEditorScene({
@@ -53,12 +57,16 @@ export const SettingsEditorScene = memo(function SettingsEditorScene({
   onBackgroundColorReset,
   projection,
   onSetProjection,
+  showAttributeTable,
+  onShowAttributeTableChange,
 }: SettingsEditorSceneProps) {
   const { t } = useTranslation('builder');
   const [appearanceOpen, setAppearanceOpen] = useState(true);
   const [terrainOpen, setTerrainOpen] = useState(true);
   const [pluginsOpen, setPluginsOpen] = useState(true);
   const [projectionOpen, setProjectionOpen] = useState(true);
+  const [readersOpen, setReadersOpen] = useState(true);
+  const attributeTableSwitchId = useId();
 
   // Only surface plugins the admin allows. getEnabledPluginDefinitions(null)
   // returns all registered plugins (no restriction), so default deployments are
@@ -156,7 +164,7 @@ export const SettingsEditorScene = memo(function SettingsEditorScene({
                 {t('settings.boundTo', { defaultValue: 'Bound to: {{name}}', name: boundLayerName })}
               </p>
             )}
-            {/* fix(HT-04): the terrain controls live in the bound DEM's editor;
+            {/* The terrain controls live in the bound DEM's editor;
                 link there so the source stays reachable from Settings. */}
             {onOpenBoundLayer && (
               <Button
@@ -170,12 +178,12 @@ export const SettingsEditorScene = memo(function SettingsEditorScene({
               </Button>
             )}
             {isTerrainActive && (
-              // #186 (c): guide users with a small high-res DEM toward draping it
-              // over a coarse global DEM so terrain stays smooth across the map.
+              // A map has one terrain source, so a small DEM can't be layered
+              // over a global one; point users at zooming in or a wider DEM.
               <p className="mt-1 text-mini italic text-muted-foreground">
                 {t('settings.terrainSmallDemTip', {
                   defaultValue:
-                    'Tip: for a small high-resolution DEM, drape it over a coarse global DEM (e.g. Copernicus GLO-30) so terrain stays smooth beyond its extent.',
+                    'Tip: a map has one terrain source. For a small high-resolution DEM, zoom in to its extent, or use a DEM that covers the whole map area.',
                 })}
               </p>
             )}
@@ -218,7 +226,7 @@ export const SettingsEditorScene = memo(function SettingsEditorScene({
             </p>
           ) : (
             <>
-              {/* UX-04: clarify that this section controls AVAILABILITY (vs live interaction on the map). */}
+              {/* Clarify that this section controls AVAILABILITY (vs live interaction on the map). */}
               <p className="px-4 pt-2 pb-1 text-mini text-muted-foreground">
                 {t('settings.pluginsAvailabilityNote', {
                   defaultValue: 'Controls whether each plugin appears on the map.',
@@ -228,8 +236,8 @@ export const SettingsEditorScene = memo(function SettingsEditorScene({
                 {plugins.map((plugin) => {
                   const isEnabled = activePluginIds.has(plugin.id);
                   const pluginLabel = t(plugin.labelKey, { defaultValue: plugin.id });
-                  // UX-04: state-specific aria labels — "Enable {name}" / "Disable {name}" —
-                  // replace the older "{action} {name} plugin" composite key.
+                  // State-specific aria labels: "Enable {name}" / "Disable
+                  // {name}".
                   const switchAriaLabel = isEnabled
                     ? t('settings.disablePlugin', { defaultValue: 'Disable {{name}}', name: pluginLabel })
                     : t('settings.enablePlugin', { defaultValue: 'Enable {{name}}', name: pluginLabel });
@@ -314,6 +322,43 @@ export const SettingsEditorScene = memo(function SettingsEditorScene({
                 })}
               </p>
             )}
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
+
+      {/* Section 5: READERS */}
+      <Collapsible open={readersOpen} onOpenChange={setReadersOpen}>
+        <CollapsibleTrigger asChild>
+          <button
+            type="button"
+            className="flex w-full items-center gap-2 px-4 py-2 hover:bg-[var(--surface-2,theme(colors.muted.DEFAULT))] border-b"
+          >
+            <ChevronRight
+              className={cn('h-4 w-4 shrink-0 transition-transform duration-[--motion-fast]', readersOpen ? 'rotate-90' : 'rtl-mirror')}
+              aria-hidden="true"
+            />
+            <span className={eyebrowClassName}>
+              {t('settings.readersLabel', { defaultValue: 'READERS' })}
+            </span>
+            {!readersOpen && (
+              <span className="ms-auto text-xs text-muted-foreground">
+                {showAttributeTable
+                  ? t('settings.attributeTableOn', { defaultValue: 'Table on' })
+                  : t('settings.attributeTableOff', { defaultValue: 'Table off' })}
+              </span>
+            )}
+          </button>
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className="flex min-h-9 items-center gap-2 px-4 py-2 border-b">
+            <label htmlFor={attributeTableSwitchId} className="flex-1 text-xs text-foreground">
+              {t('settings.attributeTable', { defaultValue: 'Readers can open the attribute table' })}
+            </label>
+            <Switch
+              id={attributeTableSwitchId}
+              checked={showAttributeTable}
+              onCheckedChange={onShowAttributeTableChange}
+            />
           </div>
         </CollapsibleContent>
       </Collapsible>

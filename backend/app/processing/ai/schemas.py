@@ -9,7 +9,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 logger = structlog.stdlib.get_logger(__name__)
 
-# Valid MapLibre paint properties per geometry type
 _VALID_PAINT_PROPS: dict[str, set[str]] = {
     "fill": {
         "fill-color",
@@ -59,19 +58,8 @@ _VALID_PAINT_PROPS: dict[str, set[str]] = {
         "heatmap-color",
         "heatmap-opacity",
     },
-    "fill-extrusion": {
-        "fill-extrusion-color",
-        "fill-extrusion-opacity",
-        "fill-extrusion-height",
-        "fill-extrusion-base",
-        "fill-extrusion-vertical-gradient",
-        "fill-extrusion-translate",
-        "fill-extrusion-translate-anchor",
-        "fill-extrusion-pattern",
-    },
 }
 
-# Color props including heatmap-color and fill-extrusion-color
 _COLOR_PROPS = {
     "fill-color",
     "fill-outline-color",
@@ -80,7 +68,6 @@ _COLOR_PROPS = {
     "circle-color",
     "circle-stroke-color",
     "heatmap-color",
-    "fill-extrusion-color",
 }
 
 
@@ -113,9 +100,6 @@ _PAINT_BOUNDS: dict[str, tuple[float, float]] = {
     "heatmap-weight": (0.0, 10.0),
     "heatmap-intensity": (0.0, 10.0),
     "heatmap-opacity": (0.0, 1.0),
-    "fill-extrusion-opacity": (0.0, 1.0),
-    "fill-extrusion-height": (0.0, 10000.0),
-    "fill-extrusion-base": (0.0, 10000.0),
 }
 
 
@@ -173,18 +157,18 @@ def _valid_paint_props_for_geometry(
     geometry_type: str | None,
     render_mode: str | None = None,
 ) -> tuple[str | None, set[str]]:
-    # Render-mode aware, mirroring frontend validateChatPaint —
-    # a heatmap-rendered layer's dataset_geometry_type is virtually always Point.
-    # Without this branch, the geometry-type filter strips every heatmap property.
+    # Mirrors frontend validateChatPaint: a heatmap-rendered layer's geometry
+    # type is virtually always Point, so without this branch the geometry-type
+    # filter would strip every heatmap property.
     if render_mode == "heatmap":
         return "heatmap", _VALID_PAINT_PROPS["heatmap"]
+    if render_mode == "symbol":
+        # Symbol layers draw icons; paint only holds the circle paint for a return to points.
+        return "symbol", set()
     layer_type = _paint_layer_type_for_geometry(geometry_type)
     if not layer_type:
         return None, set()
-    valid_props = _VALID_PAINT_PROPS.get(layer_type, _VALID_PAINT_PROPS["circle"])
-    if layer_type == "fill":
-        valid_props = valid_props | _VALID_PAINT_PROPS["fill-extrusion"]
-    return layer_type, valid_props
+    return layer_type, _VALID_PAINT_PROPS.get(layer_type, _VALID_PAINT_PROPS["circle"])
 
 
 def validate_paint_for_geometry(
@@ -201,6 +185,18 @@ def validate_paint_for_geometry(
     return cleaned
 
 
+def _removed_property_warning(key: str, layer_type: str) -> str:
+    message = f"Removed '{key}': not valid for {layer_type} layers"
+    if key.startswith("fill-extrusion-"):
+        # The 3D companion takes its colour from fill-color; height and opacity
+        # live in the builder config, which paint edits cannot reach.
+        message += (
+            ". A 3D polygon layer is coloured with fill-color; change its opacity"
+            " with set_opacity"
+        )
+    return message
+
+
 def validate_paint_with_feedback(
     paint: dict | None,
     geometry_type: str | None,
@@ -211,8 +207,7 @@ def validate_paint_with_feedback(
     Used by the chat service to feed validation feedback back to the LLM.
 
     render_mode: when 'heatmap', geometry-type filtering is skipped so
-    heatmap-* properties are kept instead of dropped — mirrors
-    the frontend's validateChatPaint render-mode awareness.
+    heatmap-* properties are kept, as in the frontend's validateChatPaint.
     """
     if not paint or (not geometry_type and render_mode != "heatmap"):
         return paint, []
@@ -226,7 +221,7 @@ def validate_paint_with_feedback(
     warnings: list[str] = []
     for key, value in paint.items():
         if key not in valid_props:
-            warnings.append(f"Removed '{key}': not valid for {layer_type} layers")
+            warnings.append(_removed_property_warning(key, layer_type))
             continue
         if key in _COLOR_PROPS and not _is_valid_color(value):
             warnings.append(f"Removed '{key}': invalid color value")
@@ -267,7 +262,7 @@ def validate_paint_property_names_with_feedback(
             warnings.append("Removed non-string paint clear entry")
             continue
         if prop not in valid_props:
-            warnings.append(f"Removed '{prop}': not valid for {layer_type} layers")
+            warnings.append(_removed_property_warning(prop, layer_type))
             continue
         if prop not in cleaned:
             cleaned.append(prop)
@@ -351,20 +346,18 @@ class LLMMapSpec(BaseModel):
         return v[:200]
 
 
-# Bounds on client-supplied chat context. Without them the
-# only limit was DEFAULT_BODY_LIMIT_BYTES (10 MB, ~2.5M tokens), billed
-# to the provider and re-sent on each of up to 8 tool rounds.
-# enforce_ai_token_budget checks usage already recorded before the
-# handler runs, and MAX_REQUEST_TOKEN_BUDGET is checked at the top of the
-# loop where the running total is still zero, so neither bounds the
-# first request.
+# Bounds on client-supplied chat context. Without them the only limit is
+# DEFAULT_BODY_LIMIT_BYTES (10 MB, ~2.5M tokens), billed to the provider and
+# re-sent on each of up to 8 tool rounds. enforce_ai_token_budget checks usage
+# already recorded before the handler runs, and MAX_REQUEST_TOKEN_BUDGET is
+# checked at the top of the loop where the running total is still zero, so
+# neither bounds the first request.
 #
 # The per-message cap is generous against the loop's own max_tokens=4096
-# (~16k chars), so a long assistant turn replayed as history is never
-# rejected. The aggregate sits above what the other three caps can
-# produce together, so a long conversation can never 422 on its own —
-# what it actually bounds is the free-form layer context, which has no
-# shape of its own to cap.
+# (~16k chars), so a long assistant turn replayed as history is never rejected.
+# The aggregate sits above what the other three caps can produce together, so
+# a long conversation never 422s on its own; it bounds the free-form layer
+# context, which has no shape of its own to cap.
 _MAX_HISTORY_CONTENT_CHARS = 20_000
 _MAX_CHAT_LAYERS = 50
 _MAX_CHAT_PAYLOAD_CHARS = 500_000
@@ -419,9 +412,8 @@ class ChatRequest(BaseModel):
 
     @model_validator(mode="after")
     def _bound_total_payload(self) -> "ChatRequest":
-        # Layer context is free-form (column_info, sample_values),
-        # so the per-field caps above do not bound it. Size the whole prompt
-        # payload once instead of guessing a cap per nested field.
+        # Layer context is free-form (column_info, sample_values), so the
+        # per-field caps above don't bound it; size the whole payload once.
         total = _chat_payload_chars(self.message, self.history) + len(
             json.dumps([layer.model_dump() for layer in self.layers], default=str)
         )
@@ -485,6 +477,7 @@ class ChatAction(BaseModel):
         "remove_layer",
         "show_query_result",
         "set_opacity",
+        "set_render_as",
     ]
     layer_id: str | None = None
     expression: list | None = None  # for set_filter
@@ -497,6 +490,8 @@ class ChatAction(BaseModel):
     dataset_name: str | None = None  # for add_layer (staging-chip display label)
     visible: bool | None = None  # for toggle_visibility
     opacity: float | None = Field(None, ge=0.0, le=1.0)  # for set_opacity
+    render_as: str | None = None  # for set_render_as
+    height_column: str | None = None  # for set_render_as extrusion-3d
     geojson: GeoJSONFeatureCollection | None = None  # for show_query_result
     bbox: list[float] | None = None  # for show_query_result
     rows: list[list] | None = (
@@ -505,8 +500,8 @@ class ChatAction(BaseModel):
     columns: list[str] | None = None  # for show_query_result (inline data table)
     row_count: int | None = None  # for show_query_result (total matched rows)
     truncated: bool | None = None  # for show_query_result (rows capped for payload)
-    # ``run_analysis`` handoff lets the builder prefill the Analysis
-    # panel ("Save as dataset") from a chat preview. layer_id above is reused.
+    # ``run_analysis`` handoff: lets the builder prefill the Analysis panel
+    # ("Save as dataset") from a chat preview. layer_id above is reused.
     operation: str | None = None  # for show_query_result (analysis operation)
     distance_meters: float | None = None  # for show_query_result (buffer distance)
 
@@ -568,6 +563,14 @@ class SSEErrorEvent(BaseModel):
         description=(
             "HTTP-equivalent status for router-level failures; provider and "
             "model errors raised inside the stream may omit it."
+        ),
+    )
+    code: Literal["model_requires_responses_api"] | None = Field(
+        default=None,
+        description=(
+            "Stable identifier for a failure the client can explain in its own "
+            "language. model_requires_responses_api: the configured model "
+            "calls tools only through the OpenAI Responses API."
         ),
     )
 

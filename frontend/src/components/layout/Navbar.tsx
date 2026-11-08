@@ -27,9 +27,9 @@ import { CollectionCreateDialog } from '@/components/collections/CollectionCreat
 import { MapCreateDialog } from '@/components/maps/MapCreateDialog';
 import { VrtCreateDialog } from '@/components/import/VrtCreateDialog';
 
-// Full-height topbar tabs with a 2px baseline marker on the active route —
-// the same underline vocabulary as the Import page's mode tabs. ring-inset
-// keeps the focus ring visible at the header's clipped top edge.
+// Full-height topbar tabs with a 2px baseline marker on the active route, like
+// the Import page's mode tabs. ring-inset keeps the focus ring visible at the
+// header's clipped top edge.
 const navLinkClass = ({ isActive }: { isActive: boolean }) =>
   cn(
     'relative inline-flex h-14 items-center px-3 text-sm font-medium transition-colors',
@@ -134,15 +134,14 @@ function UserMenu() {
   const { t: tAuth } = useTranslation('auth');
   const { t: tReport } = useTranslation('report');
   const openReport = useReportDialog((s) => s.openReport);
-  // #305: explicit light/dark override (default stays 'system', which
-  // already honors prefers-color-scheme). resolvedTheme drives the icon/label.
-  const { setTheme, resolvedTheme } = useTheme();
-  // fix(#817): also admit a multi-tenant fleet operator (manage_tenants
-  // only) — the admin routes admit them via the same mode-aware predicate.
+  // The default stays 'system', which honors prefers-color-scheme;
+  // resolvedTheme drives the icon and label.
+  const { setTheme, resolvedTheme, forcedTheme } = useTheme();
+  // Also admits a multi-tenant fleet operator (manage_tenants only), as the
+  // admin routes do via the same mode-aware predicate.
   const settingsAdmin = useSettingsAdmin();
   const canAccessAdmin = can('manage_users') || can('manage_settings') || settingsAdmin;
 
-  // Anonymous: show sign-in button instead of user dropdown
   if (!user) {
     return (
       <Button
@@ -208,22 +207,24 @@ function UserMenu() {
           </Link>
         </DropdownMenuItem>
 
-        {/* #305: light/dark toggle (no UI affordance existed before) */}
-        <DropdownMenuItem
-          onClick={(e) => {
-            e.preventDefault();
-            setTheme(resolvedTheme === 'dark' ? 'light' : 'dark');
-          }}
-        >
-          {resolvedTheme === 'dark' ? (
-            <Sun className="h-4 w-4" />
-          ) : (
-            <Moon className="h-4 w-4" />
-          )}
-          {resolvedTheme === 'dark'
-            ? t('nav.lightMode', { defaultValue: 'Light mode' })
-            : t('nav.darkMode', { defaultValue: 'Dark mode' })}
-        </DropdownMenuItem>
+        {/* Light/dark toggle; a story or dashboard that sets its own theme hides it */}
+        {!forcedTheme && (
+          <DropdownMenuItem
+            onClick={(e) => {
+              e.preventDefault();
+              setTheme(resolvedTheme === 'dark' ? 'light' : 'dark');
+            }}
+          >
+            {resolvedTheme === 'dark' ? (
+              <Sun className="h-4 w-4" />
+            ) : (
+              <Moon className="h-4 w-4" />
+            )}
+            {resolvedTheme === 'dark'
+              ? t('nav.lightMode', { defaultValue: 'Light mode' })
+              : t('nav.darkMode', { defaultValue: 'Dark mode' })}
+          </DropdownMenuItem>
+        )}
 
         {/* Admin control plane (capability-bearing operators only) */}
         {canAccessAdmin && (
@@ -271,12 +272,10 @@ function MobileNav() {
   const [collectionOpen, setCollectionOpen] = useState(false);
   const [mapOpen, setMapOpen] = useState(false);
   const [vrtOpen, setVrtOpen] = useState(false);
-  // fix(#817): also admit a multi-tenant fleet operator (manage_tenants
-  // only) — the admin routes admit them via the same mode-aware predicate.
+  // Also admits a multi-tenant fleet operator, as in the user menu.
   const settingsAdmin = useSettingsAdmin();
   const canAccessAdmin = can('manage_users') || can('manage_settings') || settingsAdmin;
 
-  // Auto-close sheet on navigation
   useEffect(() => {
     setOpen(false);
   }, [location.pathname]);
@@ -425,13 +424,12 @@ function MobileNav() {
 export function Navbar() {
   const { t } = useTranslation();
   const { can } = usePermissions();
-  // fix(#817): also admit a multi-tenant fleet operator (manage_tenants
-  // only) — the admin routes admit them via the same mode-aware predicate.
+  // Also admits a multi-tenant fleet operator, as in the user menu.
   const settingsAdmin = useSettingsAdmin();
   const canAccessAdmin = can('manage_users') || can('manage_settings') || settingsAdmin;
 
   return (
-    // fix(#522): fixed (not sticky) so the navbar shares the viewport-fixed
+    // Fixed, not sticky, so the navbar shares the viewport-fixed
     // positioning context of the admin sidebar — otherwise macOS elastic
     // overscroll slides the sticky navbar over the stationary fixed sidebar.
     // AppLayout reserves this header's height (h-14 + safe-area) as top padding.

@@ -15,7 +15,7 @@ const drawingStoreState = vi.hoisted(() => ({
   clearDrawing: vi.fn(),
 }));
 
-// fix(#1851): a plain object mock can't vary the blocker's `state` per test,
+// A plain object mock can't vary the blocker's `state` per test,
 // and the "Leave" wiring is only exercised while it is 'blocked'.
 const mockUseUnsavedGuard = vi.hoisted(() => vi.fn());
 
@@ -48,7 +48,7 @@ vi.mock('@/components/dataset/hooks/use-dataset', () => ({
   useUpdateAttribute: () => ({ mutateAsync: vi.fn() }),
   useDatasetHistory: () => ({ data: { history: [], total: 0 }, isLoading: false }),
   useDatasetRows: () => ({ data: { rows: [], total: 0 }, isLoading: false }),
-  // fix(#1285 codex round 4): mounted at the page level now.
+  // Mounted at the page level now.
   useDatasetRefreshWatch: () => ({ latestRun: undefined, isBusy: false, trackDispatchedRun: vi.fn() }),
 }));
 
@@ -181,6 +181,7 @@ const EDITOR_USER: UserResponse = {
   is_active: true,
   status: 'active',
   last_login_at: null,
+  can_reset_password: true,
   created_at: '2026-03-01T00:00:00Z',
   roles: ['editor'],
 };
@@ -198,6 +199,10 @@ function makeDataset(): DatasetResponse {
     id: 'dataset-1',
     record_id: 'record-1',
     table_name: 'world_countries',
+    source_health: 'unknown',
+    schema_drift_status: 'unknown',
+    source_freshness: 'unknown',
+    has_generic_geometry: false,
     title: 'World Countries',
     summary: 'Original summary',
     srid: 4326,
@@ -291,7 +296,7 @@ describe('DatasetPage editable affordance integration', () => {
     setUser(null);
   });
 
-  // fix(#433): this test walks two full edit→stage→resolve cycles with
+  // This test walks two full edit→stage→resolve cycles with
   // per-keystroke userEvent typing through a heavy DatasetPage render; on
   // loaded CI runners (coverage-instrumented, 2 cores) it can exceed the 5s
   // default timeout while every step is properly awaited — slowness, not a
@@ -304,7 +309,7 @@ describe('DatasetPage editable affordance integration', () => {
 
     expect(screen.queryByTestId('pending-edits-bar')).not.toBeInTheDocument();
 
-    // DetailPanel is React.lazy (Phase 276 CODE-06) — wait for the chunk
+    // DetailPanel is React.lazy — wait for the chunk
     // to resolve before querying its child fields synchronously. Under
     // coverage load the chunk can take longer than findBy's 1s default.
     await user.click(await screen.findByText('Original summary', undefined, { timeout: 10_000 }));
@@ -373,9 +378,9 @@ describe('DatasetPage editable affordance integration', () => {
     expect(screen.getByTestId('dataset-chat-panel')).toHaveAttribute('data-above-pending-bar', 'false');
   });
 
-  // fix(#1851): "Leave" on the unsaved-changes dialog let navigation proceed
-  // without discarding the staged draft, which then reappeared (and could be
-  // saved) against whatever dataset mounted next.
+  // "Leave" on the unsaved-changes dialog must discard the staged draft, not
+  // just let navigation proceed: otherwise it reappears (and could be saved)
+  // against whatever dataset mounts next.
   it('discards the staged draft when the user chooses Leave on the unsaved-changes dialog', async () => {
     setUser(EDITOR_USER);
     const user = userEvent.setup();
@@ -404,7 +409,7 @@ describe('DatasetPage editable affordance integration', () => {
     });
   });
 
-  // fix(#1851 review P1): resetting useDraftEditing's own state (the test
+  // Resetting useDraftEditing's own state (the test
   // above) is not enough — InlineEdit keeps its OWN local editing/draft
   // state, and it deliberately ignores prop-value changes while `editing` is
   // true (see InlineEdit.tsx's sync effect). Typed-but-uncommitted text in an
@@ -456,7 +461,7 @@ describe('DatasetPage editable affordance integration', () => {
 
     render(<DatasetPage />, { route: '/datasets/dataset-1' });
 
-    // DetailPanel is React.lazy (Phase 276 CODE-06) — wait for the chunk
+    // DetailPanel is React.lazy — wait for the chunk
     // to resolve before querying its child fields synchronously.
     const summaryShell = await screen.findByTestId('editable-field-shell-summary');
     expect(summaryShell).toHaveAttribute('data-editable', 'false');
@@ -479,7 +484,7 @@ describe('DatasetPage editable affordance integration', () => {
       expect(window.location.hash).toBe('#metadata');
     });
 
-    // DetailPanel is React.lazy (Phase 276 CODE-06) — wait for the chunk
+    // DetailPanel is React.lazy — wait for the chunk
     // to resolve before querying tab roles synchronously.
     expect(await screen.findByRole('tab', { name: 'Metadata' })).toHaveAttribute('aria-selected', 'true');
   });
@@ -555,7 +560,7 @@ describe('DatasetPage editable affordance integration', () => {
       await screen.findByRole('menuitem', { name: 'Create VRT' }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole('menuitem', { name: 'Re-Upload' }),
+      screen.getByRole('menuitem', { name: 'Re-upload' }),
     ).toBeInTheDocument();
   });
 
@@ -615,7 +620,7 @@ describe('DatasetPage editable affordance integration', () => {
       screen.queryByRole('menuitem', { name: 'Create VRT' }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole('menuitem', { name: 'Re-Upload' }),
+      screen.queryByRole('menuitem', { name: 'Re-upload' }),
     ).not.toBeInTheDocument();
   });
 });

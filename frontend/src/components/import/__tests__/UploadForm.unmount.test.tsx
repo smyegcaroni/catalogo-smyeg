@@ -1,12 +1,12 @@
 /**
- * fix(#1712): an upload batch must survive the form unmounting.
+ * An upload batch must survive the form unmounting.
  *
  * The Import page renders tabs conditionally, so switching away mid-upload
  * unmounts UploadForm. The upload (and the preview call chained after it)
  * keeps running server-side, so if the returned job id lands in dead
  * component state the user is left with an unreachable pending job and its
  * staged bytes until the stale-pending sweep collects them. Mirrors
- * UrlImportForm.unmount.test.tsx (#1708) for this tab's batch shape.
+ * UrlImportForm.unmount.test.tsx for this tab's batch shape.
  */
 import { render, screen, waitFor, act } from '@/test/test-utils';
 import { UploadForm } from '../UploadForm';
@@ -174,7 +174,7 @@ const VECTOR_PREVIEW = {
   layers: null,
 };
 
-// fix(codex #1763 r2): a multi-layer file, so switching the reviewed layer
+// A multi-layer file, so switching the reviewed layer
 // (BulkReviewList's layer picker) is exercisable.
 const MULTI_LAYER_PREVIEW = {
   job_id: 'job-multi',
@@ -348,7 +348,7 @@ describe('UploadForm unmount survival', () => {
     expect(peekUploadBatch()).toBeNull();
   });
 
-  // fix(codex #1763 r2): a layer reselect used to write only to component
+  // A layer reselect used to write only to component
   // state, so the session kept the ORIGINAL layer and a remount restored
   // it — a subsequent default commit would silently ingest the wrong layer.
   test('a layer reselected before unmount is still selected on remount, and commit sends it', async () => {

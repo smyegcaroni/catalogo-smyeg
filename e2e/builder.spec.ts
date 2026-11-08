@@ -1,15 +1,9 @@
-import { test, expect, type Page, type Response, getAuthToken } from './helpers/session';
+import { test, expect, type Page, getAuthToken } from './helpers/session';
+import { isMapUpdateResponse } from './helpers/maps';
 import path from 'path';
 
 const BASE_URL = process.env.E2E_BASE_URL ?? 'http://localhost:8080';
 const TEXT_TYPES = ['character', 'text', 'varchar', 'char'];
-
-function isMapUpdateResponse(response: Response, mapId: string): boolean {
-  return (
-    response.request().method() === 'PUT' &&
-    new URL(response.url()).pathname === `/api/maps/${mapId}`
-  );
-}
 
 interface DatasetListItem {
   id?: string;
@@ -238,7 +232,7 @@ test.describe.serial('Map Builder', () => {
       await waitForBuilder(page);
 
       await expect(page.getByTestId('builder-sidebar'), `${viewport.label} sidebar`).toBeVisible();
-      // Phase 1034 retired the "Map Stack" / "Data" section headings. At
+      // The "Map Stack" / "Data" section headings no longer exist. At
       // desktop (≥1100px) the unified stack renders with an h2 "Layers"
       // header + stack-row-* IDs. At tablet (<1100px) the sidebar collapses
       // to a 64px rail (SidebarRail) with icon buttons but no h2 and no
@@ -267,10 +261,10 @@ test.describe.serial('Map Builder', () => {
     }
   });
 
-  // fix(#392): the Add-Dataset dialog no longer exposes a "Basemap" radio or
-  // in-dialog "in use"/"swap" controls — basemap swapping moved to the
-  // #stack-row-basemap-group row / BasemapGroupEditorScene (Phase 1035). This
-  // test now asserts only the shipped All/Vector/Raster tab set. (audit B-008)
+  // The Add-Dataset dialog exposes no "Basemap" radio or
+  // in-dialog "in use"/"swap" controls — basemap swapping lives in the
+  // #stack-row-basemap-group row / BasemapGroupEditorScene. This
+  // test asserts only the shipped All/Vector/Raster tab set.
   test('Add Dataset dialog exposes responsive v1 tabs', async ({ page }) => {
     for (const viewport of [
       { width: 1440, height: 900, label: 'desktop' },
@@ -307,7 +301,7 @@ test.describe.serial('Map Builder', () => {
     const dialog = page.getByRole('dialog', { name: /add dataset/i });
     await expect(dialog).toBeVisible();
 
-    // fix(#392): no "Basemap" radio in the Add-Dataset dialog (Phase 1035, audit B-008).
+    // No "Basemap" radio in the Add-Dataset dialog.
     for (const tab of ['All', 'Vector', 'Raster']) {
       await expect(dialog.getByRole('radio', { name: tab })).toBeVisible();
     }
@@ -342,8 +336,8 @@ test.describe.serial('Map Builder', () => {
 
     const initialDatasetCount = initialLayers.filter((layer) => layer.dataset_id === originalLayer.dataset_id).length;
 
-    // Phase 1034 replaced per-layer LayerItem testids and the auto-grouped
-    // "dataset-rendering-group" rollup with flat unified stack rows
+    // Per-layer LayerItem testids and the auto-grouped
+    // "dataset-rendering-group" rollup are replaced by flat unified stack rows
     // (id="stack-row-{layerId}"). Duplicate is exposed via the row kebab.
     const originalRow = page.locator(`#stack-row-${originalLayer.id}`);
     await expect(originalRow).toBeVisible();
@@ -357,9 +351,9 @@ test.describe.serial('Map Builder', () => {
     const rowDuplicateRes = await rowDuplicateResponse;
     expect([200, 201]).toContain(rowDuplicateRes.status());
 
-    // fix(#1810): read the new layer straight off the write's own response
+    // Read the new layer straight off the write's own response
     // body instead of re-fetching the map right after — a fresh GET here
-    // raced the layer-add commit under host load and intermittently saw a
+    // would race the layer-add commit under host load and could see a
     // pre-write (sometimes empty) snapshot. The response IS the commit's
     // confirmation, so build the "after" state from it plus the known
     // "before" state rather than a racy re-read.
@@ -391,7 +385,7 @@ test.describe.serial('Map Builder', () => {
     const modalDuplicateRes = await modalDuplicateResponse;
     expect([200, 201]).toContain(modalDuplicateRes.status());
 
-    // fix(#1810): same principle as the row-duplicate assertion above —
+    // Same principle as the row-duplicate assertion above —
     // read the created layer from the write's response, not a fresh GET.
     const modalDuplicate = await modalDuplicateRes.json() as MapLayerListItem;
     const afterModalLayers = [...afterRowLayers, modalDuplicate];
@@ -404,12 +398,11 @@ test.describe.serial('Map Builder', () => {
     await expect(page.locator('[data-sonner-toast][data-type="error"]')).toHaveCount(0);
   });
 
-  // fix(#392): basemap swapping moved OUT of the Add Dataset modal (Phase
-  // 1035) into the #stack-row-basemap-group row / BasemapGroupEditorScene
-  // flyout — re-pointed here (mirrors the already-green "switches basemap
-  // without losing overlay layers" test) while preserving the original
-  // intent: swap -> save -> assert PUT persists basemap_style -> reload ->
-  // overlays intact. (audit B-008)
+  // Basemap swapping lives in the #stack-row-basemap-group row /
+  // BasemapGroupEditorScene flyout, not the Add Dataset modal (mirrors the
+  // "switches basemap without losing overlay layers" test): swap -> save
+  // -> assert PUT persists basemap_style -> reload ->
+  // overlays intact.
   test('swaps basemap via the basemap-group editor and persists after save', async ({ page }) => {
     const token = getAuthToken();
     const headers = { Authorization: `Bearer ${token}` };
@@ -427,10 +420,10 @@ test.describe.serial('Map Builder', () => {
     const presetSection = editor.locator('section').filter({ hasText: /^PRESET/i }).first();
     await expect(presetSection).toBeVisible({ timeout: 5_000 });
 
-    // fix(#394) UX-03: preset cards are role="radio" inside a radiogroup now.
+    // Preset cards are role="radio" inside a radiogroup now.
     await presetSection.getByRole('radio', { name: /OpenFreeMap Dark/i }).click();
 
-    // Phase 1035 replaced the dedicated "Basemap" section heading with a
+    // The dedicated "Basemap" section heading is now a
     // basemap-group row at the top of the unified stack (id=stack-row-basemap-group);
     // overlay layers are now flat stack-row-{layerId} entries. The row renders
     // `Basemap · {derivedPresetName}`, where the derived name strips the
@@ -624,7 +617,7 @@ test.describe.serial('Map Builder', () => {
     await page.goto(`/maps/${mapId}`);
     await waitForBuilder(page);
 
-    // Phase 1035 replaced the inline "Swap to ..." popover with a basemap-group
+    // The inline "Swap to ..." popover is now a basemap-group
     // editor scene: click the basemap-group row to open the flyout, then pick a
     // preset from the PRESET grid.
     const overlaySelector = '[id^="stack-row-"]:not([id="stack-row-basemap-group"])';
@@ -670,7 +663,7 @@ test.describe.serial('Map Builder', () => {
     // sit after the Settings + Add data controls and open the LayerEditorPanel
     // in a drill-down Sheet (<800px viewport). The Sheet itself doesn't carry
     // builder-layer-editor — the LayerEditorPanel renders inside the dialog.
-    // Phase 1043-03 added a basemap-group button at the bottom of the SidebarRail —
+    // The SidebarRail has a basemap-group button at the bottom —
     // avoid `button.last()` which now selects the basemap button. Target user layer
     // buttons by excluding the fixed control buttons (Settings, Add data, Basemap group).
     const sidebar = page.getByTestId('builder-sidebar');
@@ -822,7 +815,7 @@ test.describe.serial('Map Builder', () => {
     await waitForBuilder(page);
 
     // Click Save. The frontend pre-check detects the invalid placeholder and shows
-    // a named error toast (FOLLOWUP-01 surface).
+    // a named error toast.
     await page.getByRole('button', { name: /save/i }).first().click();
 
     // Assert: error toast with the popup-config-invalid dedupe id appears.
@@ -840,7 +833,7 @@ test.describe.serial('Map Builder', () => {
     // Fix: clear the invalid popup_config via API so we can verify the success-path round-trip.
     // (The "fix via Popup tab" UI journey requires the layer to have a vector type that renders
     //  the tabbed editor with a Popup tab — not guaranteed for every fallback dataset geometry.
-    //  The FOLLOWUP-01 requirement is the error-surface toast, not the Popup-tab UI journey.)
+    // The requirement is the error-surface toast, not the Popup-tab UI journey.)
     const clearRes = await fetch(`${BASE_URL}/api/maps/${mapId}/layers/`, {
       method: 'PATCH',
       headers,
@@ -854,7 +847,7 @@ test.describe.serial('Map Builder', () => {
     await page.goto(`/maps/${mapId}`);
     await waitForBuilder(page);
 
-    // Save — no popup-config-invalid toast, success toast appears (FOLLOWUP-01 round-trip)
+    // Save — no popup-config-invalid toast, success toast appears (round-trip)
     const saveResponsePromise = page.waitForResponse(
       (response) => isMapUpdateResponse(response, mapId),
     );

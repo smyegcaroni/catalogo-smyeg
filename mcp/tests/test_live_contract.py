@@ -34,6 +34,7 @@ cleanup delete that is not 204/404 fails the tier loudly.
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,7 +76,7 @@ def _admin_credentials() -> tuple[str, str]:
 
     A standard install (``make dev-init``) writes a GENERATED admin password
     into the repo root .env — a hardcoded admin/admin fallback would 401 on
-    any normal stack (#866 review r2). Username falls back to "admin" (the
+    any normal stack. Username falls back to "admin" (the
     installer's own default) only when nothing provides it; a missing
     password fails the tier with a clear message instead of a confusing 401.
     """
@@ -137,7 +138,7 @@ def live():
     # Cleanup ledger, appended to as each persistent resource is created.
     # Everything past the first POST runs inside try/finally so a mid-seed
     # failure (e.g. the map POST) still deletes what already exists
-    # (#866 review r2). Dataset deletes need the title as confirmation.
+    # . Dataset deletes need the title as confirmation.
     created_datasets: list[tuple[str, str]] = []  # (id, confirm_title)
     created_maps: list[str] = []
     saved_env = {
@@ -150,7 +151,10 @@ def live():
             "/datasets/create/",
             json={
                 "title": dataset_title,
-                "columns": [{"name": "name", "type": "text"}],
+                "columns": [
+                    {"name": "name", "type": "text"},
+                    {"name": "height", "type": "integer"},
+                ],
             },
         )
         assert created.status_code == 201, f"dataset seed failed: {created.text[:200]}"
@@ -200,7 +204,7 @@ def live():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-        # Loud cleanup (#866 review r3): only 204 (deleted) and 404 (already
+        # Loud cleanup: only 204 (deleted) and 404 (already
         # gone) are success — anything else is recorded and fails the tier at
         # the end so pollution of a long-lived target is visible, not silent.
         problems: list[str] = []
@@ -236,7 +240,7 @@ def live():
         for m_id in created_maps:
             _delete_map(m_id)
 
-        # Fallback sweep (#866 review r3): both creation endpoints commit
+        # Fallback sweep: both creation endpoints commit
         # BEFORE serializing their response, so a commit-then-500 leaves a
         # resource the ledger never saw. The run marker is unique, so any
         # marker-titled resource not in the ledger is ours to delete.
@@ -390,7 +394,7 @@ def test_get_map_contract(live):
 
 
 def test_query_contract(live):
-    """feat(#565): the tool's promised workflow, end to end — schema for the
+    """The tool's promised workflow, end to end — schema for the
     table name, then a scoped SELECT, then the columns/rows shape."""
     schema = server.get_dataset_schema(live.dataset_id)
     table = schema["table_name"]
@@ -420,3 +424,91 @@ def test_query_refuses_an_unscoped_table(live):
         )
     assert "404" in str(exc.value)
     assert "Table not accessible" in str(exc.value)
+
+
+def _api_client(live):
+    token = os.environ["GEOLENS_TOKEN"]
+    return httpx.Client(
+        base_url=os.environ["GEOLENS_INSTANCE"],
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=DEFAULT_TIMEOUT,
+    )
+
+
+def _block(text):
+    return {
+        "id": str(uuid.uuid4()),
+        "type": "markdown",
+        "v": 1,
+        "config": {"text": text},
+    }
+
+
+def test_story_tools_read_the_published_version_not_the_draft(live):
+    with _api_client(live) as http:
+        title = f"MCP story {live.marker}"
+        created = http.post("/stories/", json={"title": title})
+        assert created.status_code == 201, created.text
+        story_id = created.json()["id"]
+        try:
+            chapter = {
+                "id": str(uuid.uuid4()),
+                "title": "One",
+                "blocks": [_block("v1")],
+            }
+            doc = {"version": 1, "chapters": [chapter]}
+            saved = http.put(
+                f"/stories/{story_id}/draft",
+                json={"revision": created.json()["revision"], "document": doc},
+            )
+            assert saved.status_code == 200, saved.text
+            published = http.post(
+                f"/stories/{story_id}/publish",
+                json={"revision": saved.json()["revision"]},
+            )
+            assert published.status_code == 200, published.text
+            edited = {**doc, "chapters": [{**chapter, "blocks": [_block("v2 draft")]}]}
+            resaved = http.put(
+                f"/stories/{story_id}/draft",
+                json={"revision": saved.json()["revision"], "document": edited},
+            )
+            assert resaved.status_code == 200, resaved.text
+
+            story = server.get_story(story_id)
+            text = story["document"]["chapters"][0]["blocks"][0]["config"]["text"]
+            assert text == "v1"
+            listed = server.list_stories(search=live.marker)
+            match = next(s for s in listed["stories"] if s["id"] == story_id)
+            assert match["chapter_count"] == 1
+        finally:
+            deleted = http.delete(f"/stories/{story_id}")
+            if deleted.status_code not in (204, 404):
+                pytest.fail(f"story {story_id}: HTTP {deleted.status_code}")
+
+    missing = str(uuid.uuid4())
+    with pytest.raises(RuntimeError, match="404"):
+        server.get_story(missing)
+
+
+def test_aggregate_matches_the_rest_route_for_each_operation(live):
+    requests = [
+        {"op": "count"},
+        {"op": "stats", "column": "height", "stats": ["count", "max"]},
+        {"op": "value_counts", "column": "name"},
+        {"op": "histogram", "column": "height", "bins": 3},
+        {"op": "group_by", "group_column": "name", "stat": "count"},
+        {"op": "rows", "columns": ["name"], "limit": 5},
+    ]
+    with _api_client(live) as http:
+        for body in requests:
+            time.sleep(0.4)  # the route allows 10 requests a second per caller
+            rest = http.post(f"/datasets/{live.dataset_id}/aggregate/", json=body)
+            assert rest.status_code == 200, (body, rest.text)
+            tool = server.aggregate(live.dataset_id, body)
+            assert tool["op"] == body["op"]
+            assert tool["result"] == rest.json()["result"], body
+
+    with pytest.raises(RuntimeError, match="404"):
+        server.aggregate(str(uuid.uuid4()), {"op": "count"})
+    with pytest.raises(RuntimeError, match="invalid_column"):
+        server.aggregate(live.dataset_id, {"op": "value_counts", "column": "nope"})

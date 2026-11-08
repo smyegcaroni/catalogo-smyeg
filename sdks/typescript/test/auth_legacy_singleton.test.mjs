@@ -1,10 +1,10 @@
 /**
- * fix(#1778 review round 3): createGeolensClient() must ALSO reconfigure
- * the generated module's shared singleton, exactly as it did before the
- * scoped-client fix in this PR. Existing consumers that call
+ * createGeolensClient() must ALSO reconfigure
+ * the generated module's shared singleton, in addition to returning a
+ * scoped client. Existing consumers that call
  * createGeolensClient() once and then call generated endpoints WITHOUT
  * passing `{ client: sdk.client }` rely on the singleton fallback
- * (`options?.client ?? client`, sdk.gen.ts) — losing that fallback broke
+ * (`options?.client ?? client`, sdk.gen.ts) — losing that fallback would break
  * every implicit call, hitting whatever baseUrl (or none) the singleton
  * last had.
  *
@@ -39,4 +39,25 @@ test('a later createGeolensClient() call updates the singleton too (last caller 
   const authValue = hdrs instanceof Headers ? hdrs.get('Authorization') : hdrs?.['Authorization'];
   assert.equal(apiKeyValue, 'key-second');
   assert.ok(!authValue, `singleton still carries the first caller's Authorization: ${authValue}`);
+});
+
+test('the shared singleton sends no credential left over from a previous caller', async () => {
+  const sent = [];
+  const record = async (request) => {
+    sent.push(request.headers);
+    return new Response('{}', { headers: { 'content-type': 'application/json' } });
+  };
+
+  createGeolensClient({ baseUrl: 'https://wire.example.test', bearerToken: 'tok-old' });
+  createGeolensClient({ baseUrl: 'https://wire.example.test', apiKey: 'key-new' });
+  singletonClient.setConfig({ fetch: record });
+  await singletonClient.get({ url: '/ping' });
+  assert.equal(sent[0].get('Authorization'), null);
+  assert.equal(sent[0].get('X-API-Key'), 'key-new');
+
+  createGeolensClient({ baseUrl: 'https://wire.example.test', bearerToken: 'tok-new' });
+  singletonClient.setConfig({ fetch: record });
+  await singletonClient.get({ url: '/ping' });
+  assert.equal(sent[1].get('X-API-Key'), null);
+  assert.equal(sent[1].get('Authorization'), 'Bearer tok-new');
 });

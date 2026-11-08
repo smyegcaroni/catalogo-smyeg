@@ -86,6 +86,7 @@ def test_valid_manifest_fixtures_pass() -> None:
         "vector-fgb.yaml",
         "vector-kml.yaml",
         "vector-kmz.yaml",
+        "vector-parquet.yaml",
     }
     for path in valid_fixtures:
         assert validate_manifest(load_manifest(path)) == [], path.name
@@ -129,7 +130,7 @@ def test_version_and_enum_errors_are_stable() -> None:
 
 
 def test_publication_intent_is_an_open_set() -> None:
-    """fix(#1201): the intent set belongs to the server's workflow extension.
+    """The intent set belongs to the server's workflow extension.
 
     Values come from its ``status_order()``, so a deployment may define its
     own and the CLI cannot know that set — an unrecognized word has to reach
@@ -173,12 +174,13 @@ def test_manifest_v1_dataset_batch_is_bounded() -> None:
         ("vector", "./rasters/tile.tif"),
         ("raster_cog", "./data/roads.geojson"),
         ("raster_cog", "./rasters/mosaic.vrt"),
-        # fix(#1683): the tier-1 formats added to the vector allowlist are
+        # The tier-1 formats added to the vector allowlist are
         # still vector-only — asserting the mismatch keeps the manifest
         # door symmetric with the pre-existing formats above.
         ("raster_cog", "./data/trails.fgb"),
         ("raster_cog", "./data/poi.kml"),
         ("raster_cog", "./data/poi.kmz"),
+        ("raster_cog", "./data/parcels.parquet"),
     ],
 )
 def test_manifest_source_type_requires_matching_extension(
@@ -197,10 +199,11 @@ def test_manifest_source_type_requires_matching_extension(
         "./data/poi.kml",
         "https://data.example.com/poi-archive.kmz",
         "./data/parcels.zip",
+        "./data/parcels.parquet",
     ],
 )
 def test_manifest_accepts_tier1_vector_extensions(uri: str) -> None:
-    """fix(#1683): the manifest door now accepts the same four tier-1
+    """The manifest door now accepts the same four tier-1
     vector formats the upload/reupload doors accepted as of #1682
     (FlatGeobuf, KML, KMZ, and a zipped File Geodatabase — the last one
     already matched `.zip`)."""
@@ -220,7 +223,7 @@ def test_manifest_accepts_a_well_formed_source_checksum() -> None:
 
 
 def test_manifest_accepts_a_null_source_checksum() -> None:
-    """gh#1773 codex r4: ManifestSource.checksum is Optional on the backend,
+    """ManifestSource.checksum is Optional on the backend,
     and the generated OpenAPI schema allows a null variant for it, so a
     template manifest with an explicit `checksum: null` (rather than the
     key omitted entirely) is a valid request. Before `type` included "null"
@@ -254,7 +257,7 @@ def test_manifest_rejects_malformed_source_checksum(checksum: str) -> None:
 
 
 def test_manifest_rejects_source_checksum_with_a_trailing_newline() -> None:
-    """gh#1773 codex r1: Python's `re` treats `$` as matching just before a
+    """Python's `re` treats `$` as matching just before a
     trailing newline, so `pattern` alone let a YAML literal-scalar checksum
     (which can carry a trailing newline) through this validator while the
     backend's Pydantic model correctly rejected it -- geolens validate would
@@ -434,7 +437,7 @@ def test_manifest_modules_do_not_import_backend_app() -> None:
     assert offenders == []
 
 
-# fix(#1472 review): the backend rejects `<`/`>` in metadata.attribution
+# The backend rejects `<`/`>` in metadata.attribution
 # (ManifestMetadata in backend/app/processing/ingest/manifest_schemas.py) because
 # the value is rendered in MapLibre's attribution control, an HTML context. This
 # packaged schema is a hand-maintained mirror, so without the same restriction

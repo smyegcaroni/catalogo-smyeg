@@ -106,12 +106,12 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: RegisterRequest,
 ) -> Response[ProblemDetail | TableRegisterResponse]:
-    """Register Table
+    """Register a PostGIS table
 
      Register an existing PostGIS table as a dataset.
 
     Verifies the table exists, extracts metadata, and creates a
-    catalog entry.
+    catalog entry. Administrators only.
 
     Args:
         body (RegisterRequest):
@@ -140,12 +140,12 @@ def sync(
     client: AuthenticatedClient,
     body: RegisterRequest,
 ) -> ProblemDetail | TableRegisterResponse | None:
-    """Register Table
+    """Register a PostGIS table
 
      Register an existing PostGIS table as a dataset.
 
     Verifies the table exists, extracts metadata, and creates a
-    catalog entry.
+    catalog entry. Administrators only.
 
     Args:
         body (RegisterRequest):
@@ -169,12 +169,12 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: RegisterRequest,
 ) -> Response[ProblemDetail | TableRegisterResponse]:
-    """Register Table
+    """Register a PostGIS table
 
      Register an existing PostGIS table as a dataset.
 
     Verifies the table exists, extracts metadata, and creates a
-    catalog entry.
+    catalog entry. Administrators only.
 
     Args:
         body (RegisterRequest):
@@ -201,12 +201,12 @@ async def asyncio(
     client: AuthenticatedClient,
     body: RegisterRequest,
 ) -> ProblemDetail | TableRegisterResponse | None:
-    """Register Table
+    """Register a PostGIS table
 
      Register an existing PostGIS table as a dataset.
 
     Verifies the table exists, extracts metadata, and creates a
-    catalog entry.
+    catalog entry. Administrators only.
 
     Args:
         body (RegisterRequest):

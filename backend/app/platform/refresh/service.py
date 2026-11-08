@@ -26,9 +26,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.failure_reason import FixedReason, redact_failure_reason
+from app.platform.dataset_origin import classify_origin
 from app.platform.jobs import ledger
 from app.platform.jobs.ledger import Outcome, hold
 from app.platform.refresh.models import DatasetRefreshRun
+from app.platform.refresh.verification import UNKNOWN_DATA_REVISION
+from app.platform.request_credential import api_key_scope_refusal, is_publish_key
 
 logger = structlog.get_logger(__name__)
 
@@ -62,7 +65,7 @@ RUN_ORIGIN_KINDS: tuple[str, ...] = (
 
 # How long a run may sit in pending/running before the sweep is allowed to
 # consider it abandoned. Matches the ingest stale-job abandonment policy in
-# platform/jobs/router.py. A legitimately long GDAL run is protected by the
+# platform/jobs/sweep.py. A legitimately long GDAL run is protected by the
 # live-Procrastinate-job predicate below rather than by this number, so the
 # cutoff only has to be longer than the gap between dispatch and claim.
 ABANDONED_RUN_CUTOFF_SECONDS = 3600
@@ -82,7 +85,7 @@ ABANDONED_ERROR_MESSAGE = FixedReason(
     code=ABANDONED_ERROR_CODE,
 )
 
-# feat(#1677): an explicit user cancel, distinct from the sweep's `abandoned`
+# An explicit user cancel, distinct from the sweep's `abandoned`
 # correction under the same terminal `cancelled` status. `abandoned` means
 # "the task is provably gone and nobody reported an outcome"; this means
 # "a person asked in-flight work to stop".
@@ -93,9 +96,9 @@ USER_CANCELLED_ERROR_MESSAGE = FixedReason(
 
 
 def redact_run_error(message: str | BaseException) -> str:
-    """ADR-002 Decision 3 applied to a run row's ``error_message``.
+    """Redact a run row's ``error_message`` before it is stored or shown.
 
-    fix(#1953): the clause is enforced in ``core/failure_reason.py``, shared
+    The clause is enforced in ``core/failure_reason.py``, shared
     with the ``ingest_jobs`` sink, rather than restated per caller.
     """
     return redact_failure_reason(message)
@@ -278,13 +281,13 @@ async def _emit_refresh_cancelled(
     *,
     cancelled_by: uuid.UUID | None = None,
 ) -> None:
-    """Record an explicit user cancel (#1677).
+    """Record an explicit user cancel.
 
     Deliberately not ``refresh.abandoned``: that is the sweep's correction
     for a task proven gone, while this records a person stopping in-flight
     work.
 
-    fix(#1709): attributed to ``cancelled_by`` — the CANCELLING user —
+    Attributed to ``cancelled_by`` — the CANCELLING user —
     not the row's immutable ``triggered_by``, since a dataset owner may
     cancel a refresh someone else started; crediting the dispatcher would
     put the action in the wrong user's history. Falls back to the row's
@@ -319,6 +322,36 @@ class DatasetBusyError(Exception):
     """
 
 
+async def _refuse_publish_key_irreversible_run(
+    session: AsyncSession, dataset_id: uuid.UUID
+) -> None:
+    """Refuse a publish key a run whose result no previous version could undo.
+
+    Every data-replacing door admits its run here. A raster replace keeps no
+    previous version, and a restore can bring back only an upload's or a drawn
+    layer's source binding, not a service's, STAC item's or table's.
+    """
+    if not is_publish_key(session):
+        return
+    row = (
+        await session.execute(
+            text(
+                "SELECT d.source_format, r.record_type FROM catalog.datasets d "
+                "JOIN catalog.records r ON r.id = d.record_id WHERE d.id = :id"
+            ),
+            {"id": dataset_id},
+        )
+    ).one_or_none()
+    if row is None:
+        return
+    origin = classify_origin(row.source_format, row.record_type)
+    if row.record_type == "raster_dataset" or origin not in ("upload", "created"):
+        raise api_key_scope_refusal(
+            "A publish key can't replace this dataset's data: no previous "
+            "version could restore it"
+        )
+
+
 async def create_pending_run(
     session: AsyncSession,
     *,
@@ -337,11 +370,15 @@ async def create_pending_run(
     credential_reference: str | None = None,
     credential_version: str | None = None,
     data_revision_baseline: int | None = None,
+    expected_data_revision: int | None = None,
 ) -> DatasetRefreshRun:
     """Insert the ``pending`` row in the caller's transaction, before ``defer``.
 
     ``data_revision_baseline`` is the dataset revision the run's publication is
-    compared with, the current one when None.
+    compared with, the current one when None. An ``expected_data_revision``
+    the client saw that differs from it makes every write count as later, so
+    the publication stops for review rather than replacing an edit the client
+    never saw.
 
     The caller must NOT commit inside this function: the run row and
     whatever else the request writes must land together, and the task is
@@ -390,6 +427,11 @@ async def create_pending_run(
         )
     ).one_or_none()
     tenant_id, data_revision = parent if parent is not None else (None, None)
+    baseline = (
+        data_revision if data_revision_baseline is None else data_revision_baseline
+    )
+    if expected_data_revision is not None and expected_data_revision != baseline:
+        baseline = UNKNOWN_DATA_REVISION
 
     # A reupload queued by an API pod older than run admission (pre-migration,
     # or a manifest apply from before it created runs) has a live task but no
@@ -437,8 +479,8 @@ async def create_pending_run(
             "database did not return a timestamp for scheduled admission"
         )
     # Every facade-admitted occurrence, including an idempotent manual Run now,
-    # has a bounded delivery/claim window. Legacy manual refreshes do not carry
-    # an execution key and retain their existing direct-dispatch behavior.
+    # has a bounded delivery/claim window. Manual refreshes without an
+    # execution key dispatch directly.
     claim_deadline = (
         db_now + timedelta(seconds=SCHEDULED_CLAIM_DEADLINE_SECONDS)
         if trigger == "scheduled" or admitted_execution
@@ -461,9 +503,7 @@ async def create_pending_run(
         execution_key=execution_key,
         source_binding_fingerprint=source_binding_fingerprint,
         local_edit_baseline=local_edit_baseline,
-        data_revision_baseline=(
-            data_revision if data_revision_baseline is None else data_revision_baseline
-        ),
+        data_revision_baseline=baseline,
         verification_policy=verification_policy,
         credential_reference=credential_reference,
         credential_version=credential_version,
@@ -472,14 +512,17 @@ async def create_pending_run(
         async with session.begin_nested():
             session.add(run)
             await session.flush()
+            # After the insert: it can wait on another run that rebinds the
+            # dataset, so only a read after it sees the binding this run replaces.
+            await _refuse_publish_key_irreversible_run(session, dataset_id)
     except IntegrityError as exc:
         if _ACTIVE_RUN_INDEX not in str(getattr(exc, "orig", exc)):
             raise
         raise DatasetBusyError(
             "A refresh is already in progress for this dataset."
         ) from exc
-    # feat(#1268): in the caller's transaction, so a dispatch the caller then
-    # rolls back — a busy dataset, a defer that never happened — leaves no
+    # In the caller's transaction, so a dispatch the caller then rolls back
+    # (a busy dataset, a defer that never happened) leaves no
     # audit row claiming a refresh started.
     await _emit_refresh_dispatch(session, run.id)
     return run
@@ -634,18 +677,6 @@ async def claim_admitted_run_for_job(
     return result.scalar_one_or_none()
 
 
-async def claim_scheduled_run_for_job(
-    session: AsyncSession,
-    ingest_job_id: uuid.UUID,
-    *,
-    execution_key: uuid.UUID,
-) -> uuid.UUID | None:
-    """Compatibility wrapper for callers that only admit scheduled work."""
-    return await claim_admitted_run_for_job(
-        session, ingest_job_id, execution_key=execution_key
-    )
-
-
 async def reject_pending_admitted_refresh(
     session: AsyncSession,
     *,
@@ -766,11 +797,6 @@ async def expire_unclaimed_admitted_runs(session: AsyncSession) -> list[uuid.UUI
     return expired
 
 
-async def expire_unclaimed_scheduled_runs(session: AsyncSession) -> list[uuid.UUID]:
-    """Compatibility wrapper for the historical scheduled-only recovery name."""
-    return await expire_unclaimed_admitted_runs(session)
-
-
 async def cancel_active_run_for_job(
     session: AsyncSession,
     ingest_job_id: uuid.UUID,
@@ -827,7 +853,7 @@ def project_refresh_success(
     ``contacted_origin`` gates ``last_checked_at`` ("last time GeoLens
     contacted the origin") because a file re-upload contacts nothing — the
     bytes arrived from the browser. ``source_health`` is left alone on every
-    path: its classifier belongs to #1222, not here.
+    path: its classifier is the source health probe's.
     """
     dataset.schema_drift_status = drift_status_from_diff(schema_diff)
     if contacted_origin:
@@ -972,9 +998,9 @@ async def record_refresh_blocked(
     return run_id
 
 
-# fix(#1274): guards the pathological legacy DOUBLE — the old system had no
-# admission control, so two reupload tasks for one dataset can both be live
-# at upgrade time, while the backfill's DISTINCT ON can represent only one
+# Guards the legacy DOUBLE: reuploads queued before admission control can
+# leave two live tasks for one dataset at upgrade time, while the backfill's
+# DISTINCT ON can represent only one
 # (the unique index allows one active row). That row's reservation must
 # outlive EVERY live legacy reupload task on the dataset, not just its bound
 # job, or a new refresh could race the unrepresented worker's swap. Native
@@ -1009,13 +1035,13 @@ _RUN_JOB_SCOPE = """
 # not: `dataset_refresh_runs` carries no RLS policy of its own (dormant
 # `tenant_id`, like `datasets`), so with RLS ENABLED this UPDATE would see
 # every tenant's rows while the `ingest_jobs` sub-query beside it (RLS-
-# enforced) sees only the current tenant's — reading another tenant's live
+# enforced) sees only the current tenant's, reading another tenant's live
 # job as absent. Joining through `catalog.datasets` puts the whole predicate
-# in one visibility scope. No table has RLS enabled today (#998), so this is
-# currently a no-op — written now rather than remembered later.
+# in one visibility scope. Single-tenant mode enables no RLS, so there it is
+# a no-op.
 #
-# fix(#1954): the two proofs THIS sweep needs before writing `cancelled`.
-# The status has two writers, told apart by `error_code`:
+# The two proofs THIS sweep needs before writing `cancelled`. The status has
+# two writers, told apart by `error_code`:
 # `abandoned` here, a bookkeeping correction provable only when the work is
 # not happening, and `cancel_active_run_for_job`'s `user_cancelled` stop
 # signal, which is a person's decision and needs no proof.
@@ -1028,7 +1054,7 @@ _RUN_JOB_SCOPE = """
 #
 # 2. The bound ingest job is absent, `failed`, or `pending` with no live
 #    task. `running` is skipped (the ingest stale sweep runs first and
-#    fails it out if genuinely dead). `pending` is NOT excluded (#1274):
+#    fails it out if genuinely dead). `pending` is NOT excluded:
 #    proof 1 already shows no live task, and pending-plus-no-task past the
 #    cutoff is exactly the create-then-defer death this sweep compensates
 #    for — otherwise a presigned commit interrupted before its defer would
@@ -1068,9 +1094,9 @@ _ABANDONED_RUN_SQL = text(
 )
 
 
-# fix(#1274): truth-recording counterpart to the abandonment cancel below.
-# For a NATIVE run, "bound job complete + run still active" is impossible
-# by construction (success and job completion commit together), which is
+# The truth-recording counterpart to _ABANDONED_RUN_SQL. For a NATIVE run,
+# "bound job complete + run still active" is impossible by construction
+# (success and job completion commit together), which is
 # why _ABANDONED_RUN_SQL refuses to touch it. But migration 0037's backfill
 # creates active rows for refreshes already running in PRE-migration
 # workers, which mark the job complete without calling the new finalizer.
@@ -1133,8 +1159,8 @@ async def sweep_abandoned_refresh_runs(
     recovered = list(completed.scalars())
     cancelled = list(result.scalars())
     await _release_consumed_acceptances(session, cancelled)
-    # feat(#1268): these are the only terminal transitions no worker
-    # reports, so without an event here the audit log shows a dispatch and
+    # These are the only terminal transitions no worker reports, so without
+    # an event here the audit log shows a dispatch and
     # then nothing. Emitted per run, not as one summary row: the audit log
     # is keyed on a resource, and "seven runs reconciled" names none.
     for run_id in recovered:

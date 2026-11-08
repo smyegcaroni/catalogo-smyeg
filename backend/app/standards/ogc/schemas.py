@@ -17,6 +17,10 @@ class OGCLink(BaseModel):
     title: str | None = Field(
         default=None, description="Optional human-readable label for the link."
     )
+    templated: bool | None = Field(
+        default=None,
+        description="True when `href` is a URI template with variables such as {z}, {x} and {y}.",
+    )
 
     @model_serializer
     def serialize_model(self):
@@ -37,7 +41,6 @@ class ConformanceResponse(BaseModel):
     )
 
 
-# Per-dataset collection metadata per OGC API Features
 class OGCCollectionMetadata(BaseModel):
     """Per-dataset collection metadata per OGC API Features."""
 
@@ -67,7 +70,6 @@ class OGCCollectionMetadata(BaseModel):
     )
 
 
-# Feature collection response for /collections/{id}/items
 class OGCFeatureItemsResponse(BaseModel):
     """FeatureCollection response as defined by OGC API - Features."""
 
@@ -88,7 +90,6 @@ class OGCFeatureItemsResponse(BaseModel):
     links: list[OGCLink] = Field(description="Pagination and self-reference links.")
 
 
-# Single feature response for /collections/{id}/items/{featureId}
 class OGCSingleFeatureResponse(BaseModel):
     """Single GeoJSON Feature response."""
 

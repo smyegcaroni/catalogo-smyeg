@@ -1,31 +1,37 @@
-import { useState, useMemo, useRef, useEffect, useCallback, useId } from 'react';
+import { useState, useMemo, useRef, useEffect, useCallback, useId, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   useTable,
   tableFeatures,
   rowSortingFeature,
   columnVisibilityFeature,
-  createSortedRowModel,
-  sortFn_alphanumeric,
-  sortFn_alphanumericCaseSensitive,
-  sortFn_basic,
-  sortFn_datetime,
-  sortFn_text,
-  sortFn_textCaseSensitive,
   type ColumnDef,
   type SortingState,
   type ColumnVisibilityState,
 } from '@tanstack/react-table';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { toast } from 'sonner';
+import { ApiError } from '@/api/client';
 import { useDatasetRows } from '@/components/dataset/hooks/use-dataset';
-import { useUpdateFeature } from '@/hooks/use-features';
+import { useDeleteFeatures, useUpdateFeature } from '@/hooks/use-features';
 import { useDebouncedValue } from '@/hooks/use-debounce';
 import { DEFAULT_ROWS_PAGE_SIZE, PAGE_SIZE_OPTIONS } from '@/lib/constants';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { Input } from '@/components/ui/input';
+import { LiveAnnouncement } from '@/components/ui/live-announcement';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
+import { TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -36,30 +42,18 @@ import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip
 import { formatNumber } from '@/lib/format';
 import { formatMutationError } from '@/lib/error-map';
 import { coerceAttributeValue } from '@/lib/attribute-values';
-import { Loader2, ArrowUpDown, Settings2, Pencil } from 'lucide-react';
+import { valueLabelFor, type ValueLabels } from '@/lib/value-labels';
+import type { Bbox } from '@/lib/bbox';
+import { cn } from '@/lib/utils';
+import { Loader2, ArrowDown, ArrowUp, ArrowUpDown, Settings2, Pencil, Trash2 } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
 
-// react-table v9 requires row models and sort functions to be registered
-// explicitly (v8 wired getSortedRowModel() as a table option and auto-detected
-// sortingFns). Columns here are built dynamically from the dataset's Postgres
-// column list with no per-column sortFn set, so all six built-ins must be
-// registered by name — the auto-detected sortFn (alphanumeric/text/datetime/
-// basic) still resolves by sampling each column's data, but only if its name
-// is present in this map. Registered individually rather than via the
-// library's bundled `sortFns` export, which is deprecated in favor of
-// importing only the functions actually used.
-export const features = tableFeatures({
+// Sorting is server-side (manualSorting), so no sorted row model is registered:
+// a page holds only `limit` rows, and sorting those alone would misrepresent
+// the column's order.
+const features = tableFeatures({
   rowSortingFeature,
   columnVisibilityFeature,
-  sortedRowModel: createSortedRowModel(),
-  sortFns: {
-    alphanumeric: sortFn_alphanumeric,
-    alphanumericCaseSensitive: sortFn_alphanumericCaseSensitive,
-    basic: sortFn_basic,
-    datetime: sortFn_datetime,
-    text: sortFn_text,
-    textCaseSensitive: sortFn_textCaseSensitive,
-  },
 });
 
 /** Columns that are not user-editable */
@@ -67,15 +61,121 @@ const NON_EDITABLE_COLUMNS = new Set(['gid', 'geom']);
 /** Columns that are not filterable */
 const NON_FILTERABLE_COLUMNS = new Set(['geom', 'geom_4326']);
 
+/** PostgreSQL's own short names for the verbose information_schema types. */
+const SHORT_TYPES: Record<string, string> = {
+  'character varying': 'varchar',
+  character: 'char',
+  'double precision': 'float8',
+  real: 'float4',
+  smallint: 'int2',
+  integer: 'int4',
+  bigint: 'int8',
+  boolean: 'bool',
+  'timestamp with time zone': 'timestamptz',
+  'timestamp without time zone': 'timestamp',
+  'time with time zone': 'timetz',
+  'time without time zone': 'time',
+};
+
+function shortType(type: string): string {
+  return SHORT_TYPES[type] ?? type.toLowerCase();
+}
+
+/** The detail code of a structured API refusal, if it has one. */
+function refusalCode(err: unknown): string | undefined {
+  if (!(err instanceof ApiError)) return undefined;
+  return (err.body as { code?: string } | undefined)?.code;
+}
+
 interface EditingCell {
   rowGid: number;
   column: string;
 }
 
-interface AttributeTableProps {
+/** One entry of AttributeTable's `columns` prop. */
+interface AttributeTableColumn {
+  name: string;
+  /** Header text; defaults to the column name. */
+  title?: string;
+  valueLabels?: ValueLabels;
+  /** Starts out of view; the Columns menu can add it. */
+  hidden?: boolean;
+}
+
+export interface AttributeTableProps {
   datasetId: string;
   canEdit?: boolean;
   compact?: boolean;
+  /** CQL2-JSON filter expression sent as the rows request's `filter` param. */
+  cql2Filter?: string;
+  /** Narrows the rows to this one feature, on top of every other filter. */
+  onlyGid?: number;
+  /**
+   * Row activation (Enter/click), e.g. the builder drawer finding a row on the
+   * map. With `rowsRequest.withBbox`, it also receives the row's EPSG:4326
+   * bounding box, null for a row without geometry.
+   */
+  onRowClick?: (gid: number, bbox?: Bbox | null) => void;
+  /** Rows request options: each row's bbox for `onRowClick`, and an embed token sent as `X-Embed-Token`. */
+  rowsRequest?: { withBbox?: boolean; embedToken?: string };
+  /** Replace the text of an empty filtered page, the load failure, and the first-load spinner. */
+  slots?: {
+    empty?: string;
+    error?: (error: unknown) => ReactNode;
+    loading?: ReactNode;
+  };
+  /** Reader-facing presentation: no SQL types in headers, no per-column filters, the count announced. */
+  display?: {
+    hideColumnTypes?: boolean;
+    hideColumnFilters?: boolean;
+    announceCount?: boolean;
+    /** Text for a read-only cell; keep it stable, since a new function rebuilds every cell. Default: the stored value. */
+    formatValue?: (column: string, value: unknown) => string;
+  };
+  /**
+   * The highlighted row's gid (the builder drawer's map highlight). Set, every
+   * rendered row carries aria-selected — the match "true" with the inset
+   * primary marker, the others "false" — and the marker follows the prop.
+   * Omitted, no selection is rendered (the dataset page).
+   */
+  selectedGid?: number | null;
+  /** Leading toolbar content, shown on the row that holds the Columns menu. */
+  heading?: ReactNode;
+  /** Trailing toolbar controls, after the Columns menu. */
+  actions?: ReactNode;
+  /**
+   * When set, renders the caller's node as the table's header row, receiving
+   * the row count and the Columns control; the count then no longer renders
+   * in the pagination bar, and the rows-per-page select is omitted (the
+   * caller's header owns the table's combobox — the builder drawer's layer
+   * picker). Unset, the toolbar and pagination bar render exactly as before.
+   */
+  renderHeader?: (parts: {
+    count: ReactNode;
+    columns: ReactNode;
+    /** `selectedGid` is set but its row is not among the loaded rows. */
+    selectedMissing: boolean;
+  }) => ReactNode;
+  /** Code labels per column; a labelled cell shows its label and keeps the code reachable. */
+  valueLabels?: ReadonlyMap<string, ValueLabels>;
+  /**
+   * The columns the table offers, in order, with display titles and value
+   * labels; `hidden` ones wait in the Columns menu. Response columns not
+   * listed are never shown. Omitted, every column shows as the API returns
+   * them. Pass a stable array: a new one rebuilds the column definitions and
+   * remounts the cells.
+   */
+  columns?: readonly AttributeTableColumn[];
+}
+
+/** The listed columns the response carries, in the listed order; every column when no list is given. */
+function orderColumns<T extends { name: string }>(
+  columns: readonly T[],
+  spec: readonly AttributeTableColumn[] | undefined,
+): readonly T[] {
+  if (!spec) return columns;
+  const byName = new Map(columns.map((col) => [col.name, col]));
+  return spec.flatMap((col) => byName.get(col.name) ?? []);
 }
 
 /** Postgres numeric types get a decimal input mode on touch keyboards. */
@@ -104,20 +204,18 @@ function InlineCellEditor({
   const [value, setValue] = useState(initialValue);
   const errorId = useId();
 
-  // fix(#1628): keyed on isSaving, not []. The saving branch below swaps the
-  // input out for a spinner, and a save that fails leaves the editor open —
-  // before #1628 the editor was remounted wholesale on every render, so this
-  // effect happened to re-run and put the caret back. It no longer remounts,
-  // so re-focus explicitly when the input comes back.
+  // Keyed on isSaving, not []. The saving branch below swaps the
+  // input out for a spinner, and a save that fails leaves the editor open.
+  // The editor is not remounted on re-render, so re-focus explicitly when the
+  // input comes back.
   useEffect(() => {
     if (isSaving) return;
     inputRef.current?.focus();
     inputRef.current?.select();
   }, [isSaving]);
 
-  // fix(#458 E-35): an unchanged value is a cancel, not a save — blur used to
-  // commit a no-op PATCH that bumped updated_at, rolled the tile version, and
-  // wrote an attribute.edit audit event for a non-change.
+  // An unchanged value is a cancel, not a save: a no-op PATCH would bump
+  // updated_at, roll the tile version and write an attribute.edit audit event.
   const commit = () => {
     if (value === initialValue) {
       onCancel();
@@ -148,11 +246,11 @@ function InlineCellEditor({
         onChange={(e) => setValue(e.target.value)}
         onBlur={commit}
         onKeyDown={handleKeyDown}
-        // fix(#820): the input must fit inside the fixed row height for its
+        // The input must fit inside the fixed row height for its
         // density mode (44px default / 28px compact) so an open editor cannot
         // stretch the row past the virtualizer's per-mode row size.
         className={`${compact ? 'h-6' : 'h-7'} text-xs px-1`}
-        // fix(#458 E-39): name the editor (column + row) and tie the rejection
+        // Name the editor (column + row) and tie the rejection
         // reason to the field so it isn't just a transient toast for SR users.
         aria-label={label}
         aria-invalid={error ? true : undefined}
@@ -168,19 +266,40 @@ function InlineCellEditor({
   );
 }
 
-export function AttributeTable({ datasetId, canEdit = false, compact = false }: AttributeTableProps) {
+export function AttributeTable({
+  datasetId,
+  canEdit = false,
+  compact = false,
+  cql2Filter,
+  onlyGid,
+  onRowClick,
+  selectedGid,
+  heading,
+  actions,
+  renderHeader,
+  valueLabels: valueLabelsProp,
+  columns: columnSpec,
+  rowsRequest,
+  slots,
+  display,
+}: AttributeTableProps) {
   const { t } = useTranslation('dataset');
-  const [cursor, setCursor] = useState(0);
   const [cursorHistory, setCursorHistory] = useState<number[]>([0]);
+  const cursor = cursorHistory[cursorHistory.length - 1];
   const [editingCell, setEditingCell] = useState<EditingCell | null>(null);
   const [editError, setEditError] = useState<string | null>(null);
-  // Scroll container ref used by the row virtualizer (PERF-07).
   const parentRef = useRef<HTMLDivElement>(null);
+  const deleteConfirmedRef = useRef(false);
   const [columnFilters, setColumnFilters] = useState<Record<string, string>>({});
   const [pageSize, setPageSize] = useState(DEFAULT_ROWS_PAGE_SIZE);
   const [sorting, setSorting] = useState<SortingState>([]);
+  // The user's Columns-menu choices only; columns the `columns` prop leaves
+  // out start hidden underneath them.
   const [columnVisibility, setColumnVisibility] = useState<ColumnVisibilityState>({});
   const updateFeature = useUpdateFeature();
+  const deleteFeatures = useDeleteFeatures();
+  const [selection, setSelection] = useState<ReadonlySet<number>>(() => new Set());
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const authIdentity = useAuthStore((state) => `${state.sessionEpoch}:${state.user?.id ?? ''}`);
   const requestScopeRef = useRef({ datasetId, authIdentity });
   if (
@@ -204,26 +323,110 @@ export function AttributeTable({ datasetId, canEdit = false, compact = false }: 
     return Object.keys(f).length > 0 ? f : undefined;
   }, [debouncedFilters]);
 
-  // Reset cursor and history when filters change
-  useEffect(() => {
-    setCursor(0);
-    setCursorHistory([0]);
-  }, [debouncedFilters]);
+  const sort = useMemo(
+    () => (sorting[0] ? { column: sorting[0].id, desc: sorting[0].desc } : undefined),
+    [sorting],
+  );
 
-  // fix(#458 E-51): an open cell editor survives a page/filter/page-size
-  // change; if the edited row leaves the result set the in-progress edit
-  // silently vanishes. Close it (and clear any error) when the row set moves.
+  // A cursor is a position within one filter + sort order. Reset paging during
+  // render, not in an effect, so no request goes out with the new order and
+  // the old cursor.
+  const pagingScope = JSON.stringify([activeFilters ?? null, sort ?? null, cql2Filter ?? null, onlyGid ?? null]);
+  const [pagedScope, setPagedScope] = useState(pagingScope);
+  if (pagedScope !== pagingScope) {
+    setPagedScope(pagingScope);
+    setCursorHistory([0]);
+  }
+
+  // When the row set moves (page, filter, sort, page size), an open cell
+  // editor would silently lose its in-progress edit as the row leaves, so
+  // close it and clear any error. The new rows start at the top; keep the
+  // horizontal position.
   useEffect(() => {
     setEditingCell(null);
     setEditError(null);
-  }, [datasetId, cursor, activeFilters, pageSize]);
+    if (parentRef.current) parentRef.current.scrollTop = 0;
+  }, [datasetId, cursor, activeFilters, sort, pageSize, cql2Filter, onlyGid]);
 
-  const { data, isLoading, isFetching, isError } = useDatasetRows(
+  const { data, error, isLoading, isFetching, isError, isPlaceholderData } = useDatasetRows(
     datasetId,
     pageSize,
     cursor,
     activeFilters,
+    sort,
+    cql2Filter,
+    onlyGid,
+    rowsRequest,
   );
+  // A schema edit, in GeoLens or on a live table, can drop or retype the sorted
+  // column, and the server reports that as a 400 whose text depends on where it
+  // failed. Fall back to unsorted rows; a 400 that persists without the sort is
+  // shown as usual.
+  if (sort && error instanceof ApiError && error.status === 400) {
+    setSorting([]);
+  }
+
+  // A selection belongs to one page of one query against one table, since a
+  // replacement table reuses gids. Like paging above, it is reset during
+  // render so no frame offers to delete rows the user did not select.
+  const selectionScope = JSON.stringify([
+    datasetId, authIdentity, pagingScope, pageSize, cursor, data?.table_id,
+  ]);
+  const [selectedScope, setSelectedScope] = useState(selectionScope);
+  if (selectedScope !== selectionScope) {
+    setSelectedScope(selectionScope);
+    setSelection(new Set());
+  }
+  // A bigint gid past 2^53 arrives rounded, so it could name another row.
+  const pageGids = useMemo(
+    () => (data?.rows ?? []).map((row) => row.gid as number).filter(Number.isSafeInteger),
+    [data?.rows],
+  );
+  const selectedGids = useMemo(
+    () => pageGids.filter((gid) => selection.has(gid)),
+    [selection, pageGids],
+  );
+  const selectable = canEdit && pageGids.length > 0;
+  // A refetch can drop every selected row, e.g. deleted by someone else,
+  // while the confirmation is open; there is then nothing to confirm.
+  if (deleteConfirmOpen && selectedGids.length === 0) setDeleteConfirmOpen(false);
+
+  const toggleRow = useCallback((gid: number, checked: boolean) => {
+    setSelection((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(gid);
+      else next.delete(gid);
+      return next;
+    });
+  }, []);
+
+  const togglePage = useCallback((checked: boolean) => {
+    setSelection(new Set(checked ? pageGids : []));
+  }, [pageGids]);
+
+  const handleDeleteRows = useCallback(async () => {
+    const gids = selectedGids;
+    const submittedScope = requestScopeRef.current;
+    try {
+      const result = await deleteFeatures.mutateAsync({
+        datasetId,
+        gids,
+        tableId: data?.table_id,
+      });
+      if (requestScopeRef.current !== submittedScope) return;
+      setSelection((prev) => new Set([...prev].filter((gid) => !gids.includes(gid))));
+      toast.success(t('attributes.rowsDeleted', {
+        count: result.deleted,
+        formattedCount: formatNumber(result.deleted),
+      }));
+    } catch (err) {
+      if (requestScopeRef.current !== submittedScope) return;
+      const code = refusalCode(err);
+      if (code === 'dataset_replaced') toast.error(t('map.featureDatasetReplaced'));
+      else if (code === 'feature_not_found') toast.error(t('attributes.deleteRowsMissing'));
+      else toast.error(formatMutationError('dataset:attributes.deleteRowsFailed', err));
+    }
+  }, [selectedGids, datasetId, data?.table_id, deleteFeatures, t]);
 
   const handleFilterChange = useCallback((colName: string, value: string) => {
     setColumnFilters((prev) => ({ ...prev, [colName]: value }));
@@ -233,21 +436,21 @@ export function AttributeTable({ datasetId, canEdit = false, compact = false }: 
     const submittedDatasetId = datasetId;
     const submittedScope = requestScopeRef.current;
     const submittedCell = editingCellRef.current;
-    // fix(#458 E-03): the inline editor is a plain text input; coerce to the
+    // The inline editor is a plain text input; coerce to the
     // column's wire type instead of sending a string into a typed column.
     const coerced = coerceAttributeValue(newValue, colType);
     if (!coerced.ok) {
       const msg = t('attributes.editInvalidValue', { type: colType });
-      // fix(#458 E-39): mirror the toast into field-associated state so the
+      // Mirror the toast into field-associated state so the
       // open editor carries aria-invalid/aria-describedby.
       setEditError(msg);
       toast.error(msg);
       return; // keep the editor open so the value can be corrected
     }
     setEditError(null);
-    // fix(#458 E-22): keep the cell in edit mode through the await so the saving
-    // spinner (InlineCellEditor isSaving) actually renders; clearing editingCell
-    // before awaiting made that branch unreachable and showed the stale value.
+    // Keep the cell in edit mode through the await so the saving spinner
+    // (InlineCellEditor isSaving) renders; clearing editingCell first made that
+    // branch unreachable and showed the stale value.
     try {
       await updateFeature.mutateAsync({
         datasetId: submittedDatasetId,
@@ -265,7 +468,7 @@ export function AttributeTable({ datasetId, canEdit = false, compact = false }: 
         requestScopeRef.current !== submittedScope
         || editingCellRef.current !== submittedCell
       ) return;
-      // fix(#458 E-21): surface the backend's specific reason (geometry-type
+      // Surface the backend's specific reason (geometry-type
       // mismatch, unknown column, …) instead of a generic toast, and keep the
       // editor open so the value can be corrected rather than silently reverting.
       const msg = formatMutationError('dataset:attributes.editFailed', err);
@@ -274,33 +477,41 @@ export function AttributeTable({ datasetId, canEdit = false, compact = false }: 
     }
   }, [datasetId, updateFeature, t]);
 
-  // fix(#1628): everything the cell renderer needs that changes from render to
-  // render, read through one ref so `columns` below never has to list it.
+  // Everything the cell renderer needs that changes render to render, read
+  // through one ref so `columnDefs` below never has to list it.
   //
   // TanStack's `<table.FlexRender cell={cell} />` renders `columnDef.cell` as
-  // the React component TYPE (`React.createElement(def.cell, ctx)`), so a new
-  // `columns` array is a new element type at every cell position and React
-  // unmounts and remounts the whole cell subtree instead of re-rendering it.
-  // That resets InlineCellEditor's `value` state back to the stored cell value.
-  // `columns` used to depend on `handleCellSave`, whose own dep list carries
-  // the object react-query's useMutation returns — and that is rebuilt on
-  // EVERY render (`return { ...result, mutate, mutateAsync: result.mutate }`,
-  // react-query 5.101 useMutation.ts). So any re-render at all, from anywhere
-  // in the page, silently threw away what the user had typed into an open
-  // cell editor. Enter then hit commit()'s value === initialValue branch: no
-  // PATCH, no validation message, editor just closes. That is the #1628 e2e
-  // flake, and the same reset also defeated the "keep the editor open so the
-  // value can be corrected" behaviour of E-03/E-21 for real users.
+  // the React component TYPE, so a new `columnDefs` array is a new element type at
+  // every cell position and React remounts the cell subtree, resetting
+  // InlineCellEditor's `value` to the stored value. Depending on
+  // `handleCellSave` would do exactly that: its deps carry the object
+  // react-query's useMutation returns, rebuilt on EVERY render (react-query
+  // 5.101 useMutation.ts), so any re-render would throw away what the user
+  // typed into an open editor, and Enter would hit commit()'s value ===
+  // initialValue branch and close without a PATCH or validation message.
   //
-  // Reading state from a ref during render is the pattern this component
-  // already used for `editingCell`: the ref is written in this render pass,
-  // before FlexRender renders the cells that read it.
+  // The ref is written in this render pass, before FlexRender renders the
+  // cells that read it, as for `editingCell`.
+  // What the `columns` prop adds: header titles, and its value labels merged
+  // over the `valueLabels` prop.
+  const { titleByName, valueLabels: effectiveValueLabels } = useMemo(() => {
+    const titles = new Map<string, string>();
+    let labels = valueLabelsProp;
+    for (const col of columnSpec ?? []) {
+      if (col.title) titles.set(col.name, col.title);
+      if (col.valueLabels) {
+        labels = new Map(labels).set(col.name, col.valueLabels);
+      }
+    }
+    return { titleByName: titles, valueLabels: labels };
+  }, [valueLabelsProp, columnSpec]);
   const cellRenderState = {
     editingCell,
     editError,
     isSaving: updateFeature.isPending,
     canEdit,
     compact,
+    valueLabels: effectiveValueLabels,
     onSave: handleCellSave,
   };
   const cellRenderRef = useRef(cellRenderState);
@@ -309,24 +520,37 @@ export function AttributeTable({ datasetId, canEdit = false, compact = false }: 
   const handleNextPage = useCallback(() => {
     if (data?.next_cursor != null) {
       setCursorHistory((prev) => [...prev, data.next_cursor!]);
-      setCursor(data.next_cursor!);
     }
   }, [data?.next_cursor]);
 
   const handlePreviousPage = useCallback(() => {
-    setCursorHistory((prev) => {
-      if (prev.length <= 1) return prev;
-      const newHistory = prev.slice(0, -1);
-      setCursor(newHistory[newHistory.length - 1]);
-      return newHistory;
-    });
+    setCursorHistory((prev) => (prev.length <= 1 ? prev : prev.slice(0, -1)));
   }, []);
 
-  const columns = useMemo<ColumnDef<typeof features, Record<string, unknown>>[]>(() => {
-    if (!data?.columns) return [];
-    return data.columns.map((col) => ({
+  const dataColumns = useMemo(
+    () => (data?.columns ? orderColumns(data.columns, columnSpec) : undefined),
+    [data?.columns, columnSpec],
+  );
+  const hideColumnTypes = !!display?.hideColumnTypes;
+  const formatValue = display?.formatValue;
+
+  const columnDefs = useMemo<ColumnDef<typeof features, Record<string, unknown>>[]>(() => {
+    if (!dataColumns) return [];
+    // An API without the field offers no sorting rather than a failing one.
+    const sortable = new Set(data?.sortable_columns ?? []);
+    return dataColumns.map((col) => ({
       accessorKey: col.name,
-      header: `${col.name} (${col.type})`,
+      header: () => (
+        <>
+          {titleByName.get(col.name) ?? col.name}
+          {!hideColumnTypes && (
+            <span className="font-normal text-muted-foreground" title={col.type}>
+              {shortType(col.type)}
+            </span>
+          )}
+        </>
+      ),
+      enableSorting: sortable.has(col.name),
       cell: (info) => {
         const {
           editingCell: currentEdit,
@@ -334,6 +558,7 @@ export function AttributeTable({ datasetId, canEdit = false, compact = false }: 
           isSaving,
           canEdit: cellsEditable,
           compact: isCompact,
+          valueLabels: labelsByColumn,
           onSave,
         } = cellRenderRef.current;
         const rowData = info.row.original;
@@ -363,18 +588,45 @@ export function AttributeTable({ datasetId, canEdit = false, compact = false }: 
           );
         }
 
-        const cellValue = String(info.getValue() ?? '');
-
+        const rawValue = info.getValue();
+        const storedValue = String(rawValue ?? '');
+        const cellValue = formatValue ? formatValue(col.name, rawValue) : storedValue;
+        const codeLabel = valueLabelFor(labelsByColumn?.get(col.name), rawValue);
         if (cellsEditable && !NON_EDITABLE_COLUMNS.has(col.name)) {
+          // The code shows beside its label on hover and focus, and screen
+          // readers always read it.
+          const shown = codeLabel === undefined ? cellValue : (
+            <>
+              {codeLabel}{' '}
+              <span className="text-muted-foreground opacity-0 group-hover/cell:opacity-100 group-focus-visible/cell:opacity-100">
+                ({storedValue})
+              </span>
+            </>
+          );
           return (
             <button
               type="button"
               className="group/cell flex items-center gap-1 rounded-sm px-0.5 -mx-0.5 text-start hover:bg-muted/50 w-full"
               onClick={() => setEditingCell({ rowGid: gid, column: col.name })}
             >
-              <span className="truncate">{cellValue}</span>
+              <span className="truncate">{shown}</span>
               <Pencil className="h-2.5 w-2.5 shrink-0 text-muted-foreground/0 group-hover/cell:text-muted-foreground/50" />
             </button>
+          );
+        }
+
+        if (codeLabel !== undefined) {
+          return (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button type="button" className="block max-w-full truncate rounded-sm text-start">
+                  {codeLabel}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="max-w-sm break-all">
+                {storedValue}
+              </TooltipContent>
+            </Tooltip>
           );
         }
 
@@ -394,48 +646,54 @@ export function AttributeTable({ datasetId, canEdit = false, compact = false }: 
         return cellValue;
       },
     }));
-    // fix(#1628): the column list and `t` ONLY. Every other input the renderer
-    // needs comes from cellRenderRef, because adding any of them back here
-    // remounts every cell — and with it any open editor — whenever they change.
-    // `t` is safe to keep: react-i18next caches its useSyncExternalStore
-    // snapshot and only hands back a new `t` on a language change, which is a
-    // legitimate reason to rebuild the columns.
-  }, [data?.columns, t]);
+    // The column lists and `t` ONLY: adding any other input remounts every
+    // cell, and with it any open editor, whenever it changes. `t` is safe
+    // because react-i18next caches its useSyncExternalStore snapshot and hands
+    // back a new `t` only on a language change, a legitimate reason to rebuild.
+  }, [dataColumns, data?.sortable_columns, titleByName, hideColumnTypes, formatValue, t]);
+
+  const defaultHidden = useMemo<ColumnVisibilityState>(
+    () => Object.fromEntries((columnSpec ?? []).filter((col) => col.hidden).map((col) => [col.name, false])),
+    [columnSpec],
+  );
+
+  const visibility = useMemo(
+    () => ({ ...defaultHidden, ...columnVisibility }),
+    [defaultHidden, columnVisibility],
+  );
 
   const table = useTable(
     {
       features,
       data: data?.rows ?? [],
-      columns,
-      state: { sorting, columnVisibility },
+      columns: columnDefs,
+      state: { sorting, columnVisibility: visibility },
       onSortingChange: setSorting,
       onColumnVisibilityChange: setColumnVisibility,
+      manualSorting: true,
+      enableMultiSort: false,
+      sortDescFirst: false,
     },
     (state) => state,
   );
 
-  // PERF-07: virtualize the body so that 100-row pages render only the visible
-  // window (~10-20 rows + overscan), keeping DOM-node count flat regardless of
-  // page size or column count. The virtualizer iterates over the post-sort,
-  // post-filter row model from TanStack Table — sort/filter state changes flow
-  // through naturally on each render via `count: rows.length`.
+  // Virtualize the body so 100-row pages render only the visible window (~10-20
+  // rows + overscan), keeping DOM-node count flat. Rows arrive filtered and
+  // sorted from the server.
   const rows = table.getRowModel().rows;
-  // fix(#820): fixed-height rows only — never reintroduce dynamic row
-  // measurement here. With a Chrome AX tree attached (screen reader, CDP
-  // Accessibility.enable), the measure→layout→re-render edge fed back
-  // synchronously and locked the page in an infinite render loop.
+  // Fixed-height rows only: never reintroduce dynamic row measurement. With a
+  // Chrome AX tree attached (screen reader, CDP Accessibility.enable), the
+  // measure→layout→re-render edge fed back synchronously and locked the page
+  // in an infinite render loop.
   //
   // The row height is enforced, not estimated: each body cell carries an
   // explicit height class (h-11 / h-7 below) matching this value, and in a
-  // collapsed-border table an explicit cell height yields exactly that row
-  // pitch (measured in Chromium: 44/28px in both densities, editor open or
-  // not — the border is absorbed into the specified height). Keep rowHeight
+  // collapsed-border table that yields exactly that row pitch (measured in
+  // Chromium: 44/28px in both densities, editor open or not). Keep rowHeight
   // and the cell height classes in lockstep.
   const rowHeight = compact ? 28 : 44;
-  // fix(#1407): react-hooks/incompatible-library only reports the first
-  // flagged hook it finds per component. The removed useReactTable() call
-  // used to occupy that slot (suppressed below it), which silently masked
-  // this same warning on useVirtualizer() below.
+  // react-hooks/incompatible-library only reports the first flagged hook it
+  // finds per component, so the suppression below applies to useVirtualizer().
   // eslint-disable-next-line react-hooks/incompatible-library -- TanStack Virtual returns imperative helpers; this component keeps virtualizer state local.
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -445,13 +703,30 @@ export function AttributeTable({ datasetId, canEdit = false, compact = false }: 
   });
   const virtualItems = virtualizer.getVirtualItems();
 
-  // fix(#851): TanStack Virtual (virtual-core 3.17.x) does not include
-  // estimateSize in its measurement-cache deps (getMeasurementOptions covers
-  // count/padding/scrollMargin/getItemKey/enabled/lanes/gap only), so when
-  // the density toggle flips rowHeight 44↔28 the cells resize immediately but
-  // getTotalSize() and item offsets keep the old density. measure() is the
-  // documented reset: it clears the item-size cache and recomputes. Skip the
-  // mount pass — the initial layout is already built from the right size.
+  // A selection made elsewhere (a map click) may sit outside the scrolled
+  // view. Rows have a fixed pitch below the sticky header, which the
+  // virtualizer's own offsets leave out, so the row is placed from those.
+  const selectedIndex = selectedGid == null
+    ? -1
+    : rows.findIndex((row) => row.original.gid === selectedGid);
+  useEffect(() => {
+    const scroller = parentRef.current;
+    if (selectedIndex < 0 || !scroller) return;
+    const headerHeight = scroller.querySelector('thead')?.offsetHeight ?? 0;
+    const top = headerHeight + selectedIndex * rowHeight;
+    if (top - headerHeight < scroller.scrollTop) {
+      scroller.scrollTop = top - headerHeight;
+    } else if (top + rowHeight > scroller.scrollTop + scroller.clientHeight) {
+      scroller.scrollTop = top + rowHeight - scroller.clientHeight;
+    }
+  }, [selectedIndex, rowHeight]);
+
+  // TanStack Virtual (virtual-core 3.17.x) leaves estimateSize out of its
+  // measurement-cache deps (getMeasurementOptions covers count/padding/
+  // scrollMargin/getItemKey/enabled/lanes/gap only), so when the density toggle
+  // flips rowHeight 44↔28 the cells resize but getTotalSize() and item offsets
+  // keep the old density. measure() clears the item-size cache and recomputes.
+  // Skip the mount pass: the initial layout already uses the right size.
   const prevCompactRef = useRef(compact);
   useEffect(() => {
     if (prevCompactRef.current !== compact) {
@@ -460,169 +735,304 @@ export function AttributeTable({ datasetId, canEdit = false, compact = false }: 
     }
   }, [compact, virtualizer]);
 
+  // `bboxes` runs parallel to `rows`; absent unless `withBbox` asked for it.
+  const rowBbox = (index: number): Bbox | null | undefined => {
+    if (!rowsRequest?.withBbox) return undefined;
+    const bbox = data?.bboxes?.[index];
+    return bbox && bbox.length === 4 && bbox.every(Number.isFinite) ? (bbox as Bbox) : null;
+  };
+
   const approximateTotal = data?.approximate_total ?? 0;
+  const totalKind = data?.total_kind ?? 'estimate';
   const rowCount = data?.rows?.length ?? 0;
-  const effectiveTotal = approximateTotal > 0 ? approximateTotal : rowCount;
-  const isExact = approximateTotal === 0 && rowCount > 0;
+  // A filtered page's total is counted, so zero means no match rather than no statistics.
+  const counted = totalKind !== 'estimate';
+  const effectiveTotal = counted || approximateTotal > 0 ? approximateTotal : rowCount;
+  const isExact = totalKind === 'exact' || (!counted && approximateTotal === 0 && rowCount > 0);
   const rangeStart = rowCount > 0 ? (cursorHistory.length - 1) * pageSize + 1 : 0;
   const rangeEnd = rangeStart > 0 ? rangeStart + rowCount - 1 : 0;
 
+  // The row count text: the pagination bar renders it by default, a
+  // renderHeader caller embeds it in its own header instead.
+  const countText = t(
+    totalKind === 'at_least'
+      ? 'attributes.showingAtLeast'
+      : isExact
+        ? 'attributes.showingExact'
+        : 'attributes.showing',
+    { start: formatNumber(rangeStart), end: formatNumber(rangeEnd), total: formatNumber(effectiveTotal) },
+  );
+  const countNode = (
+    <span className="whitespace-nowrap text-muted-foreground">
+      {countText}
+      {isFetching && (
+        <Loader2 className="inline h-3 w-3 animate-spin ms-2" />
+      )}
+    </span>
+  );
+
+  const columnsMenu = columnDefs.length > 0 ? (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="outline" size="sm" className="h-7 pointer-coarse:min-h-11 text-xs gap-1.5" title={t('attributes.columns')}>
+          <Settings2 className="h-3.5 w-3.5" aria-hidden="true" />
+          <span className="max-[399px]:sr-only">{t('attributes.columns')}</span>
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="max-h-64 overflow-y-auto">
+        {table.getAllColumns()
+          .filter((col) => col.getCanHide())
+          .map((col) => (
+            <DropdownMenuCheckboxItem
+              key={col.id}
+              className="text-xs"
+              checked={col.getIsVisible()}
+              onCheckedChange={(value) => col.toggleVisibility(!!value)}
+            >
+              {titleByName.get(col.id) ?? col.id}
+            </DropdownMenuCheckboxItem>
+          ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  ) : null;
+
+  const deleteRowsAction = selectedGids.length > 0 ? (
+    <Button
+      variant="destructive"
+      size="sm"
+      className="h-7 text-xs gap-1.5"
+      onClick={() => setDeleteConfirmOpen(true)}
+      disabled={deleteFeatures.isPending}
+    >
+      <Trash2 className="h-3.5 w-3.5" />
+      {t('attributes.deleteRows', {
+        count: selectedGids.length,
+        formattedCount: formatNumber(selectedGids.length),
+      })}
+    </Button>
+  ) : null;
+
+  // The root is a shrinkable flex column: inside a height-bounded parent
+  // (DataTab) the scroll region absorbs the overflow, so the toolbar and the
+  // pagination bar stay on screen. A renderHeader caller owns the header row,
+  // so the shell drops the inter-row gap (the caller's header borders the
+  // table directly).
+  const shell = (body: ReactNode) => (
+    <div className={cn('flex min-h-0 flex-1 flex-col', !renderHeader && 'gap-3')}>
+      {renderHeader ? (
+        renderHeader({
+          count: countNode,
+          columns: columnsMenu,
+          selectedMissing: data !== undefined && !isPlaceholderData && selectedIndex < 0 && selectedGid != null,
+        })
+      ) : (
+        heading || actions || columnsMenu ? (
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            {heading}
+            <div className="ms-auto flex items-center gap-1">
+              {deleteRowsAction}
+              {columnsMenu}
+              {actions}
+            </div>
+          </div>
+        ) : null
+      )}
+      {/* Paging, filters and a moving map refetch; the delay announces only where the count settles. */}
+      {display?.announceCount && data && <LiveAnnouncement text={countText} delayMs={1000} />}
+      {body}
+    </div>
+  );
+
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center py-12">
-        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-      </div>
+    return shell(
+      slots?.loading ?? (
+        <div className="flex items-center justify-center py-12">
+          <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+        </div>
+      ),
     );
   }
 
-  if (isError) return <div className="p-4 text-sm text-destructive">{t('attributes.loadFailed', { defaultValue: 'Failed to load data. Please try again.' })}</div>;
+  if (isError) {
+    return shell(
+      slots?.error?.(error) ?? (
+        <div className="p-4 text-sm text-destructive">{t('attributes.loadFailed', { defaultValue: 'Failed to load data. Please try again.' })}</div>
+      ),
+    );
+  }
 
-  if (effectiveTotal === 0 && !activeFilters && (!data?.rows || data.rows.length === 0)) {
-    return (
+  // A CQL2 filter that matched nothing is a filter result, not an empty
+  // dataset: it flows through the normal path (header, toolbar, noResults).
+  if (effectiveTotal === 0 && !activeFilters && !cql2Filter && (!data?.rows || data.rows.length === 0)) {
+    return shell(
       <div className="text-center py-12 text-muted-foreground">
         {t('attributes.noData')}
-      </div>
+      </div>,
     );
   }
 
-  // fix(#820): exact per-density cell height (py-0 + h-*) instead of padding,
+  // Exact per-density cell height (py-0 + h-*) instead of padding,
   // so real row pitch always equals `rowHeight` and the virtualizer's offset
   // math stays correct without dynamic measurement.
   const cellClass = compact ? 'h-7 py-0 text-xs' : 'h-11 py-0';
+  const lastItem = virtualItems[virtualItems.length - 1];
+  const paddingTop = virtualItems[0]?.start ?? 0;
+  const paddingBottom = lastItem
+    ? virtualizer.getTotalSize() - (lastItem.start + lastItem.size)
+    : 0;
+  const visibleColumnCount = table.getVisibleLeafColumns().length + (selectable ? 1 : 0);
+  const pageChecked = selectedGids.length === 0
+    ? false
+    : selectedGids.length === pageGids.length
+      ? true
+      : 'indeterminate';
 
-  return (
-    <div className="space-y-3">
-      {/* Toolbar: column visibility */}
-      <div className="flex items-center justify-end">
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="outline" size="sm" className="h-7 text-xs gap-1.5">
-              <Settings2 className="h-3.5 w-3.5" />
-              {t('attributes.columns')}
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="max-h-64 overflow-y-auto">
-            {table.getAllColumns()
-              .filter((col) => col.getCanHide())
-              .map((col) => (
-                <DropdownMenuCheckboxItem
-                  key={col.id}
-                  className="capitalize text-xs"
-                  checked={col.getIsVisible()}
-                  onCheckedChange={(value) => col.toggleVisibility(!!value)}
-                >
-                  {col.id}
-                </DropdownMenuCheckboxItem>
-              ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </div>
-
+  return shell(
+    <>
       {/*
-        PERF-07: scroll container is `parentRef`. Virtualization is applied to
-        the <tbody> only — the native <table>/<thead>/<tr>/<td> structure is
-        preserved so column auto-sizing and sticky headers keep working. The
-        table is `w-max` (content-sized): wide tables overflow and scroll via
-        the inner shadcn Table container's `overflow-x-auto`; few-column tables
-        size to their content instead of stretching to fill (no empty columns).
-        Vertical scroll is captured here (max-h + overflow-auto).
+        `parentRef` is the only scroll container, for both axes, so the
+        sticky header and the horizontal scrollbar belong to the visible box.
+        The shared Table renders `bare` because its own overflow wrapper would
+        nest a second scroll container that grows to the rendered rows and
+        clips them. The table is `w-max` (content-sized): wide tables scroll
+        sideways and few-column tables don't stretch into empty columns.
 
-        The recommended TanStack pattern for native-table virtualization
-        (https://tanstack.com/virtual/latest/docs/framework/react/examples/table)
-        keeps rendered <tr>s in document flow and shifts each one back to its
-        virtualized offset via `translateY(virtualRow.start - index * size)`.
-        Total scrollable height is enforced by an inner spacer div wrapping
-        the <table>. The spacer sets only a min-height (the rows' total): the
-        sticky header rows are not counted in it, so a fixed height would clip
-        the rows of a short table below the scroll box's edge.
+        Only the <tbody> is virtualized, and spacer rows above and below the
+        rendered window give the table its full height. A sticky <thead> stays
+        pinned only while its table is that tall; rows shifted with transforms
+        would leave the table short and let the header scroll away.
       */}
       <div
         ref={parentRef}
-        className="rounded-md border relative max-h-[60vh] overflow-auto"
+        role="region"
+        aria-label={t('attributes.tableLabel')}
+        tabIndex={0} // eslint-disable-line jsx-a11y/no-noninteractive-tabindex -- scrollable region must be keyboard-focusable
+        className="relative min-h-0 overflow-auto rounded-md border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
       >
-        <div
-          style={
-            rows.length === 0
-              ? undefined
-              : { minHeight: `${virtualizer.getTotalSize()}px`, width: '100%' }
-          }
-        >
-          <Table aria-label={t('attributes.tableLabel')} className="w-max">
-            <TableHeader className="sticky top-0 z-10 bg-muted/80 backdrop-blur-sm">
-              {table.getHeaderGroups().map((headerGroup) => (
-                <TableRow key={headerGroup.id}>
-                  {headerGroup.headers.map((header) => {
-                    // fix(#438): A11Y-04 — announce sort state on the column header.
-                    const sorted = header.column.getIsSorted();
-                    const ariaSort = sorted === 'asc'
-                      ? 'ascending'
-                      : sorted === 'desc'
-                        ? 'descending'
-                        : header.column.getCanSort()
-                          ? 'none'
-                          : undefined;
-                    return (
-                    <TableHead key={header.id} aria-sort={ariaSort}>
-                      {header.isPlaceholder ? null : (
-                        <button
-                          type="button"
-                          className="flex items-center gap-1 hover:text-foreground"
-                          onClick={header.column.getToggleSortingHandler()}
-                        >
-                          <table.FlexRender header={header} />
-                          {header.column.getIsSorted() === 'asc' ? (
-                            <span> ↑</span>
-                          ) : header.column.getIsSorted() === 'desc' ? (
-                            <span> ↓</span>
-                          ) : (
-                            <ArrowUpDown className="h-3 w-3 text-muted-foreground/50" />
-                          )}
-                        </button>
-                      )}
-                    </TableHead>
-                    );
-                  })}
-                </TableRow>
-              ))}
-              {/* Filter row */}
-              <TableRow>
-                {table.getHeaderGroups()[0]?.headers.map((header) => (
-                  <TableHead key={`filter-${header.id}`} className="py-1">
-                    {!NON_FILTERABLE_COLUMNS.has(header.column.id) ? (
-                      <Input
-                        aria-label={t('attributes.filterColumn', { column: header.column.id })}
-                        value={columnFilters[header.column.id] ?? ''}
-                        onChange={(e) => handleFilterChange(header.column.id, e.target.value)}
-                        placeholder={t('attributes.filter')}
-                        className="bg-transparent border-0 border-b rounded-none text-xs h-7 focus-visible:ring-0 focus-visible:border-primary"
-                      />
-                    ) : null}
+        <table data-slot="table" className="w-max min-w-full caption-bottom text-sm">
+          <TableHeader className="sticky top-0 z-10 bg-muted">
+            {table.getHeaderGroups().map((headerGroup) => (
+              <TableRow key={headerGroup.id}>
+                {selectable ? (
+                  <TableHead className="w-10">
+                    <Checkbox
+                      aria-label={t('attributes.selectPage')}
+                      checked={pageChecked}
+                      disabled={isPlaceholderData}
+                      onCheckedChange={(value) => togglePage(value === true)}
+                    />
                   </TableHead>
-                ))}
+                ) : null}
+                {headerGroup.headers.map((header) => {
+                  // Announce sort state on the column header.
+                  const sorted = header.column.getIsSorted();
+                  const canSort = header.column.getCanSort();
+                  const ariaSort = sorted === 'asc'
+                    ? 'ascending'
+                    : sorted === 'desc'
+                      ? 'descending'
+                      : canSort
+                        ? 'none'
+                        : undefined;
+                  return (
+                  <TableHead key={header.id} aria-sort={ariaSort} className="normal-case">
+                    {header.isPlaceholder ? null : canSort ? (
+                      <button
+                        type="button"
+                        className="flex items-center gap-1.5 hover:text-foreground"
+                        onClick={header.column.getToggleSortingHandler()}
+                      >
+                        <table.FlexRender header={header} />
+                        {sorted === 'asc' ? (
+                          <ArrowUp className="h-3 w-3" />
+                        ) : sorted === 'desc' ? (
+                          <ArrowDown className="h-3 w-3" />
+                        ) : (
+                          <ArrowUpDown className="h-3 w-3 text-muted-foreground/50" />
+                        )}
+                      </button>
+                    ) : (
+                      <span className="flex items-center gap-1.5">
+                        <table.FlexRender header={header} />
+                      </span>
+                    )}
+                  </TableHead>
+                  );
+                })}
               </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rows.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={columns.length} className="text-center text-muted-foreground py-8">
-                    {t('attributes.noResults')}
-                  </TableCell>
-                </TableRow>
-              ) : (
-                virtualItems.map((virtualRow, index) => {
+            ))}
+            {/* Filter row: input cells, so none of the header's mono caps. */}
+            {!display?.hideColumnFilters && (
+            <TableRow className="[&_th]:h-8 [&_th]:py-1 [&_th]:font-sans [&_th]:normal-case [&_th]:tracking-normal">
+              {selectable ? <TableHead /> : null}
+              {table.getHeaderGroups()[0]?.headers.map((header) => (
+                <TableHead key={`filter-${header.id}`}>
+                  {!NON_FILTERABLE_COLUMNS.has(header.column.id) ? (
+                    <Input
+                      aria-label={t('attributes.filterColumn', { column: header.column.id })}
+                      value={columnFilters[header.column.id] ?? ''}
+                      onChange={(e) => handleFilterChange(header.column.id, e.target.value)}
+                      placeholder={t('attributes.filter')}
+                      // size={1} drops the input's 20-character intrinsic width,
+                      // so the header text and cell values size the column.
+                      size={1}
+                      className="h-6 min-w-24 rounded-none border-0 border-b px-1 text-xs md:text-xs focus-visible:border-primary focus-visible:ring-0"
+                    />
+                  ) : null}
+                </TableHead>
+              ))}
+            </TableRow>
+            )}
+          </TableHeader>
+          <TableBody>
+            {rows.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={visibleColumnCount} className="text-center text-muted-foreground py-8">
+                  {slots?.empty ?? t('attributes.noResults')}
+                </TableCell>
+              </TableRow>
+            ) : (
+              <>
+                {paddingTop > 0 ? (
+                  <tr aria-hidden="true">
+                    <td colSpan={visibleColumnCount} style={{ height: paddingTop, padding: 0 }} />
+                  </tr>
+                ) : null}
+                {virtualItems.map((virtualRow) => {
                   const row = rows[virtualRow.index];
+                  const gid = row.original.gid as number;
+                  const activatable = onRowClick && Number.isSafeInteger(gid);
+                  const selected = selectedGid !== undefined && gid === selectedGid;
                   return (
                     <TableRow
                       key={row.id}
-                      className={virtualRow.index % 2 === 1 ? 'bg-muted/30' : ''}
-                      style={{
-                        // Shift each rendered <tr> from its document-flow position
-                        // to its virtualized offset. All rendered rows form a
-                        // contiguous block of equal-height items, so subtracting
-                        // index * size collapses them onto virtualRow.start.
-                        transform: `translateY(${virtualRow.start - index * virtualRow.size}px)`,
-                      }}
+                      data-index={virtualRow.index}
+                      aria-selected={selectedGid === undefined ? undefined : selected ? 'true' : 'false'}
+                      className={cn(
+                        virtualRow.index % 2 === 1 ? 'bg-muted/30' : '',
+                        activatable && 'cursor-pointer hover:bg-primary-50/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
+                        selected && 'selection-inset',
+                      )}
+                      tabIndex={activatable ? 0 : undefined}
+                      aria-label={activatable ? t('attributes.rowActionLabel', { gid, defaultValue: 'Show row {{gid}} on the map' }) : undefined}
+                      onClick={activatable ? () => onRowClick(gid, rowBbox(row.index)) : undefined}
+                      onKeyDown={activatable ? (e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          onRowClick(gid, rowBbox(row.index));
+                        }
+                      } : undefined}
                     >
+                      {selectable ? (
+                        <TableCell className={`w-10 ${cellClass}`}>
+                          <Checkbox
+                            aria-label={t('attributes.selectRow', { gid })}
+                            checked={selectedGids.includes(gid)}
+                            disabled={isPlaceholderData || !Number.isSafeInteger(gid)}
+                            onCheckedChange={(value) => toggleRow(gid, value === true)}
+                          />
+                        </TableCell>
+                      ) : null}
                       {row.getVisibleCells().map((cell) => (
                         <TableCell key={cell.id} className={`max-w-xs truncate ${cellClass}`}>
                           <table.FlexRender cell={cell} />
@@ -630,56 +1040,92 @@ export function AttributeTable({ datasetId, canEdit = false, compact = false }: 
                       ))}
                     </TableRow>
                   );
-                })
-              )}
-            </TableBody>
-          </Table>
-        </div>
+                })}
+                {paddingBottom > 0 ? (
+                  <tr aria-hidden="true">
+                    <td colSpan={visibleColumnCount} style={{ height: paddingBottom, padding: 0 }} />
+                  </tr>
+                ) : null}
+              </>
+            )}
+          </TableBody>
+        </table>
       </div>
 
-      {/* Pagination */}
-      <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-          <span className="text-muted-foreground">
-            {isExact
-              ? t('attributes.showingExact', { start: formatNumber(rangeStart), end: formatNumber(rangeEnd), total: formatNumber(effectiveTotal) })
-              : t('attributes.showing', { start: formatNumber(rangeStart), end: formatNumber(rangeEnd), total: formatNumber(effectiveTotal) })}
-            {isFetching && (
-              <Loader2 className="inline h-3 w-3 animate-spin ms-2" />
-            )}
-          </span>
-          <div className="flex items-center gap-1.5">
-            <span className="text-muted-foreground text-xs">{t('attributes.rowsPerPage')}</span>
-            <Select
-              value={String(pageSize)}
-              onValueChange={(val) => {
-                setPageSize(Number(val));
-                setCursor(0);
-                setCursorHistory([0]);
+      <AlertDialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
+        <AlertDialogContent
+          onCloseAutoFocus={(event) => {
+            // The opener is disabled during a delete and gone once nothing is selected.
+            if (!deleteConfirmedRef.current && selectedGids.length > 0) return;
+            deleteConfirmedRef.current = false;
+            event.preventDefault();
+            parentRef.current?.focus();
+          }}
+        >
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('attributes.deleteRowsTitle')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t('attributes.deleteRowsDescription', {
+                count: selectedGids.length,
+                formattedCount: formatNumber(selectedGids.length),
+              })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('common:cancel')}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={deleteFeatures.isPending}
+              onClick={() => {
+                deleteConfirmedRef.current = true;
+                handleDeleteRows();
+                setDeleteConfirmOpen(false);
               }}
             >
-              <SelectTrigger
-                className="h-7 w-[70px] text-xs"
-                aria-label={t('attributes.rowsPerPage')}
+              {t('common:delete')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Pagination */}
+      {/* A floating launcher publishes the width it covers, so the buttons stop short of it. */}
+      <div className="flex flex-wrap items-center justify-between gap-2 pe-[var(--floating-dock-reach,0px)] text-sm">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          {!renderHeader && countNode}
+          {!renderHeader && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-muted-foreground text-xs">{t('attributes.rowsPerPage')}</span>
+              <Select
+                value={String(pageSize)}
+                onValueChange={(val) => {
+                  setPageSize(Number(val));
+                  setCursorHistory([0]);
+                }}
               >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {PAGE_SIZE_OPTIONS.map((opt) => (
-                  <SelectItem key={opt} value={String(opt)}>
-                    {opt}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
+                <SelectTrigger
+                  className="h-7 w-[70px] text-xs"
+                  aria-label={t('attributes.rowsPerPage')}
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {PAGE_SIZE_OPTIONS.map((opt) => (
+                    <SelectItem key={opt} value={String(opt)}>
+                      {opt}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <Button
             variant="outline"
             size="sm"
             onClick={handlePreviousPage}
-            disabled={cursorHistory.length <= 1}
+            disabled={cursorHistory.length <= 1 || isPlaceholderData}
           >
             {t('attributes.previous')}
           </Button>
@@ -687,12 +1133,14 @@ export function AttributeTable({ datasetId, canEdit = false, compact = false }: 
             variant="outline"
             size="sm"
             onClick={handleNextPage}
-            disabled={data?.next_cursor == null}
+            // Placeholder rows belong to the previous page or order, so their
+            // cursor would pair the old position with the new query.
+            disabled={data?.next_cursor == null || isPlaceholderData}
           >
             {t('common:next')}
           </Button>
         </div>
       </div>
-    </div>
+    </>,
   );
 }

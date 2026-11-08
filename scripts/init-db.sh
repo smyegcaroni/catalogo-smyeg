@@ -1,18 +1,11 @@
 #!/bin/bash
 set -e
 
-# The heredoc delimiter must be QUOTED ('EOSQL') so bash
-# does NOT perform command substitution on the backticks (`...`) inside the
-# SQL comments below. Prior to this fix, unquoted `<<-EOSQL` caused bash to
-# try executing `GRANT SELECT ON ALL TABLES`, `grant_reader_access`, and
-# `backend/app/processing/ingest/metadata.py` as shell commands, aborting
-# the script with `set -e` BEFORE psql ever ran. The bug was latent because
-# the live geolens-db container's pgdata volume is persistent (init-db.sh
-# only runs once on a fresh volume), and the backtick comments were added
-# AFTER that one-time init. This surfaced when the alembic-clean-db script
-# (which builds a
-# fresh DB on every run) finally exercised init-db.sh against a clean
-# volume.
+# The heredoc delimiter must be quoted ('EOSQL'): the SQL comments contain
+# backticks, and an unquoted delimiter would make bash run `GRANT SELECT ON ALL
+# TABLES`, `grant_reader_access` and similar as commands, aborting under
+# `set -e` before psql runs.
+#
 # Runs both as the container's docker-entrypoint-initdb.d hook (local socket,
 # no host/port set) and from a host against a managed database (POSTGRES_HOST
 # etc. exported). Host/port args are added only when set, which is what keeps
@@ -20,7 +13,7 @@ set -e
 : "${POSTGRES_USER:?POSTGRES_USER is required}"
 : "${POSTGRES_DB:?POSTGRES_DB is required}"
 
-# fix(#1992): -X skips a host .psqlrc that could `\set ON_ERROR_STOP off` and
+# -X skips a host .psqlrc that could `\set ON_ERROR_STOP off` and
 # let a failed statement below fall through, so the script exits 0 unfixed.
 psql_args=(-X -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB")
 if [ -n "${POSTGRES_HOST:-}" ]; then
@@ -43,7 +36,7 @@ psql "${psql_args[@]}" <<-'EOSQL'
     -- FRESH pgdata volume -- init-db.sh is a Postgres docker-entrypoint init
     -- script and never re-runs against an existing volume (see header comment).
     --
-    -- E-1 runbook -- adding pg_stat_statements to an EXISTING (pre-existing) volume:
+    -- Runbook: adding pg_stat_statements to an EXISTING (pre-existing) volume:
     --   1. Ensure the library is preloaded. The bundled image sets this via
     --      db/postgresql.conf (shared_preload_libraries = 'pg_stat_statements').
     --      For an external/managed Postgres, set it in postgresql.conf (or the

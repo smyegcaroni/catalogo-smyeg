@@ -1,6 +1,4 @@
 /**
- * Phase 1045 SP-04 — selection-utils
- *
  * Pure helper that computes the next layer-row selection state from a click
  * event. Extracted so it can be unit-tested without rendering the panel.
  *
@@ -20,7 +18,7 @@ import { getParentGroupId } from '@/components/builder/folder-groups';
 import { isFolderGroupLayer } from '@/lib/layer-capabilities';
 import type { MapLayerResponse } from '@/types/api';
 
-export interface ClickModifiers {
+interface ClickModifiers {
   shiftKey: boolean;
   metaKey: boolean;
   ctrlKey: boolean;
@@ -30,19 +28,18 @@ export interface ClickModifiers {
  *  dataset_name. An empty (or whitespace-only) query always matches.
  *  Single source of truth shared by UnifiedStackPanel's row rendering and
  *  computeSelectableRowIds below — the two must never disagree. */
-export function layerMatchesSearch(layer: MapLayerResponse, query: string): boolean {
+function layerMatchesSearch(layer: MapLayerResponse, query: string): boolean {
   const q = query.trim().toLowerCase();
   if (q === '') return true;
   return (layer.display_name ?? layer.dataset_name ?? '').toLowerCase().includes(q);
 }
 
 /**
- * fix(#771): the ordered list of row ids the stack actually RENDERS — children
- * of collapsed groups and rows hidden by the layer search are excluded. The raw
- * flat layer array previously fed shift-click range selection directly, so a
- * range could sweep up rows the user cannot see and bulk delete/visibility/
- * opacity then acted on them. Mirrors UnifiedStackPanel's render plan exactly
- * (the panel consumes this same helper for its row-skip decisions):
+ * The ordered list of row ids the stack actually RENDERS: children of collapsed
+ * groups and rows hidden by the layer search are excluded, so a shift-click
+ * range can't sweep up rows the user cannot see. Mirrors UnifiedStackPanel's
+ * render plan exactly (the panel consumes this same helper for its row-skip
+ * decisions):
  *   - group row: rendered unless a search is active and neither its name nor
  *     any child matches;
  *   - group children: rendered only while the group is expanded, and (under
@@ -89,7 +86,7 @@ export function computeSelectableRowIds(
   return ids;
 }
 
-export interface NextSelection {
+interface NextSelection {
   selection: Set<string>;
   anchor: string | null;
 }

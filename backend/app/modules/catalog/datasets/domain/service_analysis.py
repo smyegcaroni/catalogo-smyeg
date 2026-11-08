@@ -19,6 +19,7 @@ import asyncio
 import json
 import uuid
 
+from asyncpg import BitString
 from sqlalchemy import text
 from typing import Any
 
@@ -57,13 +58,13 @@ PREVIEW_FEATURE_CAP = 500
 LayerFilter = tuple[str, list[Any]]
 
 
-# Each AI preview may hold two connections, so cap each worker at one quarter
-# of its pool to reserve half for other traffic. External poolers hide their
-# capacity; use the default local-pool budget in that mode.
+# Previews may hold two connections each and dataset aggregates one, so a
+# quarter of the pool as slots for each leaves a quarter for other traffic.
+# External poolers hide their capacity; use the default budget in that mode.
 _EXTERNAL_POOLER_PREVIEW_BOUND = 3
 
 
-def _preview_bound() -> int:
+def preview_slot_bound() -> int:
     from app.core.config import settings
 
     if settings.db_use_external_pooler:
@@ -74,7 +75,7 @@ def _preview_bound() -> int:
     return max(1, (settings.db_pool_size + overflow) // 4)
 
 
-_MAX_CONCURRENT_PREVIEWS = _preview_bound()
+_MAX_CONCURRENT_PREVIEWS = preview_slot_bound()
 _preview_slots = asyncio.Semaphore(_MAX_CONCURRENT_PREVIEWS)
 _GEOJSON_PRECISION = 6
 
@@ -85,13 +86,15 @@ async def compile_layer_filter(
     cql2: dict[str, Any] | None,
     *,
     bind_prefix: str,
+    live_columns: list[dict] | None = None,
 ) -> LayerFilter | None:
     """Validate a layer's CQL2-JSON filter against its live columns and compile it.
 
     The parser, whitelist and literal type checks are the ones the OGC items
     ``filter`` parameter runs. Raises ValueError naming the problem when the
     filter is malformed, too large, or reads a column the table lacks. The
-    caller has already checked access to ``dataset``.
+    caller has already checked access to ``dataset``, and may pass the
+    table's ``live_columns`` when it has read them already.
     """
     if cql2 is None:
         return None
@@ -109,7 +112,10 @@ async def compile_layer_filter(
         raise ValueError("Invalid CQL2 expression: filter nests too deeply") from exc
     try:
         ast_root = parse_feature_cql2(filter_expr, "cql2-json")
-        live_columns = await get_catalog_port().get_column_info(db, dataset.table_name)
+        if live_columns is None:
+            live_columns = await get_catalog_port().get_column_info(
+                db, dataset.table_name
+            )
         queryables = feature_queryable_columns(live_columns, dataset.geometry_type)
         where_sql, binds = compile_feature_cql2_ast(
             ast_root, queryables, bind_prefix=bind_prefix
@@ -290,9 +296,11 @@ def _preview_extra_columns(
 def _json_safe(value: Any) -> Any:
     """Make one transferred property value JSON-serializable.
 
-    A spatial join can transfer a ``bytea`` column back as raw
-    ``bytes``, which Pydantic's JSON serializer 500s on; encode as
-    PostgreSQL's ``\\x``-hex, matching ``to_jsonb(t.*)`` in the features API.
+    A ``bytea`` column comes back as raw ``bytes`` and a ``bit`` or
+    ``bit varying`` column as asyncpg's ``BitString``; Pydantic's JSON
+    serializer 500s on both. Encode bytes as PostgreSQL's ``\\x``-hex,
+    matching ``to_jsonb(t.*)`` in the features API, and bits as their
+    ``'1010'`` text.
 
     Recursive: a ``bytea[]`` comes back as a list of ``bytes`` (a
     scalar-only check would miss it). Natively-serializable scalars
@@ -300,6 +308,9 @@ def _json_safe(value: Any) -> Any:
     """
     if isinstance(value, (bytes, bytearray, memoryview)):
         return "\\x" + bytes(value).hex()
+    if isinstance(value, BitString):
+        # as_string() groups bits by four with spaces; PostgreSQL's text has none.
+        return value.as_string().replace(" ", "")
     if isinstance(value, (list, tuple)):
         return [_json_safe(v) for v in value]
     if isinstance(value, dict):
@@ -389,17 +400,16 @@ async def run_analysis_preview(
         count_sql = render_select_by_location_count(
             table_ref, mask_table_ref=mask_table_ref, mask=request.mask
         )
-    # Names of the properties this operation adds, in the order the SELECT
-    # emits them (immediately after gid and the geometry). Must stay in step
-    # with build_preview_sql's extra_cols above — the rows come back positional.
+    # Names of the properties this operation adds, in SELECT order (after gid
+    # and the geometry). The rows come back positional, so this follows
+    # build_preview_sql's extra_cols.
     extra_columns = _preview_extra_columns(request, join_table_ref)
     # Read ORM state before rollback releases the caller's connection.
     # execute_safe needs its own connection for READ ONLY and SET LOCAL ROLE.
     source_feature_count = dataset.feature_count
-    # Whether the cached snapshot above gets overridden by a live count over
-    # the viewport and the source filter. Cheap check only; the count itself
-    # runs inside the _preview_slots block below via execute_safe, which opens
-    # its own connection and has no ordering dependency on the rollback below.
+    # Whether a live count over the viewport and source filter overrides the
+    # cached snapshot above. Cheap check only; the count runs inside the
+    # _preview_slots block below via execute_safe, on its own connection.
     live_count_needed = (
         request.bbox is not None or source_filter is not None
     ) and request.operation not in _ROW_FILTERING_OPERATIONS
@@ -420,10 +430,9 @@ async def run_analysis_preview(
             "Try again in a moment.",
         )
     async with _preview_slots:
-        # The live denominator lives in this slot too, not before it. Read
-        # first, before the geometry query, so a preview whose denominator
-        # loses the race for the sandbox's per-user advisory lock still gets
-        # a geometry result even if the count comes back None.
+        # The live denominator is read in this slot too, and first, so a
+        # preview whose denominator loses the race for the sandbox's per-user
+        # advisory lock still gets a geometry result even if the count is None.
         source_feature_count = (
             await _resolve_live_source_count(
                 db, table_ref, request.bbox, user_id, filter_binds
@@ -439,11 +448,11 @@ async def run_analysis_preview(
             max_result_bytes=DEFAULT_MAX_RESULT_BYTES,
             binds=binds_referenced_by(sql, filter_binds),
         )
-        # Inside the same slot as the geometry query, not after
-        # it -- both open their own sandbox connection, so releasing the
-        # semaphore between them would let _MAX_CONCURRENT_PREVIEWS stop
-        # bounding connections while the uncapped, both-layer count query
-        # is still running (the geometry query stops at PREVIEW_FEATURE_CAP).
+        # Same slot as the geometry query: both open their own sandbox
+        # connection, so releasing the semaphore between them would let
+        # _MAX_CONCURRENT_PREVIEWS stop bounding connections while the uncapped,
+        # both-layer count query still runs (the geometry query stops at
+        # PREVIEW_FEATURE_CAP).
         resolved_match_count = (
             await _resolve_match_count(db, count_sql, user_id, filter_binds)
             if count_sql is not None

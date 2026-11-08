@@ -1,20 +1,19 @@
-"""Tenant session GUC plumbing (ISO-01, Phase 1208-01).
+"""Tenant session GUC plumbing.
 
 Provides ``current_tenant_var``, a ContextVar carrying the active tenant id
 across a request or worker job; a SQLAlchemy engine-level ``begin`` hook that
 issues ``SELECT set_config('app.current_tenant', :tid, true)``; and statement
 hooks binding tenant-schema reads/writes to SET-only per-tenant roles. Active
 only in ``multi_tenant`` mode — in ``single_tenant`` (default) the hook
-returns after the first ``is_multi_tenant()`` check, a byte-identical no-op
-required by Plan 05.
+returns after the first ``is_multi_tenant()`` check, a byte-identical no-op.
 
 ``true`` as the third ``set_config`` arg makes it transaction-local, so it
 clears automatically and never bleeds across transactions on a reused
 connection. The tenant id is always a bound parameter, never f-string
-interpolated (T-1208-01).
+interpolated.
 
 ``current_tenant_var`` is set by two callers: ``TenantContextMiddleware``
-(request plane, resets in a finally block, T-1208-03) and
+(request plane, resets in a finally block) and
 ``tenant_job_context`` (worker plane, for a Procrastinate job's duration).
 Both share this hook, so ``get_db`` sessions and the bare ``async_session``
 both pick up the GUC.
@@ -310,15 +309,15 @@ def _on_begin(conn: Connection) -> None:
     ``SET LOCAL app.current_tenant``. multi_tenant + var unset: no-op, so RLS
     fail-closes the unscoped query.
 
-    fix(#1778): use ``SET LOCAL``, never ``SELECT set_config(...)`` — the
+    Use ``SET LOCAL``, never ``SELECT set_config(...)`` — the
     SELECT form takes the transaction's first snapshot, so Postgres then
     refuses a later ``SET TRANSACTION ISOLATION LEVEL``/``[NOT] DEFERRABLE``
     (25001).
 
-    T-1208-01 requires a bound parameter for the tenant id; ``SET`` takes
+    The tenant id must be a bound parameter; ``SET`` takes
     none, so the guard moves to the value: ``_normalize_context_tenant_id``
     accepts only a canonical UUID rendering (hex + hyphens, no quote) — the
-    same guard used at the ``current_tenant_var.set`` sites (T-1209-14).
+    same guard used at the ``current_tenant_var.set`` sites.
     """
     from app.core.tenancy import is_multi_tenant
 
@@ -374,10 +373,10 @@ def tenant_job_context(tenant_id: str | None) -> Generator[None, None, None]:
 
     single_tenant: strict no-op, var untouched. multi_tenant: sets the var for
     the ``with`` block and restores the prior value on exit (including on
-    exception), preventing bleed between jobs in the same asyncio task
-    (T-1208-03). ``tenant_id`` may be ``None`` in core (the cloud overlay
+    exception), preventing bleed between jobs in the same asyncio task.
+    ``tenant_id`` may be ``None`` in core (the cloud overlay
     supplies it from Procrastinate job kwargs) — the var stays unset and RLS
-    fail-closes, the intended backstop (T-1208-04).
+    fail-closes, the intended backstop.
     """
     from app.core.tenancy import is_multi_tenant
 
@@ -406,8 +405,7 @@ def tenant_task(fn: _TaskFn) -> _TaskFn:
     ``tenant_id`` job kwarg (threaded in by :func:`defer_async_with_tenant`)
     and binds it via :func:`tenant_job_context` for the task's duration.
     Without this, a multi_tenant worker task sees the var unset and falls back
-    to the shared ``data`` schema / global reader / no tenant storage prefix
-    (fix(#256)).
+    to the shared ``data`` schema / global reader / no tenant storage prefix.
 
     single_tenant: ``tenant_job_context`` is a no-op, byte-identical to
     calling ``fn`` directly. ``tenant_id`` is POPPED before calling ``fn``, so

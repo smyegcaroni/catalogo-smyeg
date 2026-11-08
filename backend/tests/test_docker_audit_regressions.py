@@ -88,10 +88,36 @@ def test_backup_base_is_digest_pinned():
     )
 
 
+def test_external_base_images_are_digest_pinned():
+    # A FROM that names an earlier stage is local; every other base keeps its
+    # tag for Dependabot and pins the multi-arch index digest.
+    for dockerfile in (
+        DOCKERFILE,
+        REPO_ROOT / "db" / "Dockerfile",
+        REPO_ROOT / "frontend" / "Dockerfile.dev",
+    ):
+        text = dockerfile.read_text()
+        froms = re.findall(
+            r"^FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*$",
+            text,
+            re.MULTILINE,
+        )
+        assert len(froms) == len(re.findall(r"^FROM\s", text, re.MULTILINE))
+        stages: set[str] = set()
+        for image, stage in froms:
+            if image not in stages:
+                assert re.fullmatch(r"[\w./-]+:[\w.-]+@sha256:[0-9a-f]{64}", image), (
+                    f"{dockerfile.relative_to(REPO_ROOT)}: pin {image} as "
+                    "image:tag@sha256:<index digest>"
+                )
+            if stage:
+                stages.add(stage)
+
+
 def test_docker_audit_matrix_is_derived_not_a_second_literal_copy():
-    # fix(#1983): dep-audit.yml derives node/python/nginx from the Dockerfile
-    # at run time instead of a second literal matrix copy (#1778 drifted,
-    # #1975 needed a manual fix) — assert it stays derived, not reverted.
+    # dep-audit.yml derives node/python/nginx from the Dockerfile
+    # at run time instead of a second literal matrix copy that can drift —
+    # assert it stays derived, not reverted.
     workflow = yaml.safe_load(DEP_AUDIT_WORKFLOW.read_text())["jobs"]
     docker_audit = workflow["docker-audit"]
 
@@ -105,7 +131,7 @@ def test_docker_audit_matrix_is_derived_not_a_second_literal_copy():
 
 
 def test_docker_audit_matrix_resolver_pins_match_dockerfile_from_tags():
-    # fix(#1983): runs the real resolve-docker-audit-matrix step against the
+    # Runs the real resolve-docker-audit-matrix step against the
     # Dockerfile, so a broken grep pattern or renamed stage fails here
     # instead of silently emitting an empty or stale pin in CI.
     steps = yaml.safe_load(DEP_AUDIT_WORKFLOW.read_text())["jobs"][
@@ -173,14 +199,15 @@ def test_python_system_audit_builds_and_enforces_patched_stage():
     assert expected_scan_config.items() <= scan_step["with"].items()
 
 
-def test_backend_runtime_removes_pip_and_its_vendored_sbom():
+def test_backend_system_layer_removes_pip_and_its_vendored_sbom():
     text = DOCKERFILE.read_text()
-    base_stage = text.split("FROM backend-system AS backend-base", 1)[1]
-    base_stage = base_stage.split("\nFROM ", 1)[0]
+    system_stage = text.split(" AS backend-system\n", 1)[1]
+    system_stage = system_stage.split("\nFROM ", 1)[0]
 
-    assert "rm -rf /usr/local/lib/python3*/site-packages/pip" in base_stage
-    assert "/usr/local/lib/python3*/ensurepip" in base_stage
-    assert "pip install" not in base_stage
+    assert "rm -rf /usr/local/lib/python3*/site-packages/pip" in system_stage
+    assert "/usr/local/lib/python3*/ensurepip" in system_stage
+    assert "pip install" not in system_stage
+    assert "FROM backend-system AS backend-base" in text
 
 
 def test_backend_runtime_does_not_recursively_chown_application_tree():
@@ -208,7 +235,7 @@ def test_production_database_init_script_is_read_only():
 
 
 def test_backup_services_override_inherited_postgres_data_volume():
-    # chore(#704): postgres 18+ bases declare VOLUME /var/lib/postgresql
+    # postgres 18+ bases declare VOLUME /var/lib/postgresql
     # (PGDATA moved to <major>/docker inside it) — the tmpfs override must
     # target the new path or the anonymous volume comes back.
     for compose_path in (DEV_COMPOSE, PROD_COMPOSE):
@@ -302,7 +329,7 @@ def _backup_stage_copy_map() -> dict[str, Path]:
 
 
 def test_backup_stage_bakes_every_script_it_sources():
-    """fix(#1798 review round 7, P2): restore.sh sources
+    """restore.sh sources
     `$SCRIPT_DIR/lib/common.sh` (SCRIPT_DIR=/scripts in this baked
     layout) for get_env_value, but the backup stage's COPY line used to
     bring in only backup-entrypoint.sh and restore.sh — the PUBLISHED

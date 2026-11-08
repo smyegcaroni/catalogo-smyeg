@@ -110,7 +110,6 @@
     "darkMode": "Modo oscuro"
   },
   "theme": {
-    "toggle": "Cambiar tema",
     "light": "Claro",
     "dark": "Oscuro",
     "system": "Sistema"
@@ -139,9 +138,6 @@
     "infrastructure": "Infraestructura",
     "general": "General",
     "basemaps": "Mapas base",
-    "mapDefaults": "Valores predeterminados del mapa",
-    "security": "Seguridad",
-    "uploads": "Subidas",
     "settings": "Configuración",
     "operations": "Operaciones",
     "settingsGeneral": "General",
@@ -152,7 +148,8 @@
     "settingsAppearance": "Apariencia",
     "settingsInfrastructure": "Infraestructura",
     "backToApp": "Volver a la App",
-    "configOps": "Operaciones de config."
+    "configOps": "Operaciones de config.",
+    "groups": "Grupos"
   },
   "errors": {
     "unexpected": "Ocurrió un error inesperado",
@@ -177,6 +174,7 @@
     "jobFailureStaleNeverQueued": "Obsoleto: estuvo pendiente demasiado tiempo (nunca se puso en cola)",
     "jobFailureUploadAbandoned": "Abandonado: la subida nunca se completó",
     "jobFailureUserCancelled": "Cancelado por el usuario",
+    "jobFailureCredentialOverHttp": "El servicio de este conjunto de datos usa HTTP sin cifrar, así que no se envió su credencial. Vuelva a importarlo desde la dirección https:// del servicio o pida a un administrador que permita su host.",
     "jobFailureWorkerLost": "Obsoleto: el trabajo se ejecutó demasiado tiempo sin que su proceso de trabajo informara del progreso",
     "requestFailed": "No se pudo completar la solicitud. Inténtalo de nuevo.",
     "badRequest": "No se pudo completar la solicitud. Comprueba los datos introducidos.",
@@ -204,10 +202,12 @@
     "sharedQueryBusy": "Las vistas previas de análisis y el chat con IA comparten una sola consulta de datos a la vez, y ya hay una en curso. Espera a que termine e inténtalo de nuevo.",
     "analysisVectorRequired": "El análisis necesita un conjunto de datos vectorial; esta capa no lo es.",
     "analysisMaskPolygonRequired": "La máscara de recorte debe ser una capa de polígonos.",
+    "datasetUnpublishBlockedByMaps": "Estos mapas comparten el conjunto de datos con un público que lo perdería al despublicarlo: {{maps}}. Quita la capa allí o restringe primero esos mapas.",
     "datasetVisibilityBlockedByMaps": "Estos mapas comparten el conjunto de datos con un público que lo perdería: {{maps}}. Quita la capa allí o restringe primero esos mapas.",
     "workflowTransitionDeniedNoneAllowed": "Este conjunto de datos no puede pasar de «{{from}}» a «{{to}}» con el flujo de publicación, y no tienes otro paso disponible. Pide ayuda a un revisor o administrador con el rol necesario.",
     "workflowTransitionDenied": "Este conjunto de datos no puede pasar de «{{from}}» a «{{to}}» con el flujo de publicación. Pasos disponibles para ti desde aquí: {{allowed}}.",
     "analysisUnknownDissolveColumn": "La columna «{{column}}» no existe en este conjunto de datos. Elige otro campo de agrupación.",
+    "columnsNeedRefresh": "Las columnas {{columns}} existen en la tabla, pero GeoLens aún no las conoce. Actualiza el conjunto de datos y vuelve a intentarlo.",
     "corsWildcardNotAllowed": "No se aceptan orígenes comodín. Las solicitudes con credenciales requieren cada origen indicado por completo, por ejemplo https://example.com.",
     "embedDomainLockUnenforceable": "Esta instalación aún no puede aplicar un bloqueo de dominio: su URL pública está configurada como {{resolved}}, pero has accedido desde {{origin}}. Un embebido carga el mapa a través de GeoLens, así que el bloqueo impediría el acceso a todos los visitantes. Configura PUBLIC_APP_URL como {{origin}} y crea el token de nuevo.",
     "duplicateSource": "Ya hay un conjunto de datos registrado desde esta fuente ({{title}}).",
@@ -225,9 +225,13 @@
     "arcgisSigninInProgress": "Ya hay otro inicio de sesión en curso para esta cuenta. Vuelva a intentarlo en un momento.",
     "arcgisPortalNotHttps": "Este portal, o el servicio de tokens al que apunta, no usa HTTPS. GeoLens no enviará una contraseña por HTTP sin cifrar; use una URL de portal https://.",
     "arcgisPortalHostInvalid": "Esa dirección de portal no es un nombre de host utilizable. Verifique la URL, por ejemplo https://tu-org.maps.arcgis.com.",
+    "credentialOverHttp": "Esta dirección de servicio usa HTTP sin cifrar, así que GeoLens no le enviará una credencial. Use la dirección https:// del servicio o pida a un administrador que permita este host.",
+    "credentialOverHttpRefresh": "El origen de este conjunto de datos usa HTTP sin cifrar, así que GeoLens no le enviará una credencial. Vuelva a importar los datos desde la dirección https:// del servicio o pida a un administrador que permita este host.",
     "refreshServiceTokenRequired": "La fuente de este conjunto de datos necesita una credencial de servicio para actualizarse. Proporciona una a continuación para continuar.",
     "refreshSourceUrlBlocked": "La URL de origen almacenada de este conjunto de datos no superó una comprobación de seguridad y no se puede actualizar automáticamente. Contacta con un administrador.",
     "reuploadGeometryLoss": "Este reemplazo no tiene geometría y este conjunto de datos sí la almacena, así que no se cambió nada. Importa el archivo como un conjunto de datos nuevo.",
+    "serviceLayerNoFeatures": "Esta capa no contiene entidades (es una capa de grupo, ráster, anotación, topología o red de servicios). Importa en su lugar una de sus capas de entidades o tablas.",
+    "serviceGeometryUnsupported": "Esta capa contiene geometría multipatch, que no se puede importar. Publícala como una capa de entidades con otro tipo de geometría.",
     "reuploadOriginChanged": "La fuente de este conjunto de datos cambió mientras se preparaba el reemplazo, así que no se puso nada en cola. Revisa la fuente del conjunto de datos antes de reemplazar sus datos.",
     "reuploadPointCloudUnsupported": "Los conjuntos de datos de nube de puntos no se pueden reemplazar volviendo a subir un archivo. Sube la nueva nube de puntos como un conjunto de datos nuevo.",
     "reuploadTilesetUnsupported": "Los conjuntos de datos 3D Tiles no se pueden reemplazar volviendo a subir un archivo. Sube el nuevo conjunto de teselas como un conjunto de datos nuevo.",
@@ -316,6 +320,10 @@
     "collectionNotFound": "Colección no encontrada",
     "mapNotFound": "Mapa no encontrado",
     "incorrectCredentials": "Nombre de usuario o contraseña incorrectos",
+    "loginThrottled": "Demasiados intentos fallidos de inicio de sesión en esta cuenta. Usa un navegador con el que hayas iniciado sesión antes, inicia sesión con SSO o usa una clave de API para scripts y aplicaciones de escritorio.",
+    "deviceTrustLinkInvalid": "Este enlace no es válido, ha caducado o ya se usó. Pide uno nuevo a tu administrador.",
+    "deviceTrustBrowserFull": "Este navegador ya recuerda tantas cuentas como puede. Abre el enlace en una ventana privada o en otro navegador.",
+    "deviceTrustUnavailable": "Este GeoLens no puede recordar navegadores en su dirección actual. Consulta a tu administrador.",
     "awaitingApproval": "Su cuenta está pendiente de aprobación",
     "accountNotActive": "Cuenta no activa",
     "insufficientPermissions": "Permisos insuficientes",
@@ -327,6 +335,8 @@
     "layerNotFound": "Capa no encontrada",
     "userNotFound": "Usuario no encontrado",
     "apiKeyNotFound": "Clave API no encontrada",
+    "datasetKeyLimit": "Este conjunto de datos ya tiene 100 claves de escritura activas. Revoque una para crear otra.",
+    "valueLabelsTooLarge": "Las etiquetas de valores de este conjunto de datos superan el límite de 1 MB. Elimine algunas etiquetas para añadir más.",
     "accessDenied": "Acceso denegado",
     "couldNotValidateCredentials": "No se pudieron validar las credenciales",
     "inactiveUser": "Usuario inactivo",
@@ -346,6 +356,7 @@
     "stagingFileUnavailable": "El archivo temporal ya no está disponible. Vuelva a subir el archivo.",
     "serviceRequiresAuth": "Este servicio requiere autenticación. Proporcione un token de acceso e inténtelo de nuevo.",
     "couldNotReachService": "No se pudo contactar al servicio. Verifique la URL e inténtelo de nuevo.",
+    "serviceNotRecognized": "No se pudo detectar el tipo de servicio. Compatibles: WFS, ArcGIS Feature Service y OGC API Features.",
     "serviceTimeout": "El servicio no respondió a tiempo. Verifique la URL e inténtelo de nuevo.",
     "remoteServiceError": "El servicio remoto devolvió un error",
     "aiSummaryFailed": "Error al generar el resumen",
@@ -369,10 +380,46 @@
     "mapMessage": "Error de mapa — algunas capas pueden no mostrarse correctamente.",
     "networkUnavailable": "Red no disponible. Comprueba tu conexión.",
     "requestTimeout": "La solicitud tardó demasiado. Inténtalo de nuevo.",
-    "unauthorized": "Tu sesión ha expirado. Inicia sesión de nuevo."
+    "unauthorized": "Tu sesión ha expirado. Inicia sesión de nuevo.",
+    "retentionUnsupportedRelation": "La retención necesita que los datos del conjunto estén en una tabla normal. Este conjunto los lee de una vista, una tabla particionada u otro tipo de relación, así que aquí no se puede activar.",
+    "retentionHasChildren": "La retención no puede ejecutarse en una tabla de la que heredan otras tablas, porque al borrar en ella podría alcanzar sus filas. Quita las tablas que heredan para usar la retención.",
+    "retentionReferenced": "Una clave foránea apunta a esta tabla, así que borrar sus filas antiguas cambiaría también las filas que las referencian. Quita la clave foránea para usar la retención.",
+    "retentionDeleteRule": "Esta tabla tiene una regla DELETE que cambia lo que hace un borrado. Quita la regla para usar la retención.",
+    "retentionNotFeatureDataset": "La retención solo funciona en conjuntos de datos cuyas entidades tienen geometría.",
+    "retentionColumnMissing": "La columna {{column}} ya no existe. Elige otra columna de fecha o marca de tiempo.",
+    "retentionColumnNotTemporal": "La columna {{column}} no es de fecha ni de marca de tiempo. Elige una columna de fecha o marca de tiempo.",
+    "retentionColumnInUse": "La retención borra filas según la columna {{column}}. Desactiva la retención o pásala a otra columna antes de cambiar esa columna o de dar su nombre a otra columna.",
+    "retentionGidUnusable": "La retención recorre la tabla por su columna gid de números enteros, que esta tabla ya no tiene. Restaura una columna gid entera para usar la retención.",
+    "retentionDeleteTrigger": "La retención no puede ejecutarse en una tabla con un disparador de borrado, porque puede conservar filas o cambiar otras al borrar las antiguas. Quita el disparador para usar la retención.",
+    "groupNotFound": "Grupo no encontrado",
+    "groupNotJoined": "Solo puede compartir con grupos a los que pertenece.",
+    "mapRestrictedNeedsGroups": "Comparta el mapa con un grupo antes de restringirlo.",
+    "mapChangeInProgress": "Hay otro cambio en curso en este mapa. Inténtalo de nuevo en breve.",
+    "groupMemberNotFound": "Esa persona no es miembro de este grupo",
+    "groupNameTaken": "Ya existe un grupo llamado \"{{name}}\"",
+    "vrtAudienceExceedsSources": "Un conjunto de datos VRT llegaría a personas que no pueden ver todos sus conjuntos de datos de origen. Restrinja la visibilidad del VRT o use orígenes que su audiencia pueda ver.",
+    "storyNotFound": "No se encontró la historia.",
+    "storyLocked": "Hay otro cambio en curso en esta historia. Vuelve a intentarlo en un momento.",
+    "storyNewerVersion": "Esta historia se guardó con una versión más reciente de GeoLens y no se puede cambiar aquí.",
+    "storyScenesUnreadable": "Algunas escenas se guardaron con una versión más reciente de GeoLens y no se pueden publicar aquí.",
+    "storyVisibilityUnsupported": "Las historias aún no se pueden publicar con esta visibilidad.",
+    "dashboardTooNew": "Este panel se guardó con una versión más reciente de GeoLens y no se puede cambiar aquí.",
+    "dashboardTooManyWidgets": "Un panel admite como máximo 50 widgets. Quita algunos antes de guardar.",
+    "dashboardWidgetsRefused": "Algunos widgets del panel usan capas que no están en este mapa o que no puedes leer. Quítalos o elige otras capas.",
+    "storyImageUnreadable": "El archivo no es una imagen legible.",
+    "storyImageTooLarge": "Esta imagen es demasiado grande. Sube un archivo de menos de 50 MB y con menos píxeles.",
+    "storyImageUnsupported": "Solo se pueden subir imágenes PNG, JPEG y WebP.",
+    "storyImageBusy": "Se están procesando otras imágenes. Inténtalo de nuevo en un momento.",
+    "storyImageMissing": "No se envió ninguna imagen. Elige un archivo e inténtalo de nuevo.",
+    "storyAssetLimit": "Esta historia ya tiene el máximo de imágenes: 200, o 250 MB en total.",
+    "storyAssetOwnerLimit": "Tus historias ya ocupan todo el almacenamiento de imágenes que permite un administrador. Quita imágenes de tus historias o pide a un administrador que aumente el límite.",
+    "storyAssetsNotFound": "No se encontraron algunas imágenes de esta historia. Quita esos bloques de imagen y vuelve a guardar.",
+    "storyFrameHostNotAllowed": "Algunas páginas incrustadas o vídeos usan un sitio que ningún administrador ha aprobado. Corrígelos o quítalos y vuelve a intentarlo."
   },
   "settings": {
-    "apiKeys": { "manageTitle": "Administrar claves API" },
+    "apiKeys": {
+      "manageTitle": "Administrar claves API"
+    },
     "tabs": {
       "preferences": "Preferencias",
       "apiKeys": "Claves API"
@@ -405,7 +452,8 @@
     "docs": "Documentación",
     "github": "GitHub",
     "api": "API",
-    "license": "Apache 2.0"
+    "license": "Apache 2.0",
+    "thirdPartyLicenses": "Licencias de terceros"
   },
   "viewer": {
     "loading": "Cargando mapa...",
@@ -413,7 +461,6 @@
     "linkExpiredDescription": "Este enlace de mapa compartido ya no está disponible. Puede haber caducado o sido revocado por el propietario.",
     "mapNotFound": "Mapa no encontrado",
     "mapNotFoundDescription": "Este mapa puede haber sido eliminado o el enlace puede ser inválido.",
-    "poweredBy": "Desarrollado con GeoLens",
     "featureFallback": "Elemento",
     "legend": {
       "title": "Capas",
@@ -428,10 +475,12 @@
       "weightedBy": "Ponderado por: {{column}}",
       "weightedByScaled": "Ponderado por: {{column}} (escalado)",
       "other": "Otros",
+      "sampled": "Con este zoom solo se muestra una parte de los elementos. Acerca el zoom para verlos todos.",
       "cluster": {
         "server": "Clúster del servidor",
         "bounded": "Clúster acotado",
-        "fallback": "Alternativa de puntos"
+        "fallback": "Alternativa de puntos",
+        "pointsPerCluster": "Puntos por clúster"
       },
       "geometry": {
         "point": "Punto",
@@ -466,7 +515,34 @@
       "booleanFalse": "Falso",
       "resultSummary_one": "{{count}} elemento visible",
       "resultSummary_other": "{{count}} elementos visibles",
-      "resultSummaryTruncated": "Se muestran {{shown}} de {{total}} elementos visibles"
+      "resultSummaryTruncated": "Se muestran {{shown}} de {{total}} elementos visibles",
+      "truncatedHint": "Acerca el zoom o desplaza el mapa para ver el resto de los elementos.",
+      "openDatasetData": "Ver todos los datos de {{name}}",
+      "tableView": "Tabla",
+      "listView": "Lista",
+      "viewSwitch": "Vista de los datos del mapa",
+      "layerPicker": "Capa de la tabla",
+      "inView": "En la vista",
+      "inViewNoGeometry": "Esta capa no tiene geometría que filtrar por la vista del mapa",
+      "filteredByMap": "Filtrado por el mapa",
+      "filterUnsupported": "No se pudo aplicar el filtro de la capa; se muestran todas las filas.",
+      "close": "Cerrar los datos del mapa",
+      "resize": "Redimensionar los datos del mapa",
+      "expand": "Ampliar los datos del mapa",
+      "collapse": "Reducir los datos del mapa",
+      "emptyFiltered": "Ninguna fila coincide con los filtros del mapa",
+      "emptyInView": "No hay filas en la vista. Desplace el mapa o desactive En la vista.",
+      "unavailable": "La tabla de esta capa no está disponible aquí.",
+      "loadingRows": "Cargando filas",
+      "allFields": "Todos los campos",
+      "loadingFields": "Cargando más campos…",
+      "fieldsFailed": "No se pudieron cargar los demás campos.",
+      "selectionMissing": "El elemento seleccionado no está en esta página.",
+      "selectionShow": "Mostrar selección",
+      "selectionShowing": "Mostrando solo el elemento seleccionado.",
+      "selectionShowAll": "Mostrar todas las filas",
+      "selectionHiddenByFilters": "Los filtros de la tabla ocultan el elemento seleccionado.",
+      "openInTable": "Abrir {{name}} en la tabla"
     },
     "heatmapLow": "Bajo",
     "heatmapHigh": "Alto",
@@ -495,6 +571,7 @@
       "emptyHint": "Haz una pregunta sobre los datos de este mapa.",
       "readOnlyNote": "Las respuestas son de solo lectura: explora los datos sin modificar el mapa.",
       "error": "Algo salió mal. Inténtalo de nuevo.",
+      "errorModelUnsupported": "El modelo de IA de este sitio necesita la API Responses de OpenAI. Pide a un administrador que la active o elija otro modelo.",
       "retry": "Reintentar",
       "queryResult": {
         "empty": "No hay resultados coincidentes.",
@@ -523,6 +600,7 @@
     "private": "Privado",
     "internal": "Interno",
     "public": "Público",
+    "restricted": "Restringido",
     "listView": "Vista de lista",
     "gridView": "Vista de cuadrícula",
     "loadFailed": "Error al cargar mapas: {{message}}",
@@ -541,7 +619,8 @@
     "card": {
       "previewAlt": "Vista previa de {{name}}",
       "updated": "Actualizado {{date}}",
-      "delete": "Eliminar mapa"
+      "delete": "Eliminar mapa",
+      "dashboard": "Panel"
     }
   },
   "enums": {
@@ -719,7 +798,9 @@
     "adminSettings": "Ajustes admin",
     "adminSaml": "Configuración de SSO SAML",
     "verifyEmail": "Verificar correo",
-    "signingIn": "Iniciando sesión"
+    "signingIn": "Iniciando sesión",
+    "trustBrowser": "Recordar este navegador",
+    "adminGroups": "Grupos admin"
   },
   "sidebar": {
     "title": "Barra lateral",
@@ -732,9 +813,6 @@
   },
   "inlineEdit": {
     "hint": "Ctrl+Enter para guardar, Escape para cancelar"
-  },
-  "mapCoordReadout": {
-    "scale": "1:{{value}}"
   },
   "errorBoundary": {
     "appTitle": "Algo salió mal",

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Consistency test for UPGRADING.md (UPG-03): the documented commands/paths must
+# Consistency test for UPGRADING.md: the documented commands/paths must
 # match the actual tooling (scripts/upgrade.sh, scripts/restore.sh, the compose
 # files), and the doc must never tell anyone to `psql < dump` a -Fc custom-format
 # dump. Pure text checks; no stack.
@@ -78,10 +78,10 @@ grep -q 'UPGRADING.md' "$ROOT/README.md" \
   && ok "README links to UPGRADING.md" \
   || bad "README does not link to UPGRADING.md"
 
-# getgeolens.com cross-repo follow-up is flagged in the doc.
-grep -qi 'getgeolens.com' "$DOC" \
-  && ok "doc flags the getgeolens.com upgrade.mdx cross-repo follow-up" \
-  || bad "doc does not flag the getgeolens.com follow-up"
+# The full procedure lives in the docs-site upgrade guide; the doc must link it.
+grep -Fq 'docs.getgeolens.com/guides/quickstart/upgrade/' "$DOC" \
+  && ok "doc links the docs-site upgrade guide" \
+  || bad "doc does not link the docs-site upgrade guide"
 
 echo "1..$((PASS + FAIL))"
 echo "# $PASS passed, $FAIL failed"

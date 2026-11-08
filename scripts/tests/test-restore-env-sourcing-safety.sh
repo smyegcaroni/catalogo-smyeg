@@ -1,7 +1,6 @@
 #!/bin/sh
 # Regression test for scripts/restore.sh and scripts/check-env.sh reading
-# `.env` with get_env_value (an awk parser) instead of shell-sourcing it
-# (fix(#1778)).
+# `.env` with get_env_value (an awk parser) instead of shell-sourcing it.
 #
 # Docker Compose's own `.env` parser and `sh` disagree about the same file:
 # install.sh writes values verbatim (an operator-typed admin password can
@@ -70,15 +69,14 @@ cat > "$SHIM/docker" <<'DOCKER'
 #!/bin/sh
 if [ "$1" = "compose" ]; then
   shift
-  # fix(#1798 review round 16, P2, review 5104847831): compose() now also
-  # emits `--project-directory VALUE` (see scripts/lib/common.sh) -- skip
-  # any number of "-f VALUE" / "--project-directory VALUE" pairs, in
+  # compose() now also emits `--project-directory VALUE` (see
+  # scripts/lib/common.sh) -- skip any number of "-f VALUE" / "--project-directory VALUE" pairs, in
   # whichever order compose() sends them, before checking the subcommand.
   while [ "$1" = "-f" ] || [ "$1" = "--project-directory" ]; do shift 2; done
   case "$1" in
     stop|start) exit 0 ;;
     exec)
-      # fix(#1778 review round 6, P2) test support: opt-in argv logging so
+      # Test support: opt-in argv logging so
       # a test can prove which POSTGRES_USER/POSTGRES_DB restore.sh
       # actually invoked psql with, without restore.sh itself changing.
       [ -n "${DOCKER_EXEC_LOG:-}" ] && printf '%s\n' "$*" >> "${DOCKER_EXEC_LOG}"
@@ -146,12 +144,12 @@ else
 fi
 
 # ============================================================================
-# CASE 3 — fix(#1778 review, P2): get_env_value's raw awk extraction used to
-# return a Compose-quoted value WITH its quote characters still attached — a
-# legal, common .env line like COMPOSE_FILE="docker-compose.prod.yml" (or
-# POSTGRES_USER="geolens") came back as the 25-character string
-# `"docker-compose.prod.yml"`, quotes and all, silently breaking any caller
-# that put it in a path or SQL identifier. Compose itself strips exactly one
+# CASE 3: get_env_value must not return a Compose-quoted value WITH its quote
+# characters still attached — a legal, common .env line like
+# COMPOSE_FILE="docker-compose.prod.yml" (or POSTGRES_USER="geolens") would come
+# back as the 25-character string `"docker-compose.prod.yml"`, quotes and all,
+# silently breaking any caller that put it in a path or SQL identifier.
+# Compose itself strips exactly one
 # matching pair of quotes and, inside double quotes, unescapes \" and \\.
 # Drive get_env_value directly (not through restore.sh/check-env.sh, which
 # only exercise a handful of keys) against every shape Compose's env-file
@@ -222,7 +220,7 @@ _assert_quote_line 'UNQUOTED_HASH_NO_SPACE=[value#nothash]' \
 _assert_quote_line 'EMPTY_DOUBLE=[]' "an empty double-quoted value is empty, not two quote chars"
 _assert_quote_line 'EMPTY_SINGLE=[]' "an empty single-quoted value is empty, not two quote chars"
 
-# fix(#1778 review round 2, P2): a comment MAY follow the closing quote —
+# A comment MAY follow the closing quote —
 # `COMPOSE_FILE="docker-compose.prod.yml" # production` is valid Compose
 # syntax. The raw text does not end in a quote (it ends in the comment), so
 # the "starts and ends with a quote" dispatch used to take the unquoted
@@ -234,7 +232,7 @@ _assert_quote_line 'HASH_INSIDE_DOUBLE=[value#withhash]' \
 _assert_quote_line 'SINGLE_WITH_TRAILING_COMMENT=[geolens]' \
   "a single-quoted value followed by a comment strips the comment and the quotes"
 
-# fix(#1798 review round 9, P2): the greedy `(.*)` in get_env_value's own
+# The greedy `(.*)` in get_env_value's own
 # single-quote branch backtracked to the LAST `'` on the line — a trailing
 # comment containing its own apostrophe (a real-world "prefer this instead"
 # comment style) matched all the way to THAT quote, returning
@@ -251,7 +249,7 @@ _assert_quote_line 'UNQUOTED_HAS_EQUALS=[a=b]' \
 _assert_quote_line 'SINGLE_HAS_EQUALS=[a=b]' \
   "a single-quoted value containing '=' is not truncated at it"
 
-# fix(#1798 review round 10, P2): Compose's env-file syntax
+# Compose's env-file syntax
 # (https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/#env-file-syntax)
 # documents \\, \", \n, \r, \t as the escape sequences a double-quoted
 # value decodes. Everything else (\d here) is left completely unchanged —
@@ -275,7 +273,7 @@ else
 fi
 
 # ============================================================================
-# CASE 3b — fix(#1798 review round 10, P2): Compose's env-file syntax
+# CASE 3b — Compose's env-file syntax
 # (https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/#env-file-syntax)
 # documents \n, \r, \t (and \\, \") as the escape sequences a
 # double-quoted value decodes — POSTGRES_DB="geo\tlens" is a literal tab
@@ -320,7 +318,7 @@ else
 fi
 
 # ============================================================================
-# CASE 4 — fix(#1778 review round 3, P2): Compose-compatible ${VAR}
+# CASE 4 — Compose-compatible ${VAR}
 # interpolation. A valid Compose .env may write
 # COMPOSE_FILE="${DEPLOY_FILE}"; the plain quote/comment parsing above
 # returns that literally, `${DEPLOY_FILE}` and all, instead of the value
@@ -386,7 +384,7 @@ else
 fi
 
 # ============================================================================
-# CASE 5 — fix(#1778 review round 6, P2): get_env_value distinguishes "key
+# CASE 5 — get_env_value distinguishes "key
 # absent from the file" (returns 1, prints nothing) from "key present with
 # an empty value" (returns 0, prints ""), and resolves a duplicate key to
 # its LAST definition (Compose's own rule) instead of its first.
@@ -455,7 +453,7 @@ else
 fi
 
 # ============================================================================
-# CASE 6 — fix(#1778 review round 6, P2): a setting Compose supports
+# CASE 6 — a setting Compose supports
 # supplying purely through the process environment (`POSTGRES_DB=prod
 # scripts/restore.sh ...`), deliberately OMITTED from .env, must survive —
 # not be overwritten with "" and then masked by restore.sh's own
@@ -489,7 +487,7 @@ fi
 
 
 # ============================================================================
-# CASE 7 — fix(#1798 review round 11 audit, P2): a leading UTF-8 BOM (bytes
+# CASE 7 — a leading UTF-8 BOM (bytes
 # EF BB BF, common from PowerShell's default UTF-8 output or some Windows
 # editors saving .env) sits BEFORE the first line's own text, so `^KEY=`
 # never matched a key on line 1 at all — get_env_value returned "not
@@ -519,20 +517,18 @@ else
   bad "a BOM-prefixed single-line .env did not return the value (got: $BOM_OUT)"
 fi
 
-# fix(#1798 CI on round 11, P2): the FIRST fix here built the BOM inside
-# awk via `sprintf("%c%c%c", 239, 187, 191)` — correct under the awk
-# builds checked locally (BWK awk on macOS, mawk in the postgres:18
-# image), but wrong on gawk under a UTF-8 locale: gawk's `%c` there
-# encodes each numeric argument as the UTF-8 bytes for that CODE POINT,
-# not the raw byte, so the 3-`%c` BOM never equalled the file's real
-# 3-byte BOM and this exact case went red on CI (gawk, LANG=...UTF-8).
+# Building the BOM inside awk via `sprintf("%c%c%c", 239, 187, 191)` is
+# correct under BWK awk on macOS and mawk in the postgres:18 image, but wrong
+# on gawk under a UTF-8 locale: gawk's `%c` there encodes each numeric
+# argument as the UTF-8 bytes for that CODE POINT, not the raw byte, so the
+# 3-`%c` BOM never equals the file's real 3-byte BOM (gawk, LANG=...UTF-8).
 # C.UTF-8 is used rather than en_US.UTF-8 because it needs no locale
 # generation and is present by default on this repo's CI runner and on
-# every awk (gawk, mawk, BWK) tested by hand — confirmed the ORIGINAL
-# sprintf-based approach fails under it on gawk, same as en_US.UTF-8.
-# Re-runs the same case under it so a future regression to a
-# locale-dependent construct fails here again, on whatever awk this
-# runner actually has, instead of only surfacing on CI.
+# every awk (gawk, mawk, BWK) tested by hand, and the sprintf-based approach
+# fails under it on gawk the same as under en_US.UTF-8.
+# Re-runs the same case under it so a regression to a locale-dependent
+# construct fails here, on whatever awk this runner actually has, instead of
+# only surfacing on CI.
 BOM_UTF8_OUT="$(LANG=C.UTF-8 LC_ALL=C.UTF-8 sh "$BOM_DRIVER" 2>&1)"
 
 if [ "$BOM_UTF8_OUT" = "FOUND:[geolens]" ]; then
@@ -542,7 +538,7 @@ else
 fi
 
 # ============================================================================
-# CASE 8 — fix(#1798 review round 11 audit, P2): _env_interpolate's
+# CASE 8 — _env_interpolate's
 # multi-pass loop resolves a chained ${VAR} reference by looking up the
 # REFERENCED key's raw value and re-scanning IT for further ${VAR} tokens —
 # but it reused the OUTER key's own `before_line` bound for every
@@ -582,7 +578,7 @@ else
 fi
 
 # ============================================================================
-# CASE 9 — fix(#1798 review round 13, P2, review 5103870781): three findings
+# CASE 9 — three bugs
 # in the SAME interpolation/decoding core CASE 8 already covers, all fixed
 # by replacing the old flat multi-pass loop + sed-built substitution with a
 # recursive, newline-safe resolver (see scripts/lib/common.sh,
@@ -667,7 +663,7 @@ set -eu
 val="\$(get_env_value TRAILING_NL "$TRAILING_ENV" && printf x)"
 val="\${val%x}"
 printf '%s' "\$val"
-# fix(#1798 review round 13, P2, review 5103870781): sentinel-terminate
+# Sentinel-terminate
 # the DRIVER's own stdout too — the driver correctly reconstructs "geo\n"
 # above via its own sentinel-protected capture, but that trailing newline
 # would be stripped ALL OVER AGAIN by the plain \$(sh "\$TRAILING_DRIVER")
@@ -686,8 +682,8 @@ else
 fi
 
 # ============================================================================
-# CASE 10 — fix(#1778 round 20, P1) at scripts/restore.sh:41:
-# _env_resolve_name's "process environment wins" check now consults an
+# CASE 10 — restore.sh's real call sequence:
+# _env_resolve_name's "process environment wins" check consults an
 # immutable snapshot taken the moment common.sh is sourced, not the live
 # shell variable table. Without this, a SECOND env_value_into call (for a
 # DIFFERENT key) that happens to assign a value into the SAME name a
@@ -786,8 +782,8 @@ else
 fi
 
 # ============================================================================
-# CASE 11 — fix(#1778 round 22, P2) at scripts/lib/common.sh:176-195
-# (dash branch): a NAME is identified per PHYSICAL line of `export -p`'s
+# CASE 11 — the dash branch of the environment snapshot in
+# scripts/lib/common.sh: a NAME is identified per PHYSICAL line of `export -p`'s
 # output. An inherited value containing a real embedded newline
 # immediately followed by text that itself looks like "export X=" gets
 # misread as a second, phantom declaration of X. Two distinct failures
@@ -798,7 +794,7 @@ fi
 #       — the real cause (an unset phantom name) never surfaces.
 #   (b) if the phantom name happens to be COMPOSE_FILE — which this file
 #       itself gave a local default via `: "${COMPOSE_FILE:=...}"` BEFORE
-#       the snapshot was taken in rounds 20-21 — the phantom write
+#       the snapshot was taken — the phantom write
 #       succeeds (COMPOSE_FILE genuinely was "set", just never actually
 #       exported/inherited) and contaminates the snapshot with
 #       "docker-compose.yml" as if an operator had exported it. Anything

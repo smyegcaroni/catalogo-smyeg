@@ -16,8 +16,8 @@ import {
 import { normalizeBboxLongitudes } from '@/lib/bbox';
 import { MAP_COLORS } from '@/lib/map-colors';
 import 'maplibre-gl/dist/maplibre-gl.css';
-// feat(#846): wires maplibre v6's worker URL. Side-effect import, kept out of
-// main.tsx so map-vendor stays out of the eager entry graph (fix(#1624)).
+// Wires maplibre v6's worker URL. Side-effect import, kept out of
+// main.tsx so map-vendor stays out of the eager entry graph.
 import '@/lib/maplibre-worker';
 
 interface BboxMapPickerProps {
@@ -41,7 +41,6 @@ export function BboxMapPicker({ onBboxSelected }: BboxMapPickerProps) {
     );
   }, [basemaps, resolvedTheme]);
 
-  // Cleanup terra-draw on unmount
   useEffect(() => {
     return () => {
       if (drawRef.current) {
@@ -96,10 +95,9 @@ export function BboxMapPicker({ onBboxSelected }: BboxMapPickerProps) {
 
   return (
     <div>
-      {/* audit(w3-maps): aria-label on <MapGL> is silently dropped —
-          @vis.gl/react-maplibre v8 forwards only id/ref/style, and MapLibre
-          labels its canvas "Map". Label the wrapper region instead (same
-          pattern as DatasetMap's shell). */}
+      {/* aria-label on <MapGL> is silently dropped (@vis.gl/react-maplibre v8
+          forwards only id/ref/style; MapLibre labels its canvas "Map"), so
+          the wrapper region is labelled, as in DatasetMap's shell. */}
       <div
         className="overflow-hidden rounded-md"
         role="region"

@@ -10,7 +10,6 @@ from app.core.config import validate_privacy_url_shape
 from app.core.dependencies import get_db
 from app.core.edition import get_edition
 from app.core.persistent_config import (
-    BASEMAPS,
     BRANDING_SHOW_BADGE,
     ENABLE_DATASET_EDITING,
     ENABLED_PLUGINS,
@@ -20,6 +19,7 @@ from app.core.persistent_config import (
     RESTRICT_PUBLIC_VISIBILITY,
     get_cached_basemap_proxy_rate_limit,
 )
+from app.modules.settings.basemaps import list_public_basemaps
 from app.platform.ratelimit import limiter
 from app.modules.settings.schemas import (
     BasemapPublicResponse,
@@ -35,7 +35,7 @@ router = APIRouter(prefix="/settings", tags=["Admin"])
 
 
 def _basemap_proxy_rate_limit(_request: Request | None = None) -> str:
-    """SEC-S10: per-IP rate limit for the public basemap endpoint (caps key replay)."""
+    """Per-IP rate limit for the public basemap endpoint (caps key replay)."""
     return f"{get_cached_basemap_proxy_rate_limit()}/minute"
 
 
@@ -43,9 +43,8 @@ def _basemap_proxy_rate_limit(_request: Request | None = None) -> str:
 @router.get(
     "/edition/",
     response_model=EditionInfoResponse,
-    # fix(scripts/deployed_surface_gate.json#edition_info_op): neutral summary — the
-    # auto-derived "Edition Info" label is a banned public-copy id; operationId/path
-    # unchanged.
+    # Neutral summary: the auto-derived "Edition Info" label is banned public
+    # copy (scripts/deployed_surface_gate.json); operationId and path unchanged.
     summary="Get runtime capabilities",
 )
 async def edition_info() -> EditionInfoResponse:
@@ -61,9 +60,14 @@ async def edition_info() -> EditionInfoResponse:
 
 
 @router.get(
-    "/feature-flags", response_model=FeatureFlagsResponse, include_in_schema=False
+    "/feature-flags",
+    response_model=FeatureFlagsResponse,
+    include_in_schema=False,
+    summary="Get feature flags",
 )
-@router.get("/feature-flags/", response_model=FeatureFlagsResponse)
+@router.get(
+    "/feature-flags/", response_model=FeatureFlagsResponse, summary="Get feature flags"
+)
 async def get_feature_flags(
     db: AsyncSession = Depends(get_db),
 ) -> FeatureFlagsResponse:
@@ -75,14 +79,19 @@ async def get_feature_flags(
     )
 
 
-@router.get("/branding", response_model=BrandingResponse, include_in_schema=False)
-# PRIV-1: privacy_url rides this endpoint even though its PersistentConfig
-# lives on the "general" tab — GET /settings/branding/ is already the one
-# public, pre-auth config bundle (login/register need it before a session
-# exists). Re-checks the shape here rather than trusting the admin-write or
-# boot validator: a row written before either existed must not reach the
-# login page as an unvalidated <a href>.
-@router.get("/branding/", response_model=BrandingResponse)
+@router.get(
+    "/branding",
+    response_model=BrandingResponse,
+    include_in_schema=False,
+    summary="Get branding",
+)
+# privacy_url rides this endpoint though its PersistentConfig lives on the
+# "general" tab: GET /settings/branding/ is the one public, pre-auth config
+# bundle (login/register need it before a session exists). The shape is
+# re-checked here rather than trusting the admin-write or boot validator, so a
+# row written before either existed never reaches the login page as an
+# unvalidated <a href>.
+@router.get("/branding/", response_model=BrandingResponse, summary="Get branding")
 async def get_branding(
     db: AsyncSession = Depends(get_db),
 ) -> BrandingResponse:
@@ -117,9 +126,14 @@ async def get_branding(
 
 
 @router.get(
-    "/basemaps", response_model=list[BasemapPublicResponse], include_in_schema=False
+    "/basemaps",
+    response_model=list[BasemapPublicResponse],
+    include_in_schema=False,
+    summary="Get basemaps",
 )
-@router.get("/basemaps/", response_model=list[BasemapPublicResponse])
+@router.get(
+    "/basemaps/", response_model=list[BasemapPublicResponse], summary="Get basemaps"
+)
 @limiter.limit(_basemap_proxy_rate_limit)
 async def get_basemaps(
     request: Request,
@@ -140,23 +154,18 @@ async def get_basemaps(
     ``_basemap_proxy_rate_limit`` to cap replay-cost from anonymous clients.
     """
     del request
-    stored = await BASEMAPS.get(db)
-    result: list[BasemapPublicResponse] = []
-    for entry in stored:
-        url = entry.get("url", "")
-        key_value = entry.get("api_key")
-        if "{api_key}" in url:
-            if not key_value:
-                continue
-            entry = {**entry, "url": url.replace("{api_key}", key_value)}
-        result.append(BasemapPublicResponse(**entry))
-    return result
+    return await list_public_basemaps(db)
 
 
 @router.get(
-    "/map-defaults", response_model=MapDefaultsResponse, include_in_schema=False
+    "/map-defaults",
+    response_model=MapDefaultsResponse,
+    include_in_schema=False,
+    summary="Get map defaults",
 )
-@router.get("/map-defaults/", response_model=MapDefaultsResponse)
+@router.get(
+    "/map-defaults/", response_model=MapDefaultsResponse, summary="Get map defaults"
+)
 async def get_map_defaults(
     db: AsyncSession = Depends(get_db),
 ) -> MapDefaultsResponse:
@@ -165,9 +174,14 @@ async def get_map_defaults(
 
 
 @router.get(
-    "/enabled-plugins", response_model=list[str] | None, include_in_schema=False
+    "/enabled-plugins",
+    response_model=list[str] | None,
+    include_in_schema=False,
+    summary="Get enabled plugins",
 )
-@router.get("/enabled-plugins/", response_model=list[str] | None)
+@router.get(
+    "/enabled-plugins/", response_model=list[str] | None, summary="Get enabled plugins"
+)
 async def get_enabled_plugins(
     db: AsyncSession = Depends(get_db),
 ) -> list[str] | None:

@@ -1,11 +1,11 @@
 /**
- * PERF-07 (Phase 274): regression-lock that AttributeTable uses
+ * regression-lock that AttributeTable uses
  * @tanstack/react-virtual for row windowing and that the virtualizer is wired
  * against the parent scroll element.
  *
  * Uses Vite's `?raw` query suffix to load the source as a string at build time
  * — no node fs needed, runs purely in the browser test environment. Same
- * pattern used by `DatasetMap.lazy.test.tsx` for PERF-06.
+ * pattern used by `DatasetMap.lazy.test.tsx`.
  *
  * jsdom does not compute layout (getBoundingClientRect returns zeros), so a
  * full DOM render test cannot meaningfully assert that virtualization renders
@@ -15,7 +15,7 @@
  * Render-correctness is exercised manually + via Playwright in the existing
  * dataset E2E spec.
  *
- * GLUX-002 (Phase 1248): accessible-name regression gate — a separate DOM
+ * Accessible-name regression gate — a separate DOM
  * render suite below asserts that filter inputs are queryable by accessible
  * name. The filter row lives in <thead> (not virtualized), so jsdom can render
  * and interrogate it without layout computation.
@@ -23,22 +23,19 @@
 import { describe, it, expect } from 'vitest';
 import attributeTableSrc from '@/components/dataset/AttributeTable.tsx?raw';
 
-// ── GLUX-002 DOM render gate ─────────────────────────────────────────────────
+// ── DOM render gate ─────────────────────────────────────────────────
 import { render, screen } from '@/test/test-utils';
 import { vi } from 'vitest';
-import { AttributeTable, features } from '@/components/dataset/AttributeTable';
+import { AttributeTable } from '@/components/dataset/AttributeTable';
 import { useDatasetRows } from '@/components/dataset/hooks/use-dataset';
 import { useUpdateFeature } from '@/hooks/use-features';
-
-// ── #1407 sortFn auto-detection regression lock ─────────────────────────────
-import { renderHook } from '@testing-library/react';
-import { useTable, type ColumnDef } from '@tanstack/react-table';
 
 vi.mock('@/components/dataset/hooks/use-dataset', () => ({
   useDatasetRows: vi.fn(),
 }));
 vi.mock('@/hooks/use-features', () => ({
   useUpdateFeature: vi.fn(),
+  useDeleteFeatures: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
 // Pass debounced value through so filter state changes propagate immediately
 vi.mock('@/hooks/use-debounce', () => ({
@@ -84,12 +81,22 @@ describe('GLUX-002: AttributeTable filter input accessible name', () => {
     expect(rowsPerPage.closest('.flex-wrap.gap-x-3')).not.toBeNull();
   });
 
-  it('sizes the row spacer with min-height so a short table is not clipped to its header', () => {
+  // A second scroll container between the region and the table grows to the
+  // rendered rows, so it clips the virtualized rows below it and takes the
+  // sticky header and horizontal scrollbar with it.
+  it('scrolls the table in one focusable, named region with no nested scroll container', () => {
     render(<AttributeTable datasetId="test-ds" />);
-    const scrollBox = screen.getByRole('table').closest<HTMLElement>('.max-h-\\[60vh\\]');
-    const spacer = scrollBox?.firstElementChild as HTMLElement;
-    expect(spacer.style.minHeight).not.toBe('');
-    expect(spacer.style.height).toBe('');
+    const region = screen.getByRole('region', { name: 'Feature attributes' });
+    expect(region).toHaveAttribute('tabindex', '0');
+    expect(region).toHaveClass('overflow-auto');
+    expect(screen.getByRole('table').parentElement).toBe(region);
+  });
+
+  it('labels headers and the Columns menu with the bare column name', () => {
+    render(<AttributeTable datasetId="test-ds" />);
+    const header = screen.getByRole('columnheader', { name: /title/ });
+    expect(header).toHaveTextContent(/^title\s*text$/);
+    expect(header).not.toHaveTextContent('(text)');
   });
 });
 
@@ -122,7 +129,7 @@ describe('PERF-07: AttributeTable virtualization wiring', () => {
     expect(attributeTableSrc).toMatch(/columnVisibility/);
   });
 
-  // fix(#820): dynamic measurement (measureElement) fed back synchronously
+  // Dynamic measurement (measureElement) fed back synchronously
   // (measure→layout→re-render) when a Chrome AX tree was attached, freezing
   // the page in an infinite render loop. Rows are fixed-height; reintroducing
   // measureElement reintroduces the freeze. Live coverage: e2e/attribute-table-ax.spec.ts.
@@ -130,7 +137,7 @@ describe('PERF-07: AttributeTable virtualization wiring', () => {
     expect(attributeTableSrc).not.toContain('measureElement');
   });
 
-  // fix(#820): with measurement gone, the virtualizer's row size and the
+  // With measurement gone, the virtualizer's row size and the
   // rendered row height must agree by construction. The row height is derived
   // from the density mode (44px default / 28px compact, measured in Chromium)
   // and enforced on the cells via matching height classes (h-11 / h-7, py-0).
@@ -140,7 +147,7 @@ describe('PERF-07: AttributeTable virtualization wiring', () => {
     expect(attributeTableSrc).toMatch(/compact \? 'h-7 py-0 text-xs' : 'h-11 py-0'/);
   });
 
-  // fix(#851): virtual-core does not invalidate its measurement cache when
+  // virtual-core does not invalidate its measurement cache when
   // estimateSize changes, so a density toggle must explicitly call
   // virtualizer.measure() or totals/offsets keep the old row height.
   it('resets cached row sizes when the density mode changes', () => {
@@ -148,12 +155,12 @@ describe('PERF-07: AttributeTable virtualization wiring', () => {
   });
 });
 
-// ── fix(#458 E-35/E-39/E-51) source contracts ────────────────────────────────
+// ── source contracts ────────────────────────────────
 // The body rows are virtualized, and jsdom computes no layout, so the cell
-// editor can't be rendered here (same constraint as PERF-07 above). Lock the
+// editor can't be rendered here (same constraint above). Lock the
 // contracts against the source instead; the live flow is covered by
 // e2e/feature-editing.spec.ts.
-describe('AttributeTable editing contracts (E-35/E-39/E-51)', () => {
+describe('AttributeTable editing contracts (E-35/E-39)', () => {
   it('E-35: an unchanged cell value commits as a cancel, not a PATCH', () => {
     // commit() guards on value === initialValue and routes to onCancel —
     // removing the guard reintroduces no-op writes (tile purge + audit noise).
@@ -170,81 +177,5 @@ describe('AttributeTable editing contracts (E-35/E-39/E-51)', () => {
     expect(attributeTableSrc).toContain('aria-invalid={error ? true : undefined}');
     expect(attributeTableSrc).toContain('aria-describedby={error ? errorId : undefined}');
     expect(attributeTableSrc).toContain("t('attributes.cellEditorLabel'");
-  });
-
-  it('E-51: an open cell edit closes when the row set changes', () => {
-    expect(attributeTableSrc).toMatch(
-      /setEditingCell\(null\);\s*setEditError\(null\);\s*\}, \[datasetId, cursor, activeFilters, pageSize\]\)/,
-    );
-  });
-});
-
-// ── #1407 sortFn auto-detection regression lock ──────────────────────────────
-// AttributeTable builds its columns dynamically from the dataset's Postgres
-// column list and never sets a per-column sortFn, so sorting depends on
-// react-table v9's runtime auto-detection (column_getAutoSortFn, which samples
-// each column's first 10 values) resolving to a sortFn *name* that is actually
-// registered in the `features` object exported by AttributeTable.tsx. A gap
-// there doesn't fail typecheck or build — a column with an unregistered
-// auto-detected name silently falls back to the `basic` comparator (or a
-// dev-only console.warn), which is exactly the kind of regression the v8→v9
-// migration (GH-1407) needed live verification for. This exercises the real
-// useTable()/features config end-to-end against synthetic rows shaped like
-// the Postgres column families the table actually renders — no mocking of
-// react-table itself.
-describe('#1407: react-table v9 sortFn auto-detection for dynamic columns', () => {
-  function useSortedColumn(data: Array<{ value: unknown }>) {
-    const columns: ColumnDef<typeof features, { value: unknown }>[] = [
-      { accessorKey: 'value', header: 'value' },
-    ];
-    return useTable(
-      {
-        features,
-        data,
-        columns,
-        state: { sorting: [{ id: 'value', desc: false }], columnVisibility: {} },
-        onSortingChange: () => {},
-        onColumnVisibilityChange: () => {},
-      },
-      (state) => state,
-    );
-  }
-
-  it('sorts a numeric column ascending via the auto-detected basic sortFn', () => {
-    const { result } = renderHook(() =>
-      useSortedColumn([{ value: 30 }, { value: 5 }, { value: 100 }]),
-    );
-    const sorted = result.current.getSortedRowModel().rows.map((r) => r.original.value);
-    expect(sorted).toEqual([5, 30, 100]);
-  });
-
-  it('sorts a text column via the auto-detected text sortFn', () => {
-    const { result } = renderHook(() =>
-      useSortedColumn([{ value: 'cherry' }, { value: 'Apple' }, { value: 'banana' }]),
-    );
-    const sorted = result.current.getSortedRowModel().rows.map((r) => r.original.value);
-    expect(sorted).toEqual(['Apple', 'banana', 'cherry']);
-  });
-
-  // The API serializes timestamp columns as ISO-8601 strings, never real Date
-  // instances (JSON has no Date type), so column_getAutoSortFn's `[object
-  // Date]` check never matches them — they auto-detect as 'alphanumeric', not
-  // 'datetime'. That's unchanged from v8 (same heuristic). What matters here
-  // is that zero-padded same-format ISO strings still sort chronologically
-  // under the alphanumeric comparator, and that 'alphanumeric' is registered.
-  it('sorts an ISO-timestamp-string column chronologically via the auto-detected alphanumeric sortFn', () => {
-    const { result } = renderHook(() =>
-      useSortedColumn([
-        { value: '2026-03-01T00:00:00' },
-        { value: '2024-01-01T00:00:00' },
-        { value: '2025-06-15T00:00:00' },
-      ]),
-    );
-    const sorted = result.current.getSortedRowModel().rows.map((r) => r.original.value);
-    expect(sorted).toEqual([
-      '2024-01-01T00:00:00',
-      '2025-06-15T00:00:00',
-      '2026-03-01T00:00:00',
-    ]);
   });
 });

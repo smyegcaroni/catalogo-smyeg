@@ -1,7 +1,6 @@
 """Community-edition defaults for the extension-seam protocols.
 
-Split from the former single-module ``defaults.py`` (#836): this sub-module
-owns the policy/no-op defaults for the extension seams (branding, auth,
+The policy/no-op defaults for the extension seams (branding, auth,
 permission, workflow, identity, audit sink, notification sink, billing,
 connectors, data serving, entitlement). Import via the
 ``app.platform.extensions.defaults`` facade, never from this sub-module.
@@ -9,12 +8,20 @@ connectors, data serving, entitlement). Import via the
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.platform.extensions.reader_theme import ReaderTheme
+
 
 class DefaultBrandingExtension:
     """Default branding: shows community badge."""
 
     def get_branding_defaults(self) -> dict[str, object]:
         return {"show_badge": True}
+
+    def get_reader_theme(self) -> ReaderTheme | None:
+        return None
 
 
 class DefaultAuthExtension:
@@ -70,7 +77,7 @@ class DefaultPermissionExtension:
                 record_cls.visibility == "private",
                 record_cls.created_by == user.id,
             ),
-            # fix(#930): internal = any signed-in user, bare like `public`,
+            # Internal = any signed-in user, bare like `public`,
             # because `status_filter` below already ANDs the published gate.
             # An inner `record_status == "published"` here looks stricter
             # but is wrong: `status_filter` ORs with `created_by == <caller>`,
@@ -81,23 +88,39 @@ class DefaultPermissionExtension:
         ]
 
         if grant_cls is not None:
-            # fix(#515): grants key catalog.datasets.id, not records.id —
+            # Grants key catalog.datasets.id, not records.id —
             # route through Dataset.record_id so granted records resolve.
-            from app.modules.catalog.datasets.domain.models import Dataset
+            from app.modules.auth.models import GroupMember
+            from app.modules.catalog.datasets.domain.models import (
+                Dataset,
+                DatasetGroupGrant,
+            )
 
             conditions.append(
                 and_(
                     record_cls.visibility == "restricted",
                     or_(
-                        # fix(#929): creator exemption — without it, a
+                        # Creator exemption — without it, a
                         # non-admin owner who restricts their own dataset
-                        # loses read access (grants have no write path).
+                        # loses read access.
                         record_cls.created_by == user.id,
                         record_cls.id.in_(
                             select(Dataset.record_id)
                             .join(grant_cls, grant_cls.dataset_id == Dataset.id)
                             .join(UserRole, grant_cls.role_id == UserRole.role_id)
                             .where(UserRole.user_id == user.id)
+                        ),
+                        record_cls.id.in_(
+                            select(Dataset.record_id)
+                            .join(
+                                DatasetGroupGrant,
+                                DatasetGroupGrant.dataset_id == Dataset.id,
+                            )
+                            .join(
+                                GroupMember,
+                                GroupMember.group_id == DatasetGroupGrant.group_id,
+                            )
+                            .where(GroupMember.user_id == user.id)
                         ),
                     ),
                 )
@@ -118,10 +141,13 @@ class DefaultPermissionExtension:
         *,
         user_roles,
     ):  # type: ignore[no-untyped-def]
-        from sqlalchemy import select
+        from sqlalchemy import exists, or_, select
 
-        from app.modules.auth.models import UserRole
-        from app.modules.catalog.datasets.domain.models import DatasetGrant
+        from app.modules.auth.models import GroupMember, UserRole
+        from app.modules.catalog.datasets.domain.models import (
+            DatasetGrant,
+            DatasetGroupGrant,
+        )
 
         record = dataset.record
 
@@ -138,29 +164,28 @@ class DefaultPermissionExtension:
             return False
 
         if record.visibility == "restricted":
-            # fix(#929): creator exemption — restricted means "owner,
+            # Creator exemption — restricted means "owner,
             # admins, and grant holders"; the owner is never locked out.
             if record.created_by == user.id:
                 return True
-            grant_result = await db.execute(
-                select(DatasetGrant.dataset_id)
-                .join(UserRole, DatasetGrant.role_id == UserRole.role_id)
-                .where(
-                    DatasetGrant.dataset_id == dataset_id,
-                    UserRole.user_id == user.id,
-                )
-                # Each granted role the user holds is its own row.
-                .limit(1)
+            by_role = exists().where(
+                DatasetGrant.role_id == UserRole.role_id,
+                DatasetGrant.dataset_id == dataset_id,
+                UserRole.user_id == user.id,
             )
-            return grant_result.scalar_one_or_none() is not None
+            by_group = exists().where(
+                DatasetGroupGrant.group_id == GroupMember.group_id,
+                DatasetGroupGrant.dataset_id == dataset_id,
+                GroupMember.user_id == user.id,
+            )
+            return bool(await db.scalar(select(or_(by_role, by_group))))
 
         if record.visibility == "internal":
-            # fix(#930): internal = any signed-in user, matching
-            # MapVisibility. Looks deletable since the fall-through below
-            # does the same thing, but before this branch existed that
-            # outcome was an accident of an unhandled value, not a pinned
-            # policy. The `record_status` gate above keeps unpublished
-            # internal records owner-only.
+            # Internal = any signed-in user, matching MapVisibility. Explicit
+            # although the fall-through returns the same, so it is a stated
+            # policy rather than the default for an unhandled value. The
+            # `record_status` gate above keeps unpublished internal records
+            # owner-only.
             return True
 
         return True
@@ -169,15 +194,14 @@ class DefaultPermissionExtension:
         """The same ladder as ``filter_visible``, read from the user end.
 
         ``filter_visible`` asks which RECORDS a user may read; this asks
-        which USERS may read a record. One rule, two directions, changed as
-        a pair — ``test_permission_audience.py`` compares them account by
-        account across every visibility/status/role, so a change to one that
-        isn't mirrored here fails there instead of quietly disagreeing with
-        what viewers see.
+        which USERS may read a record. ``test_permission_audience.py``
+        compares them account by account across every visibility/status/role,
+        so a change to one that isn't mirrored here fails there.
         """
         from sqlalchemy import and_, false, or_, select, true
 
-        from app.modules.auth.models import Role, UserRole
+        from app.modules.auth.models import GroupMember, Role, UserRole
+        from app.modules.catalog.datasets.domain.models import DatasetGroupGrant
         from app.platform.extensions.protocols import RecordAudience
 
         # `filter_visible` returns the statement unchanged for an admin, so
@@ -193,21 +217,29 @@ class DefaultPermissionExtension:
         is_owner = false() if query.owner_id is None else user_cls.id == query.owner_id
 
         if query.visibility in ("public", "internal"):
-            # fix(#930): internal = any signed-in user, bare like `public` —
+            # Internal = any signed-in user, bare like `public` —
             # the status gate below already ANDs the published check.
             reaches = true()
         elif query.visibility == "private":
             reaches = is_owner
         elif query.visibility == "restricted" and grant_cls is not None:
-            # fix(#929): creator exemption, then the grant — the same edge
-            # `filter_visible` walks (record -> dataset -> grant -> role ->
-            # user), traversed from the user end.
+            # Creator exemption, then the role and group grants — the same
+            # edges `filter_visible` walks (record -> dataset -> grant -> role
+            # or group -> user), traversed from the user end.
             reaches = or_(
                 is_owner,
                 user_cls.id.in_(
                     select(UserRole.user_id)
                     .join(grant_cls, grant_cls.role_id == UserRole.role_id)
                     .where(grant_cls.dataset_id == query.dataset_id)
+                ),
+                user_cls.id.in_(
+                    select(GroupMember.user_id)
+                    .join(
+                        DatasetGroupGrant,
+                        DatasetGroupGrant.group_id == GroupMember.group_id,
+                    )
+                    .where(DatasetGroupGrant.dataset_id == query.dataset_id)
                 ),
             )
         else:
@@ -260,7 +292,7 @@ class DefaultIdentityExtension:
 
     Returning None from ``resolve_identity_from_token`` signals the auth
     dep chain (``get_optional_user`` / ``get_current_user``) to fall
-    through to the existing JWT decode + DB lookup path.
+    through to the JWT decode + DB lookup path.
 
     The async signature is required, not incidental: the dep wire-in does
     ``await ext.resolve_identity_from_token(token, request, db)``, so an
@@ -390,7 +422,7 @@ class DefaultEntitlementPort:
     (RBAC) remain orthogonal and guard independently.
 
     The cloud overlay REPLACES this by registering under the
-    ``"entitlement"`` single-slot key; ExtensionSlotConflictError (SLOT-01)
+    ``"entitlement"`` single-slot key; ExtensionSlotConflictError
     prevents two overlays from claiming it. See ``protocols.EntitlementPort``
     for the full contract.
     """

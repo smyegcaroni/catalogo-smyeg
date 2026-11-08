@@ -1,6 +1,10 @@
 import { apiFetch, ApiError, authenticatedRawFetch } from './client';
 import type {
   MapResponse,
+  MapVisibility,
+  MapGroupsResponse,
+  MapGroupsConfirm,
+  MapLayerAccessGap,
   DuplicateMapResponse,
   MapListResponse,
   MapCreateRequest,
@@ -24,6 +28,8 @@ import type {
   MapIconListResponse,
   MapIconResponse,
   MapAccessResponse,
+  MapStoriesResponse,
+  MapLayerBulkDeleteResponse,
 } from '@/types/api';
 import { API_BASE } from '@/lib/constants';
 import { translateApiErrorDetail } from '@/lib/error-map';
@@ -31,7 +37,7 @@ import i18n from '@/i18n/i18n';
 import { normalizeLayerStyleState } from '@/lib/normalize-style-config';
 import { normalizeSavedMap } from '@/lib/normalize-saved-map';
 
-export type ShareExpirationPresetDays = 1 | 7 | 30 | 90;
+type ShareExpirationPresetDays = 1 | 7 | 30 | 90;
 
 export interface ShareExpirationInput {
   expiresAt?: string | null;
@@ -70,7 +76,7 @@ export async function listMaps(
 }
 
 export async function getMap(id: string): Promise<MapResponse> {
-  const resp = await apiFetch<MapResponse>(`/maps/${id}`);
+  const resp = await apiFetch<MapResponse>(`/maps/${encodeURIComponent(id)}`);
   if (resp.layers) {
     for (const l of resp.layers) {
       const normalized = normalizeLayerStyleState(l.style_config, l.paint, l.dataset_geometry_type, {
@@ -80,10 +86,8 @@ export async function getMap(id: string): Promise<MapResponse> {
       l.paint = normalized.paint;
     }
   }
-  // Apply map-level normalization: guarantees basemap_style is a non-empty string,
-  // show_basemap_labels is a boolean, plugins is string[]|null. Composes with
-  // the per-layer normalizeLayerStyleState loop above; does NOT reassign resp.layers
-  // because the loop already mutated those elements in place.
+  // Map-level normalization (basemap_style, show_basemap_labels, plugins). The
+  // per-layer loop above already mutated resp.layers in place.
   const mapNorm = normalizeSavedMap(resp);
   resp.basemap_style = mapNorm.basemap_style;
   resp.show_basemap_labels = mapNorm.show_basemap_labels;
@@ -94,7 +98,11 @@ export async function getMap(id: string): Promise<MapResponse> {
 }
 
 export async function getMapAccess(id: string): Promise<MapAccessResponse> {
-  return apiFetch<MapAccessResponse>(`/maps/${id}/access/`);
+  return apiFetch<MapAccessResponse>(`/maps/${encodeURIComponent(id)}/access/`);
+}
+
+export async function getMapStories(id: string): Promise<MapStoriesResponse> {
+  return apiFetch<MapStoriesResponse>(`/maps/${encodeURIComponent(id)}/stories/`);
 }
 
 export async function getMapHistory(
@@ -105,7 +113,7 @@ export async function getMapHistory(
   if (params.skip !== undefined) query.set('skip', String(params.skip));
   if (params.limit !== undefined) query.set('limit', String(params.limit));
   const qs = query.toString();
-  return apiFetch<MapHistoryListResponse>(`/maps/${mapId}/history${qs ? `?${qs}` : ''}`);
+  return apiFetch<MapHistoryListResponse>(`/maps/${encodeURIComponent(mapId)}/history${qs ? `?${qs}` : ''}`);
 }
 
 export async function createMap(data: MapCreateRequest): Promise<MapResponse> {
@@ -119,7 +127,7 @@ export async function updateMap(
   id: string,
   data: MapUpdateRequest,
 ): Promise<MapResponse> {
-  return apiFetch<MapResponse>(`/maps/${id}`, {
+  return apiFetch<MapResponse>(`/maps/${encodeURIComponent(id)}`, {
     method: 'PUT',
     body: JSON.stringify(data),
   });
@@ -129,7 +137,7 @@ export async function patchMapLayers(
   id: string,
   diff: MapLayerDiffRequest,
 ): Promise<MapResponse> {
-  const resp = await apiFetch<MapResponse>(`/maps/${id}/layers`, {
+  const resp = await apiFetch<MapResponse>(`/maps/${encodeURIComponent(id)}/layers`, {
     method: 'PATCH',
     body: JSON.stringify(diff),
   });
@@ -146,13 +154,13 @@ export async function patchMapLayers(
 }
 
 export async function duplicateMap(mapId: string): Promise<DuplicateMapResponse> {
-  return apiFetch<DuplicateMapResponse>(`/maps/${mapId}/duplicate/`, {
+  return apiFetch<DuplicateMapResponse>(`/maps/${encodeURIComponent(mapId)}/duplicate/`, {
     method: 'POST',
   });
 }
 
 export async function deleteMap(id: string): Promise<void> {
-  await apiFetch(`/maps/${id}`, {
+  await apiFetch(`/maps/${encodeURIComponent(id)}`, {
     method: 'DELETE',
   });
 }
@@ -161,7 +169,7 @@ export async function addLayerToMapApi(
   mapId: string,
   data: MapLayerInput,
 ): Promise<MapLayerResponse> {
-  const layer = await apiFetch<MapLayerResponse>(`/maps/${mapId}/layers`, {
+  const layer = await apiFetch<MapLayerResponse>(`/maps/${encodeURIComponent(mapId)}/layers`, {
     method: 'POST',
     body: JSON.stringify(data),
   });
@@ -177,7 +185,7 @@ export async function removeLayerFromMapApi(
   mapId: string,
   layerId: string,
 ): Promise<void> {
-  await apiFetch(`/maps/${mapId}/layers/${layerId}`, {
+  await apiFetch(`/maps/${encodeURIComponent(mapId)}/layers/${encodeURIComponent(layerId)}`, {
     method: 'DELETE',
   });
 }
@@ -185,15 +193,15 @@ export async function removeLayerFromMapApi(
 /**
  * Batch-delete multiple layers from a map in a single HTTP call.
  *
- * This call fires one POST request
- * regardless of how many layers are selected. The backend returns partial-failure details
- * inline so the caller can surface them without treating the whole operation as failed.
+ * One POST regardless of how many layers are selected. The backend returns
+ * partial-failure details inline so the caller can surface them without
+ * treating the whole operation as failed.
  */
 export async function bulkDeleteLayersApi(
   mapId: string,
   layerIds: string[],
-): Promise<import('@/types/api').MapLayerBulkDeleteResponse> {
-  return apiFetch(`/maps/${mapId}/layers/bulk-delete`, {
+): Promise<MapLayerBulkDeleteResponse> {
+  return apiFetch(`/maps/${encodeURIComponent(mapId)}/layers/bulk-delete`, {
     method: 'POST',
     body: JSON.stringify({ layer_ids: layerIds }),
   });
@@ -202,26 +210,18 @@ export async function bulkDeleteLayersApi(
 /**
  * Fetch a shared map by its share token.
  *
- * Returns `null` when the token does not exist (404) — this is treated as an
- * expected, quiet outcome. The caller (`useSharedMap` → `PublicViewerPage`)
- * handles `data === null` via the existing `isError || !data` branch, rendering
- * the "Map not found" view without any application-layer error surface.
- *
- * Other error statuses (403, 410 expired, 500) still throw ApiError normally so
- * that they surface correctly (e.g. the "Link expired" view for 410).
+ * Returns `null` when the token does not exist (404), an expected quiet outcome
+ * the caller renders as "Map not found". Other statuses (403, 410 expired, 500)
+ * still throw ApiError so they surface correctly (e.g. "Link expired" for 410).
  */
-export async function getSharedMap(token: string, apiKey?: string, embedToken?: string): Promise<SharedMapResponse | null> {
+export async function getSharedMap(token: string, embedToken?: string): Promise<SharedMapResponse | null> {
   const extraHeaders: Record<string, string> = {};
-  if (apiKey) {
-    extraHeaders['X-Api-Key'] = apiKey;
-  }
-  // Embed viewers present their token so the
-  // metadata payload includes the token's scoped (possibly non-public)
-  // dataset layers — the tile path already honored the same capability.
+  // Embed viewers present their token so the metadata payload includes the
+  // token's scoped (possibly non-public) dataset layers, as the tile path does.
   if (embedToken) {
     extraHeaders['X-Embed-Token'] = embedToken;
   }
-  const resp = await apiFetch<SharedMapResponse | null>(`/maps/shared/${token}`, {
+  const resp = await apiFetch<SharedMapResponse | null>(`/maps/shared/${encodeURIComponent(token)}`, {
     headers: extraHeaders,
     expected404: true,
   });
@@ -237,25 +237,23 @@ export async function getSharedMap(token: string, apiKey?: string, embedToken?: 
       l.paint = normalized.paint;
     }
   }
-  // Apply map-level normalization: SharedMapResponse.show_basemap_labels is optional
-  // Older shared payloads omit it; normalizeSavedMap defaults it to true.
-  // Does NOT reassign resp.layers — per-layer mutations already applied above.
+  // SharedMapResponse.show_basemap_labels is optional; older payloads omit it and
+  // normalizeSavedMap defaults it to true. resp.layers is already normalized above.
   const mapNorm = normalizeSavedMap(resp);
   resp.basemap_style = mapNorm.basemap_style;
   resp.show_basemap_labels = mapNorm.show_basemap_labels;
   resp.basemap_config = mapNorm.basemap_config;
   resp.terrain_config = mapNorm.terrain_config;
-  // plugins: SharedMapResponse has no plugins field; normalization result is intentionally
-  // discarded. When SharedMapResponse gains plugins, add: resp.plugins = mapNorm.plugins;
+  // SharedMapResponse has no plugins field, so the normalized plugins are discarded.
   return resp;
 }
 
 export async function checkMapVisibility(mapId: string): Promise<VisibilityCheckResponse> {
-  return apiFetch<VisibilityCheckResponse>(`/maps/${mapId}/visibility-check/`);
+  return apiFetch<VisibilityCheckResponse>(`/maps/${encodeURIComponent(mapId)}/visibility-check/`);
 }
 
 export async function exportMapStyleJson(mapId: string): Promise<Record<string, unknown>> {
-  return apiFetch<Record<string, unknown>>(`/maps/${mapId}/style.json`);
+  return apiFetch<Record<string, unknown>>(`/maps/${encodeURIComponent(mapId)}/style.json`);
 }
 
 export async function importMapStyleJson(style: Record<string, unknown>): Promise<MapStyleImportResponse> {
@@ -278,23 +276,48 @@ export async function uploadMapIcon(file: File): Promise<MapIconResponse> {
   });
 }
 
-export async function publishMap(id: string, visibility: 'public' | 'private' | 'internal'): Promise<MapResponse> {
-  return apiFetch<MapResponse>(`/maps/${id}`, {
+/**
+ * Share a map with exactly these groups; an empty list unshares it. Without
+ * `confirm`, the server answers 409 when some layer is unreadable by a group
+ * that would newly reach the map (see `layersHiddenFromGroups`).
+ */
+export async function setMapGroups(
+  id: string,
+  groupIds: string[],
+  confirm?: MapGroupsConfirm,
+): Promise<MapGroupsResponse> {
+  return apiFetch<MapGroupsResponse>(`/maps/${encodeURIComponent(id)}/groups/`, {
+    method: 'PUT',
+    body: JSON.stringify({ group_ids: groupIds, ...(confirm && { confirm }) }),
+  });
+}
+
+/** The layers a 409 from `setMapGroups` lists, or undefined for any other failure. */
+export function layersHiddenFromGroups(err: unknown): MapLayerAccessGap[] | undefined {
+  if (!(err instanceof ApiError) || err.status !== 409 || !err.body || typeof err.body !== 'object') {
+    return undefined;
+  }
+  const detail = err.body as { code?: unknown; layers?: unknown };
+  return detail.code === 'layers_hidden_from_groups' && Array.isArray(detail.layers)
+    ? (detail.layers as MapLayerAccessGap[])
+    : undefined;
+}
+
+export async function publishMap(id: string, visibility: MapVisibility): Promise<MapResponse> {
+  return apiFetch<MapResponse>(`/maps/${encodeURIComponent(id)}`, {
     method: 'PUT',
     body: JSON.stringify({ visibility }),
   });
 }
 
 /**
- * Distinguishes the one 400 `publishMap` can return that
- * has its own dedicated UI (SharePanel's inline "can't go public" message)
- * from every other failure, which still gets the generic toast. Reads the
- * raw `err.body` the backend sent (`{ message, datasets }` from
- * `validate_public_visibility` in `maps/router.py`), not `err.message` —
- * that is already a translated fallback string rather than JSON.
+ * Distinguishes the one 400 `publishMap` can return that has its own UI
+ * (SharePanel's inline "can't go public" message) from every other failure,
+ * which gets the generic toast. Reads the raw `err.body` the backend sent
+ * (`{ message, datasets }` from `validate_public_visibility` in
+ * `maps/router.py`), not `err.message`, which is a translated fallback string.
  *
- * Shared by `usePublishMap` (to skip its own toast for this one case) and
- * `SharePanel` (to render the inline message), so the two can't drift.
+ * Shared by `usePublishMap` and `SharePanel` so the two can't drift.
  */
 export function nonPublicDatasetsFromError(err: unknown): string | undefined {
   if (!(err instanceof ApiError) || err.status !== 400 || !err.body || typeof err.body !== 'object') {
@@ -317,46 +340,46 @@ export async function createShareToken(
   expiration: ShareExpirationInput = {},
 ): Promise<ShareTokenResponse> {
   const body = serializeShareExpiration(expiration);
-  return apiFetch<ShareTokenResponse>(`/maps/${mapId}/share/`, {
+  return apiFetch<ShareTokenResponse>(`/maps/${encodeURIComponent(mapId)}/share/`, {
     method: 'POST',
     ...(body && { body }),
   });
 }
 
 export async function revokeShareToken(mapId: string): Promise<void> {
-  await apiFetch(`/maps/${mapId}/share/`, { method: 'DELETE' });
+  await apiFetch(`/maps/${encodeURIComponent(mapId)}/share/`, { method: 'DELETE' });
 }
 
 export async function updateShareTokenExpiration(
   mapId: string,
   expiration: ShareExpirationInput,
 ): Promise<ShareTokenResponse> {
-  return apiFetch<ShareTokenResponse>(`/maps/${mapId}/share/`, {
+  return apiFetch<ShareTokenResponse>(`/maps/${encodeURIComponent(mapId)}/share/`, {
     method: 'PATCH',
     body: serializeShareExpiration(expiration),
   });
 }
 
 export async function getMapShareToken(mapId: string): Promise<ShareTokenResponse | null> {
-  return apiFetch<ShareTokenResponse | null>(`/maps/${mapId}/share/`);
+  return apiFetch<ShareTokenResponse | null>(`/maps/${encodeURIComponent(mapId)}/share/`);
 }
 
 export async function uploadThumbnail(mapId: string, dataUri: string): Promise<void> {
-  await apiFetch(`/maps/${mapId}/thumbnail/`, {
+  await apiFetch(`/maps/${encodeURIComponent(mapId)}/thumbnail/`, {
     method: 'PUT',
     body: JSON.stringify({ data_uri: dataUri }),
   });
 }
 
 export async function uploadOgImage(mapId: string, dataUri: string): Promise<void> {
-  await apiFetch(`/maps/${mapId}/og-image/`, {
+  await apiFetch(`/maps/${encodeURIComponent(mapId)}/og-image/`, {
     method: 'PUT',
     body: JSON.stringify({ data_uri: dataUri }),
   });
 }
 
 export async function fetchDatasetMaps(datasetId: string): Promise<MapListResponse> {
-  return apiFetch<MapListResponse>(`/datasets/${datasetId}/maps/`);
+  return apiFetch<MapListResponse>(`/datasets/${encodeURIComponent(datasetId)}/maps/`);
 }
 
 export interface StreamEvent {
@@ -423,9 +446,8 @@ export async function* streamGenerateMap(
   data: MapGenerateRequest,
   signal?: AbortSignal,
 ): AsyncGenerator<StreamEvent> {
-  // Route through the refresh-aware raw fetch so a stream issued as
-  // the first request after a long idle transparently refreshes the JWT
-  // instead of hard-failing with a 401. Authorization header is set inside.
+  // Route through the refresh-aware raw fetch so a stream issued as the first
+  // request after a long idle refreshes the JWT instead of failing with a 401.
   const response = await authenticatedRawFetch(
     `${API_BASE}/ai/generate-map/stream/`,
     {
@@ -458,7 +480,7 @@ export async function fetchColumnValues(
 ): Promise<ColumnValuesResponse> {
   const params = limit ? `?limit=${limit}` : '';
   return apiFetch<ColumnValuesResponse>(
-    `/datasets/${datasetId}/columns/${columnName}/values/${params}`,
+    `/datasets/${encodeURIComponent(datasetId)}/columns/${encodeURIComponent(columnName)}/values/${params}`,
   );
 }
 
@@ -467,7 +489,7 @@ export async function fetchColumnStats(
   columnName: string,
 ): Promise<ColumnStatsResponse> {
   return apiFetch<ColumnStatsResponse>(
-    `/datasets/${datasetId}/columns/${columnName}/stats/`,
+    `/datasets/${encodeURIComponent(datasetId)}/columns/${encodeURIComponent(columnName)}/stats/`,
   );
 }
 
@@ -479,7 +501,7 @@ function toChatLayers(layers: MapLayerResponse[]): ChatMapLayer[] {
     dataset_table_name: l.dataset_table_name,
     geometry_type: l.dataset_geometry_type,
     layer_type: l.layer_type ?? null,
-    column_info: l.dataset_column_info,
+    column_info: l.dataset_column_info ?? null,
     visible: l.visible,
     filter: l.filter ?? null,
     label_config: l.label_config ?? null,
@@ -500,7 +522,7 @@ function toChatLayers(layers: MapLayerResponse[]): ChatMapLayer[] {
  * without leaking provider/key detail. Returns `available=false` (not a 503)
  * when provider keys are missing. A viewer without `use_ai_chat` gets 403.
  */
-export interface AIAvailabilityResponse {
+interface AIAvailabilityResponse {
   available: boolean;
 }
 

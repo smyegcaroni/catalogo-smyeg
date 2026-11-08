@@ -2,7 +2,7 @@
  * feature attribute editors (drawing AttributeForm + dataset AttributeTable).
  */
 
-export type AttributeInputType =
+type AttributeInputType =
   | 'number-int'
   | 'number-float'
   | 'checkbox'
@@ -159,11 +159,9 @@ const FALSE_WORDS = new Set(['false', 'f', '0', 'no', 'n']);
 /**
  * Coerce a free-text cell value to the column's wire type.
  *
- * fix(#458 E-03): the attribute table's inline editor is a plain text input;
- * sending its raw string into a typed Postgres column made every non-text
- * cell edit fail. Empty input means NULL (matches the pre-fix `value || null`
- * contract). `ok: false` means the text is not representable in the column
- * type and must not be sent.
+ * The inline editor is a plain text input, so its raw string cannot go into a
+ * typed Postgres column. Empty input means NULL. `ok: false` means the text is
+ * not representable in the column type and must not be sent.
  */
 export function coerceAttributeValue(
   raw: string,

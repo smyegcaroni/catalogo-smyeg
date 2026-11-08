@@ -110,19 +110,18 @@ def sync_detailed(
     client: AuthenticatedClient,
     expected_version_number: int,
 ) -> Response[Any | ProblemDetail]:
-    """Delete Previous Version
+    """Delete the previous version
 
-     Delete the dataset's previous version, so it can no longer be restored.
+     Delete the dataset's newest kept version, so it can no longer be restored.
 
-    Refuses with 404 ``no_previous_version`` when there is none, 409
-    ``previous_version_changed`` when it is not ``expected_version_number``,
-    409 ``previous_version_in_use`` while a view or foreign key elsewhere
-    reads its table, and 409 ``dataset_busy`` while a refresh, replacement or
-    restore is active.
+    Deprecated: use ``DELETE /previous-versions/{version_number}``. Behaves
+    like it, and also refuses with 409 ``previous_version_changed`` when
+    ``expected_version_number`` is not the newest kept version.
 
     Args:
         dataset_id (UUID):
-        expected_version_number (int): The previous version the caller confirmed deleting
+        expected_version_number (int): The newest kept version, which the caller confirmed
+            deleting
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -150,19 +149,18 @@ def sync(
     client: AuthenticatedClient,
     expected_version_number: int,
 ) -> Any | ProblemDetail | None:
-    """Delete Previous Version
+    """Delete the previous version
 
-     Delete the dataset's previous version, so it can no longer be restored.
+     Delete the dataset's newest kept version, so it can no longer be restored.
 
-    Refuses with 404 ``no_previous_version`` when there is none, 409
-    ``previous_version_changed`` when it is not ``expected_version_number``,
-    409 ``previous_version_in_use`` while a view or foreign key elsewhere
-    reads its table, and 409 ``dataset_busy`` while a refresh, replacement or
-    restore is active.
+    Deprecated: use ``DELETE /previous-versions/{version_number}``. Behaves
+    like it, and also refuses with 409 ``previous_version_changed`` when
+    ``expected_version_number`` is not the newest kept version.
 
     Args:
         dataset_id (UUID):
-        expected_version_number (int): The previous version the caller confirmed deleting
+        expected_version_number (int): The newest kept version, which the caller confirmed
+            deleting
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -185,19 +183,18 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     expected_version_number: int,
 ) -> Response[Any | ProblemDetail]:
-    """Delete Previous Version
+    """Delete the previous version
 
-     Delete the dataset's previous version, so it can no longer be restored.
+     Delete the dataset's newest kept version, so it can no longer be restored.
 
-    Refuses with 404 ``no_previous_version`` when there is none, 409
-    ``previous_version_changed`` when it is not ``expected_version_number``,
-    409 ``previous_version_in_use`` while a view or foreign key elsewhere
-    reads its table, and 409 ``dataset_busy`` while a refresh, replacement or
-    restore is active.
+    Deprecated: use ``DELETE /previous-versions/{version_number}``. Behaves
+    like it, and also refuses with 409 ``previous_version_changed`` when
+    ``expected_version_number`` is not the newest kept version.
 
     Args:
         dataset_id (UUID):
-        expected_version_number (int): The previous version the caller confirmed deleting
+        expected_version_number (int): The newest kept version, which the caller confirmed
+            deleting
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -223,19 +220,18 @@ async def asyncio(
     client: AuthenticatedClient,
     expected_version_number: int,
 ) -> Any | ProblemDetail | None:
-    """Delete Previous Version
+    """Delete the previous version
 
-     Delete the dataset's previous version, so it can no longer be restored.
+     Delete the dataset's newest kept version, so it can no longer be restored.
 
-    Refuses with 404 ``no_previous_version`` when there is none, 409
-    ``previous_version_changed`` when it is not ``expected_version_number``,
-    409 ``previous_version_in_use`` while a view or foreign key elsewhere
-    reads its table, and 409 ``dataset_busy`` while a refresh, replacement or
-    restore is active.
+    Deprecated: use ``DELETE /previous-versions/{version_number}``. Behaves
+    like it, and also refuses with 409 ``previous_version_changed`` when
+    ``expected_version_number`` is not the newest kept version.
 
     Args:
         dataset_id (UUID):
-        expected_version_number (int): The previous version the caller confirmed deleting
+        expected_version_number (int): The newest kept version, which the caller confirmed
+            deleting
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

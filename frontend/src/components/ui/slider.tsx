@@ -10,9 +10,8 @@ function Slider({
   min = 0,
   max = 100,
   "aria-label": ariaLabel,
-  // fix(#788 item 3): forward aria-valuetext to the Thumb like aria-label —
-  // Radix leaves unknown props on the Root span, which has no slider role, so
-  // valuetext set by callers never reached assistive tech.
+  // Forwarded to the Thumb like aria-label: Radix leaves unknown props on the
+  // Root span, which has no slider role, so assistive tech would never see it.
   "aria-valuetext": ariaValueText,
   "aria-describedby": ariaDescribedBy,
   ...props

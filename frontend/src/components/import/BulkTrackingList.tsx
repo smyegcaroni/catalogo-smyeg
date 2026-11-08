@@ -82,14 +82,12 @@ export function BulkTrackingList({ entries, onReset, autoOpenVrt = false, onOutc
     }];
   });
 
-  // 'fanned_out' parents have no further status to display — children carry
-  // forward progress under their own job IDs (the per-layer modal already shown).
-  // Treat fanned_out as terminal so the parent doesn't sit in "Active and recent
-  // jobs" forever. See SMOKE-v1013-F1.
-  // fix(#1677): 'cancelled' likewise. Cancel is a user-reachable terminal
-  // status for every job type now, and a cancelled import will never progress
-  // — leaving it out kept it in "Active" forever and held `allDone` false, so
-  // the VRT auto-open never fired for a batch the user had finished with.
+  // 'fanned_out' parents have no further status to display: children carry
+  // progress under their own job IDs (the per-layer modal already shown), so
+  // treat it as terminal or the parent sits in "Active and recent jobs"
+  // forever. 'cancelled' likewise: a cancelled import never progresses, and
+  // leaving it out would keep it in "Active" and hold `allDone` false, so the
+  // VRT auto-open would never fire for a batch the user had finished with.
   const isTerminal = (status: string | undefined) =>
     status === 'complete' || status === 'failed' || status === 'fanned_out' || status === 'cancelled';
 
@@ -144,7 +142,6 @@ export function BulkTrackingList({ entries, onReset, autoOpenVrt = false, onOutc
     [doneCount, trackable.length],
   );
 
-  /* ── All-done completion card ──────────────────────── */
   if (allDone) {
     return (
       <div className="space-y-4">
@@ -232,7 +229,7 @@ export function BulkTrackingList({ entries, onReset, autoOpenVrt = false, onOutc
                 {stagingFailures.map((entry) => (
                   <div key={entry.id} className="rounded-lg border border-destructive/30 p-3 text-sm">
                     <p className="font-medium">{entry.fileName}</p>
-                    {entry.error && <p className="mt-1 text-destructive">{entry.error}</p>}
+                    {entry.error && <p role="alert" className="mt-1 text-destructive">{entry.error}</p>}
                   </div>
                 ))}
               </div>
@@ -257,7 +254,7 @@ export function BulkTrackingList({ entries, onReset, autoOpenVrt = false, onOutc
                 size="sm"
                 className="border-primary/40 text-primary hover:bg-primary/10 hover:text-primary"
               >
-                <Link to={`/datasets/${completedEntries[0].datasetId}`}>
+                <Link to={`/datasets/${completedEntries[0].datasetId}#metadata`}>
                   <Sparkles className="me-1 size-3" />
                   {t('complete.aiMetadata', { defaultValue: 'Add AI metadata' })}
                 </Link>
@@ -289,7 +286,6 @@ export function BulkTrackingList({ entries, onReset, autoOpenVrt = false, onOutc
     );
   }
 
-  /* ── In-progress state (batch banner + active jobs) ── */
   return (
     <div className="space-y-4">
       {/* Batch progress banner */}
@@ -298,7 +294,7 @@ export function BulkTrackingList({ entries, onReset, autoOpenVrt = false, onOutc
           <div className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-primary/30 border-t-primary" />
           <div className="flex-1">
             <p className="text-xs">
-              <span className="font-semibold">{t('bulk.importingFiles', { count: trackable.length, defaultValue: `Importing ${trackable.length} files` })}</span>
+              <span className="font-semibold">{t('bulk.importingFiles', { count: trackable.length })}</span>
             </p>
             <p className="font-mono text-mini text-muted-foreground tracking-wide mt-0.5">
               {t(failedCount > 0 ? 'bulk.progressDetailWithFailures' : 'bulk.progressDetail', {

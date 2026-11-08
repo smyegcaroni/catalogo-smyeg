@@ -20,16 +20,16 @@ interface BasemapSublayer {
   kind: 'vector' | 'raster';
 }
 
-export interface BasemapGroupEditorSceneProps {
+interface BasemapGroupEditorSceneProps {
   activePresetId: string;
   presets: BasemapPreset[];
   sublayers: BasemapSublayer[];
   masterOpacity: number;
   onSwapBasemap: (presetId: string) => void;
   /**
-   * Optional. When omitted, the "Add custom basemap" affordance is not rendered.
-   * Custom-basemap support is a Plan 1037 follow-up; until a real handler is
-   * supplied the button stays hidden rather than shipping a no-op stub.
+   * Optional. When omitted, the "Add custom basemap" affordance is not rendered:
+   * custom-basemap support isn't implemented, so the button stays hidden rather
+   * than shipping a no-op stub.
    */
   onAddCustomBasemap?: () => void;
   onSublayerVisibilityChange: (sublayerId: string) => void;
@@ -37,7 +37,7 @@ export interface BasemapGroupEditorSceneProps {
   onMasterOpacityChange: (opacity: number) => void;
 }
 
-export interface BasemapGroupEditorFooterProps {
+interface BasemapGroupEditorFooterProps {
   onResetAppearance: () => void;
   onRemoveBasemap: () => void;
 }
@@ -84,10 +84,9 @@ export function BasemapGroupEditorScene({
           <p className="eyebrow mb-2">
             {t('basemapGroup.presetSectionLabel', { defaultValue: 'PRESET' })}
           </p>
-          {/* fix(#394) UX-03/B-017: expose selected-state to assistive tech —
-              radiogroup + aria-checked, same pattern as the Projection pills
-              in SettingsEditorScene. The border highlight alone was invisible
-              to screen readers. */}
+          {/* Selected state is exposed to assistive tech via radiogroup +
+              aria-checked, as the Projection pills in SettingsEditorScene; the
+              border highlight alone is invisible to screen readers. */}
           <div
             role="radiogroup"
             aria-label={t('basemapGroup.presetSectionAria', { defaultValue: 'Basemap preset' })}
@@ -164,7 +163,7 @@ export function BasemapGroupEditorScene({
         </div>
       </section>
 
-      {/* 2. Sublayers section — hidden when there are no sublayers (e.g. blank basemap). WR-02 fix. */}
+      {/* 2. Sublayers section — hidden when there are no sublayers (e.g. blank basemap). */}
       {sublayers.length > 0 && (
       <section className="border-b">
         <div className="px-4 py-2">

@@ -17,7 +17,7 @@ function Table({
     <div
       data-slot="table-container"
       className="relative w-full overflow-x-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-      tabIndex={containerFocusable ? 0 : undefined} // eslint-disable-line jsx-a11y/no-noninteractive-tabindex
+      tabIndex={containerFocusable ? 0 : undefined} // eslint-disable-line jsx-a11y/no-noninteractive-tabindex -- scrollable region must be keyboard-focusable when it overflows
       role="region"
       aria-label={ariaLabel}
     >
@@ -80,8 +80,7 @@ function TableHead({ className, ...props }: React.ComponentProps<"th">) {
   return (
     <th
       data-slot="table-head"
-      // Redesign: mono-caps column headers — tables read as instrument
-      // readouts, matching the stats-grid and eyebrow label system.
+      // Mono-caps headers match the stats-grid and eyebrow label system.
       className={cn(
         "text-muted-foreground h-10 px-4 py-3 text-start align-middle font-mono font-medium text-mini uppercase tracking-[0.08em] whitespace-nowrap [&:has([role=checkbox])]:pe-0 [&>[role=checkbox]]:translate-y-[2px]",
         className

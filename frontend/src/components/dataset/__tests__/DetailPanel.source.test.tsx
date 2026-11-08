@@ -4,7 +4,7 @@ import { DetailPanel } from '../panels/DetailPanel';
 import type { DatasetRefreshWatch } from '@/components/dataset/hooks/use-dataset';
 import type { DatasetResponse, RecordType } from '@/types/api';
 
-// fix(#1285 codex round 4): SourcePanel is fully mocked below and never
+// SourcePanel is fully mocked below and never
 // actually renders SourceRefreshAction, so this stub's values are never
 // read — it exists only to satisfy DetailPanel's required prop (owned for
 // real by the dataset page via useDatasetRefreshWatch).
@@ -14,7 +14,11 @@ function makeRefreshWatch(): DatasetRefreshWatch {
 
 vi.mock('@/components/dataset/tabs/OverviewTab', () => ({ OverviewTab: () => null }));
 vi.mock('@/components/dataset/tabs/MetadataTab', () => ({ MetadataTab: () => null }));
-vi.mock('@/components/dataset/tabs/DataTab', () => ({ DataTab: () => null }));
+vi.mock('@/components/dataset/tabs/DataTab', () => ({
+  DataTab: ({ canEdit }: { canEdit?: boolean }) => (
+    <div data-testid="data-tab" data-can-edit={String(Boolean(canEdit))} />
+  ),
+}));
 vi.mock('@/components/dataset/tabs/StructureTab', () => ({ StructureTab: () => null }));
 vi.mock('@/components/dataset/tabs/AccessTab', () => ({ AccessTab: () => null }));
 vi.mock('@/components/dataset/SourcePanel', () => ({
@@ -28,6 +32,10 @@ function makeDataset(recordType: RecordType): DatasetResponse {
     id: `dataset-${recordType}`,
     record_id: 'record-1',
     table_name: 'ds_source',
+    source_health: 'unknown',
+    schema_drift_status: 'unknown',
+    source_freshness: 'unknown',
+    has_generic_geometry: false,
     title: 'Source dataset',
     summary: null,
     srid: null,
@@ -70,9 +78,9 @@ function makeDataset(recordType: RecordType): DatasetResponse {
   };
 }
 
-// feat(#1285): DetailPanel now wires the "Refresh from source" action into
+// DetailPanel now wires the "Refresh from source" action into
 // SourcePanel's `actions` slot, gated on canEdit AND REFRESHABLE_ORIGINS
-// (fix, codex round 1: origin presence alone was too broad — an upload,
+// (origin presence alone is too broad — an upload,
 // created, or STAC origin resolves just fine but the refresh door refuses
 // all three). These synthetic datasets all set source_format: null, which
 // datasetOrigin() reads as a registered-table (postgis) origin — allowlisted
@@ -135,7 +143,7 @@ it.each<[string, string]>([
 );
 
 it('offers the refresh action for a stac-origin dataset, which now has a strategy', () => {
-  // feat(#1266): the refresh door dispatches stac to its own executor, which
+  // The refresh door dispatches stac to its own executor, which
   // re-reads the item document and follows the asset if the publisher moved
   // it. A binding whose item identity cannot be verified is still refused,
   // but per dataset and with a reason the error-map renders — not by hiding
@@ -175,4 +183,26 @@ it('withholds the refresh action from a reader who cannot edit, even with a reso
   );
 
   expect(screen.getByTestId('source-panel')).toHaveAttribute('data-has-actions', 'false');
+});
+
+it.each<[RecordType, string | null, boolean]>([
+  ['vector_dataset', 'Point', true],
+  ['table', null, false],
+])('lets the Data tab edit a %s only when it has geometry', (recordType, geometryType, editable) => {
+  render(
+    <DetailPanel
+      dataset={{ ...makeDataset(recordType), geometry_type: geometryType }}
+      canEdit
+      capabilities={buildDatasetEditCapabilities({ isEditor: true })}
+      activeTab="data"
+      onTabChange={vi.fn()}
+      resolveDraftValue={() => ''}
+      stagePendingDraft={vi.fn()}
+      handleDraftDirtyChange={vi.fn()}
+      onNavigateToValidationField={vi.fn()}
+      refreshWatch={makeRefreshWatch()}
+    />,
+  );
+
+  expect(screen.getByTestId('data-tab')).toHaveAttribute('data-can-edit', String(editable));
 });

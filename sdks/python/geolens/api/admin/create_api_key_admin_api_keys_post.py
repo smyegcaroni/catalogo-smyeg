@@ -106,11 +106,12 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: AdminApiKeyCreateRequest,
 ) -> Response[ApiKeyCreateResponse | ProblemDetail]:
-    """Create Api Key
+    """Create an API key for a user
 
      Create an API key for a user (admin only).
 
     The raw key is returned only in this response and cannot be retrieved again.
+    Requires a signed-in session: a request that presents an API key gets 403.
 
     Args:
         body (AdminApiKeyCreateRequest):
@@ -139,11 +140,12 @@ def sync(
     client: AuthenticatedClient,
     body: AdminApiKeyCreateRequest,
 ) -> ApiKeyCreateResponse | ProblemDetail | None:
-    """Create Api Key
+    """Create an API key for a user
 
      Create an API key for a user (admin only).
 
     The raw key is returned only in this response and cannot be retrieved again.
+    Requires a signed-in session: a request that presents an API key gets 403.
 
     Args:
         body (AdminApiKeyCreateRequest):
@@ -167,11 +169,12 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: AdminApiKeyCreateRequest,
 ) -> Response[ApiKeyCreateResponse | ProblemDetail]:
-    """Create Api Key
+    """Create an API key for a user
 
      Create an API key for a user (admin only).
 
     The raw key is returned only in this response and cannot be retrieved again.
+    Requires a signed-in session: a request that presents an API key gets 403.
 
     Args:
         body (AdminApiKeyCreateRequest):
@@ -198,11 +201,12 @@ async def asyncio(
     client: AuthenticatedClient,
     body: AdminApiKeyCreateRequest,
 ) -> ApiKeyCreateResponse | ProblemDetail | None:
-    """Create Api Key
+    """Create an API key for a user
 
      Create an API key for a user (admin only).
 
     The raw key is returned only in this response and cannot be retrieved again.
+    Requires a signed-in session: a request that presents an API key gets 403.
 
     Args:
         body (AdminApiKeyCreateRequest):

@@ -1,6 +1,6 @@
 """Backfill FlatGeobuf download distributions for existing spatial datasets.
 
-fix(#1681 codex review): _DISTRIBUTION_TEMPLATES now generates a FlatGeobuf
+_DISTRIBUTION_TEMPLATES generates a FlatGeobuf
 download distribution at dataset creation (records/service.py), but those rows
 are materialized — existing spatial datasets created before this deploy would
 never advertise the fgb download in DCAT feeds until an unrelated geometry-mode
@@ -16,22 +16,19 @@ auto-generated fgb download rows.
 Non-spatial datasets are excluded (geometry_type IS NULL) — FlatGeobuf
 requires geometry, matching generate_distributions' spatial-only filter.
 
-fix(#1681 codex review round 2): the NOT EXISTS guard reads only
+The NOT EXISTS guard reads only
 auto_generated rows, matching generate_distributions' own existence probe
-(fix(#1370) there) — a user-authored download/fgb row must not suppress the
+— a user-authored download/fgb row must not suppress the
 platform's own export row; the intended end state is both rows coexisting.
-Narrowing the guard reopens the case that broad check was incidentally
-absorbing: a user's row at the exact guessable URL this INSERT targets
-(`/datasets/{id}/export?format=fgb`) collides on uq_record_distribution, so
+Because the guard is narrow, a user's row at the exact guessable URL this
+INSERT targets (`/datasets/{id}/export?format=fgb`) collides on uq_record_distribution, so
 the INSERT carries `ON CONFLICT DO NOTHING` — the same resolution
 `reconcile_distributions` uses for the identical collision at runtime (see
 `TestATemplateUrlCollisionDoesNotRaise` in
 test_distribution_reconcile_1314.py).
 
-Revises 0053_source_format_fgb (#1682, merged concurrently) rather than a
-core revision authored alongside this one: that PR's own migration already
-covers letting 'fgb' through chk_datasets_source_format, so this file is
-scoped to the (unrelated) DCAT distribution gap only.
+0053_source_format_fgb already lets 'fgb' through chk_datasets_source_format,
+so this file covers only the DCAT distribution gap.
 
 Revision ID: 0054_backfill_flatgeobuf_distributions
 Revises: 0053_source_format_fgb

@@ -171,7 +171,7 @@ def cog_info(monkeypatch):
         "height": 512,
         "nodata": 0,
         "band_info": [{"min": 0, "max": 4095, "mean": 1200}],
-        # fix(#1334): the shape fetch_cog_info actually returns, so tests
+        # The shape fetch_cog_info actually returns, so tests
         # against this fixture exercise the same fields the refresh path
         # now writes to the asset row. crs_wkt and epsg are a
         # matched pair, same as a real _georeferencing result: leaving epsg
@@ -179,7 +179,7 @@ def cog_info(monkeypatch):
         # EPSG" rather than "the fixture just didn't set it".
         "crs_wkt": 'PROJCS["WGS 84 / UTM zone 33N",AUTHORITY["EPSG","32633"]]',
         "epsg": 32633,
-        # fix(#1375): res_x/res_y/is_rotated join them for the same reason —
+        # res_x/res_y/is_rotated join them for the same reason —
         # _geotransform reads all three off /cog/stac's proj:transform, so a
         # fixture without them would exercise only the degraded path.
         "res_x": 30.0,
@@ -573,7 +573,7 @@ class TestAssetSelection:
         )
 
     def test_an_empty_string_key_is_recognised_by_identity(self) -> None:
-        """fix(#1331): ``""`` is a legal JSON property name, so an item may
+        """``""`` is a legal JSON property name, so an item may
         key its data asset under the empty string — and a binding that
         recorded it names a real asset. Testing the stored key with
         truthiness treats ``""`` exactly like no key was ever recorded,
@@ -773,7 +773,7 @@ class TestResolution:
     async def test_a_search_that_ignores_the_collection_filter_binds_nothing(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 13): item ids are only collection-scoped.
+        """Item ids are only collection-scoped.
 
         An endpoint that honours `ids` while ignoring `collections` can
         legitimately return a same-id item from somewhere else — and one that
@@ -798,7 +798,7 @@ class TestResolution:
     async def test_a_search_that_could_not_be_carried_out_is_not_a_withdrawal(
         self, stac_transport, code: int
     ) -> None:
-        """fix(#1266 review round 13): round 1 collapsed "looked and found
+        """An earlier version collapsed "looked and found
         nothing" into "could not look", on the reasoning that the item's own
         404 was authoritative anyway.
 
@@ -820,7 +820,7 @@ class TestResolution:
         """A 404 from /search is the catalog saying there is nowhere to look,
         which leaves the item's own 404 as the last authoritative word.
 
-        fix(#1266 review round 14): including its DETAIL. The search
+        That includes its DETAIL. The search
         endpoint's `not_found` describes the wrong resource — the Source
         panel would tell a user the source was not found where it should say
         the item was withdrawn.
@@ -834,7 +834,7 @@ class TestResolution:
     async def test_a_search_that_never_reached_the_wire_keeps_the_item_contact(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 14): the item answered, so the origin WAS
+        """The item answered, so the origin WAS
         contacted.
 
         A search that fails before it reaches the wire — a DNS timeout, a
@@ -858,7 +858,7 @@ class TestResolution:
     async def test_a_search_page_that_ignores_the_filters_proves_nothing(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 15): non-empty and non-matching is not
+        """A non-empty and non-matching result is not
         absence.
 
         The request asks for one id in one collection with `limit: 1`, so an
@@ -883,7 +883,7 @@ class TestResolution:
     async def test_a_permalink_body_must_affirm_the_stored_collection(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 18): where no URL can speak for the
+        """Where no URL can speak for the
         collection, the document has to.
 
         A permalink states no collection, so a permalink re-pointed at
@@ -915,7 +915,7 @@ class TestResolution:
     async def test_a_keyed_binding_whose_asset_vanished_reports_removal(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 18): a binding that recorded its key knows
+        """A binding that recorded its key knows
         exactly which entry disappeared.
 
         Reporting that as "cannot identify the asset" sent the reader to the
@@ -940,8 +940,8 @@ class TestResolution:
     async def test_a_redirect_into_another_collection_binds_nothing(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 17): the post-redirect URL states an
-        identity, and round 15 made it authoritative.
+        """The post-redirect URL states an
+        identity, and it is authoritative.
 
         A stored URL that redirects to another collection's same-id item, in
         a body that omits its optional `collection` field, passed every check
@@ -966,7 +966,7 @@ class TestResolution:
     async def test_a_self_link_whose_hostname_does_not_resolve_is_refused(
         self, stac_transport, monkeypatch
     ) -> None:
-        """fix(#1266 review round 16): the gap the probe alone leaves.
+        """The gap the probe alone leaves.
 
         The probe reports NXDOMAIN as `network_error`, indistinguishable from
         a host that is merely down — but the DOOR raises on it, before any
@@ -1003,7 +1003,7 @@ class TestResolution:
     async def test_a_self_link_that_answers_with_a_login_page_is_not_stored(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 19): 200 is not the same claim as "this
+        """200 is not the same claim as "this
         serves the item".
 
         A self link behind an auth wall answers 200 with HTML, which a ranged
@@ -1032,7 +1032,7 @@ class TestResolution:
     async def test_an_untrusted_self_link_does_not_steer_a_relative_asset(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 20): the self link steers TWO things.
+        """The self link steers TWO things.
 
         Validating it only on the way to storage left the asset base reading
         from an untrusted URL — so an item advertising a login page could
@@ -1067,7 +1067,7 @@ class TestResolution:
     async def test_a_replacement_without_the_bound_asset_is_not_adopted(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 20): the item is what a pointer addresses,
+        """The item is what a pointer addresses,
         the asset is what the dataset needs.
 
         An address that serves the item WITHOUT the bound asset is one the
@@ -1100,7 +1100,7 @@ class TestResolution:
     async def test_a_searched_item_advertising_the_stale_url_revalidates_it(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 21): the search path is reached BECAUSE the
+        """The search path is reached BECAUSE the
         stored pointer 404s.
 
         A searched feature advertising that same stale URL was fast-pathed as
@@ -1135,7 +1135,7 @@ class TestResolution:
     async def test_a_replacement_whose_bound_asset_has_no_href_is_not_adopted(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 21): present is not the same as usable.
+        """Present is not the same as usable.
 
         A STAC Asset Object requires an href, and a keyed empty object gives
         the next refresh nothing to resolve — which it would report as an
@@ -1160,7 +1160,7 @@ class TestResolution:
     async def test_a_redirected_document_bases_relative_assets_on_where_it_came_from(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 22): the self link plays two roles.
+        """The self link plays two roles.
 
         A document served from a new directory while still declaring the old
         self link resolved its relative assets under the STALE directory —
@@ -1198,7 +1198,7 @@ class TestResolution:
     async def test_the_pointer_and_the_asset_come_from_one_document(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 23): one binding, one document.
+        """One binding, one document.
 
         When two addresses for the same item give the bound key different
         hrefs, storing one document's pointer beside the other's href made
@@ -1228,7 +1228,7 @@ class TestResolution:
     async def test_a_binding_with_no_collection_borrows_one_from_its_url(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 24): `StacImportItem.collection` is optional.
+        """`StacImportItem.collection` is optional.
 
         A binding that carries none skipped every collection comparison, so a
         stored `/collections/A/items/x` redirecting to `/collections/B/items/x`
@@ -1265,7 +1265,7 @@ class TestResolution:
     async def test_a_missing_new_asset_keeps_its_conclusive_verdict(
         self, stac_transport, monkeypatch
     ) -> None:
-        """fix(#1266 review round 24): Titiler being unable to describe a
+        """Titiler being unable to describe a
         missing object adds nothing.
 
         The probe already settled that the publisher's new href is gone, and
@@ -1294,10 +1294,10 @@ class TestResolution:
     async def test_the_projection_comes_from_the_document_the_asset_did(
         self, stac_transport, monkeypatch
     ) -> None:
-        """fix(#1266 review round 24): a canonical document that supersedes
+        """A canonical document that supersedes
         the representation supersedes its projection too.
 
-        fix(#1334 review): stubs the probe to report no CRS at all — its OWN
+        Stubs the probe to report no CRS at all — its OWN
         reading would otherwise outrank the document's declared one
         (``reconcile_epsg``), which is a different concern from the one this
         test isolates: WHICH document's declaration wins, not probe-vs-
@@ -1331,7 +1331,7 @@ class TestResolution:
     async def test_a_self_link_that_redirects_into_a_blocked_target_is_refused(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 15): the submission-time validator checks
+        """The submission-time validator checks
         the hostname it is handed and nothing further.
 
         A public self link whose first hop redirects into a blocked target
@@ -1455,7 +1455,7 @@ class TestResolution:
     async def test_a_stored_url_that_serves_a_different_item_binds_nothing(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review): a valid item is not the same claim as THIS item.
+        """A valid item is not the same claim as THIS item.
 
         A stored URL that redirects — a scene collapsed into a mosaic, a
         bucket serving a default document — hands back a perfectly well-formed
@@ -1493,7 +1493,7 @@ class TestResolution:
     async def test_a_recorded_id_is_checked_even_when_the_url_states_none(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 9): the hole the URL-derived check left.
+        """The hole the URL-derived check left.
 
         A catalog outside the `/collections/{c}/items/{id}` layout states no
         identity in its URLs, so the derived check was skipped entirely and a
@@ -1542,7 +1542,7 @@ class TestResolution:
     async def test_a_legacy_permalink_binding_is_refused_before_it_is_asked(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 10): the residue of recording the id.
+        """The residue of recording the id.
 
         A binding written before item ids were recorded, whose catalog
         publishes permalink-style URLs that state no identity either, gives a
@@ -1592,7 +1592,7 @@ class TestResolution:
     async def test_a_searched_items_relative_asset_resolves_against_its_self_link(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review): the base is the ITEM's address, not /search's.
+        """The base is the ITEM's address, not /search's.
 
         Joining a relative asset href against the search endpoint composes a
         path under the search URL — a different object, and possibly a live
@@ -1639,7 +1639,7 @@ class TestResolution:
     async def test_a_self_link_that_addresses_another_item_is_not_trusted(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 2): the self link is now load-bearing.
+        """The self link is now load-bearing.
 
         It is the base for relative assets and the pointer that gets stored,
         so a body that is right about its own id while its self link
@@ -1708,7 +1708,7 @@ class TestResolution:
     async def test_an_asset_the_ssrf_guard_refuses_is_never_adopted(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 4): a security property, not a health one.
+        """A security property, not a health one.
 
         Every other probe verdict is a fact about the origin that the binding
         can carry — an asset that 404s is still where the publisher says it
@@ -1738,7 +1738,7 @@ class TestResolution:
     async def test_a_searched_item_with_no_trustworthy_url_declines_relative_assets(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 4): the round-2 fix, one branch over.
+        """The same fix, one branch over.
 
         Dropping a contradictory self link left `asset_base` falling back to
         the `/search` endpoint, so a relative href still composed a path under
@@ -1797,7 +1797,7 @@ class TestResolution:
     async def test_a_moved_asset_that_cannot_be_read_is_not_adopted(
         self, stac_transport, monkeypatch
     ) -> None:
-        """fix(#1266 review round 5): a publisher's document saying where the
+        """A publisher's document saying where the
         asset is, is not the same fact as that asset being openable. Same
         discipline as the raster replace path's read-back of its own COG."""
         install, _ = stac_transport
@@ -1841,7 +1841,7 @@ class TestResolution:
     async def test_an_asset_href_too_long_for_the_column_is_refused(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 5): `datasets.origin_uri` is String(2000).
+        """`datasets.origin_uri` is String(2000).
 
         The storable-href gate mirrors the import model's 4096 cap, which is
         right for `origin_ref` (JSONB) and more than the column can hold — so
@@ -1860,7 +1860,7 @@ class TestResolution:
     async def test_a_self_link_the_policy_blocks_is_not_stored(
         self, stac_transport, monkeypatch
     ) -> None:
-        """fix(#1266 review round 5): a pointer has to be one the DOOR will
+        """A pointer has to be one the DOOR will
         accept next time.
 
         The refresh door SSRF-validates `origin_ref.item_href` before it
@@ -1871,7 +1871,7 @@ class TestResolution:
         install, _ = stac_transport
         blocked_item = f"{_ROOT}/v2/collections/scenes/items/scene-1"
 
-        # fix(#1266 review round 15): refused through the SAFE CLIENT now, so
+        # Refused through the SAFE CLIENT now, so
         # the block is driven from the transport rather than by stubbing the
         # submission-time validator. This is the first-hop shape; the
         # redirect shape, which only the per-hop hook can catch, has its own
@@ -1899,7 +1899,7 @@ class TestResolution:
     async def test_a_keyless_binding_whose_href_moved_refuses_to_guess(
         self, stac_transport
     ) -> None:
-        """fix(#1266 review round 11): the last place a guess was dressed as
+        """The last place a guess was dressed as
         a rule.
 
         With no recorded key and an href that has already moved, re-running
@@ -1966,7 +1966,7 @@ class TestResolution:
     async def test_an_empty_string_keyed_binding_follows_the_move_it_could_not_guess(
         self, stac_transport
     ) -> None:
-        """fix(#1331): the same scenario as the ``visual`` case above, for the
+        """The same scenario as the ``visual`` case above, for the
         one key value truthiness treats as absent. Before the fix, the stored
         ``""`` key was ignored, the href match failed because the asset moved,
         and — since the item also gained a decoy the priority list would
@@ -2061,7 +2061,7 @@ class TestAssetKeyCapture:
         assert "data_asset_key" in StacItemSummary.model_fields
 
     def test_search_never_surfaces_a_key_import_would_reject(self) -> None:
-        """fix(#1266 review round 8): one bound, applied at both ends.
+        """One bound, applied at both ends.
 
         STAC puts no limit on an asset identifier, and the frontend echoes
         search results straight into the import request — so a key the import
@@ -2082,7 +2082,7 @@ class TestAssetKeyCapture:
         assert storable_asset_key(None) is None
 
     def test_an_empty_string_key_is_a_storable_key(self) -> None:
-        """fix(#1331): ``""`` is a legal JSON property name and clears the
+        """``""`` is a legal JSON property name and clears the
         length bound, so there is no reason to refuse it at capture — unlike
         an over-long key, it has nowhere it fails to fit. What made it
         misbehave was every downstream consultation reading it with
@@ -2121,7 +2121,7 @@ class TestAssetKeyCapture:
     async def test_import_records_the_key_search_supplied(
         self, client, admin_auth_header, test_db_session
     ) -> None:
-        """fix(#1266 review round 4): end to end, or the mechanism is inert.
+        """End to end, or the mechanism is inert.
 
         Without this the key stays unwritten on every new import, and the
         first refresh after a move falls back to re-running the import's
@@ -2193,7 +2193,7 @@ class TestAssetKeyCapture:
     async def test_import_records_an_empty_string_key(
         self, client, admin_auth_header, test_db_session
     ) -> None:
-        """fix(#1331): a searched item may key its data asset under ``""``,
+        """A searched item may key its data asset under ``""``,
         and the import request echoes back whatever search surfaced —
         including that. Recording it is what lets the FIRST refresh after a
         move recover the asset by identity instead of falling back to a
@@ -2333,7 +2333,7 @@ class TestDispatch:
     async def test_a_credential_is_staged_by_reference_never_as_an_argument(
         self, client, admin_auth_header, test_db_session, credential_backend
     ) -> None:
-        """feat(#1764): the catalog may be protected, so the credential is
+        """The catalog may be protected, so the credential is
         carried — but a task argument is a durable row, so only the reference
         crosses and the secret lives in the single-use store."""
         admin_id = await get_user_id(test_db_session, "admin")
@@ -2379,7 +2379,7 @@ class TestDispatch:
     async def test_a_marked_dataset_refuses_a_token_less_refresh(
         self, client, admin_auth_header, test_db_session
     ) -> None:
-        """feat(#1764): the marker says the last successful refresh used a
+        """The marker says the last successful refresh used a
         credential, so an anonymous one would reach the catalog, collect a 401
         and report a live dataset as inaccessible."""
         admin_id = await get_user_id(test_db_session, "admin")
@@ -2397,7 +2397,7 @@ class TestDispatch:
     async def test_a_marker_that_appears_during_the_reservation_is_caught(
         self, client, admin_auth_header, test_db_session
     ) -> None:
-        """feat(#1764): a credentialed refresh finishing inside the window
+        """A credentialed refresh finishing inside the window
         marks the dataset without moving its origin, so the binding check
         passes and only the post-reservation recheck notices."""
         admin_id = await get_user_id(test_db_session, "admin")
@@ -2428,7 +2428,7 @@ class TestDispatch:
     async def test_a_binding_recording_no_catalog_refuses_a_credential(
         self, client, admin_auth_header, test_db_session, credential_backend
     ) -> None:
-        """fix(#1764): a credential is anchored on the catalog URL the caller
+        """A credential is anchored on the catalog URL the caller
         submitted at import. A binding from before that was recorded has no
         anchor, and falling back to the stored item pointer would let a
         document from that era name where the credential goes."""
@@ -2556,13 +2556,13 @@ class TestWorker:
         assert described.band_info == [{"min": 0, "max": 4095, "mean": 1200}]
         # One integer band is imagery, not elevation.
         assert described.is_dem is False
-        # fix(#1334): the moved object's own CRS, from the same probe as
+        # The moved object's own CRS, from the same probe as
         # band_count/dtype/nodata — not left stale like the fields above
         # would be if the refresh only wrote the address.
         assert described.crs_wkt == (
             'PROJCS["WGS 84 / UTM zone 33N",AUTHORITY["EPSG","32633"]]'
         )
-        # fix(#1375): and the pixel geometry, which a move is more likely to
+        # And the pixel geometry, which a move is more likely to
         # change than anything else here — a re-tiled or reprojected
         # replacement is exactly where the old resolution stops describing
         # the new object.
@@ -2594,13 +2594,13 @@ class TestWorker:
     async def test_a_refresh_without_a_transform_leaves_pixel_geometry_alone(
         self, client, admin_auth_header, test_db_session, stac_transport, monkeypatch
     ) -> None:
-        """fix(#1375 review): the three affine-derived columns are one fact.
+        """The three affine-derived columns are one fact.
 
         ``fetch_cog_info``'s transform probe is optional — ``/cog/info`` can
         answer while ``/cog/stac`` fails — and an earlier version of this
         change turned that partial result into ``is_rotated=False``. That is
         not a missing value but a wrong measurement: the column is NOT NULL
-        and cannot say "unknown", and ``_check_rotation`` (VAL-07) rejects a
+        and cannot say "unknown", and ``_check_rotation`` rejects a
         VRT source only when the flag is TRUE, so a fabricated ``False``
         would walk a rotated replacement straight through the gate built to
         stop it. A remote asset is an eligible VRT source, so that path is
@@ -2706,7 +2706,7 @@ class TestWorker:
     async def test_a_move_to_an_elevation_raster_reclassifies_it(
         self, client, admin_auth_header, test_db_session, stac_transport, monkeypatch
     ) -> None:
-        """fix(#1266 review round 6): the tile proxy branches on `is_dem`
+        """The tile proxy branches on `is_dem`
         BEFORE it looks at band metadata, so a stale flag renders a new
         elevation raster as ordinary imagery — and the reverse case requests
         RGB with algorithm=terrainrgb.
@@ -2742,7 +2742,7 @@ class TestWorker:
     async def test_a_moved_asset_brings_its_footprint_with_it(
         self, client, admin_auth_header, test_db_session, stac_transport
     ) -> None:
-        """fix(#1266 review round 25): a re-tiled scene comes with a new bbox.
+        """A re-tiled scene comes with a new bbox.
 
         A dataset still advertising the old one lies to every spatial search
         and map-bounds read — the same staleness the registered-table
@@ -2773,7 +2773,7 @@ class TestWorker:
         assert "20" in extent and "55" in extent
 
     def test_a_three_dimensional_bbox_keeps_its_horizontal_pair(self) -> None:
-        """fix(#1266 review round 26): a bbox may be SIX values.
+        """A bbox may be SIX values.
 
         `minx, miny, minz, maxx, maxy, maxz` sliced to its first four reads
         the elevation as east and the longitude as north, and writes a
@@ -2789,7 +2789,7 @@ class TestWorker:
             [10.0, 45.0, 100.0, 11.0, 46.0, 900.0]
         ) == [10.0, 45.0, 11.0, 46.0]
         assert stac_resolve._horizontal_bbox([10.0, 45.0, 11.0]) is None
-        # SEC-FU-06's rule, which `parse_bbox` already applies: JSON 1e400
+        # The rule `parse_bbox` already applies: JSON 1e400
         # parses as infinity and PostGIS handles it inconsistently.
         assert stac_resolve._horizontal_bbox([10.0, 45.0, float("inf"), 46.0]) is None
         assert stac_resolve._horizontal_bbox([10.0, float("nan"), 11.0, 46.0]) is None
@@ -2912,7 +2912,7 @@ class TestWorker:
     async def test_a_removed_asset_is_diagnosed_as_itself_not_a_withdrawal(
         self, client, admin_auth_header, test_db_session, stac_transport
     ) -> None:
-        """fix(#1266 review round 17): two things are missing-shaped.
+        """Two things are missing-shaped.
 
         The ITEM being gone and the ASSET being gone from a live item are not
         the same thing to the person reading the history, and the second one
@@ -2972,7 +2972,7 @@ class TestWorker:
     async def test_an_inconclusive_failure_still_dates_the_contact(
         self, client, admin_auth_header, test_db_session, stac_transport
     ) -> None:
-        """fix(#1266 review round 3): `last_checked_at` means the last time
+        """`last_checked_at` means the last time
         GeoLens contacted the origin AT ALL, success or failure.
 
         A 5xx establishes nothing about where the asset is, so no verdict is
@@ -3169,7 +3169,7 @@ class TestWorker:
 
 
 class TestCredentialedRefresh:
-    """feat(#1764): a protected catalog is re-read as the same caller the
+    """A protected catalog is re-read as the same caller the
     import was, and the marker that records it is written from the credential
     the attempt actually used."""
 
@@ -3253,7 +3253,7 @@ class TestCredentialedRefresh:
         stac_transport,
         credential_backend,
     ) -> None:
-        """fix(#1764): a single-use credential is gone after one claim. The
+        """A single-use credential is gone after one claim. The
         attempt fails without contacting the catalog, and the failure is
         WRITTEN, so the run does not sit pending and hold the dataset against
         the admission index for an hour."""
@@ -3296,7 +3296,7 @@ class TestCredentialedRefresh:
 
 
 class TestOriginAssetRepair:
-    """feat(#1692): the refresh repairs the served origin asset.
+    """The refresh repairs the served origin asset.
 
     The import persists the origin item's primary data asset as a
     ``dataset_assets`` row, which is what puts a COG href a generic STAC

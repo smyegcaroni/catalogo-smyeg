@@ -131,7 +131,7 @@ class TestBboxToTiles:
 
 
 class TestSpecBboxToTiles:
-    """fix(#934): the spec-form reader seeds a crossing extent per lobe."""
+    """The spec-form reader seeds a crossing extent per lobe."""
 
     def test_non_crossing_matches_bbox_to_tiles(self):
         spec = list(spec_bbox_to_tiles(-75, 40, -73, 41.5, z=10))
@@ -152,7 +152,7 @@ class TestSpecBboxToTiles:
         assert len(tiles) == len(set(tiles))
 
     def test_crossing_bbox_at_z0_yields_the_single_world_tile_once(self):
-        # fix(#934 codex r1): both lobes resolve to (0, 0, 0) at z0; the
+        # Both lobes resolve to (0, 0, 0) at z0; the
         # shared tile must be seeded (and counted) exactly once.
         assert list(spec_bbox_to_tiles(170, -10, -170, 10, z=0)) == [(0, 0, 0)]
 

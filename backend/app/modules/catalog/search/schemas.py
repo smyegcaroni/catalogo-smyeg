@@ -1,64 +1,10 @@
 """Search and OGC API Records response schemas."""
 
+import json
 import uuid
-from datetime import date, datetime
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
-
-from app.modules.catalog.features.service import parse_bbox
-
-
-class SearchParams(BaseModel):
-    """Query parameters for dataset search."""
-
-    q: str | None = Field(
-        default=None,
-        description="Free-text search query (supports full-text + semantic)",
-    )
-    bbox: str | None = Field(
-        default=None, description="Spatial filter as minx,miny,maxx,maxy (EPSG:4326)"
-    )
-    keywords: list[str] | None = Field(
-        default=None, description="Filter by one or more keyword tags"
-    )
-    geometry_type: str | None = Field(
-        default=None, description="Filter by OGC geometry type, e.g. Point"
-    )
-    srid: int | None = Field(default=None, description="Filter by EPSG SRID")
-    source_organization: str | None = None
-    date_from: date | None = Field(
-        default=None, description="Include records created on or after this date"
-    )
-    date_to: date | None = Field(
-        default=None, description="Include records created on or before this date"
-    )
-    vintage_start: date | None = Field(
-        default=None, description="Minimum data vintage start date"
-    )
-    vintage_end: date | None = Field(
-        default=None, description="Maximum data vintage end date"
-    )
-    sort_by: str = Field(
-        default="relevance",
-        description="Sort order: relevance, title, created, updated",
-    )
-    offset: int = Field(default=0, description="Number of results to skip (pagination)")
-    limit: int = Field(
-        default=10, ge=1, le=1000, description="Max results to return (1-1000)"
-    )
-    exclude_synthetic: bool = Field(
-        default=True, description="Exclude VRT mosaics and derived records"
-    )
-
-    @field_validator("bbox")
-    @classmethod
-    def validate_bbox(cls, v: str | None) -> str | None:
-        # Validate through the shared parser rather than a third copy of the
-        # split/collapse/compare logic: the copies drifted before, and the one
-        # here was also missing the SEC-FU-06 non-finite guard.
-        if v is not None:
-            parse_bbox(v)
-        return v
 
 
 class OGCRasterBand(BaseModel):
@@ -70,20 +16,19 @@ class OGCRasterBand(BaseModel):
 
     name: str | None = None
     data_type: str | None = None
-    # fix(#1805): band_info is a raw JSONB column not schema-constrained at
-    # the DB layer, and service_records.py passes bi["nodata"] through
-    # verbatim — unlike the TOP-LEVEL RasterAsset.nodata column (Text), a
-    # band's nodata sentinel can be an int or float, so str-only 422'd here.
+    # band_info is a raw JSONB column the DB doesn't constrain, and
+    # service_records.py passes bi["nodata"] through verbatim. Unlike the
+    # top-level RasterAsset.nodata column (Text), a band's nodata sentinel can
+    # be an int or float, so a str-only type would 422.
     nodata: str | int | float | None = None
     statistics: dict | None = None
     description: str | None = None
 
-    # fix(#1805): FastAPI's response serialization fills every declared
-    # field's default (None) here regardless of whether the raw dict had the
-    # key, collapsing "band lacks nodata" (unavailable) and "nodata: null"
-    # (confirmed absent) into the same wire shape. model_fields_set still
-    # reflects whether `nodata` was in the input, so drop the key from the
-    # dump when it wasn't, keeping "unknown" genuinely absent.
+    # FastAPI's response serialization fills every declared field's default
+    # (None) whether or not the raw dict had the key, collapsing "band lacks
+    # nodata" (unavailable) and "nodata: null" (confirmed absent) into one
+    # wire shape. model_fields_set still reflects whether `nodata` was in the
+    # input, so drop the key from the dump when it wasn't.
     @model_serializer(mode="wrap")
     def _serialize_nodata_presence(self, handler):  # noqa: ANN001
         data = handler(self)
@@ -142,7 +87,7 @@ class OGCRecordProperties(BaseModel):
     time: dict
     lineage: str | None = None
     update_frequency: str | None = None
-    # feat(#1224): computed from the dataset's last_refreshed_at against
+    # Computed from the dataset's last_refreshed_at against
     # update_frequency above, gated on origin; never stored. See
     # datasets/domain/source_freshness.py.
     source_freshness: str = Field(
@@ -185,10 +130,9 @@ class OGCRecordProperties(BaseModel):
         ),
     )
     gsd: float | None = None
-    # fix(#1805): gsd is a lossy min(abs(res_x), abs(res_y)) — two sources
-    # with different per-axis resolution can share one gsd, so the client
-    # can't replicate _check_grid_alignment (res_x/res_y independently) from
-    # gsd alone.
+    # The gsd is a lossy min(abs(res_x), abs(res_y)): sources with different
+    # per-axis resolution can share one gsd, so the client can't replicate
+    # _check_grid_alignment (res_x/res_y independently) from gsd alone.
     res_x: float | None = None
     res_y: float | None = None
     crs_is_geographic: bool | None = Field(
@@ -201,10 +145,9 @@ class OGCRecordProperties(BaseModel):
     vrt_type: str | None = None
     source_count: int | None = None
     dataset_count: int | None = None
-    # fix(#1805): these three are emitted by service_records.py; without a
-    # declaration here, /search/datasets (validated through
-    # OGCFeatureCollectionResponse, unlike the raw-dict OGC/STAC routers)
-    # silently strips them.
+    # These three are emitted by service_records.py. /search/datasets
+    # validates through OGCFeatureCollectionResponse (unlike the raw-dict
+    # OGC/STAC routers), so undeclared fields would be silently stripped.
     proj_code: str | None = Field(default=None, alias="proj:code")
     proj_shape: tuple[int, int] | None = Field(
         default=None,
@@ -226,12 +169,11 @@ class OGCAsset(BaseModel):
     """STAC-style asset entry for an OGC Record."""
 
     href: str
-    # STAC asset `type` is optional, and _build_stac_assets omits the key
-    # entirely (rather than passing type=None) when the stored asset row has
-    # no media type. FastAPI response serialization otherwise fills the
-    # declared default regardless of the raw dict's shape, so the presence
-    # check below (mirroring OGCRasterBand's nodata handling above) is what
-    # keeps "unknown" genuinely absent from the wire instead of a null.
+    # STAC asset `type` is optional, and _build_stac_assets omits the key when
+    # the stored asset row has no media type. FastAPI response serialization
+    # would otherwise fill the declared default, so the presence check below
+    # (as for OGCRasterBand's nodata) keeps "unknown" absent from the wire
+    # instead of a null.
     type: str | None = None
     title: str | None = None
     roles: list[str] | None = None
@@ -278,11 +220,28 @@ class OGCFeatureCollectionResponse(BaseModel):
     )
 
 
+SAVED_SEARCH_PARAMS_MAX_BYTES = 64 * 1024
+
+
 class SavedSearchCreate(BaseModel):
     """Request body for creating a saved search."""
 
     name: str = Field(min_length=1, max_length=255)
-    params: dict = Field(description="Serialized SearchParams filters to replay")
+    params: dict = Field(
+        description=(
+            "Serialized SearchParams filters to replay, at most 64 KiB as JSON"
+        )
+    )
+
+    @field_validator("params")
+    @classmethod
+    def bound_params(cls, v: dict) -> dict:
+        encoded = json.dumps(v, ensure_ascii=False, separators=(",", ":")).encode()
+        if len(encoded) > SAVED_SEARCH_PARAMS_MAX_BYTES:
+            raise ValueError(
+                f"params must be at most {SAVED_SEARCH_PARAMS_MAX_BYTES} bytes as JSON"
+            )
+        return v
 
 
 class SavedSearchResponse(BaseModel):

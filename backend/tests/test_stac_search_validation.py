@@ -1,4 +1,4 @@
-"""SEC-FU-05: STAC /search GET intersects max_length=10000 cap.
+"""STAC /search GET intersects max_length=10000 cap.
 
 Pins the audit finding that the GET /api/stac/search?intersects= parameter
 had no length cap, allowing multi-megabyte GeoJSON payloads to force JSON
@@ -107,13 +107,14 @@ class TestSecFu05StacIntersectsMaxLength:
             assert "at most 10000" not in resp.json()["detail"].lower()
 
     async def test_sec_fu_05_post_body_is_capped(self, client: AsyncClient):
-        """POST /stac/search body.intersects dict IS now capped (SEC-023).
+        """POST /stac/search body.intersects dict IS now capped.
 
-        SEC-FU-05 capped only the GET `intersects` query param (max_length=10000);
-        the POST body dict bypassed any bound and reached the same anonymous
-        ST_GeomFromGeoJSON predicate (a multi-megabyte GeoJSON DoS amplifier).
-        SEC-023 adds a matching serialized-size cap on StacSearchBody.intersects,
-        so an oversized body now returns 400 before any spatial query runs. This
+        An earlier cap covered only the GET `intersects` query param
+        (max_length=10000); the POST body dict bypassed any bound and reached
+        the same anonymous ST_GeomFromGeoJSON predicate (a multi-megabyte
+        GeoJSON DoS amplifier). A matching serialized-size cap on
+        StacSearchBody.intersects now makes an oversized body return 400
+        before any spatial query runs. This
         test previously asserted the body was *unaffected* — that was the bug.
         """
         # Build a large polygon dict whose JSON representation exceeds 10000 chars
@@ -142,7 +143,7 @@ class TestSecFu05StacIntersectsMaxLength:
 
 @pytest.mark.anyio
 class TestStacSearchBodyBounds:
-    """KNOWN-12: POST /stac/search body.limit/offset carry Pydantic ge/le."""
+    """POST /stac/search body.limit/offset carry Pydantic ge/le."""
 
     async def test_post_search_limit_above_max_clamped(self, client: AsyncClient):
         """limit above the 200 ceiling is clamped, not rejected.
@@ -170,3 +171,39 @@ class TestStacSearchBodyBounds:
         """limit=200 (at the le=200 ceiling) must pass schema validation."""
         resp = await client.post("/stac/search", json={"limit": 200, "offset": 0})
         assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.anyio
+class TestStacSearchListCounts:
+    """ids and collections accept at most 1000 values on GET and POST."""
+
+    @pytest.mark.parametrize("param", ["ids", "collections"])
+    async def test_get_over_limit_rejected(self, client: AsyncClient, param: str):
+        values = ",".join(f"00000000-0000-0000-0000-{i:012d}" for i in range(1001))
+        resp = await client.get("/stac/search", params={param: values})
+        assert resp.status_code == 400, resp.text
+        assert resp.headers["content-type"].startswith("application/problem+json")
+        assert param in resp.json()["detail"]
+
+    @pytest.mark.parametrize("param", ["ids", "collections"])
+    async def test_get_trailing_comma_does_not_count(
+        self, client: AsyncClient, param: str
+    ):
+        values = ",".join(f"00000000-0000-0000-0000-{i:012d}" for i in range(1000))
+        resp = await client.get("/stac/search", params={param: values + ","})
+        assert resp.status_code == 200, resp.text
+
+    @pytest.mark.parametrize("param", ["ids", "collections"])
+    async def test_post_over_limit_rejected(self, client: AsyncClient, param: str):
+        values = [f"00000000-0000-0000-0000-{i:012d}" for i in range(1001)]
+        resp = await client.post("/stac/search", json={param: values})
+        assert resp.status_code == 400, resp.text
+        assert resp.headers["content-type"].startswith("application/problem+json")
+
+    @pytest.mark.parametrize("param", ["ids", "collections"])
+    async def test_at_limit_accepted(self, client: AsyncClient, param: str):
+        values = [f"00000000-0000-0000-0000-{i:012d}" for i in range(1000)]
+        get = await client.get("/stac/search", params={param: ",".join(values)})
+        assert get.status_code == 200, get.text
+        post = await client.post("/stac/search", json={param: values})
+        assert post.status_code == 200, post.text

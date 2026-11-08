@@ -4,12 +4,12 @@
  * Regression tests proving that getMap() and getSharedMap() route their responses
  * through normalizeSavedMap at the API boundary before returning to callers.
  *
- * BSR-20: Legacy MapResponse payloads survive normalization — buildMapStack output
+ * Legacy MapResponse payloads survive normalization — buildMapStack output
  *         is structurally equivalent to pre-wiring behavior.
- * BSR-22: Four viewer surfaces (builder + public via getMap, shared + embed via
+ * Four viewer surfaces (builder + public via getMap, shared + embed via
  *         getSharedMap) produce structurally equivalent normalized outputs for the
  *         same logical map.
- * BSR-23: d2c5c99c-equivalent MapResponse fixtures pass through without field loss.
+ * d2c5c99c-equivalent MapResponse fixtures pass through without field loss.
  *
  * SC3 (lossless round-trip) note: The write path (updateMap, patchMapLayers) is
  * intentionally out of scope for this plan. SC3 is closed by SC1 (read-path
@@ -104,6 +104,7 @@ function makeMapResponsePayload(overrides: Partial<MapResponse> = {}): MapRespon
     pitch: overrides.pitch ?? 0,
     basemap_style: overrides.basemap_style ?? 'positron',
     show_basemap_labels: overrides.show_basemap_labels ?? true,
+    show_attribute_table: overrides.show_attribute_table ?? true,
     basemap_config: overrides.basemap_config ?? null,
     terrain_config: overrides.terrain_config ?? null,
     visibility: overrides.visibility ?? 'public',
@@ -157,10 +158,12 @@ function makeSharedMapResponsePayload(overrides: Partial<SharedMapResponse> = {}
     center_lng: overrides.center_lng ?? -74.006,
     center_lat: overrides.center_lat ?? 40.7128,
     zoom: overrides.zoom ?? 10,
+    has_saved_view: overrides.has_saved_view ?? true,
     bearing: overrides.bearing ?? 0,
     pitch: overrides.pitch ?? 0,
     basemap_style: overrides.basemap_style ?? 'positron',
     show_basemap_labels: overrides.show_basemap_labels,
+    show_attribute_table: overrides.show_attribute_table ?? true,
     basemap_config: overrides.basemap_config,
     terrain_config: overrides.terrain_config,
     has_non_public_layers: overrides.has_non_public_layers ?? false,
@@ -488,7 +491,7 @@ describe('four-viewer parity', () => {
 
     expect(sharedResult).not.toBeNull();
     const sr = sharedResult!;
-    // BSR-22 invariants: normalized outputs are structurally equivalent
+    // Invariants: normalized outputs are structurally equivalent
     expect(mapResult.basemap_style).toBe(sr.basemap_style);
     expect(mapResult.show_basemap_labels).toBe(sr.show_basemap_labels);
     expect(mapResult.basemap_config).toEqual(sr.basemap_config);

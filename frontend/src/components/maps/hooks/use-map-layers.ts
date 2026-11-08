@@ -15,8 +15,8 @@ import { DEFAULT_HILLSHADE_PAINT } from '@/components/builder/layer-adapters/bui
 /** Empty GeoJSON FeatureCollection */
 const EMPTY_FC: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: [] };
 
-// fix(#394) VT-04: use the shared helper — a local duplicate is exactly the
-// silent-drift class the source-layer parity test pins down.
+// Use the shared helper; a local duplicate is the silent-drift class the
+// source-layer parity test pins down.
 const getSourceLayerName = getMvtSourceLayerName;
 
 /** The prefix of the ids the preview gives its dataset's source and layers. */
@@ -41,7 +41,7 @@ export function previewSourceId(tableName: string) {
 }
 
 /** What the preview knows about its dataset. */
-export interface PreviewDataset {
+interface PreviewDataset {
   datasetId?: string;
   tableName: string;
   geometryType: string;
@@ -51,7 +51,7 @@ export interface PreviewDataset {
 }
 
 /** The one layer the preview draws: the whole dataset in the default style. */
-export function toPreviewSyncInput(dataset: PreviewDataset): SyncLayerInput {
+function toPreviewSyncInput(dataset: PreviewDataset): SyncLayerInput {
   return {
     id: PREVIEW_LAYER_KEY,
     dataset_id: dataset.datasetId ?? '',
@@ -112,10 +112,10 @@ interface UseMapLayersOptions {
   mapRef: React.RefObject<MaplibreMap | null>;
   /** Column name containing height/elevation data for 3D extrusion (polygon datasets only) */
   elevationColumn?: string | null;
-  /** fix(#1472 review): the dataset's required credit line. Applied as the
-   *  MapLibre source `attribution`, which the map's default attribution control
-   *  reads off whichever sources are live — the preview map has no explicit
-   *  control to pass `customAttribution` to. */
+  /** The dataset's required credit line. Applied as the MapLibre source
+   *  `attribution`, which the map's default attribution control reads off
+   *  whichever sources are live; the preview map has no explicit control to
+   *  pass `customAttribution` to. */
   attribution?: string | null;
 }
 
@@ -162,10 +162,10 @@ export function useMapLayers({
       try {
         map.addSource(sourceId, preview.source);
 
-        // fix(#430 codex r21): a generic sketch dataset (GEOMETRY sentinel /
-        // GEOMETRYCOLLECTION) can hold every family at once — install all
-        // three renderers with $type filters so no family disappears when the
-        // display type degrades to generic after a cross-family draw.
+        // A generic sketch dataset (GEOMETRY sentinel / GEOMETRYCOLLECTION) can
+        // hold every family at once: install all three renderers with $type
+        // filters so no family disappears when the display type degrades to
+        // generic after a cross-family draw.
         if (drawsAs === 'mixed') {
           map.addLayer({
             id,
@@ -246,11 +246,11 @@ export function useMapLayers({
             'source-layer': sourceLayer,
             paint: {
               'fill-extrusion-color': MAP_COLORS.default.fill,
-              // Null-safe height expression (#14): only read the property when
-              // present, then coalesce the raw value to 0 BEFORE ``to-number`` so
-              // a feature with a null/missing height never reaches a numeric
-              // operator as ``null`` (which throws the maplibre worker error
-              // "Expected value to be of type number, but found null").
+              // Null-safe height expression: read the property only when present,
+              // then coalesce the raw value to 0 BEFORE ``to-number`` so a null or
+              // missing height never reaches a numeric operator as ``null`` (which
+              // throws the maplibre worker error "Expected value to be of type
+              // number, but found null").
               'fill-extrusion-height': [
                 'max',
                 [
@@ -310,18 +310,17 @@ export function useMapLayers({
       if (!rasterTileUrl || rasterLayersAdded.current) return;
       if (map.getSource('raster-tile-source')) return;
       try {
-        // #1362 codex r2: the raster tile route is a fixed per-dataset path
-        // (never re-added, see the guard above), and the api response for a
-        // public dataset carries `Cache-Control: public, max-age=3600` — so
-        // the browser's OWN cache can keep serving pre-replace tile bytes
-        // for an identical URL for up to an hour even after this source is
-        // freshly re-added on remount. Bust that with tileVersion (the
-        // dataset's updated_at) the same way the vector source already does
-        // via buildSignedTileUrl.
-        // fix(#1372, #2007): the server embeds `?v=<tile_cache_version>` and
-        // `pv=<publication_version>` (nginx's shared cache keys on both) — any
-        // server query supersedes this client-side append, which would both
-        // make nginx key on the wrong `v` and emit a second `?`.
+        // The raster tile route is a fixed per-dataset path (never re-added, see
+        // the guard above), and the api response for a public dataset carries
+        // `Cache-Control: public, max-age=3600`, so the browser's OWN cache can
+        // keep serving pre-replace tile bytes for an identical URL for up to an
+        // hour even after this source is re-added on remount. Bust that with
+        // tileVersion (the dataset's updated_at) as the vector source does via
+        // buildSignedTileUrl.
+        // The server embeds `?v=<tile_cache_version>` and
+        // `pv=<publication_version>` (nginx's shared cache keys on both); any
+        // server query supersedes this client-side append, which would make nginx
+        // key on the wrong `v` and emit a second `?`.
         const hasServerVersion = rasterTileUrl.includes('?');
         const versionedTileUrl =
           tileVersion && !hasServerVersion
@@ -424,12 +423,10 @@ export function useMapLayers({
     }
   }, []);
 
-  // Clean up vector layers on unmount or prop change
   useEffect(() => {
     return () => { vectorLayersAdded.current = false; };
   }, [tableName]);
 
-  // Clean up raster layers on unmount or tile URL change
   useEffect(() => {
     return () => { rasterLayersAdded.current = false; };
   }, [rasterTileUrl]);

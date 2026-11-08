@@ -8,9 +8,8 @@ import {
   type Bbox,
 } from '../bbox';
 
-// fix(#903): the shape the backend can now produce (RFC 7946 §5.2 / STAC spec
-// form) and that nothing on the frontend understood. Fiji is the canonical
-// case: ~3° of longitude reported as `west > east`.
+// The shape the backend can produce (RFC 7946 §5.2 / STAC spec form).
+// Fiji is the canonical case: ~3° of longitude reported as `west > east`.
 const FIJI: Bbox = [178.5, -20, -178.5, -15];
 const NYC: Bbox = [-74.5, 40.5, -73.5, 41.5];
 const WORLD: Bbox = [-180, -90, 180, 90];
@@ -94,5 +93,30 @@ describe('toFitBounds', () => {
       [-74.5, 40.5],
       [-73.5, 41.5],
     ]);
+  });
+
+  // MapLibre's globe fit returns no camera for a zero-size box, so a point
+  // must reach fitBounds as a box with width and height.
+  it.each<{ point: Bbox }>([
+    { point: [12.5, 48.1, 12.5, 48.1] },
+    { point: [-180, 0, -180, 0] },
+    { point: [0, 90, 0, 90] },
+    { point: [0, -90, 0, -90] },
+  ])('widens the point $point to a centimetre-scale box around it', ({ point }) => {
+    const [[west, south], [east, north]] = toFitBounds(point);
+    const [lng, lat] = point;
+    expect(west).toBeLessThan(lng);
+    expect(east).toBeGreaterThan(lng);
+    expect(north - south).toBeGreaterThan(0);
+    expect(south).toBeLessThanOrEqual(lat);
+    expect(north).toBeGreaterThanOrEqual(lat);
+    expect(south).toBeGreaterThanOrEqual(-90);
+    expect(north).toBeLessThanOrEqual(90);
+    expect(east - west).toBeLessThan(1e-6);
+    expect(north - south).toBeLessThan(1e-6);
+  });
+
+  it('keeps a line with one zero-size axis exact', () => {
+    expect(toFitBounds([10, 20, 10, 25])).toEqual([[10, 20], [10, 25]]);
   });
 });

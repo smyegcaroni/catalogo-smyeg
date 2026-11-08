@@ -57,7 +57,14 @@ async def people(client: AsyncClient, admin_auth_header: dict):
 
 
 @pytest.fixture
-def mint_key(client: AsyncClient, admin_auth_header: dict):
+async def mint_key(client: AsyncClient, admin_auth_header: dict, test_db_session):
+    """Mint keys through the API and remove them afterwards.
+
+    An active read_only key left in the database makes the 0032 downgrade refuse,
+    which fails any later migration test in the same database.
+    """
+    minted: list[str] = []
+
     async def mint(user_id: uuid.UUID, scope: str = "full") -> tuple[str, str]:
         resp = await client.post(
             "/admin/api-keys/",
@@ -66,9 +73,16 @@ def mint_key(client: AsyncClient, admin_auth_header: dict):
         )
         assert resp.status_code == 201, resp.text
         body = resp.json()
+        minted.append(body["id"])
         return body["key"], body["id"]
 
-    return mint
+    yield mint
+    await test_db_session.rollback()
+    await test_db_session.execute(
+        text("DELETE FROM catalog.api_keys WHERE id = ANY(CAST(:ids AS uuid[]))"),
+        {"ids": minted},
+    )
+    await test_db_session.commit()
 
 
 @pytest.fixture
@@ -262,8 +276,8 @@ async def test_access_is_decided_on_the_live_row_not_the_cached_snapshot(
 @pytest.mark.parametrize(
     ("record_status", "expected"),
     [
-        ("published", {"stranger": 200, "owner": 200, "anonymous": 403}),
-        ("draft", {"stranger": 404, "owner": 200, "anonymous": 403}),
+        ("published", {"stranger": 200, "owner": 200, "anonymous": 404}),
+        ("draft", {"stranger": 404, "owner": 200, "anonymous": 404}),
     ],
 )
 async def test_internal_tiles_open_to_any_signed_in_key_once_published(
@@ -544,5 +558,5 @@ async def test_capability_arms_keep_their_order(
     assert stale_sig.status_code == expired_sig.status_code == 200, stale_sig.text
     _assert_private(stale_sig)
     assert bad_embed.status_code == 403
-    assert anonymous.status_code == 403
-    assert "Signature required" in anonymous.json()["detail"]
+    assert anonymous.status_code == 404
+    assert anonymous.json()["detail"] == "Dataset not found"

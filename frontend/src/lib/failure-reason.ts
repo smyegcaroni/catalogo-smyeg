@@ -1,10 +1,9 @@
 import i18n from '@/i18n/i18n';
 
 /**
- * fix(#1953): the code ADR-002 Decision 3 stores in place of a failure the
- * server did not compose (`backend/app/core/failure_reason.py`). Every surface
- * that renders a job or run reason maps it here, or the reader gets an
- * untranslated identifier where a sentence belongs.
+ * The code ADR-002 Decision 3 stores in place of a failure the server did not
+ * compose (`backend/app/core/failure_reason.py`). Every surface that renders a
+ * job or run reason maps it here, or the reader gets an untranslated identifier.
  */
 export const INTERNAL_FAILURE_REASON = 'internal_error';
 
@@ -21,6 +20,7 @@ const FIXED_FAILURE_CODE_KEYS: Record<string, `errors.${string}`> = {
   backfill_settle_failed: 'errors.jobFailureBackfillSettleFailed',
   backfill_start_failed: 'errors.jobFailureBackfillStartFailed',
   backfill_worker_shutdown: 'errors.jobFailureBackfillWorkerShutdown',
+  credential_over_http: 'errors.jobFailureCredentialOverHttp',
   dataset_deleted: 'errors.jobFailureDatasetDeleted',
   dispatch_interrupted: 'errors.jobFailureDispatchInterrupted',
   missing_crs: 'errors.jobFailureMissingCrs',

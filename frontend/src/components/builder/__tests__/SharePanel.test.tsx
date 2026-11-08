@@ -19,22 +19,42 @@ import {
 import { useEdition } from '@/hooks/use-edition';
 import { useCanSetPublicVisibility, useTileConfig } from '@/hooks/use-settings';
 import {
+  useMapAudienceBusy,
   useCreateShareToken,
   useMapShareToken,
   usePublishMap,
   useRevokeShareToken,
   useUpdateShareToken,
+  useLayersHiddenFromMapGroups,
 } from '@/hooks/use-maps';
 import { toast } from 'sonner';
 
-vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() } }));
+
+vi.mock('@/components/builder/MapGroupShare', () => ({
+  MapGroupShare: ({ visibility, hasLinks, focusOnOpen, onSaved, onPickerOpenChange }: { visibility: string; hasLinks: boolean; focusOnOpen?: boolean; onSaved?: (v: string) => void; onPickerOpenChange?: (open: boolean) => void }) => (
+    <div
+      data-testid="map-group-share"
+      data-visibility={visibility}
+      data-has-links={String(hasLinks)}
+      data-auto-focus={String(Boolean(focusOnOpen))}
+    >
+      <button type="button" onClick={() => onSaved?.('private')}>
+        stub cleared
+      </button>
+      <button type="button" onClick={() => onPickerOpenChange?.(true)}>
+        stub open picker
+      </button>
+    </div>
+  ),
+}));
 
 vi.mock('@/hooks/use-edition', () => ({
   useEdition: vi.fn(),
 }));
 
 vi.mock('@/api/maps', async (importOriginal) => {
-  // fix(#1831 review): keep the real `nonPublicDatasetsFromError` — it's the
+  // Keep the real `nonPublicDatasetsFromError` — it's the
   // shared predicate SharePanel uses to detect the blocked-publish refusal;
   // only `checkMapVisibility` needs stubbing here.
   const actual = await importOriginal<typeof import('@/api/maps')>();
@@ -46,13 +66,15 @@ vi.mock('@/api/maps', async (importOriginal) => {
 
 vi.mock('@/hooks/use-maps', () => ({
   usePublishMap: vi.fn(),
+  useMapAudienceBusy: vi.fn(() => false),
   useCreateShareToken: vi.fn(),
   useRevokeShareToken: vi.fn(),
   useMapShareToken: vi.fn(),
   useUpdateShareToken: vi.fn(),
+  useLayersHiddenFromMapGroups: vi.fn(),
 }));
 
-// fix(#1548 review r3): SharePanel now reads the deployment's configured
+// SharePanel now reads the deployment's configured
 // public origin for every URL it hands out. Default the mock to the current
 // origin so tests written before that change emit byte-identical URLs; the
 // tests that care drive a DIFFERENT hostname, which is the whole point.
@@ -77,6 +99,7 @@ const mockedUseCreateShareToken = vi.mocked(useCreateShareToken);
 const mockedUseRevokeShareToken = vi.mocked(useRevokeShareToken);
 const mockedUseMapShareToken = vi.mocked(useMapShareToken);
 const mockedUseUpdateShareToken = vi.mocked(useUpdateShareToken);
+const mockedUseLayersHiddenFromMapGroups = vi.mocked(useLayersHiddenFromMapGroups);
 const mockedUseCreateEmbedToken = vi.mocked(useCreateEmbedToken);
 const mockedUseMapEmbedTokens = vi.mocked(useMapEmbedTokens);
 const mockedUseUpdateEmbedToken = vi.mocked(useUpdateEmbedToken);
@@ -118,6 +141,11 @@ function setup({
   lockOriginsAfterCreate = null,
   mapId = 'map-1',
   strictMode = false,
+  groups,
+  gateEmbedTokens = false,
+  groupHiddenIds = [],
+  hasDashboard = false,
+  onOpenChange = vi.fn(),
 }: {
   enterprise?: boolean;
   hasShareToken?: boolean;
@@ -138,7 +166,7 @@ function setup({
   publishMapFn?: (...args: any[]) => any;
   /** The deployment's configured PUBLIC_APP_URL. null = unconfigured. */
   publicAppUrl?: string | null;
-  /** feat(#1691): useCanSetPublicVisibility() — false when the instance
+  /** useCanSetPublicVisibility() — false when the instance
    *  restricts public visibility to admins and the user is not one. */
   canSetPublic?: boolean;
   /** Return an active embed token even when the share link is created at
@@ -154,6 +182,15 @@ function setup({
   /** Renders under React.StrictMode, which double-invokes effect setup and
    *  cleanup on mount — the app's real runtime configuration in dev. */
   strictMode?: boolean;
+  /** The group list the server sends to the owner and admins; omitted for anyone else. */
+  groups?: ComponentProps<typeof ShareDialog>['groups'];
+  /** Return no embed tokens unless the dialog asked for a map's list. */
+  gateEmbedTokens?: boolean;
+  /** The layer ids the server says some of the map's groups can't read. */
+  groupHiddenIds?: string[];
+  /** Whether the saved map has a dashboard. */
+  hasDashboard?: boolean;
+  onOpenChange?: (open: boolean) => void;
 } = {}) {
   const createShareToken = vi.fn().mockResolvedValue({
     token: 'share-token',
@@ -174,6 +211,7 @@ function setup({
   });
 
   mockedUseCanSetPublicVisibility.mockReturnValue(canSetPublic);
+  mockedUseLayersHiddenFromMapGroups.mockReturnValue(new Set(groupHiddenIds));
 
   mockedUseTileConfig.mockReturnValue({
     data: {
@@ -228,7 +266,9 @@ function setup({
     use_count: 0,
     created_at: '2026-05-01T00:00:00Z',
   });
-  mockedUseMapEmbedTokens.mockImplementation((() => {
+  mockedUseMapEmbedTokens.mockImplementation(((id?: string) => {
+    // Mirrors the real query, which fetches nothing without a map id.
+    if (gateEmbedTokens && !id) return { data: undefined, isLoading: false, isError: false };
     if (lockOriginsAfterCreate && embedTokenCreated) {
       return {
         data: { tokens: [embedTokenRow(lockOriginsAfterCreate)], total: 1 },
@@ -274,11 +314,13 @@ function setup({
       key={mapId}
       mapId={mapId}
       visibility={visibility}
+      groups={groups}
       open
-      onOpenChange={vi.fn()}
+      onOpenChange={onOpenChange}
       hasUnsavedChanges={hasUnsavedChanges}
       saveStatus={saveStatus}
       layers={layers}
+      hasDashboard={hasDashboard}
     />
   );
   // Bare: see the renderUnderStrictMode import comment above. Every hook
@@ -362,12 +404,12 @@ describe('ShareDialog edition gates', () => {
 /*  #1515: embed iframe sandbox attribute                              */
 /* ------------------------------------------------------------------ */
 //
-// Supersedes the M-70 contract this block used to pin. `allow-scripts` alone
+// Supersedes the contract this block used to pin. `allow-scripts` alone
 // gives the frame an opaque origin, and the emitted snippet could not boot:
 // measured end to end, the viewer rendered "Map not found" for a valid share
 // token because every /api/ call was cross-origin with `Origin: null`.
 //
-// The sandbox-escape M-70 feared needs the frame to be same-origin with its
+// The sandbox escape it guarded against needs the frame to be same-origin with its
 // EMBEDDER, which a third-party embed never is. See the generateEmbedCode
 // docstring.
 //
@@ -456,6 +498,25 @@ describe('#1515: embed code sandbox attribute', () => {
     expect(textarea.value).toContain('title="');
     expect(textarea.value).toContain('width="100%"');
   });
+
+  it('adds dashboard=collapsed to the embed code from a toggle shown only for a map with a dashboard', async () => {
+    const user = userEvent.setup();
+    setup({ enterprise: false, hasShareToken: false, hasDashboard: true });
+    await user.click(screen.getByRole('button', { name: /generate share link/i }));
+    const textarea = (await screen.findByRole('textbox')) as HTMLTextAreaElement;
+    expect(textarea.value).not.toContain('dashboard=collapsed');
+
+    await user.click(screen.getByRole('switch', { name: 'Start with the dashboard collapsed' }));
+    expect(textarea.value).toContain('dashboard=collapsed');
+  });
+
+  it('offers no collapsed toggle for a map without a dashboard', async () => {
+    const user = userEvent.setup();
+    setup({ enterprise: false, hasShareToken: false });
+    await user.click(screen.getByRole('button', { name: /generate share link/i }));
+    await screen.findByRole('textbox');
+    expect(screen.queryByRole('switch', { name: 'Start with the dashboard collapsed' })).not.toBeInTheDocument();
+  });
 });
 
 describe('SHARE-04: buildEmbedSrc shared URL builder', () => {
@@ -473,6 +534,14 @@ describe('SHARE-04: buildEmbedSrc shared URL builder', () => {
     expect(src).toBe('https://x.io/m/abc123?embed=true');
   });
 
+  it('adds dashboard=collapsed only when asked', () => {
+    const args = { shareToken: 'abc123', embedTokenRaw: 'tok-456', origin: 'https://x.io' };
+    expect(buildEmbedSrc({ ...args, dashboardCollapsed: true })).toBe(
+      'https://x.io/m/abc123?embed=true&et=tok-456&dashboard=collapsed',
+    );
+    expect(buildEmbedSrc({ ...args, dashboardCollapsed: false })).not.toContain('dashboard');
+  });
+
   it('generateEmbedCode wraps the exact buildEmbedSrc output (no drift)', () => {
     const args = { shareToken: 'abc123', embedTokenRaw: 'tok-456', origin: 'https://x.io', title: 'Harbor map' };
     expect(generateEmbedCode(args)).toContain(`src="${buildEmbedSrc(args)}"`);
@@ -480,7 +549,7 @@ describe('SHARE-04: buildEmbedSrc shared URL builder', () => {
 });
 
 /* ------------------------------------------------------------------ */
-/*  SHARE-02 / SHARE-06: chip-based allowed-origins input             */
+/* Chip-based allowed-origins input */
 /* ------------------------------------------------------------------ */
 
 /**
@@ -617,7 +686,7 @@ describe('SHARE-02 chip-based allowed-origins input', () => {
   });
 
   /**
-   * fix(#1548 review P2): both compose files ship PUBLIC_APP_URL defaulted to
+   * Both compose files ship PUBLIC_APP_URL defaulted to
    * localhost, so a self-hoster reached at a real hostname is refused here on a
    * stock install. The refusal exists to replace a silently-empty embed with an
    * actionable message, so routing it to the generic "update failed" toast — the
@@ -701,7 +770,7 @@ describe('SHARE-02 chip-based allowed-origins input', () => {
 });
 
 /* ------------------------------------------------------------------ */
-/*  fix(#1831): the visibility PUT's 400 refusal (map holds non-public  */
+/* The visibility PUT's 400 refusal (map holds non-public */
 /*  dataset layers) used to vanish — the dataset names were read off    */
 /*  the already-translated `err.message` (a fallback string, not JSON)  */
 /*  and JSON.parse'd there, instead of off the raw `err.body` the       */
@@ -736,7 +805,7 @@ describe('#1831 publish blocked by non-public datasets', () => {
       expect(screen.getByTestId('share-publish-blocked-error')).toBeInTheDocument();
     });
     expect(screen.getByTestId('share-publish-blocked-error')).toHaveTextContent('Large Lakes');
-    // fix(#1831 review P2): role="alert" so it's announced the way the toast
+    // role="alert" so it's announced the way the toast
     // it replaces would have been.
     expect(screen.getByRole('alert')).toBe(screen.getByTestId('share-publish-blocked-error'));
 
@@ -768,6 +837,20 @@ describe('#1831 publish blocked by non-public datasets', () => {
     expect(screen.getByTestId('share-publish-blocked-error')).toBeInTheDocument();
   });
 
+  it('says a map shared with groups stays restricted when Private is picked', async () => {
+    const user = userEvent.setup();
+    const publishMapFn = vi.fn().mockResolvedValue({ visibility: 'restricted' });
+    setup({ visibility: 'internal', publishMapFn, hasShareToken: false });
+
+    await user.click(screen.getByRole('radio', { name: /only you/i }));
+
+    await waitFor(() => expect(publishMapFn).toHaveBeenCalledWith({ id: 'map-1', visibility: 'private' }));
+    expect(toast.warning).toHaveBeenCalledWith(
+      'This map is still shared with groups, so only you, admins and those groups can open it',
+    );
+    expect(toast.success).not.toHaveBeenCalledWith('Map is now private');
+  });
+
   it('test_publish_success_does_not_show_the_refusal_message', async () => {
     const user = userEvent.setup();
     const publishMapFn = vi.fn().mockResolvedValue({});
@@ -782,7 +865,7 @@ describe('#1831 publish blocked by non-public datasets', () => {
 });
 
 /* ------------------------------------------------------------------ */
-/*  SHARE-04: Expiration preset Select + Pitfall #6 regression pins    */
+/* Expiration preset Select + regression pins */
 /* ------------------------------------------------------------------ */
 
 // Radix Select requires pointer capture / scroll polyfills in JSDOM.
@@ -794,7 +877,7 @@ Element.prototype.scrollIntoView = () => undefined;
 
 /**
  * Open the Link Settings disclosure and return the user-event instance.
- * Reusable helper for SHARE-04 tests (parallel to openChipBlock above).
+ * Reusable helper for tests (parallel to openChipBlock above).
  */
 async function openLinkSettings(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByRole('button', { name: /link settings/i }));
@@ -936,7 +1019,7 @@ describe('SHARE-04 expiration presets', () => {
   });
 
   /**
-   * Pitfall #6 regression pin (rawShareToken survival).
+   * Regression pin (rawShareToken survival).
    *
    * Contract: selecting a preset fires updateShareToken but does NOT touch
    * rawShareToken or embedTokenRaw state. The "Copy Link" button is gated on
@@ -967,7 +1050,7 @@ describe('SHARE-04 expiration presets', () => {
   });
 
   /**
-   * Pitfall #6 mirror (embedTokenRaw survival).
+   * Mirror pin (embedTokenRaw survival).
    *
    * Both rawShareToken and embedTokenRaw are independent of expiration mutations.
    * The embed code textarea is gated on embedTokenRaw being non-null.
@@ -1002,7 +1085,7 @@ describe('SHARE-04 expiration presets', () => {
 });
 
 /* ------------------------------------------------------------------ */
-/*  SHARE-03: embed-preview iframe pane                               */
+/* Embed-preview iframe pane */
 /* ------------------------------------------------------------------ */
 
 /**
@@ -1019,6 +1102,10 @@ async function generateShareLinkAndWait(user: ReturnType<typeof userEvent.setup>
 describe('SHARE-03 embed-preview iframe', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.useRealTimers();
+  });
+
+  afterEach(() => {
     vi.useRealTimers();
   });
 
@@ -1051,7 +1138,7 @@ describe('SHARE-03 embed-preview iframe', () => {
     });
   });
 
-  // fix(#1515): the preview and the copied snippet must carry the SAME sandbox.
+  // The preview and the copied snippet must carry the SAME sandbox.
   // While they differed the preview was a preview of a different page, and it
   // showed "Map not found" for a token that was perfectly valid.
   it('test_iframe_sandbox_matches_the_emitted_snippet: preview sandbox === generateEmbedCode sandbox', async () => {
@@ -1071,6 +1158,38 @@ describe('SHARE-03 embed-preview iframe', () => {
       title: 'Harbor map',
     });
     expect(snippet).toContain(`sandbox="${iframe.getAttribute('sandbox')}"`);
+  });
+
+  it('waits on a fresh load when the collapsed switch changes the preview URL', async () => {
+    const user = userEvent.setup();
+    setup({ enterprise: false, hasShareToken: false, hasNonPublic: true, hasDashboard: true });
+
+    await generateShareLinkAndWait(user);
+    await user.click(screen.getByRole('button', { name: /preview/i }));
+    const iframe = await screen.findByTestId('share-preview-iframe');
+    fireEvent.load(iframe);
+    expect(iframe).toHaveClass('opacity-100');
+
+    await user.click(screen.getByRole('switch', { name: 'Start with the dashboard collapsed' }));
+    expect(screen.getByTestId('share-preview-iframe')).toHaveClass('opacity-0');
+  });
+
+  it('gives the replacement URL a full 8 seconds to load when the switch changes it mid-load', async () => {
+    const user = userEvent.setup();
+    setup({ enterprise: false, hasShareToken: false, hasNonPublic: true, hasDashboard: true });
+    await generateShareLinkAndWait(user);
+
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole('button', { name: /preview/i }));
+    expect(screen.getByTestId('share-preview-iframe')).toBeInTheDocument();
+    act(() => vi.advanceTimersByTime(7000));
+    fireEvent.click(screen.getByRole('switch', { name: 'Start with the dashboard collapsed' }));
+
+    act(() => vi.advanceTimersByTime(7999));
+    expect(screen.getByTestId('share-preview-iframe')).toBeInTheDocument();
+    act(() => vi.advanceTimersByTime(1));
+    expect(screen.queryByTestId('share-preview-iframe')).not.toBeInTheDocument();
+    expect(screen.getByText('Preview unavailable')).toBeInTheDocument();
   });
 
   it('test_iframe_title_attribute_set: iframe has title="Map embed preview" (a11y)', async () => {
@@ -1116,11 +1235,11 @@ describe('SHARE-03 embed-preview iframe', () => {
 });
 
 /* ------------------------------------------------------------------ */
-/*  Pitfall #7: inflightEmbedCreate race guard                        */
+/* inflightEmbedCreate race guard */
 /* ------------------------------------------------------------------ */
 
 /* ------------------------------------------------------------------ */
-/*  SHARE-08: Copy Link emits /card URL; embed + Open unchanged        */
+/* Copy Link emits /card URL; embed + Open unchanged */
 /* ------------------------------------------------------------------ */
 
 describe('SHARE-08 Copy Link emits /card URL', () => {
@@ -1166,7 +1285,7 @@ describe('SHARE-08 Copy Link emits /card URL', () => {
 });
 
 /* ------------------------------------------------------------------ */
-/*  SHARE-10: 2-weight typography system (font-semibold + font-medium) */
+/* 2-weight typography system (font-semibold + font-medium) */
 /* ------------------------------------------------------------------ */
 
 describe('SHARE-10 font-weight hierarchy', () => {
@@ -1306,11 +1425,11 @@ describe('P2-01 explicit create-embed-token for public-only embeds', () => {
 });
 
 /* ------------------------------------------------------------------ */
-/*  fix(#778): confirm visibility changes that cross the public        */
+/* Confirm visibility changes that cross the public */
 /*  boundary before mutating                                           */
 /* ------------------------------------------------------------------ */
 
-describe('fix(#778) public-boundary visibility confirmation', () => {
+describe('public-boundary visibility confirmation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -1395,7 +1514,7 @@ describe('fix(#778) public-boundary visibility confirmation', () => {
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
   });
 
-  // feat(#1691): the restrict_public_visibility instance setting caps
+  // The restrict_public_visibility instance setting caps
   // non-admins at non-public. The server enforces it with a 403; the panel
   // disables the choice and swaps its description for the admin-only note.
   it('disables the Public choice when the instance restricts public to admins', () => {
@@ -1880,7 +1999,7 @@ describe('#1548 r3 shareable URLs use the configured public origin', () => {
   });
 
   /**
-   * fix(#1548 review r5): the snippet and the preview deliberately DIVERGE on
+   * The snippet and the preview deliberately DIVERGE on
    * origin, and asserting them together is the clearest statement of the rule.
    * Same map, same token, same moment — the snippet names the host the customer
    * will open, the preview names the host this browser just reached.
@@ -1903,7 +2022,7 @@ describe('#1548 r3 shareable URLs use the configured public origin', () => {
 
   it('copies a share link on the configured origin', async () => {
     // userEvent.setup() installs its own clipboard stub, so the spy has to be
-    // planted AFTER it — the existing SHARE-08 test does the same.
+    // planted AFTER it — the existing test does the same.
     const user = userEvent.setup();
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, 'clipboard', {
@@ -1922,7 +2041,7 @@ describe('#1548 r3 shareable URLs use the configured public origin', () => {
   });
 
   /**
-   * fix(#1548 review r4): the regression guard.
+   * The regression guard.
    *
    * Both compose files inject `${PUBLIC_APP_URL:-http://localhost:8080}`, so
    * the DEFAULT install reports a non-null, perfectly good-looking localhost
@@ -2013,7 +2132,7 @@ describe('#1548 r3 shareable URLs use the configured public origin', () => {
   });
 
   /**
-   * fix(#1548 review r6): you genuinely cannot preview a domain-locked embed
+   * You genuinely cannot preview a domain-locked embed
    * from a host the lock does not permit — that is the feature working. Saying
    * so beats rendering a map with no layers in it and letting the operator
    * conclude the embed is broken.
@@ -2112,7 +2231,7 @@ describe('#1548 r3 shareable URLs use the configured public origin', () => {
   });
 
   /**
-   * fix(#1548 review r5): the split-horizon deployment.
+   * The split-horizon deployment.
    *
    * A public hostname routed externally and unreachable from the internal admin
    * network is a normal setup, not a misconfiguration. The copied link must
@@ -2155,7 +2274,7 @@ describe('#1548 r3 shareable URLs use the configured public origin', () => {
     });
 
     /**
-     * fix(#1548 review r7): a domain-locked preview has no answer here at all.
+     * A domain-locked preview has no answer here at all.
      * Its API calls must carry the configured origin, and `frame-ancestors`
      * then judges THIS dialog as the parent against that same origin — which
      * the admin's hostname is not. The browser blocks the frame before a single
@@ -2245,5 +2364,169 @@ describe('#1548 r3 shareable URLs use the configured public origin', () => {
         `${PUBLIC_HOST}/api/maps/shared/share-token/card`,
       );
     });
+  });
+});
+
+describe('sharing a map with groups', () => {
+  const SURVEYORS = { id: 'g-1', name: 'Surveyors' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const restrictedLayer = {
+    id: 'layer-1',
+    dataset_id: 'ds-1',
+    dataset_name: 'Parcels',
+    display_name: null,
+    dataset_visibility: 'restricted',
+    dataset_status: 'published',
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any;
+  const draftLayer = { ...restrictedLayer, id: 'layer-2', dataset_name: 'Draft roads', dataset_status: 'draft' };
+
+  it("warns about the layers some of a restricted map's groups can't read", () => {
+    setup({
+      visibility: 'restricted',
+      groups: [SURVEYORS],
+      hasShareToken: false,
+      layers: [restrictedLayer, draftLayer],
+      groupHiddenIds: ['layer-1', 'layer-2'],
+    });
+
+    const warning = screen.getByTestId('share-group-hidden-warning');
+    expect(warning).toHaveTextContent("Hidden from some of this map's groups: Parcels.");
+    expect(warning).not.toHaveTextContent('Draft roads');
+    expect(screen.getByTestId('share-audience-hidden-warning')).toHaveTextContent('Draft roads');
+  });
+
+  it('shows a restricted map with its level checked and its group editor', () => {
+    setup({ visibility: 'restricted', groups: [SURVEYORS], hasShareToken: false });
+
+    expect(screen.getByRole('radio', { name: /^Specific groups/ })).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByRole('radio', { name: /^Only you/ })).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getByTestId('map-group-share')).toHaveAttribute('data-visibility', 'restricted');
+  });
+
+  it('holds every visibility level while a group save or visibility change is in flight', () => {
+    vi.mocked(useMapAudienceBusy).mockReturnValue(true);
+    setup({ visibility: 'restricted', groups: [SURVEYORS], hasShareToken: false });
+
+    for (const radio of screen.getAllByRole('radio')) expect(radio).toBeDisabled();
+    vi.mocked(useMapAudienceBusy).mockReturnValue(false);
+  });
+
+  it('leaves Escape to the group picker while its list is open', async () => {
+    const user = userEvent.setup();
+    const onOpenChange = vi.fn();
+    setup({ visibility: 'restricted', groups: [SURVEYORS], hasShareToken: false, onOpenChange });
+
+    await user.click(screen.getByRole('button', { name: 'stub open picker' }));
+    await user.keyboard('{Escape}');
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
+  it('opens the group editor on a private map without changing visibility', async () => {
+    const user = userEvent.setup();
+    const { publishMapFn } = setup({ visibility: 'private', groups: [], hasShareToken: false });
+    expect(screen.queryByTestId('map-group-share')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('radio', { name: /^Specific groups/ }));
+
+    expect(screen.getByTestId('map-group-share')).toHaveAttribute('data-auto-focus', 'true');
+    expect(screen.getByRole('radio', { name: /^Specific groups/ })).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByRole('radio', { name: /^Only you/ })).toHaveAttribute('aria-checked', 'false');
+    expect(publishMapFn).not.toHaveBeenCalled();
+  });
+
+  it('follows a save that leaves the map private: level, announcement and focus', async () => {
+    const user = userEvent.setup();
+    const view = setup({ visibility: 'private', groups: [], hasShareToken: false });
+    await user.click(screen.getByRole('radio', { name: /^Specific groups/ }));
+    // The map went restricted, then its last group was removed.
+    view.rerender(
+      <ShareDialog key="map-1" mapId="map-1" visibility="restricted" groups={[SURVEYORS]} open onOpenChange={vi.fn()} />,
+    );
+    view.rerender(
+      <ShareDialog key="map-1" mapId="map-1" visibility="private" groups={[]} open onOpenChange={vi.fn()} />,
+    );
+
+    expect(screen.getByRole('radio', { name: /^Only you/ })).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByRole('radio', { name: /^Specific groups/ })).toHaveAttribute('aria-checked', 'false');
+    expect(screen.queryByTestId('map-group-share')).not.toBeInTheDocument();
+  });
+
+  it('announces a save that leaves the map private and focuses the checked level', async () => {
+    const user = userEvent.setup();
+    setup({ visibility: 'restricted', groups: [SURVEYORS], hasShareToken: false });
+
+    await user.click(screen.getByRole('button', { name: 'stub cleared' }));
+
+    expect(await screen.findByText('Groups removed. Only you and admins can open this map.')).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: /^Only you/ })).toHaveFocus();
+  });
+
+  it('focuses the checked level only once the save has settled and the levels are enabled', async () => {
+    const user = userEvent.setup();
+    vi.mocked(useMapAudienceBusy).mockReturnValue(true);
+    const view = setup({ visibility: 'restricted', groups: [SURVEYORS], hasShareToken: false });
+
+    await user.click(screen.getByRole('button', { name: 'stub cleared' }));
+    expect(screen.getByRole('radio', { name: /^Only you/ })).not.toHaveFocus();
+
+    vi.mocked(useMapAudienceBusy).mockReturnValue(false);
+    view.rerender(
+      <ShareDialog key="map-1" mapId="map-1" visibility="private" groups={[]} open onOpenChange={vi.fn()} />,
+    );
+    await waitFor(() => expect(screen.getByRole('radio', { name: /^Only you/ })).toHaveFocus());
+  });
+
+  it('unshares when Only you is chosen on a restricted map and says members lose access', async () => {
+    const user = userEvent.setup();
+    const publishMapFn = vi.fn().mockResolvedValue({ clearedGroups: true });
+    setup({ visibility: 'restricted', groups: [SURVEYORS], hasShareToken: false, publishMapFn });
+    expect(screen.getByRole('radio', { name: /^Only you/ })).toHaveTextContent(
+      'Members of its groups lose access',
+    );
+
+    await user.click(screen.getByRole('radio', { name: /^Only you/ }));
+
+    await waitFor(() =>
+      expect(publishMapFn).toHaveBeenCalledWith({ id: 'map-1', visibility: 'private' }),
+    );
+    expect(toast.success).toHaveBeenCalledWith(
+      'Map is now private. Members of its groups no longer have access.',
+    );
+  });
+
+  it.each([
+    ['an embed token and no share link', { forceActiveEmbedToken: true }, 'true'],
+    ['neither a share link nor an embed token', {}, 'false'],
+  ])('reports links for a private map with %s', async (_label, extra, expected) => {
+    const user = userEvent.setup();
+    setup({ visibility: 'private', groups: [], hasShareToken: false, gateEmbedTokens: true, ...extra });
+    await user.click(screen.getByRole('radio', { name: /^Specific groups/ }));
+    expect(screen.getByTestId('map-group-share')).toHaveAttribute('data-has-links', expected);
+  });
+
+  it('keeps editing groups on an internal map but offers Specific groups only once some exist', () => {
+    setup({ visibility: 'internal', groups: [], hasShareToken: false });
+
+    expect(screen.getByTestId('map-group-share')).toHaveAttribute('data-visibility', 'internal');
+    expect(screen.getByRole('radio', { name: /^Specific groups/ })).toBeDisabled();
+  });
+
+  it('shows a non-owner the level checked but no group editor', () => {
+    setup({ visibility: 'restricted', hasShareToken: false });
+
+    expect(screen.queryByTestId('map-group-share')).not.toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: /^Specific groups/ })).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('hides the level from a non-owner on a map that is not restricted', () => {
+    setup({ visibility: 'internal', hasShareToken: false });
+
+    expect(screen.queryByRole('radio', { name: /^Specific groups/ })).not.toBeInTheDocument();
+    expect(screen.queryByTestId('map-group-share')).not.toBeInTheDocument();
   });
 });

@@ -1,6 +1,6 @@
 """The two clamps that decide which OGR driver may open an upload.
 
-fix(#1846, GHSA-hrf5-v3cq-frx5). GDAL picks a driver by asking every
+GDAL picks a driver by asking every
 registered driver whether it recognises the bytes. Some of them answer yes to
 a document that is really a set of instructions naming somewhere else to read
 from, and a staged upload is bytes a caller chose. Two independent answers:
@@ -258,7 +258,7 @@ async def test_run_ogr2ogr_service_takes_the_service_variant(spawned):
 async def test_service_preview_takes_the_service_variant(spawned):
     """The fifth clamped site, measured at the spawn rather than at the call.
 
-    fix(#1857 item 3). The structural gate stops at the CALL, and this is the
+    The structural gate stops at the CALL, and this is the
     one clamped site that mutates the env after building it, so a change
     rebinding `env` before the spawn would keep full structural credit. The
     SERVICE variant, like `run_ogr2ogr_service`: WFS and OAPIF must survive.
@@ -321,7 +321,7 @@ def test_an_ordinary_archive_is_still_accepted(tmp_path):
 # Every real-GDAL call here sticks to flags that have existed for the whole
 # 3.x line, and reads TEXT rather than `-json`.
 #
-# fix(#1846 review round 5): CI installs Ubuntu's `gdal-bin` (GDAL 3.4) while
+# CI installs Ubuntu's `gdal-bin` (GDAL 3.4) while
 # the worker image is 3.10.3, and `-limit` does not exist on 3.4 -- `ogrinfo`
 # exits 1 with "Unknown option name '-limit'" and an empty stdout, so a
 # positive control asserting the smuggled row appeared failed before GDAL had
@@ -1306,7 +1306,7 @@ def _strip_steps(text: str) -> int:
 
 
 def test_the_comment_strip_is_linear_in_the_size_of_the_schema():
-    """The lazy regex this replaced was quadratic on uploader-chosen text.
+    r"""The lazy regex this replaced was quadratic on uploader-chosen text.
 
     `re.compile(r"/\*.*?\*/", re.DOTALL)` restarts a scan to end-of-string at
     every unterminated opener: 64 KB took 3.6 s, and the scan used to run

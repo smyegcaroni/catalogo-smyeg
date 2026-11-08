@@ -1,8 +1,7 @@
 """Shared RasterAsset bulk-fetch helpers used by search, OGC, and STAC routers.
 
 Centralizes the column list so adding/renaming RasterAsset columns happens in
-one place instead of three near-identical SELECT clauses (post-impl-20260426
-KISS-6).
+one place instead of three near-identical SELECT clauses.
 """
 
 import uuid
@@ -21,8 +20,8 @@ def _row_to_meta(row: Any, *, include_vrt: bool, include_generation_id: bool) ->
     meta: dict = {
         "band_count": row.band_count,
         "epsg": row.epsg,
-        # fix(#569): lets consumers render res_x/res_y honestly — degree
-        # resolutions must not be formatted as meters.
+        # Lets consumers render res_x/res_y honestly: degree resolutions must
+        # not be formatted as meters.
         "crs_is_geographic": facts["crs_is_geographic"],
         # Converts res_x/res_y to STAC's metres; None for a geographic or unknown CRS.
         "crs_metres_per_unit": facts["crs_metres_per_unit"],

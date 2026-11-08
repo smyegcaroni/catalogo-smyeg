@@ -55,6 +55,7 @@ const mapState = vi.hoisted(() => {
     setTransformRequest: vi.fn(),
     getCanvas: vi.fn(() => canvas),
     getZoom: vi.fn(() => 5),
+    coveringTiles: vi.fn(() => []),
     easeTo: vi.fn(),
     getStyle: vi.fn(() => ({ version: 8, sources: {}, layers: Array.from(layerIds).map((id) => ({ id })) })),
     queryRenderedFeatures: vi.fn(() => []),
@@ -149,7 +150,7 @@ vi.mock('@/components/map/MapCoordReadout', () => ({ MapCoordReadout: () => null
 vi.mock('@/lib/builder/basemap-style-mutation', () => ({ applySublayerOverrides: vi.fn() }));
 
 function makeVectorToken(sig: string): TileToken {
-  return { kind: 'vector', sig, exp: 9999999999, scope: 'test', expires_in: 3600 };
+  return { kind: 'vector', sig, exp: 9999999999, scope: 'test', expires_in: 3600, tile_url_template: '' };
 }
 
 // Non-cluster vector layer: dedupes onto viewer-source-data-parcels.
@@ -163,6 +164,7 @@ const PARCELS_LAYER: SharedLayerResponse = {
   column_info: null,
   sort_order: 0,
   visible: true,
+  show_in_legend: true,
   opacity: 1,
   paint: { 'fill-color': '#2255aa' },
   layout: {},
@@ -185,6 +187,7 @@ const SENSORS_LAYER: SharedLayerResponse = {
   column_info: null,
   sort_order: 1,
   visible: true,
+  show_in_legend: true,
   opacity: 1,
   paint: { 'circle-color': '#aa5522', 'circle-radius': 6 },
   layout: {},

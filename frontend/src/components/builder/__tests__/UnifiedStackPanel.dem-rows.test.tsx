@@ -1,4 +1,4 @@
-// BLDR-03 regression pin: terrain-mode DEM layers are suppressed from the
+// Regression pin: terrain-mode DEM layers are suppressed from the
 // UnifiedStackPanel stack render via the visibleStackLayers memo.
 // Hillshade-mode DEM layers still render rows (⛰ glyph); terrain-mode DEM
 // layers are filtered out and produce no [data-row-id] element.
@@ -33,7 +33,7 @@ vi.mock('@/components/map/layer-icons', () => ({
   ColorizedGeometryIcon: ({ layerId }: { layerId: string }) => (
     <span data-testid={`type-icon-${layerId}`} />
   ),
-  // fix(#452): StackRow's type icon is now the shared LayerTypeIcon.
+  // StackRow's type icon is now the shared LayerTypeIcon.
   LayerTypeIcon: ({ iconId }: { iconId: string }) => (
     <span data-testid={`type-icon-${iconId}`} />
   ),
@@ -153,9 +153,9 @@ function defaultProps(
 // Tests
 // ---------------------------------------------------------------------------
 
-// fix(HT-03): terrain-mode (overlay-off) DEM rows are NO LONGER suppressed from
+// Terrain-mode (overlay-off) DEM rows are NO LONGER suppressed from
 // the stack. Hiding them made the DEM unmanageable the moment the editor closed
-// and let rebinding orphan invisible layers (HT-11). The map still paints
+// and let rebinding orphan invisible layers. The map still paints
 // nothing for them; the row just stays reachable, like any hidden-from-view row.
 describe('UnifiedStackPanel HT-03: terrain-mode DEM rows stay reachable', () => {
   it('renders both hillshade and terrain-mode DEM rows', () => {
@@ -225,5 +225,27 @@ describe('UnifiedStackPanel HT-03: terrain-mode DEM rows stay reachable', () => 
     expect(document.querySelector('[data-row-id="dem-hillshade"]')).toBeTruthy();
     expect(document.querySelector('[data-row-id="dem-image"]')).toBeTruthy();
     expect(document.querySelector('[data-row-id="dem-terrain"]')).toBeTruthy();
+  });
+});
+
+describe('UnifiedStackPanel audience-hidden badge on a restricted map', () => {
+  it("badges the layers the server says the map's groups can't read", () => {
+    const restricted = { dataset_visibility: 'restricted', dataset_status: 'published' } as const;
+    const unshared = { ...makeDemLayer('dem-unshared', 'hillshade'), ...restricted };
+    const shared = { ...makeDemLayer('dem-shared', 'hillshade'), ...restricted, sort_order: 1 };
+
+    render(
+      <UnifiedStackPanel
+        {...defaultProps([unshared, shared], {
+          mapVisibility: 'restricted',
+          groupHiddenLayerIds: new Set(['dem-unshared']),
+        })}
+      />,
+    );
+
+    const badgeIn = (id: string) =>
+      document.querySelector(`[data-row-id="${id}"]`)?.textContent?.includes("Hidden from this map's viewers");
+    expect(badgeIn('dem-unshared')).toBe(true);
+    expect(badgeIn('dem-shared')).toBe(false);
   });
 });

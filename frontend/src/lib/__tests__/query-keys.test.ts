@@ -32,9 +32,13 @@ describe('queryKeys factory', () => {
     });
 
     it('rows includes all params', () => {
-      expect(queryKeys.datasets.rows('abc', 50, 0)).toEqual(['dataset-rows', 'abc', 50, 0, undefined]);
+      expect(queryKeys.datasets.rows('abc', 50, 0)).toEqual(['dataset-rows', 'abc', 50, 0, undefined, undefined, undefined]);
       const filters = { name: 'x' };
-      expect(queryKeys.datasets.rows('abc', 50, 0, filters)).toEqual(['dataset-rows', 'abc', 50, 0, filters]);
+      const sort = { column: 'name', desc: true };
+      expect(queryKeys.datasets.rows('abc', 50, 0, filters, sort)).toEqual(['dataset-rows', 'abc', 50, 0, filters, sort, undefined]);
+      // The CQL2 filter is part of the cache identity: a drawer sending the
+      // layer's filter must never hit an unfiltered cached page.
+      expect(queryKeys.datasets.rows('abc', 50, 0, filters, sort, 'cql2')).toEqual(['dataset-rows', 'abc', 50, 0, filters, sort, 'cql2']);
     });
 
     it('history includes skip and limit', () => {
@@ -108,11 +112,9 @@ describe('queryKeys factory', () => {
     });
 
     it('sharedMap includes token', () => {
-      // fix(#394) B-023: the key gained an embedToken slot so embed viewers
-      // don't share cache entries with the anonymous payload.
-      expect(queryKeys.maps.sharedMap('tok123')).toEqual(['shared-map', 'tok123', undefined, undefined]);
-      expect(queryKeys.maps.sharedMap('tok123', 'key')).toEqual(['shared-map', 'tok123', 'key', undefined]);
-      expect(queryKeys.maps.sharedMap('tok123', undefined, 'et_x')).toEqual(['shared-map', 'tok123', undefined, 'et_x']);
+      // Embed viewers don't share cache entries with the anonymous payload.
+      expect(queryKeys.maps.sharedMap('tok123')).toEqual(['shared-map', 'tok123', undefined]);
+      expect(queryKeys.maps.sharedMap('tok123', 'et_x')).toEqual(['shared-map', 'tok123', 'et_x']);
     });
 
     it('columnValues includes datasetId and col', () => {
@@ -361,9 +363,8 @@ describe('queryKeys factory', () => {
   // -------------------------------------------------------------------------
   describe('saml', () => {
     it('providers returns expected key', () => {
-      // fix(#1164): pins the string the admin SAML list has always cached under.
-      // It used to live only in inline literals at the call sites, so nothing
-      // caught a typo that turned an invalidation into a no-op.
+      // Pins the string the admin SAML list caches under, so a typo cannot
+      // silently turn an invalidation into a no-op.
       expect(queryKeys.saml.providers).toEqual(['saml', 'providers']);
     });
 

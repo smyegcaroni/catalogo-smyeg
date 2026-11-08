@@ -27,8 +27,8 @@ DEFAULT_CONFIG = ROOT / "scripts" / "deployed_surface_gate.json"
 USER_AGENT = "GeoLens deployed-surface-check"
 # getgeolens.com / docs.getgeolens.com are the marketing + docs surfaces.
 # pypi.org is allowed so the gate can assert the published package project pages
-# (geolens, geolens-cli) no longer carry stale enterprise-era long-description
-# wording (GATE-04, v1052). Keep this set narrow — it doubles as an SSRF guard
+# (geolens, geolens-cli) carry no stale enterprise-era long-description
+# wording. Keep this set narrow — it doubles as an SSRF guard
 # on the URLs the checker will fetch.
 ALLOWED_DEPLOYED_HOSTS = frozenset(
     {"getgeolens.com", "docs.getgeolens.com", "pypi.org"}

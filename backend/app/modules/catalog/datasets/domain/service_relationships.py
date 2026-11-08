@@ -43,6 +43,9 @@ from app.platform.extensions import get_catalog_port, get_permission_extension
 
 logger = structlog.stdlib.get_logger(__name__)
 
+# With text-embedding-3-small, unrelated datasets score 0.3-0.4 and related ones 0.5+.
+_MAX_DISTANCE = 0.5
+
 __all__ = [
     "auto_detect_relationships",
     "create_relationship",
@@ -116,7 +119,7 @@ async def get_related_datasets(
     """Return top-N datasets similar to the given dataset by embedding cosine distance.
 
     Returns an empty list when the dataset has no embedding or no neighbors
-    exceed the similarity threshold (0.3, i.e. cosine distance <= 0.7).
+    reach the similarity floor (0.5, i.e. cosine distance <= 0.5).
     Results are RBAC-filtered to only include datasets visible to the requesting user.
     """
     try:
@@ -131,7 +134,7 @@ async def get_related_datasets(
         # committing a newer row, ranking against one vector and scoring
         # against another.
         neighbor_record_ids = await get_catalog_port().get_nearest_record_ids(
-            db, record_id, anchor=anchor, limit=limit * 3, max_distance=0.7
+            db, record_id, anchor=anchor, limit=limit * 3, max_distance=_MAX_DISTANCE
         )
         if not neighbor_record_ids:
             return []
@@ -223,8 +226,8 @@ async def _visible_relationships(
 
     # FK columns store record_id, but dereferenceable endpoints resolve by
     # Dataset.id, so resolve the source's Dataset.id here (dataset_id is its
-    # record_id). Create-input still takes target_dataset_id as a
-    # record_id -- intentional asymmetry, unchanged here.
+    # record_id). Create-input still takes target_dataset_id as a record_id
+    # (intentional asymmetry).
     source_dataset = (
         await session.execute(select(Dataset).where(Dataset.record_id == dataset_id))
     ).scalar_one_or_none()
@@ -545,10 +548,9 @@ async def _fetch_target_rows(
     prop_cols = await live_property_columns(session, target_table)
     prop_sel = f", {prop_cols}" if prop_cols else ""
     table_ref = get_catalog_port().quote_table(target_table)
-    # The match runs against the BASE table, inside the
-    # projection -- a relationship may legitimately target a column the
-    # projection drops (e.g. `geom`/`geom_4326`), and predicating on the
-    # projected alias made such a fetch an undefined-column error.
+    # The match runs against the BASE table, inside the projection: a
+    # relationship may target a column the projection drops (e.g. `geom`,
+    # `geom_4326`), which the projected alias can't be predicated on.
     rows_result = await session.execute(
         text(
             f"SELECT gid, to_jsonb(t.*) - 'gid' AS properties "

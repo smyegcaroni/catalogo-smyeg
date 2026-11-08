@@ -1,11 +1,11 @@
 /**
- * fix(#1746): ServiceUrlForm regression tests.
+ * ServiceUrlForm tests.
  *
- * Two findings pinned here:
- * - Finding 4: the service-token field is a request-only credential, not a
- *   login password, so it must opt every password manager out explicitly
+ * Two behaviors pinned here:
+ * - The service-token field is a request-only credential, not a login
+ *   password, so it must opt every password manager out explicitly
  *   (autoComplete="off" alone does not stop Chrome from offering to save it).
- * - Finding 8: the layer picker must be keyed by layer_id, not layer.name —
+ * - The layer picker must be keyed by layer_id, not layer.name —
  *   two ArcGIS sublayers can share a display name (e.g. two sublayers both
  *   titled REC_PassiveConservedAccessScore), and a name-keyed list would
  *   collapse or misroute the duplicates.
@@ -40,7 +40,7 @@ vi.mock('../ImportPreview', () => ({
 }));
 
 vi.mock('../ImportMetadataForm', () => ({
-  // codex review #1757 round 3: exposes a real trigger for onCommit so a
+  // Exposes a real trigger for onCommit so a
   // test can reach handleCommit without re-implementing the real form.
   ImportMetadataForm: ({ onCommit }: { onCommit: (metadata: { title: string }) => void }) => (
     <div data-testid="import-metadata-form">
@@ -55,7 +55,7 @@ vi.mock('../JobProgress', () => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
-  // fix(#1712): the preview/commit session (service-url-session.ts) is
+  // The preview/commit session (service-url-session.ts) is
   // module-scoped, same reasoning as url-import-session.ts's own test
   // hygiene — without this, a session left behind by one test's mid-preview
   // or mid-commit unmount is adopted by the next test's fresh render.
@@ -86,6 +86,7 @@ const DUPLICATE_NAME_PROBE: ProbeResponse = {
       layer_type: 'Feature Layer',
       layer_id: 15,
       object_id_field: 'OBJECTID',
+      importable: true,
       kind: 'vector',
     },
     {
@@ -96,6 +97,7 @@ const DUPLICATE_NAME_PROBE: ProbeResponse = {
       layer_type: 'Feature Layer',
       layer_id: 17,
       object_id_field: 'OBJECTID',
+      importable: true,
       kind: 'vector',
     },
   ],
@@ -105,7 +107,8 @@ async function connectToDuplicateNameService() {
   const user = userEvent.setup();
   render(<ServiceUrlForm />);
 
-  await user.type(
+  await enterUrl(
+    user,
     screen.getByPlaceholderText('serviceUrl.placeholder'),
     'https://example.test/arcgis/rest/services/Rec/FeatureServer',
   );
@@ -130,7 +133,7 @@ describe('ServiceUrlForm token input', () => {
   it('opts every password manager out of the service token field', async () => {
     const user = userEvent.setup();
     render(<ServiceUrlForm />);
-    // feat(#1746 B4): the non-ArcGIS credential field is now behind a
+    // The non-ArcGIS credential field is now behind a
     // method select; Bearer token is the method that reuses a plain
     // password-type input.
     await user.click(screen.getByRole('combobox', { name: 'Authentication' }));
@@ -203,14 +206,14 @@ describe('ServiceUrlForm layer picker with a shared layer name', () => {
 });
 
 /**
- * Lane A2 (service-auth wave): ArcGIS auth method select. An ArcGIS-shaped
+ * ArcGIS auth method select. An ArcGIS-shaped
  * URL (matching /(FeatureServer|MapServer)/, mirroring the backend adapter's
  * own detection) swaps the plain optional token field for a three-way
  * Authentication select: no authentication, sign in, or paste a token.
  */
 const ARCGIS_URL = 'https://services6.arcgis.com/abcd1234/arcgis/rest/services/Foo/FeatureServer';
 
-// codex review #1757 round 2: the expiry timer (fires 30s ahead of
+// The expiry timer (fires 30s ahead of
 // expires_at) makes this a functionally significant value now, not just
 // display text. It must stay in the future relative to whenever the test
 // actually runs, or the token would be cleared immediately.
@@ -218,9 +221,21 @@ function futureExpiry(msFromNow = 60 * 60 * 1000): string {
   return new Date(Date.now() + msFromNow).toISOString();
 }
 
+// One input event per URL instead of one per character: typing an ~85
+// character URL through this form can outlast the test timeout on a loaded
+// runner, and only the resulting URL matters to these tests.
+async function enterUrl(
+  user: ReturnType<typeof userEvent.setup>,
+  input: HTMLElement,
+  url: string,
+) {
+  await user.click(input);
+  await user.paste(url);
+}
+
 async function typeArcGisUrl(user: ReturnType<typeof userEvent.setup>) {
   render(<ServiceUrlForm />);
-  await user.type(screen.getByPlaceholderText('serviceUrl.placeholder'), ARCGIS_URL);
+  await enterUrl(user, screen.getByPlaceholderText('serviceUrl.placeholder'), ARCGIS_URL);
   return user;
 }
 
@@ -258,7 +273,7 @@ describe('ServiceUrlForm ArcGIS auth method select', () => {
     expect(screen.getByLabelText('Password')).toHaveValue('');
   });
 
-  // codex review #1757 P1: a token entered for one origin (ArcGIS or not)
+  // A token entered for one origin (ArcGIS or not)
   // must not survive the service URL being edited to point at a different
   // origin, since handleConnect forwards whatever is in the token field.
   it('clears a pasted ArcGIS token when the service URL is edited to a different origin', async () => {
@@ -270,7 +285,8 @@ describe('ServiceUrlForm ArcGIS auth method select', () => {
 
     const urlInput = screen.getByPlaceholderText('serviceUrl.placeholder');
     await user.clear(urlInput);
-    await user.type(
+    await enterUrl(
+      user,
       urlInput,
       'https://services7.arcgis.com/other-org/arcgis/rest/services/Bar/FeatureServer',
     );
@@ -287,8 +303,8 @@ describe('ServiceUrlForm ArcGIS auth method select', () => {
     render(<ServiceUrlForm />);
 
     const urlInput = screen.getByPlaceholderText('serviceUrl.placeholder');
-    await user.type(urlInput, 'https://example.test/wfs');
-    // feat(#1746 B4): the non-ArcGIS bearer field is now behind its own
+    await enterUrl(user, urlInput, 'https://example.test/wfs');
+    // The non-ArcGIS bearer field is now behind its own
     // method select, sharing the `token` state with ArcGIS's 'token'
     // method — the very thing this test proves does not carry across.
     await user.click(screen.getByRole('combobox', { name: 'Authentication' }));
@@ -296,7 +312,7 @@ describe('ServiceUrlForm ArcGIS auth method select', () => {
     await user.type(screen.getByLabelText('Bearer token'), 'stale-wfs-token');
 
     await user.clear(urlInput);
-    await user.type(urlInput, ARCGIS_URL);
+    await enterUrl(user, urlInput, ARCGIS_URL);
 
     // The plain token field and the ArcGIS token-method field are the same
     // underlying state; it must not carry the WFS-typed value across.
@@ -320,7 +336,7 @@ describe('ServiceUrlForm ArcGIS auth method select', () => {
     expect(screen.getByLabelText('Username')).toHaveValue('alice');
   });
 
-  // codex review #1757 round 3 P2: a same-origin edit that only flips the
+  // A same-origin edit that only flips the
   // URL's SHAPE (ArcGIS-looking or not) is a distinct axis from the origin
   // changing, and was not resetting the auth branch: a token typed for a
   // non-ArcGIS URL used to survive a path-only edit that turned the same
@@ -332,7 +348,7 @@ describe('ServiceUrlForm ArcGIS auth method select', () => {
 
     const urlInput = screen.getByPlaceholderText('serviceUrl.placeholder');
     const sameOriginNonArcGis = 'https://services6.arcgis.com/some/wfs/endpoint';
-    await user.type(urlInput, sameOriginNonArcGis);
+    await enterUrl(user, urlInput, sameOriginNonArcGis);
     await user.click(screen.getByRole('combobox', { name: 'Authentication' }));
     await user.click(await screen.findByRole('option', { name: 'Bearer token' }));
     await user.type(screen.getByLabelText('Bearer token'), 'stale-token');
@@ -340,7 +356,7 @@ describe('ServiceUrlForm ArcGIS auth method select', () => {
     // Path-only edit, SAME origin, now ArcGIS-shaped (matches ARCGIS_URL's
     // origin exactly).
     await user.clear(urlInput);
-    await user.type(urlInput, ARCGIS_URL);
+    await enterUrl(user, urlInput, ARCGIS_URL);
 
     expect(screen.getByRole('combobox', { name: 'Authentication' })).toHaveTextContent(
       'No authentication',
@@ -367,11 +383,11 @@ describe('ServiceUrlForm ArcGIS auth method select', () => {
     const urlInput = screen.getByPlaceholderText('serviceUrl.placeholder');
     const sameOriginNonArcGis = 'https://services6.arcgis.com/some/wfs/endpoint';
     await user.clear(urlInput);
-    await user.type(urlInput, sameOriginNonArcGis);
+    await enterUrl(user, urlInput, sameOriginNonArcGis);
 
     // No longer ArcGIS-shaped: the ArcGIS-specific method (and its pasted
     // token) is gone, replaced by the four-way WFS/OGC API Features select
-    // (feat #1746 B4), reset to its own 'none' default rather than
+    // reset to its own 'none' default rather than
     // carrying the ArcGIS token across.
     expect(screen.queryByLabelText('Token or API key')).not.toBeInTheDocument();
     expect(screen.getByRole('combobox', { name: 'Authentication' })).toHaveTextContent(
@@ -391,18 +407,20 @@ describe('ServiceUrlForm credential reset notice', () => {
 
     const urlInput = screen.getByPlaceholderText('serviceUrl.placeholder');
     await user.clear(urlInput);
-    await user.type(urlInput, OTHER_ORG_URL);
+    await enterUrl(user, urlInput, OTHER_ORG_URL);
 
     expect(screen.getByTestId('credentials-reset-notice')).toBeInTheDocument();
   });
 
   it('stays quiet while the first URL is typed and when nothing was set', async () => {
-    const user = await typeArcGisUrl(userEvent.setup());
+    const user = userEvent.setup();
+    render(<ServiceUrlForm />);
+    await user.type(screen.getByPlaceholderText('serviceUrl.placeholder'), ARCGIS_URL);
     expect(screen.queryByTestId('credentials-reset-notice')).not.toBeInTheDocument();
 
     const urlInput = screen.getByPlaceholderText('serviceUrl.placeholder');
     await user.clear(urlInput);
-    await user.type(urlInput, OTHER_ORG_URL);
+    await enterUrl(user, urlInput, OTHER_ORG_URL);
 
     expect(screen.queryByTestId('credentials-reset-notice')).not.toBeInTheDocument();
   });
@@ -422,7 +440,7 @@ describe('ServiceUrlForm credential reset notice', () => {
 
     const urlInput = screen.getByPlaceholderText('serviceUrl.placeholder');
     await user.clear(urlInput);
-    await user.type(urlInput, OTHER_ORG_URL);
+    await enterUrl(user, urlInput, OTHER_ORG_URL);
     expect(screen.getByTestId('credentials-reset-notice')).toBeInTheDocument();
 
     await chooseAuthMethod(user, 'Sign in with username and password');
@@ -464,7 +482,7 @@ describe('ServiceUrlForm ArcGIS sign-in', () => {
     });
   });
 
-  // codex review #1757 P2: the credential inputs stay enabled while a
+  // The credential inputs stay enabled while a
   // sign-in is pending, so a user can correct the password before a slow
   // request settles. That edit bumps the generation (via
   // invalidateMintedCredential), which already keeps the stale response's
@@ -550,7 +568,7 @@ describe('ServiceUrlForm ArcGIS sign-in', () => {
     });
   });
 
-  // codex review #1757 P1: the Authentication select disables itself while a
+  // The Authentication select disables itself while a
   // request is in flight, which already closes the method-switch route to
   // this race. The service URL field stays editable, though, so this
   // exercises the same generation guard through the one avenue still open:
@@ -570,7 +588,8 @@ describe('ServiceUrlForm ArcGIS sign-in', () => {
 
     const urlInput = screen.getByPlaceholderText('serviceUrl.placeholder');
     await user.clear(urlInput);
-    await user.type(
+    await enterUrl(
+      user,
       urlInput,
       'https://services7.arcgis.com/other-org/arcgis/rest/services/Bar/FeatureServer',
     );
@@ -586,7 +605,7 @@ describe('ServiceUrlForm ArcGIS sign-in', () => {
     });
   });
 
-  // codex review #1757 round 2 P2: a minted token is bound to the
+  // A minted token is bound to the
   // credentials that produced it. Editing the username afterward must
   // clear it, and a resubmit must never reach Probe with the stale token.
   it('clears the minted token when the username changes after a successful sign-in, and never forwards it to Probe', async () => {
@@ -612,7 +631,7 @@ describe('ServiceUrlForm ArcGIS sign-in', () => {
     expect(mockProbeService).not.toHaveBeenCalled();
   });
 
-  // codex review #1757 round 2 P2: the credential fields sit inside the
+  // The credential fields sit inside the
   // outer <form> (a <form> cannot nest), whose submit handler otherwise
   // runs Probe. Pressing Enter in the password field must sign in instead.
   it('routes Enter in the password field to sign-in instead of Probe', async () => {
@@ -628,7 +647,7 @@ describe('ServiceUrlForm ArcGIS sign-in', () => {
     expect(mockProbeService).not.toHaveBeenCalled();
   });
 
-  // codex review #1757 round 2: a minted token stops being usable 30
+  // A minted token stops being usable 30
   // seconds ahead of ArcGIS's own deadline, even if the wizard sits open.
   it('expires the minted token 30 seconds before its stated deadline, clearing state and showing the expired message', async () => {
     // shouldAdvanceTime: real wall-clock keeps flowing (so userEvent and
@@ -674,7 +693,7 @@ describe('ServiceUrlForm ArcGIS sign-in', () => {
       });
 
       const { unmount } = render(<ServiceUrlForm />);
-      await user.type(screen.getByPlaceholderText('serviceUrl.placeholder'), ARCGIS_URL);
+      await enterUrl(user, screen.getByPlaceholderText('serviceUrl.placeholder'), ARCGIS_URL);
       await fillSigninForm(user);
       await user.click(screen.getByRole('button', { name: 'Sign in' }));
 
@@ -690,7 +709,7 @@ describe('ServiceUrlForm ArcGIS sign-in', () => {
     }
   });
 
-  // codex review #1757 round 3 P2: expireStaleTokenIfPast used to clear
+  // expireStaleTokenIfPast used to clear
   // state but its return value was discarded in handleConnect, so the
   // SAME invocation still closed over the pre-clear `token` and forwarded
   // it to probeService. Jumping the system clock forward without
@@ -698,7 +717,7 @@ describe('ServiceUrlForm ArcGIS sign-in', () => {
   // NOT fired) exercises exactly the throttled-background-tab path that
   // check exists for, as distinct from the timer having already run.
   //
-  // codex review #1757 round 4 P2: the jump lands at +45s of a 60s
+  // The jump lands at +45s of a 60s
   // deadline, inside the 30s margin window but short of the raw
   // expires_at. Before the shared EXPIRY_MARGIN_MS fix, isPast compared
   // only against the raw deadline and would have called this "not
@@ -735,7 +754,7 @@ describe('ServiceUrlForm ArcGIS sign-in', () => {
     }
   });
 
-  // codex review #1757 round 3 P2: the expiry timer's own callback clears
+  // The expiry timer's own callback clears
   // BOTH `token` and `tokenExpiresAt` when it fires, so by the time Commit
   // runs on a later step, expireStaleTokenIfPast alone can no longer tell
   // "expired" apart from "never had one". The `tokenExpired` marker is
@@ -815,7 +834,8 @@ describe('ServiceUrlForm portal URL guidance', () => {
     const user = userEvent.setup();
     render(<ServiceUrlForm />);
 
-    await user.type(
+    await enterUrl(
+      user,
       screen.getByPlaceholderText('serviceUrl.placeholder'),
       'https://myorg.maps.arcgis.com/home/index.html',
     );
@@ -824,5 +844,40 @@ describe('ServiceUrlForm portal URL guidance', () => {
     expect(screen.queryByRole('combobox', { name: 'Authentication' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Probe →' })).toBeDisabled();
     expect(mockProbeService).not.toHaveBeenCalled();
+  });
+  it('announces a probe failure and ties it to the URL field', async () => {
+    const user = userEvent.setup();
+    mockProbeService.mockRejectedValue(new ApiError('Plain HTTP is refused.', 400, null));
+    render(<ServiceUrlForm />);
+
+    const input = screen.getByLabelText(/Service URL/);
+    await user.type(input, 'http://example.test/wfs');
+    await user.click(screen.getByRole('button', { name: 'Probe →' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Plain HTTP is refused.');
+    const field = screen.getByLabelText(/Service URL/);
+    expect(field).toHaveAttribute('aria-invalid', 'true');
+    expect(field).toHaveAccessibleDescription('Plain HTTP is refused.');
+  });
+  it.each([
+    ['a URL refusal', 400, false],
+    ['a credential refusal', 403, true],
+  ])('ties %s to the matching field only', async (_label, status, credential) => {
+    const user = userEvent.setup();
+    mockProbeService.mockRejectedValue(new ApiError('Probe refused.', status, null));
+    render(<ServiceUrlForm />);
+
+    await enterUrl(user, screen.getByPlaceholderText('serviceUrl.placeholder'), 'https://example.test/wfs');
+    await user.click(screen.getByRole('combobox', { name: 'Authentication' }));
+    await user.click(await screen.findByRole('option', { name: 'Bearer token' }));
+    await user.click(screen.getByRole('button', { name: 'Probe →' }));
+
+    await screen.findByRole('alert');
+    const urlField = screen.getByLabelText(/Service URL/);
+    const tokenField = screen.getByLabelText('Bearer token');
+    expect(urlField.hasAttribute('aria-invalid')).toBe(!credential);
+    expect(tokenField.hasAttribute('aria-invalid')).toBe(credential);
+    expect(tokenField.hasAttribute('aria-describedby')).toBe(credential);
   });
 });

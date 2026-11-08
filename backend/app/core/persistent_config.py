@@ -7,6 +7,7 @@ DB overrides are ignored and writes are blocked.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -23,7 +24,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.platform.cache import get_cache
 from app.platform.cache.provider import CacheProvider
 from app.platform.audit import AuditEvent, audit_emit
+from app.core.ai_credentials import anthropic_configured
 from app.core.config import settings
+from app.core.config_ai import DEFAULT_LLM_MODEL
 from app.core.logging_config import apply_http_logger_levels
 from app.core.public_urls import (
     PUBLIC_URL_KEYS,
@@ -45,7 +48,7 @@ _UNSET: Any = object()
 
 _registry: list[PersistentConfig] = []
 
-# fix(#435): ADMIN-03 (M-03) — single source of truth for enterprise-only
+# Single source of truth for enterprise-only
 # Settings tabs; the backend `_require_enterprise_for_key` gate, config
 # import/export, and the frontend AdminSidebar all consult this set. Lives
 # here so config_ops need not import settings/router.py at import time.
@@ -65,19 +68,17 @@ _sync_rate_limit_cache: dict[str, tuple[Any, float]] = {}
 _DEFAULT_GLOBAL_RATE_LIMIT = 60
 _DEFAULT_SEMANTIC_SEARCH_RATE_LIMIT = 30
 _DEFAULT_BASEMAP_PROXY_RATE_LIMIT = 120
-# Ceiling for the OGC Features `limit` page size. Conservative by default
-# (#665 review): the offset path is O(N) in memory on an anonymous endpoint,
-# so a low default protects resource-limited deployments; operators raise
-# it from the dashboard for bulk export.
+# Ceiling for the OGC Features `limit` page size. Conservative by default:
+# the offset path is O(N) in memory on an anonymous endpoint, so a low default
+# protects resource-limited deployments; operators raise it for bulk export.
 _DEFAULT_OGC_ITEMS_MAX_PAGE_SIZE = 1000
 
 
 def _validate_or_fallback(cfg: PersistentConfig[T], raw: Any) -> tuple[T, bool]:
     """Validate `raw` against cfg's TypeAdapter; return (value, validated_ok).
 
-    Used by `PersistentConfig.get()` and `get_all_registry_values()` on the
-    DB-hit branch. On failure: logs a warning and returns
-    `(cfg.env_default, False)` without raising or caching.
+    Used by `PersistentConfig.get()` on the DB-hit branch. On failure: logs a
+    warning and returns `(cfg.env_default, False)` without raising or caching.
 
     Security: `exc.errors()` includes the offending input value. No
     registered config currently stores secrets — a future secret-containing
@@ -168,7 +169,7 @@ class PersistentConfig(Generic[T]):
             effective = self.env_default
 
         # On validation fallback, skip the cache write so the next read
-        # re-hits the DB and re-logs until the corrupt row is fixed (D-03).
+        # re-hits the DB and re-logs until the corrupt row is fixed.
         if cache is not None and validated_ok:
             await cache.set(cache_key, effective, ttl=_CACHE_TTL)
         self._update_sync_cache(effective)
@@ -256,7 +257,7 @@ class PersistentConfig(Generic[T]):
         if commit:
             await db.commit()
             await self.apply_side_effects(value)
-        # fix(#430): with commit=False, side effects are deferred to the
+        # With commit=False, side effects are deferred to the
         # batching caller's terminal commit — running them pre-commit flips
         # runtime state (log level, rate limits) a rollback won't restore.
 
@@ -265,8 +266,8 @@ class PersistentConfig(Generic[T]):
 
         Called automatically by set()/reset() when they own the commit. A
         caller batching with ``commit=False`` must not loop this per key —
-        use ``apply_side_effects_batch`` after its terminal commit (fix
-        #1543), never before it (fix(#430) r3; see set() above).
+        use ``apply_side_effects_batch`` after its terminal commit,
+        never before it (see set() above).
         """
         await apply_side_effects_batch([(self, value)])
 
@@ -276,16 +277,16 @@ class PersistentConfig(Generic[T]):
         Deliberately synchronous: this runs once per key of a batch, and having
         no await in it is what keeps a whole batch's worth uninterleavable.
         """
-        # BUG-025: public-URL keys are also memoized in a separate 60s cache
+        # Public-URL keys are also memoized in a separate 60s cache
         # in public_urls; clear it so the new value is reflected immediately.
         if self.key in PUBLIC_URL_KEYS:
             invalidate_public_url_cache()
 
         self._on_change(value)
 
-        # BUG-008: warm the sync cache with the NEW value — set() only ever
-        # warmed it with the OLD value (via get(db) above), so slowapi kept
-        # enforcing the previous limit for up to _CACHE_TTL per process.
+        # Warm the sync cache with the NEW value; set() warmed it with the OLD
+        # one (via get(db) above), so slowapi would keep enforcing the previous
+        # limit for up to _CACHE_TTL per process.
         self._update_sync_cache(value)
 
     async def reset(
@@ -303,7 +304,7 @@ class PersistentConfig(Generic[T]):
         ``settings`` is the batch's prospective snapshot, so the audited new
         value is the default that takes effect once the whole batch commits.
 
-        fix(#430): pass ``commit=False`` to defer the DB commit to a caller's
+        Pass ``commit=False`` to defer the DB commit to a caller's
         terminal commit (config-import overwrite mode), so a mid-import failure
         rolls the resets back instead of leaving settings wiped to defaults.
         """
@@ -340,7 +341,7 @@ class PersistentConfig(Generic[T]):
             if commit:
                 await db.commit()
                 await self.apply_side_effects(self.env_default)
-            # fix(#430): with commit=False the caller applies side effects
+            # With commit=False the caller applies side effects
             # (with env_default) after its terminal commit — see set().
 
     def _on_change(self, value: T) -> None:
@@ -351,10 +352,8 @@ class PersistentConfig(Generic[T]):
         if self.key in (
             "login_rate_limit",
             "global_rate_limit",
-            # CR-03 (Phase 1062 review): also warm the cache for the two new
-            # rate-limit knobs so DB-overridden values are picked up by slowapi
-            # at request time. Without these entries, get_cached_*_rate_limit()
-            # always fell through to _DEFAULT_* and ignored admin-set values.
+            # Also warm the two rate-limit knobs so slowapi picks up DB-overridden
+            # values at request time instead of falling through to _DEFAULT_*.
             "semantic_search_rate_limit",
             "basemap_proxy_rate_limit",
         ):
@@ -366,9 +365,9 @@ async def apply_side_effects_batch(
 ) -> None:
     """Apply the post-commit side effects of a whole settings batch at once.
 
-    fix(#1543): a per-key eviction loop let a concurrent reader see the new
-    value for already-evicted keys and the old value for the rest — surfaced
-    by the embedding model/dimensions pair never resolving as committed.
+    A per-key eviction loop would let a concurrent reader see the new
+    value for already-evicted keys and the old value for the rest, so the
+    embedding model/dimensions pair would never resolve as committed.
     One ``delete_many`` collapses that span to a single atomic step, evicted
     only after commit (evicting before it would let a reader repopulate the
     cache with the pre-commit value for a full TTL).
@@ -376,9 +375,9 @@ async def apply_side_effects_batch(
     Scope: this makes the WRITER atomic, not a reader — two separate
     ``get`` calls can still straddle this step and see one key's new value
     against another's cached-old one. ``get_uncached`` is the per-key
-    opt-out (#1539); the embedding endpoint has no uncached variant yet, so
-    it can still lag by a full ``_CACHE_TTL`` regardless of this eviction —
-    closing that needs the read protocol widened, not another eviction fix.
+    opt-out; the embedding endpoint has no uncached variant yet, so it can
+    still lag by a full ``_CACHE_TTL`` regardless of this eviction. Closing
+    that needs the read protocol widened, not another eviction fix.
     """
     if not items:
         return
@@ -399,8 +398,8 @@ class _LogLevelConfig(PersistentConfig[str]):
 
     def _on_change(self, value: str) -> None:
         logging.getLogger().setLevel(value.upper())
-        # fix(#1746): keep httpx/httpcore's WARNING floor correct after a
-        # runtime log-level change too — see apply_http_logger_levels().
+        # A runtime change moves the HTTP client loggers' floor too; see
+        # apply_http_logger_levels().
         apply_http_logger_levels(value.upper())
 
 
@@ -412,10 +411,10 @@ REGISTRATION_ENABLED = PersistentConfig[bool](
     label="Registration Enabled",
 )
 
-# SIGNUP-04: when self-serve registration is ON, email verification is the
+# When self-serve registration is ON, email verification is the
 # activation gate. Default True for the secure path; independent of
 # REGISTRATION_ENABLED, which gates availability, not activation.
-# SECURITY (#267): with SMTP, this is NOT username-enumeration-safe — the
+# SECURITY: with SMTP, this is NOT username-enumeration-safe — the
 # /auth/register response is uniform, but a verification email sends only
 # when the identity was free, letting a registrant infer it out-of-band.
 # Mitigated by /register rate limiting, not eliminated.
@@ -446,7 +445,7 @@ PUBLIC_BASE_URL = PersistentConfig[str](
     label="Public Base URL",
 )
 
-# CONF-01: PUBLIC_BASE_URL is the legacy alias for PUBLIC_API_URL, kept
+# PUBLIC_BASE_URL is the legacy alias for PUBLIC_API_URL, kept
 # functional for backwards compatibility. Warn once at import time rather
 # than per-request.
 if settings.public_base_url:
@@ -484,7 +483,7 @@ PUBLIC_API_URL = PersistentConfig[str](
     label="Public API URL",
 )
 
-# PRIV-1: per-instance privacy-policy link for the login/register pages.
+# Per-instance privacy-policy link for the login/register pages.
 # tab="general" (not "branding") deliberately: ENTERPRISE_ONLY_TABS gates the
 # branding tab, and self-hosted community operators need this the most.
 PRIVACY_URL = PersistentConfig[str](
@@ -501,6 +500,33 @@ LOG_LEVEL = _LogLevelConfig(
     tab="general",
     label="Log Level",
 )
+
+
+async def sync_log_level(session: AsyncSession) -> None:
+    """Apply the stored log level when this process's root logger differs.
+
+    ``_on_change`` runs only in the process that saved the setting; every
+    other API worker and replica converges here from its periodic loop.
+    """
+    value = (await LOG_LEVEL.get(session)).upper()
+    if logging.getLevelName(logging.getLogger().level) != value:
+        LOG_LEVEL._on_change(value)
+
+
+async def run_log_level_sync(interval_seconds: float = 30.0) -> None:
+    """Keep this process's log level in step with the shared setting."""
+    from app.core.db import async_session
+
+    while True:
+        try:
+            async with async_session() as session:
+                await sync_log_level(session)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # broad: the loop must survive a transient DB error
+            logger.warning("log_level_sync_failed", error=str(exc))
+        await asyncio.sleep(interval_seconds)
+
 
 LOG_JSON = PersistentConfig[bool](
     key="log_json",
@@ -526,7 +552,7 @@ ENABLE_DATASET_EDITING = PersistentConfig[bool](
     label="Enable Dataset Editing",
 )
 
-# feat(#1691): when ON, only admins may set `visibility: public` on datasets/
+# When ON, only admins may set `visibility: public` on datasets/
 # maps (gate: `check_public_visibility_allowed` in catalog/authorization.py).
 # Default OFF; fires only on a mutation that requests public, so existing
 # public content is untouched.
@@ -538,7 +564,7 @@ RESTRICT_PUBLIC_VISIBILITY = PersistentConfig[bool](
     label="Restrict Public Visibility to Admins",
 )
 
-# FRONT-01: landing-first flag, default OFF. When ON, the frontend root
+# Landing-first flag, default OFF. When ON, the frontend root
 # guard redirects unauthenticated visitors from "/" to "/login" unless
 # they've set the gl-guest-browse sessionStorage escape hatch.
 LANDING_FIRST = PersistentConfig[bool](
@@ -593,6 +619,15 @@ REFRESH_TOKEN_EXPIRE_DAYS = PersistentConfig[int](
     label="Refresh Token Expiry (days)",
 )
 
+# None keeps audit rows forever; the admin validator enforces the minimum.
+AUDIT_RETENTION_DAYS = PersistentConfig[int | None](
+    key="audit_retention_days",
+    type_=int | None,
+    env_default=None,
+    tab="general",
+    label="Audit Log Retention (days)",
+)
+
 LOGIN_RATE_LIMIT = PersistentConfig[int](
     key="login_rate_limit",
     type_=int,
@@ -601,7 +636,7 @@ LOGIN_RATE_LIMIT = PersistentConfig[int](
     label="Login Rate Limit (per min)",
 )
 
-# DOMAIN-01: allowlist of permitted email domains for signup/login/SSO/
+# Allowlist of permitted email domains for signup/login/SSO/
 # admin-create. Default [] means unrestricted. JSONB-backed key — no
 # Alembic migration required.
 ALLOWED_EMAIL_DOMAINS = PersistentConfig[list[str]](
@@ -612,7 +647,7 @@ ALLOWED_EMAIL_DOMAINS = PersistentConfig[list[str]](
     label="Allowed Email Domains",
 )
 
-# SSO-01: when False, POST /auth/login returns 403 for users without
+# When False, POST /auth/login returns 403 for users without
 # manage_settings — admins always retain password-login as a break-glass
 # escape hatch. Default True. JSONB-backed key — no Alembic migration
 # required.
@@ -638,7 +673,7 @@ LLM_PROVIDER = PersistentConfig[str](
     key="llm_provider",
     type_=str,
     env_default_factory=lambda: (
-        "anthropic" if settings.anthropic_api_key else "openai_compatible"
+        "anthropic" if anthropic_configured() else "openai_compatible"
     ),
     tab="ai",
     label="LLM Provider",
@@ -647,9 +682,24 @@ LLM_PROVIDER = PersistentConfig[str](
 
 
 def llm_model_default(provider: str, *, light: bool = False) -> str:
-    """The model ``provider`` uses when no admin override is set."""
+    """The model ``provider`` uses when no admin override is set, or ``""``."""
     if provider == "anthropic":
-        return "claude-haiku-4-5-20251001" if light else settings.llm_model
+        # Bedrock and Vertex don't serve Anthropic's model names, so they have
+        # no default; Foundry deployments may carry them.
+        chat = settings.llm_model or (
+            ""
+            if settings.anthropic_platform in ("bedrock", "vertex")
+            else DEFAULT_LLM_MODEL
+        )
+        if not light:
+            return chat
+        if settings.llm_model_light:
+            return settings.llm_model_light
+        # Foundry deployments, Bedrock inference profiles and Vertex IDs don't
+        # use Anthropic's model names, so reuse the model the operator set.
+        if settings.anthropic_platform != "anthropic":
+            return chat
+        return "claude-haiku-5-5"
     if light:
         # Reuse OPENAI_MODEL rather than a hardcoded name, which 404s on Azure
         # OpenAI, gateways and Ollama, where it must match a real deployment.
@@ -755,7 +805,11 @@ class _ProviderModelConfig(PersistentConfig[str]):
             model = config.get("default_model")
             if isinstance(model, str) and model.strip():
                 return model
-        return llm_model_default(provider, light=self.light)
+        default = llm_model_default(provider, light=self.light)
+        if not default and self.light:
+            # No platform default: follow the chat model an admin set.
+            return await LLM_MODEL.for_provider(db, provider, runtime_config)
+        return default
 
     async def resolved_default(
         self, db: AsyncSession, settings: Mapping[str, object] | None = None
@@ -821,6 +875,14 @@ class _ProviderModelConfig(PersistentConfig[str]):
 
 
 LLM_MODEL = _ProviderModelConfig("llm_model", light=False, label="LLM Model")
+
+
+async def llm_model_unset(db: AsyncSession, provider: str) -> bool:
+    """Whether ``provider`` has neither an admin model nor a default one."""
+    if llm_model_default(provider):
+        return False
+    return not await LLM_MODEL.for_provider(db, provider)
+
 
 OPENAI_BASE_URL = PersistentConfig[str](
     key="openai_base_url",
@@ -964,6 +1026,24 @@ MAX_DATASETS_PER_USER = PersistentConfig[int](
     label="Max Datasets per User (0=unlimited)",
 )
 
+# Checked at each story image upload; images already stored stay.
+MAX_STORY_IMAGE_MB_PER_USER = PersistentConfig[int](
+    key="max_story_image_mb_per_user",
+    type_=int,
+    env_default=0,
+    tab="storage",
+    label="Max Story Image Storage per User (MB, 0=unlimited)",
+)
+
+# Lowering it frees no storage until each dataset's next replacement or restore.
+PREVIOUS_VERSIONS_KEPT = PersistentConfig[int](
+    key="previous_versions_kept",
+    type_=int,
+    env_default=3,
+    tab="storage",
+    label="Previous Versions Kept per Dataset",
+)
+
 
 async def _load_registry_values(db: AsyncSession) -> dict[str, Any]:
     """Every registered key's override or env_default, model defaults unresolved."""
@@ -984,30 +1064,6 @@ async def _load_registry_values(db: AsyncSession) -> dict[str, Any]:
     return settings_dict
 
 
-async def get_all_registry_values(db: AsyncSession) -> dict[str, Any]:
-    """Batch-load all registry settings in a single DB query.
-
-    Returns a dict mapping each registered key to its effective value
-    (DB override if present, otherwise env_default). Bypassed when
-    ENV_ONLY_CONFIG is set — returns env_defaults directly without
-    hitting the DB.
-
-    .. note::
-        Consumed only by tests today; kept as a forward-looking helper for
-        an admin/settings dump endpoint that needs an atomic snapshot
-        without N round-trips.
-    """
-    settings_dict = await _load_registry_values(db)
-
-    # A model without an override resolves against this snapshot's provider.
-    for model in (LLM_MODEL, LLM_MODEL_LIGHT):
-        if not settings_dict[model.key].strip():
-            settings_dict[model.key] = await model.default_for(
-                db, settings_dict[LLM_PROVIDER.key]
-            )
-    return settings_dict
-
-
 async def get_allowed_extensions_list(db: AsyncSession) -> list[str]:
     """Return the allowed upload extensions as a parsed list."""
     raw = await UPLOAD_ALLOWED_EXTENSIONS.get(db)
@@ -1022,8 +1078,7 @@ TILE_CACHE_TTL = PersistentConfig[int](
     label="Tile Cache TTL (s)",
 )
 
-# Import default basemaps/map-defaults from the existing router constants
-# to avoid circular imports, define them inline
+# Defined inline to avoid a circular import of the router constants.
 _DEFAULT_BASEMAPS = [
     {
         "id": "openfreemap-positron",
@@ -1078,13 +1133,21 @@ MAP_DEFAULTS = PersistentConfig[dict[str, float]](
 )
 
 
-# -- Plugins --
 ENABLED_PLUGINS = PersistentConfig[list[str] | None](
     key="enabled_plugins",
     type_=list[str] | None,
     env_default=None,
     tab="map",
     label="Enabled Plugins",
+)
+
+# Empty by default, which keeps story embed and video blocks off.
+STORY_FRAME_HOSTS = PersistentConfig[list[dict[str, Any]]](
+    key="story_frame_hosts",
+    type_=list[dict[str, Any]],
+    env_default_factory=list,
+    tab="network",
+    label="Story Embed and Video Hosts",
 )
 
 
@@ -1130,7 +1193,7 @@ def get_cached_global_rate_limit() -> int:
 def get_cached_semantic_search_rate_limit() -> int:
     """Sync accessor for slowapi callable -- reads from sync cache, falls back to default.
 
-    SEC-S11: caps OpenAI embedding cost-DoS by limiting unique novel queries per IP.
+    Caps OpenAI embedding cost-DoS by limiting unique novel queries per IP.
     Default 30/min matches the audit recommendation for cost-sensitive endpoints.
     Configurable at runtime via the admin Settings UI / PUT /settings/ with key
     `semantic_search_rate_limit` (there is no SEMANTIC_SEARCH_RATE_LIMIT env var;
@@ -1145,7 +1208,7 @@ def get_cached_semantic_search_rate_limit() -> int:
 def get_cached_basemap_proxy_rate_limit() -> int:
     """Sync accessor for slowapi callable -- reads from sync cache, falls back to default.
 
-    SEC-S10: caps commercial-tier basemap key replay from anonymous clients.
+    Caps commercial-tier basemap key replay from anonymous clients.
     Default 120/min is loose enough for the SPA boot path (one call per page load
     across users behind a shared NAT) while still bounding attacker throughput.
     Configurable at runtime via the admin Settings UI / PUT /settings/ with key

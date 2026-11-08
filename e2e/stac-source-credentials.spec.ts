@@ -4,7 +4,7 @@ import { getAuthToken, getSearchSeed, type SearchSeed } from './helpers/catalog'
 const BASE_URL = process.env.E2E_BASE_URL ?? 'http://localhost:8080';
 
 /**
- * Request-only authentication for STAC sources (feat(#1764)), from the two
+ * Request-only authentication for STAC sources, from the two
  * places a person types the credential: the import wizard's STAC tab and a
  * STAC dataset's refresh dialog.
  *
@@ -208,8 +208,9 @@ test.describe('STAC refresh dialog credential prompt', () => {
 
     await openRefreshDialogAndSubmit(page);
 
-    await page.getByLabel('Authentication', { exact: true }).selectOption('bearer');
-    await page.getByLabel('Bearer token', { exact: true }).fill('e2e-stac-token');
+    await page.getByLabel('Authentication', { exact: true }).click();
+    await page.getByRole('option', { name: 'Bearer token', exact: true }).click();
+    await page.getByRole('dialog').getByLabel('Bearer token', { exact: true }).fill('e2e-stac-token');
     await page.getByRole('button', { name: 'Start refresh' }).click();
 
     await expect(page.getByRole('dialog')).toHaveCount(0);

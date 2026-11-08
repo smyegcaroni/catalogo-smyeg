@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -14,14 +15,23 @@ if TYPE_CHECKING:
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.catalog.authorization import check_vrt_audiences_after_change
 from app.modules.catalog.datasets.domain._sql_safety import SAFE_TABLE_NAME_RE
-from app.modules.catalog.datasets.domain.helpers import WorkflowTransitionDenied
+from app.modules.catalog.datasets.domain.helpers import (
+    DatasetNotFoundError,
+    WorkflowTransitionDenied,
+)
 from app.modules.catalog.datasets.domain.models import (
     AttributeMetadata,
     Dataset,
     RecordTranslation,
 )
 from app.modules.catalog.datasets.domain.service_query import get_dataset
+from app.modules.catalog.datasets.domain.value_label_budget import (
+    ValueLabelsOverBudget,
+    refuse_value_labels_over_budget,
+)
+from app.modules.catalog.write_recheck import refuse_publish_key_widening
 from app.platform.catalog_locks import bump_publication_version_on
 from app.platform.extensions import get_catalog_port, get_workflow_extension
 from app.platform.extensions.protocols import WorkflowTransitionContext
@@ -30,6 +40,7 @@ logger = structlog.stdlib.get_logger(__name__)
 
 
 __all__ = [
+    "ValueLabelsOverBudget",
     "compute_schema_diff",
     "defer_metadata_embedding",
     "get_attribute",
@@ -68,17 +79,14 @@ _SUBTYPE_TYPE_EQUIVALENCES = {
 def _normalize_col_type(column: dict) -> str:
     """Normalize one column's reported type for case-insensitive comparison.
 
-    Which vocabulary a value is in depends on the value, not on whether it
-    is the "old" or "new" argument: a reupload preview diffs a PostgreSQL
-    type against an OGR type, but the post-swap drift recompute diffs two
-    PostgreSQL types. Every attribute column's PostgreSQL type reaching
-    this diff is lowercase (a PostGIS geometry column would report the
-    non-lowercase ``USER-DEFINED``, but ``column_info`` excludes those
-    before they get here). Every OGR type name starts with a capital
-    letter, so a lowercase value is already canonical and returned as-is,
-    while a capitalized one maps to the PostgreSQL type ogr2ogr would
-    create for it, honoring a GDAL subtype the driver stores narrower
-    than the bare type.
+    The vocabulary depends on the value, not on which argument it is: a
+    reupload preview diffs a PostgreSQL type against an OGR type, while the
+    post-swap drift recompute diffs two PostgreSQL types. PostgreSQL attribute
+    types reaching this diff are lowercase (PostGIS geometry's
+    ``USER-DEFINED`` is excluded by ``column_info``) and every OGR type name
+    starts with a capital. A lowercase value is returned as-is; a capitalized
+    one maps to the PostgreSQL type ogr2ogr would create, honoring a GDAL
+    subtype the driver stores narrower than the bare type.
     """
     raw_type = column["type"]
     base_type = raw_type.lower()
@@ -137,9 +145,8 @@ def compute_schema_diff(
         ],
         "row_count_old": old_feature_count,
         "row_count_new": new_feature_count,
-        # `None` on either side is UNKNOWN, not zero -- coercing
-        # it invented a delta the size of whichever count was known. An
-        # unknown difference is reported as unknown.
+        # `None` on either side is unknown, not zero, so the difference is
+        # reported as unknown.
         "row_count_delta": (
             None
             if old_feature_count is None or new_feature_count is None
@@ -149,7 +156,6 @@ def compute_schema_diff(
 
 
 # Field maps for the simple-assignment portion of update_user_metadata.
-# Module scope so they aren't rebuilt per call.
 _RECORD_FIELD_MAP: dict[str, str] = {
     "title": "title",
     "summary": "summary",
@@ -208,42 +214,82 @@ def _apply_tile_columns(dataset: Dataset, meta: "DatasetMeta") -> bool:
     return True
 
 
+async def refuse_stranding_shared_maps(
+    session: AsyncSession,
+    record: Any,
+    dataset_id: uuid.UUID,
+    *,
+    visibility: str | None = None,
+    record_status: str | None = None,
+    regrant: Callable[[], Awaitable[object]] | None = None,
+) -> None:
+    """Raise ValueError when moving the record to ``visibility`` and
+    ``record_status`` (None keeps the current one) strands one of the owner's
+    shared maps. ``regrant`` changes the grants between the two audience reads.
+    """
+    from app.modules.catalog.maps.service import (
+        find_maps_broken_by_dataset_visibility,
+    )
+
+    new_status = record_status or record.record_status
+    broken_maps = await find_maps_broken_by_dataset_visibility(
+        session,
+        dataset_id,
+        old_visibility=record.visibility,
+        new_visibility=visibility or record.visibility,
+        record_status=record.record_status,
+        new_record_status=new_status,
+        record_id=record.id,
+        owner_id=record.created_by,
+        regrant=regrant,
+    )
+    if broken_maps:
+        unpublishes = record.record_status == "published" and new_status != "published"
+        action = "unpublish" if unpublishes else "restrict visibility"
+        raise ValueError(
+            f"Cannot {action}: dataset is used in shared maps: {', '.join(broken_maps)}"
+        )
+
+
 async def _apply_visibility_change(
     session: AsyncSession,
     record: Any,
     dataset: Dataset,
     dataset_id: uuid.UUID,
     new_visibility: str,
+    regrant: Callable[[], Awaitable[object]] | None = None,
+    *,
+    new_status: str | None = None,
 ) -> bool:
-    """Set record.visibility, blocking a change that would strand a shared map.
+    """Set record.visibility unless it strands one of the owner's shared maps.
 
     The helper compares the before and after audiences so internal-map
-    viewers are protected as well as public-map viewers.
+    viewers are protected as well as public-map viewers. ``regrant`` changes
+    the dataset's grants in the same step, which moves its audience even when
+    the visibility stays. ``new_status`` is the status the same edit moves to,
+    so the check judges the combined result.
     """
-    from app.modules.catalog.maps.service import (
-        find_maps_broken_by_dataset_visibility,
-    )
+    pending = [regrant] if regrant is not None else []
 
-    broken_maps = await find_maps_broken_by_dataset_visibility(
+    async def regrant_once() -> None:
+        while pending:
+            await pending.pop()()
+
+    await refuse_stranding_shared_maps(
         session,
+        record,
         dataset_id,
-        old_visibility=record.visibility,
-        new_visibility=new_visibility,
-        record_status=record.record_status,
-        record_id=record.id,
-        owner_id=record.created_by,
+        visibility=new_visibility,
+        record_status=new_status,
+        regrant=regrant_once if pending else None,
     )
-    if broken_maps:
-        raise ValueError(
-            "Cannot restrict visibility: dataset is used in shared maps: "
-            f"{', '.join(broken_maps)}"
-        )
-    if new_visibility == record.visibility:
+    await regrant_once()
+    if new_visibility == record.visibility and regrant is None:
         return True
     record.visibility = new_visibility
-    # A visibility change moves who may read the dataset, so it
+    # A visibility or grant change moves who may read the dataset, so it
     # retires outstanding tile signatures exactly as a status change does.
-    # `update_user_metadata` already holds both catalog rows.
+    # Every caller already holds both catalog rows.
     await bump_publication_version_on(session, dataset)
     return True
 
@@ -338,7 +384,7 @@ async def update_user_metadata(
     """Update user-editable fields including extended metadata.
 
     Accepts a DatasetMeta Pydantic model. Only updates fields that are
-    explicitly set. Raises ValueError if dataset not found.
+    explicitly set. Raises DatasetNotFoundError if dataset not found.
     Does not commit; caller controls transaction scope.
 
     ``actor`` defaults to the identity ``actor_id`` names, since a workflow
@@ -348,7 +394,7 @@ async def update_user_metadata(
     """
     dataset = await get_dataset(session, dataset_id)
     if dataset is None:
-        raise ValueError(f"Dataset {dataset_id} not found.")
+        raise DatasetNotFoundError(f"Dataset {dataset_id} not found.")
     if actor is None and actor_id is not None:
         from app.modules.catalog.datasets.domain.helpers import _load_actor_identities
 
@@ -365,6 +411,13 @@ async def update_user_metadata(
     touches_raster = "is_dem" in meta.model_fields_set
     await lock_catalog_rows_for_write(
         session, dataset, with_raster_asset=touches_raster
+    )
+    # Loaded before the lock: judge the row as committed. The flush keeps an
+    # ownership transfer this request already applied.
+    await session.flush()
+    await session.refresh(record, ["visibility", "record_status", "created_by"])
+    await refuse_publish_key_widening(
+        session, record.id, visibility=meta.visibility, record_status=meta.record_status
     )
 
     if "language" in meta.model_fields_set:
@@ -385,11 +438,23 @@ async def update_user_metadata(
         _apply_tile_columns(dataset, meta),
     ]
 
+    await check_vrt_audiences_after_change(
+        session, dataset, visibility=meta.visibility, record_status=meta.record_status
+    )
     if meta.visibility is not None:
         mutated_flags.append(
             await _apply_visibility_change(
-                session, record, dataset, dataset_id, meta.visibility
+                session,
+                record,
+                dataset,
+                dataset_id,
+                meta.visibility,
+                new_status=meta.record_status,
             )
+        )
+    elif meta.record_status is not None:
+        await refuse_stranding_shared_maps(
+            session, record, dataset_id, record_status=meta.record_status
         )
     if meta.record_status is not None:
         mutated_flags.append(
@@ -464,7 +529,17 @@ async def update_attribute(
     if attr is None:
         raise ValueError("Attribute not found")
 
-    editable = {"title", "description", "units", "semantic_role", "domain_type"}
+    if kwargs.get("value_labels"):
+        await refuse_value_labels_over_budget(session, attr, kwargs["value_labels"])
+
+    editable = {
+        "title",
+        "description",
+        "units",
+        "semantic_role",
+        "domain_type",
+        "value_labels",
+    }
     modified_fields = set(attr.user_modified_fields or [])
     for key, value in kwargs.items():
         if key in editable:
@@ -546,6 +621,7 @@ async def reset_attribute(
     attr.domain_type = port.infer_domain_type(attr.data_type or "")
     attr.units = port.infer_units(attr.field_name)
     attr.description = None
+    attr.value_labels = None
     attr.user_modified_fields = []
     attr.example_values = example_values
 

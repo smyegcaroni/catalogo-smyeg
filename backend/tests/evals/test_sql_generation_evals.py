@@ -359,9 +359,9 @@ async def test_spatial_containment(client, test_db_session, eval_dataset):
 async def test_locations_reach_geojson_deterministically(
     client, test_db_session, eval_dataset
 ):
-    """fix(#544): a 'names and locations' question must produce mappable
+    """A 'names and locations' question must produce mappable
     geometry after the deterministic geometry-append pass, no matter which
-    columns the model chose (attribute-only selects previously dropped the
+    columns the model chose (an attribute-only select would otherwise drop the
     map overlay on every chat surface)."""
     from app.processing.ai.chat_geojson import (
         _extract_geojson,
@@ -387,11 +387,11 @@ async def test_locations_reach_geojson_deterministically(
 
 
 # ---------------------------------------------------------------------------
-# fix(#935): metric buffers must come from the geodesic expression the prompt
+# Metric buffers must come from the geodesic expression the prompt
 # now embeds from render_geodesic_buffer, not a bare ST_Buffer(::geography)
 # ---------------------------------------------------------------------------
 
-# fix(#935 codex r3): the fixtures must actually reach the branches under
+# The fixtures must actually reach the branches under
 # test. The two seam stations sit ~5.5 km from ±180, so a 10 km buffer
 # genuinely crosses the antimeridian (a ±179.5 station's buffer stops ~0.4°
 # short); the wide-region row is ONE MULTIPOINT spanning 20° across the seam,
@@ -511,7 +511,7 @@ async def pacific_dataset(test_db_session):
 def _geojson_component_stats(result: SandboxResult) -> tuple[list[float], list[float]]:
     """(per-COMPONENT longitude widths, all longitudes) across GeoJSON cells.
 
-    fix(#935 codex r3): a correctly seam-split buffer is a MULTIPOLYGON with
+    A correctly seam-split buffer is a MULTIPOLYGON with
     lobes at BOTH edges, so its whole-feature width is ~360 by construction —
     the honest metric is per polygon component: every component of a correct
     output is narrow and inside ±180, while the corrupt un-split output is a
@@ -555,7 +555,7 @@ def _geojson_component_stats(result: SandboxResult) -> tuple[list[float], list[f
 async def test_seam_crossing_buffer_uses_the_geodesic_expression(
     client, test_db_session, pacific_dataset
 ):
-    """fix(#935): a metric-buffer question over stations ~5.5 km from ±180
+    """A metric-buffer question over stations ~5.5 km from ±180
     must produce the geodesic buffer expression, and the executed output must
     stay coherent at the seam.
 
@@ -566,11 +566,10 @@ async def test_seam_crossing_buffer_uses_the_geodesic_expression(
     wide, which is exactly what drew a band across the map and fit-bounds'd
     the chat overlay to the whole world (#935's user-visible symptom).
 
-    fix(#1589): the model no longer types that expression — it writes
-    ``geolens_buffer(...)`` and ``generate_sql`` expands the marker before
-    returning. The predicates are unchanged and now read the expansion, which
-    is what actually runs; the marker itself must be gone by then, or
-    something downstream is looking at SQL nobody expanded.
+    The model writes ``geolens_buffer(...)`` and ``generate_sql`` expands the
+    marker before returning. The predicates read the expansion, which is what
+    actually runs; the marker itself must be gone by then, or something
+    downstream is looking at SQL nobody expanded.
     """
     sql, result = await _ask(
         test_db_session,
@@ -596,13 +595,13 @@ async def test_seam_crossing_buffer_uses_the_geodesic_expression(
 async def test_wide_multipart_buffer_stays_component_narrow(
     client, test_db_session, pacific_dataset
 ):
-    """fix(#935 codex r3): the regions row is ONE MULTIPOINT spanning 20°
+    """The regions row is ONE MULTIPOINT spanning 20°
     across the seam, so its buffer trips the >= 6° span gate — the branch the
     per-point question cannot reach. Every output component must stay narrow
     and inside ±180; the unfixed whole-input projection produced either a
     world-spanning component or geometry escaping the range.
 
-    fix(#1589): asserted on the expanded SQL, as above."""
+    Asserted on the expanded SQL, as above."""
     sql, result = await _ask(
         test_db_session,
         pacific_dataset,

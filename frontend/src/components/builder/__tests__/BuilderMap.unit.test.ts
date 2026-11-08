@@ -4,7 +4,6 @@ import {
   ensureRasterDemTerrainSource,
   getExpressionSafeOpacity,
   isTerrainCapableDemLayer,
-  MAP_STACK_Z_ORDER_POLICY,
   normalizeTerrainExaggeration,
   simplifyPaint,
   TERRAIN_SOURCE_ID,
@@ -79,11 +78,11 @@ describe('getExpressionSafeOpacity', () => {
     expect(getExpressionSafeOpacity({ 'line-opacity': 0.5 }, 'line', 0.4)).toBe(0.2);
   });
 
-  it('fix(#394) ST-03: multiplies expression-valued opacity by the master slider', () => {
-    const opacityExpression = ['step', ['zoom'], 0.25, 10, 0.75];
+  it('scales expression-valued opacity by the master slider', () => {
+    const opacityExpression = ['step', ['zoom'], 0.5, 10, 1];
 
     expect(getExpressionSafeOpacity({ 'circle-opacity': opacityExpression }, 'circle', 0.4))
-      .toEqual(['*', opacityExpression, 0.4]);
+      .toEqual(['step', ['zoom'], 0.2, 10, 0.4]);
     // Master at 1 keeps the expression identity (no pointless wrapper churn).
     expect(getExpressionSafeOpacity({ 'circle-opacity': opacityExpression }, 'circle', 1)).toEqual(opacityExpression);
   });
@@ -275,19 +274,9 @@ describe('basemap appearance helpers', () => {
     expect(map.setPaintProperty).toHaveBeenCalledWith('road-primary', 'line-opacity', 0.35);
     expect(map.setPaintProperty).not.toHaveBeenCalledWith('layer-user-roads', 'line-opacity', expect.anything());
   });
-
-  it('documents the map stack z-order policy', () => {
-    expect(MAP_STACK_Z_ORDER_POLICY).toEqual([
-      'surface terrain',
-      'basemap relief and detail',
-      'user data geometry',
-      'basemap labels',
-      'user data labels',
-    ]);
-  });
 });
 
-// fix(#903): a crossing bbox used to be dropped outright, so both fit paths and
+// A crossing bbox used to be dropped outright, so both fit paths and
 // Zoom to Layer were silent no-ops for a seam-crossing layer.
 describe('getVisibleLayerBounds across the antimeridian (fix #903)', () => {
   function layer(bbox: number[] | null, visible = true): MapLayerResponse {
@@ -305,8 +294,15 @@ describe('getVisibleLayerBounds across the antimeridian (fix #903)', () => {
     ]);
   });
 
+  // MapLibre's globe fit returns no camera for a zero-size box.
+  it('fits a single-point layer with a box that has width and height', () => {
+    const [[west, south], [east, north]] = getVisibleLayerBounds([layer([12.5, 48.1, 12.5, 48.1])])!;
+    expect(east - west).toBeGreaterThan(0);
+    expect(north - south).toBeGreaterThan(0);
+  });
+
   it('merges a crossing layer with a neighbour on the far side of the seam', () => {
-    // codex on #903: unwrapping only the crossing layer gave [-179, 182] — a
+    // Unwrapping only the crossing layer gave [-179, 182] — a
     // 361 degree span for a union that occupies about 5.
     const bounds = getVisibleLayerBounds([
       layer([178, -20, -178, -15]),
@@ -319,7 +315,7 @@ describe('getVisibleLayerBounds across the antimeridian (fix #903)', () => {
     ]);
   });
 
-  // codex round 2 on #903: shifting on the west edge alone pushed a contained
+  // Shifting on the west edge alone pushed a contained
   // layer a whole turn away from a world-wide one, fitting a 530 degree span.
   it('leaves a contained layer inside a world-wide one', () => {
     expect(getVisibleLayerBounds([layer([-180, -85, 180, 85]), layer([10, 0, 20, 5])])).toEqual([
@@ -335,7 +331,7 @@ describe('getVisibleLayerBounds across the antimeridian (fix #903)', () => {
       .toEqual([[-182, -20], [-177, -14]]);
   });
 
-  // codex round 3 on #903: no planar placement expresses "already contained"
+  // No planar placement expresses "already contained"
   // for a crossing layer inside a world-spanning one, so the search returned a
   // span WIDER than the world it started from.
   it('leaves world bounds alone when a crossing layer is added inside them', () => {

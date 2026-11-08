@@ -1,5 +1,5 @@
 /**
- * Phase 1044-02 — Drag-from-catalog aria-live announcement contract (POL-23)
+ * Drag-from-catalog aria-live announcement contract
  *
  * Test surface: the sr-only aria-live region in MapBuilderPage that announces
  * keyboard / mouse drag events to assistive technology users.
@@ -114,6 +114,7 @@ vi.mock('@/hooks/use-maps', () => ({
   useRemoveLayer: () => ({}),
   useExportMapStyleJson: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useImportMapStyleJson: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useLayersHiddenFromMapGroups: () => new Set(),
 }));
 
 vi.mock('@/hooks/use-ai-availability', () => ({
@@ -156,6 +157,7 @@ vi.mock('@/components/builder/hooks/use-builder-dialogs', () => ({
 
 vi.mock('@/components/builder/hooks/use-builder-layers', () => ({
   useBuilderLayers: () => ({
+    dashboard: { panel: 'right', widgets: [] },
     localLayers: [],
     localName: 'A11Y Test Map',
     setLocalName: vi.fn(),
@@ -201,7 +203,6 @@ vi.mock('@/components/builder/hooks/use-builder-layers', () => ({
     handleAiRemoveLayer: vi.fn(),
     handleQueryResult: vi.fn(),
     handleDismissEphemeral: vi.fn(),
-    handleRenderModeChange: vi.fn(),
     chatLayerActions: {
       onFilterChange: vi.fn(),
       onPaintChange: vi.fn(),
@@ -253,7 +254,7 @@ afterEach(() => {
 });
 
 // ---------------------------------------------------------------------------
-// Phase 1044-02 — aria-live region contract (POL-23, T-1044-05)
+// Aria-live region contract
 // ---------------------------------------------------------------------------
 
 describe('Phase 1044-02 — MapBuilderPage drag aria-live region (POL-23)', () => {
@@ -278,7 +279,7 @@ describe('Phase 1044-02 — MapBuilderPage drag aria-live region (POL-23)', () =
   });
 });
 
-describe('fix(#785) — DndContext translated announcements', () => {
+describe('DndContext translated announcements', () => {
   it('wires the accessibility prop (source pin)', () => {
     // Without it, dnd-kit's DEFAULT announcements fire — hardcoded English
     // built from the draggable id, i.e. "Picked up draggable item <uuid>…".
@@ -318,7 +319,7 @@ describe('MapBuilderPage complementary landmark names', () => {
 
 /**
  * Tests 3-6 (pickup/drop/cancel announcement content) are deferred to the
- * Playwright e2e spec at frontend/e2e/builder-v1-5.spec.ts (Phase 1044 Plan 03).
+ * Playwright e2e spec at frontend/e2e/builder-v1-5.spec.ts.
  *
  * Rationale: these handlers (handleDragStart, handleDragEnd, handleDragCancel)
  * are invoked by @dnd-kit/core's internal PointerSensor / KeyboardSensor machinery,
@@ -331,7 +332,7 @@ describe('MapBuilderPage complementary landmark names', () => {
  * The e2e spec exercises the full browser stack where PointerSensor fires correctly:
  * - Test 3 → "drag-from-catalog negative: Escape cancels mid-drag" asserts region contains 'Drop cancelled.'
  * - Test 5 → "drag-from-catalog happy" asserts region contains the layer name after drop
- * - Tests 4, 6 → pickup and cancel content verified via VoiceOver walkthrough (1044-A11Y-WALKTHROUGH.md)
+ * - Tests 4, 6 → pickup and cancel content verified by a manual VoiceOver walkthrough
  *
  * The two tests above (1+2) cover the highest-regression-risk surface: someone deleting
  * the region or changing its ARIA attributes. Those regressions would be caught here.

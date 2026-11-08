@@ -36,10 +36,17 @@ interface ImportMetadataFormProps {
   } | null;
 }
 
-// fix(#927/#929): no `restricted` — see RegisterForm. Visibility is now
-// private/public at import time, and the dataset Access tab owns changing it.
+// No `restricted`, as in RegisterForm. Import offers private, internal and
+// public; group sharing belongs to the dataset Access tab.
+// Radix Select cannot hold an empty-string value. Real columns are prefixed so
+// no source field name can equal the "no column" placeholder.
+const NO_COLUMN = 'none';
+const encodeColumn = (name: string) => (name ? `col:${name}` : NO_COLUMN);
+const decodeColumn = (value: string) => (value.startsWith('col:') ? value.slice(4) : '');
+
 const VISIBILITY_OPTIONS = [
   { value: 'private', labelKey: 'metadata.visibilityPrivate' },
+  { value: 'internal', labelKey: 'metadata.visibilityInternal' },
   { value: 'public', labelKey: 'metadata.visibilityPublic' },
 ];
 
@@ -72,7 +79,7 @@ export function ImportMetadataForm({
   const { t } = useTranslation('import');
   const formId = useId();
   const fieldId = (field: string) => `${formId}-${field}`;
-  // feat(#1691): hide the Public option when the restrict_public_visibility
+  // Hide the Public option when the restrict_public_visibility
   // instance setting caps non-admins at non-public (server enforces via 403).
   const canSetPublic = useCanSetPublicVisibility();
   const visibilityOptions = canSetPublic
@@ -83,7 +90,6 @@ export function ImportMetadataForm({
   const [visibility, setVisibility] = useState(initialRequest?.visibility ?? 'private');
   const [sridOverride, setSridOverride] = useState(initialRequest?.srid_override?.toString() ?? '');
 
-  // Geometry column override state
   const hasDetected =
     detectedGeometryColumns &&
     (detectedGeometryColumns.x_column || detectedGeometryColumns.wkt_column);
@@ -136,7 +142,6 @@ export function ImportMetadataForm({
   const showGeomSection =
     !isRaster && !hasEmbeddedGeometry && previewColumns && previewColumns.length > 0;
 
-  // Raster-specific fields
   const [temporalStart, setTemporalStart] = useState(
     initialRequest ? (initialRequest.temporal_start ?? '') : (previewData?.temporal_start ?? ''),
   );
@@ -163,7 +168,6 @@ export function ImportMetadataForm({
         : null,
     };
 
-    // Add geometry column overrides
     if (showGeomSection && geomMode !== 'none') {
       if (geomType === 'latlng' && xColumn && yColumn) {
         request.x_column = xColumn;
@@ -215,7 +219,7 @@ export function ImportMetadataForm({
 
           <div className="space-y-2">
             <Label htmlFor={fieldId('import-visibility')}>{t('metadata.visibilityLabel')}</Label>
-            {/* fix(#438): DS-08 — native <select> → themed ui/select. */}
+            {/* Native <select> → themed ui/select. */}
             <Select value={visibility} onValueChange={setVisibility}>
               <SelectTrigger id={fieldId('import-visibility')} className="w-full">
                 <SelectValue />
@@ -230,7 +234,7 @@ export function ImportMetadataForm({
             </Select>
           </div>
 
-          {/* CRS Override — Phase 1057 CRS-06 D-08:
+          {/* CRS Override
               When detectedCrs is non-null (probe resolved the CRS automatically),
               hide the editable override input and show a read-only confirmation
               instead.  When detectedCrs is null (unrecognised URI, true-unknown,
@@ -299,7 +303,7 @@ export function ImportMetadataForm({
                 <Label htmlFor={fieldId('geom-mode')}>
                   {t('metadata.geometryMode')}
                 </Label>
-                {/* fix(#438): DS-08 — native <select> → themed ui/select. */}
+                {/* Native <select> → themed ui/select. */}
                 <Select
                   value={geomMode}
                   onValueChange={(v) => setGeomMode(v as GeometryMode)}
@@ -348,45 +352,45 @@ export function ImportMetadataForm({
                         <Label htmlFor={fieldId('x-column')}>
                           {t('metadata.xColumn')}
                         </Label>
-                        {/* fix(#438): DS-08 exception — the X/Y/WKT column
-                            pickers stay native: they carry an empty-string
-                            placeholder option, which Radix Select cannot
-                            represent without sentinel plumbing, and they sit in a
-                            dense keyboard-driven metadata grid where the native
-                            control is defensible. */}
-                        <select
-                          id={fieldId('x-column')}
-                          value={xColumn}
-                          onChange={(e) => setXColumn(e.target.value)}
+                        <Select
+                          value={encodeColumn(xColumn)}
+                          onValueChange={(v) => setXColumn(decodeColumn(v))}
                           disabled={geomMode === 'auto'}
-                          className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm shadow-xs focus:outline-none focus:ring-2 focus:ring-ring/50 disabled:opacity-60"
                         >
-                          <option value="">--</option>
-                          {numericColumns.map((c) => (
-                            <option key={c.name} value={c.name}>
-                              {c.name}
-                            </option>
-                          ))}
-                        </select>
+                          <SelectTrigger id={fieldId('x-column')} className="w-full">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value={NO_COLUMN}>--</SelectItem>
+                            {numericColumns.map((c) => (
+                              <SelectItem key={c.name} value={encodeColumn(c.name)}>
+                                {c.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
                       </div>
                       <div className="space-y-1">
                         <Label htmlFor={fieldId('y-column')}>
                           {t('metadata.yColumn')}
                         </Label>
-                        <select
-                          id={fieldId('y-column')}
-                          value={yColumn}
-                          onChange={(e) => setYColumn(e.target.value)}
+                        <Select
+                          value={encodeColumn(yColumn)}
+                          onValueChange={(v) => setYColumn(decodeColumn(v))}
                           disabled={geomMode === 'auto'}
-                          className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm shadow-xs focus:outline-none focus:ring-2 focus:ring-ring/50 disabled:opacity-60"
                         >
-                          <option value="">--</option>
-                          {numericColumns.map((c) => (
-                            <option key={c.name} value={c.name}>
-                              {c.name}
-                            </option>
-                          ))}
-                        </select>
+                          <SelectTrigger id={fieldId('y-column')} className="w-full">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value={NO_COLUMN}>--</SelectItem>
+                            {numericColumns.map((c) => (
+                              <SelectItem key={c.name} value={encodeColumn(c.name)}>
+                                {c.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
                       </div>
                     </div>
                   ) : (
@@ -394,20 +398,23 @@ export function ImportMetadataForm({
                       <Label htmlFor={fieldId('wkt-column')}>
                         {t('metadata.wktColumn')}
                       </Label>
-                      <select
-                        id={fieldId('wkt-column')}
-                        value={wktColumn}
-                        onChange={(e) => setWktColumn(e.target.value)}
+                      <Select
+                        value={encodeColumn(wktColumn)}
+                        onValueChange={(v) => setWktColumn(decodeColumn(v))}
                         disabled={geomMode === 'auto'}
-                        className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm shadow-xs focus:outline-none focus:ring-2 focus:ring-ring/50 disabled:opacity-60"
                       >
-                        <option value="">--</option>
-                        {stringColumns.map((c) => (
-                          <option key={c.name} value={c.name}>
-                            {c.name}
-                          </option>
-                        ))}
-                      </select>
+                        <SelectTrigger id={fieldId('wkt-column')} className="w-full">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={NO_COLUMN}>--</SelectItem>
+                          {stringColumns.map((c) => (
+                            <SelectItem key={c.name} value={encodeColumn(c.name)}>
+                              {c.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
                     </div>
                   )}
                 </>
@@ -458,7 +465,7 @@ export function ImportMetadataForm({
                   <Label htmlFor={fieldId('compression')}>
                     {t('metadata.compressionLabel')}
                   </Label>
-                  {/* fix(#438): DS-08 — native <select> → themed ui/select. */}
+                  {/* Native <select> → themed ui/select. */}
                   <Select value={compression} onValueChange={setCompression}>
                     <SelectTrigger id={fieldId('compression')} className="w-full">
                       <SelectValue />
@@ -478,7 +485,7 @@ export function ImportMetadataForm({
                   <Label htmlFor={fieldId('resampling')}>
                     {t('metadata.resamplingLabel')}
                   </Label>
-                  {/* fix(#438): DS-08 — native <select> → themed ui/select. */}
+                  {/* Native <select> → themed ui/select. */}
                   <Select value={resampling} onValueChange={setResampling}>
                     <SelectTrigger id={fieldId('resampling')} className="w-full">
                       <SelectValue />

@@ -1,20 +1,17 @@
-"""Unit tests for IA-P1-03: VRT magic-byte sniff + path-traversal guard +
+"""Unit tests for VRT magic-byte sniff + path-traversal guard +
 GDAL VSI surface clamp.
 
-Pins the 3-layer defense added in Phase 1068:
+Pins the 3-layer defense:
 - validate_file_content routes .vrt through validate_vrt_body
 - validate_vrt_body rejects non-VRT XML, '..' segments, absolute paths, raw
   URLs, and GDAL VSI paths in user-uploaded <SourceFilename> values
 - _build_vrt subprocess env applies CPL_VSIL_CURL_ALLOWED_EXTENSIONS +
   VRT_VIRTUAL_OVERVIEWS=NO
 
-fix(#937): the env used to also carry GDAL_HTTP_FOLLOWLOCATION=NO as a
-redirect clamp. That is not a GDAL configuration option and never blocked a
-redirect; the safe-env test below now asserts it stays ABSENT so it cannot
+The env must not carry GDAL_HTTP_FOLLOWLOCATION=NO as a
+redirect clamp. That is not a GDAL configuration option and never blocks a
+redirect; the safe-env test below asserts it stays ABSENT so it cannot
 be reintroduced as a claimed defense.
-
-Requirement: IA-P1-03
-Phase: 1068
 """
 
 from unittest.mock import patch
@@ -240,7 +237,7 @@ class TestGdalBuildVrtSafeEnv:
         """`_build_vrt` invokes gdalbuildvrt with the safety-clamp env vars."""
         captured_env: dict | None = None
 
-        # fix(#430 BA-29 / #430): run_gdal now passes timeout= to subprocess.run.
+        # run_gdal now passes timeout= to subprocess.run.
         def _fake_run(cmd, capture_output, text, env, timeout=None):
             nonlocal captured_env
             captured_env = env
@@ -263,6 +260,6 @@ class TestGdalBuildVrtSafeEnv:
         assert captured_env is not None
         assert captured_env.get("CPL_VSIL_CURL_ALLOWED_EXTENSIONS") == "tif,tiff,vrt"
         assert captured_env.get("VRT_VIRTUAL_OVERVIEWS") == "NO"
-        # fix(#937): not a GDAL option, provides no redirect protection —
+        # Not a GDAL option, provides no redirect protection —
         # must not be reintroduced as if it did.
         assert "GDAL_HTTP_FOLLOWLOCATION" not in captured_env

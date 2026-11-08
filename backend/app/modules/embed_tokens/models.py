@@ -27,9 +27,8 @@ class EmbedToken(Base):
             unique=True,
             postgresql_where=text("is_active = true"),
         ),
-        # DBM-02: partial index for the hot
-        # `WHERE is_active = true AND expires_at > now()` filter combo.
-        # Migration 0001_baseline is the source of truth for the actual DDL.
+        # Partial index for the hot `is_active = true AND expires_at > now()`
+        # filter. Migration 0001_baseline owns the DDL.
         Index(
             "ix_embed_tokens_active_expires",
             "expires_at",
@@ -64,7 +63,7 @@ class EmbedToken(Base):
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("catalog.users.id", ondelete="SET NULL"), nullable=True
     )
-    # TSEAM-01 (Phase 1207): dormant tenant_id — nullable, no FK enforcement.
+    # Dormant tenant_id — nullable, no FK enforcement.
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )

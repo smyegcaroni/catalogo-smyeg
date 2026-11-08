@@ -1,3 +1,4 @@
+import { Color } from '@maplibre/maplibre-gl-style-spec';
 import type { AdapterLayerInput, LayerAdapter, LayerDrawing, LayerSpec } from './types';
 import { normalizeRasterBounds, paintValueChanged } from './shared';
 import { DEFAULT_HILLSHADE_PAINT } from './builder-defaults';
@@ -7,8 +8,7 @@ import { writeDescribedLayer, writeDescribedVisibility } from '../layer-writer';
 import { effectiveDemRenderMode } from '@/lib/dem-render-mode';
 import { MAP_COLORS } from '@/lib/map-colors';
 
-// builder-audit #338 ADAPT-06: re-export the single hillshade default from builder-defaults
-// (was a byte-identical local copy that diverged from renderAs's DEFAULT_HILLSHADE_PAINT).
+// Re-export the single hillshade default from builder-defaults.
 export const HILLSHADE_PAINT_DEFAULTS = DEFAULT_HILLSHADE_PAINT;
 
 type HillshadePaintProperty = keyof typeof HILLSHADE_PAINT_DEFAULTS;
@@ -63,38 +63,15 @@ function formatAlpha(value: number): string {
   return Number(value.toFixed(4)).toString();
 }
 
-function compoundHexColorAlpha(color: string, opacity: number): string | null {
-  const hex = color.trim().match(/^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i)?.[1];
-  if (!hex) return null;
-
-  const expand = (value: string) => value.length === 1 ? `${value}${value}` : value;
-  const hasShortChannels = hex.length === 3 || hex.length === 4;
-  const red = parseInt(expand(hasShortChannels ? hex[0] : hex.slice(0, 2)), 16);
-  const green = parseInt(expand(hasShortChannels ? hex[1] : hex.slice(2, 4)), 16);
-  const blue = parseInt(expand(hasShortChannels ? hex[2] : hex.slice(4, 6)), 16);
-  const alphaHex = hasShortChannels ? hex[3] : hex.slice(6, 8);
-  const baseAlpha = alphaHex ? parseInt(expand(alphaHex), 16) / 255 : 1;
-  return `rgba(${red}, ${green}, ${blue}, ${formatAlpha(baseAlpha * opacity)})`;
-}
-
-function compoundRgbColorAlpha(color: string, opacity: number): string | null {
-  const match = color.trim().match(/^rgba?\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)(?:\s*,\s*([0-9.]+)\s*)?\)$/i);
-  if (!match) return null;
-  const red = Number(match[1]);
-  const green = Number(match[2]);
-  const blue = Number(match[3]);
-  if (![red, green, blue].every(Number.isFinite)) return null;
-  const baseAlpha = match[4] === undefined ? 1 : Number(match[4]);
-  if (!Number.isFinite(baseAlpha)) return null;
-  return `rgba(${red}, ${green}, ${blue}, ${formatAlpha(Math.min(1, Math.max(0, baseAlpha)) * opacity)})`;
-}
-
+/** The colour with its alpha multiplied by `opacity`, read by the same parser MapLibre paints with. */
 function compoundColorAlpha(color: string, opacity: number): string {
   if (opacity === 1) return color;
-  if (color.trim().toLowerCase() === 'transparent') return MAP_COLORS.transparent;
-  return compoundHexColorAlpha(color, opacity)
-    ?? compoundRgbColorAlpha(color, opacity)
-    ?? color;
+  const parsed = Color.parse(color);
+  if (!parsed) return color;
+  if (parsed.a === 0) return MAP_COLORS.transparent;
+  // Channels come back multiplied by alpha.
+  const channel = (value: number) => Math.round((value / parsed.a) * 255);
+  return `rgba(${channel(parsed.r)}, ${channel(parsed.g)}, ${channel(parsed.b)}, ${formatAlpha(parsed.a * opacity)})`;
 }
 
 function buildHillshadePaint(input: AdapterLayerInput): Record<string, number | string> {
@@ -122,6 +99,8 @@ export const COLOR_RELIEF_OWNED_PAINT_PROPERTIES = ['color-relief-color', 'color
 function colorReliefSpec(input: AdapterLayerInput): LayerSpec | null {
   if (input.is_dem !== true || input.paint['_hypso-enabled'] !== true) return null;
   const ramp = input.paint['_hypso-ramp'];
+  // A transient factor from a viewer fade; the saved paint never carries it.
+  const fade = input.paint['_hypso-fade'];
   return {
     layer: {
       id: `${input.layerId}${COLOR_RELIEF_SUFFIX}`,
@@ -136,7 +115,7 @@ function colorReliefSpec(input: AdapterLayerInput): LayerSpec | null {
           undefined,
           input.paint['_hypso-reversed'] === true,
         ),
-        'color-relief-opacity': 0.7,
+        'color-relief-opacity': 0.7 * (typeof fade === 'number' ? fade : 1),
       },
     },
     ownedPaint: COLOR_RELIEF_OWNED_PAINT_PROPERTIES,
@@ -170,8 +149,7 @@ export const hillshadeAdapter: LayerAdapter = {
   addLayers(map, input) {
     const { sourceId, tileUrl, tileSize, minzoom, maxzoom, bounds, attribution } = input;
     if (!map.getSource(sourceId)) {
-      // builder-audit #338 ADAPT-01: shared normalizeRasterBounds, computed once instead
-      // of the prior double-call inside the spread ternary.
+      // Shared normalizeRasterBounds, computed once.
       const normalizedBounds = normalizeRasterBounds(bounds);
       map.addSource(sourceId, {
         type: 'raster-dem',
@@ -180,7 +158,7 @@ export const hillshadeAdapter: LayerAdapter = {
         minzoom: minzoom ?? 0,
         maxzoom: maxzoom ?? 18,
         ...(normalizedBounds ? { bounds: normalizedBounds } : {}),
-        // fix(#1472 review): the dataset's required credit line, read by
+        // The dataset's required credit line, read by
         // MapLibre's attribution control off the source it renders from.
         ...(attribution ? { attribution } : {}),
         encoding: 'mapbox',

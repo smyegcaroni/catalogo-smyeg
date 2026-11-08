@@ -6,7 +6,7 @@ import { DatasetMap } from '@/components/dataset/DatasetMap';
 import { previewSourceId } from '@/components/maps/hooks/use-map-layers';
 import { BLANK_BASEMAP_ID } from '@/lib/basemap-utils';
 
-// fix(#1004): what the map was actually told to draw and where to point. The
+// What the map was actually told to draw and where to point. The
 // three camera/extent sites derive from the bbox prop alone, so recording the
 // props MapGL and Source receive is enough to pin all three.
 const mapSpy = vi.hoisted(() => ({
@@ -35,6 +35,7 @@ const fakeMap = vi.hoisted(
     new Proxy({} as Record<string, unknown>, {
       get(target, prop: string) {
         if (prop === 'fitBounds' || prop === 'flyTo') return mapSpy[prop];
+        if (prop === 'getContainer') return () => containerState.el ?? document.createElement('div');
         if (!(prop in target)) target[prop] = vi.fn();
         return target[prop];
       },
@@ -57,7 +58,7 @@ const drawingState = vi.hoisted(() => ({
   setEditDirty: vi.fn(),
   setHasUnsavedMapWork: vi.fn(),
   isEditDirty: false,
-  // fix(#1761 review round 3 P1): identity-change session counter. Real
+  // Identity-change session counter. Real
   // usage never resets this to 0 mid-life, so tests that bump it use a high
   // starting value to avoid colliding with any other test's leftover state.
   sessionEpoch: 0,
@@ -97,10 +98,12 @@ vi.mock('@vis.gl/react-maplibre', async () => {
       if (id === 'bbox-source') mapSpy.bboxSourceAttribution = attribution;
       return children ?? null;
     },
-    Layer: () => null,
+    Layer: ({ id }: { id?: string }) => <div data-testid={`layer-${id}`} />,
     NavigationControl: () => <div data-testid="nav-control" />,
   };
 });
+
+const containerState = vi.hoisted(() => ({ el: null as HTMLElement | null }));
 
 vi.mock('@/components/theme-provider', () => ({
   useTheme: () => ({ resolvedTheme: 'light' }),
@@ -127,7 +130,7 @@ vi.mock('@/hooks/use-tile-token', () => ({
 
 vi.mock('@/stores/drawing-store', () => {
   const useDrawingStore = (selector: (state: typeof drawingState) => unknown) => selector(drawingState);
-  // fix(#1761 review round 3 P1): finishDrawingSession reads
+  // finishDrawingSession reads
   // useDrawingStore.getState() directly (not via the selector hook), the
   // same static-access pattern the real zustand store supports.
   useDrawingStore.getState = () => drawingState;
@@ -135,7 +138,7 @@ vi.mock('@/stores/drawing-store', () => {
   return { useDrawingStore };
 });
 
-// fix(#1761 review round 3 P1): a stable hoisted object (not a fresh
+// A stable hoisted object (not a fresh
 // literal per render) so a test can hold onto `terraDrawState.clear` and
 // assert it was invoked by the identity-change cleanup effect.
 const terraDrawState = vi.hoisted(() => ({
@@ -167,7 +170,7 @@ vi.mock('@/components/drawing/hooks/use-terra-draw', () => ({
 
 import { getAvailableModes } from '@/components/drawing/hooks/use-terra-draw';
 
-// fix(#1761 review round 4): a stable hoisted mutateAsync (not a fresh
+// A stable hoisted mutateAsync (not a fresh
 // vi.fn() per render) so a test can control WHEN the update mutation
 // resolves, to simulate an identity change while it is in flight.
 const updateFeatureMutateAsync = vi.hoisted(() => vi.fn().mockResolvedValue({}));
@@ -184,7 +187,7 @@ vi.mock('@/api/features', () => ({
   getFeature: vi.fn(),
 }));
 
-// fix(#1761 review round 3 P1): keep useFeatureEditing's real implementation
+// Keep useFeatureEditing's real implementation
 // (performDeselect etc. are exercised elsewhere in this file) but replace
 // showAllFeaturesInTiles with a spy, so the identity-change cleanup test
 // below can assert the tile-filter restore ran without needing a real
@@ -286,6 +289,41 @@ describe('DatasetMap interaction state', () => {
     expect(screen.getByTestId('dataset-map-shell').className).toContain(
       '[&_.maplibregl-ctrl-bottom-right]:max-w-[calc(100%-5.5rem)]',
     );
+  });
+
+  it('folds the open attribution control on a narrow map only', () => {
+    const props = { bbox: [-10, -10, 10, 10] as [number, number, number, number], tableName: 't', geometryType: 'Polygon', datasetId: 'dataset-1' };
+    const mountWithWidth = (width: number) => {
+      const container = document.createElement('div');
+      Object.defineProperty(container, 'clientWidth', { value: width });
+      container.innerHTML = '<details class="maplibregl-ctrl-attrib maplibregl-compact maplibregl-compact-show" open></details>';
+      containerState.el = container;
+      mapSpy.attachMapInstance = true;
+      const { unmount } = render(<DatasetMap {...props} />);
+      return { attrib: container.querySelector('.maplibregl-ctrl-attrib')!, unmount };
+    };
+
+    const { attrib: narrow, unmount } = mountWithWidth(390);
+    expect(narrow).not.toHaveAttribute('open');
+    expect(narrow).not.toHaveClass('maplibregl-compact-show');
+
+    unmount();
+    const { attrib: wide } = mountWithWidth(1200);
+    expect(wide).toHaveAttribute('open');
+    expect(wide).toHaveClass('maplibregl-compact-show');
+    mapSpy.attachMapInstance = false;
+    containerState.el = null;
+  });
+
+  it('draws the dashed extent outline for a regional dataset', () => {
+    render(<DatasetMap bbox={[-74.5, 40.5, -73.5, 41.5]} tableName="t" geometryType="Polygon" datasetId="dataset-1" />);
+    expect(screen.getByTestId('layer-bbox-line')).toBeInTheDocument();
+  });
+
+  it('skips the extent outline when the dataset spans the whole world', () => {
+    render(<DatasetMap bbox={[-180, -85, 180, 85]} tableName="t" geometryType="Point" datasetId="dataset-1" />);
+    expect(screen.queryByTestId('layer-bbox-line')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('layer-bbox-fill')).not.toBeInTheDocument();
   });
 
   it('enables interaction and editing controls once edit mode is active', () => {
@@ -1939,11 +1977,11 @@ describe('DatasetMap generic-geometry draw gating (fix #430 codex r18/r19)', () 
   });
 });
 
-// fix(#1004): the dataset payload now carries the RFC 7946 §5.2 spec bbox, so a
+// The dataset payload carries the RFC 7946 §5.2 spec bbox, so a
 // seam-crossing extent arrives as west > east instead of flattened to
-// [-180, s, 180, n]. All three consumers here carry #903 seam handling that the
-// flattened pair made unreachable — isLargeExtent measured a 360° span and took
-// the large-extent branch every time.
+// [-180, s, 180, n]. All three consumers here handle the seam; a flattened
+// pair would make that unreachable — isLargeExtent would measure a 360° span
+// and take the large-extent branch every time.
 describe('DatasetMap antimeridian extent (fix #1004)', () => {
   // The reproduction fixture: points at 179.5, -179.5 and 178.44 near Fiji.
   const FIJI_BBOX: [number, number, number, number] = [178.44, -18.14, -179.5, -16.5];
@@ -2020,7 +2058,7 @@ describe('DatasetMap antimeridian extent (fix #1004)', () => {
   });
 });
 
-// fix(#1761 review round 3 P1): the identity-change choke point
+// The identity-change choke point
 // (lib/auth-cache-reset.ts) only resets Zustand fields. DatasetMap's own
 // finishDrawingSession is what tears down Terra Draw's drawn geometry, the
 // map's hidden-tile filters, and this component's own open dialogs — none
@@ -2028,7 +2066,7 @@ describe('DatasetMap antimeridian extent (fix #1004)', () => {
 // (a sessionEpoch bump) drives that cleanup even though nothing in the
 // choke point itself knows this component exists.
 describe('DatasetMap identity-change cleanup (fix #1761 review round 3 P1)', () => {
-  // fix(#1761 review round 4): spy-able 'drawn-overlay' source, so the
+  // The map mock exposes a spy-able 'drawn-overlay' source, so the
   // "tears down..." test below can also assert resetOverlay() actually
   // reaches the map (not just that finishDrawingSession's OTHER cleanup
   // steps ran).
@@ -2111,14 +2149,14 @@ describe('DatasetMap identity-change cleanup (fix #1761 review round 3 P1)', () 
     expect(showAllFeaturesInTilesMock).toHaveBeenCalled();
     expect(drawingState.clearDrawing).toHaveBeenCalled();
     expect(screen.queryByText('Edit Feature Attributes')).not.toBeInTheDocument();
-    // fix(#1761 review round 4): a create in progress can leave a
+    // A create in progress can leave a
     // not-yet-committed shape in the drawn-overlay source; the
     // identity-change cleanup must empty it too.
     expect(overlaySetData).toHaveBeenCalledWith({ type: 'FeatureCollection', features: [] });
   });
 });
 
-// fix(#1761 review round 4): the attribute-edit dialog's onSubmit used to
+// The attribute-edit dialog's onSubmit used to
 // close unconditionally once handleEditAttributeSubmit resolved, even when
 // its own epoch check had refused the write as stale — discarding a SECOND
 // identity's own now-open editor for their feature.
@@ -2308,6 +2346,24 @@ describe('DatasetMap record types', () => {
     );
 
     expect(mapSpy.bboxSourceAttribution).toBe('Autzen Stadium LiDAR (CC BY 4.0)');
+  });
+
+  it('carries the dataset attribution for an extentless tileset the viewer draws', () => {
+    mapSpy.bboxSourceAttribution = undefined;
+    render(
+      <DatasetMap
+        bbox={null}
+        tableName={null}
+        geometryType={null}
+        datasetId="dataset-1"
+        recordType="tiles3d_dataset"
+        viewer3d={{ kind: 'tileset', url: '/api/datasets/dataset-1/tiles3d/tileset.json' }}
+        attribution="3DBAG (CC BY 4.0)"
+      />,
+    );
+
+    expect(screen.getByRole('region', { name: /dataset map/i })).toBeInTheDocument();
+    expect(mapSpy.bboxSourceAttribution).toBe('3DBAG (CC BY 4.0)');
   });
 
   it('does not duplicate the attribution on a vector dataset\'s bbox source (its own vector source already carries it)', () => {

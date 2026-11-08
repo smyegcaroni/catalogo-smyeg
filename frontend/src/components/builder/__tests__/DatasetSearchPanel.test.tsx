@@ -9,7 +9,7 @@ vi.mock('@/api/search', async (importOriginal) => {
 });
 
 // ---------------------------------------------------------------------------
-// useQuery override state — used by Phase 1042-02 polish tests to simulate
+// useQuery override state — used by polish tests to simulate
 // isLoading / isFetching states without relying on real promise timing.
 // When null, the mock delegates to the real @tanstack/react-query useQuery.
 // ---------------------------------------------------------------------------
@@ -43,10 +43,10 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
-// builder-audit #338 SEARCH-01: the panel now gates its Import/Upload CTAs on
+// The panel now gates its Import/Upload CTAs on
 // `!!token && can('upload')`. Default to an upload-capable, signed-in session so
 // the existing suites (which assert on the CTAs) keep passing; the dedicated
-// SEARCH-01 describe flips these to cover the gated-off path.
+// describe block flips these to cover the gated-off path.
 let mockToken: string | null = 'test-token';
 let mockCanUpload = true;
 vi.mock('@/stores/auth-store', () => ({
@@ -73,6 +73,7 @@ function makeRecord(overrides: {
     type: 'Feature',
     id: overrides.id,
     geometry: null,
+    time: {},
     bbox: null,
     links: [],
     properties: {
@@ -84,11 +85,15 @@ function makeRecord(overrides: {
       updated: '2026-01-02T00:00:00Z',
       updated_by_display: null,
       never_edited: false,
+      themes: [],
+      time: {},
+      source_freshness: 'unknown',
+      source_health: 'unknown',
       crs: 'EPSG:4326',
       geometry_type: overrides.geometryType ?? 'POLYGON',
       feature_count: overrides.featureCount ?? 100,
-      contacts: null,
-      license: null,
+      contacts: [],
+      license: 'proprietary',
       source_organization: overrides.sourceOrganization ?? 'City GIS',
       quality_detail: null,
       record_status: 'published',
@@ -216,7 +221,7 @@ describe('DatasetSearchPanel', () => {
     expect(roadsRow).not.toBeNull();
     expect(within(roadsRow as HTMLElement).getByText('Added')).toBeInTheDocument();
 
-    fireEvent.click(within(roadsRow as HTMLElement).getByRole('button', { name: 'another rendering' }));
+    fireEvent.click(within(roadsRow as HTMLElement).getByRole('button', { name: 'Add another rendering: Roads' }));
     expect(onDuplicateRendering).toHaveBeenCalledWith('roads-layer');
 
     fireEvent.click(screen.getByRole('button', { name: 'Add to map: Population' }));
@@ -233,6 +238,17 @@ describe('DatasetSearchPanel', () => {
     expect(screen.getByText('Count')).toBeInTheDocument();
     expect(screen.getAllByRole('button', { name: 'Add to map: Population' }).length).toBeGreaterThan(0);
     expect(screen.getByRole('link', { name: 'Import data...' })).toHaveAttribute('href', '/import');
+  });
+
+  it('leaves out an expanded row description that repeats the title', async () => {
+    const parks = makeRecord({ id: 'parks', title: 'Parks' });
+    parks.properties.description = 'Parks';
+    mockSearchDatasets.mockResolvedValue({ ...searchResponse, numberMatched: 1, numberReturned: 1, features: [parks] });
+    render(<DatasetSearchPanel {...defaultProps()} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand Parks' }));
+
+    expect(screen.getAllByText('Parks')).toHaveLength(1);
   });
 
   it('offers no Add to map, drag or Vector label for an unknown record type', async () => {
@@ -271,7 +287,7 @@ describe('DatasetSearchPanel', () => {
     expect(within(row).queryByText('Vector')).not.toBeInTheDocument();
   });
 
-  // fix(#1778): featureMeta/DatasetMetadata read width/height/epsg off
+  // featureMeta/DatasetMetadata read width/height/epsg off
   // OGCRecordProperties, none of which the API ever returned under those
   // flat names -- the raster size/CRS rows were always blank. Now sourced
   // from proj:shape/proj:code, the shape the API actually serializes.
@@ -280,6 +296,7 @@ describe('DatasetSearchPanel', () => {
       type: 'Feature',
       id: 'ortho',
       geometry: null,
+      time: {},
       bbox: null,
       links: [],
       properties: {
@@ -291,11 +308,15 @@ describe('DatasetSearchPanel', () => {
         updated: '2026-01-02T00:00:00Z',
         updated_by_display: null,
         never_edited: false,
+        themes: [],
+        time: {},
+        source_freshness: 'unknown',
+        source_health: 'unknown',
         crs: 'EPSG:32617',
         geometry_type: null,
         feature_count: null,
-        contacts: null,
-        license: null,
+        contacts: [],
+        license: 'proprietary',
         source_organization: 'City GIS',
         quality_detail: null,
         record_status: 'published',
@@ -322,7 +343,7 @@ describe('DatasetSearchPanel', () => {
   });
 
   // =========================================================================
-  // BSR-17 / BSR-18: initialQuery, raster filter removal, three-state UX
+  // initialQuery, raster filter removal, three-state UX
   // =========================================================================
 
   it('Test 1: initialQuery pre-fills search input and fires query with q=foo', async () => {
@@ -398,7 +419,7 @@ describe('DatasetSearchPanel', () => {
     expect(uploadLink).toHaveAttribute('href', '/import');
   });
 
-  // builder-audit #338 SEARCH-01: Import/Upload CTAs are gated on `!!token && can('upload')`.
+  // Import/Upload CTAs are gated on `!!token && can('upload')`.
   describe('SEARCH-01: Import/Upload CTAs gated on upload capability', () => {
     afterEach(() => {
       mockCanUpload = true;
@@ -473,7 +494,7 @@ describe('DatasetSearchPanel', () => {
 });
 
 // ---------------------------------------------------------------------------
-// DatasetSearchPanel — Phase 1042-02 polish fixes (POL-15, AUD-10/12/13/15)
+// DatasetSearchPanel — polish fixes
 // ---------------------------------------------------------------------------
 
 describe('DatasetSearchPanel — Phase 1042-02 polish fixes', () => {
@@ -520,7 +541,7 @@ describe('DatasetSearchPanel — Phase 1042-02 polish fixes', () => {
     // Progress band — h-0.5 element with animate-pulse
     const progressBand = container.querySelector('.h-0\\.5.animate-pulse');
     expect(progressBand).not.toBeNull();
-    // ux(#776): the stale list stays fully interactive during a debounced
+    // The stale list stays fully interactive during a debounced
     // refetch — the band is the signal; the old pointer-events/opacity freeze
     // made visible rows unclickable on every keystroke pause.
     expect(container.querySelector('.pointer-events-none.opacity-50')).toBeNull();

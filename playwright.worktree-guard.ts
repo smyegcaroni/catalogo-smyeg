@@ -1,7 +1,7 @@
 import { lstatSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-// fix(#1480): a worktree e2e run silently tests whatever the shared stack is
+// A worktree e2e run silently tests whatever the shared stack is
 // serving, which is the MAIN checkout.
 //
 // The dev stack bind-mounts the main checkout (`./frontend` -> /app, and
@@ -11,15 +11,12 @@ import { dirname, join } from 'node:path';
 // from a real pass — false passes when your break is.
 //
 // This deliberately does NOT try to work out whether your changes happen to be
-// in the stack. An earlier revision did, comparing git metadata and then file
-// bytes between the two trees, and review found eleven separate ways for that
-// answer to be wrong. That surface is unbounded: it spans git reporting,
-// filesystem semantics and compose configuration.
+// in the stack. That surface is unbounded: it spans git reporting, filesystem
+// semantics and compose configuration.
 //
-// It also does not shell out to git. The first simplification did, and review
-// found that a `rev-parse` failure — an older git without `--path-format`, or a
-// `safe.directory` ownership rejection — turned into an empty string and
-// silently disabled the guard, which is the same false pass in a new costume.
+// It also does not shell out to git: a `rev-parse` failure — an older git
+// without `--path-format`, or a `safe.directory` ownership rejection — would
+// become an empty string and silently disable the guard, the same false pass.
 //
 // Detection is a filesystem fact instead. A linked worktree's `.git` is a FILE
 // containing `gitdir: /…/.git/worktrees/<name>`; the main checkout's `.git` is
@@ -28,7 +25,7 @@ import { dirname, join } from 'node:path';
 
 const ACKNOWLEDGED = new Set(['1', 'true', 'yes', 'on']);
 
-// fix(#1492): cwd alone is not enough. Playwright resolves `-c` relative to
+// The cwd alone is not enough. Playwright resolves `-c` relative to
 // cwd, so `cd ~ && npx playwright test -c /path/to/a/worktree/playwright.config.ts`
 // walks up from ~ and finds nothing — and invoking from inside the MAIN
 // checkout finds ITS .git directory and allows. This module sits beside the
@@ -36,8 +33,7 @@ const ACKNOWLEDGED = new Set(['1', 'true', 'yes', 'on']);
 //
 // Both anchors are checked and EITHER one reporting a worktree blocks. That is
 // deliberate: falling back from __dirname to cwd when the loader gives no
-// __dirname would silently restore the original hole, which is the same
-// fail-open-fallback shape as the earlier git and stat findings.
+// __dirname would silently restore the original hole.
 declare const __dirname: string | undefined;
 
 function anchors(): string[] {
@@ -53,11 +49,10 @@ function anchors(): string[] {
 
 export type Marker = { dir: string; kind: 'directory' | 'file' | 'unreadable' };
 
-// fix(#1492) round thirteen: ONLY "there is nothing here" may continue the
-// walk. An earlier revision caught every stat error and walked past, so an
-// inaccessible or dangling `.git` allowed the run — the same fail-open the git
-// version had, relocated to the filesystem, and contradicting this module's
-// own claim that unclassifiable entries block.
+// ONLY "there is nothing here" may continue the walk. Catching every stat
+// error and walking past would let an inaccessible or dangling `.git` allow
+// the run — a fail-open, contradicting this module's own claim that
+// unclassifiable entries block.
 const NOT_HERE = new Set(['ENOENT', 'ENOTDIR']);
 
 /** Nearest `.git` at or above `start`, or null if there is genuinely none. Exported for testing. */
@@ -94,9 +89,9 @@ export function findGitMarker(start: string): Marker | null {
  * `npm run e2e:smoke:builder-hardening` selects its own with `-c`.
  */
 export function assertWorktreeMatchesStack(): void {
-  // fix(#1492) round fourteen: any non-empty string is truthy, so
-  // E2E_ALLOW_WORKTREE=0 or =false — which a shell or CI profile may set to
-  // mean "off" — used to bypass the guard entirely. Only an affirmative value
+  // Any non-empty string is truthy, so E2E_ALLOW_WORKTREE=0 or =false —
+  // which a shell or CI profile may set to mean "off" — must not bypass the
+  // guard. Only an affirmative value
   // acknowledges; everything else, including 0 and false, does not.
   if (ACKNOWLEDGED.has((process.env.E2E_ALLOW_WORKTREE ?? '').trim().toLowerCase())) return;
 

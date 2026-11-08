@@ -41,6 +41,7 @@ _TYPE_MAP = {
     "float": "DOUBLE PRECISION",
     "date": "DATE",
     "boolean": "BOOLEAN",
+    "timestamp": "TIMESTAMP WITH TIME ZONE",
 }
 
 
@@ -111,16 +112,11 @@ async def create_empty_dataset(
         role=reader_role,
     )
 
-    column_info = []
-    for i, col in enumerate(request.columns, start=1):
-        column_info.append(
-            {
-                "name": col.name.lower(),
-                "type": _TYPE_MAP[col.type],
-                "ordinal_position": i,
-                "is_nullable": True,
-            }
-        )
+    # Introspect rather than hand-write, so type names match what the
+    # add-column path stores and filters/writes key on.
+    column_info = await get_catalog_port().get_column_info(
+        session, table_name, schema=data_schema
+    )
 
     dataset = await create_dataset(
         session,
@@ -149,8 +145,8 @@ async def create_dataset(
     visibility: str = "private",
     record_status: str = "published",
     ingestion: IngestionResult | None = None,
-    # Legacy kwargs, kept for call sites that still pass ingestion fields
-    # directly. New call sites should use `ingestion=IngestionResult(...)`.
+    # Legacy kwargs for call sites that pass ingestion fields directly; prefer
+    # `ingestion=IngestionResult(...)`.
     srid: int | None = None,
     geometry_type: str | None = None,
     feature_count: int | None = None,
@@ -223,13 +219,12 @@ async def create_dataset(
     dataset = Dataset(
         record_id=record.id,
         table_name=table_name,
-        # First ingest IS the first successful materialization,
-        # so stamp it here rather than leaving every dataset reporting null.
-        #
-        # A Python datetime, NOT func.now(): a SQL expression leaves the
-        # attribute EXPIRED after flush, so the next read issues a lazy
-        # SELECT that explodes once the session is closed, exactly where
-        # dataset_to_response reads it. Every stamping site does the same.
+        # First ingest is the first successful materialization, so stamp it
+        # here rather than leaving the dataset reporting null. A Python
+        # datetime, not func.now(): a SQL expression leaves the attribute
+        # expired after flush, and the next read's lazy SELECT fails once the
+        # session is closed, exactly where dataset_to_response reads it. Every
+        # stamping site does the same.
         last_refreshed_at=datetime.now(timezone.utc),
         srid=ing.srid,
         geometry_type=ing.geometry_type,
@@ -276,7 +271,7 @@ async def create_dataset(
     from app.modules.audit.service import (
         AuditEvent,
         audit_emit,
-    )  # LAZY — preserved per D-17
+    )  # LAZY
 
     await audit_emit(
         session,

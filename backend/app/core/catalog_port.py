@@ -58,10 +58,8 @@ class CatalogPort(Protocol):
     # ownerless dataset has no owner to name (#1293, policy in
     # app.modules.quota.service).
     #
-    # fix(#1590): DefaultCatalogPort also accepts
-    # `replacing_dataset_id: uuid.UUID | None = None` here, forwarded
-    # internally from `finalize_presigned_object` — not yet on the Protocol;
-    # see that method's comment for why.
+    # DefaultCatalogPort also accepts `replacing_dataset_id` here; see
+    # `finalize_presigned_object`'s comment for why it is not on the Protocol yet.
     async def verify_completed_presigned_upload(
         self,
         *,
@@ -74,7 +72,7 @@ class CatalogPort(Protocol):
         job_id: uuid.UUID,
     ) -> int: ...
 
-    # fix(#1207): the presigned completion contract, shared by both doors.
+    # The presigned completion contract, shared by both doors.
     # `finalize_presigned_object` owns freeze/verify/validate and every
     # cleanup decision; see its docstring for the failure postconditions.
     async def lock_presigned_job(self, db: AsyncSession, job_id: uuid.UUID) -> Any: ...
@@ -93,12 +91,12 @@ class CatalogPort(Protocol):
         self, storage_method: Any, created_at: Any, *args: Any
     ) -> str: ...
 
-    # fix(#1590): DefaultCatalogPort.finalize_presigned_object also accepts
+    # DefaultCatalogPort.finalize_presigned_object also accepts
     # `replacing_dataset_id: uuid.UUID | None = None` (reupload door,
-    # router_reupload.py, #1290), not yet declared here: version.py's 2->3
-    # precedent says adding a Protocol keyword is an EXTENSION_API_VERSION
-    # bump, not a no-op — a full-replacement overlay would TypeError on it
-    # today. Add the keyword here at the next bump.
+    # router_reupload.py), not declared here: adding a Protocol keyword is an
+    # EXTENSION_API_VERSION bump (version.py's 2->3 precedent), and a
+    # full-replacement overlay would TypeError on it today. Add the keyword at the
+    # next bump.
     async def finalize_presigned_object(
         self,
         *,
@@ -260,7 +258,7 @@ class CatalogPort(Protocol):
 
     async def set_hnsw_recall(self, session: AsyncSession) -> None: ...
 
-    # fix(#1580): returns ``(embedding, model_name, config_fingerprint)``, not a
+    # Returns ``(embedding, model_name, config_fingerprint)``, not a
     # bare vector — related-items compares two STORED rows and must be able to
     # name the space the anchor is in. ``config_fingerprint`` is None for a
     # pre-column row; ``RecordEmbedding.usable_by_config`` grandfathers it.
@@ -268,7 +266,7 @@ class CatalogPort(Protocol):
         self, session: AsyncSession, record_id: uuid.UUID
     ) -> tuple[list[float], str, str | None] | None: ...
 
-    # fix(#1580): anchor is a required keyword so ranking and scoring
+    # Anchor is a required keyword so ranking and scoring
     # share one read and can't straddle a commit under READ COMMITTED.
     async def get_nearest_record_ids(
         self,
@@ -280,7 +278,7 @@ class CatalogPort(Protocol):
         max_distance: float = 0.7,
     ) -> list[uuid.UUID]: ...
 
-    # fix(#1580): ``(model_name, config_fingerprint)`` are required keywords —
+    # ``(model_name, config_fingerprint)`` are required keywords —
     # a neighbour record may hold a row in more than one space, and scoring in
     # the wrong one gives a well-formed, meaningless number.
     async def get_embedding_distances(
@@ -330,11 +328,11 @@ class CatalogPort(Protocol):
         self, session: AsyncSession, dataset_ids: list[uuid.UUID]
     ) -> dict[str, dict[str, Any]]: ...
 
-    # How many members ONE generation is assembling. fix(#1327): that is the
+    # How many members ONE generation is assembling. That is the
     # attempt's intended set, which for a source add/remove is not what the VRT
     # is serving until the attempt publishes — so this is a fact about the
     # generation and must not be projected as a dataset's `source_count`. Count
-    # `catalog.vrt_source_links` for that, as every catalog surface now does.
+    # `catalog.vrt_source_links` for that, as every catalog surface does.
     async def get_vrt_generation_source_count(
         self, session: AsyncSession, generation_id: uuid.UUID
     ) -> int | None: ...
@@ -354,7 +352,6 @@ class CatalogPort(Protocol):
         self, session: AsyncSession, job_id: uuid.UUID, user: Any
     ) -> Any: ...
 
-    # Tile signing (Phase 252 LAYERING-01)
     def generate_tile_signature(self, scope: str, exp: int) -> str: ...
 
     def round_tile_expiry(self, ttl_seconds: int = 900) -> int: ...

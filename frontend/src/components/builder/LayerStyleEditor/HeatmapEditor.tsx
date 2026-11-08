@@ -2,8 +2,8 @@ import { HeatmapStyleControls } from '../HeatmapStyleControls';
 import type { BaseStyleEditorProps } from './types';
 
 /**
- * HeatmapEditor — thin wrapper that passes BaseStyleEditorProps
- * to the already-separate HeatmapStyleControls component.
+ * HeatmapEditor: thin wrapper that passes BaseStyleEditorProps to
+ * HeatmapStyleControls.
  */
 export function HeatmapEditor({
   layer,
@@ -18,5 +18,3 @@ export function HeatmapEditor({
     />
   );
 }
-
-export default HeatmapEditor;

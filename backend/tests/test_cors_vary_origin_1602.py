@@ -1,10 +1,10 @@
-"""fix(#1602): a CORS response has to declare that it varies by ``Origin``.
+"""A CORS response has to declare that it varies by ``Origin``.
 
 ``DynamicCORSMiddleware`` writes two origin-dependent policies. The
 credentialed one echoes the caller's origin into
-``Access-Control-Allow-Origin``; the anonymous one answers ``*``. Neither said
-``Vary: Origin``, so the body and the policy were cacheable under a key that
-did not include the input the policy was derived from.
+``Access-Control-Allow-Origin``; the anonymous one answers ``*``. Without
+``Vary: Origin``, the body and the policy would be cacheable under a key that
+does not include the input the policy is derived from.
 
 It is not a leak on a default deployment: the shipped ``frontend/nginx.conf``
 serves ``location /api/`` with ``proxy_cache off``, and a browser fails closed
@@ -29,7 +29,7 @@ What these tests pin, beyond "the header is present":
 - the reach. ``dispatch`` returns from four places, and only two of them
   write a CORS policy. All four declare the variance, because all four produce
   a cacheable representation of a URL that answers some other origin
-  differently (fix(#1602 codex r1)). The two that carry no policy assert that
+  differently. The two that carry no policy assert that
   absence in the same test, so "it varies" cannot quietly become "it has
   headers".
 """
@@ -37,7 +37,7 @@ What these tests pin, beyond "the header is present":
 import pytest
 from starlette.responses import Response
 
-from app.api.middleware.cors import _merge_vary_origin
+from app.api.middleware.cors import _merge_vary
 
 _FOREIGN_ORIGIN = "https://cors-1602.example.org"
 _ALLOWED_ORIGIN = "https://allowed-1602.example.com"
@@ -224,7 +224,7 @@ async def test_the_route_sets_a_vary_this_test_is_not_inventing(
 # ---------------------------------------------------------------------------
 # (d) the responses that get no CORS policy at all
 #
-# fix(#1602 codex r1): these two used to assert the opposite. A response
+# A response
 # produced for a rejected origin, or for a request carrying no Origin header,
 # is still origin-dependent: it is the SAME URL that answers an allowed origin
 # with Access-Control-Allow-Origin. A CDN that stores the header-less variant
@@ -317,7 +317,7 @@ def test_merge_vary_origin(existing, expected):
     if existing is not None:
         response.headers["Vary"] = existing
 
-    _merge_vary_origin(response)
+    _merge_vary(response, "Origin")
 
     assert response.headers.getlist("Vary") == [expected]
 
@@ -334,7 +334,7 @@ def test_merge_vary_origin_collapses_duplicate_field_lines():
     response.headers.append("Vary", "Accept-Language")
     response.headers.append("Vary", "Accept-Encoding")
 
-    _merge_vary_origin(response)
+    _merge_vary(response, "Origin")
 
     assert response.headers.getlist("Vary") == [
         "Accept-Language, Accept-Encoding, Origin"
@@ -362,10 +362,10 @@ async def test_every_dispatch_outcome_declares_the_variance(
     before looking. They must agree about ``Vary``, because all four produce a
     cacheable representation of a URL whose policy depends on ``Origin``.
 
-    Driven through the app rather than by calling the writers directly. After
-    fix(#1602 codex r1) the merge no longer lives in the writers at all, so a
-    writer-level test would assert against the wrong layer and would pass while
-    the pass-through branch, the one the finding was about, stayed broken.
+    Driven through the app rather than by calling the writers directly. The
+    merge does not live in the writers at all, so a writer-level test would
+    assert against the wrong layer and would pass while the pass-through
+    branch stayed broken.
 
     ``expected_allow_origin`` is carried so the four cases are pinned as
     genuinely different answers. Without it this reads as one assertion run

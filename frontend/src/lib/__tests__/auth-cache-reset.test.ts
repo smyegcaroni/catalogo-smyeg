@@ -6,7 +6,7 @@ import { useDrawingStore } from '@/stores/drawing-store';
 import { useSearchStore } from '@/stores/search-store';
 import type { UserResponse } from '@/types/api';
 
-// fix(#430 codex r6): identity changes evict the whole query cache; token
+// Identity changes evict the whole query cache; token
 // refresh (same user id) does not.
 describe('wireAuthCacheReset', () => {
   const initialAuthState = useAuthStore.getState();
@@ -64,7 +64,7 @@ describe('wireAuthCacheReset', () => {
       expect(getReportEntries()).toHaveLength(1);
 
       // Logout: buffer cleared — an anonymous tab must not inherit the
-      // previous user's captured entries (fix(#1663 review P1)).
+      // previous user's captured entries.
       useAuthStore.setState({ token: null, user: null });
       expect(getReportEntries()).toHaveLength(0);
     } finally {
@@ -72,7 +72,7 @@ describe('wireAuthCacheReset', () => {
     }
   });
 
-  // fix(#1713): drawing-store's target dataset, selected feature (a real
+  // drawing-store's target dataset, selected feature (a real
   // row's property bag) and edit-dirty flag are identity-scoped residue of
   // the same kind — an in-place identity change must not leave them for the
   // next signed-in user.
@@ -123,7 +123,7 @@ describe('wireAuthCacheReset', () => {
     }
   });
 
-  // fix(#1761 review P1): the race the ownerId-only check missed —
+  // The race the ownerId-only check missed:
   // handleEditAttributeSubmit reads `selectedFeature` before an update
   // mutation and calls setSelectedFeature again once it resolves. These pin
   // that resolution being refused when it lands AFTER an identity change,
@@ -198,7 +198,7 @@ describe('wireAuthCacheReset', () => {
     }
   });
 
-  // fix(#1713): milder than drawing-store — search intent, not row data —
+  // Milder than drawing-store — search intent, not row data —
   // but the same class and the same choke point.
   it('clears identity-scoped search fields when identity changes, not on token refresh', () => {
     const qc = new QueryClient();
@@ -230,8 +230,8 @@ describe('wireAuthCacheReset', () => {
     }
   });
 
-  // fix(#1850): the AI chat transcript is sessionStorage keyed on the map,
-  // not on identity, and previously outlived logout — a second user signing
+  // The AI chat transcript is sessionStorage keyed on the map,
+  // not on identity, so it must not outlive logout — a second user signing
   // in in the same tab would render the first user's prompts and query
   // metadata.
   it('clears geolens-chat-* sessionStorage keys when identity changes, not on token refresh', () => {
@@ -288,7 +288,7 @@ describe('wireAuthCacheReset', () => {
     }
   });
 
-  // fix(#1761 review P2): SearchBar keys its local input/debounce state on
+  // SearchBar keys its local input/debounce state on
   // this counter (see SearchBar.identity.test.tsx) precisely because `q`
   // can stay '' across the identity change and not signal anything on its
   // own — this pins that the counter itself always moves, even then.
