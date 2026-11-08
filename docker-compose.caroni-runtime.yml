@@ -78,4 +78,4 @@ services:
     healthcheck: {"test": ["CMD", "valkey-cli", "ping"], "timeout": "5s", "interval": "10s", "retries": 3, "start_period": "5s"}
     logging: {"driver": "json-file", "options": {"max-file": "3", "max-size": "50m"}}
   titiler:
-    image: "ghcr.io/developmentseed/titiler:2.2.1"
+    image: "ghcr.io/developmentseed/titiler:2.4.0"
