@@ -68,7 +68,7 @@ services:
     profiles: !reset []
     ports: !reset []
     volumes: !reset []
-    image: "valkey/valkey:8.1.10-alpine"
+    image: "valkey/valkey:9.1.3-alpine"
     restart: "unless-stopped"
     user: "valkey"
     security_opt: !override ["no-new-privileges:true"]
