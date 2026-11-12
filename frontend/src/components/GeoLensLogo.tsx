@@ -1,6 +1,6 @@
+import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
-import faoLogo from '@/assets/fao-logo-white-3lines-es.svg';
-import caroniLogo from '@/assets/logo-cuenca-caroni-white.png';
+import institutionalLogo from '@/assets/logo_web_caroni.webp';
 
 interface GeoLensLogoProps {
   variant?: 'full' | 'icon';
@@ -9,32 +9,26 @@ interface GeoLensLogoProps {
 }
 
 const sizes = {
-  sm: { fao: 'h-5 md:h-7', caroni: 'h-5 md:h-7', gap: 'gap-2 md:gap-3' },
-  md: { fao: 'h-7', caroni: 'h-7', gap: 'gap-3' },
-  lg: { fao: 'h-10', caroni: 'h-10', gap: 'gap-4' },
+  sm: 'h-5 md:h-7',
+  md: 'h-7',
+  lg: 'h-10',
 };
 
 export function GeoLensLogo({
-  variant = 'full',
   size = 'sm',
   className,
 }: GeoLensLogoProps) {
-  const s = sizes[size];
+  const { t } = useTranslation();
 
   return (
-    <span className={cn('inline-flex items-center', s.gap, className)}>
+    <span className={cn('inline-flex max-w-full items-center', className)}>
       <img
-        src={faoLogo}
-        alt="Organización de las Naciones Unidas para la Alimentación y la Agricultura"
-        className={cn('w-auto shrink-0 object-contain', s.fao)}
+        src={institutionalLogo}
+        alt={t('institutionLogoAlt')}
+        width={520}
+        height={90}
+        className={cn('w-auto max-w-full object-contain', sizes[size])}
       />
-      {variant === 'full' && (
-        <img
-          src={caroniLogo}
-          alt="Cuenca del Río Caroní"
-          className={cn('w-auto shrink-0 object-contain', s.caroni)}
-        />
-      )}
     </span>
   );
 }
