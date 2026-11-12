@@ -9,9 +9,9 @@ interface GeoLensLogoProps {
 }
 
 const sizes = {
-  sm: 'h-5 md:h-7',
-  md: 'h-7',
-  lg: 'h-10',
+  sm: 'h-6 md:h-9',
+  md: 'h-9',
+  lg: 'h-12',
 };
 
 export function GeoLensLogo({
