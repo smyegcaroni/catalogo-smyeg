@@ -132,7 +132,7 @@ describe('LoginPage footer and mobile branding (#1852)', () => {
     });
 
     const wordmark = screen.getByRole('button', {
-      name: /Organización de las Naciones Unidas.*Cuenca del Río Caroní/i,
+      name: /Ministry of Popular Power for Ecosocialism/i,
     });
     await userEvent.click(wordmark);
 
